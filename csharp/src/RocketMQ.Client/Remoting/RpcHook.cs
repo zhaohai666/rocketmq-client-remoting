@@ -1,12 +1,3 @@
-// RPC 钩子（对应 org.apache.rocketmq.remoting.RPCHook）。
-//
-// AclClientRPCHook：基于 accessKey/secretKey 计算签名并注入 ExtFields
-// （AccessKey / Signature / SecurityToken）。签名算法**逐字节对齐** Java：
-//
-//   - org.apache.rocketmq.acl.common.AclClientRPCHook#doBeforeRequest
-//   - org.apache.rocketmq.acl.common.AclUtils#combineRequestContent
-//   - org.apache.rocketmq.acl.common.AclSigner#calSignature
-//
 // 签名内容：先 MakeCustomHeaderToNet()，再按 key 序取 ExtFields 的**全部** value
 // （排除 Signature 键自身；拼接时只有 value，不带 key、不带 `=`/`&` 等分隔符），
 // 最后拼上 Body 原始字节。
@@ -21,17 +12,14 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Remoting;
 
-/// <summary>对应 org.apache.rocketmq.remoting.RPCHook。</summary>
 public interface IRpcHook
 {
     /// <summary>发送前调用。实现必须自行保证线程安全；传输层不持锁调用本方法。</summary>
     void DoBeforeRequest(string remoteAddr, RemotingCommand request);
 
-    /// <summary>收到响应后调用（AclClientRPCHook 里是空实现，与 Java 一致）。</summary>
     void DoAfterResponse(string remoteAddr, RemotingCommand request, RemotingCommand? response);
 }
 
-/// <summary>对应 org.apache.rocketmq.acl.common.SessionCredentials。</summary>
 public sealed class SessionCredentials
 {
     public const string AccessKeyField = "AccessKey";
@@ -53,7 +41,6 @@ public sealed class SessionCredentials
     public string SecurityToken { get; }
 }
 
-/// <summary>对应 org.apache.rocketmq.acl.common.AclClientRPCHook。</summary>
 public sealed class AclClientRPCHook : IRpcHook
 {
     private readonly SessionCredentials _credentials;
@@ -83,23 +70,15 @@ public sealed class AclClientRPCHook : IRpcHook
 
     public void DoAfterResponse(string remoteAddr, RemotingCommand request, RemotingCommand? response)
     {
-        // 与 Java 一致：空实现
         _ = remoteAddr;
         _ = request;
         _ = response;
     }
 
-    /// <summary>
-    /// 对应 Java AclUtils.combineRequestContent：内部先 MakeCustomHeaderToNet()，
-    /// 再按 key 序拼接全部 value（跳过 Signature），最后拼 Body。
-    /// </summary>
     public static byte[] BuildRequestContent(RemotingCommand request)
     {
-        // customHeader 的字段同样是签名内容的一部分（对应 Java parseRequestContent）。
         request.MakeCustomHeaderToNet();
 
-        // 显式用 Ordinal 排序：Java 的 TreeMap 按 String 自然序（UTF-16 码元）比较，
-        // 与 Ordinal 等价；这里不依赖 SortedDictionary 的默认比较器（它是 culture-sensitive 的）。
         var keys = new List<string>(request.ExtFields.Keys);
         keys.Sort(StringComparer.Ordinal);
 
@@ -123,14 +102,12 @@ public sealed class AclClientRPCHook : IRpcHook
         return ms.ToArray();
     }
 
-    /// <summary>对应 Java AclSigner.calSignature：HmacSHA1 + 标准 Base64（带 '=' 填充）。</summary>
     public static string CalcSignature(string secretKey, RemotingCommand request)
     {
         byte[] data = BuildRequestContent(request);
         return HmacSha1Base64(secretKey, data);
     }
 
-    /// <summary>HMAC-SHA1 + 标准 Base64。对应 Java AclSigner.calSignature。</summary>
     public static string HmacSha1Base64(string key, byte[] data)
     {
         using var mac = new HMACSHA1(Encoding.UTF8.GetBytes(key));
@@ -138,16 +115,8 @@ public sealed class AclClientRPCHook : IRpcHook
     }
 }
 
-/// <summary>
-/// 对应 org.apache.rocketmq.remoting.rpchook.StreamTypeRPCHook：
-/// 给每笔请求打 <c>ReqT = String.valueOf(RequestType.STREAM.getCode())</c>，即字面量
-/// <c>"0"</c>（clientId 的后缀才用枚举名 <c>@STREAM</c>，两处口径不同别混）。
-/// 开关是 <c>ClientConfig#enableStreamRequestType</c>，Java 只有 pull / lite 消费者
-/// 在构造函数里置真（DefaultMQPullConsumer:113/126、DefaultLitePullConsumer:213/228）。
-/// </summary>
 public sealed class StreamTypeRPCHook : IRpcHook
 {
-    /// <summary>对应 Java RequestType.STREAM.getCode()。</summary>
     public const int StreamRequestTypeCode = 0;
 
     public void DoBeforeRequest(string remoteAddr, RemotingCommand request)
@@ -167,14 +136,6 @@ public sealed class StreamTypeRPCHook : IRpcHook
 
 /// <summary>
 /// 按注册顺序依次执行的组合钩子。
-///
-/// Java 的传输层持有 RPCHook **列表**（<c>NettyRemotingAbstract#rpcHooks</c>，按注册顺序
-/// 执行），本端口的 RemotingClient 只有一槽（first-wins），所以顺序靠组合还原。
-/// 顺序在这里是语义而不是风格：Java <c>MQClientAPIImpl:329-332</c> 的注册顺序是
-/// Namespace → <b>Stream</b> → 用户钩子（ACL）→ DynamicalExtField，注释原文
-/// "Inject stream rpc hook first to make reserve field signature" —— <c>ReqT</c> 必须在
-/// 签名**之前**写入，否则签的内容与真正上线的 ExtFields 不一致，开鉴权的 broker 验签必失败。
-/// </summary>
 public sealed class ChainedRpcHook : IRpcHook
 {
     private readonly IReadOnlyList<IRpcHook> _hooks;
@@ -194,14 +155,6 @@ public sealed class ChainedRpcHook : IRpcHook
     }
 }
 
-/// <summary>
-/// 对应 org.apache.rocketmq.client.rpchook.NamespaceRpcHook：5.x 新命名空间（namespaceV2）
-/// 非空时给每笔请求加 <c>nsd=true</c> 与 <c>ns=&lt;namespaceV2&gt;</c> 两个扩展头。
-/// Java 里它由 <c>MQClientAPIImpl:329</c> 注册在钩子链**最前**（Namespace → Stream → 用户），
-/// 本端口的 <see cref="RequestHooks.Compose"/> 按同一顺序装链。
-/// 传入取值函数而非字符串：Java 每笔请求都实时读 <c>clientConfig.getNamespaceV2()</c>，
-/// 配置改了要能跟着走。
-/// </summary>
 public sealed class NamespaceRpcHook : IRpcHook
 {
     private readonly Func<string?> _namespaceV2;
@@ -232,15 +185,6 @@ public sealed class NamespaceRpcHook : IRpcHook
     }
 }
 
-/// <summary>
-/// 按 Java <c>MQClientAPIImpl:329-332</c> 的顺序装好请求钩子：Namespace（namespaceV2）→
-/// Stream → 用户钩子（ACL）。
-///
-/// namespaceV2 传的是**取值函数**（与 Java 同构：MQClientAPIImpl 持 clientConfig，钩子每笔
-/// 请求现读 <c>getNamespaceV2()</c>）。给了取值函数就**无条件**装 NamespaceRpcHook ——
-/// Java 也是无条件注册，命名空间为空时由钩子自己在 <c>doBeforeRequest</c> 里直接返回。
-/// 传字符串快照就是把「start() 之后才配命名空间」这条路堵死：配了也不上线，且一声不响。
-///
 /// 各 facade 在 Start() 里统一走这里，顺序就不会写反。
 /// </summary>
 public static class RequestHooks

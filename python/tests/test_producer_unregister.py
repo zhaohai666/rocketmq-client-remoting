@@ -1,17 +1,4 @@
 # -*- coding: utf-8 -*-
-"""生产者退出时发 ``UNREGISTER_CLIENT``(35) 的离线接线与上线形状。
-
-Java 链路：``DefaultMQProducerImpl.shutdown():313`` → ``MQClientInstance.unregisterProducer:1198-1201``
-→ 私有 ``unregisterClient(group, null):1158-1182`` —— 逐台 broker 同步发 35，
-**没用到的那个槽位传 null**（字段压根不上线），异常只 log.warn。
-真机侧的证据在 ``verify_producer_unregister_live.py``（抓帧 + 204 前后对照），
-Rust 还有一套「同 clientId 共用一条连接」的判别式证明（``rust/examples/live_producer.rs`` P11）；
-这里锁的是不会退回来的三件事：
-
-* 注销排在**关客户端之前**（35 只能走还开着的长连接）；
-* 注销失败不能把 ``shutdown()`` 打断；
-* 空组名不上线（broker ``ClientManageProcessor:228/237`` 判的是 ``group != null``）。
-"""
 from __future__ import annotations
 
 from client.mq_client import MQClientInstance
@@ -82,7 +69,7 @@ def test_producer_shutdown_unregisters_before_closing_the_client():
 
 
 def test_unregister_failure_does_not_break_shutdown():
-    """Java 的 unregisterClient 把异常吞成 log.warn，shutdown 必须继续关客户端。"""
+    pass
     client = _FakeClient(fail_unregister=True)
     p = _producer(client)
     p.shutdown()
@@ -91,7 +78,7 @@ def test_unregister_failure_does_not_break_shutdown():
 
 
 def test_blank_group_is_not_put_on_the_wire():
-    """空组名必须整个不上线：Java 传 null，broker 用 ``group != null`` 决定摘哪一侧。"""
+    pass
     spy = _InvokeSpy()
     MQClientInstance.unregister_client(spy, "127.0.0.1:10911", "cid-1", "GID_x", "", 3000)
     addr, request = spy.requests[0]
@@ -109,7 +96,7 @@ def test_consumer_side_blank_producer_group_is_dropped_too():
 
 
 def test_both_sides_present_when_given():
-    """两个槽位都有值时按 Java 的字段顺序上线（clientID, producerGroup, consumerGroup）。"""
+    pass
     spy = _InvokeSpy()
     MQClientInstance.unregister_client(spy, "127.0.0.1:10911", "cid-1", "GID_p", "GID_c", 3000)
     ext = spy.requests[0][1].custom_header.to_ext_fields()
@@ -126,10 +113,7 @@ def test_whitespace_group_is_dropped_too():
 
 
 def test_unregister_fans_out_to_every_broker_including_slaves():
-    """Java ``unregisterClient``:1158-1182 遍历 brokerAddrTable 的**每个 brokerId**：
-    Producer/ConsumerManager 是每台 broker 各自一份状态，漏掉从节点就等于那台的注册要等
-    通道扫描（默认 ~120s）才回收。心跳那侧仍只打 master —— 两个 helper 的分工一起锁住。
-    """
+    pass
     from remoting.protocol.route import BrokerData, TopicRouteData
 
     inst = MQClientInstance("unreg-fanout", ["127.0.0.1:9876"])
@@ -150,7 +134,7 @@ def test_unregister_fans_out_to_every_broker_including_slaves():
 
 
 def test_unregister_failure_on_one_broker_does_not_stop_the_fanout():
-    """单台失败只 log.debug：Java 的 catch 是 log.warn，剩下那台照样要注销到。"""
+    pass
     from remoting.protocol.route import BrokerData, TopicRouteData
 
     inst = MQClientInstance("unreg-fanout-fail", ["127.0.0.1:9876"])
@@ -172,16 +156,7 @@ def test_unregister_failure_on_one_broker_does_not_stop_the_fanout():
 
 
 def test_consumer_heartbeat_fans_out_to_slaves_while_producer_stays_master_only():
-    """心跳的扇出面按「带不带 ConsumerData」分：消费者**每台都打**（主 + 从），
-    生产者只打 master —— 同一条 Java 规则（``sendHeartbeatToAllBroker``:732-750 仅在
-    ``consumerEmpty && id != MASTER_ID`` 时跳从节点）。
-
-    消费者侧漏掉从节点不是"少一发冗余"：broker 的 ``ConsumerManager`` 每台各自一份，
-    从节点收不到心跳时会给指向自己的拉取回 ``SUBSCRIPTION_NOT_EXIST``
-    （``PullMessageProcessor``:420-427；默认 ``postSubscriptionWhenPull=false`` 的拉取
-    不带订阅标志，走的正是那条）。生产者的心跳相反，仍走 master 优先的
-    ``get_route_of_all_brokers``——两个 helper 的分工在这里一起锁住。
-    """
+    pass
     from client.consumer import DefaultMQPushConsumer
     from client.producer import DefaultMQProducer
     from remoting.protocol.route import BrokerData, TopicRouteData
@@ -223,12 +198,7 @@ def test_consumer_heartbeat_fans_out_to_slaves_while_producer_stays_master_only(
 
 
 def test_unregister_budget_is_the_client_api_timeout():
-    """默认超时必须是 Java 的 ``getMqClientApiTimeout()`` = 3000ms（``ClientConfig.java:81``；
-    ``MQClientInstance#unregisterClient``:1170 传的就是它）。
-
-    ``shutdown()`` 那条路径不显式传参，所以这个默认值就是线上真正生效的预算。写歪成 5000
-    不会让任何用例变红 —— 只是每台 broker 多等 2s、整体退出慢一档，因此单独立一条盯着它。
-    """
+    pass
     spy = _InvokeSpy()
     MQClientInstance.unregister_client(spy, "127.0.0.1:10911", "cid-1", "GID_x", "")
     assert spy.timeouts == [3000], spy.timeouts

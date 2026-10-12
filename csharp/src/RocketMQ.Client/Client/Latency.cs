@@ -4,27 +4,8 @@ using RocketMQ.Common;
 
 namespace RocketMQ.Client;
 
-/// <summary>
-/// 发送延迟故障容错（对应 org.apache.rocketmq.client.latency.* 与 Python client/latency.py）。
-///
 /// 实现 MQFaultStrategy + LatencyFaultToleranceImpl（带 FaultItem）：追踪每个 broker 的
 /// 发送延迟，延迟过高或发生异常时<b>隔离</b>一段时间（不分配给新消息），默认关闭。
-///
-/// 与 Java 关键点逐条对齐：
-///   * latencyMax / notAvailableDuration 两套阈值表（逐字一致）；
-///   * UpdateFaultItem 的 notAvailableDuration 取 ComputeNotAvailableDuration，
-///     隔离（异常）场景固定按 10000ms 算档位；
-///   * FaultItem.IsAvailable() = now &gt;= startTimestamp（隔离期未过则不可用）；
-///   * LatencyFaultToleranceImpl.IsAvailable/IsReachable 在没有记录时返回 true，
-///     即"从未出过问题的 broker 默认可用/可达"；
-///   * startDetector 可达性探测（<see cref="LatencyFaultToleranceImpl.StartDetector"/>）：
-///     Java 把它跑在单线程 ScheduledExecutor（3s 首跳、3s 周期），每轮对容错表里的每个
-///     FaultItem 按 checkStamp（detectInterval=2000ms 一档）用 ServiceDetector 探测，
-///     探活成功即把 reachableFlag 置回 true。本端口的探测器是 TCP 连接（见
-///     <see cref="TcpServiceDetector"/>），detectTimeout=200ms / detectInterval=2000ms
-///     与 Java ClientConfig:82-83 的默认值逐字一致；开关 StartDetectorEnable 默认 false，
-///     开启后隔离（RemotingException 路径）才把 reachable 置 false、由探测线程翻回来。
-/// </summary>
 public class FaultItem
 {
     public FaultItem(string name)
@@ -38,13 +19,8 @@ public class FaultItem
 
     public long StartTimestamp { get; private set; }
 
-    /// <summary>
-    /// Java FaultItem.checkStamp：下一轮探测的到期时刻（ms）。初始 0 ⇒ 首轮必探测；
-    /// 每次探测完 +detectInterval。
-    /// </summary>
     public long CheckStamp { get; set; }
 
-    /// <summary>Java：only when now + dur &gt; startTimestamp 才更新（保持最长隔离期）。</summary>
     public void UpdateNotAvailableDuration(long notAvailableDurationMillis)
     {
         long now = UtilAll.CurrentTimeMillis();
@@ -63,21 +39,13 @@ public class FaultItem
     private bool _reachableFlag = true;
 }
 
-/// <summary>对应 Java client.latency.Resolver：broker 名 → 地址（查不到返回 null）。</summary>
 public delegate string? BrokerAddrResolver(string brokerName);
 
-/// <summary>对应 Java client.latency.ServiceDetector：探测远端服务是否恢复。</summary>
 public interface IServiceDetector
 {
     bool Detect(string endpoint, long timeoutMillis);
 }
 
-/// <summary>
-/// TCP 连接探测器：在 timeoutMillis 内完成一次建连即视为可达，探完立刻断开。
-/// Java 内置的 ServiceDetector 是一发 getMaxOffset RPC（隐含"请求-响应全链路通"），
-/// 本端口按任务口径用裸 TCP 建连——对「机器活着、端口开着」这一判定等价，且不依赖
-/// 具体请求码。任何异常（含超时）都算不可达。
-/// </summary>
 public sealed class TcpServiceDetector : IServiceDetector
 {
     public bool Detect(string endpoint, long timeoutMillis)
@@ -113,16 +81,11 @@ public sealed class TcpServiceDetector : IServiceDetector
     }
 }
 
-/// <summary>
-/// 对应 Java client.latency.LatencyFaultToleranceImpl。表用锁保护；FaultItem 字段由表锁
-/// 串行化访问（CheckStamp 例外：只由探测线程写、阈值判断读，竞态无害）。
-/// </summary>
 public class LatencyFaultToleranceImpl
 {
     private readonly object _lock = new();
     private readonly Dictionary<string, FaultItem> _faultItemTable = new();
 
-    // Java ClientConfig:82-83 的默认值：detectTimeout=200、detectInterval=2000
     private int _detectTimeout = 200;
     private int _detectInterval = 2000;
     private volatile bool _startDetectorEnable;
@@ -184,7 +147,6 @@ public class LatencyFaultToleranceImpl
             _faultItemTable.TryGetValue(name, out item);
         }
 
-        // 没有记录 = 从未出过问题，默认可用（与 Java/Python 一致）
         return item == null || item.IsAvailable();
     }
 
@@ -216,14 +178,7 @@ public class LatencyFaultToleranceImpl
         }
     }
 
-    // ---------------- 可达性探测（Java LatencyFaultToleranceImpl:60-103）----------------
 
-    /// <summary>
-    /// 一轮探测（Java detectByOneRound）：到期（now - checkStamp &gt;= 0）的 FaultItem 逐个
-    /// 探测——resolver 拿不到地址就把条目摘掉（broker 已下线）；探测器探活成功且当前
-    /// 标记不可达时把 reachableFlag 翻回 true（Java 同处打 info 日志）。
-    /// checkStamp 在探测**之前**就 +detectInterval：探测挂死也不会把周期拖短。
-    /// </summary>
     public void DetectByOneRound()
     {
         List<KeyValuePair<string, FaultItem>> snapshot;
@@ -267,10 +222,6 @@ public class LatencyFaultToleranceImpl
         }
     }
 
-    /// <summary>
-    /// 对应 Java startDetector：单线程 3s 首跳 + 3s 固定周期，每轮只在 startDetectorEnable
-    /// 为真时探测。重复调用幂等（Java 靠 executor 单例；这里靠 _detectorRunning 标记）。
-    /// </summary>
     public void StartDetector()
     {
         lock (_lock)
@@ -311,8 +262,6 @@ public class LatencyFaultToleranceImpl
 
     private void DetectorLoop()
     {
-        // Java scheduleAtFixedRate(run, 3, 3, SECONDS)：首跳 3s、固定 3s。
-        // 计划时刻锚定（Schedules.WaitUntil 的第二形态无停止事件重载，用 100ms 分片版）。
         long next = UtilAll.CurrentTimeMillis() + 3000;
         while (!_detectorStop.IsSet)
         {
@@ -340,9 +289,6 @@ public class LatencyFaultToleranceImpl
     }
 }
 
-/// <summary>
-/// 对应 Java client.latency.MQFaultStrategy。
-///
 /// 仅当 SendLatencyFaultEnable 为 true 时，发送选队列阶段会：
 ///   1) 优先选 available（隔离期已过）的 broker；
 ///   2) 否则选 reachable 的 broker；
@@ -351,7 +297,6 @@ public class LatencyFaultToleranceImpl
 /// </summary>
 public class MQFaultStrategy
 {
-    // 两套阈值表（Java DefaultMQProducer 的默认值，逐字一致）
     public static readonly int[] LatencyMax = { 50, 100, 550, 1800, 3000, 5000, 15000 };
     public static readonly int[] NotAvailableDuration = { 0, 0, 2000, 5000, 6000, 10000, 30000 };
 
@@ -369,25 +314,18 @@ public class MQFaultStrategy
 
     public bool IsStartDetectorEnable() => _startDetectorEnable;
 
-    /// <summary>同步把开关传导给容错表（Java setStartDetectorEnable 同款）。</summary>
     public void SetStartDetectorEnable(bool enable)
     {
         _startDetectorEnable = enable;
         LatencyFaultTolerance.SetStartDetectorEnable(enable);
     }
 
-    /// <summary>起探测线程（Java MQFaultStrategy.startDetector → LatencyFaultToleranceImpl）。
-    /// 每轮只在 <see cref="IsStartDetectorEnable"/> 为真时探测，开关运行时可随时翻转。</summary>
     public void StartDetector() => LatencyFaultTolerance.StartDetector();
 
     public void Shutdown() => LatencyFaultTolerance.ShutdownDetector();
 
     public LatencyFaultToleranceImpl LatencyFaultTolerance { get; } = new();
 
-    /// <summary>
-    /// 队列选择（对应 Python select_one_message_queue / Java 同名方法）。
-    /// lastBrokerName 非空时尽量避开该 broker；enable=false 时退化为普通轮询。
-    /// </summary>
     public MessageQueue SelectOneMessageQueue(TopicPublishInfo tpInfo,
                                               string? lastBrokerName,
                                               bool resetIndex = false)
@@ -425,10 +363,6 @@ public class MQFaultStrategy
         return tpInfo.SelectOneMessageQueue(lastBrokerName ?? "");
     }
 
-    /// <summary>
-    /// 故障记录：isolation=true 时 latency 固定按 10000ms 算档位（→ 隔离 10000ms）。
-    /// 未开启时直接忽略（与 Java/Python 一致）。
-    /// </summary>
     public void UpdateFaultItem(string brokerName, double currentLatency,
                                 bool isolation, bool reachable)
     {

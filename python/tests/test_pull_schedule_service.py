@@ -1,20 +1,4 @@
 # -*- coding: utf-8 -*-
-"""PullConsumerScheduleService（Java MQPullConsumerScheduleService 等价物）本地单测。
-
-全部离线：消费者用内存替身（不连集群、不碰 socket —— Windows 回环端口有 ~2s 拒连
-延迟，任何计时断言都靠事件/流水，墙钟等待一律给 ≥30s 预算，见 _wait_for）。
-
-覆盖：
-* 任务注册 → 按「本实例应得队列」展开（register 在 start 前只记账，start 当场展开）；
-* 延迟到期才派发、回调返回值 / pull_message_later（一次性）/ set_pull_interval（常驻）
-  三条重排通道与优先级；
-* 位点来源：int / callable / None（问 broker 位点表，查不到退队尾）、游标跟随
-  next_begin_offset（含 OFFSET_ILLEGAL 的建议位点）；
-* queue 维度串行（同一队列不同时在途）；
-* 队列集合变化时的增撤（rebalance 语义，等价 Java putTask）；
-* 回调异常兜 1000ms（Java PullTaskImpl catch 分支）；
-* shutdown 排空在途 pull、复用的消费者不被关、自建的消费者被关。
-"""
 from __future__ import annotations
 
 import threading
@@ -204,8 +188,6 @@ class TestRegistrationAndExpansion:
         consumer.set_queues(TOPIC, _queues(3))
         service = PullConsumerScheduleService(pull_consumer=consumer)
         service.register_pull_task(TOPIC, _RecordingCallback())
-        # Java registerPullTaskCallback 会 registerMessageQueueListener(topic, null)
-        # → registerTopics（心跳订阅集/路由来源）；队列展开要等消费者能用。
         assert TOPIC in consumer.register_topics
         assert service.task_table() == {}
         assert service.callback_topics() == [TOPIC]
@@ -445,11 +427,7 @@ class TestSerialisationAndErrors:
             service.shutdown()
 
     def test_callback_exception_reschedules_with_1000ms(self):
-        """Java PullTaskImpl catch(Throwable) → 本轮 1000ms 顺延（不覆盖常驻间隔）。
-
-        第二轮 pull 进门就被闸门挡进事件等待 —— 保证读到的
-        ``last_next_delay_millis`` 是异常轮结算出来的 1000，而不是第三轮的新值。
-        """
+        pass
         consumer = FakePullConsumer()
         consumer.set_queues(TOPIC, _queues(1))
         second_round = threading.Event()
@@ -502,7 +480,7 @@ class TestSerialisationAndErrors:
         service, consumer, _cb = _started_service(_queues(1))
         try:
             assert _wait_for(lambda: len(consumer.pulls) >= 1)
-            del service._callback_table[TOPIC]  # 模拟 Java callbackTable 里没有该 topic
+            del service._callback_table[TOPIC]
             assert _wait_for(lambda: service.task_table() == {})
             # 丢任务后不再派发
             n = len(consumer.pulls)
@@ -524,7 +502,6 @@ class TestQueueSetChanges:
         service.start()
         try:
             assert _wait_for(lambda: len(consumer.counts()) >= 2)
-            # 队列变更：撤 q0、留 q1、加 q2（Java putTask 语义）。
             consumer.set_queues(TOPIC, [q1, q2])
             assert _wait_for(lambda: set(service.task_table()) == {q1, q2})
             assert _wait_for(lambda: (TOPIC, "broker-a", 2) in consumer.counts())

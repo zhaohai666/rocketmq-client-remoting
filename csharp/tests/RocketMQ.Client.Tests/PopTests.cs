@@ -1,13 +1,4 @@
 // POP 模式（5.x 轻量消费）单测 —— 纯逻辑，不联网。
-//
-// 覆盖：
-// 1. ExtraInfoUtil 全函数：7/8 段 build+split 往返、**末尾空串被丢弃**（Java String.split 语义）、
-//    长度下限校验、retry 判定三分支、getRealTopic 三分支；
-// 2. startOffsetInfo / msgOffsetInfo / orderCountInfo 的解析与错误分支（段数≠3、重复 key）；
-// 3. 5 个 POP 请求/响应头的 extFields **逐键断言**（broker 用 fastjson2 按 Java 属性名反序列化，
-//    错一个字母就静默丢字段 —— 这是守卫）；
-// 4. MQClientInstance.StampPopCk：POP_CK 反构（8 段、msgQueueOffset 取自体下标）、
-//    已带 POP_CK 不覆盖、1ST_POP_TIME 只在缺失时补、startOffsetInfo 缺失时的降级分支。
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
 using Xunit;
@@ -67,8 +58,6 @@ public class PopTests
     [InlineData("1 2 3")]
     public void SplitDropsTrailingEmptySegments(string input)
     {
-        // Java String.split(" ") 的 limit=0 语义：末尾空串被丢弃。C# 的 Split(' ') 会保留，
-        // 所以这里必须显式丢弃 —— 否则长度下限校验会与 Java 分歧。
         Assert.Equal(3, ExtraInfoUtil.Split(input).Length);
     }
 
@@ -339,7 +328,6 @@ public class PopTests
             Assert.True(ext.ContainsKey(k), "ChangeInvisibleTimeRequestHeader missing key: " + k);
         }
 
-        // Java 是 primitive boolean，总是出现且小写
         Assert.Equal("false", ext["suspend"]);
         Assert.Equal("20000", ext["invisibleTime"]);
 

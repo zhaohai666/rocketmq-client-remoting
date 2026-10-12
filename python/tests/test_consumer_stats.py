@@ -1,13 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消费侧统计（ConsumerStatsManager）单测 —— 离线，不依赖采样线程与集群。
-
-Java 语义锚点（common/stats/StatsItem.java + client/stat/ConsumerStatsManager.java，5.5.1）：
-* StatsItem 持有**累计** value/times；快照 = 累计差分（不是每分钟一个桶）；
-  tps = sum*1000/(last.ts-first.ts)（**每秒**）；avgpt = sum/timesDiff（RT 项 = 平均耗时）；
-* TPS 计数：addValue(key, msgs, 1) → tps = **调用次数**/秒，sum = 消息数；
-* RT 计数：addRTValue(key, rt, 1) → avgpt = 平均毫秒；
-* consumeStatus 全取 minute 快照；consumeFailedMsgs 取 failed 的 **hour** 窗口 sum。
-"""
 from __future__ import annotations
 
 import time
@@ -35,7 +26,6 @@ class TestComputeStatsData:
         assert ss.times == 3
 
     def test_single_sample_has_zero_span(self):
-        # 只有一个点：span=0 → tps=0（Java 中除零防护来自 span>0 判断）
         ss = compute_stats_data([(1_000, 5, 1)])
         assert ss.sum == 0 and ss.tps == 0.0
 
@@ -121,11 +111,6 @@ class TestConsumerStatsManager:
         assert cs.consume_failed_msgs == 0
 
     def test_consume_status_maps_rt_to_avgpt_and_tps_to_tps(self):
-        # 直接喂累计快照点（间隔 1s），绕开真实采样线程，窗口内增量即窗口数据：
-        #   pull_rt：value 增 200 / times 增 4 → avgpt=50ms
-        #   consume_rt：value 增 40 / times 增 4 → avgpt=10ms
-        #   pull_tps：value（消息数）增 20 → tps=20/s（Java 的 TPS 是**消息**每秒）
-        #   consume_ok_tps：value 增 8 → tps=8/s
         m = ConsumerStatsManager()
         now = int(time.time() * 1000)
 

@@ -87,13 +87,7 @@ def start_consumer(group: str, topic: str, collector: Collector,
 
 
 def prepare_topic(topic: str, queues: int = 4) -> None:
-    """按真实用法先把 topic 建出来，再启动消费者。
-
-    消费者**不做默认 topic 兜底**（对齐 Java：只有生产者才会用 TBW102 为新 topic 合成
-    发布信息）。topic 不存在时消费者拿不到路由 → 不分配队列 → 不消费，而且消费者要等
-    下一次 30s 心跳才会被 broker 登记（Java 同样），分配还要再往后。真实环境里 topic
-    由管理员或首次发送预先创建，这里显式建出来，避免测出"实现没问题但等超时"的假失败。
-    """
+    pass
     c = MQClientInstance("setup-%d" % int(time.time() * 1000), [NAMESRV])
     c.start()
     try:
@@ -134,8 +128,6 @@ def main() -> int:
     producer.send(Message(topic1, b"retry-me"))
     producer.send(Message(topic1, b"normal-1"))
     print("S1: 已发送，等待回投（延迟梯度 level3≈10s）...")
-    # 回投消息落在 %RETRY%group 主题，该主题由 broker 在首次回投时才创建；
-    # 消费者要等下一轮 rebalance（对齐 Java 的 20s）才会分配它的队列，故窗口给足。
     time.sleep(30)
     c1.shutdown()
     retry_arrivals = [r for r in seen1 if r[0] == b"retry-me"]
@@ -153,8 +145,6 @@ def main() -> int:
         check("S1-回投有延迟梯度(>=8s)", False, "不足两次投递")
     check("S1-正常消息只投一次", len(normal_arrivals) == 1,
           "arrivals=%d" % len(normal_arrivals))
-    # 重投消息实际存在 %RETRY%group 下；对齐 Java resetRetryAndNamespace 后，
-    # listener 看到的 topic 应被还原成业务原始 topic（否则用户按 topic 分支会走错）
     retried = [r for r in retry_arrivals if r[2] >= 1]
     check("S1-重投消息 topic 还原为原始 topic",
           bool(retried) and all(r[1] == topic1 for r in retried),
@@ -380,9 +370,6 @@ def main() -> int:
           cid7 in list_before and cid7 not in list_after,
           "before=%d after=%d" % (len(list_before), len(list_after)))
 
-    # ---------- S8 命名空间隔离 ----------
-    # 带 namespace 的客户端把资源名拼成 "<ns>%<topic>" 再发给 broker（Java NamespaceUtil），
-    # listener 拿到的 topic 应还原成业务原始 topic；不带 namespace 的客户端读不到该消息。
     ns = PREFIX + "_NS"
     raw_topic = PREFIX + "_NsTopic"
     ns_topic = ns + "%" + raw_topic          # broker 侧真实主题名
@@ -419,8 +406,6 @@ def main() -> int:
     c8p.subscribe(raw_topic, "*")
     c8p.start()
 
-    # 消费者必须先于发送启动：CONSUME_FROM_LAST_OFFSET 从「消费者启动时刻」的最新位点开始
-    # （Java 同样），先发后起会把消息跳过。等分配就绪（位点已在分配时解析）再发。
     time.sleep(5)
     p8.start()
     p8.send(Message(raw_topic, b"ns-1"))
@@ -439,16 +424,6 @@ def main() -> int:
     check("S8-topic 还原为业务原始名", bool(seen8_topics) and all(t == raw_topic for t in seen8_topics),
           "topics=%s" % sorted(set(seen8_topics)))
 
-    # ---------- S9 死信终态（%DLQ%） ----------
-    # 为什么必须真机验：重试到上限后**由 broker**把消息改投 %DLQ%<group>
-    # （Java AbstractSendMessageProcessor#consumerSendMsgBack:183 判
-    # `msgExt.getReconsumeTimes() >= maxReconsumeTimes`，是 `>=` 不是 `>`；
-    # maxReconsumeTimes 取客户端请求头，客户端在 -1 时按 16 传，见 DefaultMQPushConsumerImpl
-    # #getMaxReconsumeTimes:890）。所以「消费了几次」和「第几次进 DLQ」两端各有一半，
-    # 任何一端写错都会表现为「消息永远在重试」或「早早就进 DLQ」，
-    # 而这两个错都不会让单测变红。这里逐条钉住：
-    #   maxReconsumeTimes=2 ⇒ 投递 3 次（reconsumeTimes 0/1/2），第 3 次回投时进 DLQ，
-    #   DLQ 里的 reconsumeTimes=3（broker 存储时 +1），原组不再有第 4 次投递。
     topic9 = PREFIX + "_Dlq"
     prepare_topic(topic9)
     group9 = PREFIX + "_g9"

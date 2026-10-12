@@ -1,9 +1,3 @@
-// -*- coding: utf-8 -*-
-// TopicValidator (org.apache.rocketmq.common.topic.TopicValidator).
-// Faithful port of python/common/topic_validator.py.
-//
-// The Java validator uses a 128-entry VALID_CHAR_BIT_MAP where code points >= 128 are
-// illegal; here we mirror that with a 7-bit ASCII allow-set (any char >= 128 is rejected).
 
 import { MQClientException } from '../remoting/exception.ts';
 import { MixAll } from './mixAll.ts';
@@ -15,7 +9,6 @@ export const GROUP_MAX_LENGTH = 120;
 export const RETRY_OR_DLQ_TOPIC_MAX_LENGTH = 255;
 
 export const VALID_CHAR_PATTERN = '^[%|a-zA-Z0-9_-]+$';
-// Literal illegal-charset marker (matches Java/Python convention).
 export const CHARSET_ILLEGAL = '{}\n';
 // Allowed character set (code points 0-127 only); mirrors Python _ALLOWED_CHARS.
 export const VALID_CHARS = new Set(

@@ -1,32 +1,4 @@
 # -*- coding: utf-8 -*-
-"""异步发送内核（``DefaultMQProducerImpl`` 的 ASYNC 分支 + ``sendMessageAsync`` /
-``onExceptionImpl`` 那一整套）真机验证。
-
-离线单测（``tests/test_producer_async.py``）锁的是链的形状：调用方立刻返回、钩子各跑
-一次、预算共享、闸门/队满怎么拒。那些场景真集群造不出来（造不出 SYSTEM_BUSY，也造不
-出慢 broker），但离线对拍也证不了真 broker 上的六件事：
-
-  A1  「立刻返回」是真的：before 钩子睡 400ms 时调用方仍在 200ms 内返回；这一笔最后
-      SEND_OK，且用 broker 回的 offset_msg_id 能 **view_message 读回原 body 和
-      queue_offset**（回调里的 SendResult 不是自说自话）；before 钩子在
-      ``AsyncSenderExecutor_N`` 上跑、用户回调在 ``NettyClientPublicExecutor_N`` 上跑
-      （Java executeInvokeCallback 的线程口径）。
-  A2  并发 30 笔异步发送：**每笔恰好一个终态**、全部 SEND_OK、broker 上正好落 30 条，
-      并且各笔的 queue_offset 互不重叠（串台的话两个回调会指向同一个位置）。
-  A3  定点发送（给了 mq）真的落在那条队列上，别的队列一条都不多。
-  A4  拦截钩子（CheckForbidden）看到的是 CommunicationMode.ASYNC；它拒绝时异常原样到
-      回调，而且 broker 上一条都没落（连请求都没发出去）。
-  A5  批量异步没有异步内核，走同步批量内核（在 AsyncSender 线程里跑）：一次回调、
-      三条都落地。
-  A6  Shutdown 的**不等待**语义（本实现照抄 Java 的 ``shutdown()``，不像 C# 那样 join
-      池线程）：交进来的每一笔仍然跑完准备段、仍然拿到终态回调，但客户端已经先一步
-      关掉，所以这一整轮**一笔都没上线**（实测 36/36 报错、broker 上连 topic 都没建
-      出来）。这条把「调用方必须自己等回调再关」锁成可观察的事实。
-
-前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
-
-用法：.venv/bin/python verify_async_send_live.py [127.0.0.1:9876]
-"""
 from __future__ import annotations
 
 import os
@@ -70,11 +42,7 @@ def _first(items):
 
 
 class _Recorder(SendCallback):
-    """线程安全的回调记账。
-
-    除了终态条数还要记下**跑在哪根线程上**：Java 的 executeInvokeCallback 口径（回调
-    在 publicExecutor 上）只能这么验。
-    """
+    pass
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -158,7 +126,6 @@ class _ForbiddenTagHook(CheckForbiddenHook):
             self.calls += 1
             self.mode = context.communication_mode
         if context.message is not None and context.message.get_tags() == "forbidden":
-            # 异常**不吞**：Java 的 checkForbidden 签名就是 throws MQClientException
             raise MQClientException("live test: tag forbidden is not allowed")
 
 
@@ -166,7 +133,6 @@ def _producer(instance_name, *hooks) -> DefaultMQProducer:
     p = DefaultMQProducer(GROUP)
     p.set_namesrv_addr(NAMESRV)
     p.set_instance_name(instance_name)
-    # 钩子必须在 start() 之前注册：Java 的钩子表在 start 后就固定了
     for h in hooks:
         if isinstance(h, SendMessageHook):
             p.register_send_message_hook(h)
@@ -411,10 +377,6 @@ def a5_batch_async(admin, topic):
         check("*  A5 请求码 = SEND_BATCH_MESSAGE(320) 由离线单测取证",
               True, "真机看不到上线报文，见 tests/test_producer_async.py")
 
-        # 逐条 ID 的**落地**证据：读回 broker 存下来的那条子消息，它必须带客户端生成的
-        # 32 位 UNIQ_KEY。Java batch():1176 的顺序是「逐条 setUniqID → 才 encode()」；
-        # 顺序错了（或像修复前的本端口那样压根不写），broker 拆开批量后存的就是没有 ID 的
-        # 裸消息 —— 消费端去重、轨迹控制台串线全废，而发送侧回调照样 SEND_OK，看不出来。
         r = rec.results[0] if rec.results else None
         if r is None:
             check("A5 批量读回", False, "回调没有交付 SendResult")
@@ -455,7 +417,6 @@ def a6_shutdown_does_not_wait(admin, topic):
     try:
         for i in range(sends):
             p.send_async(Message(topic, ("async-a6-%d" % i).encode()), rec, 8000)
-        # 立刻关：Java/Python 在这里等的是**零**（C# 才会 join 池线程）
         p.shutdown()
         returned_at = time.monotonic()
         # 每一笔仍然会跑完准备段、仍然拿到终态回调（不等待 ≠ 凭空丢任务）
@@ -467,11 +428,6 @@ def a6_shutdown_does_not_wait(admin, topic):
               and sum(1 for t in rec.ats if t > returned_at) >= sends - 1,
               "Shutdown 返回后才有 %d/%d 笔落到终态"
               % (sum(1 for t in rec.ats if t > returned_at), sends))
-        # ⚠ 但代价是真的会丢：这些准备段是在「传输层已经关掉」的客户端上跑的，实测每一笔
-        # 都撞死在路由刷新的超时上（wait response on the channel ... timeout），所以整轮
-        # 全部报错、broker 上一条都没落（连 topic 都没建出来）。C# 那个版本 join 完池子
-        # 才关客户端，同样的用例能落满；这里照抄 Java 的 ``shutdown()``，锁的就是
-        # 「调用方必须自己等回调再关」这条。
         check("A6 不等待的代价：客户端先关，在途发送基本全部报错",
               len(rec.errors) * 2 >= sends,
               "报错=%d/%d，例如：%s" % (len(rec.errors), sends, _first(rec.errors)))

@@ -1,6 +1,3 @@
-// Smoke: MQClientInstance 跨 facade 复用（org.apache.rocketmq.client.impl.MQClientManager
-// + 引用计数关闭 + 实例级反向请求多播）。Run: node --experimental-strip-types test/mq_client_manager_smoke.ts
-//
 // 覆盖：
 //   1. manager factoryTable：clientId 命中复用 / 未命中现建（created 标志、factory 只跑一次）。
 //   2. 引用计数：register/unregister 平衡；**归零才真正 shutdown**（定时器停、实例不再 running）。

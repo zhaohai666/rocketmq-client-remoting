@@ -1,15 +1,4 @@
 # -*- coding: utf-8 -*-
-"""对拍：Python AclClientRPCHook vs Java AclClientRPCHook（AclProbe 输出的固定向量）。
-
-Java 侧向量（/tmp/aclprobe/AclProbe.java 输出）：
-  V1 sk=SK_TEST_SECRET_12345678 ext{topic=MyTopic,producerGroup=MyGroup,a=1,Zz=last,batch=false}
-     body=0102030405  content_hex=414b5f544553546c6173743166616c73654d7947726f75704d79546f7069630102030405
-     signature=qQhdzvXfV+g0r8LdwNCt+chJ4XY=
-  V2 + SecurityToken=TOKEN-ABC
-     content_hex=414b5f54455354544f4b454e2d4142436c6173743166616c73654d7947726f75704d79546f7069630102030405
-     signature=5YIp2FNQL8pxQP3w6YKnSv3kAsw=
-  V3 sk=SK ext{a=1,b=2} body=None  content_hex=414b3132  signature=d3vJKL2iRdr4ZykZfY+lxfQlfdc=
-"""
 import sys
 
 sys.path.insert(0, ".")

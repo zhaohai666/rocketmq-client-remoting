@@ -1,19 +1,3 @@
-// #100：发布地址查找只认 master（Java MQClientInstance.findBrokerAddressInPublish:1295-1305）的离线单测。
-//
-// 队列集那一半（topicRouteData2TopicPublishInfo:294-303 跳过没有 master 的 broker）已在
-// RouteHeartbeatTests 里锁死；本文件锁的是**地址**侧的同一条分界线：队列挑出来了，发送时还要把
-// brokerName 解析成地址，Java 那边是 `brokerAddrTable.get(brokerName).get(MASTER_ID)`（只认主，
-// 拿不到返回 null），而不是 `FindBrokerAddressInSubscribe`（主优先、没主退一台从节点）。
-//
-// 两处都用发布口径，主从切换期间才会是本端立刻报错，而不是把请求打到从节点上再被拒 ——
-// 从节点对 SEND_MESSAGE / ACK_MESSAGE / CHANGE_INVISIBLE_TIME 一律 reject
-// （SendMessageProcessor:131 ⇒ SYSTEM_BUSY(2)，还是个可重试码），白烧一轮超时，
-// 错误类型也和 Java 不一样。
-//
-// 平表的写入点必须在**真的** `UpdateTopicRouteInfoFromNameServer` 里（Java :962-964），
-// 所以这里让实例连一个进程内假 namesrv 走真 RPC，而不是往 `_brokerAddrTable` 里直接塞值 ——
-// 绕过它等于这条路径没测。
-//
 // 与 python/tests/test_publish_route_master.py 的地址侧同题。
 using System.Buffers.Binary;
 using System.Globalization;
@@ -352,7 +336,6 @@ public class PublishRouteMasterTests
         return instance;
     }
 
-    /// <summary>本端报的「broker 不存在」：消息是 Java 原文，码是 -1（不是 broker 回的码）。</summary>
     private static void AssertNotExist(MQClientException e)
     {
         Assert.Equal("The broker[" + Broker + "] not exist", e.Message);
@@ -392,7 +375,6 @@ public class PublishRouteMasterTests
         }
     }
 
-    /// <summary>Java <c>sendKernelImpl:919-924</c>：发布地址查不到，按 topic 刷一次路由再查。</summary>
     [Fact]
     public void PublishAddrForRefreshesTheRouteThenRechecks()
     {
@@ -427,7 +409,6 @@ public class PublishRouteMasterTests
             int before = namesrv.CountRequests(RequestCode.GetRouteinfoByTopic);
             AssertNotExist(Assert.Throws<MQClientException>(
                 () => instance.PublishAddrFor(Broker, Topic)));
-            // 报错前必须先刷一次路由（Java 的 tryToFindTopicPublishInfo），不能直接拿旧结论结账
             Assert.Equal(before + 1, namesrv.CountRequests(RequestCode.GetRouteinfoByTopic));
             // 一次 broker wire 都没发：从节点上是「发过去再被拒」，这里压根不发
             Assert.Equal(0, slave.CountOffsetQueries());
@@ -511,12 +492,6 @@ public class PublishRouteMasterTests
 
     // ---------------------------------------------------------------- 订阅口径（#104）
 
-    /// <summary>
-    /// Java <c>RebalanceImpl#lock:153 / lockAll:195</c>（解锁 <c>#unlock:74 / unlockAll:104</c>）：
-    /// 队列锁的地址是 <c>findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)</c> ——
-    /// 只认主、**不刷路由**，拿不到就整台跳过。路由里只剩从节点时 LOCK/UNLOCK 一条都不该上线：
-    /// 从节点上锁等于锁在它自己的锁管理器里，master 不知情，顺序消费的互斥保证静默失效。
-    /// </summary>
     [Fact]
     public void OrderlyLocksSkipTheBrokerWhenTheMasterIsGone()
     {
@@ -535,8 +510,6 @@ public class PublishRouteMasterTests
             instance.UnlockBatchMq("GID_prm_lock", "prm-lock@1", mqs);
             Assert.Equal(0, slave.CountRequests(RequestCode.LockBatchMq));
             Assert.Equal(0, slave.CountRequests(RequestCode.UnlockBatchMq));
-            // 也不许刷路由：Java 的 lock/unlock 直接 findBrokerAddressInSubscribe(false) 收场，
-            // 没有发送路径上的那一次 tryToFindTopicPublishInfo
             Assert.Equal(before, namesrv.CountRequests(RequestCode.GetRouteinfoByTopic));
 
             // 负控：主回来之后锁/解锁都落在主地址上、返回的锁集就是请求的那两个队列
@@ -555,11 +528,6 @@ public class PublishRouteMasterTests
         }
     }
 
-    /// <summary>
-    /// Java <c>PullAPIWrapper#popAsync:369-373</c>：POP 的地址同一条订阅口径（只认主）——
-    /// 查不到按 topic 刷一次路由再查，仍查不到在本端报「The broker[X] not exist」，
-    /// 一条 POP wire 都不发（从节点收 POP 只会换回一个可重试的 SYSTEM_BUSY）。
-    /// </summary>
     [Fact]
     public void PopMessageIsMasterOnlyAndReportsNotExist()
     {
@@ -592,12 +560,6 @@ public class PublishRouteMasterTests
         }
     }
 
-    /// <summary>
-    /// Java <c>RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241</c>：位点查询先只认主，
-    /// 查不到按 topic 刷一次路由，重查时**放宽到从节点**（位点是 HA 复制来的同一份数据，Java 允许
-    /// 从从节点读），仍没有才抛「The broker[X] not exist」。与管理侧 offset 查询（一律打主）
-    /// 的差别只在这最后一步。
-    /// </summary>
     [Fact]
     public void ConsumerOffsetFallsBackToTheSlaveAfterARefresh()
     {

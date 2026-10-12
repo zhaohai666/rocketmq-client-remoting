@@ -1,28 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""定时消息撤回（recallMessage 370）真机验证。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_recall_live.py 127.0.0.1:9876
-
-为什么必须真机：句柄不是客户端能自己拼出来的。只有 broker 在
-``SendMessageProcessor#attachRecallHandle`` 里（且仅当消息带 TIMER_* 延迟属性）才会
-把句柄挂回 SEND 响应头，撤回是否真的生效也只能靠「到点没投递」来证明。离线单测
-（tests/test_recall_message.py）锁的是编解码、报文键名和本地校验顺序，证不了语义。
-
-场景（每条都对应 Java 的一个行为）：
-  R1 定时消息的 SendResult 带 recallHandle，普通消息不带。
-  R2 句柄能解出 topic / brokerName / 被撤回消息的 uniqKey，且与发送结果一致。
-  R3 recall_message 成功返回被撤回消息的 uniqKey（Java 取响应头 msgId）。
-  R4 %RETRY% topic 在本地就被拒（Java "topic is not supported"），不打网络。
-  R5 非法句柄在本地就被拒（Java "recall handle is invalid"），且是秒回。
-  R6 **语义**：同时发两条同样延迟的消息，撤回其中一条 → 到点后对照消息被投递、
-     被撤回的那条永远不到；这才是撤回真正的定义。
-  R7 全程把 broker 的 recallMessageEnable 改回原值（跑之前是 false 就跑完还是 false）。
-
-broker 的 recallMessageEnable 默认 false（Java BrokerConfig:546），本地 conf 也是 false，
-所以脚本先 UPDATE_BROKER_CONFIG 打开，退出前无条件还原。
-"""
 from __future__ import annotations
 
 import sys

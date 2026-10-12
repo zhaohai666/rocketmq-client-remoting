@@ -1,6 +1,3 @@
-// -*- coding: utf-8 -*-
-// Message binary codec (org.apache.rocketmq.common.message.MessageDecoder).
-// 17-segment store format + 6-segment batch format, aligned with the Java/RocketMQ wire.
 import zlib from 'node:zlib';
 import { Buffer } from 'node:buffer';
 import { Message, MessageExt, MessageBatch } from './message.ts';

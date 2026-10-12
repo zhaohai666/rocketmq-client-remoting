@@ -5,7 +5,6 @@ package remoting
 
 import "strings"
 
-// RequestCode mirrors org.apache.rocketmq.remoting.protocol.RequestCode.
 const (
 	ReqSendMessage                      = int32(10)
 	ReqPullMessage                      = int32(11)
@@ -92,11 +91,6 @@ const (
 	ReqNotifyUnsubscribeLite            = int32(200073)
 )
 
-// Request codes the admin / tooling surface needs, kept in a second block so
-// the client-runtime codes above stay readable. Values mirror
-// org.apache.rocketmq.remoting.protocol.RequestCode exactly — a wrong number
-// here shows up as "request code not supported" (3) from the broker, which is
-// at least loud, but the nameserver ones silently do nothing useful.
 const (
 	ReqUpdateAndCreateTopicList          = int32(18)
 	ReqGetBrokerRuntimeInfo              = int32(28)

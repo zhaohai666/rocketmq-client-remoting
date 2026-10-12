@@ -21,7 +21,6 @@ namespace rocketmq {
 
 namespace {
 
-// 把 int 写进 extFields（Java 侧 extFields 全是字符串）
 std::string i64str(int64_t v) { return std::to_string(v); }
 
 // 取响应 extFields 中的整数（缺失返回 fallback）
@@ -82,10 +81,6 @@ void DefaultMQAdminExt::start() {
     if (nameServerAddrs_.empty()) {
         throw MQClientException("name server address is not set");
     }
-    // Java `DefaultMQAdminExtImpl#start`:161 无条件 `changeInstanceNameToPID`，clientId
-    // 再走 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。本端口的 admin
-    // 默认 instanceName 是 "ADMIN"（不是 Java 的 "DEFAULT"），所以改写只在调用方显式
-    // 设成 "DEFAULT" 时才起作用。
     instanceName_ = changeInstanceNameToPID(instanceName_);
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);
@@ -93,8 +88,6 @@ void DefaultMQAdminExt::start() {
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         3000, 15000, MQClientInstance::tlsEnabledFromEnv(),
                                         unitName_, pollNameServerIntervalMillis_));
-    // 请求钩子（namespaceV2 的 `nsd`/`ns`、ACL 签名 / stream 的 `ReqT`）：管理端所有
-    // 请求同样要带上。namespaceV2 传**取值函数**（Java 每笔请求实时读 clientConfig）。
     std::shared_ptr<RPCHook> requestHook =
         composeRequestHooks(enableStreamRequestType_, rpcHook_,
                             [this] { return namespaceV2_; });
@@ -151,8 +144,6 @@ std::vector<std::string> DefaultMQAdminExt::brokerAddrsOfCluster(MQClientInstanc
 // ---------------------------------------------------------------- Topic 管理
 void DefaultMQAdminExt::createTopic(const std::string& /*key*/, const std::string& newTopic,
                                     int32_t queueNum, int32_t /*topicSysFlag*/) {
-    // 对应 Java DefaultMQAdminExt.createTopic → Validators.checkTopic + isSystemTopic：
-    // 与 producer 门面同款本地快失败，非法/系统重名的建 topic 请求不该打到 broker。
     Validators::checkTopic(newTopic);
     Validators::isSystemTopic(newTopic);
     requireClient().createTopicInRoute(newTopic, queueNum, queueNum, MixAll::READ_PERM_BY_DEFAULT);
@@ -325,7 +316,6 @@ TopicConfigSerializeWrapper DefaultMQAdminExt::getAllTopicConfig(const std::stri
 TopicConfigSerializeWrapper DefaultMQAdminExt::getUserTopicConfig(
     const std::string& brokerAddr, bool specialTopic, int32_t timeoutMillis) {
     TopicConfigSerializeWrapper wrapper = getAllTopicConfig(brokerAddr, timeoutMillis);
-    // 对应 Java getUserTopicConfig：剔除系统 topic 与 %RETRY%/%DLQ%
     TopicList sysTopics = getSystemTopicListFromBroker(brokerAddr, timeoutMillis);
     std::set<std::string> sysSet(sysTopics.topicList.begin(), sysTopics.topicList.end());
 
@@ -460,8 +450,6 @@ void DefaultMQAdminExt::createStaticTopic(const std::string& brokerAddr,
 GroupForbidden DefaultMQAdminExt::updateAndGetGroupReadForbidden(
     const std::string& brokerAddr, const std::string& group, const std::string& topic,
     const std::optional<bool>& readable) {
-    // UPDATE_AND_GET_GROUP_FORBIDDEN(353)：readable 仅在非 nullopt 时带（Java 不设该
-    // 字段即"仅查询"）；响应体是 GroupForbidden JSON，解码返回。
     if (group.empty() || topic.empty()) {
         throw MQClientException("updateAndGetGroupReadForbidden: group/topic required");
     }
@@ -487,10 +475,6 @@ GroupForbidden DefaultMQAdminExt::updateAndGetGroupReadForbidden(
 bool DefaultMQAdminExt::resumeCheckHalfMessage(const std::string& brokerAddr,
                                               const std::string& topic,
                                               const std::string& msgId) {
-    // RESUME_CHECK_HALF_MESSAGE(323)：Java（MQClientAPIImpl:3279）对非 SUCCESS **返回
-    // false 而不抛错**——网络层异常才上抛；broker 拒绝（如 msgId 不是半消息，表现为
-    // SYSTEM_ERROR）通过返回值表达。invokeSync 会把非 SUCCESS 转成异常，所以这里拿
-    // 原始响应自己判断 code。
     if (topic.empty()) {
         throw MQClientException("resumeCheckHalfMessage: topic required");
     }
@@ -519,10 +503,8 @@ void DefaultMQAdminExt::createOrUpdateOrderConf(const std::string& key,
     try {
         getKvConfig(MixAll::NAMESPACE_ORDER_TOPIC_CONFIG, key, oldValue);
     } catch (const std::exception&) {
-        // Java 打印后按空表继续：key 缺失是首写的常态，不是失败。
         oldValue.clear();
     }
-    // 条目 key -> 完整 "key:value" 文本（Java HashMap 语义：重复 key 后写胜出）
     std::map<std::string, std::string> entries;
     size_t start = 0;
     while (start <= oldValue.size()) {
@@ -570,8 +552,6 @@ void DefaultMQAdminExt::cleanExpiredConsumerQueue(const std::string& brokerAddr,
 
 std::vector<std::string> DefaultMQAdminExt::cleanExpiredConsumerQueueByAddr(
     const std::vector<std::string>& addrs, int32_t timeHours) {
-    // Java 的 ByAddr 形态：逐个地址执行，返回**失败的地址**列表（不 fail-fast，
-    // 一台 broker 挂了不掩盖其他台的结果）。
     std::vector<std::string> failed;
     for (const std::string& addr : addrs) {
         try {
@@ -639,7 +619,6 @@ JsonValue DefaultMQAdminExt::queryConsumeTimeSpan(const std::string& topic,
 }
 
 std::set<std::string> DefaultMQAdminExt::getTopicClusterList(const std::string& topic) {
-    // Java 有 getClusterList / getTopicClusterList 两个名字、同一实现（Go 同口径做别名）。
     return getClusterList(topic);
 }
 
@@ -660,8 +639,6 @@ void DefaultMQAdminExt::setMessageRequestMode(const std::string& brokerAddr,
 // ---------------------------------------- NameServer 配置（318/319）
 void DefaultMQAdminExt::updateNameServerConfig(const PropertyMap& properties,
                                               int32_t timeoutMillis) {
-    // UPDATE_NAMESRV_CONFIG(318)：body 是 properties **文本**（k=v\n，不是 JSON）；
-    // 广播到每个 NameServer，任一失败即抛（Java 记 errResponse 最后统一抛）。
     std::string text = MixAll::properties2String(properties);
     if (text.empty()) return;
     MQClientInstance& client = requireClient();
@@ -730,7 +707,6 @@ PropertyMap DefaultMQAdminExt::getBrokerConfig(const std::string& brokerAddr,
 void DefaultMQAdminExt::updateBrokerConfig(const std::string& brokerAddr,
                                           const PropertyMap& properties,
                                           int32_t timeoutMillis) {
-    // 对应 Java Validators.checkBrokerConfig 的 brokerPermission 校验
     auto it = properties.find("brokerPermission");
     if (it != properties.end()) {
         int32_t perm = -1;
@@ -801,7 +777,6 @@ JsonValue DefaultMQAdminExt::viewBrokerStatsData(const std::string& brokerAddr,
 // ---------------------------------------------------------------- NameServer KV
 void DefaultMQAdminExt::createAndUpdateKvConfig(const std::string& ns, const std::string& key,
                                                const std::string& value) {
-    // Java putKVConfigValue：广播到**每一个** NameServer
     MQClientInstance& client = requireClient();
     PropertyMap ext;
     ext["namespace"] = ns;
@@ -918,8 +893,6 @@ bool DefaultMQAdminExt::getSubscriptionGroupConfig(const std::string& addr,
 
 SubscriptionGroupWrapper DefaultMQAdminExt::getAllSubscriptionGroup(const std::string& brokerAddr,
                                                                    int32_t timeoutMillis) {
-    // 对应 Java getAllSubscriptionGroup：**分页**累积，直到 groupSeq >= totalGroupNum-1。
-    // 老版本 broker 不带 totalGroupNum，此时一次性返回全部（单轮即结束）。
     MQClientInstance& client = requireClient();
     int32_t timeout = timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis;
     int64_t begin = UtilAll::currentTimeMillis();
@@ -1126,10 +1099,6 @@ std::set<std::string> DefaultMQAdminExt::queryTopicConsumeByWho(const std::strin
 
 ConsumeStats DefaultMQAdminExt::examineConsumeStatsGroup(const std::string& consumerGroup,
                                                         const std::string& topic) {
-    // 对应 Java `examineConsumeStats(group[, topic])`（:389-424）：按
-    // `%RETRY%<group>` 的路由扇出全部 broker，逐台取统计并合并（offsetTable
-    // 并入、consumeTps 累加）；全空时抛错（Java 的 MQClientException 同口径，
-    // 带 CONSUMER_NOT_ONLINE 让 resetOffsetNew 式的退化分支可用）。
     TopicRouteData route = examineTopicRoute(MixAll::getRetryTopic(consumerGroup));
     ConsumeStats result;
     for (const BrokerData& bd : route.brokerDatas) {
@@ -1147,8 +1116,6 @@ ConsumeStats DefaultMQAdminExt::examineConsumeStatsGroup(const std::string& cons
 }
 
 bool DefaultMQAdminExt::consumed(const MessageExt& msg, const std::string& consumerGroup) {
-    // 对应 Java `DefaultMQAdminExtImpl.consumed:1533-1557`：该组在本队列的
-    // consumerOffset 是否已越过这条消息的 queueOffset（位点越过 ⇒ 已消费）。
     ConsumeStats cstats = examineConsumeStatsGroup(consumerGroup);
     ClusterInfo ci = examineBrokerClusterInfo();
     std::string storeHost = msg.getStoreHostString();
@@ -1159,15 +1126,12 @@ bool DefaultMQAdminExt::consumed(const MessageExt& msg, const std::string& consu
         if (bdIt == ci.brokerAddrTable.end()) continue;
         auto addrIt = bdIt->second.brokerAddrs.find(MixAll::MASTER_ID);
         if (addrIt == bdIt->second.brokerAddrs.end()) continue;
-        // Java 先把 master 地址规范化成 ip:port 再比对（convert2IpString）；
-        // 四端存的 broker 地址本来就是注册时的 ip:port 形态，直接比。
         if (storeHost.empty() || addrIt->second != storeHost) continue;
         if (kv.second.consumerOffset > msg.getQueueOffset()) return true;
     }
     return false;
 }
 
-// Java 枚举名原文（对账用；C++ 成员名相同，只是给测试/日志一个稳定的字符串形态）
 const char* trackTypeName(TrackType type) {
     switch (type) {
         case TrackType::CONSUMED: return "CONSUMED";
@@ -1182,7 +1146,6 @@ const char* trackTypeName(TrackType type) {
 
 namespace {
 
-// Java 分支里 exceptionDesc 的统一格式："CODE:n DESC:msg"
 std::string codeDesc(int32_t code, const std::string& msg) {
     return "CODE:" + std::to_string(code) + " DESC:" + msg;
 }
@@ -1190,8 +1153,6 @@ std::string codeDesc(int32_t code, const std::string& msg) {
 }  // namespace
 
 std::vector<MessageTrack> DefaultMQAdminExt::messageTrackDetail(const MessageExt& msg) {
-    // 对应 Java `DefaultMQAdminExtImpl.messageTrackDetail:1349-1427`：查谁在消费
-    // 这个 topic，逐组判 CONSUMED / FILTERED / PULL / NOT_ONLINE / BROADCASTING…。
     std::vector<MessageTrack> result;
     TopicRouteData route = examineTopicRoute(msg.topic);
     std::string brokerAddr;
@@ -1201,7 +1162,6 @@ std::vector<MessageTrack> DefaultMQAdminExt::messageTrackDetail(const MessageExt
     }
     if (brokerAddr.empty()) return result;
     std::set<std::string> groups = queryTopicConsumeByWho(brokerAddr, msg.topic);
-    // Java 按 broker 返回顺序遍历；本端拿到的是 set，排序让输出确定
     for (const std::string& group : groups) {
         MessageTrack mt;
         mt.consumerGroup = group;
@@ -1254,9 +1214,6 @@ std::vector<MessageTrack> DefaultMQAdminExt::messageTrackDetail(const MessageExt
 
             if (ifConsumed) {
                 mt.trackType = TrackType::CONSUMED;
-                // Java 遍历订阅表找本 topic：tagsSet 非空、既不含消息 tag 也不含
-                // "*" ⇒ 订阅比消息窄，消息是被过滤掉的那部分（SQL92 订阅 tagsSet
-                // 为空，同样落回 CONSUMED —— 忠实保留 Java 语义）。
                 const JsonValue* sub = cc.subscriptionTable.find(msg.topic);
                 if (sub != nullptr && sub->isObject()) {
                     const JsonValue* tags = sub->find("tagsSet");
@@ -1294,7 +1251,6 @@ TopicList DefaultMQAdminExt::queryTopicsByConsumerToBroker(const std::string& br
 }
 
 TopicList DefaultMQAdminExt::queryTopicsByConsumer(const std::string& group) {
-    // 对应 Java DefaultMQAdminExtImpl:1078：按 %RETRY%<group> 查路由，逐 broker 下发 343 合并
     TopicRouteData route = examineTopicRoute(MixAll::getRetryTopic(group));
     TopicList merged;
     for (const BrokerData& bd : route.brokerDatas) {
@@ -1302,7 +1258,6 @@ TopicList DefaultMQAdminExt::queryTopicsByConsumer(const std::string& group) {
         if (addr.empty()) continue;
         TopicList part = queryTopicsByConsumerToBroker(addr, group);
         for (const std::string& topic : part.topicList) {
-            // Java 侧 TopicList.topicList 是 Set<String>，这里等价地去重
             if (merged.contains(topic)) continue;
             merged.topicList.push_back(topic);
         }
@@ -1364,26 +1319,19 @@ int64_t DefaultMQAdminExt::minOffset(const MessageQueue& mq) {
 }
 
 int64_t DefaultMQAdminExt::searchOffset(const MessageQueue& mq, int64_t timestamp) {
-    // Java MQAdminImpl:189：显式下发 LOWER 边界。
     return searchLowerBoundaryOffset(mq, timestamp);
 }
 
 int64_t DefaultMQAdminExt::searchLowerBoundaryOffset(const MessageQueue& mq, int64_t timestamp) {
-    // 对应 Java DefaultMQAdminExt:133。
     return requireClient().searchOffsetByBoundary(mq, timestamp, BoundaryType::LOWER);
 }
 
 int64_t DefaultMQAdminExt::searchUpperBoundaryOffset(const MessageQueue& mq, int64_t timestamp) {
-    // 对应 Java DefaultMQAdminExt:137。时间戳落在队尾之后时 UPPER 给最后一条自身的位点，
-    // LOWER 给它的下一个位点（maxOffset）。
     return requireClient().searchOffsetByBoundary(mq, timestamp, BoundaryType::UPPER);
 }
 
 int64_t DefaultMQAdminExt::earliestMsgStoreTime(const MessageQueue& mq) {
     MQClientInstance& client = requireClient();
-    // Java MQAdminImpl:250 的 earliestMsgStoreTime 与 max/min/search 同一个形状：
-    // 只认 master，刷一次路由重查，仍拿不到照 :264 抛「The broker[X] not exist」。
-    // （publishAddrInAdmin 是实例私有，这里用同形状的 publishAddrFor。）
     std::string addr = client.publishAddrFor(mq.brokerName, mq.topic);
     PropertyMap ext;
     ext["topic"] = mq.topic;
@@ -1417,15 +1365,7 @@ PropertyMap DefaultMQAdminExt::buildResetOffsetExtFields(
     ext["topic"] = topic;
     ext["group"] = group;
     ext["timestamp"] = i64str(timestamp);
-    // 键名是 **isForce** 不是 force：Java `RemotingCommand.makeCustomHeaderToNet:437-450`
-    // 拿 requestHeader 的**字段名**做 ext key，而 `ResetOffsetRequestHeader` 声明的字段是
-    // `private boolean isForce`（getter `isForce()` 不参与命名）。写成 force 时 broker 侧
-    // isForce 恒为 false ⇒ `Broker2Client.resetOffset:152-158` 的分支退化成「取时间戳位点」，
-    // 前重（timestamp=-1）会把 consumerOffset 原样回显而不是跳到 maxOffset。
-    // 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
-    //               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
     ext["isForce"] = isForce ? "true" : "false";
-    // Java：offset=-1 表示 offset 为空
     ext["offset"] = i64str(offset);
     if (queueId >= 0) ext["queueId"] = i64str(queueId);
     return ext;
@@ -1457,9 +1397,6 @@ std::map<MessageQueue, int64_t> DefaultMQAdminExt::invokeBrokerToResetOffset(
 std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByTimestamp(
     const std::string& topic, const std::string& group, int64_t timestamp, bool isForce,
     const std::string& clusterName, bool isCpp) {
-    // 对应 Java resetOffsetByTimestamp：逐 broker 下发 INVOKE_BROKER_TO_RESET_OFFSET
-    // （broker 端按 timestamp 计算新位点，并同步在线消费者 + 更新 offset 表）。
-    //
     // 注意：这里**不再**走"逐队列 searchOffset + updateConsumerOffset"的旧本地实现——
     // 那不会同步在线消费者，也不会做 broker 端一致性校验。
     std::string routeTopic = topic;
@@ -1473,7 +1410,6 @@ std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByTimestamp(
     for (const BrokerData& bd : route.brokerDatas) {
         std::string addr = bd.selectBrokerAddr();
         if (addr.empty()) continue;
-        // queueId=-1 / offset=-1：Java 的"按 timestamp 重置整个 topic"那个重载
         for (const auto& kv : invokeBrokerToResetOffset(
                  addr, topic, group, timestamp, isForce, isCpp, -1, -1)) {
             allOffsets[kv.first] = kv.second;
@@ -1488,28 +1424,14 @@ std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByTimestamp(
 std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByQueueId(
     const std::string& brokerAddr, const std::string& consumerGroup, const std::string& topic,
     int32_t queueId, int64_t resetOffset) {
-    // 对应 Java DefaultMQAdminExt#resetOffsetByQueueId（DefaultMQAdminExtImpl:1827）：
-    // 两笔 RPC 缺一不可。
-    // 1) updateConsumerOffset(25) 直接把 offsetTable 改成目标位点；
-    // 2) 带 queueId + offset 的 222 走 AdminBrokerProcessor#resetOffsetInner，先按
-    //    [min, max+1] 校验（越界回 SYSTEM_ERROR "Target offset N not in consume queue
-    //    range [min-max]"），再 ConsumerOffsetManager#assignResetOffset —— 它同时写
-    //    resetOffsetTable（一次性，下次 pull 用 queryThenEraseResetOffset 取走）和
-    //    offsetTable，并清掉该队列的 POP 在途计数。只做第 1 步的话在线消费者仍按自己
-    //    内存里的位点继续拉。
-    // 实测（5.5.1 真机）两笔 RPC **不是原子的**：ConsumerOffsetManager#commitOffset 只做
-    //    覆盖写（offset 变小也只打 [NOTIFYME] warn，不做区间校验），所以第 2 笔被拒时，
-    //    第 1 笔已经把非法位点落库。Java 同样如此，这里不做保护性回滚。
     updateConsumerOffsetToBroker(brokerAddr, consumerGroup,
                                  MessageQueue(topic, "", queueId), resetOffset);
-    // Java 的单队列重载不传 force（默认 false），timestamp 传 0（位点已给定、不参与计算）
     return invokeBrokerToResetOffset(brokerAddr, topic, consumerGroup, 0, false, false,
                                      queueId, resetOffset);
 }
 
 void DefaultMQAdminExt::resetOffsetNew(const std::string& consumerGroup,
                                       const std::string& topic, int64_t timestamp) {
-    // 对应 Java resetOffsetNew：先试新版（broker 端重置），消费者不在线再退化到旧版
     try {
         resetOffsetByTimestamp(topic, consumerGroup, timestamp, true);
     } catch (const MQClientException& e) {
@@ -1523,7 +1445,6 @@ void DefaultMQAdminExt::resetOffsetNew(const std::string& consumerGroup,
 
 std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByTimestampOld(
     const std::string& consumerGroup, const std::string& topic, int64_t timestamp, bool force) {
-    // 对应 Java resetOffsetByTimestampOld：逐队列 searchOffset 后按 force 决策写回
     MQClientInstance& client = requireClient();
     TopicRouteData route = examineTopicRoute(topic);
     std::map<MessageQueue, int64_t> result;
@@ -1566,9 +1487,6 @@ std::vector<MessageExt> DefaultMQAdminExt::queryMessage(const std::string& topic
 
 bool DefaultMQAdminExt::queryMessageByUniqKey(const std::string& topic,
                                              const std::string& uniqKey, MessageExt& out) {
-    // 对应 Java queryMessageByUniqKey：indexType="U" + extFields["_UNIQUE_KEY_QUERY"]="true"。
-    // 注意：broker 侧 uniqKey 倒排索引只有 RocksDB 索引实现（IndexRocksDBStore）支持；
-    // 默认文件索引下该查询会返回空，属 broker 配置差异而非客户端问题。
     int64_t now = UtilAll::currentTimeMillis();
     std::vector<MessageExt> msgs = requireClient().queryMessageAllBrokers(
         topic, uniqKey, 32, 0, now + 3600 * 1000, MessageConst::INDEX_UNIQUE_TYPE, true);
@@ -1586,9 +1504,6 @@ std::vector<MessageExt> DefaultMQAdminExt::queryMessageByKey(const std::string& 
 }
 
 MessageExt DefaultMQAdminExt::viewMessage(const std::string& topic, const std::string& msgId) {
-    // 对应 Java DefaultMQAdminExtImpl.viewMessage：先按 offset msgId 直查 commitLog，
-    // 解不出或查不到就退回 uniqKey（5.x 客户端返回的 msgId 本身就是 uniqKey，
-    // 硬解只会得到越界的垃圾端口）。
     std::string byIdError;
     try {
         std::string ip;
@@ -1613,7 +1528,6 @@ MessageExt DefaultMQAdminExt::viewMessage(const std::string& topic, const std::s
         }
         return msgs[0];
     } catch (const std::exception& e) {
-        // Java 同样只 warn，然后走 uniqKey 兜底
         byIdError = e.what();
     }
 
@@ -1646,8 +1560,6 @@ QueryConsumeQueueResponseBody DefaultMQAdminExt::queryConsumeQueue(
 PropertyMap DefaultMQAdminExt::buildConsumeMessageDirectlyExtFields(
     const std::string& topic, const std::string& consumerGroup, const std::string& clientId,
     const std::string& msgId) {
-    // Java ConsumeMessageDirectlyResultRequestHeader 的字段名：topic / consumerGroup /
-    // clientId / msgId。MQClientAPIImpl:2747-2751 四个 set 全部显式下发（四个都非 null）。
     PropertyMap ext;
     ext["topic"] = topic;
     ext["consumerGroup"] = consumerGroup;
@@ -1663,9 +1575,6 @@ ConsumeMessageDirectlyResult DefaultMQAdminExt::consumeMessageDirectly(
         throw MQClientException("consumeMessageDirectly: consumerGroup required");
     }
     PropertyMap ext = buildConsumeMessageDirectlyExtFields(topic, consumerGroup, clientId, msgId);
-    // invokeSyncRaw 不代抛非 SUCCESS：206（消费者不在线）这类响应码对调用方是有语义的
-    // （Java MQClientAPIImpl:2758-2770 的 switch 只认 SUCCESS，其余统一抛
-    // MQClientException(响应码, remark)），这里原样带上响应码抛出。
     RemotingCommand response = requireClient().invokeSyncRaw(
         vipAddr(brokerAddr), RequestCode::CONSUME_MESSAGE_DIRECTLY, ext, Bytes(), false,
         timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
@@ -1675,7 +1584,6 @@ ConsumeMessageDirectlyResult DefaultMQAdminExt::consumeMessageDirectly(
             response.code);
     }
     if (response.body.empty()) {
-        // Java :2761-2764 的 body == null 分支：broker 说成功但没带回消费者的判据
         throw MQClientException("no consume result for client " + clientId);
     }
     ConsumeMessageDirectlyResult result;
@@ -1688,10 +1596,6 @@ ConsumeMessageDirectlyResult DefaultMQAdminExt::consumeMessageDirectly(
 ConsumeMessageDirectlyResult DefaultMQAdminExt::consumeMessageDirectly(
     const std::string& consumerGroup, const std::string& clientId, const std::string& topic,
     const std::string& msgId) {
-    // 对应 Java DefaultMQAdminExtImpl.consumeMessageDirectly:1323-1347：先 viewMessage
-    // 把 msgId 解成消息本体 —— 目标 broker 取消息的**存储主机**（消息落在哪台 broker 就
-    // 打哪台；broker 收到 309 后按 clientId 找在线消费者转推），msgId 是 uniq key 时换成
-    // offset msgId（broker 侧把 msgId 原样记进回给 admin 的结果，用它对号入座）。
     MessageExt msg = viewMessage(topic, msgId);
     std::string outMsgId = msgId;
     if (!msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).empty()

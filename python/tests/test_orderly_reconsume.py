@@ -1,32 +1,4 @@
 # -*- coding: utf-8 -*-
-"""顺序消费的 ``checkReconsumeTimes`` / 回投语义单测，不需要集群。
-
-对齐 Java ``ConsumeMessageOrderlyService``（:236-360）：
-
-  - ``processConsumeResult``:254-266 —— ``SUSPEND_CURRENT_QUEUE_A_MOMENT`` 先过
-    ``checkReconsumeTimes``；返回 true 才 ``makeMessageToConsumeAgain`` + 延后重试，
-    返回 false 走 ``commit()``，位点前进
-  - ``processConsumeResult``:244-300 —— ``autoCommit`` 两条分支：true 时 COMMIT/ROLLBACK
-    是**非法**用法（Java 少了 ``break``，警告后落进 SUCCESS 分支照 ack）；false 时
-    COMMIT 提交、ROLLBACK 退回重试、SUCCESS 只记 TPS 不动位点
-  - ``submitConsumeRequestLater``:211-234 —— 挂起时长解析：``-1`` 回落到消费者配置，
-    再钳到 ``[10, 30000]``
-  - ``getMaxReconsumeTimes``:313-320 —— 顺序侧 ``-1`` 读成 ``Integer.MAX_VALUE``
-    （**不是**并发侧的 16）
-  - ``checkReconsumeTimes``:322-336 —— 没用尽就本地 ``reconsumeTimes+1`` 并挂起；
-    用尽则回投，**只有回投失败**才算挂起
-  - ``sendMessageBack``:338-360 —— 走内部生产者把消息当**普通消息**发到
-    ``%RETRY%<group>``（属性置法见下），不是 ``CONSUMER_SEND_MSG_BACK(3)``
-
-外加 Java ``DefaultMQProducerImpl.sendKernelImpl:1004-1018`` 的那次"抬进请求头"：
-broker 的 ``handleRetryAndDLQ``（``SendMessageProcessor:197-210``）读的是
-``requestHeader.reconsumeTimes`` / ``maxReconsumeTimes``，不是报文里的属性。
-
-为什么全部放离线：这三处坏掉都是**静默**的。少 +1 就永远到不了阈值；抬错字段
-broker 就拿订阅组默认的 16 判定；回投成功后还挂起，则一条毒消息永久占住那条队列
-（顺序消费的 head-of-line blocking 在真机上表现为"这个组就停在第 N 条不动了"，
-和"消费者挂了"看起来一模一样）。
-"""
 from __future__ import annotations
 
 import time
@@ -149,7 +121,6 @@ class Harness:
     def __init__(self, max_reconsume_times: int = -1, stats=None) -> None:
         self.c = DefaultMQPushConsumer(GROUP)
         self.c.max_reconsume_times = max_reconsume_times
-        # 配置成 0 也不忙等：Java 侧这个值会被 submitConsumeRequestLater 钳到 10ms 下限
         self.c.suspend_current_queue_time_millis = 0
         self.c._pending[KEY] = deque()
         self.c._consume_offsets[KEY] = 0
@@ -361,8 +332,6 @@ def test_retry_topic_properties_are_lifted_into_the_send_header():
     assert request.custom_header.max_reconsume_times == 6
     assert m.properties.get(MessageConst.PROPERTY_RECONSUME_TIME) is None, \
         "抬完要清掉本地属性（Java 在 clearProperty 之后才复用这条 msg）"
-    # ⚠ 线上属性里 RECONSUME_TIME **仍在**：Java 先序列化 properties 再抬字段（顺序照抄，
-    #    改成"先抬后编"会让消费端读不到 broker 写的重试次数）
     assert "RECONSUME_TIME" in ext["i"], "V2 的 properties 键是 i"
 
 
@@ -406,7 +375,6 @@ def test_suspend_millis_is_clamped_to_the_protocol_bounds():
     h = Harness()
     h.c.suspend_current_queue_time_millis = 1000
     ctx = ConsumeOrderlyContext(h.mq)
-    # 0 会让消费线程忙等、一天会让队列假死：Java 在同一个地方钳到 [10, 30000]
     for asked, expected in ((0, 10), (9, 10), (10, 10), (250, 250),
                             (30000, 30000), (30001, 30000), (1 << 40, 30000)):
         ctx.suspend_current_queue_time_millis = asked
@@ -445,8 +413,7 @@ def test_listener_suspend_override_reaches_the_sleep(monkeypatch):
 
 @pytest.mark.parametrize("status", [ConsumeOrderlyStatus.COMMIT, ConsumeOrderlyStatus.ROLLBACK])
 def test_commit_and_rollback_are_illegal_under_auto_commit(status, caplog):
-    """Java:246-250 —— 这两个值只给 binlog 消费用；Java 少了 ``break``，警告之后
-    **落进 SUCCESS 分支**：消息照 ack。写成"回滚/不提交"都会让队列原地打转。"""
+    pass
     h = Harness(max_reconsume_times=0)   # 阈值 0：只要走到回投判据就会发出去
     batch = [msg(9, 0)]
     with caplog.at_level("WARNING"):
@@ -487,10 +454,7 @@ def test_manual_rollback_requeues_without_tps():
 
 
 def test_manual_success_holds_the_batch_without_committing(monkeypatch):
-    """有意偏差：Java:272-274 把消息留在 ProcessQueue 里等显式 commit()，而本端口没有把
-    ProcessQueue 暴露给 listener（没有 commit 的口子），照抄"什么都不做"会让这批消息
-    被分发线程吞掉、位点又没动 —— 这里等价地塞回队首并等一个挂起周期：位点同样不前进，
-    消息不丢，也不会忙等。"""
+    pass
     stats = RecordingStats()
     h = Harness(stats=stats)
     h.c.suspend_current_queue_time_millis = 1000
@@ -516,8 +480,7 @@ def test_manual_suspend_below_cap_requeues():
 
 
 def test_manual_suspend_at_cap_does_not_commit_after_hand_over():
-    """与自动提交分支的差别：Java:288-296 毒消息交给 broker 之后**没有 else 分支**，
-    位点不前进（要不要提交由 binlog 消费方自己定）。"""
+    pass
     h = Harness(max_reconsume_times=1)
     assert _consume(h, [msg(5, 1)],
                     _manual(ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT)) is False
@@ -531,8 +494,7 @@ def test_manual_suspend_at_cap_does_not_commit_after_hand_over():
 
 @pytest.mark.parametrize("returned", [None, "SUCCESS", 0])
 def test_bogus_listener_return_is_treated_as_suspend(returned):
-    """Java:474-504 —— null 兜成挂起（Java 靠静态类型挡掉"返回别的东西"）。
-    旧实现在这两种情况下会一路落进 SUCCESS 分支：消息被 ack、位点前进、**静默丢失**。"""
+    pass
     h = Harness(max_reconsume_times=3)
     batch = [msg(2, 0)]
     assert _consume(h, batch, ScriptedListener(returned)) is False
@@ -562,8 +524,6 @@ def _hooked(h, listener):
 def test_orderly_hook_marks_commit_as_success():
     h = Harness()
     status, success, ctx_type = _hooked(h, _manual(ConsumeOrderlyStatus.COMMIT))
-    # Java 写进上下文的是归一化后那个枚举的 ``toString()``（ConsumeMessageOrderlyService:507），
-    # 默认实现就是**裸成员名** —— 不是 Python 的 ``"ConsumeOrderlyStatus.COMMIT"``。
     assert status == "COMMIT", "钩子拿的是原始 status，形态按 Java Enum.toString()"
     assert status != str(ConsumeOrderlyStatus.COMMIT), "不能带上 Python 的类名前缀"
     assert success is True, "Java:509 —— success 判据是 SUCCESS || COMMIT"
@@ -586,8 +546,7 @@ def test_orderly_hook_sees_success_for_success():
 
 
 def test_orderly_hook_sees_returnnull_for_a_null_return():
-    """Java:483-496 的 returnType 在归一化**之前**算（null → RETURNNULL），而写进上下文的
-    status 是归一化后的挂起（:502-507）—— 这两步用的不是同一个值。"""
+    pass
     h = Harness(max_reconsume_times=3)
     status, success, ctx_type = _hooked(h, ScriptedListener(None))
     assert status == "SUSPEND_CURRENT_QUEUE_A_MOMENT"

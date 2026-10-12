@@ -1,50 +1,5 @@
 //! [`DefaultMQAdminExt`] 对**真实 5.5.1 broker** 的联调验证。
 //!
-//! 与 `python/verify_admin_live.py`、cpp `examples/admin_live.cpp`、csharp
-//! `ValidatorsLive` 的管理端场景对齐。离线单测（`src/client/admin.rs` 的 `mod tests`）
-//! 只能覆盖纯逻辑（properties 文本解析、分页合并、集群地址挑选、码值口径），这里补上
-//! 必须真 broker 才能证明的部分：
-//! - A1 生命周期与**私有实例**隔离（模块头第 2 条偏差）：admin `shutdown()` 之后，
-//!   同 clientId 的 producer 照常收发 —— 证明 admin 没有走 `create_mq_client_instance`
-//!   的进程级共享表（#38 的坑在管理端不成立）。
-//! - A2 集群：`fetch_broker_cluster_info` / `examine_broker_cluster_info` /
-//!   `fetch_broker_runtime_stats` / `view_broker_stats_data`。
-//! - A3 Topic：`create_topic`(4 队列) → `fetch_all_topic_list` → `examine_topic_route`
-//!   → `get_cluster_list` / `get_topic_cluster_list` / `fetch_topics_by_cluster` →
-//!   `examine_topic_config` → `get_all_topic_config` → `get_user_topic_config` →
-//!   `get_system_topic_list_from_broker` → `fetch_all_topic_route` →
-//!   `create_and_update_topic_config`（改队列数后回读）。
-//! - A4 Broker 配置：`get_broker_config` 拿到的是 **properties 文本**（历史 bug 点），
-//!   `update_broker_config` 可逆改动 + 回读生效 + 还原；非法 `brokerPermission` 在
-//!   **任何 IO 之前**给出 code=16。
-//! - A5 NameServer KV：写/读/列/删 + `put_kv_config` 别名（广播到每一台 NameServer）。
-//! - A6 订阅组：创建 → 单查 → `examine_subscription_group_config` →
-//!   `get_all_subscription_group`（**分页**累积）→ `get_user_subscription_group` →
-//!   删除后查不到。
-//! - A7 生产 + 统计：`examine_topic_stats`（多 broker 合并）/ `examine_topic_stats_by_broker`
-//!   / `examine_consume_stats` / `fetch_consume_stats_in_broker` / `query_consume_queue`。
-//! - A8 在线消费者：`examine_consumer_connection_info` / `get_consumer_list_by_group` /
-//!   `query_topic_consume_by_who` / `query_topics_by_consumer(group)` +
-//!   `query_topics_by_consumer_to_broker`（343）/ `query_subscription` /
-//!   `examine_producer_connection_info`，以及 `examine_consumer_running_info`（307 走
-//!   broker→客户端回调，证明 `ClientRemotingProcessor` 真能被管理端驱动）。
-//! - A9 消息查询：`query_message`/`query_message_by_key`/`query_message_by_uniq_key` 可达
-//!   （命中依赖 broker 索引实现，按 Python 口径显式 SKIP）、`view_message(offsetMsgId)`
-//!   body 一致、`view_message(uniqKey)` 走兜底并给出干净的 code=208。
-//! - A10 Offset：`max/min/search_offset`、`earliest_msg_store_time`、未提交位点回 `None`、
-//!   `update_consumer_offset(_to_broker)` 写回、`clone_group_offset`；A10.5 时间戳查位点的
-//!   `boundaryType`（`search_lower_boundary_offset`/`search_upper_boundary_offset`，Java
-//!   `DefaultMQAdminExt:133/:137`：1 队列 topic 发 3 条 ⇒ LOWER = maxOffset、UPPER = maxOffset-1）。
-//! - A11 `send_message_back` 重投 → 管理端轮询 `%RETRY%<group>` 的统计（broker 把
-//!   delayLevel=0 改写成 3，约 10s 后可见）。
-//! - A12 位点重置：`reset_offset_by_timestamp`(222, broker 端) 推到未来 → 位点 == max、
-//!   `reset_offset_new`、`reset_offset_by_timestamp_old`、`reset_offset_by_queue_id`
-//!   （25 + 带 queueId/offset 的 222：拉回 min ⇒ 首笔 pull 被 OFFSET_RESET 短路成
-//!   PULL_OFFSET_MOVED、第二笔取到历史消息；越界目标被 broker 拒 ⇒ 位点停在第 1 笔写入的
-//!   非法值，证明两笔 RPC 非原子、与 Java 同构）。
-//! - A13 写权限 + 清理：`wipe_write_perm_of_broker` → `add_write_perm_of_broker` 还原 →
-//!   `delete_topic_in_broker` / `delete_topic_in_name_server` / `delete_topic` →
-//!   topic 从 `fetch_all_topic_list` 消失。
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
 //! ```text
@@ -497,7 +452,6 @@ async fn a3_topic_lifecycle(ck: &mut Checker, env: &Env) {
         ),
         Err(e) => ck.abort("A3 fetchAllTopicList", &e.to_string()),
     }
-    // Python/Java 的 `getClusterList(topic)`：查该 topic 所在的集群名。
     let mut clusters_of_topic: Vec<String> = Vec::new();
     match admin.get_cluster_list(&topic).await {
         Ok(clusters) => {
@@ -735,7 +689,6 @@ async fn a5_kv_config(ck: &mut Checker, env: &Env) {
         ),
         Err(e) => ck.abort("A5 getKVListByNamespace", &e.to_string()),
     }
-    // Java 的 putKVConfig 是空实现，真正的写入在 createAndUpdateKvConfig（Python 同）。
     if let Err(e) = admin.put_kv_config(&ns, "k2", "v2").await {
         ck.abort("A5 putKVConfig 别名", &e.to_string());
     } else {
@@ -1213,8 +1166,6 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
         }
         Err(e) => ck.abort("A8 queryTopicsByConsumerToBroker", &e.to_string()),
     }
-    // Java 的 admin 级方法（DefaultMQAdminExtImpl:1078）只收 group：按 %RETRY%<group>
-    // 的路由逐 broker 扇出再合并，所以这条断言同时验证了路由解析和合并口径。
     match admin.query_topics_by_consumer(&group).await {
         Ok(list) => {
             let topics = list.get_topic_list();
@@ -1231,9 +1182,6 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
         .await
     {
         Ok(list) => {
-            // 每行是 Java 的 `Map<订阅组名, List<ConsumeStats>>`（组名里有时间戳，
-            // 内层 ConsumeStats 又按 `MessageQueue` 键展开 offsetTable），这里直接按
-            // 整行 JSON 里出现本组判定，不依赖内层键的拼法。
             let hit = list
                 .stats_list
                 .iter()
@@ -1244,8 +1192,6 @@ async fn a8_online_consumer(ck: &mut Checker, env: &Env) -> Option<String> {
                 .filter_map(|row| row.as_object())
                 .flat_map(|row| row.keys().cloned())
                 .collect();
-            // 本组那一行的 ConsumeStats 必须带 offsetTable（Java 按 writeQueueNums
-            // 逐个队列填 brokerOffset/consumerOffset），否则统计只是空壳。
             let has_offsets = list
                 .stats_list
                 .iter()
@@ -1395,7 +1341,6 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
         ),
         Err(e) => ck.abort("A10 earliestMsgStoreTime", &e.to_string()),
     }
-    // 全新组没提交过位点：Java 的 `setZeroIfNotFound=false` 语义 ⇒ None 而不是 0。
     let fresh = env.dest_group.clone();
     match admin.examine_consumer_offset(&fresh, &mq).await {
         Ok(offset) => ck.check(
@@ -1448,11 +1393,6 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
         Err(e) => ck.abort("A10 cloneGroupOffset", &e.to_string()),
     }
 
-    // A10.5 searchOffset 的 boundaryType（Java DefaultMQAdminExt:133/:137）。
-    // 单开一个 1 队列 topic：位点语义只在单队列上才确定。3 条消息 ⇒ maxOffset=3；
-    // 远未来时间戳下 UPPER = 最后一条自身位点(2)、LOWER = 它的下一个位点(3) = maxOffset
-    // （ConsumeQueue.binarySearchInQueueByTime 的 case 1）。两者不同即证明 boundaryType
-    // 字段真的到了 broker 并被解析 —— 若字段丢失或被忽略，两次都会落到 LOWER。
     let bnd_topic = format!("RustLiveAdminBoundary{}", env.stamp);
     if let Err(e) = admin
         .create_topic(MixAll::DEFAULT_TOPIC, &bnd_topic, 1, 0)
@@ -1512,7 +1452,6 @@ async fn a10_offset_admin(ck: &mut Checker, env: &Env) {
             &format!("lower={lo_past} upper={up_past}"),
         );
     }
-    // searchOffset 走的就是 LOWER（Java MQAdminImpl:189）：同时间戳必须同结果。
     match admin.search_offset(&bmq, future).await {
         Ok(same) => ck.check(
             "A10.5 searchOffset 默认边界与显式 LOWER 同结果",
@@ -1671,7 +1610,6 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
         },
         Err(e) => ck.abort("A12 resetOffsetNew", &e.to_string()),
     }
-    // 旧版：逐队列 searchOffset + updateConsumerOffset（Java 的 old 分支）。
     match admin
         .reset_offset_by_timestamp_old(&dest, &topic, ts + 2_000, true)
         .await
@@ -1684,9 +1622,6 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
         Err(e) => ck.abort("A12 resetOffsetByTimestampOld", &e.to_string()),
     }
 
-    // ---------- resetOffsetByQueueId（Java DefaultMQAdminExtImpl:1827，两笔 RPC）----------
-    // 与上面的按 timestamp 重置不同：这条把「队列 + 显式 offset」交给 broker，
-    // 拉回 minOffset 后必须能按该位点重新取到 A7 发的历史消息。
     let min_reset = admin.min_offset(&mq).await.unwrap_or(-1);
     match admin
         .reset_offset_by_queue_id(&env.broker(), &group, &topic, mq.queue_id, min_reset)
@@ -1694,8 +1629,6 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
     {
         Ok(table) => ck.check(
             "A12 resetOffsetByQueueId 打到 broker 成功",
-            // Java 该方法是 void：broker 只有 language=CPP 才回可解析的 offsetTable，
-            // 所以空表合法；非空时必须是我们操作的那个队列。
             table.is_empty()
                 || table.iter().any(|(k, _)| k.queue_id == mq.queue_id),
             &format!("returnedTable={}（Java 为 void，可为空）", table.len()),
@@ -1713,11 +1646,6 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
         ),
         Err(e) => ck.abort("A12 回读 resetOffsetByQueueId 位点", &e.to_string()),
     }
-    // 一次性 resetOffsetTable 真的被下一次 pull 取走：Java `PullMessageProcessor:539-548`
-    // 在 useServerSideResetOffset 下**不读消息**，直接回 OFFSET_RESET ⇒
-    // ResponseCode.PULL_OFFSET_MOVED(:672)，客户端 `MQClientAPIImpl:1098` 把它映射成
-    // PullStatus.OFFSET_ILLEGAL + nextBeginOffset=重置位点。所以第一笔 pull 必须是
-    // OffsetIllegal 且 nextBeginOffset==目标位点；第二笔才真正拿到历史消息。
     {
         let consumer = match DefaultMQPullConsumer::with_config(PullConsumerConfig {
             consumer_group: group.clone(),
@@ -1766,9 +1694,6 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
             }
         }
     }
-    // 越界负例：resetOffsetInner 的 [min, max+1] 校验必须拒掉；同时量化 Java 语义——
-    // 两笔 RPC **不是原子的**（commitOffset 无区间校验，第 1 笔已把非法位点落库），
-    // 所以失败后位点停在非法目标上，这里不断言"回滚"。
     let bad_target = max_now + 100;
     let rejected = admin
         .reset_offset_by_queue_id(&env.broker(), &group, &topic, mq.queue_id, bad_target)
@@ -1797,7 +1722,6 @@ async fn a13_perm_and_cleanup(ck: &mut Checker, env: &Env) {
     let group = env.group.clone();
     let addr = env.broker();
     let broker_name = env.broker_name();
-    // 这两条打在 **NameServer** 上（Java 同名接口也是走 nameServer），可逆。
     match admin
         .wipe_write_perm_of_broker(&env.namesrv, &broker_name)
         .await

@@ -1,13 +1,4 @@
 // 动态 name server（DefaultTopAddressing）单测 —— 本地 mock HTTP server，不依赖外网。
-//
-// Java 语义锚点与 Python 侧 test_top_addressing.py 同源：
-//   * WS 地址 / unitName / para 的 URL 拼装规则；
-//   * clearNewLine（trim 后截断到第一个 \r 或 \n）；
-//   * 200 → 地址串；非 200 / 连接失败 → 空串；
-//   * fetchAndApply：地址**变化才应用**；
-//   * MQClientInstance：配了静态地址不 fetch；空地址 fetch 一次并应用；取不到报错；
-//     只有走动态取址时才起 10s/2min 的刷新线程（Java scheduleAtFixedRate）；
-//   * configureFromEnv(ROCKETMQ_NAMESRV_DOMAIN)：实例构造时自己装配 wsAddr + unitName。
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -278,10 +269,6 @@ void testDefaultConstructedIsDisabled() {
     expectEq(ta.fetchNsAddr(false), "", "disabled fetch returns empty");
 }
 
-// configureFromEnv：对应 Java MQClientAPIImpl 构造里的 `new DefaultTopAddressing(unitName)`
-// —— 那个构造函数自己读域名（Java 是系统属性，本端口统一用环境变量
-// ROCKETMQ_NAMESRV_DOMAIN，与 python/rust/csharp 三端口一致）。
-// 这条链路此前只能靠调用方手工 setWsAddr 才通，实例自己装配是缺的。
 void testConfigureFromEnv(MockAddrServer& s) {
     const std::string key = "ROCKETMQ_NAMESRV_DOMAIN";
     // 1) 未配置 = 完全 no-op（不能让没设 env 的用户白等 3s 域名解析）

@@ -1,5 +1,3 @@
-//! broker 真的死了：在途请求必须**立刻**有终态（Java `failFast` → `requestFail`）真机验证。
-//!
 //! 与 `python/verify_fail_fast_live.py`、`cpp/examples/live_fail_fast.cpp`、
 //! `csharp/examples/RocketMQ.Examples/LiveFailFast.cs` 同场景、同断言。
 //!
@@ -380,7 +378,6 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         .find(|p| p.1 == "send_request")
         .map(|p| p.2.clone())
         .unwrap_or_default();
-    // 报的是 Error::SendRequest（Java failFast 的口径）
     ck.check(
         "L3 报的是 RemotingSendRequestException（Java failFast 的口径）",
         send_request == PARKED,

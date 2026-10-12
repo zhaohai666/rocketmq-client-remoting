@@ -1,5 +1,3 @@
-// -*- coding: utf-8 -*-
-// MixAll constants and helpers (org.apache.rocketmq.common.MixAll).
 import os from 'node:os';
 import { createHash } from 'node:crypto';
 
@@ -51,10 +49,6 @@ export const MixAll = {
   UNIT_PREFIX: 'unit_',
   REQ_T: 'ReqT',
   STREAM_REQUEST_TYPE: 'STREAM',
-  // Java MixAll.java:122 — RPC_REQUEST_HEADER_NAMESPACED_FIELD /
-  // RPC_REQUEST_HEADER_NAMESPACE_FIELD. Written on every request by
-  // NamespaceRpcHook when ClientConfig.namespaceV2 is non-empty (the
-  // SERVER-side namespace mechanism of the Aliyun-style serverless instances).
   RPC_REQUEST_HEADER_NAMESPACED_FIELD: 'nsd',
   RPC_REQUEST_HEADER_NAMESPACE_FIELD: 'ns',
   LMQ_PREFIX: '%LMQ%',
@@ -150,28 +144,18 @@ export const MixAll = {
     return MixAll.buildMqClientId(MixAll.cachedIpStr(), instanceName, unitName, enableStreamRequestType);
   },
 
-  // ---- Namespace helpers (Java NamespaceUtil; port of go/common/namespace.go) ----
-  // Facts that are easy to get wrong — do not "simplify" these away:
-  //   - the separator is `%` (not `/`, not `:`);
-  //   - the %RETRY% / %DLQ% prefix sits OUTSIDE the namespace, so the fully
-  //     qualified retry topic is `%RETRY%NS%GID`. Both wrap and unwrap must
-  //     strip the retry/DLQ prefix, work on the remainder, then put it back;
-  //   - system resources (topics starting with `rmq_sys_`, groups starting
-  //     with `CID_RMQ_SYS_`) are NEVER namespaced.
   NAMESPACE_SEPARATOR: '%',
   SYSTEM_TOPIC_PREFIX_RMQ: 'rmq_sys_',
   SYSTEM_CONSUMER_GROUP_PREFIX: 'CID_RMQ_SYS_',
 
   isSysTopicStrict(topic) { return topic != null && topic.startsWith(MixAll.SYSTEM_TOPIC_PREFIX_RMQ); },
   isSysConsumerGroupStrict(group) { return group != null && group.startsWith(MixAll.SYSTEM_CONSUMER_GROUP_PREFIX); },
-  // isSystemResource mirrors Java NamespaceUtil.isSystemResource.
   isSystemResource(resource) {
     if (!resource) return false;
     return MixAll.isSysTopicStrict(resource) || MixAll.isSysConsumerGroupStrict(resource);
   },
   // withoutRetryAndDLQ strips the %RETRY% / %DLQ% prefix.
   withoutRetryAndDLQ(resource) { return MixAll.resetRetryAndDlqTopic(resource); },
-  // isAlreadyWithNamespace mirrors Java NamespaceUtil.isAlreadyWithNamespace.
   isAlreadyWithNamespace(resource, namespace) {
     if (!namespace || !resource || MixAll.isSystemResource(resource)) return false;
     return MixAll.withoutRetryAndDLQ(resource).startsWith(namespace + MixAll.NAMESPACE_SEPARATOR);

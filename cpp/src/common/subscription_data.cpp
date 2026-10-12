@@ -15,7 +15,6 @@ const char* const ExpressionType::CLASS_FILTER = "CLASS_FILTER";
 
 namespace {
 
-// Java Set.hashCode() = 各元素 hashCode 之和（32 位有符号回绕）
 int32_t setHashCode(const std::set<std::string>& s) {
     int64_t h = 0;
     for (const std::string& e : s) {
@@ -34,7 +33,6 @@ int32_t setHashCode(const std::set<int64_t>& s) {
     return static_cast<int32_t>(h);
 }
 
-// Java set 序列化为 JSON 数组
 JsonValue setToJson(const std::set<std::string>& s) {
     JsonValue arr = JsonValue::makeArray();
     for (const std::string& e : s) {
@@ -146,28 +144,10 @@ std::string SubscriptionData::toString() const {
 SubscriptionData FilterAPI::buildSubscriptionData(const std::string& topic,
                                                   const std::string& subString) {
     SubscriptionData sub(topic, subString);
-    // Java `FilterAPI.buildSubscriptionData` 逐句对齐（探针 /tmp/subprobe/SubProbe.java 与
-    // BlankProbe.java 实测过四种输入）：
-    //
-    //   StringUtils.isEmpty(subString) || subString.equals("*")  → setSubString("*") 后**直接 return**
-    //       ⇒ tagsSet 与 codeSet 都保持空
-    //   否则按 "||" 做 Java String.split（**丢弃末尾空串**），然后 trim、丢空片段，
-    //       每个 tag 同时进 tagsSet 与 codeSet（codeSet 存 tag.hashCode()）。
-    //       Java-split 结果数组长度为 0 时（即 subString 形如 "||"、"||||"）抛 Exception。
-    //
-    // ⚠ 两处曾有的偏差（都会污染心跳、并让客户端二次 tag 过滤失效）：
-    //   ① 给 "*" 塞 tagsSet={"*"} —— Java 里 tagsSet 非空才是"客户端二次 tag 过滤"的开关
-    //      （PullAPIWrapper.processPullResult 的 `!tagsSet.isEmpty()`），塞了 "*" 会让订阅
-    //      全量时把所有正常 tag 的消息客户端自己过滤掉；
-    //   ② 从不填 codeSet —— 它是 broker 侧按 tag 哈希过滤的依据
-    //      （ExpressionMessageFilter.isMatchedByConsumeQueue 走 codeSet.contains）。
-    // 另注：判空必须用"空串"而不是"全空白"—— Java StringUtils.isEmpty 只认 null/""，
-    // 纯空白（如 "   "）会走进 split 分支，结果 tagsSet 空但 subString 原样保留。
     if (subString.empty() || subString == "*") {
         sub.subString = "*";
         return sub;
     }
-    // Java String.split("\\|\\|")：先全切，再丢弃**末尾**空串
     std::vector<std::string> rawTags;
     size_t pos = 0;
     while (true) {
@@ -183,7 +163,6 @@ SubscriptionData FilterAPI::buildSubscriptionData(const std::string& topic,
         rawTags.pop_back();
     }
     if (rawTags.empty()) {
-        // Java: throw new Exception("subString split error")
         throw std::invalid_argument("subString split error");
     }
     for (std::string& tag : rawTags) {

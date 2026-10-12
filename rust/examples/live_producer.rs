@@ -6,37 +6,6 @@
 //! producer 是 `MQClientInstance` 上面那一层，所以真集群独有的性质是
 //! 「broker 到底认不认这份请求」。锁死的条目：
 //!
-//! - P1 **生命周期**：`start()` 生成 clientId 并复用进程内实例、启动前所有发送入口
-//!   一律快速失败、`shutdown()` 幂等且能重启、心跳真的把 ProducerData 注册到 broker
-//!   （用半消息回查能找上门来反证，见 P6）；关停时**已经排队的异步发送照样跑完**
-//!   （Java `ThreadPoolExecutor.shutdown()`：不再收新的，队列里的不吞、不重），
-//!   关停之后再投异步一律同步报错。
-//! - P2 **六条发送路径**：同步 / 定点 / 批量 / oneway / 选择器 / 异步，逐条对
-//!   `SendResult` 字段与 broker 上实际落库的结果；超阈值消息在 broker 端被透明解压
-//!   （消费者读到原正文，且 sysFlag 的 COMPRESSED 位已被清）。异步那一栏锁的是
-//!   **发送内核**本身：回调里的 `(queue, offset)` 能从 broker 原样读回那一条、
-//!   30 笔并发一笔不漏也不重复回调、定点异步真的落在指定队列、池内校验失败按 Java
-//!   文案回调一次且生产者之后照常能用。
-//! - P3 **钩子**：CheckForbidden 的异常原样抛给调用方且消息不落地；
-//!   SendMessageHook 的 before/after 每轮各一次、after 看得见 sendResult。
-//! - P4 **轨迹接缝**：注入的 dispatcher 在 `start()` 里被拉起并注册两个轨迹钩子，
-//!   发送/事务收尾真的产出 `TraceContext`（Pub + EndTransaction，字段取自 broker 响应）。
-//! - P5 **Request-Reply**：请求消息带上 CORRELATION_ID / REPLY_TO_CLIENT / TTL 三个
-//!   属性、等待槽登记又清理、没人应答时按 Python 语义回 `RequestTimeout`。
-//! - P6 **事务消息**：半消息对消费者不可见 → COMMIT 后可见 / ROLLBACK 后永不可见；
-//!   UNKNOW 被 broker 经心跳登记的连接**回查**，回查后提交的最终状态生效。
-//! - P7 **管理便捷方法**：`create_topic` 经 TBW102 真建出 topic、四个 offset RPC、
-//!   按 key 查消息、`view_message` 按 Python 的行为明确报错。
-//! - P9 **定时消息撤回**：SEND 响应带回 `recallHandle`（普通消息没有）、handle 本地解码
-//!   对得上 brokerName/uniqKey、`recall_message` 真把定时消息摘掉（到点不投递，同延迟的
-//!   对照组照投），`%RETRY%` topic 与坏 handle 在任何 IO 之前按 Java 文案失败。
-//! - P8 **发送重试内核**：可重试码集合与 Java 对齐、单次超时上限与「非 SEND_OK 换
-//!   broker」开关不影响真集群上的正常发送、没有路由时按错误码定性而非空转重试。
-//! - P11 **退出注销**：`shutdown()` 逐台 broker 发 `UNREGISTER_CLIENT`(35)。同 `instanceName`
-//!   的两个生产者共用一条连接，先退的那个组照样从 broker 消失、另一个的连接仍在 ——
-//!   这条判据把「35 生效」和「TCP 断了才被清掉」分开（Python/C++/C# 一生产者一实例，
-//!   只能用抓帧证明，见那边的 `verify_producer_unregister_live.py` / `live_producer_unregister.cpp`
-//!   / `ProducerUnregisterLive.cs`）。
 //!
 //! 用法（先按项目记忆里的 runbook 起本地集群）：
 //! ```text
@@ -93,7 +62,6 @@ use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializabl
 
 /// 主 topic 的队列数（P2 的定点/选择器断言依赖它）。
 const QUEUE_NUMS: i32 = 4;
-/// 压缩阈值：4 KiB（Java/Python 默认），正文取 8 KiB 可压缩数据必然触发压缩。
 const COMPRESSIBLE_BODY_LEN: usize = 8 * 1024;
 /// P5 等应答的预算：远短于 broker 的处理时间，保证一定走到超时分支。
 const REQUEST_TIMEOUT_MS: i64 = 1_500;
@@ -653,9 +621,6 @@ async fn p1_lifecycle(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) -
         sent.map(|r| r.status == SendStatus::SendOk).unwrap_or(false),
         &err,
     );
-    // ---- 关闭时把已经排队的异步发送跑完（Java `ThreadPoolExecutor.shutdown()`：不再收
-    // 新的，队列里那些照样执行）。实例是同时被拆掉的，所以这一批的终态**可能**是错误，
-    // 但必须「一笔不漏、一笔不重」—— 吞掉一笔的实现在生产上就是丢消息。
     const DRAIN: usize = 10;
     let draining = Arc::new(AsyncProbe::default());
     for i in 0..DRAIN {
@@ -946,9 +911,6 @@ async fn p2_send_paths(
         &format!("onTarget={on_target} {}", aimed.summary()),
     );
 
-    // ---- 本地校验在池子里报错：`Validators.checkMessage` 的超长 body 走的是
-    //      `async_send_inner` 的失败分支（Java `sendKernelImpl` 同位置）：既不落地，也
-    //      只回调一次，之后这个生产者照常能用（许可/队列没被这条断链漏掉）。
     let too_big = vec![b'q'; 5 * 1024 * 1024];
     let rejected = Arc::new(AsyncProbe::default());
     p.send_async(
@@ -1000,10 +962,6 @@ async fn p2_send_paths(
         .send(&mut big, Some(5000), Some(&big_mq))
         .await
         .map_err(|e| format!("compressed send failed: {e}"))?;
-    // Java `sendKernelImpl:930/1095-1096`：压缩只改核内那份 body（`prevBody` 先记下原件），
-    // send 返回前 finally 把**调用方**的 Message 换回原始正文 —— 所以这里读到的仍是 8 KiB。
-    // 「客户端确实压过」的证据改由 broker 侧给：storeSize 远小于原文 + 解压闭环
-    // （同一对象连发两次的复用场景在 live_compression_matrix 里单列）。
     let client_body = big.get_body().to_vec();
     let body_restored = client_body == raw;
     let back = wait_async(
@@ -1029,8 +987,6 @@ async fn p2_send_paths(
     // broker 存的是我们发出去的压缩流，所以整条消息的 storeSize 远小于原始正文。
     let plain_len = i32::try_from(COMPRESSIBLE_BODY_LEN).unwrap_or(i32::MAX);
     let went_compressed = stored.map(|m| m.store_size < plain_len).unwrap_or(false);
-    // 解完压的 MessageExt：COMPRESSED 位被清（否则重复消费会再解一次），
-    // 但算法 id 留在 sysFlag 里 —— Java/Python 的 clearCompressedFlag 只清最低位。
     let flag_ok = stored
         .map(|m| {
             !MessageSysFlag::is_compressed(m.sys_flag)
@@ -1107,13 +1063,6 @@ async fn p3_hooks(
         &format!("{new_lines:?}"),
     );
 
-    // 失败也要跑 after（Java sendKernelImpl 的 finally 语义）。
-    // 失败必须发生在**核内**（地址解析之后）：Java 的钩子只在 `brokerAddr != null` 的
-    // try 里跑，所以这里用一个 broker 一定拒收的 queueId —— `AbstractSendMessageProcessor
-    // .msgCheck` 对 `queueId >= max(writeQueueNums, readQueueNums)` 回
-    // INVALID_PARAMETER(29)（地址解析照样成功，钩子 before/after 各跑一次，after 带着
-    // broker 的异常）。也不能拿「不存在的 topic」当失败手段：本集群开着
-    // autoCreateTopicEnable，新 topic 会经 TBW102 兜底真发成功。
     let before_len = hook.lines().len();
     let mut bad = msg(topic, b"hook-fails", "TagAllowed", "");
     let bad_mq = MessageQueue::new(topic, broker_name, QUEUE_NUMS * 256);
@@ -1138,10 +1087,6 @@ async fn p3_hooks(
         &format!("err={err} tail={tail:?}"),
     );
 
-    // 地址解析失败是**另一条**路：Java `:1100` 的抛点在钩子之外（`if (brokerAddr != null)`
-    // 之后），before/after 都不跑。旧版本这里会拿「路由里没有的 brokerName」当失败手段，
-    // 因为地址解析当时发生在核内；#100 起解析先于钩子（`sendKernelImpl:919-924`），
-    // 于是同一条腿变成「本端 not exist、钩子零调用、一条 wire 都不发」。
     let before_len = hook.lines().len();
     let mut bogus_msg = msg(topic, b"must-not-land-bogus", "TagAllowed", "");
     let bogus_mq = MessageQueue::new(topic, "RustNoSuchBroker_zzz", 0);
@@ -1283,10 +1228,6 @@ async fn p5_request_reply(
         err.contains("wait reply message timeout"),
         &err,
     );
-    // 光有类型和文案不够：Java 抛的是
-    // `RequestTimeoutException(ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, ...)`，
-    // 10006 这个码也要在 —— 调用方按码分流时「没等到应答」（对方可能只是慢，
-    // 消息其实已投出去）和别的客户端故障不是一类处置。
     ck.check(
         "P5 the timeout carries 10006 REQUEST_TIMEOUT_EXCEPTION",
         code == Some(10006),
@@ -1412,8 +1353,6 @@ async fn p6_transactions(
         end_hook.called.load(Ordering::SeqCst) >= 3,
         &format!("called={}", end_hook.called.load(Ordering::SeqCst)),
     );
-    // 回查后提交的那次收尾必须标着 fromCheck=true（Java 的
-    // checkTransactionState → endTransaction(fromTransactionCheck=true)）
     let last_hook = lock(&end_hook.last).clone().unwrap_or_default();
     ck.check(
         "P6 the last end-transaction hook call is the broker check-back, marked as such",
@@ -1695,8 +1634,6 @@ async fn read_broker_flag(instance: &MQClientInstance, addr: &str, key: &str) ->
     MixAll::string_to_properties(&text).get(key).map(str::to_string)
 }
 
-/// 只改一个配置项（Java `updateBrokerConfig` 按 Properties 逐键反射赋值，
-/// 所以单键请求不会碰到其它设置）。
 async fn write_broker_flag(
     instance: &MQClientInstance,
     addr: &str,
@@ -1722,9 +1659,6 @@ async fn write_broker_flag(
 }
 
 /// 定时消息的 `recallMessage`(370)：handle 由 SEND 响应下发，撤回后消息**不会**投递。
-///
-/// ⚠ broker 默认 `recallMessageEnable=false`（Java `BrokerConfig:546`），本机集群也是关的，
-/// 所以这里临时打开、跑完还原；还原失败记 FAILED，不静默改共享集群的配置。
 async fn p9_recall(
     p: &DefaultMQProducer,
     instance: &MQClientInstance,
@@ -1792,8 +1726,6 @@ async fn p9_recall(
         &format!("{outcome:?} want={want}"),
     );
 
-    // 本地校验：两类错误都不该产生任何 IO（Java 的顺序：状态 → topic 名 → %RETRY%/%DLQ%
-    // → handle 解码 → 才谈路由）。
     let retry_err = p
         .recall_message(
             &format!("{}{PULL_GROUP}", MixAll::RETRY_GROUP_TOPIC_PREFIX),
@@ -1873,14 +1805,6 @@ async fn producer_clients(admin: &DefaultMQAdminExt, group: &str) -> Vec<String>
 }
 
 /// P11：生产者退出必须逐台 broker 发 `UNREGISTER_CLIENT`(35)。
-///
-/// Java 链路：`DefaultMQProducerImpl#shutdown:313` → `MQClientInstance#unregisterProducer:1198-1201`
-/// → 私有 `unregisterClient(group, null):1158-1182`。判别式在**同一条连接**上：
-/// 同一个 `instanceName` ⇒ 同一个 clientId ⇒ 同一个 `MQClientInstance` ⇒ 每台 broker 一条
-/// TCP 连接（Python/C++/C# 每个生产者各自一份实例，做不了这条判据，那边改用抓帧证明）。
-/// 于是先退场的 A 并不会把连接关掉（`MQClientInstance#shutdown` 的租户守卫让实例活着，
-/// broker 那条 channel 依旧为 B 服务），这种情况下 A 的组能从 `ProducerManager.groupChannelTable`
-/// 里消失，只有一发被 broker 接受的 35 解释得通 —— 不发的话只能等通道断开或 120s 扫描。
 async fn p11_producer_unregister(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) -> Live {
     let shared = format!("{run}-unreg");
     let group_a = format!("PID_rust_unreg_a_{run}");

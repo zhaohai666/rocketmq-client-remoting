@@ -1,11 +1,3 @@
-// 广播模式本地位点文件（Java LocalFileOffsetStore）的格式对齐守卫 —— 不需要集群。
-//
-// Java 侧 fastjson2 序列化 Map<MessageQueue, AtomicLong> 时把 MessageQueue 对象直接
-// 当 JSON key 写出（用真实 jar 跑 OffsetSerializeWrapper.toJson 实测）：
-//   {"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,...}}
-// 严格 JSON 非法，但 fastjson2 自产自销能读回。四端按同一格式落盘，Java 消费者
-// 与本端消费者共用同一份 ~/.rocketmq_offsets/<clientId>/<group>/offsets.json 时互认。
-//
 // 与 python/tests/test_local_offsets.py、rust/src/client/consumer.rs（mod tests）、
 // csharp/tests/RocketMQ.Client.Tests/LocalOffsetsTests.cs 的同名测试同题。
 #include <cstdint>
@@ -127,11 +119,9 @@ void testSaveWritesCompatFormatAndRollsBak() {
         path, items({{"Ttbroker-a0", 7}, {"Ttbroker-a1", 9}, {"Ttbroker-a2", 11}}), map);
     std::string raw = readFile(path);
     expect(raw.rfind("{\"offsetTable\":{", 0) == 0, "save_java_format_prefix", raw);
-    // 首次写不产生 .bak（Java string2File 只在已有旧内容时滚动）
     expect(!std::filesystem::exists(path + ".bak"), "save_first_no_bak");
 
     DefaultMQPushConsumer::saveLocalOffsetsAt(path, items({{"Ttbroker-a0", 99}}), map);
-    // .bak = 上一代内容（Java MixAll.string2File 语义）
     expect(readFile(path + ".bak") == raw, "save_bak_is_previous");
 
     // 主文件在 → 读主文件
@@ -152,7 +142,6 @@ void testSaveWritesCompatFormatAndRollsBak() {
 }
 
 void testLoadReadsCompatWrittenFile() {
-    // Java 写出的文件本端要能读（跨端互认的核心）
     std::string dir = tempDir("java");
     std::string path = dir + "/offsets.json";
     std::error_code ec;

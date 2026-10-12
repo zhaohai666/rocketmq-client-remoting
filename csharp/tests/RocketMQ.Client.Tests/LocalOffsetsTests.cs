@@ -1,11 +1,3 @@
-// 本地位点文件格式对齐 Java LocalFileOffsetStore 的回归守卫。
-//
-// Java 侧 fastjson2 序列化 Map<MessageQueue, AtomicLong> 时把 MessageQueue 对象直接
-// 当 JSON key 写出（用真实 jar 跑 OffsetSerializeWrapper.toJson 实测）：
-//   {"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,...}}
-// 严格 JSON 非法，但 fastjson2 自产自销能读回。四端按同一格式落盘，Java 消费者
-// 与本端消费者共用同一份 ~/.rocketmq_offsets/<clientId>/<group>/offsets.json 时互认。
-//
 // 与 python/tests/test_local_offsets.py、rust/src/client/consumer.rs（mod tests）
 // 的同名测试同题。
 using RocketMQ.Client;
@@ -122,11 +114,9 @@ public class LocalOffsetsTests
             DefaultMQPushConsumer.SaveLocalOffsetsAt(path, items, mqMap);
             string raw = File.ReadAllText(path);
             Assert.StartsWith("{\"offsetTable\":{", raw);
-            // 首次写不产生 .bak（Java string2File 只在已有旧内容时滚动）
             Assert.False(File.Exists(path + ".bak"));
 
             DefaultMQPushConsumer.SaveLocalOffsetsAt(path, Items(("Ttbroker-a0", 99)), mqMap);
-            // .bak = 上一代内容（Java MixAll.string2File 语义）
             Assert.Equal(raw, File.ReadAllText(path + ".bak"));
 
             // 主文件在 → 读主文件
@@ -154,7 +144,6 @@ public class LocalOffsetsTests
     [Fact]
     public void Load_ReadsLegacyWrittenFile()
     {
-        // Java 写出的文件本端要能读（跨端互认的核心）
         string dir = Path.Combine(Path.GetTempPath(),
             "rmq_dotnet_offsets_java_" + Guid.NewGuid().ToString("N"));
         string path = Path.Combine(dir, "offsets.json");

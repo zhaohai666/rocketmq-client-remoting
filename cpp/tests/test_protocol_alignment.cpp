@@ -1,9 +1,3 @@
-// Java 对齐守卫：校验 codes.h 的常量与 Java 源码一致。
-//
-// 两级校验：
-//   1) 与内置的"权威取值表"逐项比对（防止 C++ 侧被误改）；
-//   2) 若设置环境变量 ROCKETMQ_JAVA_SRC（指向 RocketMQ Java 源码树根），
-//      额外读取 RequestCode.java 做同名常量的回归校验。未设置则跳过（不算失败）。
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -31,7 +25,6 @@ static int g_fail = 0;
         }                                                                      \
     } while (0)
 
-// 在 Java 文本中查找 `name = <int> ;`（允许空白），返回是否命中并输出取值
 static bool parseProtocolConst(const std::string& text, const std::string& name, long long& out) {
     size_t from = 0;
     while (true) {
@@ -102,9 +95,6 @@ static void checkBuiltinTable() {
     CHECK(std::string(SerializeType::valueOf(SerializeType::ROCKETMQ)) == "ROCKETMQ",
           "SerializeType::valueOf");
 
-    // ClientErrorCode：Java 的 client/common/ClientErrorCode.java 一共七个常量，
-    // 一个都不能少、一个都不能改值。10001~10005 是发送重试的定性；10006/10007 各有各的
-    // 抛出点（request-reply 超时、造应答消息失败），以前表里缺这两个，站点只能拿默认码 1 抛出去。
     CHECK(ClientErrorCode::CONNECT_BROKER_EXCEPTION == 10001, "CONNECT_BROKER_EXCEPTION==10001");
     CHECK(ClientErrorCode::ACCESS_BROKER_TIMEOUT == 10002, "ACCESS_BROKER_TIMEOUT==10002");
     CHECK(ClientErrorCode::BROKER_NOT_EXIST_EXCEPTION == 10003, "BROKER_NOT_EXIST_EXCEPTION==10003");
@@ -199,7 +189,6 @@ static void checkClientErrorCodeAgainstProtocolSource() {
             CHECK(v == pr.expect, std::string("java ClientErrorCode.") + pr.name
                                       + " matches exception.h");
         } else {
-            // Java 侧少一个常量本身就是漂移：这张表 C++ 必须与 Java 同名同值
             std::cout << "[warn] java const ClientErrorCode." << pr.name << " not found; skipped\n";
         }
     }

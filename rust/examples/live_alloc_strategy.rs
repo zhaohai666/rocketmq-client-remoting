@@ -1,32 +1,3 @@
-//! 可插拔队列分配策略的真机验证（对应 Java `setAllocateMessageQueueStrategy`）。
-//!
-//! 单元测试（`src/client/allocate_strategy.rs`）只能证明「给定 mqAll/cidAll 的切分结果
-//! 与 Java 一致」，证明不了**这条链路真的通**：换掉策略对象之后，rebalance 是否用它、
-//! broker 是否看得见同组第二个实例、分配结果是否真的驱动了收发。所以这里跑真集群。
-//!
-//! 场景与 cpp/examples/live_lite_pull.cpp、`verify_lite_pull_live.py`、
-//! C# `LiveLitePull` 的 S7 同口径（同一套断言，跨语言对拍）：
-//! - A1 默认策略：`allocate_message_queue_strategy()` 回读 = AVG（Java 字段初值），
-//!   setter 换掉的策略能读回 AVG_BY_CIRCLE。
-//! - A2 同组两实例 + AVG_BY_CIRCLE：两边各自心跳注册，broker 的
-//!   `GET_CONSUMER_LIST_BY_GROUP` 才认到两个 clientId → 4 个队列按下标取模交叉切开，
-//!   不重不漏，且形状是「步长 2」的交叉（AVG 会给连续两段）；两边合起来收全 12 条。
-//! - A3 两个 CONFIG 消费者各配一半队列：`assignment()` 恰为配置进去的那一半
-//!   （CONFIG 无视 mqAll/cidAll），poll 到的消息也只来自这些队列；两半合起来
-//!   恰好覆盖全部 12 条且互不重叠 → 策略确实驱动了收发，而不只是改了个字段。
-//! - A4 CONSISTENT_HASH：用**真实 clientId** 建哈希环，等两边把队列分完之后，
-//!   线上 `assignment()` 必须与「拿真实 mqAll/cidAll 离线跑同一策略」的预测逐条相等。
-//!   注意这里**不要求两边都非空**：环按队列 key 落点，真实 clientId 的哈希完全可能把
-//!   4 个队列全分给一个实例（Java 同款），所以判定只看「不重不漏」。
-//! - A5 MACHINE_ROOM_NEARBY：包着 A4 的同一个环，外加一个「全员同机房」的 resolver。
-//!   单机房时 NEARBY 在内层分完后必定走同一个机房分支 → 结果应与内层策略**完全一致**，
-//!   这条断言证明装饰器没有偷偷改切分；resolver 的调用记录还证明 rebalance 真的问过
-//!   每个队列的机房（`broker-a`）和每个客户端的机房。
-//! - A6 MACHINE_ROOM：真实 brokerName 是 `broker-a`，不含 `@`，Java 的
-//!   `split("@").length == 2` 判定不通过 → 任何机房白名单都筛不出队列。这里验证
-//!   「配错机房」是**安静地饿死**（分配空、收不到消息、不抛异常），而不是把
-//!   rebalance 打崩。
-//!
 //! ⚠ A2 依赖「订阅在首个心跳前就已注册 broker」：lite 的心跳只发给实例路由表里
 //! 已知的 broker，所以 `start()` 会先把订阅 topic 的路由拉进来（见
 //! `pull_consumer.rs` 的 `refresh_route_for_heartbeat`）。少了那一步，同组对端要等
@@ -352,9 +323,6 @@ fn expected_bodies(topic: &str) -> BTreeSet<String> {
 // ------------------------------------------------------------------ 共用骨架
 
 /// 造同组两实例、各装一个策略并订阅（未 start）。
-///
-/// 两个策略分开传：A4/A5 两边同策略，A6 要故意配成「一个正常 + 一个配错机房」，
-/// 看 Java 那种「各组各算、互不误吃」的语义在真机上成不成立。
 fn pair_with_strategy(
     fx: &Fixture,
     kind: &str,
@@ -379,10 +347,6 @@ fn pair_with_strategy(
 /// 为什么以预测为收敛条件，而不是「先等不重不漏、再比预测」：哈希环完全可能把 4 个
 /// 队列全分给一个实例，另一边在首轮重平衡之前 `assignment()` 本来就是空 —— 那种初始态
 /// 同样满足「不重不漏」，比出来的其实是「一边还没算」的快照。（第一版就在这里翻车。）
-///
-/// Java `RebalanceImpl#rebalanceByTopic` 调策略前会把 mqAll、cidAll 都 `Collections.sort`，
-/// 所以这里也得自己排：`all` 由 `sorted_queues` 排好，clientId 按字典序（同 Java
-/// `String#compareTo`）。`strategies` 与 `asserted` 一一对应 —— A6 要故意让两边配不同策略。
 async fn wait_until_prediction_converged(
     group: &str,
     all: &[MessageQueue],
@@ -548,11 +512,6 @@ async fn a2_circle_split(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[Mes
         &format!("posA={pos_a:?}"),
     );
     // 交叉切分后两边各自收自己那半边，合起来覆盖全部 12 条。
-    //
-    // ⚠ 不断言「互不重叠」：对端心跳落地前 cidAll 只有自己，第一轮 AVG_BY_CIRCLE 会把
-    // **全部**队列分给自己（Java 同款行为），撤队只清 next_offset / last_commit，
-    // 已经进了本地缓冲的消息留在 FIFO 里（与 Python 同口径，见 pull_consumer.rs:1647）。
-    // 所以这里只要求「两边都真收到、合起来不漏」。
     let ga = drain_for(&ca, 8).await;
     let gb = drain_for(&cb, 8).await;
     let ba = bodies(&ga);
@@ -790,7 +749,6 @@ async fn a5_nearby(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQu
 // ------------------------------------------------------------------ A6 机房配错
 
 async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, all: &[MessageQueue]) {
-    // 真实 brokerName 是 `broker-a`，Java 的 `split("@")` 只切出 1 段 → 白名单再怎么写都筛不出队列。
     let room_strategy = AllocateMessageQueueByMachineRoom::new([ROOM]);
     ck.check(
         "A6 策略名 = MACHINE_ROOM 且白名单能读回",
@@ -798,9 +756,6 @@ async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, al
         format!("idcs={:?}", room_strategy.get_consumeridcs()).as_str(),
     );
     let room: std::sync::Arc<dyn AllocateMessageQueueStrategy> = std::sync::Arc::new(room_strategy);
-    // 对照组：同组另一个消费者用默认 AVG。两边各自算策略（Java 就是各算各的），
-    // 对照组能分到队列 ⇒ 这一组的心跳注册 + 重平衡确实跑起来了，
-    // 于是「A6 一边为空」只能归因于机房筛选，而不是链路没通。
     let avg: std::sync::Arc<dyn AllocateMessageQueueStrategy> =
         std::sync::Arc::new(AllocateMessageQueueAveragely);
     let (ca, cb) = match pair_with_strategy(fx, "room", &[room.clone(), avg.clone()], topic) {
@@ -831,8 +786,6 @@ async fn a6_machine_room_starved(ck: &mut Checker, fx: &Fixture, topic: &str, al
         starved.is_empty(),
         &format!("assignment=[{}]", key_set_text(&queue_keys(&starved))),
     );
-    // 两边各自算策略（Java 就是各算各的）：配错机房的一方算出空，对照组按**两个** cid
-    // 算 AVG 只拿到自己那半边 —— 它没有替配错的那位兜底，这才是 Java 的语义。
     let (matched, detail) = wait_until_prediction_converged(
         &fx.group_name("room"),
         all,

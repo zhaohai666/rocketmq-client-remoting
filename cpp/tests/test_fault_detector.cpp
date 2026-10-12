@@ -1,28 +1,3 @@
-// 故障规避主动探测（Java 5.x LatencyFaultToleranceImpl.startDetector + DefaultMQProducerImpl
-// 构造函数里的匿名 ServiceDetector）离线单测 —— 不需要集群。
-//
-// Java 基准（client 5.x，逐行读过）：
-//   * ClientConfig：startDetectorEnable=false / detectTimeout=200 / detectInterval=2000；
-//   * DefaultMQProducerImpl.start():272 调 mqFaultStrategy.startDetector()：单线程
-//     scheduled executor 固定 3s 一跳，每跳的 runnable 先判 startDetectorEnable；
-//   * detectByOneRound：故障表里 checkStamp 到期的每一项先占坑（checkStamp = now +
-//     detectInterval），resolver（findBrokerAddressInPublish）解析不到地址就摘除故障项，
-//     然后 ServiceDetector.detect(addr, detectTimeout) —— cpp 用 GET_MAX_OFFSET(30) 等价；
-//     成功且不可达 → 翻回 reachable（"is reachable now, then it can be used."）；
-//     失败不动标志（置不可达是发送路径的职责）；
-//   * sendDefaultImpl:817-821：RemotingException 的 reachable = !isStartDetectorEnable()
-//     —— 探测线程在跑时传输失败记 unreachable，等探测器放回。
-//
-// 覆盖：
-//   A. 默认值（tolerance / producer getter）与默认不探测（开关关着零笔 GET_MAX_OFFSET）；
-//   B. detectByOneRound 离线语义：翻回 reachable / detectInterval 占坑限频 / 失败不动标志 /
-//      resolver 解析不到摘除故障项 / 没装 resolver+detector 不炸；
-//   C. 周期触发 + 恢复放行（真 producer + 假 broker：探测恢复 reachable，报文形状
-//      GET_MAX_OFFSET、topic=候选 topic、queueId=0）；
-//   D. 超时置不可用：探测超时不能放行（多轮探测后仍 unreachable），之后 broker 开始应答
-//      → 恢复放行；
-//   E. 探测开着时传输失败记 unreachable（Java :821 的 reachable=!startDetectorEnable）。
-//
 // loopback 怪癖：失败类断言（E 的连不上、D 的超时轮询）都给了 ≥8s 预算。
 #include <atomic>
 #include <chrono>
@@ -407,7 +382,6 @@ void testDisabledByDefault(DetectorMock& mock) {
     }
     expect(p.mqFaultStrategy().latencyFaultTolerance().getFaultItem("broker-a") != nullptr,
            "故障项已入表（否则 0 笔探测没有意义）");
-    // 两跳多的时间窗（Java 3s 固定跳）里一笔探测都不该有
     std::this_thread::sleep_for(std::chrono::seconds(4));
     expectInt(mock.countRequests(RequestCode::GET_MAX_OFFSET), 0,
               "开关关闭时零笔探测");
@@ -455,7 +429,6 @@ void testDetectByOneRoundOffline() {
         tol.detectByOneRound();
         expectInt(probes, 0, "checkStamp 占坑：detectInterval 内不重复探测");
     }
-    // resolver 解析不到 → 摘除故障项（Java resolver 返回 null 的分支）
     {
         LatencyFaultToleranceImpl tol;
         int probes = 0;
@@ -488,8 +461,6 @@ void testDetectByOneRoundOffline() {
 void testPeriodicAndRecovery(DetectorMock& mock) {
     const std::string topic = "DetectRecover";
     mock.addRoute(topic, makeRoute(mock.address(), "broker-a"));
-    // SEND 回 SERVICE_NOT_AVAILABLE（可重试码）：MQBrokerException 分支把 broker-a 记成
-    // 隔离 + 不可达（Java :830），之后的放行只能靠探测器。
     mock.scriptSend({{ResponseCode::SERVICE_NOT_AVAILABLE, 0}});
     mock.setProbeMode(ProbeMode::ANSWER);
 
@@ -516,7 +487,6 @@ void testPeriodicAndRecovery(DetectorMock& mock) {
         12000);
     expect(recovered, "探测恢复 reachable（恢复后放行）");
 
-    // 报文形状：GET_MAX_OFFSET(30)，topic=候选 topic，queueId=0（Java ServiceDetector 形状）
     const WireRecord probe = mock.recordOf(0, RequestCode::GET_MAX_OFFSET);
     expectInt(probe.code, RequestCode::GET_MAX_OFFSET, "探测走 GET_MAX_OFFSET(30)");
     const auto t = probe.ext.find("topic");
@@ -597,7 +567,6 @@ void testConnectFailureMarksUnreachable(DetectorMock& mock) {
     const FaultItem* item = p.mqFaultStrategy().latencyFaultTolerance().getFaultItem("broker-a");
     expect(item != nullptr, "传输失败记录故障项");
     if (item != nullptr) {
-        // Java sendDefaultImpl:817-821：探测开着时 RemotingException 记 unreachable
         expect(!item->isReachable(), "探测开着：传输失败记 unreachable（等探测器放回）");
         expect(!item->isAvailable(), "传输失败同时隔离该 broker");
     }

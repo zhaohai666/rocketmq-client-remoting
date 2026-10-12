@@ -60,7 +60,6 @@ DefaultTopAddressing::DefaultTopAddressing(std::string wsAddr, std::string unitN
 
 std::string DefaultTopAddressing::getWsAddr(const std::string& domain,
                                             const std::string& subgroup) {
-    // Java MixAll.getWSAddr：domain 自带端口（含 ':'）时不追加默认 :8080
     if (domain.find(':') != std::string::npos) {
         return "http://" + domain + "/rocketmq/" + subgroup;
     }
@@ -73,9 +72,6 @@ bool DefaultTopAddressing::isConfigured() {
 }
 
 void DefaultTopAddressing::configureFromEnv(const std::string& unitName) {
-    // 对应 Java `MQClientAPIImpl` 构造里的 `new DefaultTopAddressing(unitName)`：
-    // 它读 ROCKETMQ_NAMESRV_DOMAIN 并用 MixAll.getWSAddr(domain) 拼出 wsAddr。
-    // 未配置（空）时保持原样 = 动态取址关闭，行为与旧版一致。
     const char* env = std::getenv("ROCKETMQ_NAMESRV_DOMAIN");
     if (env == nullptr || env[0] == '\0') {
         return;
@@ -85,7 +81,6 @@ void DefaultTopAddressing::configureFromEnv(const std::string& unitName) {
 }
 
 std::string DefaultTopAddressing::buildUrl() const {
-    // Java fetchNSAddr 的 URL 拼装（unitName / para 规则逐条照抄）
     std::string url = wsAddr_;
     if (!para_.empty()) {
         if (!trimCopy(unitName_).empty()) {
@@ -132,7 +127,6 @@ std::string DefaultTopAddressing::fetchNsAddr(bool verbose) {
 }
 
 std::string DefaultTopAddressing::fetchAndApply() {
-    // Java MQClientAPIImpl.fetchNameServerAddr：地址**变化才应用**
     std::lock_guard<std::mutex> lk(m_);
     const std::string addrs = fetchNsAddr();
     if (!trimCopy(addrs).empty() && addrs != nsAddr_) {

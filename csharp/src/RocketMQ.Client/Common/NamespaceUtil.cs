@@ -1,6 +1,3 @@
-// 命名空间工具（对应 org.apache.rocketmq.remoting.protocol.NamespaceUtil，
-// 端口自 python/remoting/protocol/namespace_util.py）。
-//
 // 命名空间用于多租户隔离：客户端把 namespace 以 "namespace%" 前缀拼到 topic / group
 // 上再发给 broker，从 broker 拿到的资源名在交给上层（listener / admin 结果）之前再剥掉。
 //
@@ -13,12 +10,10 @@ using System.Globalization;
 
 namespace RocketMQ.Common;
 
-/// <summary>对应 Java NamespaceUtil（仅客户端用到的部分）。</summary>
 public static class NamespaceUtil
 {
     public const string NamespaceSeparator = "%";
 
-    /// <summary>摘掉 retry/DLQ 前缀（对应 Java withOutRetryAndDLQ）。</summary>
     public static string WithOutRetryAndDlq(string resource) => MixAll.ResetRetryAndDlqTopic(resource);
 
     public static bool IsRetryTopic(string resource) => MixAll.IsRetryTopic(resource);
@@ -47,11 +42,6 @@ public static class NamespaceUtil
         return plain.StartsWith(ns + NamespaceSeparator, StringComparison.Ordinal);
     }
 
-    /// <summary>
-    /// 剥掉命名空间前缀（对应 Java 两个重载的 withoutNamespace）。
-    /// "MQ_INST_XX%Topic" → "Topic"；"%RETRY%MQ_INST_XX%GID" → "%RETRY%GID"。
-    /// 未带该命名空间时原样返回。
-    /// </summary>
     public static string WithoutNamespace(string resourceWithNamespace, string ns = "")
     {
         if (string.IsNullOrEmpty(resourceWithNamespace))
@@ -93,7 +83,6 @@ public static class NamespaceUtil
         return resourceWithNamespace;
     }
 
-    /// <summary>拼上命名空间前缀（对应 Java wrapNamespace）。</summary>
     public static string WrapNamespace(string ns, string resourceWithoutNamespace)
     {
         if (string.IsNullOrEmpty(ns) || string.IsNullOrEmpty(resourceWithoutNamespace))
@@ -126,7 +115,6 @@ public static class NamespaceUtil
         return prefix + ns + NamespaceSeparator + plain;
     }
 
-    /// <summary>"%RETRY%&lt;wrapNamespace(ns, group)&gt;"（对应 Java wrapNamespaceAndRetry）。</summary>
     public static string WrapNamespaceAndRetry(string ns, string consumerGroup)
     {
         if (string.IsNullOrEmpty(consumerGroup))
@@ -137,7 +125,6 @@ public static class NamespaceUtil
         return MixAll.RetryGroupTopicPrefix + WrapNamespace(ns, consumerGroup);
     }
 
-    /// <summary>从资源名里取出命名空间（对应 Java getNamespaceFromResource）。</summary>
     public static string GetNamespaceFromResource(string resource)
     {
         if (string.IsNullOrEmpty(resource) || IsSystemResource(resource))

@@ -1,20 +1,4 @@
 // 系统原生压缩库的 P/Invoke 绑定（libzstd / liblz4）。
-//
-// 为什么走 P/Invoke 而不是托管实现：
-//   Java 客户端的 LZ4 / ZSTD 也是 JNI 调 native（lz4-java 内嵌 native、zstd-jni 内嵌
-//   libzstd），语义上就是「同一份上游 C 实现」。这里直接 P/Invoke 系统的
-//   libzstd.dylib / liblz4.dylib，保证四个语言端在线上产出**同一种帧格式**：
-//     - ZSTD：zstd 标准帧（magic 0x28 B5 2F FD）。Java `ZstdCompressor` 用
-//       `ZstdOutputStream`/`ZstdInputStream`，对应本文件的 `ZSTD_compress`/`ZSTD_decompress`。
-//     - LZ4：**LZ4 Frame** 格式（magic 0x18 4D 22 04）。Java `Lz4Compressor` 用
-//       `LZ4FrameOutputStream`/`LZ4FrameInputStream`，对应本文件的 **LZ4F** 流式 API。
-//       ⚠ 不能用 `LZ4_compress_default`：它产出 raw block，没有帧头/块描述符/结束标记，
-//       Java `LZ4FrameInputStream` 读不了。
-//
-// 约束（与 Common/Compression.cs 的文件头规则一致）：**绝不静默透传**。
-// 原生库加载失败、导出符号缺失、native 返回错误码，一律抛异常；调用方（Producer 发送路径）
-// 可以像 Java `DefaultMQProducerImpl#tryToCompressMessage` 那样降级为「不压缩且不打压缩位」，
-// 但这里不会把压缩字节当成正文交出去。
 using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -184,7 +168,6 @@ internal static class NativeCompressionLibrary
                patch.ToString(CultureInfo.InvariantCulture);
     }
 
-    /// <summary>不可用时的统一错误文案：与 Java 侧「没有该 codec 就抛」的语义一致。</summary>
     internal static InvalidOperationException Unavailable(string algorithm) =>
         new("unsupported compression type for " + algorithm + ": native " + algorithm +
             " library is not loadable (need libzstd / liblz4 with LZ4F exports)");
@@ -233,10 +216,6 @@ internal readonly struct PinnedBytes : IDisposable
     }
 }
 
-/// <summary>
-/// zstd 标准帧编解码。对应 Java <c>org.apache.rocketmq.common.compression.ZstdCompressor</c>
-/// （<c>ZstdOutputStream</c> / <c>ZstdInputStream</c>，zstd-jni）。
-/// </summary>
 internal static class NativeZstdCodec
 {
     private const string Lib = NativeCompressionLibrary.Zstd;
@@ -302,11 +281,6 @@ internal static class NativeZstdCodec
         return Shrink(dst, (int)written);
     }
 
-    /// <summary>
-    /// 解一个或多个**串接的** zstd 帧（Java <c>ZstdInputStream</c> 可读多帧，
-    /// 例如 <c>cat a.zst b.zst</c>；<c>ZSTD_decompress</c> 本身也支持多帧，
-    /// 但它要求 dstCapacity 是**所有帧**明文总量）。
-    /// </summary>
     internal static byte[] Decompress(byte[] src)
     {
         using var pin = new PinnedBytes(src);
@@ -347,8 +321,6 @@ internal static class NativeZstdCodec
 
     private static int ClampLevel(int level)
     {
-        // Java 把 compressLevel 透传给 ZstdOutputStream；越界会被 zstd 判为错误，
-        // 这里按 zstd 的语义钳到 [1, maxCLevel]，0 表示「用库默认级别 3」。
         if (level <= 0)
         {
             return 0;
@@ -396,10 +368,6 @@ internal static class NativeZstdCodec
     }
 }
 
-/// <summary>
-/// LZ4 Frame 编解码。对应 Java <c>org.apache.rocketmq.common.compression.Lz4Compressor</c>
-/// （<c>LZ4FrameOutputStream</c> / <c>LZ4FrameInputStream</c>，lz4-java）。
-///
 /// 走官方 LZ4F 流式 API，帧头与 lz4-java 默认写法对齐：
 /// 独立块（FLG bit5=1）、max64KB 块（BD=0x40）、不写 content-size（流式时长度未知）、
 /// 不带 content/block checksum ⇒ FLG=0x60，头 7 字节 = magic(4)+FLG+BD+HC。
@@ -506,10 +474,6 @@ internal static class NativeLz4Codec
     [DllImport(Lib, EntryPoint = "LZ4_versionNumber")]
     private static extern uint VersionNumber();
 
-    /// <summary>
-    /// 产出 LZ4 Frame。level 被忽略——Java <c>Lz4Compressor#compress(src, level)</c>
-    /// 也不看 level（<c>new LZ4FrameOutputStream(baos)</c> 用的是默认参数）。
-    /// </summary>
     internal static byte[] Compress(byte[] src)
     {
         Preferences prefs = Preferences.Lz4LegacyLike();
@@ -565,10 +529,6 @@ internal static class NativeLz4Codec
         }
     }
 
-    /// <summary>
-    /// 解 LZ4 Frame（可含多个串接帧）。语义对齐 Java <c>LZ4FrameInputStream</c>：
-    /// 截断/坏块一律抛错，绝不返回半截明文。
-    /// </summary>
     internal static byte[] Decompress(byte[] src)
     {
         if (src.Length == 0)

@@ -1,5 +1,3 @@
-// org.apache.rocketmq.common.message.MessageConst 的 C# 对应：消息属性键常量。
-//
 // ⚠ 这些键名是**协议的一部分**：broker/客户端按字面匹配，改一个字母就静默丢属性。
 namespace RocketMQ.Common;
 
@@ -13,10 +11,6 @@ public static class MessageConst
     public const string PropertyRealTopic = "REAL_TOPIC";
     public const string PropertyRealQueueId = "REAL_QID";
     public const string PropertyTransactionPrepared = "TRAN_MSG";
-    /// <summary>
-    /// ⚠ Java 里这个属性的字面值是 "PGROUP"（不是 "PRODUCER_GROUP"）。
-    /// broker 事务回查时正是用这个属性反查生产者，写错会导致回查永远找不到 listener。
-    /// </summary>
     public const string PropertyProducerGroup = "PGROUP";
     public const string PropertyMinOffset = "MIN_OFFSET";
     public const string PropertyMaxOffset = "MAX_OFFSET";
@@ -45,8 +39,6 @@ public static class MessageConst
     public const string PropertyCluster = "CLUSTER";
     public const string PropertyMessageType = "MSG_TYPE";
 
-    // Request-Reply（5.x）专用属性键（对应 Java MessageConst / Python MessageConst）。
-    // 这些键名是协议的一部分，broker 的 ReplyMessageProcessor 按字面匹配。
     public const string PropertyCorrelationId = "CORRELATION_ID";
     public const string PropertyReplyToClient = "REPLY_TO_CLIENT";
     public const string PropertyMessageTTL = "TTL";
@@ -57,10 +49,6 @@ public static class MessageConst
     public const string PropertyPopCkOffset = "POP_CK_OFFSET";
     public const string PropertyPopTime = "POP_TIME";
 
-    /// <summary>
-    /// 首次被 POP 到的时间戳。broker 只在 retry topic 重编码路径写；普通 topic 由客户端在
-    /// 缺失时用响应头的 popTime 补上（Java MQClientAPIImpl.processPopResponse）。
-    /// </summary>
     public const string PropertyFirstPopTime = "1ST_POP_TIME";
     public const string PropertyInvisibleTime = "INVISIBLE_TIME";
     public const string PropertyDelayTime = "DELAY_TIME";
@@ -75,11 +63,6 @@ public static class MessageConst
     public const string PropertyOriginQueueId = "ORIGIN_QID";
     public const string PropertyOriginTopic = "ORIGIN_TOPIC";
 
-    // 定时消息（5.x timer wheel）的三个毫秒/秒级属性键（对应 Java MessageConst 的
-    // PROPERTY_TIMER_DELAY_SEC / PROPERTY_TIMER_DELAY_MS / PROPERTY_TIMER_DELIVER_MS）。
-    // 键名是协议的一部分：broker 的 TimerMessageStore 按字面匹配，写错一个字母
-    // 消息就按普通消息立刻投递。Producer 发送链路（MaxDelayValue）与轨迹/回查路径
-    // 都读同一组键。
     public const string PropertyTimerDelaySec = "TIMER_DELAY_SEC";
     public const string PropertyTimerDelayMs = "TIMER_DELAY_MS";
     public const string PropertyTimerDeliverMs = "TIMER_DELIVER_MS";

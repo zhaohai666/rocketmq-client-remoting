@@ -126,8 +126,6 @@ def main():
     # ---------- 1. 异步发送（真异步链：不阻塞调用方 + 两个线程池 + 真投递 + 失败走回调） ----------
     topic_async = "%s_Async" % PREFIX
 
-    # SendMessageHook 顺带当"线程探针"：before 在 AsyncSenderExecutor 上跑，
-    # after 与用户回调在 NettyClientPublicExecutor 上跑（Java 同款分工）。
     hook_threads = []
 
     class _ThreadSpy:
@@ -192,7 +190,6 @@ def main():
           len(recv_async) == 21,
           "received=%d/21" % len(recv_async))
 
-    # 定点异步发送（Java send(msg, mq, cb, timeout)：topicPublishInfo 为 null）
     fixed_mq = MessageQueue(topic_async, "broker-a", 0)
     ok_fixed, err_fixed = [], []
     prod.send_async(Message(topic_async, b"async-fixed"),
@@ -206,7 +203,6 @@ def main():
           "ok=%d err=%d%s" % (len(ok_fixed), len(err_fixed),
                               (" last=%s" % err_fixed[-1]) if err_fixed else ""))
 
-    # 校验类失败不发请求、只走回调（Java：runnable 的 catch → newCallBack.onException）
     ok_bad, err_bad = [], []
     prod.send_async(Message(topic_async, b""),
                     SendCallbackImpl(lambda sr: ok_bad.append(sr),

@@ -1,32 +1,14 @@
-// 订阅组模型（对应 org.apache.rocketmq.remoting.protocol.subscription 包）：
-// SubscriptionGroupConfig / GroupRetryPolicy / SimpleSubscriptionData /
-// SubscriptionGroupWrapper。
-//
-// 字段名与默认值以 Java 5.x 探针实测为准：
-//   JSON.toJSONString(new SubscriptionGroupConfig("MyGroup")) ->
-//   {"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,"consumeEnable":true,
-//    "consumeFromMinEnable":true,"consumeMessageOrderly":false,"consumeTimeoutMinute":15,
-//    "groupName":"MyGroup","groupRetryPolicy":{"type":"CUSTOMIZED"},"groupSysFlag":0,
-//    "notifyConsumerIdsChangedEnable":true,"retryMaxTimes":16,"retryQueueNums":1,
-//    "whichBrokerWhenConsumeSlowly":1}
-// fastjson2 **跳过 null 字段**（subscriptionDataSet 为 null 时整个键不出现）。
 using System.Globalization;
 using RocketMQ.Common;
 
 namespace RocketMQ.Remoting.Protocol;
 
-/// <summary>org.apache.rocketmq.remoting.protocol.subscription.GroupRetryPolicyType。</summary>
 public static class GroupRetryPolicyType
 {
     public const string Exponential = "EXPONENTIAL";
     public const string Customized = "CUSTOMIZED";
 }
 
-/// <summary>
-/// 对应 GroupRetryPolicy。两个子策略在 Java 里默认是 new 出来的实例，但 fastjson2
-/// 的探针输出里只有 {"type":"CUSTOMIZED"} —— 说明它们实际序列化时被跳过。
-/// 因此这里同样只在显式设置时输出（用 JsonValue 透传，避免过度建模）。
-/// </summary>
 public sealed class GroupRetryPolicy
 {
     public string Type { get; set; } = GroupRetryPolicyType.Customized;
@@ -118,7 +100,6 @@ public sealed class SubscriptionGroupConfig
     public int ConsumeTimeoutMinute { get; set; } = 15;
     public PropertyMap Attributes { get; set; } = new();
 
-    // Java 为 null 时 fastjson2 整个键不输出
     public List<SimpleSubscriptionData> SubscriptionDataSet { get; } = new();
     public bool HasSubscriptionDataSet { get; set; }
 
@@ -242,10 +223,6 @@ public sealed class SubscriptionGroupConfig
         + ", whichBrokerWhenConsumeSlowly=" + WhichBrokerWhenConsumeSlowly.ToString(CultureInfo.InvariantCulture) + "]";
 }
 
-/// <summary>
-/// 对应 org.apache.rocketmq.remoting.protocol.body.SubscriptionGroupWrapper。
-/// 探针输出：{"dataVersion":{...},"forbiddenTable":{},"subscriptionGroupTable":{...}}
-/// </summary>
 public sealed class SubscriptionGroupWrapper
 {
     public SortedDictionary<string, SubscriptionGroupConfig> SubscriptionGroupTable { get; } = new();

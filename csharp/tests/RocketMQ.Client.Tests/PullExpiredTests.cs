@@ -1,18 +1,3 @@
-// ProcessQueue 拉取停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME）的离线单测 —— 不需要集群。
-//
-// 为什么必须先离线锁死再上真机：这条判据是**唯一**能把"死掉的拉取循环"救回来的机制。
-// Java 侧（逐行读过，作为四语言的共同基准）：
-//   * ProcessQueue#PULL_MAX_IDLE_TIME = 系统属性 rocketmq.client.pull.pullMaxIdleTime，
-//     默认 **120000ms**（不是网传的 60s），判据用严格 `>`（ProcessQueue.java:43 / isPullExpired）。
-//   * 盖章在**发起**拉取的那一刻，位于 makeSureStateOK / 暂停 / 流控之前
-//     （DefaultMQPushConsumerImpl#pullMessage:253；POP 同理 popMessage:508，读 lastPopTimestamp）。
-//   * RebalanceImpl#updateProcessQueueTableInRebalance:438-461：队列仍在订阅集合里但
-//     pq.isPullExpired() → setDropped(true) + removeUnnecessaryMessageQueue + 打
-//     "[BUG]doRebalance ... because pull is pause, so try to fixed it"，同一趟后面的加锁分支重建。
-// 少第一步，一条循环线程被异常打穿后那把队列就**永久不再消费**，而且没有任何异常；
-// 少第二步（撤了不重建），后果同样是永久停摆。两种错都不会让已完成的投递失败，
-// 所以只能靠断言锁住。
-//
 // 与 python/tests/test_pull_expired.py、cpp/tests/test_pull_expired.cpp、
 // rust/src/client/consumer.rs 的同一组断言对拍。真机恢复场景见 examples 的 LiveRedelivery（H 段）。
 //
@@ -63,7 +48,6 @@ public class PullExpiredTests
     [Fact]
     public void StallBoundary_IsStrictlyGreaterThanThreshold()
     {
-        // Java 是 `now - last > 120000`。写成 >= 时，正好停在阈值上的健康长轮询会被误撤。
         var consumer = NewConsumer();
         MessageQueue mq = Mq(0);
         string key = DefaultMQPushConsumer.OffsetKeyForTest(mq);
@@ -82,8 +66,6 @@ public class PullExpiredTests
     [Fact]
     public void DeadLoop_IsStalledEvenWithAFreshStamp()
     {
-        // 循环线程被异常打穿（Java 的 [BUG] 分支防的就是这个）：盖章再新也要立刻判停摆，
-        // 等满 120s 意味着这 120s 里这把队列一条都不消费。
         var consumer = NewConsumer();
         string key = DefaultMQPushConsumer.OffsetKeyForTest(Mq(0));
         consumer.RegisterLoopForTest(key, alive: false);
@@ -178,8 +160,6 @@ public class PullExpiredTests
     [Fact]
     public void SweepIgnoresQueuesNoLongerAssigned()
     {
-        // 不再分配给本实例的队列由撤销分支处理（Java 的 !mqSet.contains）。
-        // 停摆清扫只负责"还在我名下但拉不动"的那一类，越界处理会把别人名下的位点写坏。
         var consumer = NewConsumer();
         string key = DefaultMQPushConsumer.OffsetKeyForTest(Mq(0));
         consumer.RegisterLoopForTest(key, alive: true);
@@ -214,8 +194,6 @@ public class PullExpiredTests
     [Fact]
     public void PopSweepDropsTheProcessQueueAndLeavesNothingBehind()
     {
-        // POP 分支（Java PopProcessQueue#isPullExpired 读 lastPopTimestamp）：撤走时在途批次
-        // 必须停 —— 既不消费也不 ack，等 invisibleTime 到期由 broker 复活重投；本地缓冲换新的一具。
         var consumer = NewConsumer();
         consumer.PopMode = true;
         MessageQueue mq = Mq(0);

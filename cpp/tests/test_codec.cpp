@@ -212,10 +212,6 @@ static void testBatchCodec() {
     CHECK(batch.body == body, "MessageBatch encode equals encodeMessages");
 }
 
-// 回归：**没设过 WAIT** 的普通消息组成的批量必须是 WAIT=true。
-// Java MessageBatch.generateFromList:70 是 setWaitStoreMsgOK(first.isWaitStoreMsgOK()) ——
-// 属性缺省即 true；判成 false 会让批量以 WAIT=false 下发，broker 不等刷盘就回 SEND_OK。
-// Python / Rust 两端此前正是这个缺陷，四端在本提交里统一。
 static void testBatchDefaultsWaitStoreMsgOkToTrue() {
     Message a("T_W", "a");
     Message b("T_W", "b");
@@ -235,8 +231,6 @@ static void testBatchDefaultsWaitStoreMsgOkToTrue() {
           "batch keeps explicit WAIT=false");
 }
 
-// 判据本身：Java Message.isWaitStoreMsgOK() = 缺省 true + Boolean.parseBoolean
-// （只有忽略大小写的 "true" 为真）。
 static void testWaitStoreMsgOkParseBooleanContract() {
     Message msg("T_W", "x");
     CHECK(msg.isWaitStoreMsgOk(), "absent -> true");
@@ -254,7 +248,6 @@ static void testWaitStoreMsgOkParseBooleanContract() {
 }
 
 static void testUtilAndHash() {
-    // MessageQueue.hashCode 与 Java 语义一致（topic=A, broker=B, qid=0 -> 93282）
     MessageQueue mq("A", "B", 0);
     CHECK(mq.hashCode() == 93282, "MessageQueue hashCode java-semantics");
 

@@ -10,20 +10,8 @@ use RocketMQ\Common\MessageConst;
 use RocketMQ\Common\TopicValidator;
 use RocketMQ\Remoting\Protocol\ResponseCode;
 
-/**
- * 发送/订阅入口上的名字校验（对应 ``org.apache.rocketmq.client.Validators``），
- * 移植自 validators.py。
- *
- * 逐条对齐 Java：
- *   * ``checkTopic`` / ``checkGroup``：blank → 长度（127 / 120）→ 字符表，顺序与文案照抄。
- *     这三步走 ``MQClientException(String, null)``，responseCode 为 null（纯客户端错误）。
- *   * ``checkMessage``：只有它带 ``ResponseCode.MESSAGE_ILLEGAL``(13)，且**顺序**要对 ——
- *     Java 先查 topic、再查禁发 topic、最后才查 body。
- *   * ``isNotAllowedSendTopic``：只禁 broker 内部流水那 8 个；**``%RETRY%`` 不在名单里**。
- */
 final class Validators
 {
-    /** 对应 Java ``Validators.CHARACTER_MAX_LENGTH``，本文件里没用到但保留常量口径。 */
     public const CHARACTER_MAX_LENGTH = 255;
 
     /** 对应 Python ``os.sep``：多队列分发（LMQ）路径里不允许出现文件系统分隔符。 */

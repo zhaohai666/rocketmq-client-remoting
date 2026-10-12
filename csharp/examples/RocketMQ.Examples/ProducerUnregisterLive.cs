@@ -4,26 +4,7 @@
 // 与 python/verify_producer_unregister_live.py（U1~U6）、
 // cpp/examples/live_producer_unregister.cpp、rust/examples/live_producer.rs 的 P11 同一套场景。
 //
-// Java 的 `DefaultMQProducerImpl#shutdown`:313 调 `mQClientFactory.unregisterProducer(group)`
-// （`MQClientInstance`:1198-1201），后者进私有的 `unregisterClient(producerGroup, null)`:1158-1182：
-// 给 `brokerAddrTable` 里**每台 broker（含 slave）**同步发一发 code 35，超时
-// `getMqClientApiTimeout()`（3000ms），任何异常只 `log.warn`。
-// `MQClientAPIImpl#unregisterClient`:1615-1639 组的头是
-// `UnregisterClientRequestHeader{clientID, producerGroup, consumerGroup}` —— 键名是大写 ID 的
-// `clientID`，生产者退出时 `consumerGroup` 传 null（**整字段不上线**）。
-// broker 端 `ClientManageProcessor#unregisterClient`:213-249 判的是 `group != null`：
-// 空串会被当成「真有个空组名」去查 `""` 的订阅组配置，所以这里必须盯住字段有没有上线，
-// 而不是只盯值。
 //
-// 本脚本证四件事：
-//   U1  生产者起来并真的发了消息（组注册的前置条件）。
-//   U2  204 `GET_PRODUCER_CONNECTION_LIST` 能看到本 clientId —— 注册确实发生过，
-//       「消失」才有意义。注册靠心跳上线（30s 一轮），所以要轮询等。
-//   U3  `Shutdown()` 期间钩子抓到 code 35：每台已知 broker 各一发，头是
-//       clientID + producerGroup，`consumerGroup` 不上线，且排在业务发送之后。
-//   U5  紧接着查 204：这个组已经不在了（broker 回 SYSTEM_ERROR
-//       `the producer group[...] not exist`，Java 的 mqadmin 也这么判）。
-//   U6  对照组（另一个没退出的生产者组）仍在 —— 排掉「broker 把所有连接都清了」这种假阳性。
 //
 // ⚠ 判据强度：C# 里每个生产者各自持有一份 `MQClientInstance`、各自一条 TCP 连接，退出时
 // 连接也会关掉，broker 的通道扫描同样会把组摘掉 —— 单看 U5 分不出是 35 还是断连的功劳，
@@ -84,10 +65,6 @@ public static class ProducerUnregisterLive
 
     private static string Join(IEnumerable<string> v) => string.Join(",", v);
 
-    /// <summary>
-    /// 逐帧记录上线请求的探针。钩子跑在 encode() **之前**，此时头还挂在 CustomHeader 上
-    /// （`MakeCustomHeaderToNet` 是编码阶段的事，与 Java 同一时点），所以取它的 ToExtFields()。
-    /// </summary>
     private sealed class UnregisterProbe : IRpcHook
     {
         private readonly object _lk = new();
@@ -154,10 +131,6 @@ public static class ProducerUnregisterLive
     private static string ExtText(PropertyMap ext) =>
         "{" + string.Join(", ", ext.Select(kv => kv.Key + "=" + kv.Value)) + "}";
 
-    /// <summary>
-    /// 204 看到的 clientId 列表；broker 说「组不存在」时返回空表
-    /// （Java 的 mqadmin 同样把 SYSTEM_ERROR 当「不在线」）。
-    /// </summary>
     private static List<string> ConnectionClientIds(DefaultMQAdminExt admin, string addr,
         string group)
     {
@@ -220,7 +193,6 @@ public static class ProducerUnregisterLive
 
         try
         {
-            // 已知 broker：主从都算，35 必须每台各一发（Java 遍历的是每个 brokerId）
             ClusterInfo cluster = new();
             for (int i = 0; i < 40; ++i)
             {
@@ -308,7 +280,6 @@ public static class ProducerUnregisterLive
         {
             if (ExtField(f, "clientID") != clientId) shapeOk = false;
             if (ExtField(f, "producerGroup") != group) shapeOk = false;
-            // Java 的 unregisterClient(group, null)：消费者槽位整个不上线
             if (f.Ext.ContainsKey("consumerGroup")) shapeOk = false;
             if (!brokers.Contains(f.Addr)) shapeOk = false;
         }

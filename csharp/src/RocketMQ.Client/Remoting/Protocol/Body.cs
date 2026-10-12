@@ -1,8 +1,3 @@
-// 公共 body（对应 org.apache.rocketmq.remoting.protocol.body.* 常用部分）：
-//   KVTable / TopicList / GetConsumerListByGroupResponseBody / CheckClientRequestBody /
-//   ClusterInfo / Connection / ConsumerConnection /
-//   ProducerConnection / ConsumerRunningInfo / ConsumeStatsList / ResetOffsetBody
-//
 // 复合且管理端不需要解释内容的字段（subscriptionTable / mqTable / statsList 等）
 // 一律用 JsonValue 透传，避免过度建模导致字段丢失。
 using System.Globalization;
@@ -10,7 +5,6 @@ using RocketMQ.Common;
 
 namespace RocketMQ.Remoting.Protocol;
 
-/// <summary>org.apache.rocketmq.remoting.protocol.body.KVTable。</summary>
 public sealed class KvTable
 {
     public PropertyMap Table { get; set; } = new();
@@ -39,7 +33,6 @@ public sealed class KvTable
     }
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.body.TopicList。</summary>
 public sealed class TopicList
 {
     // JSON 键是 "topicList"；C# 属性不能与类型同名，故改名 Topics
@@ -106,7 +99,6 @@ public sealed class TopicList
     public bool Contains(string topic) => Topics.Contains(topic);
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.body.GetConsumerListByGroupResponseBody。</summary>
 public sealed class GetConsumerListByGroupResponseBody
 {
     public List<string> ConsumerIdList { get; } = new();
@@ -157,20 +149,11 @@ public sealed class GetConsumerListByGroupResponseBody
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.CheckClientRequestBody。
-///
-/// 只被 CHECK_CLIENT_CONFIG(46) 用到：broker 拿 clientId/group 记日志，真正被校验的只有
-/// subscriptionData 的 expressionType 与 subString（Java
-/// ClientManageProcessor#checkClientConfig）。namespace 字段 Java 5.5.1 里存在但发送端
-/// 不填，这里同样保留字段而不写值（未设置时不参与序列化，对齐 fastjson 不序列化 null）。
-/// </summary>
 public sealed class CheckClientRequestBody
 {
     public string ClientId { get; set; } = string.Empty;
     public string Group { get; set; } = string.Empty;
     public SubscriptionData? SubscriptionData { get; set; }
-    // Java 的字段名就叫 namespace；C# 里是关键字，属性名用 Namespace、JSON 键仍是 "namespace"
     public string? Namespace { get; set; }
 
     public JsonValue ToJson()
@@ -228,10 +211,6 @@ public sealed class CheckClientRequestBody
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.ClusterInfo。
-/// Java 的 brokerAddrTable 是 Map&lt;String, BrokerData&gt;，这里直接复用 BrokerData。
-/// </summary>
 public sealed class ClusterInfo
 {
     public SortedDictionary<string, BrokerData> BrokerAddrTable { get; } = new();
@@ -382,11 +361,10 @@ public sealed class ClusterInfo
     }
 }
 
-/// <summary>org.apache.rocketmq.client.common.Connection。</summary>
 public sealed class Connection
 {
     public string ClientId { get; set; } = string.Empty;
-    public string ClientAddr { get; set; } = string.Empty; // Java 字段名 clientAddr
+    public string ClientAddr { get; set; } = string.Empty;
     public string Language { get; set; } = string.Empty;
     public int Version { get; set; }
 
@@ -410,7 +388,6 @@ public sealed class Connection
         };
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.body.ConsumerConnection。</summary>
 public sealed class ConsumerConnection
 {
     public List<Connection> ConnectionSet { get; } = new();
@@ -473,7 +450,6 @@ public sealed class ConsumerConnection
     }
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.body.ProducerConnection。</summary>
 public sealed class ProducerConnection
 {
     public List<Connection> ConnectionSet { get; } = new();
@@ -521,10 +497,6 @@ public sealed class ProducerConnection
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.ConsumeStatus
-/// （ConsumerRunningInfo.statusTable 的值，字段全部来自 ConsumerStatsManager 的快照）。
-/// </summary>
 public sealed class ConsumeStatus
 {
     public double PullRT { get; set; }
@@ -560,13 +532,11 @@ public sealed class ConsumeStatus
     }
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo。</summary>
 public sealed class ConsumerRunningInfo
 {
-    // Java ConsumerRunningInfo 里 properties 的固定键（常量名照抄 Java）
     public const string PropNameserverAddr = "PROP_NAMESERVER_ADDR";
     public const string PropThreadpoolCoreSize = "PROP_THREADPOOL_CORE_SIZE";
-    public const string PropConsumeOrderly = "PROP_CONSUMEORDERLY";   // Java 常量名无下划线
+    public const string PropConsumeOrderly = "PROP_CONSUMEORDERLY";
     public const string PropConsumeType = "PROP_CONSUME_TYPE";
     public const string PropClientVersion = "PROP_CLIENT_VERSION";
     public const string PropConsumerStartTimestamp = "PROP_CONSUMER_START_TIMESTAMP";
@@ -597,8 +567,6 @@ public sealed class ConsumerRunningInfo
         v.Set("properties", AdminJsonStrings.MakeStringMap(Properties));
         v.Set("subscriptionSet", SubscriptionSet.IsNull ? JsonValue.MakeArray() : SubscriptionSet);
         v.Set("mqTable", MqTable.IsNull ? JsonValue.MakeObject() : MqTable);
-        // Python/Java 侧 307 应答总是带 mqPopTable/statusTable/userConsumerInfo；
-        // 缺省时输出空对象，保持三语言报文形状一致。
         v.Set("mqPopTable", MqPopTable.IsNull ? JsonValue.MakeObject() : MqPopTable);
         v.Set("statusTable", StatusTable.IsNull ? JsonValue.MakeObject() : StatusTable);
         v.Set("userConsumerInfo", UserConsumerInfo.IsNull ? JsonValue.MakeObject() : UserConsumerInfo);
@@ -645,13 +613,6 @@ public sealed class ConsumerRunningInfo
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.ConsumeStatsList
-/// （GET_BROKER_CONSUME_STATS 的响应：consumeStatsList 为 groupName 到
-///   ConsumeStats 列表的集合）。
-/// ⚠ JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错时真机响应会
-/// 解析成空集合，看着像「这个 broker 没有积压」。
-/// </summary>
 public sealed class ConsumeStatsList
 {
     // 透传
@@ -660,7 +621,6 @@ public sealed class ConsumeStatsList
     public string BrokerAddr { get; set; } = string.Empty;
     public bool HasBrokerAddr { get; set; }
 
-    // Java 的 long 原语字段，恒出现在 JSON 里
     public long TotalDiff { get; set; }
     public long TotalInflightDiff { get; set; }
 
@@ -712,13 +672,6 @@ public sealed class ConsumeStatsList
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.ResetOffsetBody。
-///
-/// ⚠ Java 字段是 Map&lt;MessageQueue, Long&gt; offsetTable，**不是** topic 到 queueId 到 offset
-/// 的嵌套 map（早期 Python 实现写错了，真实 broker 响应解析不出来）。
-/// fastjson2 会把 MessageQueue 键内联成 JSON 对象，故用 MessageQueueKeys 工具解析。
-/// </summary>
 public sealed class ResetOffsetBody
 {
     public SortedDictionary<MessageQueue, long> OffsetTable { get; } = new();
@@ -765,9 +718,6 @@ public sealed class ResetOffsetBody
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.common.message.MessageQueueForC（ResetOffsetBodyForC 数组的元素）。
-/// </summary>
 public sealed class MessageQueueForC
 {
     public string Topic { get; set; } = string.Empty;
@@ -797,14 +747,6 @@ public sealed class MessageQueueForC
     };
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.ResetOffsetBodyForC：offsetTable 是**数组**
-/// （每条自带 offset），不是 map。
-///
-/// 只有 222 发起方的 language=CPP 时 broker 才推这种体（Broker2Client.resetOffset:158-163），
-/// Java 管理端恒发 JAVA，所以 Java 客户端永远收不到。本端口解析它是为了与 language=CPP 的
-/// 旧 C++ SDK 管理端互通 —— 收到却解析不出等于整笔重置静默丢弃。
-/// </summary>
 public sealed class ResetOffsetBodyForC
 {
     public List<MessageQueueForC> OffsetTable { get; } = new();
@@ -855,12 +797,6 @@ public sealed class ResetOffsetBodyForC
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody
-/// （GET_CONSUMER_STATUS_FROM_CLIENT(221) 的应答体）。MessageQueueTable 的键是
-/// MessageQueue（fastjson2 内联对象键）；ConsumerTable 是 Java 保留的废弃字段
-/// （clientId 到位点表），本客户端不填，序列化时按 Java 形状带空对象。
-/// </summary>
 public sealed class GetConsumerStatusBody
 {
     public SortedDictionary<MessageQueue, long> MessageQueueTable { get; } = new();
@@ -882,12 +818,6 @@ public sealed class GetConsumerStatusBody
     public byte[] Encode() => RemotingSerializable.Encode(ToJson());
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.ConsumeMessageDirectlyResult
-/// （CONSUME_MESSAGE_DIRECTLY(309) 的应答体）。字段全是标量——唯一不需要处理
-/// MessageQueue 内联键的 body。ConsumeResult 取 CMResult 常量：
-/// CR_SUCCESS / CR_LATER / CR_ROLLBACK / CR_COMMIT / CR_THROW_EXCEPTION / CR_RETURN_NULL。
-/// </summary>
 public sealed class ConsumeMessageDirectlyResult
 {
     public bool Order { get; set; }

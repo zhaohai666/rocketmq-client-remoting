@@ -76,11 +76,6 @@ final class DefaultMQPullConsumer
     public ?bool $tlsEnable = null;
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
-    /**
-     * SOCKS 代理（对应 Java ClientConfig 的 socksProxyConfig → SocksProxyConfig）：
-     * 配了则 NameServer + Broker 的 remoting 连接都经代理；动态取址的 HTTP 不走代理。
-     * 只在 start() 建 MQClientInstance 时透传一次。
-     */
     public ?SocksProxyConfig $socksProxy = null;
     public ?MessageQueueListener $messageQueueListener = null;
     /**
@@ -169,7 +164,6 @@ final class DefaultMQPullConsumer
         return $this->namespaceV2;
     }
 
-    /** 对应 Java `NettyClientConfig#setSocksProxyConfig`：null 清除。start() 前设置。 */
     public function setSocksProxy(?SocksProxyConfig $proxy): void
     {
         $this->socksProxy = $proxy;
@@ -247,14 +241,6 @@ final class DefaultMQPullConsumer
         }
     }
 
-    /**
-     * Java `MQClientInstance#prepareHeartbeatData:1031-1045` 为拉模式消费者组出来的那一份。
-     *
-     * `consumeType()` 恒为 `CONSUME_ACTIVELY`、`consumeFromWhere()` 恒为
-     * `CONSUME_FROM_LAST_OFFSET` —— 与推送消费者的 PASSIVELY 是两个口径（broker 侧按
-     * consumeType 分流，见 Python 蓝本注释）。订阅集逐条 buildSubscriptionData(topic, "*")
-     * 并显式把 **subVersion 置 0** —— 拉模式没有"订阅版本"语义。
-     */
     private function buildHeartbeat(): HeartbeatData
     {
         $hb = new HeartbeatData($this->clientId ?? '');
@@ -328,7 +314,6 @@ final class DefaultMQPullConsumer
         if ($this->started) {
             return;
         }
-        // 对应 Java DefaultMQPullConsumerImpl.checkConfig（:772）——纯本地校验。
         Validators::checkGroup($this->consumerGroup);
         if ($this->consumerGroup === MixAll::DEFAULT_CONSUMER_GROUP) {
             throw new MQClientException(sprintf(
@@ -339,11 +324,9 @@ final class DefaultMQPullConsumer
         if ($this->nameServerAddrs === [] && !DefaultTopAddressing::isConfigured()) {
             throw new MQClientException('name server address is not set');
         }
-        // Java :803：策略为 None 直接拒绝启动。
         if ($this->allocateMessageQueueStrategy === null) {
             throw new MQClientException('allocateMessageQueueStrategy is null');
         }
-        // Java :712-714：CLUSTERING 才改写 instanceName。
         if ($this->messageModel === MessageModel::CLUSTERING) {
             $this->instanceName = MixAll::changeInstanceNameToPid($this->instanceName);
         }
@@ -382,9 +365,6 @@ final class DefaultMQPullConsumer
             return;
         }
         $this->started = false;
-        // 优雅注销（对齐 Java DefaultMQPullConsumerImpl.shutdown:689-692）。
-        // 本端口没有 Java 的本地位点表，persistConsumerOffset 无对应物
-        // （位点由调用方 updateConsumeOffset 直接写给 broker）。
         $client = $this->mqClient;
         if ($client !== null) {
             try {
@@ -409,34 +389,17 @@ final class DefaultMQPullConsumer
     /** @return list<MessageQueue> */
     public function fetchSubscribeMessageQueues(string $topic): array
     {
-        // Java DefaultMQPullConsumerImpl:142 读订阅信息（读位、不筛 master）。
         return $this->requireClient()->getTopicSubscribeInfo($topic);
     }
 
-    /**
-     * 本实例「平衡后」应负责的队列（Java MQPullConsumer:187，官方
-     * example/simple/PullConsumer.java:62 就靠它决定去拉哪些队列）。
-     *
-     * Java（DefaultMQPullConsumerImpl:120-135）读的是后台 rebalance 填出来的
-     * processQueueTable；本端口拉模式没有那条后台线程，所以按 RebalanceImpl.rebalanceByTopic
-     * 的同一条公式当场算：mqAll=订阅信息（读位口径，与 fetchSubscribeMessageQueues 同源）、
-     * cidAll=GET_CONSUMER_LIST_BY_GROUP、分配策略取本实例那一份。公式与推送消费者的
-     * rebalance 共用一份口径，两处一旦分叉，同一队列会被两个实例同时认领。
-     *
-     * 拿不到路由/消费者列表时**保留现有分配**（退回本实例实际拉过的队列），
-     * 绝不回退成"独占全部队列"——那会让同组多实例互相重复消费（同 python 端口）。
-     *
-     * @return list<MessageQueue>
-     */
     public function fetchMessageQueuesInBalance(string $topic): array
     {
-        $client = $this->requireClient(); // Java isRunning()：未启动直接抛 MQClientException
+        $client = $this->requireClient();
         $pulled = array_values(array_filter(
             $this->pulledQueues,
             static fn(MessageQueue $mq): bool => $mq->topic === $topic,
         ));
         if ($this->messageModel === MessageModel::BROADCASTING) {
-            // Java rebalanceByTopic 对 BROADCASTING 不查消费者列表、全量分配。
             $subscribe = $client->getTopicSubscribeInfo($topic);
             $allocated = $subscribe !== [] ? $subscribe : $pulled;
             return $this->sortedQueues($allocated, $topic);
@@ -466,7 +429,6 @@ final class DefaultMQPullConsumer
     {
         $out = [];
         foreach ($mqs as $mq) {
-            // Java :128-131 逐个比对表键的 topic；别让策略的意外返回值把别的 topic 混进拉取循环。
             if ($mq instanceof MessageQueue && $mq->topic === $topic) {
                 $out[implode("\0", AllocationHelper::mqSortKey($mq))] = $mq;
             }
@@ -475,13 +437,6 @@ final class DefaultMQPullConsumer
         return array_values($out);
     }
 
-    /**
-     * 短轮询拉取（对应 Java pullSyncImpl，block=false）。
-     *
-     * ⚠ sysFlag 的 suspend 位是 **false** —— 这是**短轮询**不挂起。曾在这里写成
-     * suspend=true：broker 在队尾会挂起到 brokerSuspendMaxTimeMillis（默认 20s），
-     * 而客户端 5s 就超时 → RemotingTimeoutException（真机必现，见 INVARIANTS B3）。
-     */
     public function pull(
         MessageQueue $mq,
         string $subExpression = '*',
@@ -492,7 +447,6 @@ final class DefaultMQPullConsumer
         $client = $this->requireClient();
         $timeout = $timeoutMillis ?? $this->consumerPullTimeoutMillis;
         $sub = FilterAPI::buildSubscriptionData($mq->topic, $subExpression);
-        // Java :248：sysFlag = buildSysFlag(false, block=false, true, false)。
         $sysFlag = PullSysFlag::buildSysFlag(false, false, true, false);
         $key = self::mqKey($mq);
         $result = $client->pullMessage(
@@ -503,7 +457,6 @@ final class DefaultMQPullConsumer
             $sysFlag,
             0,
             $sub->subString ?? '*',
-            // Java：TAG 类型时 subVersion 传 0（isTagType ? 0L : subVersion）
             0,
             ExpressionType::TAG,
             timeoutMillis: $timeout,
@@ -519,7 +472,6 @@ final class DefaultMQPullConsumer
         return $result;
     }
 
-    /** 长轮询拉取（对应 Java pullBlockIfNotFound，block=true → 挂起等消息）。 */
     public function pullBlockIfNotFound(
         MessageQueue $mq,
         string $subExpression,
@@ -583,7 +535,6 @@ final class DefaultMQPullConsumer
     public function earliestMsgStoreTime(MessageQueue $mq): int
     {
         $client = $this->requireClient();
-        // Java MQAdminImpl:250：与 max/min/search 同一个形状 —— 只认 master，刷一次路由重查。
         $addr = $client->adminAddrFor($mq);
         $header = new GetEarliestMsgStoretimeRequestHeader();
         $header->topic = $mq->topic;
@@ -598,14 +549,6 @@ final class DefaultMQPullConsumer
         return $respHeader->timestamp ?? 0;
     }
 
-    /**
-     * 消息回投（对应 Java DefaultMQPullConsumer.sendMessageBack）。
-     *
-     * 注意两点（真机踩过）：
-     * 1. 地址靠 findBrokerAddressInPublish 反查**发布地址表**（只认 master）；
-     * 2. 与 Java 的**有意差异**：Java 在失败时会吞掉异常、改用内部默认生产者把消息直接发到
-     *    %RETRY%group。本实现不做这个兜底 —— 回投失败就抛，让调用方看见。
-     */
     public function sendMessageBack(MessageExt $msg, int $delayLevel): void
     {
         $client = $this->requireClient();
@@ -621,9 +564,6 @@ final class DefaultMQPullConsumer
         $header->originMsgId = (string) $msg->msgId;
         $header->originTopic = $msg->topic;
         $header->unitMode = $this->unitMode;
-        // ⚠ 这里**不能**照抄 Java 弃用的 sendMessageBack（它直接传 getMaxReconsumeTimes()，
-        // 默认 -1）。客户端版本 ≥ V3_4_9 后 broker 会无条件采用该字段，-1 会让
-        // reconsumeTimes(0) >= -1 成立、消息直接进 %DLQ%。留 null 交给订阅组的 retryMaxTimes。
         $header->maxReconsumeTimes = null;
         $request = RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, $header);
         $response = $client->remotingClient->invokeSync($addr, $request, 5000);
@@ -643,20 +583,6 @@ final class DefaultMQPullConsumer
     }
 }
 
-/**
- * 轻量拉取消费者（对应 org.apache.rocketmq.client.consumer.DefaultLitePullConsumer），
- * 移植自 python/client/consumer.py 的 DefaultLitePullConsumer。
- *
- * 两种模式：**subscribe 模式**（自动 rebalance + 本地缓冲 + poll）与 **assign 模式**
- * （调用方显式指定队列）。位点默认 autoCommit（poll 交出去即向 broker 提交）。
- *
- * ## PHP 单线程适配（有意偏差，对应 PORTING.md「异步模型」）
- *
- * Python 的后台 pull 服务线程改为 ``tick()`` 驱动：每轮先按 1s 节奏 rebalance
- * （对齐 Python _pull_service_loop 的 rebalance 节流），再对每条已分配队列做一次
- * 短轮询拉取（Python 本来就是 suspend=False 的短轮询，语义零偏差）；poll() 的
- * Condition 等待改为 10ms 粒度的有界自旋（deadline 语义不变）。
- */
 final class DefaultLitePullConsumer
 {
     public string $consumerGroup;
@@ -678,15 +604,9 @@ final class DefaultLitePullConsumer
     /** @var list<string> */
     public array $nameServerAddrs = [];
     public mixed $rpcHook = null;
-    /** TLS（Java tls.enable 等价物；null = 交给 env ROCKETMQ_TLS_ENABLE）。 */
     public ?bool $tlsEnable = null;
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
-    /**
-     * SOCKS 代理（对应 Java ClientConfig 的 socksProxyConfig → SocksProxyConfig）：
-     * 配了则 NameServer + Broker 的 remoting 连接都经代理；动态取址的 HTTP 不走代理。
-     * 只在 start() 建 MQClientInstance 时透传一次。
-     */
     public ?SocksProxyConfig $socksProxy = null;
 
     /** subscribe 模式的订阅表（topic => sub_expression）。 */
@@ -726,11 +646,9 @@ final class DefaultLitePullConsumer
     private array $nextOffset = [];
     /** @var array<string,int> 已消费游标（poll 交出去才前进） */
     private array $consumeOffset = [];
-    /** @var array<string,int> 提交落点（对位 Java OffsetStore 的内存位点表） */
     private array $offsetTable = [];
     /** @var array<string,int> */
     private array $seekOffset = [];
-    /** Java nextAutoCommitDeadline 初值 -1 ⇒ 第一次 poll 就提交一次。 */
     private float $nextAutoCommitDeadline = -1.0;
     /** @var array<string,bool> */
     private array $paused = [];
@@ -829,7 +747,6 @@ final class DefaultLitePullConsumer
         return $this->namespaceV2;
     }
 
-    /** 对应 Java `NettyClientConfig#setSocksProxyConfig`：null 清除。start() 前设置。 */
     public function setSocksProxy(?SocksProxyConfig $proxy): void
     {
         $this->socksProxy = $proxy;
@@ -861,9 +778,6 @@ final class DefaultLitePullConsumer
         unset($this->subscription[$ns], $this->subscriptionData[$ns]);
     }
 
-    /**
-     * assign 模式下给某个 topic 的队列指定 tag 过滤表达式（对应 Java setSubExpressionForAssign）。
-     */
     public function setSubExpressionForAssign(string $topic, string $subExpression): void
     {
         $ns = $this->withNamespace($topic);
@@ -887,8 +801,6 @@ final class DefaultLitePullConsumer
         foreach ($messageQueues as $mq) {
             $queues[self::mqKey($mq)] = $mq;
         }
-        // Java assignedMessageQueue.updateAssignedMessageQueue：撤掉的队列连着整份
-        // MessageQueueState 丢掉（拉取游标与已消费游标一起消失）。**不**动 offsetTable。
         foreach (array_keys($this->assigned) as $key) {
             if (!isset($queues[$key])) {
                 unset($this->nextOffset[$key], $this->consumeOffset[$key]);
@@ -913,7 +825,6 @@ final class DefaultLitePullConsumer
         if ($this->started) {
             return;
         }
-        // 对应 Java DefaultLitePullConsumerImpl.checkConfig（:415）：纯本地校验，最先做。
         Validators::checkGroup($this->consumerGroup);
         if ($this->consumerGroup === MixAll::DEFAULT_CONSUMER_GROUP) {
             throw new MQClientException(sprintf(
@@ -927,11 +838,9 @@ final class DefaultLitePullConsumer
         if ($this->subscription === [] && !$this->assignMode) {
             throw new MQClientException('subscription is not set, call subscribe() or assign() first');
         }
-        // Java :435：策略为 null 直接拒绝启动。
         if (!isset($this->allocateMessageQueueStrategy)) {
             throw new MQClientException('allocateMessageQueueStrategy is null');
         }
-        // Java :287-289：CLUSTERING 才改写 instanceName。
         if ($this->messageModel === MessageModel::CLUSTERING) {
             $this->instanceName = MixAll::changeInstanceNameToPid($this->instanceName);
         }
@@ -1006,9 +915,6 @@ final class DefaultLitePullConsumer
         }
         $this->started = false;
         $this->running = false;
-        // Java 的 shutdown 走 persistConsumerOffset()：与 auto_commit 无关。
-        // 自动提交模式再多走一步 commit()：本端口没有 Java 那份 5s 定时器，"poll 交出去
-        // 但还没到截止时刻"的位点得在这里补上，否则重启后从上一格重投。
         try {
             if ($this->autoCommit) {
                 $this->commit();
@@ -1047,8 +953,6 @@ final class DefaultLitePullConsumer
             $this->messageModel,
             $this->consumeFromWhere,
         );
-        // consumeType 是 CONSUME_ACTIVELY 而**不是**推送消费者的 PASSIVELY
-        //（Java DefaultLitePullConsumerImpl.consumeType():1111-1112）。
         $cd->unitMode = $this->unitMode;
         foreach ($this->subscriptionData as $sub) {
             $cd->subscriptionDataSet[] = $sub;
@@ -1064,7 +968,6 @@ final class DefaultLitePullConsumer
         }
         $hb = $this->buildHeartbeat();
         $ok = 0;
-        // 每台都发（主 + 从）：与推送消费者同一条 Java 依据。
         foreach ($this->mqClient->getAllBrokerAddrs() as $addr) {
             try {
                 $this->mqClient->sendHeartbeat($addr, $hb, 5000);
@@ -1099,8 +1002,6 @@ final class DefaultLitePullConsumer
             $this->rebalance();
             $this->lastRebalanceTs = $now;
         }
-        // 队列集合变更比对：PHP 是 tick 驱动，没有 Java 的调度线程。首查在 start 后 10s，
-        // 之后每个 topicMetadataCheckIntervalMillis 一趟；没有注册监听器时这一趟是空转。
         if ($this->nextMetadataCheckAt > 0.0 && $now >= $this->nextMetadataCheckAt) {
             $this->nextMetadataCheckAt = $now + $this->topicMetadataCheckIntervalMillis / 1000.0;
             try {
@@ -1161,7 +1062,6 @@ final class DefaultLitePullConsumer
             Logger::debug("lite pull_one failed for $mq->topic@$mq->queueId: " . $e->getMessage());
             return false;
         }
-        // Java :982-998：一轮拉取回来之后无论哪种状态都推进游标；刹车只有一只。
         $intact = ($this->nextOffset[$key] ?? null) === $offset;
         if ($intact) {
             $this->nextOffset[$key] = $result->nextBeginOffset;
@@ -1211,8 +1111,6 @@ final class DefaultLitePullConsumer
 
     private function maybeAutoCommit(): void
     {
-        // 对位 Java ``maybeAutoCommit``：到点提交**全部**已分配队列；提交的是"已消费游标"
-        // 而不是拉取游标 —— 缓冲里还没交给调用方的消息不算已消费。
         $now = microtime(true);
         if ($now < $this->nextAutoCommitDeadline) {
             return;
@@ -1242,7 +1140,6 @@ final class DefaultLitePullConsumer
             // ignore
         }
         if ($this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-            // Java RebalanceLitePullImpl:FIRST_OFFSET 分支与 push 同形（result = 0L）。
             return 0;
         }
         if ($this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
@@ -1266,8 +1163,6 @@ final class DefaultLitePullConsumer
 
     private function rebalance(): void
     {
-        // 对应 Java DefaultLitePullConsumerImpl.rebalance：与 push 完全相同的
-        // rebalanceByTopic 路径，mqAll / cidAll 都要先排序。
         $client = $this->requireClient();
         $newSet = [];
         foreach (array_keys($this->subscription) as $topic) {
@@ -1292,8 +1187,6 @@ final class DefaultLitePullConsumer
                     $cidAll,
                 );
             } catch (\Throwable $e) {
-                // 对应 Java rebalanceByTopic 的 catch (Throwable)：本轮跳过该 topic
-                //（保留它当前的分配），绝不能因为一次策略异常就把队列撤走。
                 Logger::error('allocate message queue exception, strategy='
                     . $this->allocateMessageQueueStrategy->getName() . ': ' . $e->getMessage());
                 foreach ($this->assigned as $key => $mq) {
@@ -1327,8 +1220,6 @@ final class DefaultLitePullConsumer
                 if (isset($newSet[$key])) {
                     continue;
                 }
-                // Java RebalanceLitePullImpl#removeUnnecessaryMessageQueue：先 persist(mq)
-                // 再 removeOffset(mq)——撤手之前把最后一次提交的位点补发出去。
                 $this->persistOffsetByKey($key);
                 // AssignedMessageQueue 的条目一起丢掉：留着 seekOffset 就是让这条队列
                 // 哪天回到本实例时静默跳回用户很久以前手动钉过的位置。
@@ -1358,15 +1249,9 @@ final class DefaultLitePullConsumer
 
     // ---------------- poll / 位点 ----------------
 
-    /**
-     * 从本地缓冲取批量消息（Java poll 语义：最多 1024 条；deadline 内等待）。
-     *
-     * @return list<MessageExt>
-     */
     public function poll(?int $timeout = null): array
     {
         $timeout = $timeout ?? $this->pollTimeoutMillis;
-        // Java poll() 进来先按截止时刻试一次自动提交（拿缓冲之前做）。
         if ($this->autoCommit) {
             $this->maybeAutoCommit();
         }
@@ -1383,7 +1268,6 @@ final class DefaultLitePullConsumer
         while ($this->localBuffer !== [] && count($out) < 1024) {
             $out[] = array_shift($this->localBuffer);
         }
-        // 对位 Java poll()：消息交到调用方手上才推进"已消费游标"；拉取游标一律不动。
         $advanced = [];
         foreach ($out as $m) {
             $key = $m->topic . ($m->brokerName ?? '') . (string) $m->queueId;
@@ -1407,8 +1291,6 @@ final class DefaultLitePullConsumer
         $key = self::mqKey($mq);
         $this->seekOffset[$key] = $offset;
         $this->nextOffset[$key] = $offset;
-        // Java 的 seek 只置 seekOffset，下一次拉取时才写进 consumeOffset
-        //（"跳回去"意味着"那里之前都还没消费"）。
         $this->consumeOffset[$key] = $offset;
         $kept = [];
         foreach ($this->localBuffer as $m) {
@@ -1450,10 +1332,6 @@ final class DefaultLitePullConsumer
         return $this->offsetTable[self::mqKey($mq)] ?? -1;
     }
 
-    /**
-     * Java ``committed()`` 走 ``offsetStore.readOffset(MEMORY_FIRST_THEN_STORE)``：
-     * 先看内存位点表，再问 broker，并把 broker 的值回填进表里。
-     */
     public function committed(MessageQueue $mq): ?int
     {
         $key = self::mqKey($mq);
@@ -1468,7 +1346,6 @@ final class DefaultLitePullConsumer
         return $brokerOffset;
     }
 
-    /** Java ``OffsetStore#persist(mq)``：只把这一条队列的内存位点发给 broker。 */
     private function persistOffset(?MessageQueue $mq): void
     {
         if ($mq === null) {
@@ -1486,12 +1363,6 @@ final class DefaultLitePullConsumer
         }
     }
 
-    /**
-     * Java ``RemoteBrokerOffsetStore#persistAll(Set)``：落在 ``$keys`` 里的写给 broker，
-     * **不在**其中的条目顺手从表里删掉。
-     *
-     * @param iterable<string>|null $keys mqKey 集合；null = 全部
-     */
     private function persistOffsetTable(?iterable $keys = null): void
     {
         if ($keys === null) {
@@ -1520,26 +1391,14 @@ final class DefaultLitePullConsumer
     {
         $mq = $this->assigned[$key] ?? null;
         if ($mq === null) {
-            // 撤走的队列没有 MessageQueue 无法发请求；Java 该场景下条目也已不在表里。
             return;
         }
         $this->persistOffset($mq);
     }
 
-    /**
-     * 提交消费位点。三个入口对位 Java 的三个重载：
-     *   commit()                    → commitAll()：按"已消费游标"提交所有已分配队列
-     *   commit([{mqKey => offset}]) → commit(Map, persist)：调用方指定位点
-     *   commit([mqKey, ...])        → commit(Set, persist)：只提交这几条队列
-     *
-     * 指定位点**只改提交位置，不改拉取游标**。
-     *
-     * @param array<string,int>|list<string>|null $offsets
-     */
     public function commit(?array $offsets = null, bool $persist = true): void
     {
         if ($offsets === null) {
-            // Java commitAll()：只遍历当下持有的队列
             $targets = [];
             foreach (array_keys($this->assigned) as $key) {
                 $targets[$key] = $this->consumeOffset[$key] ?? -1;
@@ -1570,8 +1429,6 @@ final class DefaultLitePullConsumer
                 continue;
             }
             if (!isset($this->assigned[$key])) {
-                // Java 的 processQueue != null && !isDropped() 守卫：不是本实例持有的队列
-                // 一律不替它提交，静默跳过。
                 continue;
             }
             $this->offsetTable[$key] = (int) $offset;

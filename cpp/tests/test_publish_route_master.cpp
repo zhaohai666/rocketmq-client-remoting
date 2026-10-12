@@ -1,22 +1,3 @@
-// #100：发布地址「只要 master」的离线单测（Java MQClientInstance#findBrokerAddressInPublish:1295-1305）。
-//
-// 与 python/tests/test_publish_route_master.py 同题（那边是黄金参考），这里补 C++ 的**地址侧**
-// 半边：队列集的筛选（Java :301-303，master 不在就整条跳过）已经在 test_route_heartbeat.cpp
-// 里锁死，本文件只关心「从队列集到地址」这一步，以及它和「问到一台就行」的退让口径的分界。
-//
-// 为什么两条口径不能合成一条：
-//   * 发布 = `brokerAddrTable.get(brokerName).get(MixAll.MASTER_ID)`，任何一步拿不到
-//     就 null（Java :1300-1304）。主从切换期间本端立刻报
-//     `MQClientException("The broker[X] not exist", -1)`，而不是把写请求打到从节点上再被
-//     reject（SendMessageProcessor:131 ⇒ SYSTEM_BUSY(2)，还是个可重试码，白烧一轮超时）；
-//   * 退让口径（brokerAddrOf / Java findByAddrTable 的形态）主优先、没主退一台从节点，
-//     给心跳/拉取/位点查询用 —— 消费侧必须保留这些队列（主挂后仍要从从节点拉取）。
-// 同一份路由上两者必须给出不同答案：本文件第一、四组用例就是这条边界的守卫。
-//
-// 报文层面不走捷径：客户端缓存里的平表由**真的** updateTopicRouteInfoFromNameServer 写入
-// （Java :962-964，那是 brokerAddrTable 唯一的写点）。换路由一律改假 name server 的应答再让
-// 客户端自己刷，不往客户端内存里塞值 —— 直接塞等于这条路径没测。
-//
 // 第六到第八组是**订阅口径**的另一半（#104）：`findBrokerAddressInSubscribe(brokerName,
 // MASTER_ID, true)` 的三处调用面 —— 顺序消费的锁（RebalanceImpl#lock:153/lockAll:195，
 // 只认主、**不刷路由**、拿不到整台跳过）、POP 拉取（PullAPIWrapper#popAsync:369-373，
@@ -260,8 +241,6 @@ private:
                 resp.code = ResponseCode::SUCCESS;
                 resp.extFields["offset"] = std::to_string(queryOffset_);
             } else if (req.code == RequestCode::LOCK_BATCH_MQ) {
-                // 回的是请求里点名的队列集（Java LockBatchResponseBody.lockOKMQSet）：
-                // 「锁上了」与「锁请求根本没发」在报文层面可区分，断言才敢说请求到过 master。
                 if (req.hasBody) {
                     const std::string text(req.body.begin(), req.body.end());
                     JsonValue root;
@@ -385,11 +364,9 @@ void testPublishAddrForReportsNotExistWhenTheMasterIsGone() {
         instance->publishAddrFor(kBroker, kTopic);
     } catch (const MQClientException& e) {
         threw = std::string(e.what()) == "The broker[broker-a] not exist";
-        // 本端报的错，没有 broker 侧错误码（Java 双参构造器给 -1）
         expectInt(e.getResponseCode(), -1, "not exist 的 responseCode == -1");
     }
     expect(threw, "只剩从节点时 publishAddrFor 报 not exist");
-    // 报错前必须先刷一次路由（Java tryToFindTopicPublishInfo），不能拿旧结论直接结账
     expectInt(static_cast<long long>(
                   namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC) - before),
               1, "报 not exist 之前刷过一次路由");
@@ -444,10 +421,6 @@ void testAdminOffsetQueriesAreMasterOnlyToo() {
     expect(master.lastExt().at("topic") == kTopic, "offset 查询带 topic");
 }
 
-// ------------------------------------------------- 6. 订阅口径（#104 的分界线）
-// Java `findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)` 的三处调用面：
-// 顺序消费的锁（RebalanceImpl#lock/unlock:74-195）、POP 的拉取（PullAPIWrapper#popAsync:369-373）
-// 与消费位点读取（RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241）。
 
 void testOrderlyLocksSkipTheBrokerWhenTheMasterIsGone() {
     MockEndpoint namesrv, master, slave;
@@ -457,8 +430,6 @@ void testOrderlyLocksSkipTheBrokerWhenTheMasterIsGone() {
     std::vector<MessageQueue> mqs{MessageQueue(kTopic, kBroker, 0),
                                   MessageQueue(kTopic, kBroker, 1)};
 
-    // Java RebalanceImpl#lock:153 / lockAll:195：发布地址拿不到 => 整台跳过，**不刷路由**。
-    // 退到从节点上锁等于锁在从节点的锁管理器里，master 不知情，顺序消费的互斥静默失效。
     expect(instance->lockBatchMq("G", kClientId, mqs).empty(),
            "只剩从节点时一台队列都锁不上");
     expectInt(static_cast<long long>(
@@ -495,7 +466,6 @@ void testPopMessageIsMasterOnlyAndReportsNotExist() {
     auto instance = seeded(namesrv);
     const size_t before = namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC);
 
-    // Java PullAPIWrapper#popAsync:369-373：只认主 → 刷一次路由 → 仍没有就抛。
     bool threw = false;
     try {
         instance->popMessage("G", kTopic, 0, 32, 30000, 0, 0);
@@ -530,8 +500,6 @@ void testConsumerOffsetFallsBackToTheSlaveAfterARefresh() {
     MessageQueue mq(kTopic, kBroker, 0);
     const size_t before = namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC);
 
-    // Java RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241：只认主 → 刷一次
-    // 路由 → 重查**放宽**（onlyThisBroker=false，位点是 HA 复制的同一份数据，可以从从节点读）。
     int64_t offset = 0;
     expect(instance->queryConsumerOffset("G", mq, offset), "只剩从节点时位点查得到");
     expectInt(offset, 424242, "刷一次路由后放宽到从节点");

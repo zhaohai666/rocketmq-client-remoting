@@ -1,39 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消息二进制编解码（对应 org.apache.rocketmq.common.message.MessageDecoder）。
-
-本模块严格对齐 Java 侧的两条编码路径，切勿混用：
-
-1) 17 段存储格式 ``MessageDecoder.encode(MessageExt, needCompress)`` / ``decode(ByteBuffer)``
-   用于 broker 写入与 pull/get 返回的消息体：
-
-   ======= ================================ ======================================
-   序号     字段                             编码
-   ======= ================================ ======================================
-   1        TOTALSIZE                        int(4)
-   2        MAGICCODE                        int(4)  -626843481 (v1) / -626843477 (v2)
-   3        BODYCRC                          int(4)
-   4        QUEUEID                          int(4)
-   5        FLAG                             int(4)
-   6        QUEUEOFFSET                      long(8)
-   7        PHYSICALOFFSET                   long(8)
-   8        SYSFLAG                          int(4)
-   9        BORNTIMESTAMP                    long(8)
-   10       BORNHOST                         4|16B ip + 4B port
-   11       STORETIMESTAMP                   long(8)
-   12       STOREHOST                        4|16B ip + 4B port
-   13       RECONSUMETIMES                   int(4)
-   14       PREPAREDTRANSACTIONOFFSET        long(8)
-   15       BODY                             int(4) len + body
-   16       TOPIC                            1B(v1)|2B(v2) len + topic
-   17       PROPERTIES                       short(2) len + k\\x01v\\x02 串
-   ======= ================================ ======================================
-
-2) 6 段轻量格式 ``MessageDecoder.encodeMessage(Message)`` / ``decodeMessage(ByteBuffer)``
-   仅用于**批量消息**（MessageBatch 的 body），不含 topic / crc：
-
-   TOTALSIZE(4) | MAGICCODE(4, 固定 0) | BODYCRC(4, 固定 0) | FLAG(4)
-   | BODY(4+len) | PROPERTIES(2+len)
-"""
 from __future__ import annotations
 
 import socket
@@ -53,7 +18,6 @@ MESSAGE_MAGIC_CODE = -626843481
 MESSAGE_MAGIC_CODE_V2 = -626843477
 BLANK_MAGIC_CODE = -875286124
 
-# 字段固定偏移（与 Java MessageDecoder 常量一致）
 MESSAGE_MAGIC_CODE_POSITION = 4
 MESSAGE_FLAG_POSITION = 16
 MESSAGE_PHYSIC_OFFSET_POSITION = 28
@@ -69,17 +33,17 @@ _HEX_TABLE = "0123456789ABCDEF"
 
 
 def string2bytes(s: str) -> bytes:
-    """UTF-8 编码（Java MessageDecoder 内的私有工具）。"""
+    pass
     return s.encode(CHARSET_UTF8)
 
 
 def bytes2string(bs: bytes) -> str:
-    """Java UtilAll.bytes2string：逐字节转**大写**十六进制（msgId 依赖大小写）。"""
+    pass
     return "".join(_HEX_TABLE[(b >> 4) & 0x0F] + _HEX_TABLE[b & 0x0F] for b in bs)
 
 
 def string2bytes_hex(hex_string: Optional[str]) -> Optional[bytes]:
-    """Java UtilAll.string2bytes：十六进制字符串 -> 字节。"""
+    pass
     if not hex_string:
         return None
     try:
@@ -110,7 +74,7 @@ def bytes_to_ip_and_port(raw: bytes) -> Tuple[str, int]:
 
 
 def crc32(data: bytes) -> int:
-    """Java UtilAll.crc32 使用标准 CRC32（poly 0xEDB88320），与 zlib.crc32 一致。"""
+    pass
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
@@ -118,7 +82,7 @@ def crc32(data: bytes) -> int:
 
 
 def message_properties_2_string(properties: Optional[Dict[str, str]]) -> str:
-    """Java MessageDecoder.messageProperties2String：k\\x01v\\x02 逐项拼接。"""
+    pass
     if properties is None:
         return ""
     parts = []
@@ -130,7 +94,7 @@ def message_properties_2_string(properties: Optional[Dict[str, str]]) -> str:
 
 
 def string_2_message_properties(properties_str: Optional[str]) -> Dict[str, str]:
-    """Java MessageDecoder.string2messageProperties。"""
+    pass
     result: Dict[str, str] = {}
     if not properties_str:
         return result
@@ -157,7 +121,7 @@ def create_message_id(addr_bytes: bytes, offset: int) -> str:
 
 
 def decode_message_id(msg_id: str) -> Tuple[str, int, int]:
-    """Java MessageDecoder.decodeMessageId -> (ip, port, offset)。"""
+    pass
     raw = bytes.fromhex(msg_id)
     ip_len = 4 if len(raw) == 16 else 16
     family = socket.AF_INET if ip_len == 4 else socket.AF_INET6
@@ -171,34 +135,14 @@ def decode_message_id(msg_id: str) -> Tuple[str, int, int]:
 
 
 def normalize_compression_type(compression_type: int) -> int:
-    """把 sysFlag 里解出的压缩类型归一化到"真实算法"。
-
-    对齐 Java ``CompressionType.findByValue`` 的向后兼容映射::
-
-        case 1: return LZ4;
-        case 2: return ZSTD;
-        case 0: // To be compatible for older versions without compression type
-        case 3: return ZLIB;
-
-    即**类型位为 0 的老版本压缩消息按 ZLIB 处理**。这是必需的：老版本客户端
-    （无类型位能力）产出的压缩消息类型位就是 0，若不映射到 ZLIB，解压会失败，
-    而外层又会照样清掉 COMPRESSED_FLAG，结果是**静默返回压缩字节流**——数据损坏
-    且事后无法识别。
-    """
+    pass
     if compression_type == 0:
         return MessageSysFlag.ZLIB_TYPE
     return compression_type
 
 
 def _unsupported(compression_type: int) -> RuntimeError:
-    """对应 Java ``CompressorFactory.getCompressor`` 在未知类型时抛的异常。
-
-    Java 的 ``CompressionType.findByValue`` 只认 0/3(ZLIB)、1(LZ4)、2(ZSTD)，
-    其余返回 null，``CompressorFactory`` 随即抛 ``IllegalArgumentException``。
-    **绝不能原样透传**：调用方（``decode_message``）在解压后会清掉
-    ``COMPRESSED_FLAG``，透传等于把压缩字节流当正文交出去且事后无法识别，
-    属于静默数据损坏。C++ 侧同语义（``CompressorFactory::decompress`` 抛 runtime_error）。
-    """
+    pass
     return RuntimeError("unsupported compression type: %d" % compression_type)
 
 
@@ -225,25 +169,12 @@ def _decompress(data: bytes, compression_type: int) -> bytes:
 
 
 def decompress_body(data: bytes, compression_type: int) -> bytes:
-    """按压缩类型解压（``_decompress`` 的公开入口）。
-
-    除 ``decode_message`` 之外还有第二个调用方：Request-Reply 的应答是从
-    ``PUSH_REPLY_MESSAGE_TO_CLIENT(326)`` 直接推过来的裸包，不走消息解码路径，
-    需要自己按 ``sysFlag`` 判断并解压（对齐 Java
-    ``ClientRemotingProcessor#receiveReplyMessage`` 里的 Compressor 分支）。
-    """
+    pass
     return _decompress(data, compression_type)
 
 
 class _Lz4Codec:
-    """LZ4 Frame 编解码器（Java lz4-java 的 Frame 格式）。
-
-    Java 侧用 ``LZ4FrameOutputStream`` / ``LZ4FrameInputStream``，Python 的
-    ``lz4.frame`` 实现的是同一个 LZ4 Frame 规范，二者字节互通。
-
-    未安装 ``lz4`` 时**抛错而非静默透传**：静默透传会把压缩字节流当正文返回，
-    属不可察觉的数据损坏（对齐 Java 抛异常的行为）。
-    """
+    pass
 
     @staticmethod
     def _mod():
@@ -265,10 +196,7 @@ class _Lz4Codec:
 
 
 class _ZstdCodec:
-    """ZSTD 编解码器（Java zstd-jni 的 ZstdOutputStream/ZstdInputStream）。
-
-    未安装 ``zstandard`` 时抛错，理由同 LZ4。
-    """
+    pass
 
     @staticmethod
     def _mod():
@@ -286,8 +214,6 @@ class _ZstdCodec:
 
     @staticmethod
     def decompress(data: bytes) -> bytes:
-        # Java ZstdInputStream 读的是带 content-size 的普通 zstd 帧，
-        # 这里用流式 API 以兼容未写入 content-size 的帧（Java 默认不写）。
         import io
 
         dctx = _ZstdCodec._mod().ZstdDecompressor()
@@ -311,11 +237,7 @@ def _topic_length_size(magic_code: int) -> int:
 
 
 def encode_message_ext(message_ext: MessageExt, need_compress: bool = False) -> bytes:
-    """对应 Java ``MessageDecoder.encode(MessageExt, boolean needCompress)``。
-
-    注意：Java 侧 topic 长度固定写 1 字节、魔数固定写 v1（-626843481），
-    storeSize > 0 时直接按其分配缓冲（尾部不足会按需补齐）。
-    """
+    pass
     body = message_ext.get_body() or b""
     if need_compress and (message_ext.get_sys_flag() & MessageSysFlag.COMPRESSED_FLAG):
         compression_type = MessageSysFlag.get_compression_type(message_ext.get_sys_flag())
@@ -377,7 +299,6 @@ def decode_message(raw: bytes, read_body: bool = True, decompress_body: bool = T
         (store_size,) = struct.unpack_from(">i", raw, offset); offset += 4
         (magic_code,) = struct.unpack_from(">i", raw, offset); offset += 4
         if magic_code not in (MESSAGE_MAGIC_CODE, MESSAGE_MAGIC_CODE_V2):
-            # Java MessageVersion.valueOfMagicCode 对未知魔数抛异常 -> decode 返回 null
             return None
         use_v2 = magic_code == MESSAGE_MAGIC_CODE_V2
         (body_crc,) = struct.unpack_from(">I", raw, offset); offset += 4
@@ -425,7 +346,6 @@ def decode_message(raw: bytes, read_body: bool = True, decompress_body: bool = T
                     msg_ext.set_sys_flag(MessageSysFlag.clear_compressed_flag(sys_flag))
                 msg_ext.set_body(bytes(body))
             else:
-                # Java readBody=false 时跳过 body 且不给 body 赋值 -> null
                 msg_ext.set_body(None)
             offset += body_len
         else:
@@ -477,10 +397,7 @@ def decode_messages(raw: bytes, read_body: bool = True) -> List[MessageExt]:
 
 
 def encode_message(message: Message) -> bytes:
-    """对应 Java ``MessageDecoder.encodeMessage(Message)``：批量消息的单条编码。
-
-    只写 TOTALSIZE / MAGICCODE(0) / BODYCRC(0) / FLAG / BODY / PROPERTIES。
-    """
+    pass
     body = message.get_body() or b""
     properties_bytes = string2bytes(message_properties_2_string(message.get_properties()))
     properties_length = len(properties_bytes)
@@ -499,7 +416,7 @@ def encode_message(message: Message) -> bytes:
 
 
 def encode_messages(messages: Sequence[Message]) -> bytes:
-    """对应 Java ``MessageDecoder.encodeMessages(List<Message>)``：拼接成批量消息 body。"""
+    pass
     out = bytearray()
     for msg in messages:
         out += encode_message(msg)
@@ -507,7 +424,7 @@ def encode_messages(messages: Sequence[Message]) -> bytes:
 
 
 def decode_batch_message(raw: bytes) -> Message:
-    """对应 Java ``MessageDecoder.decodeMessage(ByteBuffer)``：单条批量单元 -> Message。"""
+    pass
     offset = 0
     offset += 4   # TOTALSIZE
     offset += 4   # MAGICCODE
@@ -525,7 +442,7 @@ def decode_batch_message(raw: bytes) -> Message:
 
 
 def decode_batch_messages(raw: bytes) -> List[Message]:
-    """对应 Java ``MessageDecoder.decodeMessages(ByteBuffer)``：批量消息 body -> List[Message]。"""
+    pass
     result: List[Message] = []
     pos = 0
     total = len(raw)
@@ -541,7 +458,7 @@ def decode_batch_messages(raw: bytes) -> List[Message]:
 
 
 def count_inner_msg_num(raw: bytes) -> int:
-    """对应 Java ``MessageDecoder.countInnerMsgNum``。"""
+    pass
     count = 0
     pos = 0
     total = len(raw)

@@ -113,11 +113,6 @@ export class MQClient {
   remotingClient: RemotingClient;
   topicRouteTable: Map<string, TopicRouteData>;
   topicPublishInfoTable: Map<string, TopicPublishInfo>;
-  // topicEndPointsTable — for STATIC topics only: keyed by
-  // "topic@mockBrokerName@globalId" (string keys: JS Map has no
-  // equals/hashCode like Java's ConcurrentHashMap) -> real broker name.
-  // Java MQClientInstance builds it on every route refresh and resolves mock
-  // broker names through getBrokerNameFromMessageQueue.
   topicEndPointsTable: Map<string, Map<string, string>>;
   brokerAddrTable: Map<string, Record<number, string>>;
   consumerTable: Map<string, any>;
@@ -146,16 +141,6 @@ export class MQClient {
   // 每次路由拉取都纯随机单挑 —— 撞上死的那台整个调用直接失败。
   _namesrvChosen: string | null;
   _running: boolean;
-  // 门面级反向请求处理器（共享实例的多播，对应 C# 端为此新加的
-  // RegisterFacadeProcessor）：Java 把 CHECK_TRANSACTION_STATE(39)/
-  // GET_CONSUMER_RUNNING_INFO(307)/RESET_CONSUMER_CLIENT_OFFSET(220)/
-  // GET_CONSUMER_STATUS_FROM_CLIENT(221)/CONSUME_MESSAGE_DIRECTLY(309)/
-  // NOTIFY_CONSUMER_IDS_CHANGED(36) 的处理器挂在**实例级**的
-  // ClientRemotingProcessor 上。remoting 的处理器表里一个 code 只有一个槽 ——
-  // 门面各自往共享实例的 remotingClient 上 registerProcessor 会互相顶掉
-  // （后启动的覆盖先启动的，先启动的门面从此收不到反向请求）。这里收拢成
-  // 实例级多播：同 code 有几个门面登记就扇出给几个，第一个非 null 的应答回给
-  // 传输层（oneway 类处理器一律返回 null，单登记时与直连行为完全一致）。
   private _facadeProcessors: Map<number, FacadeProcessor[]>;
 
   constructor(
@@ -254,10 +239,6 @@ export class MQClient {
     throw lastErr != null ? lastErr : new MQClientException('all name servers failed');
   }
 
-  // ---- route management ----
-  // Build publish info from a TopicRouteData. Returns a TopicPublishInfo whose
-  // msgQueueList is the master-writable queue set. Also refreshes the static
-  // topicEndPointsTable (Java builds both in the same route-refresh block).
   topicRouteData2TopicPublishInfo(topic: string, routeData: TopicRouteData): TopicPublishInfo {
     const info = new TopicPublishInfo();
     info.orderTopic = false;
@@ -347,10 +328,6 @@ export class MQClient {
     return null;
   }
 
-  // Java MQClientInstance.getBrokerNameFromMessageQueue: a static topic's
-  // logical MessageQueue carries the MOCK broker name ("__syslo__<scope>");
-  // the topicEndPointsTable maps it to the REAL hosting broker name. Non
-  // static topics (or an unknown queue) pass their own broker name through.
   getBrokerNameFromMessageQueue(mq: MessageQueue): string {
     const endpoints = this.topicEndPointsTable.get(mq.topic);
     if (endpoints != null && endpoints.size > 0) {
@@ -378,9 +355,6 @@ export class MQClient {
     return null;
   }
 
-  // Publish address for a specific queue (master only). Static-topic queues
-  // resolve through the endpoints table first (Java sendKernelImpl does
-  // findBrokerAddressInPublish(getBrokerNameFromMessageQueue(mq))).
   publishAddrFor(mq: MessageQueue): string | null {
     return this.findBrokerAddressInPublish(this.getBrokerNameFromMessageQueue(mq));
   }
@@ -960,11 +934,6 @@ export class MQClient {
     }
   }
 
-  // 驱动一次门面处理器的多播分派：**广播** —— 该 code 的每一个登记者都被唤起
-  // （共享实例上的 CHECK_TRANSACTION_STATE(39) 等反向请求要能分发到多个门面），
-  // 回给传输层的是第一个非 null 应答；一个门面的处理器出错不影响其余登记者
-  // （对应 Java ClientRemotingProcessor 整段 try-catch 的兜法）。oneway 类处理器
-  // 一律返回 null；单登记者时与直连行为完全一致。
   dispatchFacadeProcessor(cmd: RemotingCommand, addr: string): RemotingCommand | null {
     const list = this._facadeProcessors.get(cmd.code);
     if (list == null || list.length === 0) return null;
@@ -986,9 +955,6 @@ export class MQClient {
     return list != null ? list.length : 0;
   }
 
-  // ---- lifecycle ----
-  // Java MQClientInstance.start 的 startOK.compareAndSet(false, true) 守卫：
-  // 共享实例下每个门面的 start() 都会调到这里，后台任务只允许拉起一次。
   start(): void {
     if (this._running) return;
     this._running = true;
@@ -1089,7 +1055,6 @@ export class MQClient {
 
   // 公开：门面的 start()（pull / lite-pull consumer）与路由刷新都直接用它。
   async sendHeartbeatToAllBrokers(): Promise<void> {
-    // Java sends the heartbeat to EVERY broker entry (masters and slaves).
     const entries = this.getAllBrokerAddrEntries();
     logger.debug('heartbeat beat to %d broker(s)', entries.length);
     for (const { addr } of entries) {
@@ -1097,14 +1062,6 @@ export class MQClient {
     }
   }
 
-  // Java ClientRemotingProcessor.checkTransactionState + DefaultMQPushConsumerImpl
-  // .checkTransactionState: the broker's transaction-poll thread sends
-  // CHECK_TRANSACTION_STATE to the client; the client replies SUCCESS at once,
-  // then runs the listener check OFF the read thread (hard rule: a
-  // broker-initiated request handler must NEVER issue a synchronous request
-  // inline — self deadlock) and finally fires END_TRANSACTION oneway.
-  // 经实例级多播登记（而非直连 registerProcessor 槽）：共享实例上多个 producer
-  // 的反向请求分发与门面自己的处理器扇出共存、互不覆盖。
   private _registerTransactionCheckProcessor(): void {
     this.registerFacadeProcessor(RequestCode.CHECK_TRANSACTION_STATE, (cmd: RemotingCommand, addr: string): RemotingCommand | null => {
       const response = RemotingCommand.createResponseCommand(ResponseCode.SUCCESS, '');

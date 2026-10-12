@@ -4,14 +4,6 @@ declare(strict_types=1);
 
 namespace RocketMQ\Client;
 
-/**
- * 客户端基础指标（对应 Java 的 RT/计数统计：send/consume 耗时与成功失败数），
- * 移植自 metrics.py。
- *
- * 发送维度统计 sendRT/sendCount/sendFailureCount；消费维度统计
- * consumeRT/consumeCount/consumeFailureCount。PHP 单线程，Python 的 threading.Lock
- * 只为计数一致性，这里无需加锁（保留同一时刻单一读写的约束语义）。
- */
 final class ClientMetrics
 {
     // 发送

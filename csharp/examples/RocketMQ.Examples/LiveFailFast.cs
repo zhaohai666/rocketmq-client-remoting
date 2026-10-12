@@ -1,7 +1,3 @@
-// broker 真的死了：在途请求必须**立刻**有终态（Java failFast → requestFail）真机验证。
-//（对应 python/verify_fail_fast_live.py、cpp/examples/live_fail_fast.cpp、
-//  rust/examples/live_fail_fast.rs 的 L1–L5）
-//
 // 离线用例（tests/FailFastTests.cs）锁的是传输层契约：本机假对端读完就关，断言
 // "毫秒级判死 + 报 RemotingSendRequestException 而不是超时 + 回调只投一次"。但这条路径
 // 存在的意义正是**真机上的 broker 重启 / 主备切换 / 网络抖动**，只有真集群能回答：
@@ -278,7 +274,6 @@ public static class LiveFailFast
             int worstMs = snapshot.Count == 0 ? 0 : snapshot.Max(r => r.ElapsedMs);
             string kinds = string.Join(",", snapshot.Select(r => r.Kind));
             string firstMsg = snapshot.FirstOrDefault(r => r.Kind == "send_request")?.Message ?? string.Empty;
-            // 报的是 RemotingSendRequestException（Java failFast 的口径）
             Check("L3 报的是 RemotingSendRequestException（Java failFast 的口径）",
                 sendRequest == Parked, "kinds=" + kinds);
             Check("L3 一条都没被报成超时（类型错 = 重试决策错）", timeouts == 0,

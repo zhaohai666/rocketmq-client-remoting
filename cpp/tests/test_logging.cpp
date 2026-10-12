@@ -1,9 +1,6 @@
 // 客户端日志单测：行格式（毫秒 + pid + 线程名 + 文件:行号）、按大小轮转与备份数上限、
 // 级别过滤、以及"关闭文件输出后不再写盘"。
 //
-// 这些断言是**可验证性**的支点：Java 侧靠 logback 配置保证的能力（SizeBasedTriggeringPolicy /
-// FixedWindowPolicy / maxIndex），这里必须有自己的回归守卫，否则将来改 logging.h 时
-// "日志把磁盘撑爆" 或 "备份无限增长" 会无声回归。
 //
 // ⚠ 本文件的日志行会同时打到 stderr（logging.h 的设计：stderr + 文件双写），
 //   所以 ctest 输出里出现一堆日志行是**正常的**，不是失败。
@@ -124,8 +121,6 @@ int main() {
     const std::string logPath = (dir / "cpp_client.log").string();
     setLogFile(logPath);
 
-    // ---------------------------------------------------------------- 线程名
-    // 主线程应自动落 "main"（对齐 Java），而不是不可读的 tid 哈希
     CHECK(currentThreadName() == std::string("main"), "main thread named \"main\"");
     const std::string before = currentThreadName();
     setThreadName("ConsumeMessageThread_0");
@@ -145,7 +140,6 @@ int main() {
     const std::vector<std::string> lines = splitLines(body);
     CHECK(lines.size() == 1, "one line written");
     if (!lines.empty()) {
-        // 对齐 Java 的 `%d{...SSS} %-5p [%pid] [%t] [%logger#%M:%L] - %m`
         const std::regex re(
             R"(^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} INFO  \[[0-9]+\] \[ConsumeMessageThread_0\] \[test_logging\.cpp:(\d+)\] - )");
         std::smatch m;

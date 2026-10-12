@@ -1,9 +1,3 @@
-//! 消费侧统计（对应 `python/client/consumer_stats.py`，即 Java
-//! `org.apache.rocketmq.client.stat.ConsumerStatsManager` 与
-//! `org.apache.rocketmq.common.stats.{StatsItem,StatsItemSet,StatsSnapshot}`）。
-//!
-//! Java 真实模型（5.5.1 源码逐条核对，**不是**按名字想象的"每分钟一个桶"）：
-//!
 //! * [`StatsItem`] 持有**累计值** value / times（只增不减），以及两条采样快照链：
 //!   `minute`（每 10s 采一个累计点）与 `hour`（每 10 分钟采一个累计点）；
 //! * 快照计算 [`compute_stats_data`]（StatsItem.java:53-79）：
@@ -14,28 +8,6 @@
 //!   timesDiff = last.times - first.times
 //!   avgpt     = timesDiff > 0 ? sum / timesDiff : 0  # "每次调用的平均量"——RT 项即平均耗时
 //!   ```
-//!
-//! * TPS 类计数（PULL_TPS 等）走 `add_value(key, msgs, 1)`：value 累加**消息数**、
-//!   times 累加**调用次数** → tps = 调用次数/秒；
-//! * RT 类计数（PULL_RT 等）同样 `add_value(key, rt, 1)`（Java 的 `addRTValue`）：
-//!   value 累加耗时、times 累加次数 → avgpt = 平均耗时（毫秒）；
-//! * [`ConsumerStatsManager::consume_status`] 全部取 **minute** 快照：pullRT/consumeRT 用
-//!   avgpt，pullTPS/consumeOKTPS/consumeFailedTPS 用 tps，consumeFailedMsgs 取 failed 的
-//!   **hour** 窗口 sum（Java 特意跨窗口取数，照抄）。
-//!
-//! 与 Java / Python 的**有意差异**（语义不变）：
-//! 1. Java 给每个 StatsItem 单独排 10s/10min 的采样任务，Python/本模块由 manager 的
-//!    **一个**采样任务统一巡采（10s 一轮，每 60 轮即 10 分钟做一次小时级）；
-//! 2. Python 用 daemon 线程 + `Event.wait()`，这里用 `tokio::time::interval_at`
-//!    （先等后采，与 `_stop.wait(10)` 一致）+ `Notify` 退出，采样周期与小时轮次都可注入，
-//!    单测在毫秒级跑完；采样任务只持 `Weak<Inner>`，manager 被丢弃后自行退出
-//!    （对应 Python 的 daemon 线程不会拖住进程退出）；
-//! 3. `shutdown()` 不 join（Rust 同步上下文里不能 block_on），改为"置位 + 唤醒 + abort"，
-//!    等价于 Python 的 `join(timeout=3)` 但永不阻塞；
-//! 4. Java 的 tps 除法**没有**除零保护（span 为 0 时是 Infinity/NaN），Python 加了
-//!    `span_ms > 0` 判断，这里跟随 Python；
-//! 5. `StatsItemSet::keys()` 返回**字典序**（C++ 用 `std::map`、本模块用 `BTreeMap`），
-//!    Python 是插入序 —— 巡采结果与顺序无关。
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -51,11 +23,8 @@ use crate::error::Result;
 use crate::remoting::protocol::body::ConsumeStatus;
 use crate::{bail, rmq_debug};
 
-/// 采样参数（Java StatsItem.init 的 `scheduleAtFixedRate(..., 0, 10, SECONDS)`）。
 pub const SAMPLING_INTERVAL_SECONDS: f64 = 10.0;
-/// 小时级快照间隔（Java `scheduleAtFixedRate(..., 0, 10, MINUTES)` = 600s）。
 pub const HOUR_SAMPLING_INTERVAL_SECONDS: f64 = 600.0;
-/// 分钟快照链长度（Java csListMinute 最多约 60 个点 ≈ 10 分钟窗口）。
 pub const MINUTE_LIST_MAX: usize = 60;
 /// 小时快照链长度。
 pub const HOUR_LIST_MAX: usize = 60;
@@ -63,7 +32,6 @@ pub const HOUR_LIST_MAX: usize = 60;
 pub const HOUR_SAMPLING_ROUNDS: u64 =
     (HOUR_SAMPLING_INTERVAL_SECONDS / SAMPLING_INTERVAL_SECONDS) as u64;
 
-/// 一个采样点：`(timestamp_ms, 累计 value, 累计 times)`（Java `CallSnapshot`）。
 pub type CallSnapshot = (i64, i64, i64);
 
 /// 锁中毒时照常取内值 —— 统计路径绝不允许 panic 把业务线程带下去。
@@ -71,7 +39,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 对应 Java `StatsSnapshot`：sum / tps / avgpt / times。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct StatsSnapshot {
     /// 窗口内的累计增量。
@@ -95,12 +62,10 @@ impl fmt::Display for StatsSnapshot {
     }
 }
 
-/// Java `StatsItem.computeStatsData` 逐条照抄（StatsItem.java:53-79）。
 pub fn compute_stats_data(cs_list: &[CallSnapshot]) -> StatsSnapshot {
     compute_stats_data_pair(cs_list.first(), cs_list.last())
 }
 
-/// 同上，但只喂首尾两点 —— 链在 Rust 侧是 `VecDeque`，而 Java/Python 也只用到 first/last。
 fn compute_stats_data_pair(first: Option<&CallSnapshot>, last: Option<&CallSnapshot>) -> StatsSnapshot {
     let mut ss = StatsSnapshot::default();
     let (first, last) = match (first, last) {
@@ -120,7 +85,6 @@ fn compute_stats_data_pair(first: Option<&CallSnapshot>, last: Option<&CallSnaps
     ss
 }
 
-/// 单项统计：累计 value/times + 分钟/小时两级采样链（Java `StatsItem`）。
 #[derive(Debug)]
 pub struct StatsItem {
     stats_name: String,
@@ -157,7 +121,6 @@ impl StatsItem {
         &self.stats_key
     }
 
-    /// 对应 Python `add_value`（Java `addValue` / `addRTValue`）：累计值只增不减。
     pub fn add_value(&self, inc_value: i64, inc_times: i64) {
         let mut state = lock(&self.state);
         state.value += inc_value;
@@ -210,13 +173,11 @@ impl StatsItem {
         }
     }
 
-    /// 分钟窗口快照（Java `getStatsDataInMinute`）。
     pub fn get_stats_data_in_minute(&self) -> StatsSnapshot {
         let state = lock(&self.state);
         compute_stats_data_pair(state.minute.front(), state.minute.back())
     }
 
-    /// 小时窗口快照（Java `getStatsDataInHour`）。
     pub fn get_stats_data_in_hour(&self) -> StatsSnapshot {
         let state = lock(&self.state);
         compute_stats_data_pair(state.hour.front(), state.hour.back())
@@ -233,8 +194,6 @@ impl StatsItem {
     }
 }
 
-/// key -> StatsItem（对应 Java `StatsItemSet`；key = `topic@group`）。
-///
 /// `Clone` 是**同一张表**的另一个句柄（内部 `Arc<Mutex<BTreeMap>>`），
 /// 所以 manager 可以把某个 set 交给调用方长期持有。
 #[derive(Clone)]
@@ -261,7 +220,6 @@ impl StatsItemSet {
         }
     }
 
-    /// 统计名（Java 的 `statsName`，如 `CONSUME_OK_TPS`）。
     pub fn stats_name(&self) -> &str {
         &self.stats_name
     }
@@ -372,8 +330,6 @@ struct Inner {
     hour_every_rounds: u64,
 }
 
-/// 消费统计管理器（Java `ConsumerStatsManager`）。
-///
 /// 五个 [`StatsItemSet`]，key 一律是 `topic@group`：
 /// PULL_RT / PULL_TPS / CONSUME_RT / CONSUME_OK_TPS / CONSUME_FAILED_TPS。
 /// [`ConsumerStatsManager::start`] 起一个统一采样任务（10s 分钟级 + 每 60 轮即 10 分钟做小时级）。
@@ -504,14 +460,12 @@ impl ConsumerStatsManager {
         }
     }
 
-    // ---------------- 记数（Java ConsumerStatsManager 同名方法） ----------------
 
     /// Python `_key(topic, group)`：`"%s@%s" % (topic, group)`，注意是 **topic 在前**。
     pub fn key(topic: &str, group: &str) -> String {
         format!("{topic}@{group}")
     }
 
-    /// 对应 Java `incPullRT`：value 累加耗时、times 累加 1。
     pub fn inc_pull_rt(&self, group: &str, topic: &str, rt: i64) {
         self.inner
             .sets
@@ -519,7 +473,6 @@ impl ConsumerStatsManager {
             .add_value(&Self::key(topic, group), rt, 1);
     }
 
-    /// 对应 Java `incPullTPS`：value 累加**消息数**、times 累加 1。
     pub fn inc_pull_tps(&self, group: &str, topic: &str, msgs: i64) {
         self.inner
             .sets
@@ -527,7 +480,6 @@ impl ConsumerStatsManager {
             .add_value(&Self::key(topic, group), msgs, 1);
     }
 
-    /// 对应 Java `incConsumeRT`。
     pub fn inc_consume_rt(&self, group: &str, topic: &str, rt: i64) {
         self.inner
             .sets
@@ -535,7 +487,6 @@ impl ConsumerStatsManager {
             .add_value(&Self::key(topic, group), rt, 1);
     }
 
-    /// 对应 Java `incConsumeOKTPS`。
     pub fn inc_consume_ok_tps(&self, group: &str, topic: &str, msgs: i64) {
         self.inner
             .sets
@@ -543,7 +494,6 @@ impl ConsumerStatsManager {
             .add_value(&Self::key(topic, group), msgs, 1);
     }
 
-    /// 对应 Java `incConsumeFailedTPS`。
     pub fn inc_consume_failed_tps(&self, group: &str, topic: &str, msgs: i64) {
         self.inner
             .sets
@@ -578,11 +528,6 @@ impl ConsumerStatsManager {
         self.inner.sets.topic_and_group_consume_failed_tps.clone()
     }
 
-    /// Java `ConsumerStatsManager.consumeStatus`：全部取 minute 快照；
-    /// `consumeFailedMsgs` 取 failed 的 **hour** 窗口 sum（Java 特意跨窗口，照抄）。
-    ///
-    /// 返回的是既有的 [`ConsumeStatus`]（`remoting::protocol::body`，即 Java 的
-    /// `ConsumerRunningInfo.statusTable` 的 value），**没有**再造第二个 ConsumeStatus 类型。
     pub fn consume_status(&self, group: &str, topic: &str) -> ConsumeStatus {
         let key = Self::key(topic, group);
         let mut cs = ConsumeStatus::default();
@@ -698,7 +643,6 @@ mod tests {
 
     #[test]
     fn single_point_has_zero_span_and_zero_tps() {
-        // 只有一个点：span=0 -> tps=0（Python 的 span_ms > 0 保护；Java 会给 Infinity）
         let ss = compute_stats_data(&[(1_000, 5, 1)]);
         assert_eq!(ss.sum, 0);
         assert!(almost(ss.tps, 0.0));

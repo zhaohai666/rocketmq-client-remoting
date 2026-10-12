@@ -1,5 +1,3 @@
-// Fair back-pressure semaphore for the async send path (Java
-// DefaultMQProducerImpl:122-153, `new Semaphore(permits, true)`).
 package client
 
 import (
@@ -7,29 +5,9 @@ import (
 	"time"
 )
 
-// fairSemaphore is Java's `new Semaphore(permits, true)` — a FAIR counting
-// semaphore. Fairness is the whole point of the async back-pressure: without it
-// a producer that keeps submitting can overtake older waiters indefinitely,
-// which is exactly why Java passes `true` explicitly. So only the HEAD of the
-// queue may be granted; a later request is not allowed to cut in even when
-// enough permits happen to be free (Java's fair `tryAcquire(permits, …)` also
-// only inspects the head for a multi-permit request).
-//
-// It also does something Java does not offer directly: setTotalPermits shifts
-// the total on the SAME object. Java resizes at runtime by replacing the whole
-// Semaphore (`new Semaphore(num - acquired), DefaultMQProducer:1383-1391`),
-// leaning on its ReadWriteCASLock so that no thread is blocked on the old
-// object at the instant of the swap — otherwise those waiters would never be
-// woken by the new object and would just sit out their own timeout. Keeping all
-// state behind one mutex removes the need for that read-write lock:
-//
 //   - resizing and acquire/release are mutually exclusive inside the object;
 //   - resizing never strands a waiter on a stale object: it carries on waiting
 //     with the new total.
-//
-// The observable outcome matches Java — in-flight permits are preserved and the
-// free permits become newTotal - inFlight, which is precisely the sum Java's own
-// DefaultMQProducerTest:593-595 asserts.
 type fairSemaphore struct {
 	mu      sync.Mutex
 	total   int
@@ -49,9 +27,6 @@ func newFairSemaphore(permits int) *fairSemaphore {
 	return &fairSemaphore{total: permits, free: permits}
 }
 
-// tryAcquire is Java `tryAcquire(permits, timeout, MILLIS)`: it reports failure
-// instead of raising (Java only throws when the thread is interrupted).
-//
 // ⚠ BOTH exits — taking the permits and giving up — must wake the queue again.
 // Under fairness only the head may proceed, so when the head changes the
 // request behind it can go from "not my turn" to "my turn" without the permit
@@ -104,9 +79,6 @@ func (s *fairSemaphore) tryAcquire(permits int, timeoutMillis int64) bool {
 	return false
 }
 
-// release is Java `release(permits)`. It may exceed the total (Java does not
-// validate either), so a few extra releases inside a shrink window cannot lose
-// count.
 func (s *fairSemaphore) release(permits int) {
 	if permits <= 0 {
 		return
@@ -123,9 +95,6 @@ func (s *fairSemaphore) availablePermits() int {
 	return s.free
 }
 
-// setTotalPermits shifts the total to `total`, preserving the in-flight permits.
-// The free count may go NEGATIVE — Java's `new Semaphore(negative)` accepts that
-// too, and returning the outstanding permits pulls it back positive.
 func (s *fairSemaphore) setTotalPermits(total int) {
 	s.mu.Lock()
 	s.free += total - s.total
@@ -140,9 +109,6 @@ func (s *fairSemaphore) totalPermits() int {
 	return s.total
 }
 
-// waitingCount is Java Semaphore#getQueueLength. Fairness can only be argued
-// from "who is queued where", so without this the tests could do nothing but
-// guess the order with sleeps.
 func (s *fairSemaphore) waitingCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

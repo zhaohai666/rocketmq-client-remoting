@@ -1,5 +1,3 @@
-// -*- coding: utf-8 -*-
-// Exception hierarchy (mirrors org.apache.rocketmq.remoting.exception / client.exception).
 
 export class RemotingException extends Error {
   constructor(message) { super(message); this.name = 'RemotingException'; }

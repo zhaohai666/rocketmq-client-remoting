@@ -1,17 +1,3 @@
-// Lite-pull-consumer tests against the same mock cluster as consumer_test.go.
-// The assertions target the three places a lite port silently diverges from
-// Java:
-//
-//   - the WIRE: lite pulls go out as LITE_PULL_MESSAGE(361) carrying the
-//     FLAG_LITE_PULL_MESSAGE bit, a SUBSCRIPTION bit with the expression, and
-//     NO suspend / commitOffset bits (a short poll with no inline commit);
-//   - the TWO CURSORS: the pull cursor follows nextBeginOffset after every
-//     status (FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL) while the
-//     consume cursor moves only when Poll delivers — collapsing them skips or
-//     duplicates messages across a restart;
-//   - the COMMIT TABLE: commit scope is a SWEEP (Java persistAll removes every
-//     cell outside the given set), a -1 cursor never reaches the wire, and a
-//     queue with no cursor is simply absent from commitAll.
 package client
 
 import (
@@ -35,9 +21,6 @@ func newLiteConsumer(t *testing.T, f *clusterFixture, group string) *DefaultLite
 	return c
 }
 
-// liteClientID is the clientId the lite consumer computes for the fixture's
-// instance (every Java lite constructor enables the stream request type, so
-// the @STREAM suffix is part of the group-membership identity).
 func liteClientID(f *clusterFixture) string {
 	return common.ClientIDFor(f.instName, "", true)
 }
@@ -384,9 +367,6 @@ func TestLitePullConsumerCommitPaths(t *testing.T) {
 		t.Fatalf("pending commit after no-op commits = %d, want 7", got)
 	}
 
-	// commitAll scopes persistAll to the CURSOR HOLDERS: q0 commits 3, and the
-	// sweep REMOVES q1's untouched 7 without ever sending it — Java's "offset
-	// is not in mqs, remove it".
 	if err := c.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
@@ -422,7 +402,6 @@ func TestLitePullConsumerCommitPaths(t *testing.T) {
 		t.Fatalf("q0 commit = %+v found=%v, want offset 3", commit, ok)
 	}
 
-	// Java commits whatever the CALLER names, assigned or not.
 	foreign := common.MessageQueue{Topic: "T", BrokerName: "b1", QueueID: 9}
 	if err := c.CommitOffsets(map[common.MessageQueue]int64{foreign: 5}, true); err != nil {
 		t.Fatalf("CommitOffsets foreign: %v", err)
@@ -433,9 +412,6 @@ func TestLitePullConsumerCommitPaths(t *testing.T) {
 	}
 }
 
-// AssignDropsRevokedCursors: pure-state, no cluster needed — Assign removes a
-// queue's whole cursor state but keeps queues it still holds (Java's
-// MessageQueueState removal vs the containsKey guard on the resolve side).
 func TestLitePullConsumerAssignDropsRevokedCursors(t *testing.T) {
 	c := MustNewDefaultLitePullConsumer("GID_lite_drop")
 	mq0 := common.MessageQueue{Topic: "T", BrokerName: "b1", QueueID: 0}

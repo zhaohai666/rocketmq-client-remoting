@@ -1,7 +1,3 @@
-// Offset store tests: the remote store's broker round trips against the mock
-// cluster (putIfAbsent, QUERY_NOT_FOUND, PersistAll's unused-queue sweep) and
-// the local file store's Java-format compatibility (golden shape, .bak roll,
-// .bak fallback, legacy keys, corruption).
 package client
 
 import (
@@ -119,8 +115,6 @@ func TestRemoteOffsetStorePersistAllDropsUnused(t *testing.T) {
 		header.CommitOffset == nil || *header.CommitOffset != 5 {
 		t.Errorf("commit payload mismatch: %+v", header)
 	}
-	// Rebalanced-away queues leave the table; a NAMED queue keeps its slot
-	// even when its offset was negative (Java's `!mqs.contains(mq)` sweep).
 	table := store.Table()
 	if _, ok := table[mq1]; ok {
 		t.Errorf("unused queue must be dropped from the table")
@@ -279,7 +273,6 @@ func TestLocalOffsetStoreIncreaseOnly(t *testing.T) {
 	if offset, _ := store.ReadOffset(mq, ReadFromMemory); offset != 5 {
 		t.Fatalf("increaseOnly must keep the max, got %d", offset)
 	}
-	// Writing without increaseOnly still lowers (Java updateOffset without the flag).
 	store.UpdateOffset(mq, 1, false)
 	if offset, _ := store.ReadOffset(mq, ReadFromMemory); offset != 1 {
 		t.Fatalf("plain update must overwrite, got %d", offset)

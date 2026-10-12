@@ -1,5 +1,3 @@
-// 心跳数据（对应 org.apache.rocketmq.remoting.protocol.heartbeat.*）。
-//
 // 用途：生产者/消费者按固定间隔向**所有** broker 发 HEART_BEAT，body 即
 // HeartbeatData 的 JSON。broker 据此注册/刷新 client channel、消费组订阅与
 // 生产者组，并创建重试 topic。
@@ -34,24 +32,18 @@
 
 namespace rocketmq {
 
-// org.apache.rocketmq.remoting.protocol.heartbeat.ConsumeType
 struct ConsumeType {
     static const char* const CONSUME_ACTIVELY;   // "CONSUME_ACTIVELY"
     static const char* const CONSUME_PASSIVELY;  // "CONSUME_PASSIVELY"
     static const char* const CONSUME_POP;        // "CONSUME_POP"
 };
 
-// org.apache.rocketmq.remoting.protocol.heartbeat.MessageModel
 struct MessageModel {
     static const char* const BROADCASTING;     // "BROADCASTING"
     static const char* const CLUSTERING;       // "CLUSTERING"
     static const char* const LITE_SELECTIVE;   // "LITE_SELECTIVE"
 };
 
-// org.apache.rocketmq.common.consumer.ConsumeFromWhere
-// ⚠ 带注释的三个是协议里的 @Deprecated 值（枚举序由协议定义约定）：
-// 它们与 CONSUME_FROM_LAST_OFFSET 落同一分支 —— 即"按最后位点"的兜底语义。
-// 本端口用字符串常量，缺省分支（非 FIRST/TIMESTAMP）天然就是这个兜底。
 struct ConsumeFromWhere {
     static const char* const CONSUME_FROM_LAST_OFFSET;  // "CONSUME_FROM_LAST_OFFSET"
     // @Deprecated：与 CONSUME_FROM_LAST_OFFSET 同分支

@@ -182,10 +182,6 @@ func main() {
 		forbidden != nil && forbidden.Group == *groupA && forbidden.Topic == *topicA,
 		fmt.Sprintf("got=%+v", forbidden))
 
-	// ---- 4. RESUME_CHECK_HALF_MESSAGE(323) ----------------------------------
-	// Java maps any non-SUCCESS reply to false instead of raising, so a
-	// well-formed call on a message that is not a half message is the
-	// interesting case: it must come back as false WITHOUT an error.
 	resumed, err := admin.ResumeCheckHalfMessage(masterAddr, *topicA, "0A0F0000000000000000000000000000000000")
 	if err != nil {
 		check("恢复半消息(323) 非半消息返回 false 而非报错", false, err.Error())

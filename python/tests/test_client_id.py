@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""clientId 口径与 Java `ClientConfig#buildMQClientId` 对齐的回归测试。
-
-Java 的默认 clientId 是 ``<本机 IP>@<instanceName>``，并且 ``instanceName`` 还是默认值
-``DEFAULT`` 时会在 ``start()`` 里被就地改写成 ``<pid>#<nanoTime>``。换掉旧的
-``<instanceName>@<秒级时间戳>`` 不只是好看：秒级时间戳会让同一秒内创建的两个客户端
-算出同一个 clientId，在 ``MQClientInstance.INSTANCE_MAP`` 里互相覆盖。
-"""
 from __future__ import annotations
 
 import re
@@ -22,7 +15,6 @@ from remoting.protocol.heartbeat import MessageModel
 
 # <IP>@<pid>#<纳秒>
 CLIENT_ID_PATTERN = re.compile(r"^[^@\s]+@%d#\d+$" % MixAll.pid())
-# 拉取/轻量消费者多一段 @STREAM（Java 的构造函数恒开 enableStreamRequestType）
 STREAM_CLIENT_ID_PATTERN = re.compile(r"^[^@\s]+@%d#\d+@STREAM$" % MixAll.pid())
 
 
@@ -33,14 +25,13 @@ def _split(client_id: str):
 
 
 class TestMixAllClientId:
-    """纯字符串部分（对应 Java `ClientConfig` 的两个方法）。"""
+    pass
 
     def test_build_mq_client_id_is_ip_first(self):
         assert MixAll.build_mq_client_id("10.0.0.1", "inst") == "10.0.0.1@inst"
 
     def test_unit_name_suffix(self):
         assert MixAll.build_mq_client_id("10.0.0.1", "inst", "unit-a") == "10.0.0.1@inst@unit-a"
-        # Java `UtilAll.isBlank(unitName)`：空白等同于没有
         assert MixAll.build_mq_client_id("10.0.0.1", "inst", "   ") == "10.0.0.1@inst"
         assert MixAll.build_mq_client_id("10.0.0.1", "inst", None) == "10.0.0.1@inst"
 
@@ -48,7 +39,6 @@ class TestMixAllClientId:
         assert MixAll.change_instance_name_to_pid("inst") == "inst"
         rewritten = MixAll.change_instance_name_to_pid(MixAll.DEFAULT_INSTANCE_NAME)
         assert rewritten.startswith("%d#" % MixAll.pid()), rewritten
-        # Java 是就地覆盖字段，第二次调用不许再换一个名字（否则重启换 clientId）
         assert MixAll.change_instance_name_to_pid(rewritten) == rewritten
 
     def test_cached_ip_str_is_stable(self):
@@ -117,15 +107,13 @@ class TestProducerClientId:
 
 
 class TestConsumerClientId:
-    """消费者只有 CLUSTERING 才改写 instanceName（Java 的三个 impl 都是这个条件）。"""
+    pass
 
     def test_push_clustering_rewrites_and_broadcast_does_not(self):
         clustering = DefaultMQPushConsumer("CID_clientid_clustering")
         clustering.set_namesrv_addr("127.0.0.1:1")
         clustering.subscribe("T", "TagA")
         clustering.set_message_listener(lambda msgs: None)
-        # 推送消费者是这几个 facade 里唯一「同步刷路由」的：`127.0.0.1:1` 上没 broker，
-        # start() 必然在盖完 clientId 之后抛连接异常（Java 也是先定 clientId 再碰网络）。
         with pytest.raises(RemotingConnectException):
             clustering.start()
         try:
@@ -147,9 +135,7 @@ class TestConsumerClientId:
             broadcast.shutdown()
 
     def test_pull_and_lite_follow_the_same_rule(self):
-        """拉取/轻量消费者的 clientId 多一段 `@STREAM`：Java 在它们的构造函数里
-        就把 enableStreamRequestType 置真（DefaultMQPullConsumer:113、
-        DefaultLitePullConsumer:213），推送消费者和生产者则不会。"""
+        pass
         pull = DefaultMQPullConsumer("CID_clientid_pull")
         pull.set_namesrv_addr("127.0.0.1:1")
         pull.start()
@@ -178,8 +164,7 @@ class TestConsumerClientId:
             lite_broadcast.shutdown()
 
     def test_stream_suffix_can_be_turned_off_and_on(self):
-        """开关是 ClientConfig 上的字段，两边都能显式设：关掉退化成 Java 的推送口径，
-        打开则让同一 instanceName 的推送消费者落在另一个 clientId 上。"""
+        pass
         off = DefaultMQPullConsumer("CID_clientid_stream_off")
         off.set_instance_name("stream-switch")
         off.set_enable_stream_request_type(False)
@@ -205,12 +190,10 @@ class TestConsumerClientId:
 
 
 class TestUnitNameClientId:
-    """unitName 是 clientId 的第三段：Java `ClientConfig#buildMQClientId` 只在
-    `UtilAll.isBlank` 为假时拼它，拼的还是原值而不是 trim 后的值。"""
+    pass
 
     def test_pure_string_part(self):
         assert MixAll.build_mq_client_id("10.0.0.1", "inst", "unit-a") == "10.0.0.1@inst@unit-a"
-        # 空白 = 没有（Java 的 isBlank 认 \t/\n/空格）
         assert MixAll.build_mq_client_id("10.0.0.1", "inst", "   ") == "10.0.0.1@inst"
         assert MixAll.build_mq_client_id("10.0.0.1", "inst", None) == "10.0.0.1@inst"
         # 两段后缀顺序固定：先 unitName 再 STREAM
@@ -285,7 +268,7 @@ class TestUnitNameClientId:
 
 class TestAdminClientId:
     def test_admin_keeps_its_own_instance_name(self):
-        """Java 的 admin 也调用 changeInstanceNameToPID，但本客户端默认名是 ADMIN 不是 DEFAULT。"""
+        pass
         admin = DefaultMQAdminExt()
         admin.set_namesrv_addr("127.0.0.1:1")
         admin.start()

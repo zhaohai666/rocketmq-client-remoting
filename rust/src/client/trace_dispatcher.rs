@@ -163,9 +163,6 @@ fn format_trace_producer_group(
     )
 }
 
-/// Python `AsyncTraceDispatcher._INSTANCE_NUM = itertools.count(0)`（`trace_dispatcher.py:69`）：
-/// 进程级实例序号，**从 0 开始**（Java `INSTANCE_NUM.getAndIncrement()`，
-/// `AsyncTraceDispatcher.java:57` + `:60`）。
 fn next_instance_id() -> u64 {
     static INSTANCE_NUM: AtomicU64 = AtomicU64::new(0);
     INSTANCE_NUM.fetch_add(1, Ordering::AcqRel)
@@ -184,21 +181,7 @@ pub type TraceProducerFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'stati
 /// 内部轨迹生产者接缝（对应 Python 的 `self.trace_producer`，一个
 /// `enable_trace=False` 的 `DefaultMQProducer`）。
 ///
-/// 方法集严格等于 Python 真正打到内部生产者上的调用，逐条：
-/// * [`Self::set_send_msg_timeout`] / [`Self::set_max_message_size`] /
-///   [`Self::set_enable_trace`] ← `trace_dispatcher.py:101-104`（构造时）
-///   （Java `getAndCreateTraceProducer`，`AsyncTraceDispatcher.java:167-178`；
-///   Java 还多了 `setVipChannelEnabled(false)`，Python 无 VIP 通道概念）；
-/// * [`Self::set_name_server_addr`] / [`Self::set_instance_name`] /
-///   [`Self::set_enable_trace`] / [`Self::start`] ← `trace_dispatcher.py:130-134`；
-/// * [`Self::shutdown`] ← `trace_dispatcher.py:155`；
-/// * [`Self::send`] ← `trace_dispatcher.py:260`（`producer.send(msg, 5000)`）；
-/// * [`Self::send_to_queue`] ← 见模块差异 2（Python 的 `send_by_selector` 落点）；
-/// * [`Self::publish_queues`] ← `trace_dispatcher.py:275-277`
-///   （`producer._topic_publish_info(topic).msg_queue_list`）。
 ///
-/// ⚠ **实现方必须保证自身不再产生轨迹**（Python `set_enable_trace(False)`，
-/// `trace_dispatcher.py:104` / `:133`；Java 同名），否则轨迹会自我复制到无限。
 ///
 /// 对象安全：需要 `await` 的方法用 `self: Arc<Self>` 接收者 + 装箱 future。
 pub trait TraceProducer: Send + Sync {
@@ -208,18 +191,11 @@ pub trait TraceProducer: Send + Sync {
     /// Python `producer.set_instance_name(...)`（`trace_dispatcher.py:131-132`）。
     fn set_instance_name(&self, instance_name: &str);
 
-    /// Java `AsyncTraceDispatcher#start` 的 `traceProducer.setNamespaceV2(namespaceV2)`
-    /// （`AsyncTraceDispatcher.java:155`）：Python 没有这一行（其 `namespace_v2`
-    /// 是死状态，见模块差异 15），值来自
-    /// [`AsyncTraceDispatcher::set_namespace_v2`]，只在**非空**时被调用。
     fn set_namespace_v2(&self, namespace_v2: &str);
 
     /// Python `producer.set_send_msg_timeout(5000)`（`trace_dispatcher.py:101`）。
     fn set_send_msg_timeout(&self, timeout_millis: i64);
 
-    /// Python `producer.set_max_message_size(self.max_msg_size)`
-    /// （`trace_dispatcher.py:102`）。参数用 `usize` 与本模块的
-    /// [`AsyncTraceDispatcher::max_msg_size`] 同宽（实现方自行窄化成 Java 的 `int`）。
     fn set_max_message_size(&self, max_msg_size: usize);
 
     /// Python `producer.set_enable_trace(False)`（`trace_dispatcher.py:104` / `:133`）。
@@ -253,10 +229,6 @@ pub trait TraceProducer: Send + Sync {
         timeout_millis: i64,
     ) -> TraceProducerFuture<Result<()>>;
 
-    /// Python `producer._topic_publish_info(topic).msg_queue_list`
-    /// （`trace_dispatcher.py:275-276`，实现在 `producer.py:591-603`，
-    /// Java `tryGetMessageQueueBrokerSet` 走的是同一份路由缓存）。
-    /// 拿不到路由 ⇒ `Err`（Python 抛异常，由调用方 `except` 吞掉）。
     fn publish_queues(
         self: Arc<Self>,
         topic: String,
@@ -266,10 +238,6 @@ pub trait TraceProducer: Send + Sync {
 /// [`TraceProducer`] 的「未接线」实现（模块差异 1）：什么都不发，只记日志。
 /// Python 在 `__init__` 里总会自己 new 一个内部生产者（`trace_dispatcher.py:95`），
 /// Rust 改为注入，未注入时用本类型兜底。
-///
-/// 注入真实生产者之前用它，行为 = 轨迹链路断开（`start` 返回 `Err`、发送返回 `Err`），
-/// 调用方（Python `producer._start_trace_dispatcher` 的 `except`）记 warning，
-/// 与「轨迹起不来但不影响业务发送」的 Java/Python 语义一致。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DisabledTraceProducer;
 
@@ -337,11 +305,6 @@ impl TraceProducer for DisabledTraceProducer {
 
 /// 分发器宿主（Python 里是 `host_producer` / `host_consumer` 两个裸对象，
 /// `trace_dispatcher.py:87-88` + `:114-118`）。
-///
-/// Python 从宿主上**只读一件事**：`host._mq_client.client_id`
-/// （`_client_id`，`trace_dispatcher.py:120-124`；Java 是
-/// `getHostProducer().getMqClientFactory().getClientId()`）。所以这里不搬
-/// `DefaultMQProducerImpl` / `DefaultMQPushConsumerImpl`，只声明 clientId 接缝。
 pub trait TraceHost: Send + Sync {
     /// Python `host._mq_client.client_id`。
     fn client_id(&self) -> String;
@@ -366,23 +329,16 @@ pub struct TraceDispatcherConfig {
     /// 现生成（Python 构造函数里 `_gen_group_name_for_trace()`，`:95` + `:107-109`）。
     /// 注入生产者时应当把当初建生产者用的同一个名字传进来，以免进程级计数器多走一格。
     pub trace_producer_group: Option<String>,
-    /// Python `self.batch_num = min(batch_num, 20)`（`:75`，Java 注释「max value 20」）。
     pub batch_num: usize,
-    /// Python `self.trace_topic_name = trace_topic_name or MixAll.TRACE_TOPIC`（`:92`）。
-    /// `None` **与空串都**回落到默认轨迹 topic（Python 的 `or` 语义，Java 用
-    /// `UtilAll.isBlank` —— 纯空白串在 Python 里会被原样保留，这里跟 Python）。
     pub trace_topic_name: Option<String>,
     /// Python `self.max_msg_size = 128000`（`:76`）。
     pub max_msg_size: usize,
     /// Python `producer.set_send_msg_timeout(5000)`（`:101`）与
     /// `send` / `send_by_selector` 的 `5000`（`:260` / `:263`）—— 同一个常量。
     pub send_msg_timeout_millis: i64,
-    /// Python `FLUSH_TRACE_INTERVAL = 5000`（`:71`，Java `flushTraceInterval`，
-    /// `AsyncTraceDispatcher.java:80`）。
     pub flush_trace_interval_millis: i64,
     /// Python `WAIT_FOR_SHUTDOWN = 5000`（`:70`；见模块差异 5）。
     pub wait_for_shutdown_millis: u64,
-    /// Python `queue.Queue(maxsize=2048)`（`:80`，Java `ArrayBlockingQueue(2048)`）。
     pub queue_capacity: usize,
 }
 
@@ -431,10 +387,6 @@ impl std::fmt::Debug for TraceDispatcherConfig {
 
 // ================================================================ 选择器
 
-/// 只在指定 broker 集合里轮询选队列（对应 Python `_BrokerSetSelector`，
-/// `trace_dispatcher.py:48-62`；Java 是 `sendTraceDataByMQ` 里那个匿名
-/// `MessageQueueSelector`，`AsyncTraceDispatcher.java:389-403`）。
-///
 /// `counter` 就是宿主分发器的 `self._send_which_queue`（`trace_dispatcher.py:89`，
 /// `itertools.count(0)`）：Python 每次发送都新建一个选择器对象，但**计数器是共享的**，
 /// 所以轮询位置跨批次连续。
@@ -444,19 +396,12 @@ struct BrokerSetSelector {
 
 impl BrokerSetSelector {
     /// Python `_BrokerSetSelector.select`（`:54-62`）。
-    ///
-    /// `None` 只在 `mqs` 整体为空时出现 —— Python 会退化到全量列表再 `% len(filtered)`
-    /// 抛 `ZeroDivisionError`，被 `_send_trace_data_by_mq` 的 `except` 记成发送失败；
-    /// 这里用 `None` 表达同一结果。Java 则是 `filterMqs.get(pos)` 越界抛
-    /// `IndexOutOfBoundsException`（`AsyncTraceDispatcher.java:400-401`）。
     fn select(&self, mqs: &[MessageQueue], broker_set: &HashSet<String>) -> Option<MessageQueue> {
         let mut filtered: Vec<&MessageQueue> = mqs
             .iter()
             .filter(|q| broker_set.contains(&q.broker_name))
             .collect();
         if filtered.is_empty() {
-            // Python `:57-60`：过滤后为空 ⇒ 退化为全量轮询（比 Java 的越界异常更安全，
-            // 语义上等价于「没有跨集群过滤需求」）。
             filtered = mqs.iter().collect();
         }
         if filtered.is_empty() {
@@ -520,9 +465,6 @@ struct Inner {
     pending: Mutex<Vec<JoinHandle<()>>>,
     /// Python `self.trace_producer`（`:95`）。
     trace_producer: Arc<dyn TraceProducer>,
-    /// Java `AsyncTraceDispatcher#namespaceV2`（`AsyncTraceDispatcher.java:86`，
-    /// `start()` 里 `:155` 透给内部生产者；Python 的 `:86` 是死状态，见模块差异 15）。
-    /// 空串 = 未配置，`start()` 跳过透传。
     namespace_v2: Mutex<String>,
     /// Python `self.host_producer` / `self.host_consumer`（`:87-88` + `:114-118`）。
     host_producer: Mutex<Option<Arc<dyn TraceHost>>>,
@@ -538,9 +480,6 @@ struct Inner {
     this: Weak<Inner>,
 }
 
-/// 轨迹异步分发器（对应 Python `AsyncTraceDispatcher` /
-/// Java `AsyncTraceDispatcher implements TraceDispatcher`）。
-///
 /// 用法（Python `producer._start_trace_dispatcher`，`producer.py:471-493`）：
 /// ```text
 /// let group = AsyncTraceDispatcher::next_trace_producer_group("GID_test", Produce);
@@ -668,10 +607,6 @@ impl AsyncTraceDispatcher {
         }
     }
 
-    /// Python `_gen_group_name_for_trace`（`:107-109`）／Java
-    /// `genGroupNameForTrace`（`AsyncTraceDispatcher.java:180-182`）：
-    /// `_INNER_TRACE_PRODUCER-<group>-<PRODUCE|CONSUME>-<N>`，`N` 是进程级自增。
-    ///
     /// 与实例方法版 [`Self::trace_producer_group`] 的区别：这里是**模块函数**，
     /// 让调用方能在构造内部生产者之前先把名字算出来（Python 是构造内部生产者时现算，
     /// 顺序无从外置 —— 见模块差异 1）。
@@ -718,10 +653,6 @@ impl AsyncTraceDispatcher {
             .store(max_msg_size, Ordering::Release);
     }
 
-    /// Java `AsyncTraceDispatcher#setNamespaceV2`（`AsyncTraceDispatcher.java:147-149`）：
-    /// 配置分发器内部生产者的 5.x 服务端命名空间。`start()` 时按 Java `:155`
-    /// 透传给内部生产者（`NamespaceRpcHook` 据此给轨迹请求加 `nsd`/`ns` 头）；
-    /// 空串 = 未配置（Python `:86` 的默认值），透传被跳过。
     pub fn set_namespace_v2(&self, namespace_v2: &str) {
         *self
             .inner
@@ -730,7 +661,6 @@ impl AsyncTraceDispatcher {
             .unwrap_or_else(|e| e.into_inner()) = namespace_v2.to_string();
     }
 
-    /// Java `AsyncTraceDispatcher#getNamespaceV2`（`AsyncTraceDispatcher.java:143-145`）。
     pub fn get_namespace_v2(&self) -> String {
         self.inner
             .namespace_v2
@@ -809,9 +739,6 @@ impl AsyncTraceDispatcher {
 
     // ---------------- 生命周期 ----------------
 
-    /// Python `start(name_srv_addr, access_channel=None)`（`:127-142`）／Java
-    /// `start(String, AccessChannel)`（`AsyncTraceDispatcher.java:151-165`）。
-    ///
     /// 顺序与 Python 逐行一致：锁内（`is_started` 为假时）设 namesrv / instanceName /
     /// `enable_trace=False` 并启动内部生产者 ⇒ 覆盖 `access_channel` ⇒
     /// worker 未起时拉起后台任务。`atexit.register(self.shutdown)`（`:142`）无等价物
@@ -838,9 +765,6 @@ impl AsyncTraceDispatcher {
                     "{}_{name_server_addr}",
                     TraceConstants::TRACE_INSTANCE_NAME
                 ));
-                // Java `:155`：`traceProducer.setNamespaceV2(namespaceV2)`。
-                // 未配置（空串）时跳过 —— Java 传 null 同样不产生任何线上效果
-                // （`NamespaceRpcHook` 的 isNotEmpty 守卫），见模块差异 15。
                 let namespace_v2 = self.get_namespace_v2();
                 if !namespace_v2.is_empty() {
                     self.inner.trace_producer.set_namespace_v2(&namespace_v2);
@@ -858,11 +782,6 @@ impl AsyncTraceDispatcher {
         Ok(())
     }
 
-    /// Python `shutdown()`（`:144-162`）的**优雅**版本：先 `flush()` 并等在途发送跑完
-    /// （上限 [`TraceDispatcherConfig::wait_for_shutdown_millis`]，对齐 Java
-    /// `ThreadUtils.shutdownGracefully`，模块差异 5），再执行与
-    /// [`TraceDispatcher::shutdown`] 完全相同的收尾。
-    ///
     /// 生产代码里 producer/consumer 移植层应优先用它（Python 的 `wait=False` 会让
     /// 最后一批轨迹与生产者关闭相互竞争）。
     pub async fn shutdown_gracefully(&self) {
@@ -877,12 +796,6 @@ impl AsyncTraceDispatcher {
 
     // ---------------- 入队 / 刷写 ----------------
 
-    /// Python `append(ctx)`（`:165-173`）／Java `append(Object)`
-    /// （`AsyncTraceDispatcher.java:184-191`）：把一个 [`TraceContext`] 入队；
-    /// 队列满时计数 + INFO 并返回 `false`（与 Java 一致，**不阻塞业务**）。
-    ///
-    /// 与 Java/Python 一致：**不看 `stopped`**（[`TraceReportSink::report`] 的注释里
-    /// 「已停止」只是实现方可选项，这里保留参考实现的语义）。
     pub fn append(&self, context: TraceContext) -> bool {
         match self.inner.push_context(context) {
             Some(rejected) => {
@@ -896,19 +809,10 @@ impl AsyncTraceDispatcher {
         }
     }
 
-    /// Python `flush()`（`:175-181`）／Java `flush()`
-    /// （`AsyncTraceDispatcher.java:193-202`）：强制把队列排空，**不等待**在途发送
-    /// （要等请用 [`Self::flush_and_wait`]）。
     pub fn flush(&self) {
         self.inner.flush();
     }
 
-    /// Python `flush()`（`trace_dispatcher.py:175-181`，= Java `flush()`
-    /// `AsyncTraceDispatcher.java:193-202`，两者都不等待）+ Java `shutdown()` 里那句
-    /// `ThreadUtils.shutdownGracefully(traceExecutor, WAIT_FOR_SHUTDOWN)`
-    /// （`AsyncTraceDispatcher.java:204-213`，Python 用的是 `wait=False`）：
-    /// 排空队列、提交批次，并等在途发送任务收敛（最多
-    /// [`TraceDispatcherConfig::wait_for_shutdown_millis`]，即 Python `:70` 的死常量）。
     pub async fn flush_and_wait(&self) {
         self.inner.flush_and_wait().await;
     }
@@ -921,9 +825,6 @@ impl AsyncTraceDispatcher {
 // 不依赖对外的 [`AsyncTraceDispatcher`] 句柄（模块差异 6）。
 
 impl Inner {
-    /// Python `_async_run`（`:183-188`）／Java `AsyncRunnable.run`
-    /// （`AsyncTraceDispatcher.java:249-266`）：后台循环。
-    ///
     /// 与 Python 同：每轮 `_flush_trace_context(False)`，本轮没刷出批次时睡 5ms
     /// （模块差异 7）；`stopped` 置位后退出。只持 `Weak`，宿主句柄全释放后自动退出
     /// （模块差异 6）。
@@ -942,9 +843,6 @@ impl Inner {
         }
     }
 
-    /// Python `_flush_trace_context(force_flush)`（`:190-205`）／Java
-    /// `flushTraceContext`（`AsyncTraceDispatcher.java:268-287`）。
-    ///
     /// 触发条件三者取其一：`force_flush`、队列长度 `>= batch_num`、
     /// 距上次刷写超过 `FLUSH_TRACE_INTERVAL`；每次最多取 `batch_num` 条。
     ///
@@ -975,10 +873,6 @@ impl Inner {
         0
     }
 
-    /// Python `_async_send_trace_message`（`:207-211`）／Java
-    /// `asyncSendTraceMessage`（`AsyncTraceDispatcher.java:289-293`）：
-    /// 空批次直接返回；**先**更新 `last_flush_time` 再提交（Python 就是这个顺序，
-    /// 影响下一轮的超时判定）。
     fn async_send_trace_message(&self, context_list: Vec<TraceContext>) {
         if context_list.is_empty() {
             return;
@@ -1162,14 +1056,6 @@ impl Inner {
 
     // ---------------- 发送 ----------------
 
-    /// Python `_send_trace_data`（`:214-231`）／Java `AsyncDataSendTask.sendTraceData`
-    /// （`AsyncTraceDispatcher.java:307-335`）：按「业务 topic + 轨迹 topic」分组，
-    /// 逐组交给 [`Inner::flush_data`]。
-    ///
-    /// 跳过规则同 Python `:220`：`region_id` 为空（含 Java 的 `null`）或
-    /// `trace_beans` 为空 —— ⚠ Java 只判 `null`（`AsyncTraceDispatcher.java:316`），
-    /// 空串的 `region_id` 在 Python 里会被丢掉，这里跟 Python
-    /// （`test_trace.py::test_dispatcher_skips_context_without_region_or_beans`）。
     async fn send_trace_data(&self, context_list: Vec<TraceContext>) {
         let default_channel = self.access_channel();
         let mut groups: Vec<(String, Vec<TraceTransferBean>)> = Vec::new();
@@ -1218,13 +1104,6 @@ impl Inner {
         }
     }
 
-    /// Python `_flush_data`（`:233-251`）／Java `flushData`
-    /// （`AsyncTraceDispatcher.java:337-359`）：把一组记录拼成一个 payload，
-    /// 累计长度达到 `max_msg_size` 就切一块发出去。
-    ///
-    /// `topic` 参数在 Python 与 Java 里都只是形参（发送只用 `trace_topic`），
-    /// 保留形参以对齐 `_flush_data(bean_list, topic, trace_topic)` 的调用形状。
-    ///
     /// Python 末尾的 `trans_bean_list.clear()`（`:251`）由 Rust 的所有权接管。
     async fn flush_data(
         &self,
@@ -1262,17 +1141,6 @@ impl Inner {
         }
     }
 
-    /// Python `_send_trace_data_by_mq`（`:253-265`）／Java `sendTraceDataByMQ`
-    /// （`AsyncTraceDispatcher.java:368-409`）：一块 payload = 一条轨迹消息。
-    ///
-    /// * body：拼好的文本（UTF-8）；
-    /// * topic：`trace_topic`（LOCAL ⇒ `RMQ_SYS_TRACE_TOPIC`，CLOUD ⇒
-    ///   `rmq_sys_TRACE_DATA_<regionId>`）；
-    /// * KEYS：块内所有 `trans_key` 的并集，**按 [`KEY_SEPARATOR`] 拼、且先过滤空串**
-    ///   —— Python `:256` 显式 `sorted(...)`（Java 是 `message.setKeys(keySet)`，
-    ///   `HashSet` 顺序不定）。Rust 跟 Python：排序后拼接（`TraceTransferBean.trans_key`
-    ///   本身是 `BTreeSet`，天然有序）。放的是**原始消息的 msgId**（不是 offsetMsgId），
-    ///   控制台按它反查轨迹。
     async fn send_trace_data_by_mq(
         &self,
         key_set: BTreeSet<String>,
@@ -1320,9 +1188,6 @@ impl Inner {
         }
     }
 
-    /// Python `_try_get_message_queue_broker_set`（`:267-280`）／Java 同名方法
-    /// （`AsyncTraceDispatcher.java:411-425`）：该 topic 涉及的 broker 名集合。
-    ///
     /// 只有跨集群（CLOUD）场景才需要按 broker 过滤；拿不到路由时返回空集 ⇒ 走普通轮询。
     /// 日志级别同 Python（`logger.debug`）。
     async fn try_get_message_queue_broker_set(&self, topic: &str) -> HashSet<String> {
@@ -1418,7 +1283,6 @@ impl TraceDispatcher for AsyncTraceDispatcher {
 }
 
 impl TraceReportSink for AsyncTraceDispatcher {
-    /// Python `get_trace_topic_name()`（`:111-112`）／Java `getTraceTopicName()`。
     fn trace_topic_name(&self) -> String {
         self.inner.trace_topic_name.clone()
     }
@@ -2115,10 +1979,6 @@ mod tests {
 
     #[tokio::test]
     async fn send_failure_is_logged_and_next_chunk_still_sent() {
-        // Python `:264-265`：`except Exception: logger.error(...)` —— 一块失败既不
-        // 冒到 `_flush_data`，也不阻止后面的块继续发（Java 同理，
-        // `AsyncTraceDispatcher.java:406-407` 的 catch 兜住整段选队+发送）。
-        // 探针（max_msg_size=1 + send 抛异常）实测 2 条记录 ⇒ 2 次尝试、无异常外抛。
         let (d, recorder) = failing_dispatcher(10);
         d.set_max_msg_size(1); // 每条记录自成一块 ⇒ 两次发送
         let bean_a =
@@ -2214,7 +2074,6 @@ mod tests {
             assert_eq!(q.broker_name, "broker-a");
             assert_eq!(q.queue_id, 0);
         }
-        // Python `:57-60`：集合与路由无交集 ⇒ 退化全量轮询（Java 会越界抛异常）
         let none: HashSet<String> = ["broker-z".to_string()].into_iter().collect();
         let mut seen = Vec::new();
         for _ in 0..4 {
@@ -2354,8 +2213,6 @@ mod tests {
 
     #[tokio::test]
     async fn start_propagates_namespace_v2_to_inner_producer() {
-        // Java `AsyncTraceDispatcher#start`:155 `traceProducer.setNamespaceV2(...)`：
-        // 位置在 instanceName 之后、enable_trace 之前（模块差异 15）。
         let (d, recorder) = dispatcher();
         assert_eq!(
             d.get_namespace_v2(),
@@ -2620,10 +2477,6 @@ mod tests {
 
     #[tokio::test]
     async fn missing_producer_builds_a_real_one() {
-        // 与 Python 对齐后：未注入时自建**真实** DefaultMQProducer
-        // （`_get_and_create_trace_producer`），不再默认静默丢弃。测试环境没有
-        // namesrv，内部生产者 start 失败 ⇒ dispatcher start 报错（与 Java/Python
-        // 「轨迹起不来但不影响业务发送」一致），但队列照常接收、flush 后清空。
         let d = AsyncTraceDispatcher::with_config(
             "GID_test",
             TraceDispatcherType::Produce,

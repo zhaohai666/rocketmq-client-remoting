@@ -42,9 +42,6 @@ async function main(): Promise<void> {
 
   const consumer = new DefaultMQPullConsumer(GROUP);
   consumer.setNamesrvAddr(NS);
-  // Java DefaultMQPullConsumer: subscribe() MUST precede start() (the pull
-  // consumer registers its subscription at heartbeat time and the start guard
-  // requires it).
   consumer.subscribe(TOPIC, '*');
   await consumer.start();
 

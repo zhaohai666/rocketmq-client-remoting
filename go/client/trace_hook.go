@@ -1,6 +1,3 @@
-// Client-side trace hooks (Java org.apache.rocketmq.client.trace.hook.*,
-// Python trace_hook.py).
-//
 //	SendMessageTraceHook        <- SendMessageTraceHookImpl
 //	ConsumeMessageTraceHook     <- ConsumeMessageTraceHookImpl
 //	EndTransactionTraceHook     <- EndTransactionTraceHookImpl
@@ -29,12 +26,8 @@ func NewSendMessageTraceHook(dispatcher *AsyncTraceDispatcher) *SendMessageTrace
 	return &SendMessageTraceHook{dispatcher: dispatcher}
 }
 
-// HookName is Java SendMessageTraceHookImpl#hookName.
 func (h *SendMessageTraceHook) HookName() string { return "SendMessageTraceHook" }
 
-// SendMessageBefore builds the Pub context. It runs per send ATTEMPT (the
-// retry chain rebuilds the context each pass), so a retried send can produce
-// several Pub records — Java behaves the same way.
 func (h *SendMessageTraceHook) SendMessageBefore(ctx *SendMessageContext) {
 	if ctx == nil || ctx.Message == nil {
 		return
@@ -104,11 +97,8 @@ func NewConsumeMessageTraceHook(dispatcher *AsyncTraceDispatcher) *ConsumeMessag
 	return &ConsumeMessageTraceHook{dispatcher: dispatcher}
 }
 
-// HookName is Java ConsumeMessageTraceHookImpl#hookName.
 func (h *ConsumeMessageTraceHook) HookName() string { return "ConsumeMessageTraceHook" }
 
-// ConsumeMessageBefore emits one SubBefore record covering the whole batch
-// (Java sends one record per message inside a single TraceContext).
 func (h *ConsumeMessageTraceHook) ConsumeMessageBefore(ctx *ConsumeMessageContext) {
 	if ctx == nil || len(ctx.MsgList) == 0 {
 		return
@@ -186,7 +176,6 @@ func NewEndTransactionTraceHook(dispatcher *AsyncTraceDispatcher) *EndTransactio
 	return &EndTransactionTraceHook{dispatcher: dispatcher}
 }
 
-// HookName is Java EndTransactionTraceHookImpl#hookName.
 func (h *EndTransactionTraceHook) HookName() string { return "EndTransactionTraceHook" }
 
 // EndTransaction emits the EndTransaction record.

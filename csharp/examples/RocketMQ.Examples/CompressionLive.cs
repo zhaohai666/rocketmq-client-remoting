@@ -1,17 +1,7 @@
 // 自动压缩的**真实集群 + 跨客户端**联调工具（对应 cpp/examples/compression_live.cpp）。
 //
-// 为什么需要它：单元测试只能证明「zlib 往返正确」，证明不了
-//   1. producer 真的在超过 compressMsgBodyOverHowmuch(4096) 时压缩并置 COMPRESSED_FLAG；
-//   2. broker 存的是压缩体（storeSize 远小于原文）；
-//   3. 消费端真的解压并把 COMPRESSED_FLAG 清掉（对齐 Java MessageDecoder）；
-//   4. **别的客户端（Java）产生的压缩消息，我们能正确解压** —— 这是真机才暴露的静默数据损坏点。
 //
-// 载荷是**确定性**的（重复一行固定文本后截断），与 Java 探针 CompressProbe 完全相同，
-// 因此两端各自本地重建后比较 CRC32 即可，无需交换文件。
 //
-// ⚠ CRC32 显示值会不同，这不是 bug：Java `UtilAll.crc32` 返回 `(int)(value & 0x7FFFFFFF)`，
-// 砍掉了最高位；本工具用标准 CRC-32。所以 Java 打印 1785582993 对应本工具打印 3933066641
-// （差正好 2^31）。判定互通要看各自的 `match=` 字段，不要直接比两边打印的 CRC 数字。
 //
 // 用法（由 Program 以 "compression-live <mode> ..." 形式调用）：
 //   rmq compression-live selftest <namesrv>
@@ -27,7 +17,6 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Examples;
 
-/// <summary>压缩真实集群 + 跨客户端联调（与 Java CompressProbe 对齐）。</summary>
 internal static class CompressionLive
 {
     private const string KLine = "rocketmq-compress-interop-payload-line-0123456789\n";
@@ -308,7 +297,6 @@ internal static class CompressionLive
             + " 原文=" + size.ToString(CultureInfo.InvariantCulture)
             + " 压缩比=" + (size / Math.Max(1, m.StoreSize)).ToString(CultureInfo.InvariantCulture) + ":1");
 
-        // 4) 解压后 COMPRESSED_FLAG 必须被清掉（对齐 Java MessageDecoder），否则上层会误以为 body 还是压缩的。
         Check("解压后 COMPRESSED_FLAG 已清除",
             !MessageSysFlag.IsCompressed(m.SysFlag),
             "sysFlag=" + m.SysFlag.ToString(CultureInfo.InvariantCulture));
@@ -367,10 +355,6 @@ internal static class CompressionLive
                 + " restoredLen=" + restored.Body.Length.ToString(CultureInfo.InvariantCulture));
         }
 
-        // 7) 另外两个后端（LZ4 Frame / ZSTD）各过一遍真机闭环：生产端压缩 → broker 存压缩体
-        //    → 消费端解压还原。单测里有用 Java 那套库（lz4-java / zstd-jni）生成的硬编码夹具
-        //    证明**线上格式**互通，这里证明的是「自己的发送路径真的用上了这个后端」。
-        //    后端走系统库（P/Invoke 到 liblz4 / libzstd），装不上时打 SKIP，不算失败。
         foreach (var (name, type, available) in new (string, int, bool)[]
                  {
                      ("lz4", CompressionType.LZ4, CompressorFactory.HasLz4Support()),

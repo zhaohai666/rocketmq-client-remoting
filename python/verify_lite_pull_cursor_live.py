@@ -1,25 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""lite-pull **拉取游标**真机验证（#105，Java DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998）。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_lite_pull_cursor_live.py 127.0.0.1:9876
-
-离线单测（python/tests/test_lite_pull_consumer.py 的 TestPullCursorFollowsNextBeginOffset、
-cpp/tests/test_lite_pull_cursor.cpp、rust/src/client/pull_consumer.rs、csharp 的
-LitePullCursorTests.cs）只能证明「脚本回的 nextBeginOffset 被跟了」；只有真 broker 能让
-下面两件事同时成立：nextBeginOffset 是**broker 算的**，而且跟过去以后**真的能收到消息**。
-
-S1 对照组：每条队列钉 1 条消息 → assign + seek(0) + `*` → 4 条全收（链路本身要通，
-    maxOffset == 1 这个前提也是后面两条腿的标尺）。
-S2 NO_MATCHED_MSG：把 assign 表达式换成永不匹配的 Tag 再 seek(0)。broker 按表达式把整段
-    滤掉后回的 nextBeginOffset **已经越过整段**（= maxOffset）。断言每条队列的拉取游标都到
-    maxOffset（旧实现只在 FOUND 时推游标，这里会永远停在 0，每轮重扫同一段）。零投递。
-S3 OFFSET_ILLEGAL 自愈（决定性一条）：对每条队列 seek 到 maxOffset + 1000（位点越界）。
-    broker 回纠正值 → 游标必须回到 maxOffset；随后每条队列再钉 1 条，4 条必须**全部收到**。
-    旧实现的游标永远卡在越界值上：每轮都收到同一个「越界纠正」，新消息一条也看不到。
-    这正是这条修正的真机价值 —— 越界之后消费者会**静默**地永远收不到消息。
-"""
 from __future__ import annotations
 
 import sys

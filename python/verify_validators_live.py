@@ -1,31 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Validators 真机验证：非法名字**本地**快速失败，合法名字照常在 5.5.1 集群收发。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_validators_live.py 127.0.0.1:9876
-
-为什么单独测（而且要在真集群上测）：单测只能证明「函数会抛」，证明不了它**拦在了
-网络之前**。而这条链路真正的代价是可重试码：``TOPIC_NOT_EXIST``(17) 在发送重试的
-可重试集合里，名字写错时每条消息都会把 ``retry_times_when_send_failed`` 与超时预算
-空转一遍才报出同一个原因。所以这里用**同一个已启动的生产者**跑正反两条腿：
-  * 反腿：非法 topic/group/超长 body/禁发 topic → 亚毫秒失败，异常是 MQClientException
-    且文案是本地校验的文案（不是 broker remark）；
-  * 正腿：合法名字照常 SEND_OK 并被消费者收到；``%RETRY%`` 前缀**不在**禁发名单里
-    （sendMessageBack 要往里写）；同名合法 topic 的「不存在」腿明显更慢 —— 那就是
-    本地校验省掉的重试空转。
-
-场景：
-  S1 生产端反腿：6 类非法输入全部亚毫秒本地失败（错误文案 + 码值口径）+ 边界放行
-  S2 批量发送反腿：批内一条非法 ⇒ 整批本地失败；混批也挡在本地（批量路径不绕过校验）
-  S3 组名反腿：start() 的组名校验排在地址检查之前，失败不留 started 状态
-  S4 正腿：合法 topic 建队列 + 起 push/lite 消费者 + 发送 SEND_OK + 两边都收到
-  S5 对照腿：合法但不存在的 topic 本地放行、走完整集群链路，耗时比反腿高两个数量级
-  S6 拉取消费者：DEFAULT_CONSUMER / 非法字符组名本地失败；合法组名能启动并查到位点
-  S7 寻址故障与"topic 没路由"的分界（Java ``validateNameServerSetting``）：一个 name server
-     地址都没有 → 10004「No name server address, please set it.」且亚毫秒本地失败；
-     地址恢复后同一条 topic 立刻 SEND_OK（对照腿，证明 S7a 判的是寻址而不是 topic）
-"""
 from __future__ import annotations
 
 import sys
@@ -86,7 +60,6 @@ def check_local_reject(name: str, prod: DefaultMQProducer, msg: Message, needle:
     if expect_code is not None:
         ok = ok and err.response_code == expect_code
     else:
-        # 名字校验走 Java 的 MQClientException(String, Throwable) ⇒ 无 broker 码
         ok = ok and err.response_code is None
     check(name, ok, "%s in %.2fms code=%r" % (
         str(err).replace("\n", " ") if err else "没有抛异常", elapsed,
@@ -134,7 +107,6 @@ def main() -> int:
                            Message(TOPIC, b""), "the message body length is zero",
                            ResponseCode.MESSAGE_ILLEGAL)
         prod.set_max_message_size(1024 * 1024 * 4)
-        # 等于上限放行：Java 判的是 `>`，反腿顺带把边界钉住
         m_boundary = Message(TOPIC, b"1" * 8)
         validators.check_message(m_boundary, 8)
         check("S1g 恰好等于 maxMessageSize 放行（Java 的 > 判定）", True)
@@ -156,7 +128,7 @@ def main() -> int:
         err2 = None
         try:
             prod.send([Message(TOPIC, b"x" * 10), Message("ValidatorsOther_%d" % STAMP, b"y")])
-        except Exception as e:  # noqa: BLE001 - 同质性检查抛的是 ValueError（Java 同款）
+        except Exception as e:
             err2 = e
         elapsed = (time.monotonic() - began) * 1000.0
         check("S2b 混批（不同 topic）也挡在本地、不到集群",
@@ -273,12 +245,6 @@ def main() -> int:
             check("S6b %s 拒绝非法字符组名（本地）" % cls.__name__,
                   e is not None and "contains illegal characters" in str(e))
 
-        # ---------------- S7 寻址故障（10004）不能伪装成"topic 没路由"（10005）----------------
-        # Java ``DefaultMQProducerImpl#validateNameServerSetting``（:729）在三条"拿不到路由"
-        # 分支的最前面跑：一个 name server 地址都没有 → 10004「No name server address,
-        # please set it.」；地址在、只是这个 topic 查不到 → 才是 10005。
-        # 少了这一步，把地址服务器配错（或它返回空列表）的人看到的会是"这个 topic 不存在"，
-        # 于是去查建 topic / 查权限，而真正坏的是寻址 —— 错方向的排障能耗掉半小时。
         print("=== S7 10004（没配 name server）vs 10005（topic 没路由）的分界 ===")
         mis = DefaultMQProducer("GID_ValidatorsLive_%d_addr" % STAMP)
         mis.set_namesrv_addr(NAMESRV)

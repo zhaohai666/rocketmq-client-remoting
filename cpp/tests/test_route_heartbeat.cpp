@@ -1,8 +1,4 @@
 // 路由 / 心跳 / 订阅数据的编解码往返单测。
-//
-// 重点不是"能跑"，而是**字段名与 Java 一致**——broker 用 fastjson2 按属性名反序列化，
-// 字段名错一个（比如 Python 侧曾用 snake_case）就会静默丢字段。
-// 因此这里既做往返，也做"精确 JSON 文本"和"不得出现某字段"的守卫。
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -37,21 +33,16 @@ static bool contains(const std::string& hay, const std::string& needle) {
 
 // ---------------------------------------------------------------- SubscriptionData
 static void testSubscriptionData() {
-    // FilterAPI: "*" / "" -> SUB_ALL 且 **两个集合都空**（Java 直接 return）
-    // Java 里 tagsSet 非空是"客户端二次 tag 过滤"的开关，塞 "*" 会让订阅全量时把正常消息过滤掉。
     SubscriptionData all1 = FilterAPI::buildSubscriptionData("T", "*");
     CHECK(all1.subString == "*" && all1.tagsSet.empty() && all1.codeSet.empty(),
           "filter '*' -> SUB_ALL with empty sets");
     SubscriptionData all2 = FilterAPI::buildSubscriptionData("T", "");
     CHECK(all2.subString == "*" && all2.tagsSet.empty() && all2.codeSet.empty(),
           "filter empty -> SUB_ALL with empty sets");
-    // 纯空白：Java StringUtils.isEmpty 只认 null/"" -> 走 split 分支，标签被 trim 成空 -> 集合仍空，
-    // 但 subString **原样保留**（探测确认：Java 输出 sub=[   ] tags=[] codes=[]）。
     SubscriptionData all3 = FilterAPI::buildSubscriptionData("T", "   ");
     CHECK(all3.subString == "   " && all3.tagsSet.empty() && all3.codeSet.empty(),
           "filter blank -> split branch, subString kept as-is, empty sets");
 
-    // "||" 切分 + trim + 丢空片段，且必须同时填 codeSet（Java tag.hashCode()）
     SubscriptionData multi = FilterAPI::buildSubscriptionData("T", " TagA || TagB || ");
     CHECK(multi.tagsSet.size() == 2, "filter split count");
     CHECK(multi.tagsSet.count("TagA") == 1 && multi.tagsSet.count("TagB") == 1, "filter split trim");
@@ -60,7 +51,6 @@ static void testSubscriptionData() {
               && multi.codeSet.count(2598920) == 1,
           "filter split fills codeSet with java hashCode");
 
-    // "||" 全分隔符：Java-split 结果数组长度为 0 -> Java 抛 "subString split error"
     bool threw = false;
     try {
         FilterAPI::buildSubscriptionData("T", "||");
@@ -69,7 +59,6 @@ static void testSubscriptionData() {
     }
     CHECK(threw, "filter '||' -> throws subString split error (java-split drops all trailing empties)");
 
-    // toJson 必须包含 Java 字段名，且**不得**出现 filterClassSource
     SubscriptionData sd("TopicProbe", "TagA||TagB");
     sd.setTagsSet({"TagA", "TagB"});
     sd.setCodeSet({11, 22});
@@ -93,10 +82,8 @@ static void testSubscriptionData() {
     CHECK(back.subVersion == sd.subVersion, "sub round-trip subVersion");
     CHECK(back.expressionType == sd.expressionType, "sub round-trip expressionType");
     CHECK(back == sd, "sub operator== after round-trip");
-    // filterClassSource 不参与序列化，故往返后丢失（与 Java 行为一致）
     CHECK(back.filterClassSource.empty(), "sub filterClassSource not serialized");
 
-    // Java equals 含 subVersion
     SubscriptionData a("T", "x");
     a.setSubVersion(1);
     SubscriptionData b("T", "x");
@@ -198,7 +185,6 @@ static void testTopicRouteData() {
     other.queueDatas[0].writeQueueNums = 99;
     CHECK(t.topicRouteDataChanged(&other), "route changed on queue diff");
 
-    // 真实样例（nameserver 响应形如 Java fastjson2 输出）
     TopicRouteData fromServerSample;
     CHECK(TopicRouteData::decode(
               "{\"brokerDatas\":[{\"brokerAddrs\":{0:\"127.0.0.1:10911\"},"
@@ -213,8 +199,6 @@ static void testTopicRouteData() {
     CHECK(fromServerSample.brokerDatas[0].selectBrokerAddr() == "127.0.0.1:10911",
           "route java-shaped select master");
 
-    // Java MQClientInstance:301-303：brokerAddrs 里没有 MASTER_ID(0) 的 broker 整条跳过。
-    // 从节点也会注册进 namesrv 且默认写位还在，所以这条**不能**靠 perm 过滤替代。
     TopicRouteData masterless;
     masterless.queueDatas.push_back(
         QueueData("broker-a", 4, 4, PermName::PERM_READ | PermName::PERM_WRITE, 0));
@@ -231,8 +215,6 @@ static void testTopicRouteData() {
     masterless.brokerDatas[0].brokerAddrs[0] = "127.0.0.1:10911";
     CHECK(masterless.getAllMessageQueue("T").size() == 8, "route keeps queue once master returns");
 
-    // Java MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332：消费侧只看读位与
-    // readQueueNums，**不查 brokerDatas、也不要求有 master**。
     TopicRouteData subscribe;
     subscribe.queueDatas.push_back(
         QueueData("broker-a", 4, 4, PermName::PERM_READ | PermName::PERM_WRITE, 0));
@@ -253,7 +235,6 @@ static void testTopicRouteData() {
 
 // ---------------------------------------------------------------- HeartbeatData
 static void testHeartbeatData() {
-    // 关键：精确 JSON 文本必须与 Java fastjson2 输出逐字节一致（无订阅时集合有序）
     HeartbeatData hb("cid");
     hb.addProducerData(ProducerData("pg"));
     const std::string expected =
@@ -325,7 +306,6 @@ static void testHeartbeatData() {
     CHECK(decoded.heartbeatFingerprint == 0 && !decoded.withoutSub,
           "heartbeat round-trip defaults (V1 path)");
 
-    // 兼容 Java 字段名 isWithoutSub
     HeartbeatData alt;
     CHECK(HeartbeatData::decode(
               "{\"clientID\":\"c\",\"isWithoutSub\":true,\"heartbeatFingerprint\":7,\"consumerDataSet\":[],\"producerDataSet\":[]}",

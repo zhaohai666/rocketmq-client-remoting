@@ -5,11 +5,6 @@
 // 必须先锁死，否则「处理器根本没注册」这种错只会在生产上表现为「成员变了却要
 // 等 20s 定时重平衡」，安静得几乎不可见。
 //
-// 对齐 Java：
-//   - `MQClientAPIImpl` 构造函数里把 40 注册在**实例级**的 clientRemotingProcessor
-//     （不是每个消费者各注册一份 —— 一个 code 只有一个处理器，各自注册会互相覆盖）
-//   - `ClientRemotingProcessor#notifyConsumerIdsChanged` → `rebalanceImmediately()`，
-//     返回 null ⇒ 不回包
 //
 // 覆盖：
 //   - 计数 + 整组唤醒（注册两个消费者，两个都被点名）
@@ -58,7 +53,6 @@ void testFanOut() {
     expect(wakeA == 1, "notify.wakesFirst", "wakeA=" + std::to_string(wakeA));
     expect(wakeB == 1, "notify.wakesEveryConsumer", "wakeB=" + std::to_string(wakeB));
 
-    // group 只用于日志：Java 不读它来决定叫醒谁，所以两次通知叫醒的是同一批人。
     instance.processNotifyConsumerIdsChanged(notifyCmd(""), "127.0.0.1:10911");
     expect(instance.consumerIdsChangedCount() == 2, "notify.blankGroupStillCounts");
     expect(wakeA == 2 && wakeB == 2, "notify.blankGroupWakesAll",

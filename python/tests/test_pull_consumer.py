@@ -1,10 +1,4 @@
 # -*- coding: utf-8 -*-
-"""主动拉取消费者（DefaultMQPullConsumer）本地单测（不需要集群）。
-
-为什么要有这个文件：`DefaultMQPullConsumer` 此前**既没有单测也没有真机脚本**
-（grep 全仓 0 命中）——是纯"纸面能力"。这里覆盖不需要 broker 的那部分契约：
-生命周期守卫、命名空间包装、以及**拉取 sysFlag 与 Java 对齐**（真机踩过超时的坑）。
-"""
 from __future__ import annotations
 
 import inspect
@@ -72,16 +66,7 @@ class TestLifecycle:
 
 
 class TestPullSysFlagParity:
-    """拉取标志位必须与 Java DefaultMQPullConsumerImpl.pullSyncImpl(:248) 一致。
-
-    Java: sysFlag = PullSysFlag.buildSysFlag(false /*commitOffset*/, block /*suspend*/,
-                                             true /*subscription*/, false /*classFilter*/)
-    即 pull() = 短轮询（suspend=False）、pull_block_if_not_found() = 长轮询（suspend=True），
-    且**两者都不带 commitOffset 位**（位点由调用方 update_consume_offset 自己提交）。
-
-    真机教训：曾把 pull() 的 suspend 写成 True → broker 在队尾挂起到
-    brokerSuspendMaxTimeMillis(20s)，客户端 5s 超时 → RemotingTimeoutException。
-    """
+    pass
 
     def test_pull_is_short_poll_without_commit_offset(self):
         src = inspect.getsource(DefaultMQPullConsumer.pull)
@@ -163,15 +148,7 @@ def _started_pull(topics=("TopicHbA", "TopicHbB")):
 
 
 class TestConsumerHeartbeat:
-    """拉模式消费者也要向 broker 注册（Java DefaultMQPullConsumerImpl.start:746）。
-
-    为什么必须离线锁死：Java 把拉模式消费者登记进 consumerTable，由实例的
-    sendHeartbeatToAllBrokerWithLock 代发一份 `consumeType=CONSUME_ACTIVELY` 的
-    ConsumerData。少了它，broker 的 ConsumerManager.consumerTable 里根本没有这个组：
-    `mqadmin consumerConnection` 看不到、GET_CONSUMER_LIST_BY_GROUP(38) 查不到，
-    而 `rejectPullConsumerEnabled=true` 的 broker 会直接拒绝它的拉取
-    （`PullMessageProcessor:493-505` "the pull consumer is rejected by server"）。
-    """
+    pass
 
     def test_heartbeat_is_actively_typed_and_carries_register_topics(self):
         c, fake = _started_pull()
@@ -181,14 +158,10 @@ class TestConsumerHeartbeat:
         assert hb.client_id == "cid@fixed"
         cd = list(hb.consumer_data_set)[0]
         assert cd.group_name == "PG_HbUnit"
-        # Java DefaultMQPullConsumerImpl.consumeType():348 恒为 CONSUME_ACTIVELY
-        # （与推送消费者的 PASSIVELY 是两个口径），consumeFromWhere():353 恒为 LAST。
         assert cd.consume_type == ConsumeType.CONSUME_ACTIVELY
         assert cd.consume_from_where == ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET
         subs = {s.topic: s for s in cd.subscription_data_set}
         assert sorted(subs) == ["TopicHbA", "TopicHbB"]
-        # Java subscriptions():375-382 里 `ms.setSubVersion(0L)`：拉模式没有订阅版本
-        # 语义，带当前时间戳会让 broker 每次都判成"订阅变了"。
         for sub in subs.values():
             assert sub.sub_string == "*"
             assert sub.sub_version == 0
@@ -220,7 +193,6 @@ class TestConsumerHeartbeat:
         c.start()
         try:
             fake = holder["client"]
-            # 路由必须先刷：心跳目标只来自路由表（Java 靠实例级路由任务做到同一件事）
             assert fake.topics_in_use == ["TopicHbStart"]
             assert fake.routed == ["TopicHbStart"]
             assert len(fake.heartbeats) == 2
@@ -245,8 +217,6 @@ class TestConsumerHeartbeat:
         c.start()
         c.shutdown()
         fake = holder["client"]
-        # Java DefaultMQPullConsumerImpl.shutdown:689-692：unregisterConsumer 后
-        # 才 mQClientFactory.shutdown()。35 只带本组、不带生产者组。
         assert fake.unregistered == [(c.client_id, "", "PG_HbStop")]
         assert fake.shutdown_called == 1
         assert c._heartbeat_stop.is_set()
@@ -271,7 +241,6 @@ class _BalanceClient:
     def get_topic_subscribe_info(self, topic):
         if self.raise_on_route:
             raise MQClientException("route failed")
-        # 真 client 按 topic 取订阅信息（Java topicSubscribeInfoTable[topic]），替身同口径。
         return [q for q in self._subscribe if q.topic == topic]
 
     def get_consumer_id_list_by_group(self, topic, consumer_group, timeout_millis=5000):
@@ -290,13 +259,7 @@ def _balance_consumer(mq_all, cid_all, model=MessageModel.CLUSTERING, pulled=())
 
 
 class TestFetchMessageQueuesInBalance:
-    """MQPullConsumer#fetchMessageQueuesInBalance(:187) 的本端口移植。
-
-    Java（DefaultMQPullConsumerImpl:120-135）读的是后台 rebalance 填出来的
-    processQueueTable；本端口拉模式没有那条后台线程，所以按 RebalanceImpl.rebalanceByTopic
-    的同一条公式当场算：mqAll=订阅信息(读位)、cidAll=GET_CONSUMER_LIST_BY_GROUP、
-    分配策略取本实例那一份。取不到就保留本地记账（绝不回退成独占全部队列）。
-    """
+    pass
 
     _TOPIC = "TopicBalUnit"
 
@@ -309,7 +272,6 @@ class TestFetchMessageQueuesInBalance:
             c.fetch_message_queues_in_balance(self._TOPIC)
 
     def test_null_topic_raises_illegal_argument(self):
-        # Java :122-124 是 IllegalArgumentException，本端口对应 ValueError。
         c = _balance_consumer(self._queues(1), ["cid-A"])
         with pytest.raises(ValueError):
             c.fetch_message_queues_in_balance(None)
@@ -333,7 +295,6 @@ class TestFetchMessageQueuesInBalance:
             ("broker-a", 0), ("broker-a", 1), ("broker-b", 0)]
 
     def test_other_topics_are_not_leaked(self):
-        # 分配按 topic 隔离：别的 topic 的队列不能混进来（Java 按 topic 过滤表键）。
         other = [MessageQueue("TopicOther", "broker-a", i) for i in range(2)]
         got = _balance_consumer(other + self._queues(2), ["cid-A"]) \
             .fetch_message_queues_in_balance(self._TOPIC)
@@ -341,7 +302,6 @@ class TestFetchMessageQueuesInBalance:
         assert [q.queue_id for q in got] == [0, 1]
 
     def test_broadcasting_takes_every_queue(self):
-        # Java rebalanceByTopic 对 BROADCASTING 不查消费者列表、全量分配。
         got = _balance_consumer(self._queues(3), ["cid-A", "cid-B"],
                                 model=MessageModel.BROADCASTING) \
             .fetch_message_queues_in_balance(self._TOPIC)
@@ -361,13 +321,9 @@ class TestFetchMessageQueuesInBalance:
         assert [q.queue_id for q in got] == [5]
 
     def test_fresh_consumer_without_broker_returns_empty(self):
-        # 没拉过、又查不到 → 空表。Java 在 rebalance 跑之前同样是空集，不是"全部"。
         assert _balance_consumer([], None).fetch_message_queues_in_balance(self._TOPIC) == []
 
 
-# ==================== pull_async（Java pull(K, subString, offset, maxNums,
-# PullCallback, timeout) 的本端移植）====================
-# 事件等待预算：Windows 回环端口有 ~2s 拒连延迟 + 线程调度抖动，一律给 30s。
 _WAIT_TIMEOUT = 30.0
 
 

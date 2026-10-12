@@ -1,31 +1,4 @@
 # -*- coding: utf-8 -*-
-"""OFFSET_ILLEGAL 纠错分支（Java ``DefaultMQPushConsumerImpl:402-427``）真机验证。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_offset_illegal_live.py 127.0.0.1:9876
-
-这条分支做四件事：位点改用 broker 给的修正值（``setNextOffset``）→ 丢掉这条队列上
-已取回未消费的消息（``ProcessQueue.setDropped(true)``）→ 把修正位点**立刻**落盘
-（``updateAndFreezeOffset`` + ``persist``）→ 撤掉队列让 rebalance 按修正位点重建
-（``removeProcessQueue`` + ``rebalanceImmediately``）。离线单测只能锁住本地状态怎么清、
-哪个 ack 被作废，下面两件事只有真集群能证明：
-
-  S1 「丢队列」——broker 判定位点非法时，队列上**已取回但还没消费/没 ack** 的消息必须
-      整批作废。做法：让 listener 卡住第一条（在途 1 条、缓冲里 2 条），再用
-      ``resetOffsetByQueueId`` 把位点重置到 3（服务端重置 ⇒ 下一笔 pull 被
-      ``PullMessageProcessor:539-545`` 短路成 OFFSET_RESET ⇒ 客户端 OFFSET_ILLEGAL）。
-      修复前：缓冲里的第 1、2 条照常投递（listener 实收 3 条）；修复后：只剩在途的
-      第 0 条，且它的 ack 因队列已被丢（Java ``ConsumeMessageConcurrentlyService:267``）
-      而作废。最后再发第 4 条，验证重建后的队列从修正位点续跑、冻结已随重建解除
-      （新消息的 ack 让 broker 上的位点继续前进到 4）。
-
-  S2 「立刻落盘」——纠错后的位点必须马上推给 broker，不能等周期落盘。做法：利用
-      ``resetOffsetByQueueId`` 两笔 RPC 非原子（第 1 笔 commitOffset 无区间校验先落库、
-      第 2 笔 222 被 ``resetOffsetInner`` 拒绝，见 ``verify_admin_live.py`` 9.5 的实测）
-      的既有行为，把 broker 上的已提交位点做成非法值 103，再让一个
-      ``persist_consumer_offset_interval=60000`` 的新消费者从 103 起拉。窗口内唯一能把
-      103 写回 3（maxOffset）的路径就是纠错分支自带的那次 persist，且全程零投递。
-"""
 from __future__ import annotations
 
 import sys
@@ -200,11 +173,6 @@ def s1_drop_and_rebuild(setup: MQClientInstance, admin: DefaultMQAdminExt,
     admin.reset_offset_by_queue_id(broker_addr, GROUP1, TOPIC1, 0, MSGS)
     print("S1: 已发出 resetOffsetByQueueId(->%d)，等下一笔 pull 取走服务端重置..." % MSGS)
 
-    # 发现延迟 = 客户端在途长轮询的返回时间 + broker 侧的巡检周期：本端口按下发
-    # suspendTimeoutMillis=20000（Java PullAPIWrapper.brokerSuspendMaxTimeMillis 默认值
-    # 20s）请求挂起，broker 的 PullRequestHoldService 每 5s 巡检一次到期请求，
-    # 命中前那笔 pull 不会重读 resetOffsetTable。实测 24.3s，与 Java 同构（长轮询语义
-    # 如此，不是缺陷）——这里给 45s 余量。
     ok = wait_until(lambda: c._queue_epoch.get(key, 0) >= 1, 45, 0.2)
     check("S1-broker 判定位点非法后本端丢弃该队列（ProcessQueue.setDropped：代号 +1）", ok,
           "epoch=%s arrivals=%s" % (c._queue_epoch.get(key, 0), listener.offsets()))

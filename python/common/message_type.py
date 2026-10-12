@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消息类型（对应 org.apache.rocketmq.common.message.MessageType）。
-
-Java 侧 TraceBean 的 ``msgType`` 在编码轨迹时用的是 **ordinal()**（见
-TraceDataEncoder 的 Pub/EndTransaction 分支），所以这里的整型值必须与 Java 的枚举
-声明顺序严格一致：Normal_Msg=0, Trans_Msg_Half=1, Trans_msg_Commit=2,
-Delay_Msg=3, Order_Msg=4。
-"""
 from __future__ import annotations
 
 from enum import Enum

@@ -78,7 +78,6 @@ std::string join(const std::vector<std::string>& items) {
     return out + "]";
 }
 
-// TopicSysFlag 的两个单元位（Java TopicSysFlag：FLAG_UNIT=0x1、FLAG_UNIT_SUB=0x2）
 constexpr int32_t kFlagUnit = 0x1;
 constexpr int32_t kFlagUnitSub = 0x2;
 constexpr const char* kStreamSuffix = "@" "STREAM";
@@ -350,7 +349,6 @@ void u5StreamProducerAndLiteConsumer(Env& env) {
     lite.setPollTimeoutMillis(1000);
     lite.subscribe(t, "*");
     lite.start();
-    // Java 在 DefaultLitePullConsumer 的每个构造函数里置 true ⇒ 默认就该带 @STREAM
     check("U5 lite 消费者默认 clientId 带 @STREAM", endsWith(lite.clientId(), kStreamSuffix),
           "actual=" + lite.clientId());
 

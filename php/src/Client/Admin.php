@@ -113,17 +113,8 @@ class DefaultMQAdminExt
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
 
-    /**
-     * SOCKS 代理（对应 Java ClientConfig 的 socksProxyConfig → SocksProxyConfig）：
-     * 配了则 NameServer + Broker 的 remoting 连接都经代理；动态取址的 HTTP 不走代理。
-     * 只在 start() 建 MQClientInstance 时透传一次。
-     */
     public ?SocksProxyConfig $socksProxy = null;
 
-    /**
-     * 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）；
-     * 只在 start() 建 MQClientInstance 时透传一次。
-     */
     public int $pollNameServerInterval = 30000;
 
     public ?RPCHook $rpcHook;
@@ -211,7 +202,6 @@ class DefaultMQAdminExt
         return $this->namespaceV2;
     }
 
-    /** 对应 Java `NettyClientConfig#setSocksProxyConfig`：null 清除。start() 前设置。 */
     public function setSocksProxy(?SocksProxyConfig $proxy): void
     {
         $this->socksProxy = $proxy;
@@ -222,7 +212,6 @@ class DefaultMQAdminExt
         return $this->socksProxy;
     }
 
-    /** 对应 Java ``ClientConfig#setVipChannelEnabled``。 */
     public function setVipChannelEnabled(bool $enable): void
     {
         $this->vipChannelEnabled = $enable;
@@ -1715,17 +1704,6 @@ class DefaultMQAdminExt
         );
     }
 
-    /**
-     * 对应 Java DefaultMQAdminExtImpl.consumeMessageDirectly（:1323-1334）→
-     * MQClientAPIImpl.consumeMessageDirectly（:2741）：向**存有这条消息**的 broker 发
-     * CONSUME_MESSAGE_DIRECTLY(309)，broker 把消息转发给 clientId 指定的客户端真实
-     * 消费一次，应答 body 是客户端回传的 ConsumeMessageDirectlyResult。
-     *
-     * msgId 两条路径对齐 Java：``viewMessage`` 解出的消息带 UNIQ_KEY（5.x 客户端
-     * msgId 的常态）时下发其 offsetMsgId，否则原样下发入参 msgId；寻址一律用消息
-     * 的 storeHost。$brokerAddr 显式给出时跳过 viewMessage 寻址直发（nodeJs 端
-     * 同款可选参数，便于调用方在已知 broker 时省一次查询）。
-     */
     public function consumeMessageDirectly(
         string $consumerGroup,
         string $clientId,
@@ -1771,16 +1749,7 @@ class DefaultMQAdminExt
         return QueryConsumeQueueResponseBody::decode($response->body);
     }
 
-    // ---------------- 批量配置（Java 有实现、此前 Python 侧缺失） ----------------
 
-    /**
-     * 对应 Java createAndUpdateTopicConfigList → UPDATE_AND_CREATE_TOPIC_LIST(18)。
-     *
-     * wire 事实：custom header 为**空**（topic 名在 body 里做授权资源），
-     * body 是 CreateTopicListRequestBody JSON，即 {"topicConfigList": [...]}。
-     *
-     * @param list<TopicConfig> $configs
-     */
     public function createAndUpdateTopicConfigList(string $brokerAddr, array $configs): void
     {
         if ($configs === []) {
@@ -1792,14 +1761,6 @@ class DefaultMQAdminExt
         $this->invokeBroker($brokerAddr, RequestCode::UPDATE_AND_CREATE_TOPIC_LIST, body: $body);
     }
 
-    /**
-     * 对应 Java createAndUpdateSubscriptionGroupConfigList → 225。
-     *
-     * 与 topic-list 同形，但 body 的 key 是 ``groupConfigList``；
-     * 单组版（200）的 body 是裸 SubscriptionGroupConfig 对象，两处字段名不同。
-     *
-     * @param list<SubscriptionGroupConfig> $configs
-     */
     public function createAndUpdateSubscriptionGroupConfigList(string $brokerAddr, array $configs): void
     {
         if ($configs === []) {
@@ -1811,15 +1772,6 @@ class DefaultMQAdminExt
         $this->invokeBroker($brokerAddr, RequestCode::UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST, body: $body);
     }
 
-    /**
-     * 对应 Java createStaticTopic → UPDATE_AND_CREATE_STATIC_TOPIC(513)。
-     *
-     * header 复用 CreateTopicRequestHeader 字段（topic/defaultTopic/队列数/perm/
-     * topicFilterType/topicSysFlag/order/force），body 是 TopicQueueMappingDetail
-     * 的 JSON 编码（单元化静态 topic 的映射文档）。
-     *
-     * @param array<string, mixed> $mappingDetail
-     */
     public function createStaticTopic(string $brokerAddr, string $defaultTopic, TopicConfig $config, array $mappingDetail, bool $force = false): void
     {
         $header = [
@@ -1836,13 +1788,6 @@ class DefaultMQAdminExt
         $this->invokeBroker($brokerAddr, RequestCode::UPDATE_AND_CREATE_STATIC_TOPIC, extFields: $header, body: RemotingSerializable::encode($mappingDetail));
     }
 
-    /**
-     * 对应 Java updateAndGetGroupReadForbidden → UPDATE_AND_GET_GROUP_FORBIDDEN(353)。
-     *
-     * readable=null 表示仅查询（Java 不设该字段）；响应体是 GroupForbidden JSON。
-     *
-     * @return array<string, mixed>
-     */
     public function updateAndGetGroupReadForbidden(string $brokerAddr, string $group, string $topic, ?bool $readable = null): array
     {
         if ($group === '' || $topic === '') {
@@ -1860,13 +1805,6 @@ class DefaultMQAdminExt
         return is_array($obj) ? $obj : [];
     }
 
-    /**
-     * 对应 Java resumeCheckHalfMessage → RESUME_CHECK_HALF_MESSAGE(323)。
-     *
-     * Java（MQClientAPIImpl:3279）对非 SUCCESS **返回 False 而不抛错**——
-     * 网络层异常才上抛；broker 拒绝（如 msgId 不是半消息，SYSTEM_ERROR）
-     * 通过返回值表达。
-     */
     public function resumeCheckHalfMessage(string $brokerAddr, string $topic, string $msgId = ''): bool
     {
         if ($topic === '') {
@@ -1886,13 +1824,6 @@ class DefaultMQAdminExt
         return $response->code === ResponseCode::SUCCESS;
     }
 
-    /**
-     * 对应 Java createOrUpdateOrderConf：**不是独立请求**，是 NameServer KV
-     * namespace=ORDER_TOPIC_CONFIG 上的读改写。
-     *
-     * 集群模式把 value 原样写入；非集群模式把存储值当作 ";" 分隔的
-     * "topic:conf" 列表，替换 key 匹配的条目后整体写回。
-     */
     public function createOrUpdateOrderConf(string $key, string $value, bool $isCluster = false): void
     {
         if ($key === '' || $value === '') {
@@ -1905,7 +1836,6 @@ class DefaultMQAdminExt
         try {
             $oldConfs = $this->getKvConfig(self::NAMESPACE_ORDER_TOPIC_CONFIG, $key) ?? '';
         } catch (\Throwable) {
-            // Java 打印后按空表继续（首写是常态）
             $oldConfs = '';
         }
         $entries = [];
@@ -1927,17 +1857,11 @@ class DefaultMQAdminExt
 
     // ---------------- 运维清理类 ----------------
 
-    /** 对应 Java cleanExpiredConsumerQueue → CLEAN_EXPIRED_CONSUMEQUEUE(306)。 */
     public function cleanExpiredConsumerQueue(string $brokerAddr, int $timeHours): void
     {
         $this->invokeBroker($brokerAddr, RequestCode::CLEAN_EXPIRED_CONSUMEQUEUE, ['time' => $timeHours]);
     }
 
-    /** 对应 Java 的 ByAddr 形态：逐个地址执行，返回**失败的地址**列表。
-     *
-     * @param list<string> $addrs
-     * @return list<string>
-     */
     public function cleanExpiredConsumerQueueByAddr(array $addrs, int $timeHours): array
     {
         $failed = [];
@@ -1951,17 +1875,11 @@ class DefaultMQAdminExt
         return $failed;
     }
 
-    /** 对应 Java deleteExpiredCommitLog → DELETE_EXPIRED_COMMITLOG(329)。 */
     public function deleteExpiredCommitLog(string $brokerAddr, int $timeHours): void
     {
         $this->invokeBroker($brokerAddr, RequestCode::DELETE_EXPIRED_COMMITLOG, ['time' => $timeHours]);
     }
 
-    /** 对应 Java 的 ByAddr 形态：逐个地址执行，返回**失败的地址**列表。
-     *
-     * @param list<string> $addrs
-     * @return list<string>
-     */
     public function deleteExpiredCommitLogByAddr(array $addrs, int $timeHours): array
     {
         $failed = [];
@@ -1975,24 +1893,11 @@ class DefaultMQAdminExt
         return $failed;
     }
 
-    /**
-     * 对应 Java cleanUnusedTopicByAddr → MQClientAPIImpl:2696：**单请求**
-     * CLEAN_UNUSED_TOPIC(316)，由 broker 自行清理未使用 topic。
-     *
-     * 客户端不要遍历 topic 表逐个删——broker 自建的 BenchmarkTest、
-     * 重试/死信 topic 会被 broker 以 SYSTEM_ERROR 拒绝。
-     */
     public function cleanUnusedTopicByAddr(string $brokerAddr): void
     {
         $this->invokeBroker($brokerAddr, RequestCode::CLEAN_UNUSED_TOPIC);
     }
 
-    /**
-     * 对应 Java queryConsumeTimeSpan：按路由遍历 master，聚合各 broker 的
-     * QUERY_CONSUME_TIME_SPAN(303) 结果（body 是 consumeTimeSpanSet JSON）。
-     *
-     * @return list<array<string, mixed>>
-     */
     public function queryConsumeTimeSpan(string $topic, string $group): array
     {
         $route = $this->examineTopicRoute($topic);
@@ -2016,13 +1921,6 @@ class DefaultMQAdminExt
 
     // ---------------- NameServer 配置（318/319） ----------------
 
-    /**
-     * 对应 Java updateNameServerConfig → UPDATE_NAMESRV_CONFIG(318)：
-     * properties 以 **k=v\n 文本**进 body，广播到每个 NameServer，
-     * 任一失败即抛（Java 记 errResponse 最后统一抛）。
-     *
-     * @param array<string, string> $properties
-     */
     public function updateNameServerConfig(array $properties, ?int $timeoutMillis = null): void
     {
         $text = MixAll::properties2String($properties);
@@ -2048,13 +1946,6 @@ class DefaultMQAdminExt
         }
     }
 
-    /**
-     * 对应 Java getNameServerConfig → GET_NAMESRV_CONFIG(319)：逐个 NameServer
-     * 查询，body 是 properties 文本；返回 {地址: properties 字典}。
-     *
-     * @param list<string>|null $namesrvAddrs
-     * @return array<string, array<string, string>>
-     */
     public function getNameServerConfig(?array $namesrvAddrs = null, ?int $timeoutMillis = null): array
     {
         $client = $this->requireClient();
@@ -2068,7 +1959,6 @@ class DefaultMQAdminExt
             try {
                 $response = $this->invokeSyncOn($client, $nsAddr, $request, $timeoutMillis ?? $this->timeoutMillis);
             } catch (\Throwable $e) {
-                // Java 收集后统一抛
                 $lastExc = $e;
                 continue;
             }
@@ -2088,13 +1978,6 @@ class DefaultMQAdminExt
         return $result;
     }
 
-    /** 对应 Java setMessageRequestMode → SET_MESSAGE_REQUEST_MODE(401)：
-     * 在 POP 与 Pull 模式间切换消费组（单元化场景）。
-     *
-     * ⚠ wire 口径：broker 对 401 **没有 header**（QueryAssignmentProcessor 直接纳
-     * body 里的 SetMessageRequestModeRequestBody）——字段必须进 body JSON（Java 属性
-     * 名 topic/consumerGroup/mode/popShareQueueNum），放 ext_fields 时 broker 侧
-     * requestBody 反序列化为 null → NPE。mode 缺省按 Java 字段初始化值为 PULL。 */
     public function setMessageRequestMode(string $brokerAddr, string $topic, string $consumerGroup, string $mode, int $popShareQueueNum = 0): void
     {
         $body = [
@@ -2108,10 +1991,6 @@ class DefaultMQAdminExt
 
     // ---------------------------------------------------------------- 辅助
 
-    /**
-     * 对应 Java PermName.isValid(String)（数字解析失败等价于抛 NumberFormatException）
-     * 与 Python 模块级 ``_perm_is_valid``。
-     */
     public static function permIsValid(int|string|null $value): bool
     {
         if ($value === null) {
@@ -2125,9 +2004,7 @@ class DefaultMQAdminExt
     }
 }
 
-// ---------------------------------------------------------------- 消息轨迹 DTO（org.apache.rocketmq.tools.admin.api） ----------------
 
-/** 对应 Java ``TrackType`` 枚举（字符串值即枚举名）。 */
 final class TrackType
 {
     public const CONSUMED = 'CONSUMED';
@@ -2139,7 +2016,6 @@ final class TrackType
     public const UNKNOWN = 'UNKNOWN';
 }
 
-/** 对应 Java ``MessageTrack``：一条消息在某消费组的投递判定。 */
 final class MessageTrack
 {
     public function __construct(

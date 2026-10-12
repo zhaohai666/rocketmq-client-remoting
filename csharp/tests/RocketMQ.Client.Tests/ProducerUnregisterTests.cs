@@ -1,19 +1,5 @@
 // 生产者/消费者退出时发 UNREGISTER_CLIENT(35) 的离线单测 —— 不需要集群。
 //
-// 对齐基准（Java 5.5.1，逐行读过；与 python/tests/test_producer_unregister.py、
-// cpp/tests/test_producer_unregister.cpp、rust/src/client/mq_client.rs 的同一组断言对拍）：
-//   * `DefaultMQProducerImpl#shutdown`:313 → `MQClientInstance#unregisterProducer`:1198-1201
-//     → 私有 `unregisterClient(producerGroup, null)`:1158-1182 —— 遍历 `brokerAddrTable` 的
-//     **每个 brokerId**（主 + 从），每台一发，超时 `getMqClientApiTimeout()`（3000ms），
-//     RemotingException / InterruptedException / MQBrokerException 一律吞成 log.warn。
-//   * `MQClientAPIImpl#unregisterClient`:1615-1639 —— 头是
-//     `UnregisterClientRequestHeader{clientID, producerGroup, consumerGroup}`，键名是
-//     大写 ID 的 `clientID`；没用到的那个槽位传 null ⇒ **整个字段不上线**。
-//   * broker 端 `ClientManageProcessor#unregisterClient`:213-249 判的是 `group != null`：
-//     空串会被当成「真有个空组名」去查 `""` 的订阅组配置。这类偏差真机不会报错，
-//     只能靠抓帧锁住。
-//   * 心跳一侧仍只打「主优先」的那台：`GetRouteOfAllBrokers`（`SelectBrokerAddr`）与
-//     `GetAllBrokerAddrs` 的分工必须守住，这里一起锁。
 //
 // 为什么这里要自带一个假集群：`MockCluster` 的路由是「一台 broker 一个名字、只有 master」，
 // 本机真集群也只有一台 master，**从节点收不收得到 35 这一条判据根本造不出来**。
@@ -42,7 +28,6 @@ public class ProducerUnregisterTests
     private const string Group = "PID_unreg_net_unit";
     private const string ClientId = "10.0.0.1@unreg-net-unit";
 
-    /// <summary>35 在离线用例里用的超时 —— Java 的 mqClientApiTimeout，写死防止被改回 5000。</summary>
     private const int DefaultApiTimeout = 3000;
 
     // ---------------- master + slave 假集群 ----------------
@@ -93,8 +78,6 @@ public class ProducerUnregisterTests
             route.QueueDatas.Add(new QueueData(BrokerName, 2, 2,
                 PermName.PermRead | PermName.PermWrite, 0));
             route.BrokerDatas.Add(new BrokerData("MsCluster", BrokerName,
-                // 同一 brokerName 下 master(brokerId=0) + slave(brokerId=1)：
-                // Java `MQClientInstance#unregisterClient`:1159-1166 遍历的正是这层的每个条目。
                 new SortedDictionary<long, string> { { 0L, MasterAddr }, { 1L, SlaveAddr } }));
             return route;
         }
@@ -327,10 +310,8 @@ public class ProducerUnregisterTests
         List<Frame> got = cluster.Frames(RequestCode.UnregisterClient);
         Assert.Single(got);
         PropertyMap ext = got[0].Ext;
-        // 键名 clientID 的 D 是大写（Java 的 @CFHeader 字段名），拼错 broker 直接读不到
         Assert.Equal(ClientId, ext["clientID"]);
         Assert.Equal(Group, ext["producerGroup"]);
-        // Java 的 unregisterClient(group, null)：消费者槽位整个不上线
         Assert.False(ext.ContainsKey("consumerGroup"));
         Assert.Equal(2, ext.Count);
     }
@@ -391,7 +372,6 @@ public class ProducerUnregisterTests
 
         // 分工：心跳/「问到一台就行」的路径只打 master 优先的那台……
         Assert.Equal(new[] { cluster.MasterAddr }, inst.GetRouteOfAllBrokers());
-        // ……注销必须每台各一发（含 slave），Java :1159-1166 遍历的是每个 brokerId。
         Assert.Equal(new[] { cluster.MasterAddr, cluster.SlaveAddr }.OrderBy(a => a, StringComparer.Ordinal)
                      .ToList(),
             inst.GetAllBrokerAddrs().OrderBy(a => a, StringComparer.Ordinal).ToList());
@@ -411,13 +391,6 @@ public class ProducerUnregisterTests
     }
 
     // ---------------- 4b：消费者心跳也覆盖从节点 ----------------
-    //
-    // Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750 遍历 brokerAddrTable 的每个
-    // brokerId，只有 `consumerEmpty && MixAll.MASTER_ID != id` 才跳过 —— 带 ConsumerData 的
-    // 心跳因此**会打到从节点**。从节点必须在自己的 ConsumerManager 里认识这个消费组，否则
-    // 指向它的拉取会被 `PullMessageProcessor`:420-427 回 SUBSCRIPTION_NOT_EXIST
-    // （默认 PostSubscriptionWhenPull=false 的拉取不带订阅标志，走的正是那条）。
-    // 生产者心跳相反（只带 ProducerData ⇒ consumerEmpty），仍只打主 —— 见上面的 helper 断言。
     [Fact]
     public void ConsumerHeartbeatReachesSlaveToo()
     {
@@ -467,14 +440,11 @@ public class ProducerUnregisterTests
         Assert.Equal(ResponseCode.SystemError, ex.ResponseCode);
 
         cluster.ClearFrames();
-        // Java :1172-1178 三种异常全部只 log.warn —— shutdown 不因单台抖动中断，
-        // 而且剩下的 broker 照样要注销到。
         inst.UnregisterClientAllBrokers(ClientId, Group, "", DefaultApiTimeout);
         Assert.Equal(1, cluster.CountAt(cluster.MasterAddr, RequestCode.UnregisterClient));
         Assert.Equal(1, cluster.CountAt(cluster.SlaveAddr, RequestCode.UnregisterClient));
     }
 
-    // ---------------- 5：超时预算与 Java 对齐 ----------------
 
     [Fact]
     public void UnregisterTimeoutMatchesLegacyApiTimeout()
@@ -518,8 +488,6 @@ public class ProducerUnregisterTests
     [Fact]
     public void DeadBrokerInRouteDoesNotBreakProducerShutdown()
     {
-        // 路由里掺一台连不上的 broker：注销它必然抛连接异常，Java 吞掉并继续下一台，
-        // 整个 shutdown 不能被打断。
         using MockCluster cluster = MockCluster.StartAt(
             new List<string?> { null, MockCluster.DeadAddr() });
         var p = new DefaultMQProducer(Group + "_dead") { NamesrvAddr = cluster.NamesrvAddr };

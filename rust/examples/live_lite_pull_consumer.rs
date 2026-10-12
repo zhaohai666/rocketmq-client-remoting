@@ -4,34 +4,6 @@
 //! 手工心跳、以及「`seek()` 会丢掉缓冲里该队列早于目标位点的消息」这三条
 //! （L7/L8/L4）——它们都只有真机能验（后台拉取循环 + broker 侧位点与订阅）。
 //!
-//! Lite 相对 [`DefaultMQPullConsumer`] 的本质区别：**调用方不管位点**，`poll()` 从
-//! 后台灌好的本地缓冲里拿消息。所以断言都围绕这条链路：
-//! - L1 生命周期：既没订阅也没 assign 时 `start()` 失败；`consumeTimestamp` 不是 14 位
-//!   本地墙钟时 `start()` 硬失败（晚抛等于静默退化成「从 max offset 消费」）；
-//!   重复 `start()`/`shutdown()` 幂等；未 start 时 `poll()` 只返回空。
-//! - L2 subscribe 模式：后台首轮重平衡分到 4 个队列（`start()` 不同步重平衡，
-//!   Python 同，所以要催一次 `rebalance()`），随后发的 12 条被 `poll()` 收全，不重不漏。
-//! - L3 位点提交：`auto_commit=true` 时位点**只在 poll() 开头到点才提交**（Java 的
-//!   `nextAutoCommitDeadline`，默认 5s 一次），所以场景要持续 poll 过一整个周期，
-//!   `committed()` 才逐队列 > 0；`auto_commit=false` 时位点不落 broker，显式 `commit()`
-//!   之后才前进。
-//! - L4 assign 模式：显式 `assign` + 默认 LAST → poll 不到存量；`seek_to_begin` 重放该
-//!   队列；全部 `seek_to_begin` 后重放 12 条；`seek_to_end` 丢掉缓冲里的旧消息。
-//! - L5 订阅级 tag：`subscribe(topic, "TagA")` 只收 6 条 TagA，且 `subscription()` /
-//!   `subscriptions()` 回读到过滤后的订阅集（这是心跳里带给 broker 的东西）。
-//! - L6 `CONSUME_FROM_TIMESTAMP`：起点=30 分钟前的**本地墙钟** → 收全 12 条；
-//!   墙钟→队列位置的映射：30 分钟前 → Σ==0（各队列队首），10 分钟后 → Σ==12（越过
-//!   全部消息）。把墙钟串当 epoch 毫秒解析会把这两个方向同时翻转。
-//! - L7 `pause` / `resume`：暂停后 `poll()` 拿不到新消息，恢复后 12 条照常收全。
-//! - L8 `send_heartbeat_to_all_broker()` >= 1：lite 的心跳报文只带自己那份
-//!   `ConsumerData`；`start()` 会先同步刷一次订阅 topic 的路由（Java
-//!   `updateTopicRouteInfoFromNameServer` 的等价物）再发首轮心跳，所以这里直接
-//!   验到达数 >= 1，而不是等后台循环把路由表填上。
-//! - L9 状态与运维接口：`assignment` / `buffered_message_count` /
-//!   `offset_for_timestamp` 单调 / `fetch_subscribe_message_queues`。
-//! - L11 三张位点表（对位 C++ `live_lite_pull.cpp` 的 S8）：1 队列 topic 灌 1200 条，
-//!   把「拉取游标 / 已消费游标 / 提交落点」三个数字在真机各自数出来。
-//! - L10 清理：删掉本次建的 topic。
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
 //! ```text
@@ -122,7 +94,6 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Java `UtilAll.YYYYMMDDHHMMSS` 口径的**本地墙钟**串（相对 now 偏移若干秒）。
 fn wall_clock(secs_offset: i64) -> String {
     let dt: DateTime<Local> = Local
         .timestamp_opt(Utc::now().timestamp() + secs_offset, 0)
@@ -337,7 +308,6 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
             return;
         }
     };
-    // 未订阅、未 assign → start 必须失败（Java 的 subscribe 前置校验）。
     match c.start().await {
         Ok(()) => ck.check("L1 未订阅时 start 失败", false, "start 竟然成功了"),
         Err(e) => ck.check(
@@ -473,9 +443,6 @@ async fn l3_commit(ck: &mut Checker, fx: &Fixture, topic: &str, mqs: &[MessageQu
         got.len() == N_MSG,
         &format!("n={}", got.len()),
     );
-    // Java 的自动提交只在 poll() 开头按那一道全局截止时刻到点才跑（默认 5s 一次），而第一次
-    // 检查发生在交付之前（已消费游标还是 -1，提交不出东西）：所以要继续 poll 过一整个周期，
-    // 位点才会自己落下去。停掉 poll 之后 Java 同样不动 —— 这里不该指望它。
     let interval = c.config().auto_commit_interval_millis.max(0) as u64;
     let spin_until = Instant::now() + Duration::from_millis(interval + 1_500);
     while Instant::now() < spin_until {
@@ -1178,10 +1145,6 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
     );
     o.resume(std::slice::from_ref(&q0));
 
-    // ---- L11g Java RemoteBrokerOffsetStore#persistAll 的 "remove unused mq"：点名提交
-    // 只发被点名的队列，内存表里**其余**条目顺手删掉 —— 上一轮 persist=false 攒下、
-    // 还没落盘的内存值就此丢掉。这条在 broker 上可观测：清掉之后 committed() 只能
-    // 回读到 broker 上那一格，再也读不到 300。
     let Some(foreign) = mqs.get(1).cloned() else {
         ck.abort("L11g 取 foreign 队列", "主 topic 不足 2 条队列");
         o.shutdown();
@@ -1199,7 +1162,6 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
         o.pending_commit_of(&q0) == 300,
         &format!("pending={}", o.pending_commit_of(&q0)),
     );
-    // 空集合：Java 的 commit(Set) 直接 return，表不动、消息也不发
     if let Err(e) = o.commit_queues(&[], true).await {
         ck.abort("L11g commit(空集合)", &e.to_string());
     }

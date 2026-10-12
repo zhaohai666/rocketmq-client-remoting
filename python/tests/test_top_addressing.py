@@ -1,18 +1,4 @@
 # -*- coding: utf-8 -*-
-"""动态 name server（TopAddressing / DefaultTopAddressing）单测 —— 本地 mock HTTP server。
-
-Java 语义锚点（common/namesrv/DefaultTopAddressing.java + MixAll.getWSAddr +
-client/impl/MQClientAPIImpl.fetchNameServerAddr，5.5.1 逐条核对）：
-  * WS 地址：``http://<domain>:8080/rocketmq/<subgroup>``；domain 自带端口（含 ':'）
-    时不追加 :8080；
-  * unitName 非空白 → URL 追加 ``-<unitName>?nofix=1``；para 非空 → ``?k=v&...``；
-  * HTTP GET（超时 3000ms）code==200 → 响应体 ``clearNewLine``（trim 后截断到第一个
-    \\r 或 \\n）作为 NS 地址串；否则 None；
-  * ``fetchNameServerAddr``：地址**变化才应用**（按 ';' 切分更新地址表）；
-  * ``MQClientInstance``：只在未配置静态地址时，start() fetch 一次 + 10s/2min 周期刷新。
-
-mock HTTP server 用标准库 http.server 起在 127.0.0.1 随机端口，不依赖外网。
-"""
 from __future__ import annotations
 
 import threading
@@ -80,7 +66,6 @@ def _top_for(server: _MockAddrServer, **kw) -> DefaultTopAddressing:
 
 class TestWsAddr:
     def test_default_port_appended(self):
-        # Java MixAll.getWSAddr：domain 无端口 → 补 :8080
         assert DefaultTopAddressing.get_ws_addr("jmenv.tbsite.net") == \
             "http://jmenv.tbsite.net:8080/rocketmq/nsaddr"
 
@@ -110,7 +95,6 @@ class TestBuildUrl:
         assert "k1=v1&k2=v2" in url or "k2=v2&k1=v1" in url
 
     def test_unit_name_with_para(self):
-        # Java：unitName + para → "-unit?nofix=1&k=v..."（末尾 & 去掉）
         ta = DefaultTopAddressing(ws_addr="http://h:8080/rocketmq/nsaddr",
                                   unit_name="u", para={"k": "v"})
         assert ta.build_url() == "http://h:8080/rocketmq/nsaddr-u?nofix=1&k=v"
@@ -133,7 +117,6 @@ class TestClearNewLine:
         assert clear_new_line("  a:9876  ") == "a:9876"
 
     def test_empty(self):
-        # Java trim() 会把前导 \r\n 一并去掉，所以这里 trim 后就是 "x"（与 Java 一致）
         assert clear_new_line("   \r\n x") == "x"
         assert clear_new_line("\r\n") == ""
 
@@ -154,7 +137,6 @@ class TestFetchNsAddr:
         assert ta.fetch_ns_addr(verbose=False) is None
 
     def test_connection_error_returns_none(self):
-        # 没有服务监听的端口 → 连接失败 → None（Java catch IOException）
         ta = DefaultTopAddressing(domain="127.0.0.1:1", timeout_millis=300)
         assert ta.fetch_ns_addr(verbose=False) is None
 
@@ -165,7 +147,6 @@ class TestFetchNsAddr:
 
     def test_unreachable_at_start_is_reported(self):
         ta = DefaultTopAddressing(domain="127.0.0.1:1", timeout_millis=300)
-        # verbose=True 走 error 日志但不抛（Java 语义）
         assert ta.fetch_ns_addr(verbose=True) is None
 
 

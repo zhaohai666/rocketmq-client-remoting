@@ -1,6 +1,3 @@
-// 拉取前流控（Java ProcessQueue 五个阈值）真机验证。
-// 用法：rmq_live_flow_control 127.0.0.1:9876
-//
 // 与 Python 的 verify_flow_control_live.py、Rust 的 live_flow_control.rs、C# 的
 // LiveFlowControl.cs 一一对应（S0~S5）。
 //
@@ -11,13 +8,6 @@
 //   B. 命中之后**一条消息都不许丢**：流控只是"暂停拉取"，不是"丢弃/跳过"。暂停期间
 //      位点不许越过还没消费完的消息，恢复后同一个队列必须继续消费到末尾。
 //
-// S1 队列级字节闸门   —— 条数闸门压到 Java 上界(65535)，只剩 size=1MiB 这道可能命中
-// S2 位点跨度闸门     —— 条数/字节都压到不命中，只剩 maxSpan=2 这道可能命中
-// S3 topic 级条数闸门 —— 队列级三条全压到不命中，只有一台实例上**跨队列累计**才可能命中
-// S4 命中之后恢复     —— 同一组再来一批大消息，闸门仍会命中且新消息照单全收
-// S5 配置数值闸门     —— Java checkConfig(:1099-1209) 的区间边界值真机能启动并收全消息；
-//                        越界配置在本地就被拒，且 broker 侧查不到这个消费组（没留下僵尸
-//                        clientId 把 cidAll 撑歪）
 //
 // ⚠ 大消息必须是**不可压缩**的随机字节：生产者对超过压缩阈值的 body 先试压，全同字节
 //   的 payload 会被压到几百字节，broker 落盘的 storeSize 跟着变成几百字节，"size 闸门
@@ -170,11 +160,6 @@ int main(int argc, char** argv) {
     }
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    // "把这道闸门压到不命中"的合法写法：Java checkConfig 的**上界**
-    // （pullThresholdForQueue / consumeConcurrentlyMaxSpan 都是 [1, 65535]，
-    // pullThresholdSizeForQueue 是 [1, 1024] MiB），**不是 0**。0 会被 S5 的启动期
-    // 闸门拒（Java :1134/:1152）；运行期虽有 max(1,n) 兜底，但那道兜底不该拿来
-    // 越过校验 —— 真机上写 0 的后果是"每轮都判成超限"，队列永久停拉。
     constexpr int32_t kOffCount = 65535;
     constexpr int32_t kOffSizeMiB = 1024;
 
@@ -292,14 +277,6 @@ int main(int argc, char** argv) {
         check("S4-恢复批次不重复", c.sink->distinct() == 6, "distinct=" + num(c.sink->distinct()));
     }
 
-    // ---------------- S5 配置数值闸门（Java checkConfig :1099-1209）----------------
-    // 离线单测（tests/test_consumer_check_config.cpp）锁的是区间与文案；这里补两件
-    // 只有真集群能锁死的事：
-    //   1. 落在 Java 区间**边界**上的配置在 broker 上真能把消费者跑起来并收全消息 ——
-    //      闸门写歪最常见的方式是"比 Java 还严"，把合法配置也拒了，用户直接起不来；
-    //   2. 越界的配置**没有打到 broker 上**。写成"先注册再校验"的话，broker 的
-    //      ConsumerManager 会留下一堆永不心跳的僵尸 clientId，把 rebalance 用的
-    //      cidAll 撑歪（真机表现为队列分配不均），而客户端日志里只有启动失败那一条。
     {
         const std::string topic = prefix + "_Config";
         prepareTopic(producer, topic, 4);
@@ -307,8 +284,6 @@ int main(int argc, char** argv) {
         const std::string badGroup = prefix + "_g6";
 
         Case c = startConsumer(nsAddr, goodGroup, topic, 0);
-        // 每条闸门都取 Java 区间的端点值：pullBatchSize=1024、popInvisibleTime=300000
-        // 这类"贴着上限"的写法在生产里就是"实际不拦"，误拒等于把用户挡在门外。
         c.consumer->setConsumeThreadMin(1);
         c.consumer->setConsumeThreadMax(2);
         c.consumer->setConsumeConcurrentlyMaxSpan(kOffCount);
@@ -340,8 +315,6 @@ int main(int argc, char** argv) {
                   "got=" + num(c.sink->got()) + " distinct=" + num(c.sink->distinct()));
         }
 
-        // 越界配置：本地拒（文案逐字对 Java）+ 失败后不留半启动实例。
-        // 每条都取"刚刚越界"的值：差 1 就够，越界幅度大不代表更可信。
         struct BadCase {
             const char* want;
             std::function<void(DefaultMQPushConsumer&)> apply;

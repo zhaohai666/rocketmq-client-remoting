@@ -1,27 +1,4 @@
 # -*- coding: utf-8 -*-
-"""unitName / unitMode / enableStreamRequestType 三个 Java `ClientConfig` 开关的落点。
-
-Java 语义锚点（5.5.1 逐条核对）：
-
-  * ``ClientConfig#buildMQClientId``（:120-137）：``ip@instanceName[@unitName][@STREAM]``，
-    口径本身见 ``tests/test_client_id.py``；这里只管**开关**是否真的接通。
-  * ``MQClientAPIImpl`` 构造（:322 / :329-332）：
-      - ``new DefaultTopAddressing(MixAll.getWSAddr(), clientConfig.getUnitName())``
-        —— unitName 要透传给动态取址（URL 变成 ``-<unitName>?nofix=1``）；
-      - ``if (clientConfig.isEnableStreamRequestType()) registerRPCHook(new StreamTypeRPCHook())``，
-        而且注册在用户 rpcHook **之前**（注释原文："Inject stream rpc hook first to make
-        reserve field signature"）—— 否则 ACL 签名里不含 ``ReqT``，broker 会算出不同摘要。
-  * ``StreamTypeRPCHook#doBeforeRequest``：只加一个扩展字段
-    ``MixAll.REQ_T``（"ReqT"）= ``String.valueOf(RequestType.STREAM.getCode())`` = ``"0"``。
-  * ``isUnitMode()`` 的消费点：``DefaultMQProducerImpl``:964/:1004（拦截钩子上下文、
-    发消息请求头）、``DefaultMQPushConsumerImpl``:640 与 ``PullAPIWrapper``:126（投递前
-    过滤钩子上下文）、``MQClientInstance``:1039（心跳里的 ``ConsumerData.unitMode``）。
-    broker 侧不是摆设：``AbstractSendMessageProcessor``:136/:491 与
-    ``ClientManageProcessor``:113/:186 会据此给自动创建的 topic 打 UNIT 系统标志。
-  * 默认值：``enableStreamRequestType`` 只有拉取/轻量消费者的构造函数写 true
-    （``DefaultMQPullConsumer``:113/:126、``DefaultLitePullConsumer``:213/:228），
-    生产者/推送消费者/admin 都是 false；``unitMode`` 默认 false、``unitName`` 默认 null。
-"""
 from __future__ import annotations
 
 import threading
@@ -59,7 +36,7 @@ def _drop(inst: MQClientInstance) -> None:
 
 # ---------------------------------------------------------------- StreamTypeRPCHook
 def test_stream_hook_only_adds_the_req_t_ext_field():
-    """Java 的 StreamTypeRPCHook 只有一行；字段名与值都不能改。"""
+    pass
     from remoting.protocol.remoting_command import RemotingCommand
     req = RemotingCommand.create_request_command(SendMessageRequestHeaderV2())
     StreamTypeRPCHook().do_before_request("127.0.0.1:9876", req)
@@ -68,11 +45,7 @@ def test_stream_hook_only_adds_the_req_t_ext_field():
 
 
 def test_stream_hook_is_registered_before_the_user_hook():
-    """注册顺序 = 签名内容：ReqT 必须先进 extFields，用户的 ACL 钩子才算得到它。
-
-    facade 是在 ``MQClientInstance`` 构造完之后才 ``register_rpc_hook(self.rpc_hook)``，
-    所以「实例构造时注册 stream 钩子」天然满足 Java 的顺序要求。
-    """
+    pass
     inst = _new_instance("stream_order", enable_stream_request_type=True)
     try:
         user = RPCHook()
@@ -99,13 +72,13 @@ def test_no_stream_hook_when_disabled():
     (lambda: DefaultLitePullConsumer("CID_stream_default"), True),
 ])
 def test_enable_stream_request_type_defaults_match_the_request_builders(factory, expected):
-    """Java 只在 pull/lite 的构造函数里打开这个开关，其余保持 ClientConfig 的 false。"""
+    pass
     assert factory().enable_stream_request_type is expected
 
 
 # ---------------------------------------------------------------- unitName → 取址
 def test_unit_name_reaches_the_address_server_url():
-    """对应 Java `new DefaultTopAddressing(MixAll.getWSAddr(), unitName)`。"""
+    pass
     inst = _new_instance("unit_addr", unit_name="unitA")
     try:
         assert inst.top_addressing._unit_name == "unitA"
@@ -125,18 +98,14 @@ def test_default_unit_name_is_empty():
 
 # ---------------------------------------------------------------- unitMode → 线上
 def test_send_request_header_carries_unit_mode():
-    """Java `DefaultMQProducerImpl#sendKernelImpl`:1004 setUnitMode(isUnitMode())。"""
+    pass
     inst = _new_instance("unit_send")
     msg = Message("T_UnitSend", b"body")
     try:
         on = inst._build_send_request("PG_unit", msg, MQ, 3000, 0, True)
         off = inst._build_send_request("PG_unit", msg, MQ, 3000, 0)
         assert on.custom_header.unit_mode is True
-        # 不传就是 false：Java ClientConfig 的默认值
         assert off.custom_header.unit_mode is False
-        # 字段要落到 extFields 才算真的上线（编码时 makeCustomHeaderToNet）。
-        # ⚠ V2 请求头的 unitMode 在 Java 里是 `@JSONField(name = "k")`（单字母缩写），
-        # 不是 "unitMode" —— 见 headers.py 的 SendMessageRequestHeaderV2。
         on.make_custom_header_to_net()
         assert str(on.ext_fields["k"]).lower() == "true"
     finally:
@@ -184,7 +153,7 @@ def test_producer_send_passes_its_own_unit_mode():
 
 
 def test_heartbeat_consumer_data_carries_unit_mode():
-    """Java `MQClientInstance`:1039 `consumerData.setUnitMode(impl.isUnitMode())`。"""
+    pass
     for facade in (DefaultMQPushConsumer("CID_unit_hb"), DefaultLitePullConsumer("CID_unit_hb")):
         facade.client_id = "unit-hb-client"
         assert list(facade._build_heartbeat().consumer_data_set)[0].unit_mode is False
@@ -217,7 +186,7 @@ class _RecorderFilter(FilterMessageHook):
 
 
 def test_check_forbidden_context_carries_unit_mode():
-    """Java `DefaultMQProducerImpl`:964 `checkForbiddenContext.setUnitMode(isUnitMode())`。"""
+    pass
     for enabled, expected in ((True, True), (False, False)):
         p = DefaultMQProducer("PID_unit_forbidden")
         p.set_unit_mode(enabled)
@@ -228,7 +197,7 @@ def test_check_forbidden_context_carries_unit_mode():
 
 
 def test_filter_message_context_carries_unit_mode():
-    """Java `DefaultMQPushConsumerImpl`:640 与 `PullAPIWrapper`:126 都传 isUnitMode()。"""
+    pass
     msg = MessageExt("T", b"x")
     for enabled, expected in ((True, True), (False, False)):
         hook = _RecorderFilter()
@@ -259,7 +228,7 @@ def test_pull_consumer_filter_uses_its_own_unit_mode():
 
 
 def test_unit_mode_setters_exist_on_every_facade():
-    """Java 的四个 facade 都继承 ClientConfig，因此都拿得到这三个 setter。"""
+    pass
     for facade in (DefaultMQProducer("PID_unit_setter"), DefaultMQPushConsumer("CID_unit_setter"),
                    DefaultMQPullConsumer("CID_unit_setter"),
                    DefaultLitePullConsumer("CID_unit_setter")):

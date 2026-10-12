@@ -2,22 +2,6 @@
 
 declare(strict_types=1);
 
-/**
- * 故障规避主动探活（Java 5.x LatencyFaultToleranceImpl.startDetector + 默认
- * ServiceDetector）纯 PHP assert 风格自测（不依赖 phpunit，不连真机）。
- *
- * 运行：C:/Users/zhaoh/.workbuddy/binaries/php/versions/8.3/php.exe tests/RunClientFaultDetector.php
- * 全部通过输出 "ALL TESTS PASSED (N checks)"，任一失败列出明细并以非零码退出。
- *
- * 网络用例以 `--broker` 参数二次拉起自身作为**子进程**假 broker（stream_socket_server +
- * stream_select 多连接，手法照抄 RunClientProducer.php / RunClientInstance.php）。
- * broker 收到的每条命令追加写入 JSON 行日志，供父进程断言「探测是否真的发出去了」；
- * GET_MAX_OFFSET(30) 的应答行为由一个**模式文件**控制（ok=正常回 / silent=收下不回），
- * 父进程改文件即可编排「探测超时 → 恢复放行」的脚本，无需真的杀进程。
- *
- * PHP 是 tick() 驱动模型：探测轮收敛在 MQClientInstance::tick() 里同步跑，所以
- * 用例直接调 tick($now) 推进（无需 sleep 等探测「自己」发生——不到期就是零开销）。
- */
 
 require_once __DIR__ . '/../bootstrap.php';
 
@@ -376,13 +360,11 @@ final class RunClientFaultDetector
 
     private function testConfigDefaults(): void
     {
-        // 默认值对齐 Java ClientConfig：关 / 200ms / 2000ms
         $p = new DefaultMQProducer('GID-det-cfg');
         $this->check(false === $p->isStartDetectorEnable(), 'producer 默认 startDetectorEnable=false');
         $this->checkSame(200, $p->getDetectTimeout(), 'producer 默认 detectTimeout=200');
         $this->checkSame(2000, $p->getDetectInterval(), 'producer 默认 detectInterval=2000');
 
-        // 默认值在构造时就同步进策略/容错表（Java MQFaultStrategy 构造器同位）
         $st = $p->mqFaultStrategy;
         $this->check(false === $st->isStartDetectorEnable(), 'strategy 默认 startDetectorEnable=false');
         $this->checkSame(200, $st->getDetectTimeout(), 'strategy 默认 detectTimeout=200');
@@ -392,7 +374,6 @@ final class RunClientFaultDetector
         $this->checkSame(2000, $tol->detectInterval, 'tolerance 默认 detectInterval=2000');
         $this->check(false === $tol->isStartDetectorEnable(), 'tolerance 默认 startDetectorEnable=false');
 
-        // setter 两处同时写（Java DefaultMQProducer.setStartDetectorEnable 同位），可运行中翻转
         $p->setStartDetectorEnable(true);
         $p->setDetectTimeout(500);
         $p->setDetectInterval(1500);
@@ -435,7 +416,6 @@ final class RunClientFaultDetector
         $tol->detectByOneRound(1050, $resolver, $script->detect(...));
         $this->checkSame(1, $script->calls, '未到期不再探测');
 
-        // 第二轮：探测成功 → 翻回可达（Java 只翻回、从不置 false）
         $tol->detectByOneRound(1100, $resolver, $script->detect(...));
         $this->checkSame(2, $script->calls, '到期后第二轮探测');
         $this->check(true === $tol->isReachable('b1'), '探测成功 → reachable 翻回 true');
@@ -446,7 +426,6 @@ final class RunClientFaultDetector
         $this->checkSame(null, $tol->getFaultItem('gone'), 'resolver=null → 摘除故障记录');
         $this->check($tol->getFaultItem('b1') !== null, '其余记录不受影响');
 
-        // detector=null：跳过探测但不炸（Java 同：装了探测轮没装探测器）
         $tol->updateFaultItem('b3', 0.0, 0.0, false);
         $tol->detectByOneRound(3000, $resolver, null);
         $this->check(false === $tol->isReachable('b3'), '无探测器 → flag 不动');
@@ -466,7 +445,6 @@ final class RunClientFaultDetector
         try {
             $strategy = $p->mqFaultStrategy;
             $tol = $strategy->getLatencyFaultTolerance();
-            // 模拟发送失败把 broker-a 置不可达（隔离 + 不可达，Java MQBrokerException 分支同位）
             $strategy->updateFaultItem('broker-a', 1000.0, true, false);
             $item = $tol->getFaultItem('broker-a');
             $this->check($item !== null, '故障表建项');
@@ -519,7 +497,6 @@ final class RunClientFaultDetector
             $this->checkSame(0, $broker->logCount(RequestCode::GET_MAX_OFFSET), '开关关闭 → 到期也不探测');
             $this->check(false === $tol->isReachable('broker-a'), '开关关闭 → flag 不动');
 
-            // 运行中打开（Java：开关每轮现读）→ 下一轮 tick 立即探测
             $p->setStartDetectorEnable(true);
             $p->mqClient->tick((int) FaultItem::nowMillis());
             $this->checkSame(1, $broker->logCount(RequestCode::GET_MAX_OFFSET), '运行中打开开关 → 下一轮探测');

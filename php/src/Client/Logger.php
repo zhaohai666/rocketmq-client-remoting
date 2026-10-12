@@ -4,35 +4,6 @@ declare(strict_types=1);
 
 namespace RocketMQ\Client;
 
-/**
- * 轻量客户端日志（对应 Python python/rocketmq_logging.py、Node
- * nodeJs/src/logging.ts 与 Go go/common/logging.go）。
- *
- * **默认落盘**（与 Java 客户端一样会生成日志文件），但落盘位置刻意不同：
- *
- *   ROCKETMQ_CLIENT_LOG_LEVEL        DEBUG|INFO|WARN|ERROR（默认 INFO）
- *   ROCKETMQ_CLIENT_LOG_DIR          日志目录（默认 <当前工作目录>/logs/rocketmqlogs）
- *   ROCKETMQ_CLIENT_LOG_FILE         文件名（默认 rocketmq_php_client.log；
- *                                    置空 / OFF / NONE 关闭文件落盘；含路径分隔符时按整路径处理）
- *   ROCKETMQ_CLIENT_LOG_USE_STDOUT   任意非空值 → 只写 stderr，不写文件
- *   ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE   单文件上限，默认 64MB（Java logback 同值）
- *   ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX  备份份数，默认 10
- *
- * **默认落盘位置随项目工作目录走**：`<当前工作目录>/logs/rocketmqlogs`。
- * PHP 客户端常在脚本 / CI / 别人的宿主进程里跑，把日志写进用户主目录会污染 `$HOME` 且
- * 留下越界副作用；落在当前工作目录则跟着部署走，容器里天然可预期。需要其他目录时显式设
- * `ROCKETMQ_CLIENT_LOG_DIR`（例如 `$HOME/logs/rocketmqlogs`）即可，这是官方逃生门。
- *
- * 轮转是**按大小**的固定备份窗（同 csharp ClientLog.RollLocked / nodeJs roll）：
- * 删除 .N，.N-1→.N … .1→.2，当前文件→.1，再开新文件。
- *
- * **文件名为什么不叫 Java 的 rocketmq_client.log**：同机同时跑 Java 客户端时两个进程
- * 会往同一个文件里插行、并把对方的轮转结果改名（PHP 与 Rust 是按天/按大小重命名，JVM 仍
- * 持有旧 fd，之后 Java 日志会静默写进已 unlink 的 inode）。需要强制对齐时设
- * ROCKETMQ_CLIENT_LOG_FILE=rocketmq_client.log 即可。
- *
- * 静态可注入 callable 覆盖输出目标（单测用），默认「文件 + stderr 之外的注入」见 log()。
- */
 final class Logger
 {
     public const DEBUG = 10;

@@ -1,8 +1,3 @@
-//! 时间戳查位点的边界语义（对应 Java `org.apache.rocketmq.common.BoundaryType`，
-//! 参考实现 `python/common/boundary_type.py`）。
-//!
-//! Java 锚点：
-//!
 //! * 枚举声明 `LOWER("lower")` / `UPPER("upper")`（`BoundaryType.java:23/:28`），
 //!   但入网的值是 `Enum.toString()`（`RemotingCommand.makeCustomHeaderToNet:430`
 //!   的 `value.toString()`）—— **大写枚举名** `LOWER` / `UPPER`；`getName()` 的小写名
@@ -11,18 +6,14 @@
 //!   才回 UPPER，其余（null / 空串 / 未知值 / 小写 "lower"）一律 LOWER。broker 解析
 //!   `SearchOffsetRequestHeader.boundaryType` 走的就是它。
 
-/// 对应 Java `BoundaryType`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum BoundaryType {
-    /// Java `BoundaryType.LOWER`。
     #[default]
     Lower,
-    /// Java `BoundaryType.UPPER`。
     Upper,
 }
 
 impl BoundaryType {
-    /// Java `Enum.name()`（`BoundaryType` 没覆写 `toString()`，两者同值）—— 入网文本。
     pub fn name(self) -> &'static str {
         match self {
             BoundaryType::Lower => "LOWER",
@@ -30,7 +21,6 @@ impl BoundaryType {
         }
     }
 
-    /// Java `BoundaryType.getName()`：小写名，只用于比对与日志。
     pub fn lowercase_name(self) -> &'static str {
         match self {
             BoundaryType::Lower => "lower",
@@ -38,7 +28,6 @@ impl BoundaryType {
         }
     }
 
-    /// Java `BoundaryType.getType(String)`：非 "upper"（大小写不敏感）一律 LOWER。
     pub fn get_type(name: &str) -> BoundaryType {
         if name.eq_ignore_ascii_case("upper") {
             BoundaryType::Upper

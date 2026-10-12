@@ -130,8 +130,6 @@ int main(int argc, char* argv[]) {
 
     // ---------------- S5 隔离到期恢复 ----------------
     std::printf("\nS5 隔离到期恢复（remove 后注入 2000ms）\n");
-    // 注意：S4 注入的是隔离档位 10000ms，而 updateNotAvailableDuration **只延长不缩短**
-    // （Java 语义），必须先 remove 才能注入更短的 2000ms 档。
     p2.mqFaultStrategy().latencyFaultTolerance().remove(broker);
     p2.mqFaultStrategy().latencyFaultTolerance().updateFaultItem(broker, 1.0, 2000, true);
     check("S5 隔离期内不可用", !p2.mqFaultStrategy().latencyFaultTolerance().isAvailable(broker));

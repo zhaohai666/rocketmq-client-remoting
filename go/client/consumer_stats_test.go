@@ -34,14 +34,10 @@ func TestStatsSnapshotIsADifferenceWindow(t *testing.T) {
 		t.Errorf("Avgpt = %v, want 100 (300 / 3 calls)", snap.Avgpt)
 	}
 
-	// An empty list is Java's `csList.isEmpty()` branch: a zero snapshot, not an
-	// error and not a division by zero.
 	if got := computeStatsData(nil); got != (statsSnapshot{}) {
 		t.Errorf("computeStatsData(nil) = %+v, want the zero snapshot", got)
 	}
 
-	// A times difference of 0 leaves avgpt at 0 even when the sum is positive:
-	// Java guards the division rather than reporting Inf.
 	sameTimes := computeStatsData([]callSnapshot{
 		{timestamp: 1_000, times: 7, value: 0},
 		{timestamp: 11_000, times: 7, value: 40},
@@ -54,10 +50,6 @@ func TestStatsSnapshotIsADifferenceWindow(t *testing.T) {
 	}
 }
 
-// A one-element list divides by a zero span. Java does not guard it, so the
-// correct answer here is NaN — a guard would be a silent divergence AND would
-// hide the real bug (a caller that forgot to seed the list, whose snapshot
-// would then read as a plausible 0 TPS).
 func TestStatsSnapshotWithOnlyOneEntryIsNaN(t *testing.T) {
 	snap := computeStatsData([]callSnapshot{{timestamp: 1_000}})
 	if snap.Sum != 0 || snap.Times != 0 || snap.Avgpt != 0 {
@@ -104,9 +96,6 @@ func TestStatsSampleSeedsTheWindow(t *testing.T) {
 	}
 }
 
-// Java's list capacities: 7 for the minute list, 7 for the hour list, 25 for
-// the day list (StatsItem:163/176/189 — the day list is the only one that spans
-// a full day at its 1h cadence).
 func TestStatsCallSnapshotCapacities(t *testing.T) {
 	it := newStatsItem("TEST_CAP", "k", false)
 	for i := 0; i < 20; i++ {
@@ -188,9 +177,6 @@ func TestStatsItemSetUnknownKeyIsAZeroSnapshot(t *testing.T) {
 	}
 }
 
-// Java's getAndCreateItem installs with putIfAbsent, so the FIRST caller's kind
-// wins: an RT call followed by a plain one keeps the RT item (only the print
-// format depends on it, but the API contract does too).
 func TestStatsItemSetKeepsTheFirstItemsKind(t *testing.T) {
 	set := newStatsItemSet("TEST_KIND")
 	set.addRTValue("k", 1, 1)
@@ -389,9 +375,6 @@ func TestConsumeStatusIsKeyedByTopicAndGroup(t *testing.T) {
 
 // ------------------------------------------------- OK/Failed accounting
 
-// Java's `case CONSUME_SUCCESS` arm: [0, ackIndex] are OK, the rest failed, and
-// the failed counter is bumped even when the count is zero (which adds a times
-// tick but no value). Pinned on the raw sums so the arithmetic is visible.
 func TestRecordConsumeSuccessTPSArithmetic(t *testing.T) {
 	const group, topic = "GID_stats_ok", "TopicStatsOk"
 	key := statsKey(topic, group)
@@ -415,10 +398,6 @@ func TestRecordConsumeSuccessTPSArithmetic(t *testing.T) {
 	}
 }
 
-// A listener that returns CONSUME_SUCCESS with a negative AckIndex makes `ok`
-// negative. Java does not clamp that and neither does this port: clamping would
-// change what the 307 answer reports versus the reference client. (The listener
-// contract requires ackIndex >= 0, so only a bug reaches this.)
 func TestRecordConsumeSuccessTPSReproducesNegativeOkWithoutClamping(t *testing.T) {
 	const group, topic = "GID_stats_neg", "TopicStatsNeg"
 	key := statsKey(topic, group)

@@ -1,23 +1,4 @@
 # -*- coding: utf-8 -*-
-"""``OFFSET_ILLEGAL`` 纠错分支单测（Java ``DefaultMQPushConsumerImpl:402-427``），不需要集群。
-
-为什么必须离线锁死：这条路径错了是**静默**的两种极端 ——
-
-  - 只把拉取游标拨到 ``nextBeginOffset`` 而不丢队列/不冻结：broker 刚把位点纠正到
-    合法区间，这条队列上**已经取回还没 ack** 的旧批次一 ack 又把位点推回非法值，
-    下一轮拉取再被 broker 拒一次 —— 客户端与 broker 之间来回弹跳，永不停歇；
-  - 纠错后的位点没立刻落盘：进程在下一轮周期落盘（默认 5s）之前崩掉，broker 上留着的
-    还是非法位点，重启后从非法位点起拉 —— 这条纠错等于没做。
-
-两个方向在真机短期窗口里都看不出差别（消息照消费、只是一直在弹/一次崩溃才暴露），
-所以断言全部放离线；真机另有一条链路证明（见 README 的 `live_*` 一节）。
-
-判据来源：``PullMessageProcessor`` 对 OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE /
-OFFSET_RESET / OFFSET_TOO_SMALL 一律回 ``PULL_OFFSET_MOVED``，``MQClientAPIImpl:1099``
-把它映射成 ``PullStatus.OFFSET_ILLEGAL``，修正值在应答头 ``nextBeginOffset``。Java 的处理
-是 ``setNextOffset`` → ``ProcessQueue.setDropped(true)`` → 异步
-``{ updateAndFreezeOffset; persist; removeProcessQueue; rebalanceImmediately }``。
-"""
 from __future__ import annotations
 
 import threading
@@ -117,7 +98,6 @@ class TestRecover:
         assert h.key not in h.c._mq_map
 
     def test_recover_persists_the_corrected_offset_immediately(self):
-        # Java 的显式 persist：不等周期落盘，纠错当场写回 broker
         h = Harness()
         h.freeze(0)
         h.recover()
@@ -132,7 +112,6 @@ class TestRecover:
         assert h.c._rebalance_now.is_set()
 
     def test_recover_bumps_the_queue_epoch(self):
-        # 代号 +1 是「旧批次作废」的依据（Java setDropped(true)）
         h = Harness(epoch=0)
         h.freeze(0)
         h.recover()
@@ -143,7 +122,7 @@ class TestRecover:
         h = Harness(assigned=False)
         h.recover()
         assert h.client.offsets == []
-        assert h.c._rebalance_now.is_set()   # 重建请求照样发（Java 的 rebalanceImmediately 无条件）
+        assert h.c._rebalance_now.is_set()
 
 
 # ------------------------------------------------- 冻结：修正值不被在途 ack 推翻
@@ -165,8 +144,6 @@ class TestFreeze:
         assert h.offset == 0
 
     def test_freeze_survives_the_drop_until_the_queue_is_rebuilt(self):
-        # 有意偏差：Java 在 removeOffset 时解冻、靠 ProcessQueue.isDropped() 兜底；
-        # 本端口没有 per-batch 的 ProcessQueue 对象，冻结一直留到队列重建（更严）
         h = Harness()
         h.freeze(0)
         h.recover()
@@ -188,7 +165,6 @@ class TestFreeze:
         assert h.offset == 2
 
 
-# ------------------------------------------------- 旧代号的批次整批作废（Java :267/:339）
 
 
 class TestDroppedBatch:
@@ -206,8 +182,6 @@ class TestDroppedBatch:
         assert h.offset == 3
 
     def test_stale_epoch_batch_is_not_consumed(self):
-        # Java ConsumeMessageConcurrentlyService:339 —— 排队期间被丢弃的批次连 listener
-        # 都不该进（消息已由新属主/重建后的队列接管）
         h = Harness(epoch=1)
         listener = FakeListener()
         h.c.message_listener = listener

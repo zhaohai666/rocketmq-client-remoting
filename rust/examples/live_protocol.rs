@@ -114,8 +114,6 @@ impl Checker {
 /// 场景返回值：`String` 是给人看的失败原因。
 type Live = Result<(), String>;
 
-/// 发一个请求并校验响应码。业务错误码（非 0）不当异常抛出，交给调用方
-/// 按场景判断 —— 对齐 Java `MQClientAPIImpl` 只在 finally 里 `createResponseException`。
 async fn rpc(
     client: &RemotingClient,
     addr: &str,
@@ -145,9 +143,6 @@ fn frame_prefix(wire: &[u8]) -> Option<(i32, i32)> {
 }
 
 /// `GET_ROUTEINFO_BY_TOPIC(105)` 的原始往返，供 S0/S1/S7 复用。
-///
-/// 对应 Java `MQClientInstance.updateTopicRouteInfoFromNameServer` /
-/// Python `mq_client.get_topic_route_data`。
 async fn get_route(
     client: &RemotingClient,
     namesrv: &str,
@@ -224,7 +219,6 @@ async fn s0_bootstrap(
             topic_filter_type: Some(TopicFilterType::SINGLE_TAG.to_string()),
             topic_sys_flag: Some(0),
             order: Some(false),
-            // Java `AttributeParser.parseToString(map)`：空 map 输出 ""，不是 null。
             attributes: Some(String::new()),
             force: Some(false),
         })),
@@ -325,9 +319,6 @@ async fn s1_route(
 }
 
 /// S2：`GET_BROKER_CLUSTER_INFO(106)` —— namesrv 回的 `ClusterInfo` JSON。
-///
-/// 对应 Java `MQClientInstance.updateTopicRouteInfoFromNameServer` 里对
-/// `brokerAddrTable` 的解析；Python 侧 `mq_client.get_broker_cluster_info`。
 async fn s2_cluster_info(client: &RemotingClient, namesrv: &str, ck: &mut Checker) -> Live {
     let resp = rpc(
         client,
@@ -385,9 +376,6 @@ struct Sent {
 }
 
 /// S3：`SEND_MESSAGE_V2(310)` —— 手工拼 V2 短键 header + 原始 body。
-///
-/// 对应 Java `DefaultMQProducerImpl.sendKernelImpl` + `MQClientAPIImpl.sendMessage`
-/// （`sendSmartMsg` 默认 true → 走 V2）；Python `mq_client._build_send_request`。
 async fn s3_send(
     client: &RemotingClient,
     broker_addr: &str,
@@ -400,7 +388,6 @@ async fn s3_send(
     let mut msg = Message::new(topic, Some(&body));
     msg.set_tags("TagRustLive");
     msg.set_keys(&format!("{topic}-key"));
-    // Java：非批量消息在发请求前补 UNIQ_KEY，它决定 SendResult.msgId。
     message_client_id_setter::set_uniq_id(&mut msg);
     msg.put_property(message_const::PROPERTY_WAIT_STORE_MSG_OK, "true");
     let uniq_id = match message_client_id_setter::get_uniq_id(&msg) {
@@ -421,7 +408,6 @@ async fn s3_send(
         properties: Some(message_decoder::message_properties_2_string(msg.get_properties())),
         reconsume_times: Some(0),
         unit_mode: Some(false),
-        // Python 恒传 0（不是 Java producer 的默认 -1），保持一致便于对拍。
         max_reconsume_times: Some(0),
         batch: Some(false),
         broker_name: Some(broker_name.to_string()),
@@ -465,10 +451,6 @@ async fn s3_send(
         queue_id == 0 && queue_offset >= 0,
         &format!("queueId={queue_id} queueOffset={queue_offset}"),
     );
-    // UNIQ_KEY 不是 RFC-4122 UUID：Java `MessageClientIDSetter.createUniqIDBuffer`
-    // 用 ip + pid + class 哈希 + 毫秒时间戳 + 计数器拼 16 字节，
-    // 再转成 **32 位大写十六进制**（真机样例：1EEAC0FF3C2AFD2B1D83038C03750001，
-    // 前 8 位就是本机 IP）。
     ck.check(
         "S3 UNIQ_KEY is 32 uppercase hex chars",
         uniq_id.len() == 32
@@ -485,11 +467,6 @@ async fn s3_send(
 }
 
 /// S4：`PULL_MESSAGE(11)` —— 校验 17 段存储格式能解码回刚发出去的消息。
-///
-/// `sysFlag` 取 `buildSysFlag(false, false, true, false)`：对齐 Java
-/// `DefaultMQPullConsumerImpl.pullSyncImpl`（位点由调用方自己提交、短轮询不挂起）。
-/// ⚠ suspend=true 会让 broker 挂到 `brokerSuspendMaxTimeMillis`（默认 20s），
-/// 客户端超时早于它就必然 `RemotingTimeoutException`。
 async fn s4_pull(
     client: &RemotingClient,
     broker_addr: &str,
@@ -605,9 +582,6 @@ async fn s4_pull(
 }
 
 /// S5：min/max offset 与消费位点的读写往返。
-///
-/// 对应 Java `MQClientAPIImpl.getMinOffset/getMaxOffset/fetchConsumeOffset/
-/// updateConsumerOffset`；Python `mq_client` 同名方法。
 async fn s5_offsets(
     client: &RemotingClient,
     broker_addr: &str,
@@ -671,7 +645,6 @@ async fn s5_offsets(
         &format!("min={min_offset} sent={} max={max_offset}", sent.queue_offset),
     );
 
-    // 提交位点后立刻回查，验证 offset store 落盘可读（Java 的 consumerOffset.json）。
     let update = rpc(
         client,
         broker_addr,
@@ -723,7 +696,6 @@ async fn s5_offsets(
         &format!("header={:?} extField={got}", resp_header.offset),
     );
 
-    // 从未提交位点的组：Java 语义是 QUERY_NOT_FOUND(22)，不是错误。
     let missing = rpc(
         client,
         broker_addr,
@@ -748,9 +720,6 @@ async fn s5_offsets(
 }
 
 /// S6：心跳注册 → 按组查在线成员 → 反注册。
-///
-/// 对应 Java `MQClientInstance.sendHeartbeatToAllBrokerV2` /
-/// `MQClientAPIImpl.getConsumerIdListByGroup` / `unregisterClient`。
 async fn s6_heartbeat(
     client: &RemotingClient,
     broker_addr: &str,
@@ -855,9 +824,6 @@ async fn s6_heartbeat(
 }
 
 /// S7：RocketMQ 二进制 header（`serializeType=ROCKETMQ`）走真实 namesrv。
-///
-/// 对应 Java `RocketMQSerializable`（`SerializeType.RMQ`）—— 帧头第 4 字节的
-/// 最高位是协议标记，broker/namesrv 两端都按该标记选解码器。
 async fn s7_rocketmq_serialize(client: &RemotingClient, namesrv: &str, topic: &str, ck: &mut Checker) -> Live {
     let mut req = RemotingCommand::create_request_command(
         request_code::GET_ROUTEINFO_BY_TOPIC,
@@ -868,9 +834,6 @@ async fn s7_rocketmq_serialize(client: &RemotingClient, namesrv: &str, topic: &s
     );
     req.serialize_type_current_rpc = serialize_type::ROCKETMQ;
 
-    // 先自证二进制 header 真的编出来并能解回来：Java `markProtocolType` 把
-    // SerializeType 放在 headerLength 这个 int 的**最高字节**（bit 24..31），
-    // 低 24 位才是 header 长度。
     let wire = req.encode();
     let (total_len, marked) = frame_prefix(&wire).ok_or_else(|| "frame shorter than 8 bytes".to_string())?;
     let header_len = header_length_of(marked);
@@ -903,8 +866,6 @@ async fn s7_rocketmq_serialize(client: &RemotingClient, namesrv: &str, topic: &s
         ),
     );
 
-    // 把解回来的命令原样发出去：namesrv 能用它自己的解码器读懂，才说明二进制
-    // header 的字节布局与 Java 一致（而不只是我们自己能自洽）。
     let resp = rpc(client, namesrv, parsed, 5000).await?;
     ck.check(
         "S7 namesrv accepts the binary header",
@@ -931,12 +892,6 @@ async fn s7_rocketmq_serialize(client: &RemotingClient, namesrv: &str, topic: &s
 }
 
 /// S8：清理 —— 先删 broker 侧 topic 配置，再显式删 namesrv 路由。
-///
-/// 对应 Java `MQAdminExt.deleteTopicInBroker` + `deleteTopicInNameServer`。
-/// ⚠ 只删 broker 是**不够**的：`RouteInfoManager.registerBroker` 里
-/// 「按注册表反删缺失 topic」那段受 `namesrvConfig.deleteTopicWithBrokerRegistration`
-/// 控制，5.x 默认 `false`，所以 namesrv 上的路由会一直留着（轮询 40s 也不会消失），
-/// 必须显式发 `DELETE_TOPIC_IN_NAMESRV(216)`。
 async fn s8_cleanup(
     client: &RemotingClient,
     namesrv: &str,
@@ -960,10 +915,6 @@ async fn s8_cleanup(
         &format!("code={} remark={:?}", resp.code, resp.remark),
     );
 
-    // Java `DeleteTopicFromNamesrvRequestHeader` 只有 topic（必填）+ clusterName
-    // （可空，为空走 `deleteTopic(topic)` 分支）。clusterName 是可选的，
-    // 所以这里直接手写 extFields —— 也顺便验证「无 custom header、纯 extFields」
-    // 这条编码路径。
     let mut del = RemotingCommand::create_request_command(request_code::DELETE_TOPIC_IN_NAMESRV, None);
     del.add_ext_field("topic", topic);
     let resp = rpc(client, namesrv, del, 5000).await?;

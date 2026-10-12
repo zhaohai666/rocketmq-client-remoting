@@ -1,18 +1,6 @@
-// 管理客户端（对应 org.apache.rocketmq.client.admin.DefaultMQAdminExt /
-// MQAdminExt 与 org.apache.rocketmq.tools.admin.DefaultMQAdminExtImpl）。
-//
 // 覆盖：Topic 增删查/配置、Broker 集群信息与运行时信息/配置、NameServer KV 配置、
 // 订阅组管理、消费者/生产者连接、消费统计、offset 管理（含真实 broker 位点重置）、
 // 消息查询（key / uniqKey / msgId / ConsumeQueue）。
-//
-// 与 Python 参考实现（python/client/admin.py）逐项对齐。对齐要点（Java 5.x 探针 +
-// 源码核对结论，勿凭记忆改）：
-//  - GET_BROKER_CONFIG 的 body 是 **properties 文本**（"k=v\n"），不是 JSON。
-//  - UPDATE_AND_CREATE_SUBSCRIPTIONGROUP 的 body 是 SubscriptionGroupConfig JSON。
-//  - GET_TOPIC_CONFIG 请求头带 topic + lo，响应体是 TopicConfig JSON。
-//  - GET_ALL_SUBSCRIPTIONGROUP_CONFIG 是**分页**接口（groupSeq / maxGroupNum / dataVersion）。
-//  - ResetOffsetBody.offsetTable 是 Map<MessageQueue, Long>。
-//  - KV 配置类请求打到 **NameServer**，且 PUT/DELETE 要广播到**每一个** NameServer。
 #ifndef ROCKETMQ_CLIENT_ADMIN_H
 #define ROCKETMQ_CLIENT_ADMIN_H
 
@@ -34,7 +22,6 @@
 
 namespace rocketmq {
 
-// 对应 Java org.apache.rocketmq.remoting.admin.track.TrackType（消息轨迹判定结果）
 enum class TrackType {
     CONSUMED,
     CONSUMED_BUT_FILTERED,
@@ -45,19 +32,14 @@ enum class TrackType {
     UNKNOWN,
 };
 
-// Java 枚举名原文（对账用；C++ 成员名相同，只是给测试/日志一个稳定的字符串形态）
 const char* trackTypeName(TrackType type);
 
-// 对应 Java org.apache.rocketmq.remoting.admin.track.MessageTrack
 struct MessageTrack {
     std::string consumerGroup;
     TrackType trackType = TrackType::UNKNOWN;
-    // 空 = 无异常；非空时形如 "CODE:n DESC:msg"（与 Java exceptionDesc 同口径）
     std::string exceptionDesc;
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.subscription.GroupForbidden：
-// UPDATE_AND_GET_GROUP_FORBIDDEN(353) 的响应体（topic/group/readable 三字段）。
 struct GroupForbidden {
     std::string topic;
     std::string group;
@@ -82,45 +64,29 @@ public:
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     void setInstanceName(const std::string& name) { instanceName_ = name; }
 
-    // ---------------- unitName / enableStreamRequestType ----------------
-    // 对应 Java `ClientConfig` 的这两个开关（必须在 start() 之前设置）。
-    // ⚠ 管理端**没有** unitMode 的落点：Java `DefaultMQAdminExtImpl` 全程没读过
-    // `isUnitMode()` —— 它既不发普通消息、也不做消息过滤。
     void setUnitName(const std::string& unitName) { unitName_ = unitName; }
     const std::string& unitName() const { return unitName_; }
     // true 时每个请求带扩展字段 `ReqT=0`，且 clientId 末尾多一段 `@STREAM`。
     void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
-    // Java `ClientConfig#pollNameServerInterval`（:58，默认 30000ms）：在用 topic 的
-    // 路由刷新周期，start() 时透传给 MQClientInstance。
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
     int32_t pollNameServerIntervalMillis() const { return pollNameServerIntervalMillis_; }
-    // 对应 Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）：true 时 broker 类请求
-    // 走 VIP 通道（端口 - 2）。**只作用于 admin 直接下发的 broker 调用**；NameServer 类
-    // 请求（KV 配置、topic 删除等）永远走原端口。
     void setVipChannelEnabled(bool enable) { vipChannelEnabled_ = enable; }
     bool isVipChannelEnabled() const { return vipChannelEnabled_; }
     std::string getNamesrvAddr() const;
     std::vector<std::string> getNameServerAddressList() const { return nameServerAddrs_; }
     void setTimeoutMillis(int32_t millis) { timeoutMillis_ = millis; }
     int32_t getTimeoutMillis() const { return timeoutMillis_; }
-    // 删除 topic 时一并清理的 KV namespace（对应 Java kvNamespaceToDeleteList）
     void addKvNamespaceToDeleteList(const std::string& ns) {
         kvNamespaceToDeleteList_.push_back(ns);
     }
 
-    // ---------------- ACL 鉴权（对应 Java DefaultMQAdminExt(rpcHook)）----------------
-    // 必须在 start() 之前调用。
     void setRPCHook(std::shared_ptr<RPCHook> hook) { rpcHook_ = std::move(hook); }
     void setCredentials(const std::string& accessKey, const std::string& secretKey,
                         const std::string& securityToken = std::string()) {
         rpcHook_ = std::make_shared<AclClientRPCHook>(
             SessionCredentials(accessKey, secretKey, securityToken));
     }
-    // 5.x 新命名空间（对应 Java `ClientConfig#namespaceV2`，管理端同样继承）：非空时
-    // NamespaceRpcHook 给**每笔请求**加 `nsd=true` / `ns=<namespaceV2>`，由 broker 侧解析
-    // 实例。链序照 Java `MQClientAPIImpl:329`：装在 ACL 签名**之前**，`nsd`/`ns` 因此在
-    // 签名内容之内（见 composeRequestHooks）。须在 start() 之前设置才有首包效果。
     void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
     const std::string& namespaceV2() const { return namespaceV2_; }
 
@@ -159,9 +125,6 @@ public:
     TopicStatsTable examineTopicStatsByBroker(const std::string& brokerAddr,
                                              const std::string& topic);
 
-    // ---------------- 批量配置 / 单元化（Java 有实现，此前 cpp 缺失） ----------------
-    // UPDATE_AND_CREATE_TOPIC_LIST(18)：custom header 为空，body 是
-    // {"topicConfigList":[TopicConfig...]}（Java 驼峰字段名）。
     void createAndUpdateTopicConfigList(const std::string& brokerAddr,
                                         const std::vector<TopicConfig>& configs);
     // UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225)：同形，但 body key 是
@@ -178,8 +141,6 @@ public:
     GroupForbidden updateAndGetGroupReadForbidden(
         const std::string& brokerAddr, const std::string& group, const std::string& topic,
         const std::optional<bool>& readable = std::nullopt);
-    // RESUME_CHECK_HALF_MESSAGE(323)：broker 拒绝（非 SUCCESS）返回 false 而不是抛错
-    // （Java MQClientAPIImpl:3279 的 switch-case 语义）；只有网络层异常才上抛。
     bool resumeCheckHalfMessage(const std::string& brokerAddr, const std::string& topic,
                                 const std::string& msgId = std::string());
     // **不是独立请求**：NameServer KV namespace=ORDER_TOPIC_CONFIG 上的读改写。
@@ -188,8 +149,6 @@ public:
     void createOrUpdateOrderConf(const std::string& key, const std::string& value,
                                  bool isCluster = false);
 
-    // ---------------- 运维清理（Java 有实现，此前 cpp 缺失） ----------------
-    // CLEAN_EXPIRED_CONSUMEQUEUE(306)：header `time`=<小时数>
     void cleanExpiredConsumerQueue(const std::string& brokerAddr, int32_t timeHours);
     // 逐地址调用 306，返回**失败的地址**列表（不 fail-fast）
     std::vector<std::string> cleanExpiredConsumerQueueByAddr(
@@ -205,18 +164,12 @@ public:
     // QUERY_CONSUME_TIME_SPAN(303)：按 topic 路由扇出到每个 master，聚合响应 body 里
     // consumeTimeSpanSet JSON 数组（返回聚合后的数组）。
     JsonValue queryConsumeTimeSpan(const std::string& topic, const std::string& group);
-    // **不发请求**：examineTopicRoute(topic) 取第一个 brokerName，再在
-    // EXAMINE_BROKER_CLUSTER_INFO(25) 的 clusterAddrTable 里找包含该 brokerName 的
-    // 所有 cluster 名返回（与 getClusterList 同语义，Java 有两个名字）。
     std::set<std::string> getTopicClusterList(const std::string& topic);
     // SET_MESSAGE_REQUEST_MODE(401)：popShareQueueNum 仅在 >0 时带。
     void setMessageRequestMode(const std::string& brokerAddr, const std::string& topic,
                                const std::string& consumerGroup, const std::string& mode,
                                int32_t popShareQueueNum = 0);
 
-    // ---------------- NameServer 配置（318/319，Java 有实现，此前 cpp 缺失） ----------------
-    // body 是 properties **文本**（k=v\n，不是 JSON）；广播每个 nameserver，
-    // 任一失败即抛（Java 记 errResponse 最后统一抛）。
     void updateNameServerConfig(const PropertyMap& properties, int32_t timeoutMillis = -1);
     // 逐个查询（默认全部 NameServer），body 按 properties 文本解析；
     // 返回 {地址: properties 字典}。
@@ -293,25 +246,12 @@ public:
                                                int32_t timeoutMillis = -1);
     std::set<std::string> queryTopicConsumeByWho(const std::string& brokerAddr,
                                                  const std::string& topic);
-    // 对应 Java DefaultMQAdminExtImpl.examineConsumeStats(group[, topic])（:389-424）：
-    // 按 %RETRY%<group> 的路由扇出全部 broker，逐台取统计并合并；全空时抛
-    // MQClientException(CONSUMER_NOT_ONLINE)。
     ConsumeStats examineConsumeStatsGroup(const std::string& consumerGroup,
                                           const std::string& topic = std::string());
-    // 对应 Java DefaultMQAdminExtImpl.consumed:1533-1557：该组在本队列的 consumerOffset
-    // 是否已越过这条消息的 queueOffset（位点越过 ⇒ 已消费）。
     bool consumed(const MessageExt& msg, const std::string& consumerGroup);
-    // 对应 Java DefaultMQAdminExtImpl.messageTrackDetail:1349-1427
     std::vector<MessageTrack> messageTrackDetail(const MessageExt& msg);
-    // 对应 Java MQClientAPIImpl#queryTopicsByConsumer:2525（343）的单 broker 原始调用。
-    // broker 端走 AdminBrokerProcessor#queryTopicsByConsumer:2421 →
-    // ConsumerOffsetManager#whichTopicByConsumer：**从位点表**（topic@group 键）反查该组
-    // 消费过哪些 topic，所以组从没提交过位点时回空表，这是预期而不是 bug。
     TopicList queryTopicsByConsumerToBroker(const std::string& brokerAddr,
                                             const std::string& group);
-    // 对应 Java DefaultMQAdminExt#queryTopicsByConsumer（DefaultMQAdminExtImpl:1078）：
-    // 先按 %RETRY%<group> 查路由，再对路由里每个 broker 下发 343 并合并
-    // （Java 的 TopicList.topicList 是 Set<String>，所以这里同样去重）。
     TopicList queryTopicsByConsumer(const std::string& group);
     JsonValue querySubscription(const std::string& brokerAddr, const std::string& group,
                                 const std::string& topic);
@@ -326,7 +266,6 @@ public:
     int64_t maxOffset(const MessageQueue& mq);
     int64_t minOffset(const MessageQueue& mq);
     int64_t searchOffset(const MessageQueue& mq, int64_t timestamp);
-    // Java DefaultMQAdminExt:133/:137 的两个方法名，分别固定 LOWER / UPPER 边界。
     int64_t searchLowerBoundaryOffset(const MessageQueue& mq, int64_t timestamp);
     int64_t searchUpperBoundaryOffset(const MessageQueue& mq, int64_t timestamp);
     int64_t earliestMsgStoreTime(const MessageQueue& mq);
@@ -338,13 +277,6 @@ public:
     void updateConsumerOffsetToBroker(const std::string& brokerAddr,
                                       const std::string& consumerGroup, const MessageQueue& mq,
                                       int64_t offset);
-    // 对应 Java resetOffsetByTimestamp：逐 broker 下发 INVOKE_BROKER_TO_RESET_OFFSET
-    //
-    // isCpp 只影响 broker 推给**在线消费者**的 220 报文形状：broker 按发起方（也就是本
-    // 请求）的 language 判 isC，仅 CPP 置真（AdminBrokerProcessor:2263-2270），CPP 时推
-    // ResetOffsetBodyForC（JSON 数组）、其余推 ResetOffsetBody（对象即键的 map）。Java
-    // 管理端两个重载传的都是 false（MQClientAPIImpl:2405/2408）；222 的**响应**体恒为
-    // map 形状（Broker2Client:232），与本参数无关。
     std::map<MessageQueue, int64_t> resetOffsetByTimestamp(
         const std::string& topic, const std::string& group, int64_t timestamp,
         bool isForce = true, const std::string& clusterName = std::string(), bool isCpp = false);
@@ -353,27 +285,10 @@ public:
     std::map<MessageQueue, int64_t> resetOffsetByTimestampOld(
         const std::string& consumerGroup, const std::string& topic, int64_t timestamp,
         bool force = true);
-    // 对应 Java DefaultMQAdminExt#resetOffsetByQueueId（DefaultMQAdminExtImpl:1827）：**两笔**
-    // RPC，缺一不可。先 updateConsumerOffset(25) 直接写 offsetTable，再发一笔带 queueId +
-    // offset 的 INVOKE_BROKER_TO_RESET_OFFSET(222)：broker 在 resetOffsetInner 里先按
-    // [min, max+1] 校验目标位点，再 assignResetOffset（同时写一次性的 resetOffsetTable
-    // 和 offsetTable，并清掉该队列的 POP 在途计数）。Java 返回 void（只打日志），这里把
-    // broker 报回的队列表返回，便于调用方核对。
-    // 注意实测（5.5.1 真机）这两笔 RPC **不是原子的**：ConsumerOffsetManager#commitOffset
-    // 只做覆盖写（offset 变小也只打 [NOTIFYME] warn，不做区间校验），所以第 2 笔被
-    // resetOffsetInner 以 "Target offset N not in consume queue range" 拒绝时，第 1 笔已经
-    // 把非法位点落库。Java 同样如此，这里不做保护性回滚。
     std::map<MessageQueue, int64_t> resetOffsetByQueueId(
         const std::string& brokerAddr, const std::string& consumerGroup,
         const std::string& topic, int32_t queueId, int64_t resetOffset);
 
-    // 222 请求体的 extFields 构造，开放给单测锁键名 —— 写错是**静默**的：Java
-    // `RemotingCommand.makeCustomHeaderToNet:437-450` 拿 requestHeader 的**字段名**做 ext
-    // key，而 `ResetOffsetRequestHeader` 声明的是 `private boolean isForce`（getter 不参与
-    // 命名）。写成 "force" 时 broker 侧 isForce 恒为 false ⇒ `Broker2Client.resetOffset:152-158`
-    // 的分支退化成「取时间戳位点」，前重（timestamp=-1）会把 consumerOffset 原样回显而不是
-    // 跳到 maxOffset（5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3=consumerOffset，
-    // {"isForce":"true", timestamp:-1} → 目标 10=maxOffset）。queueId < 0 表示不带该字段。
     static PropertyMap buildResetOffsetExtFields(const std::string& topic,
                                                  const std::string& group, int64_t timestamp,
                                                  bool isForce, int32_t queueId, int64_t offset);
@@ -396,31 +311,16 @@ public:
     // 309 是 admin → broker 的请求：broker 收到后**转推**给 clientId 对应的在线消费者
     // （见 DefaultMQPushConsumer 的客户端处理器），把该消费者本地真实消费一次的判据
     // （ConsumeMessageDirectlyResult body）带回来。
-    //
-    // 对应 Java DefaultMQAdminExtImpl.consumeMessageDirectly:1323-1347：先用 viewMessage
-    // 把 msgId 解成消息（offsetMsgId 直查 commitLog、失败退 uniqKey 检索两条路径），目标
-    // broker 取消息的**存储主机**（消息在哪台 broker 就打哪台，不是路由第一台）；消息带
-    // uniq key 时把请求里的 msgId 换成 **offsetMsgId**（Java MessageClientExt 同口径，
-    // nodeJs/src/client/admin.ts:1361-1387 同）。
     ConsumeMessageDirectlyResult consumeMessageDirectly(const std::string& consumerGroup,
                                                         const std::string& clientId,
                                                         const std::string& topic,
                                                         const std::string& msgId);
-    // 对应 Java MQClientAPIImpl#consumeMessageDirectly:2741-2771：单笔 309 RPC。
-    // 响应体是 ConsumeMessageDirectlyResult JSON；非 SUCCESS 或 SUCCESS 而 body 为空时
-    // 抛 MQClientException（典型非 SUCCESS：CONSUMER_NOT_ONLINE(206)，消费者不在线时
-    // broker 无处转推）。
     ConsumeMessageDirectlyResult consumeMessageDirectly(const std::string& brokerAddr,
                                                         const std::string& consumerGroup,
                                                         const std::string& clientId,
                                                         const std::string& topic,
                                                         const std::string& msgId,
                                                         int32_t timeoutMillis = -1);
-    // 309 的 extFields 构造，开放给单测锁键名（同 buildResetOffsetExtFields 的理由）：
-    // 键名是 Java ConsumeMessageDirectlyResultRequestHeader 的**字段名**。
-    // MQClientAPIImpl 只设 topic / consumerGroup / clientId / msgId 四个字段 ——
-    // brokerName / topicSysFlag / groupSysFlag 不下发；写成别的键名 broker 侧解析不到
-    // 是**静默**的（推给消费者的消息对不上号，admin 拿到的结果里 remark/msgId 全错）。
     static PropertyMap buildConsumeMessageDirectlyExtFields(
         const std::string& topic, const std::string& consumerGroup, const std::string& clientId,
         const std::string& msgId);
@@ -432,10 +332,6 @@ private:
     std::string vipAddr(const std::string& addr) const {
         return MixAll::brokerVipChannel(vipChannelEnabled_, addr);
     }
-    // 一笔 INVOKE_BROKER_TO_RESET_OFFSET(222)。Java 在这里有两个重载：不带 queueId 的按
-    // timestamp 重置整个 topic，带 queueId + offset 的只重置单个队列。这里用哨兵值表示
-    // 「不带该字段」：queueId < 0 即 Java 的默认 -1，offset < 0 即 Java 的「offset=-1 表示
-    // offset 为 null」。
     std::map<MessageQueue, int64_t> invokeBrokerToResetOffset(
         const std::string& brokerAddr, const std::string& topic, const std::string& group,
         int64_t timestamp, bool isForce, bool isCpp, int32_t queueId, int64_t offset);
@@ -448,12 +344,9 @@ private:
     std::string instanceName_;
     std::string clientId_;
     std::string unitName_;
-    // Java `ClientConfig#namespaceV2`：非空时 NamespaceRpcHook 给每笔请求加 nsd/ns 头
     std::string namespaceV2_;
     bool enableStreamRequestType_ = false;
-    // Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）
     bool vipChannelEnabled_ = false;
-    // Java ClientConfig:58，默认 30000ms（路由刷新周期）
     int32_t pollNameServerIntervalMillis_ = 30000;
     std::vector<std::string> nameServerAddrs_;
     std::vector<std::string> kvNamespaceToDeleteList_;

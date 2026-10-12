@@ -1,22 +1,4 @@
 # -*- coding: utf-8 -*-
-"""批量/静态 topic/读禁配/半消息/顺序配置等 admin 方法的真实集群验证。
-
-对标 go/examples/live_admin_batch：这些方法此前在 Python 侧只有 RequestCode
-常量、没有任何业务实现，报文编码错误 mock 层看不见，必须打真实 broker。
-
-覆盖（全部打真实 broker / nameServer，无 mock）：
- 1. UPDATE_AND_CREATE_TOPIC_LIST(18)：body={"topicConfigList":[...]}，header 为空
- 2. UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225)：body={"groupConfigList":[...]}
- 3. UPDATE_AND_GET_GROUP_FORBIDDEN(353)：禁读→仅查询不改动→恢复可读→回包字段
- 4. RESUME_CHECK_HALF_MESSAGE(323)：非半消息返回 False 而非报错（Java 语义）
- 5. createOrUpdateOrderConf：nameserver KV 的合并/覆盖语义
- 6. CLEAN_EXPIRED_CONSUMEQUEUE(306) / DELETE_EXPIRED_COMMITLOG(329) + ByAddr
- 7. CLEAN_UNUSED_TOPIC(316)：broker 接受即可（清理策略是 broker 侧的）
- 8. QUERY_CONSUME_TIME_SPAN(303)：路由扇出聚合
- 9. UPDATE/GET_NAMESRV_CONFIG(318/319)：properties 文本 + 回读
-
-用法：scripts/with_cluster.sh python verify_admin_batch_live.py
-"""
 import os
 import sys
 import time

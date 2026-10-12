@@ -1,6 +1,3 @@
-// C# 批量 admin 方法（Java 有实现、此前 C# 缺失的 15 个）的真实集群联调
-// （对应 cpp/examples/admin_batch_live.cpp，断言口径同 python/verify_admin_batch_live.py）。
-//
 // 全部打真实 nameServer + broker，无 mock。覆盖：
 //   1. 批量建 topic(18)：header 为空、body={"topicConfigList":[...]}，生效校验
 //   2. 批量建订阅组(225)：body key 是 groupConfigList，生效校验
@@ -237,9 +234,6 @@ internal static class AdminBatchLive
             Check("消费组读禁配(353) 回包含 group/topic", false, e.Message);
         }
 
-        // ---- 4. 恢复半消息(323) ---------------------------------------------
-        // Java（MQClientAPIImpl:3279）对非 SUCCESS 返回 false 而非抛错：对非半消息
-        // （broker 表现为 SYSTEM_ERROR）的良构调用必须得到 false，而不是异常。
         try
         {
             bool resumed = admin.ResumeCheckHalfMessage(

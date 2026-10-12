@@ -71,11 +71,6 @@ type DefaultMQAdminExt struct {
 	started  bool
 }
 
-// NewDefaultMQAdminExt builds an admin client. The first parameter is the RPC
-// hook, matching Java and the Python port's `DefaultMQAdminExt(rpc_hook)` —
-// note this is NOT a clientId (an earlier port passed a string here and every
-// request threw while getTopicRouteData swallowed it, surfacing as
-// "topic xxx not exist").
 func NewDefaultMQAdminExt(rpcHook remoting.RPCHook) *DefaultMQAdminExt {
 	return &DefaultMQAdminExt{
 		InstanceName:                 "ADMIN",
@@ -98,9 +93,6 @@ func (a *DefaultMQAdminExt) SetNamesrvAddr(addr string) {
 }
 
 // SetNameServerAddresses sets the nameserver list.
-//
-// Call it BEFORE Start: the underlying instance copies the list once, exactly
-// like Java's MQClientInstance, so setting it afterwards is inert.
 func (a *DefaultMQAdminExt) SetNameServerAddresses(addrs []string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -165,11 +157,6 @@ func (a *DefaultMQAdminExt) SetTimeoutMillis(timeoutMillis int64) {
 }
 
 // Start builds and starts the underlying instance.
-//
-// Java's DefaultMQAdminExtImpl#start:161 unconditionally calls
-// changeInstanceNameToPID, after which the clientId goes through
-// ClientConfig#buildMQClientId ->
-// `<local ip>@<instanceName>[@<unitName>][@STREAM]`.
 func (a *DefaultMQAdminExt) Start() error {
 	a.mu.Lock()
 	if a.started {
@@ -194,10 +181,6 @@ func (a *DefaultMQAdminExt) Start() error {
 	config := NewClientInstanceConfig()
 	config.PollNameServerIntervalMillis = pollInterval
 	instance := CreateOrGetInstance(clientID, addrs, config)
-	// The admin owns its instance exclusively (Java uses a private one), so
-	// install the user hook before Start runs the first heartbeat. The stream
-	// flag only reaches the instance through the hook chain — it is already
-	// baked into the clientId above.
 	instance.EnsureRPCHooks("", stream, hook)
 	if err := instance.Start(); err != nil {
 		return err
@@ -227,7 +210,6 @@ func (a *DefaultMQAdminExt) Shutdown() {
 	}
 }
 
-// Instance returns the underlying client instance (Java getMQClientInstance).
 func (a *DefaultMQAdminExt) Instance() (*Instance, error) {
 	return a.requireClient()
 }
@@ -285,9 +267,6 @@ func (a *DefaultMQAdminExt) invokeBroker(addr string, code int32, ext *common.St
 	return response, nil
 }
 
-// invokeNameServerAll broadcasts to every nameserver (Java
-// putKVConfigValue / deleteKVConfigValue semantics) and raises if any of them
-// failed.
 func (a *DefaultMQAdminExt) invokeNameServerAll(code int32, ext *common.StringMap, body []byte, timeoutMillis int64) error {
 	instance, err := a.requireClient()
 	if err != nil {
@@ -317,9 +296,6 @@ func (a *DefaultMQAdminExt) invokeNameServerAll(code int32, ext *common.StringMa
 	return nil
 }
 
-// invokeNameServerOne sends to the first nameserver that answers (Java
-// invokeSync(null, ...) semantics); the response is returned unchecked so
-// callers can branch on the code.
 func (a *DefaultMQAdminExt) invokeNameServerOne(code int32, ext *common.StringMap, timeoutMillis int64) (*remoting.RemotingCommand, error) {
 	instance, err := a.requireClient()
 	if err != nil {
@@ -338,9 +314,6 @@ func (a *DefaultMQAdminExt) invokeNameServerOne(code int32, ext *common.StringMa
 	return nil, common.ClientError(fmt.Sprintf("all name servers unreachable: %v", lastErr))
 }
 
-// invokeNameServerAddr sends to one EXPLICIT nameserver (never via the VIP
-// channel — Java's deleteTopicInNameServer connects straight to the
-// nameserver) and checks for SUCCESS.
 func (a *DefaultMQAdminExt) invokeNameServerAddr(addr string, code int32, ext *common.StringMap, timeoutMillis int64) (*remoting.RemotingCommand, error) {
 	instance, err := a.requireClient()
 	if err != nil {
@@ -356,7 +329,6 @@ func (a *DefaultMQAdminExt) invokeNameServerAddr(addr string, code int32, ext *c
 	return response, nil
 }
 
-// firstBrokerAddr picks any broker (Java's "no broker address available").
 func (a *DefaultMQAdminExt) firstBrokerAddr() (string, error) {
 	instance, err := a.requireClient()
 	if err != nil {
@@ -368,10 +340,6 @@ func (a *DefaultMQAdminExt) firstBrokerAddr() (string, error) {
 // ---------------- Topic management ----------------
 
 // CreateTopic creates a topic on every master of the default-topic route.
-//
-// `key` is kept for signature parity with Java (which routes through the
-// TBW102 default topic); it is deliberately unused, exactly as in the Python
-// port.
 func (a *DefaultMQAdminExt) CreateTopic(key, newTopic string, queueNum int32, topicSysFlag int32) error {
 	instance, err := a.requireClient()
 	if err != nil {
@@ -448,9 +416,6 @@ func (a *DefaultMQAdminExt) DeleteTopicInNameSrv(topic string) error {
 	return instance.DeleteTopicInNameSrv(topic, 5000)
 }
 
-// DeleteTopic removes a topic: every broker first, then the nameserver route,
-// then any configured KV namespaces. Individual failures are logged, not
-// raised — the same best-effort shape Java uses.
 func (a *DefaultMQAdminExt) DeleteTopic(topic string, clusterName string) error {
 	instance, err := a.requireClient()
 	if err != nil {
@@ -489,10 +454,6 @@ func (a *DefaultMQAdminExt) FetchAllTopicList() (*remoting.TopicList, error) {
 }
 
 // FetchTopicsByCluster sends GET_TOPICS_BY_CLUSTER(224) to a nameserver.
-//
-// The field name must be Java's `cluster`. With `clusterName` the nameserver
-// fails to find the cluster (the NPE is swallowed) and answers SUCCESS with an
-// empty list.
 func (a *DefaultMQAdminExt) FetchTopicsByCluster(clusterName string) (map[string]bool, error) {
 	response, err := a.invokeNameServerOne(remoting.ReqGetTopicsByCluster,
 		adminExt("cluster", clusterName), 0)
@@ -539,7 +500,6 @@ func (a *DefaultMQAdminExt) GetClusterList(topic string) (map[string]bool, error
 	return clusters, nil
 }
 
-// GetTopicClusterList is an alias of GetClusterList (Java has both names).
 func (a *DefaultMQAdminExt) GetTopicClusterList(topic string) (map[string]bool, error) {
 	return a.GetClusterList(topic)
 }
@@ -689,7 +649,6 @@ func (a *DefaultMQAdminExt) FetchBrokerClusterInfo() (*remoting.ClusterInfo, err
 	return instance.GetBrokerClusterInfo(10_000)
 }
 
-// ExamineBrokerClusterInfo is Java's second name for the same call.
 func (a *DefaultMQAdminExt) ExamineBrokerClusterInfo() (*remoting.ClusterInfo, error) {
 	return a.FetchBrokerClusterInfo()
 }
@@ -704,7 +663,6 @@ func (a *DefaultMQAdminExt) FetchBrokerRuntimeStats(brokerAddr string, timeoutMi
 	return remoting.DecodeKVTable(response.Body)
 }
 
-// GetBrokerRuntimeInfo is Java's older name for FetchBrokerRuntimeStats.
 func (a *DefaultMQAdminExt) GetBrokerRuntimeInfo(brokerAddr string, timeoutMillis int64) (*remoting.KVTable, error) {
 	return a.FetchBrokerRuntimeStats(brokerAddr, timeoutMillis)
 }
@@ -720,8 +678,6 @@ func (a *DefaultMQAdminExt) GetBrokerConfig(brokerAddr string, timeoutMillis int
 	return String2Properties(string(response.Body)), nil
 }
 
-// UpdateBrokerConfig sends UPDATE_BROKER_CONFIG(25), including Java
-// Validators.checkBrokerConfig's brokerPermission check.
 func (a *DefaultMQAdminExt) UpdateBrokerConfig(brokerAddr string, properties map[string]string, timeoutMillis int64) error {
 	if perm, ok := properties["brokerPermission"]; ok && !common.PermIsValidStr(perm) {
 		return common.ClientErrorCode(remoting.RespNoPermission,
@@ -821,8 +777,6 @@ func (a *DefaultMQAdminExt) CreateAndUpdateKVConfig(namespace, key, value string
 		adminExt("namespace", namespace, "key", key, "value", value), nil, 0)
 }
 
-// PutKVConfig is Java's interface name (the impl delegates to
-// createAndUpdateKvConfig).
 func (a *DefaultMQAdminExt) PutKVConfig(namespace, key, value string) error {
 	return a.CreateAndUpdateKVConfig(namespace, key, value)
 }
@@ -847,13 +801,6 @@ func (a *DefaultMQAdminExt) DeleteKVConfig(namespace, key string) error {
 		adminExt("namespace", namespace, "key", key), nil, 0)
 }
 
-// ---------------- Nameserver config (Java updateNameServerConfig) ----------------
-
-// UpdateNameServerConfig broadcasts UPDATE_NAMESRV_CONFIG(318) to every
-// nameserver (Java DefaultMQAdminExt.updateNameServerConfig): the properties
-// ride in the BODY as java.util.Properties TEXT, and the first failing
-// nameserver decides the error (Java remembers errResponse and throws at the
-// end). Java returns silently for an empty property set — so does this.
 func (a *DefaultMQAdminExt) UpdateNameServerConfig(properties map[string]string, timeoutMillis int64) error {
 	text := propertiesToString(properties)
 	if text == "" {
@@ -862,11 +809,6 @@ func (a *DefaultMQAdminExt) UpdateNameServerConfig(properties map[string]string,
 	return a.invokeNameServerAll(remoting.ReqUpdateNameSrvConfig, nil, []byte(text), timeoutMillis)
 }
 
-// GetNameServerConfig sends GET_NAMESRV_CONFIG(319) to every listed nameserver
-// (nil/empty means all of them, Java's default) and returns each server's
-// config parsed from the Properties-text body. Java throws on the first
-// failure; the loop does the same. No VIP-channel rewrite: nameservers have no
-// VIP listener.
 func (a *DefaultMQAdminExt) GetNameServerConfig(nameServers []string, timeoutMillis int64) (map[string]map[string]string, error) {
 	instance, err := a.requireClient()
 	if err != nil {
@@ -1059,7 +1001,6 @@ func (a *DefaultMQAdminExt) ExamineConsumerConnectionInfo(consumerGroup string, 
 	return remoting.DecodeConsumerConnection(response.Body)
 }
 
-// ExamineConsumerConnection is Java's shorter name.
 func (a *DefaultMQAdminExt) ExamineConsumerConnection(consumerGroup string, brokerAddr string) (*remoting.ConsumerConnection, error) {
 	return a.ExamineConsumerConnectionInfo(consumerGroup, brokerAddr)
 }
@@ -1102,7 +1043,6 @@ func (a *DefaultMQAdminExt) ExamineConsumerRunningInfo(consumerGroup, clientID s
 	return remoting.DecodeConsumerRunningInfo(response.Body)
 }
 
-// GetConsumerRunningInfo is Java's alternative name.
 func (a *DefaultMQAdminExt) GetConsumerRunningInfo(consumerGroup, clientID string, jstack bool, brokerAddr string) (*remoting.ConsumerRunningInfo, error) {
 	return a.ExamineConsumerRunningInfo(consumerGroup, clientID, jstack, brokerAddr)
 }
@@ -1171,10 +1111,6 @@ func (a *DefaultMQAdminExt) QueryTopicConsumeByWho(brokerAddr, topic string) (ma
 	return groups, nil
 }
 
-// ExamineConsumeStatsGroup mirrors Java
-// DefaultMQAdminExtImpl.examineConsumeStats(group[, topic]): fan out over the
-// %RETRY%<group> route, merge the offset tables and sum the tps. An empty
-// result is an error (Java's MQClientException).
 func (a *DefaultMQAdminExt) ExamineConsumeStatsGroup(consumerGroup, topic string) (*remoting.ConsumeStats, error) {
 	route, err := a.ExamineTopicRoute(common.GetRetryTopic(consumerGroup))
 	if err != nil {
@@ -1216,8 +1152,6 @@ func (a *DefaultMQAdminExt) QueryTopicsByConsumerToBroker(brokerAddr, group stri
 	return remoting.DecodeTopicList(response.Body)
 }
 
-// QueryTopicsByConsumer fans out over the %RETRY%<group> route and merges the
-// answers (Java's TopicList.topicList is a Set, hence the de-duplication).
 func (a *DefaultMQAdminExt) QueryTopicsByConsumer(group string) (*remoting.TopicList, error) {
 	route, err := a.ExamineTopicRoute(common.GetRetryTopic(group))
 	if err != nil {

@@ -1,24 +1,4 @@
 # -*- coding: utf-8 -*-
-"""DefaultMQAdminExt（管理端）真实集群联调 + sendMessageBack 重投验证。
-
-覆盖（全部打真实 broker / nameServer，无 mock）：
- 1. 集群探活 / fetchBrokerClusterInfo / getClusterList
- 2. createTopic（含 queue 数校验）→ fetchAllTopicList → examineTopicRoute
- 3. examineTopicConfig（GET_TOPIC_CONFIG，TopicConfigAndQueueMapping JSON）
- 4. getBrokerConfig（**properties 文本**，验证不再当 KVTable JSON 解析）
- 5. updateBrokerConfig → 回读确认生效（可逆，测完还原）
- 6. NameServer KV：createAndUpdateKvConfig → getKVConfig → getKVListByNamespace → deleteKvConfig
- 7. 订阅组：create/update → examine → 单查 → deleteSubscriptionGroup
- 8. 生产 N 条 → examineTopicStats / examineConsumeStats / queryConsumeQueue /
-    queryMessage(key) / viewMessage(msgId)
- 9. resetOffsetByTimestamp（真实 INVOKE_BROKER_TO_RESET_OFFSET，观察位点变化）
-    + resetOffsetByQueueId（单队列显式位点：正例回读位点、重启消费者重投、越界负例）
-10. queryTopicsByConsumer（343）：单 broker 原始调用 + Java 的组级重载（按 %RETRY% 路由扇出合并）
-11. sendMessageBack：消费 1 条后重投 → 校验 %RETRY%<group> 里出现原消息
-12. 清理：deleteSubscriptionGroup / deleteTopic
-
-用法：先起 nameServer(9876)+broker(10911)，再在 venv 里 `python verify_admin_live.py`
-"""
 import os
 import sys
 import time
@@ -272,8 +252,6 @@ def main():
         check("viewMessage body 与发送一致", vm.body == body0,
               "期望 %r 实际 %r" % (body0, vm.body))
 
-    # 客户端 uniqKey 也是 32 位十六进制，硬解会拼出一个假地址；必须走 Java 的
-    # queryMessageByUniqKey 兜底，最终以 MQClientException 收场，而不是裸 OverflowError。
     try:
         admin.view_message(TOPIC, msg_id0)
         check("viewMessage(uniqKey) 走兜底并给出干净异常", False, "没有抛异常")
@@ -298,12 +276,6 @@ def main():
         check("maxOffset >= minOffset", max_off >= min_off,
               "min=%d max=%d" % (min_off, max_off))
 
-    # ---------- 7.5 searchOffset 的 boundaryType（Java DefaultMQAdminExt:133/:137）----------
-    # 单开一个 1 队列 topic：位点语义只在单队列上才是确定的（多队列时分不清落哪一条）。
-    # 3 条消息 ⇒ maxOffset=3；用「远未来时间戳」这把尺子同时量两个边界：
-    # 队尾之后 UPPER = 最后一条自己的位点(2)，LOWER = 它的下一个位点(3) = maxOffset
-    # （ConsumeQueue.binarySearchInQueueByTime:261-270 的 case 1）。这条断言同时是
-    # 「boundaryType 字段真的到了 broker」的证据 —— 若字段没被解析，两者都只会是 LOWER。
     bnd_topic = "AdminBoundaryTopic_%d" % STAMP
     safe("createTopic(%s, 1 队列)" % bnd_topic,
          lambda: admin.create_topic(MixAll.DEFAULT_TOPIC, bnd_topic, 1),
@@ -370,9 +342,6 @@ def main():
         first.broker_name = first.broker_name or mq.broker_name
 
         def _do_back():
-            # 消费者仍在线时重投（对齐 Java：在消费线程内调用 sendMessageBack）。
-            # 注意 send_message_back 成功时返回 None —— 不能让 safe() 的返回值
-            # 兼任"成功标志"，否则 None 会被误判为失败而跳过后续校验。
             cons.send_message_back(first, 0)
             return "origin_topic=%s commitLogOffset=%d" % (
                 first.topic, first.commit_log_offset)
@@ -403,15 +372,7 @@ def main():
               "maxOffsetSum=%s（轮询 %ds；broker 把 delayLevel=0 改写为 3，约 10s 后可见）"
               % (retry_max, waited))
 
-    # ---------- 8.5 fetchConsumeStatsInBroker（341）：按订阅组出行，本组带 offsetTable ----------
-    # Java `AdminBrokerProcessor#fetchAllConsumeStatsInBroker` 对
-    # `subscriptionGroupTable.keySet()` 的每个组建一行 `{group: [ConsumeStats]}`，
-    # 内层 topic 才来自位点表 `whichTopicByConsumer`（所以要等消费者刷过位点）。
-    # ⚠ 响应 JSON 键是 Java 字段名 consumeStatsList；早期实现写成 statsList，
-    # 于是真机响应永远解析出空集合，看着像「broker 没有积压」——这条断言就是回归护栏。
     def _group_has_offset_table(rows):
-        # 每行是 Java 的 Map<订阅组名, List<ConsumeStats>>，ConsumeStats.offsetTable
-        # 按 writeQueueNums 逐队列填 brokerOffset/consumerOffset
         for row in rows:
             stats = row.get(GROUP) if isinstance(row, dict) else None
             if stats is None:
@@ -451,10 +412,6 @@ def main():
         check("reset 后消费者位点被推到 maxOffset", off_after >= max_now - 1,
               "consumerOffset=%s maxOffset=%s" % (off_after, max_now))
 
-    # ---------- 9.5 resetOffsetByQueueId（Java DefaultMQAdminExtImpl:1827，两笔 RPC）----------
-    # 与 9 的差别：这一条把「队列 + 显式 offset」交给 broker，不按 timestamp 反算。
-    # 只回读 examine_consumer_offset 断言：Java 该方法是 void，且 broker 仅在
-    # language=CPP 时回可解析的 offsetTable，所以返回表为空属预期，不是 bug。
     min_reset = admin.min_offset(mq)
     rqi = safe("resetOffsetByQueueId(回到 minOffset)",
                lambda: admin.reset_offset_by_queue_id(
@@ -465,12 +422,6 @@ def main():
         check("resetOffsetByQueueId 后位点==目标 offset", off_rqi == min_reset,
               "consumerOffset=%s target=%s" % (off_rqi, min_reset))
 
-    # 真机重投：位点被拉回 minOffset 后，重启消费者应能**重新**收到历史消息。
-    # 这一步证明的不只是 offsetTable 改写了，而是 broker 端 resetOffsetTable 的一次性
-    # 重置确实被下一次 pull 取走（ConsumerOffsetManager#queryThenEraseResetOffset）。
-    # Java `PullMessageProcessor:539-548` 命中一次性重置时**不读消息**，直接回
-    # OFFSET_RESET ⇒ PULL_OFFSET_MOVED(:672)，客户端映射成 OFFSET_ILLEGAL + 新位点，
-    # 消费者按 nextBeginOffset 再拉一次才真正拿到消息（rust A12 逐笔验证了这个两段式）。
     again = []
     lock2 = threading.Lock()
 
@@ -491,13 +442,6 @@ def main():
     check("resetOffsetByQueueId 后重新消费到历史消息", len(again) >= 1,
           "reConsumed=%d（队列 %d 位点已回到 minOffset=%s）" % (len(again), mq.queue_id, min_reset))
 
-    # 越界负例：目标 offset 超出 [minOffset, maxOffset+1] 时 broker 的 222 必须拒绝
-    # （resetOffsetInner 回 SYSTEM_ERROR "Target offset N not in consume queue range [...]"）。
-    # ⚠ 同时量化一个 Java 语义：这两笔 RPC **不是原子的**——
-    # `ConsumerOffsetManager#commitOffset` 只做覆盖写入（连 offset 变小都只打一条
-    # [NOTIFYME] warn，不做区间校验），所以第 1 笔 updateConsumerOffset 已经把非法位点
-    # 落库，第 2 笔才被拒绝。这里断言「222 拒绝 + 位点仍停在第 1 笔写入的非法值」，
-    # 与 Java `DefaultMQAdminExtImpl:1829-1846` 完全同构；不额外加保护性回滚。
     max_for_range = admin.max_offset(mq)
     bad_target = max_for_range + 100
     try:
@@ -511,10 +455,6 @@ def main():
           off_after_bad == bad_target,
           "consumerOffset=%s badTarget=%s" % (off_after_bad, bad_target))
 
-    # ---------- 9.6 queryTopicsByConsumer（343）：单 broker 原始调用 vs Java 的组级重载 ----------
-    # broker 端读的是 offsetTable（ConsumerOffsetManager#whichTopicByConsumer），所以必须
-    # 等消费者刷过位点；Java 的 admin 级方法（DefaultMQAdminExtImpl:1078）只收 group——
-    # 先按 %RETRY%<group> 查路由，再逐 broker 扇出并合并成 Set。
     by_broker = safe("queryTopicsByConsumerToBroker",
                      lambda: admin.query_topics_by_consumer_to_broker(broker_addr, GROUP),
                      lambda t: "topics=%d" % len(t.get_topic_list()))

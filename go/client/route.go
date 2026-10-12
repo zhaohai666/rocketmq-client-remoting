@@ -1,7 +1,3 @@
-// Package client holds the shared client instance (Java MQClientInstance):
-// the topic route cache, publish-info bookkeeping, the heartbeat/persist
-// scheduled tasks and the broker->client request handlers. Producers and
-// consumers (packages to come) attach to one instance per clientId.
 package client
 
 import (
@@ -17,8 +13,6 @@ import (
 
 // ---------------------------------------------------------------- QueueData
 
-// QueueData is one queue partition of a topic route
-// (org.apache.rocketmq.remoting.protocol.route.QueueData).
 type QueueData struct {
 	BrokerName     string
 	ReadQueueNums  int32
@@ -60,8 +54,6 @@ type BrokerAddrPair struct {
 	Addr string
 }
 
-// BrokerData is one broker group of a topic route
-// (org.apache.rocketmq.remoting.protocol.route.BrokerData).
 type BrokerData struct {
 	Cluster            string
 	BrokerName         string
@@ -70,9 +62,6 @@ type BrokerData struct {
 	EnableActingMaster bool
 }
 
-// SelectBrokerAddr mirrors Java BrokerData.selectBrokerAddr: the master
-// (brokerId 0) when present, otherwise a pseudo-random slave. An empty string
-// address is returned as-is, matching Java (no validation).
 func (b *BrokerData) SelectBrokerAddr() (string, bool) {
 	for _, pair := range b.BrokerAddrs {
 		if pair.ID == int64(common.MasterID) {
@@ -85,9 +74,6 @@ func (b *BrokerData) SelectBrokerAddr() (string, bool) {
 	return b.BrokerAddrs[pseudoRandomIndex(len(b.BrokerAddrs))].Addr, true
 }
 
-// Equal matches Java BrokerData.equals: cluster / brokerName / brokerAddrs
-// only. zoneName and enableActingMaster are excluded — route-change detection
-// must not fire just because the broker moved zones.
 func (b *BrokerData) Equal(other *BrokerData) bool {
 	if b.Cluster != other.Cluster || b.BrokerName != other.BrokerName ||
 		len(b.BrokerAddrs) != len(other.BrokerAddrs) {
@@ -193,11 +179,6 @@ type MappingEntry struct {
 
 // TopicRouteData is the GET_ROUTE_INFO_BY_TOPIC(105) body and the client's
 // whole route-table entry value.
-//
-// Two null semantics that must not be unified:
-//   - orderTopicConf is ALWAYS written, null included (Java field order);
-//   - topicQueueMappingByBroker: nil (key absent) is different from an empty
-//     non-nil slice (key present as {}).
 type TopicRouteData struct {
 	OrderTopicConf            *string
 	QueueDatas                []*QueueData
@@ -327,8 +308,6 @@ func DecodeTopicRouteData(data []byte) (*TopicRouteData, error) {
 	return route, nil
 }
 
-// Clone mirrors Java cloneTopicRouteData: queue/broker elements are copied by
-// reference value (they are treated as immutable), the tables are deep.
 func (t *TopicRouteData) Clone() *TopicRouteData {
 	clone := &TopicRouteData{
 		OrderTopicConf: t.OrderTopicConf,
@@ -350,14 +329,6 @@ func (t *TopicRouteData) Clone() *TopicRouteData {
 	return clone
 }
 
-// GetAllMessageQueue assembles every writable queue, mirroring Java
-// topicRouteData2TopicPublishInfo's assembly loop. Two skip conditions, verbatim
-// from Java MQClientInstance: the broker is missing from the route, OR its
-// brokerAddrs lack the master id. The second check is not redundancy — a slave
-// registers itself with write permission enabled by default, and once the
-// master drops the route keeps only brokerId=1 for that name. Picking such a
-// queue sends the request to a slave, which rejects sends with SYSTEM_BUSY
-// (retryable) — a whole retry round burned for nothing.
 func (t *TopicRouteData) GetAllMessageQueue(topic string) []common.MessageQueue {
 	var mqs []common.MessageQueue
 	for _, qd := range t.QueueDatas {
@@ -391,13 +362,6 @@ func (t *TopicRouteData) GetAllMessageQueue(topic string) []common.MessageQueue 
 	return mqs
 }
 
-// GetAllSubscribeMessageQueue assembles every READABLE queue (Java
-// topicRouteData2TopicSubscribeInfo). Deliberately a separate path from
-// GetAllMessageQueue: only the READ permission and readQueueNums count, no
-// brokerDatas lookup and no master requirement. (1) perm=4 read-only topics
-// are consumable in Java while their publish info is empty; (2) when the
-// master is down the rebalance queue set must not change — pulls can go
-// through slaves. The consumer side must always use this one.
 func (t *TopicRouteData) GetAllSubscribeMessageQueue(topic string) []common.MessageQueue {
 	var mqs []common.MessageQueue
 	for _, qd := range t.QueueDatas {
@@ -411,11 +375,6 @@ func (t *TopicRouteData) GetAllSubscribeMessageQueue(topic string) []common.Mess
 	return mqs
 }
 
-// TopicRouteDataChanged is the short-circuit condition of
-// updateTopicRouteInfoFromNameServer. Sorted comparison covers queueDatas by
-// (brokerName, read, write, perm) — topicSysFlag excluded, so a broker-only
-// sysFlag flip does not look like a route change — and brokerDatas by name,
-// compared through the narrow Java-equals above.
 func (t *TopicRouteData) TopicRouteDataChanged(old *TopicRouteData) bool {
 	if old == nil {
 		return true
@@ -473,9 +432,6 @@ func (t *TopicRouteData) TopicRouteDataChanged(old *TopicRouteData) bool {
 // QueueFilter decides whether a candidate queue is acceptable.
 type QueueFilter func(*common.MessageQueue) bool
 
-// TopicPublishInfo is the per-topic publish bookkeeping (Java
-// TopicPublishInfo). SelectOneMessageQueue round-robins through a ring
-// cursor; index may go negative or overflow, it is reduced modulo len first.
 type TopicPublishInfo struct {
 	mu             sync.Mutex
 	orderTopic     bool
@@ -500,14 +456,6 @@ func (p *TopicPublishInfo) ResetIndex() {
 	p.index = 0
 }
 
-// SelectOneMessageQueue picks the next queue (Java
-// TopicPublishInfo.selectOneMessageQueue / Python
-// select_one_message_queue(*filters)).
-//
-// No filters: unconditional round-robin, never returns ok=false. With
-// filters: try at most n queues from the cursor (the cursor advances either
-// way, Java same); only when all are filtered out does it return ok=false. An
-// empty list is an error.
 func (p *TopicPublishInfo) SelectOneMessageQueue(filters []QueueFilter) (common.MessageQueue, bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

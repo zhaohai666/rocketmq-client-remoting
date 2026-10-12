@@ -1,17 +1,6 @@
-// startDetector 可达性探测线程的离线单测（对应 Java client.latency.LatencyFaultToleranceImpl
-// 的 detectByOneRound / startDetector 与 ClientConfig 的 detectTimeout/detectInterval）。
-//
 // 为什么必须单测而不是只靠真机：探测线程只在「broker 被隔离 + 之后恢复」这条罕见路径上生效，
 // 真机矩阵里几乎不会命中；而它的失败模式是静默的——探测永远失败就是把坏 broker 一直隔离
 // （发送延迟飙升但没有报错），探测永远成功就是把不可达的 broker 放回轮询。
-//
-// 三条关键判据逐条锁死：
-//   1. 默认值 200ms/2000ms/startDetectorEnable=false 与 Java ClientConfig:82-83 一致
-//      （开关默认关是 Java 的行为，不能自作主张打开）；
-//   2. checkStamp 门控：一轮探测后把下一跳推到 now+detectInterval，未到期不重复探测
-//      （Java 同口径；写反了就是每 3s 周期里对每台 broker 疯狂建连）；
-//   3. resolver 查不到地址 = broker 已从路由里消失，条目直接摘掉（Java 同），
-//      而不是留在表里被永久隔离。
 using System.Net;
 using System.Net.Sockets;
 using RocketMQ.Client;
@@ -51,7 +40,6 @@ public class LatencyDetectorTests
         return tol;
     }
 
-    // ---------------------------------------------------------------- 默认值（Java 对拍）
 
     [Fact]
     public void Detector_DefaultsMatchLegacyClientConfig()
@@ -90,7 +78,6 @@ public class LatencyDetectorTests
         detector.Enqueue(true);
         LatencyFaultToleranceImpl tol = MakeTolerance(detector, name => "127.0.0.1:10911");
 
-        // 隔离 + 标记不可达（Java 的 RemotingException 路径）
         tol.UpdateFaultItem("broker-a", 12.0, 10000, reachable: false);
         Assert.False(tol.IsReachable("broker-a"));
 
@@ -187,7 +174,7 @@ public class LatencyDetectorTests
     {
         var tol = new LatencyFaultToleranceImpl();
         tol.StartDetector();
-        tol.StartDetector(); // 重复调用不报错（Java 靠单例 executor，本端口靠运行标记）
+        tol.StartDetector();
         tol.ShutdownDetector();
         tol.ShutdownDetector(); // 已停再停也应无害
     }

@@ -41,10 +41,6 @@ func (i *Instance) GetConsumerListByGroup(addr, group string, timeoutMillis int6
 	return body.ConsumerIDList, nil
 }
 
-// GetConsumerIDListByGroup is Java MQClientInstance#findConsumerIdList: ask one
-// master of the topic's route. Every client heartbeats to every broker, so any
-// one broker holds the COMPLETE list for the group.
-//
 // The second return value is "the question was answered": false means no route,
 // a transport error, or a non-SUCCESS reply. Callers must then KEEP their
 // current assignment — never fall back to "I own every queue", which makes
@@ -141,10 +137,6 @@ func (i *Instance) batchLock(group, clientID string, mqs []common.MessageQueue, 
 	return locked
 }
 
-// adminPublishAddr is Java MQAdminImpl's offset lookup: master-only publish
-// address, one route refresh, master again, then "The broker[X] not exist".
-// It never falls back to a slave — the management path is supposed to fail
-// loudly while the master is down.
 func (i *Instance) adminPublishAddr(mq common.MessageQueue) (string, error) {
 	return i.PublishAddrFor(mq.BrokerName, mq.Topic)
 }
@@ -193,9 +185,6 @@ func (i *Instance) GetMinOffset(mq common.MessageQueue, timeoutMillis int64) (in
 	return i64Or(respHeader.Offset, 0), nil
 }
 
-// SearchOffsetByTimestamp sends SEARCH_OFFSET_BY_TIMESTAMP(29) with
-// boundaryType=LOWER (Java's MQAdminImpl.searchOffset uses LOWER, i.e. "the
-// first message stored at or after the timestamp").
 func (i *Instance) SearchOffsetByTimestamp(mq common.MessageQueue, timestamp int64, timeoutMillis int64) (int64, error) {
 	addr, err := i.adminPublishAddr(mq)
 	if err != nil {
@@ -220,9 +209,6 @@ func (i *Instance) SearchOffsetByTimestamp(mq common.MessageQueue, timestamp int
 	return i64Or(respHeader.Offset, 0), nil
 }
 
-// sendMessageBack is Java DefaultMQPushConsumerImpl#sendMessageBack: the
-// cluster-side redelivery path (CONSUMER_SEND_MSG_BACK = 36).
-//
 // `offset` is the message's commitLogOffset, NOT its queueOffset — the broker
 // looks the record up by physical offset.
 func (i *Instance) sendMessageBack(group string, msg *common.MessageExt, delayLevel int32,

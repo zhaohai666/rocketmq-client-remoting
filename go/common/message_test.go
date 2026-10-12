@@ -220,8 +220,6 @@ func TestBatchGenerateFromListDefaults(t *testing.T) {
 	if batch.Message.Topic != "batch-topic" {
 		t.Fatalf("topic %q", batch.Message.Topic)
 	}
-	// Java generateFromList：batch.setWaitStoreMsgOK(first.isWaitStoreMsgOK())，
-	// 缺席按 true —— 普通消息绝不能被降级成 WAIT=false
 	if v, ok := batch.Message.GetWaitStoreMsgOK(); !ok || v != "true" {
 		t.Fatalf("batch WAIT = %q (present=%v)", v, ok)
 	}
@@ -267,8 +265,6 @@ func TestBatchGenerateFromListRejects(t *testing.T) {
 	}
 }
 
-// python3 生成的 6 段轻量帧（Java MessageDecoder#encodeMessage 同字节）：
-// 单条：flag=7，body="body"，TAGS=TagA，KEYS=k1
 const batchOneHex = "0000002C00000000000000000000000700000004626F64790012544147530154616741024B455953016B3102"
 
 // 两条：m1 无属性；m2 带 TAGS=TagA
@@ -345,7 +341,6 @@ func TestBatchEncodeDecodeRoundTrip(t *testing.T) {
 	}
 }
 
-// 批量 body 的编码里 MagicCode 固定 0、BODYCRC 固定 0（Java encodeMessage 同）
 func TestBatchFrameConstantsAreZero(t *testing.T) {
 	m := NewMessage("", []byte("x"))
 	raw := EncodeMessage(m)

@@ -2,16 +2,6 @@
 // （对应 python/verify_latency_live.py、cpp/examples/live_latency.cpp，同一套 S1–S5；
 //  S6 是发送重试内核的检查，另两种语言由各自的 live 用例锁定）。
 // 用法：rmq latency [namesrv]
-//
-// 场景（单 broker broker-a / DefaultCluster）：
-//   S1 默认关闭：发 10 条全 OK（行为不变，容错表不记录）
-//   S2 开启故障规避：发 20 条全 OK（broker 健康，不触发隔离）
-//   S3 成功发送后容错表有记录：broker-a 的 FaultItem.CurrentLatency > 0 且可用/可达
-//   S4 手工注入隔离（broker-a，隔离档位 10000ms）→ 再发送：单 broker 下走
-//      available→reachable→普通轮询 的退化链仍全部发出
-//   S5 隔离到期恢复：remove 后注入 2000ms 隔离，立即不可用，≈2s 后恢复可用
-//   S6 发送重试内核：可重试码集合与 Java 对齐、单次超时上限与「非 SEND_OK 换 broker」
-//      开关不影响真集群上的正常发送、彻底拿不到路由时按 NOT_FOUND_TOPIC 定性而非空转重试
 using System.Diagnostics;
 using System.Globalization;
 using System.Net.Sockets;
@@ -137,8 +127,6 @@ public static class LiveLatency
         // ---------------- S5 隔离到期恢复 ----------------
         Console.WriteLine();
         Console.WriteLine("S5 隔离到期恢复（remove 后注入 2000ms）");
-        // 注意：S4 注入的是隔离档位 10000ms，而 UpdateNotAvailableDuration **只延长不缩短**
-        // （Java 语义），必须先 Remove 才能注入更短的 2000ms 档。
         p2.MqFaultStrategy.LatencyFaultTolerance.Remove(Broker);
         p2.MqFaultStrategy.LatencyFaultTolerance.UpdateFaultItem(Broker, 1.0, 2000, true);
         Check("S5 隔离期内不可用", !p2.MqFaultStrategy.LatencyFaultTolerance.IsAvailable(Broker));

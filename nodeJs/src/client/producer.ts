@@ -126,16 +126,9 @@ export class DefaultMQProducer {
   tlsEnable: boolean;
   // TLS 细项（见 setTlsOptions）；null = test-mode（信任自签）。
   tlsOptions: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null;
-  // SOCKS 代理（Java ClientConfig#socksProxyConfig）；null = 直连。对齐
-  // SocksProxyConfig 字段：addr/username/password + version(4|5，默认 5)。
   socksProxyConfig: SocksProxyConfig | null;
   rpcHook: AclRPCHook | null;
   unitName: string | null;
-  // Java ClientConfig#instanceName — the clientId knob. Two facades in one
-  // process that set the SAME instanceName (+unitName) share one MQClient
-  // instance through MQClientManager (Java MQClientManager.factoryTable).
-  // The DEFAULT stays pid-unique per start (changeInstanceNameToPid), so the
-  // historical never-share behaviour is kept unless the user opts in.
   instanceName: string;
   sendLatencyFaultEnable: boolean;
   heartbeatIntervalMillis: number;
@@ -258,8 +251,6 @@ export class DefaultMQProducer {
   setNamespaceV2(ns: string | null): this { this.namespaceV2 = ns; return this; }
   getNamespaceV2(): string | null { return this.namespaceV2; }
   setUnitName(name: string): this { this.unitName = name; return this; }
-  // Java ClientConfig#setInstanceName — 同进程内把 instanceName 设成同一个值的
-  // producer/consumer/admin 经 MQClientManager 共享一个 MQClient 实例。
   setInstanceName(name: string): this { this.instanceName = name; return this; }
   getInstanceName(): string { return this.instanceName; }
   setTlsEnable(enable: boolean): this { this.tlsEnable = enable; return this; }
@@ -268,11 +259,6 @@ export class DefaultMQProducer {
   setTlsOptions(opts: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null): this {
     this.tlsOptions = opts; return this;
   }
-  // SOCKS 代理（Java ClientConfig#setSocksProxyConfig）。addr 为代理 'host:port'，
-  // username/password 可选（SOCKS5 RFC 1929 子协商 / SOCKS4 userid），version 默认
-  // 5（'SOCKS5'），可 4 / 'SOCKS4'（域名目标自动 SOCKS4a）。TCP 建连后、TLS 握手前
-  // 完成 CONNECT；TopAddressing 的 HTTP 寻址不走代理。也可用环境变量
-  // ROCKETMQ_SOCKS_PROXY_CONFIG 传 JSON（Java 的 {"0.0.0.0/0": {...}} 形状或裸对象）。
   setSocksProxyConfig(config: SocksProxyConfig | null): this { this.socksProxyConfig = config; return this; }
   getSocksProxyConfig(): SocksProxyConfig | null { return this.socksProxyConfig; }
   setSendMsgTimeout(ms: number): this { this.sendMsgTimeout = ms; return this; }
@@ -348,9 +334,6 @@ export class DefaultMQProducer {
     const clientId = MixAll.clientIdFor(instanceName, this.unitName);
     this.producerClientId = clientId;
 
-    // 跨 facade 复用（Java MQClientManager.getOrCreateMQClientInstance）：同 clientId
-    // 的 producer/consumer/admin 共享一个实例 —— 一份路由缓存/心跳/路由刷新定时器、
-    // 一条到同 broker 的 RPC 通道。引用计数 +1 由 registerClient 完成，归零才真关闭。
     const manager = MQClientManager.getInstance();
     const { instance: client, created } = manager.getOrCreateMQClientInstance(clientId, () => {
       const remotingClient = new RemotingClient({
@@ -360,11 +343,6 @@ export class DefaultMQProducer {
     });
     this.client = client;
     manager.registerClient(clientId, client);
-    // Java MQClientAPIImpl:329-335 registration order: Namespace -> Stream ->
-    // user (ACL) hook -> DynamicalExtField. The namespace extFields must be
-    // written BEFORE the ACL hook so the signature covers nsd/ns.
-    // 配置快照 first-wins（Java cloneClientConfig 口径）：只有创建者注册 hook，
-    // 复用方（created=false）的 tls/代理/hook 不会改写已存在的实例。
     if (created) {
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
@@ -394,9 +372,6 @@ export class DefaultMQProducer {
         await this._flushAccumulation(acc);
       });
       this._accumulator.start();
-      // 累加器按 clientId 共享（实例级，Java MQClientInstance 持有 ProduceAccumulator
-      // 同口径）：挂到实例上，由实例真正 shutdown 时统一停表 —— 共享 clientId 的
-      // 单个 producer shutdown 不能停掉其他门面还在用的累加器。
       const accs: ProduceAccumulator[] = ((client as any)._accumulators ||= []);
       if (!accs.includes(this._accumulator)) accs.push(this._accumulator);
     }

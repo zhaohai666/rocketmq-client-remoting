@@ -1,8 +1,5 @@
 // ``FairSemaphore`` 的单测 —— 只测那个公平计数信号量本身。
 //
-// 对端是 Java ``new Semaphore(permits, true)``：异步发送背压整套语义都压在它身上，
-// 所以这里盯的是**公平**（只有队首能拿）与**运行时改容量**（在途份数原样保留）两件事，
-// 而不是「能不能拿到许可」这种换谁都一样的部分。
 //
 // 与 python/tests/test_backpressure.py、cpp/tests/test_backpressure.cpp 同题。
 // 生产者那一侧怎么用它（拿不到就回调、还几次）由真机工具 `dotnet backpressure` 钉
@@ -39,7 +36,6 @@ public class BackPressureTests
     [Fact]
     public void TryAcquireTimesOutWithoutThrowing()
     {
-        // Java tryAcquire(permits, timeout, MILLIS) 超时返回 false，只有 interrupt 才抛
         var sem = new FairSemaphore(1);
         Assert.True(sem.TryAcquire(1, 0));
         long began = Environment.TickCount64;
@@ -167,7 +163,6 @@ public class BackPressureTests
     [Fact]
     public void SetTotalPermitsKeepsOutstandingWork()
     {
-        // 改总量 = 「空闲 = 新总量 - 在途」，与 Java new Semaphore(num - acquired) 同解
         var sem = new FairSemaphore(10);
         Assert.True(sem.TryAcquire(4, 0)); // 在途 4
         sem.SetTotalPermits(15);
@@ -180,7 +175,6 @@ public class BackPressureTests
     [Fact]
     public void ShrinkingBelowOutstandingGivesNegativeFree()
     {
-        // Java 的 new Semaphore(负数) 是合法的，归还许可会把它拉回正数 —— 这里同样接受
         var sem = new FairSemaphore(10);
         Assert.True(sem.TryAcquire(6, 0));
         sem.SetTotalPermits(2);
@@ -193,8 +187,6 @@ public class BackPressureTests
     [Fact]
     public void ResizeWakesSomeoneBlockedOnTheOldCapacity()
     {
-        // 这是本实现换掉 Java「整体换一个 Semaphore 对象」写法的理由：调大容量时，正堵在
-        // 等待队列里的人会被叫醒；Java 那些等待者挂在旧对象上，只能等到自己的超时。
         var sem = new FairSemaphore(1);
         Assert.True(sem.TryAcquire(1, 0));
         bool got = false;
@@ -210,7 +202,6 @@ public class BackPressureTests
     [Fact]
     public void ReleaseBeyondTotalIsAllowed()
     {
-        // Java release() 不校验是否超过总量（信号量可以被"无中生有"地放大）
         var sem = new FairSemaphore(1);
         sem.Release(3);
         Assert.Equal(4, sem.AvailablePermits());
@@ -219,7 +210,6 @@ public class BackPressureTests
     [Fact]
     public void ZeroPermitsAcquireIsSatisfiedEvenWhenEmpty()
     {
-        // Java tryAcquire(0, …) 恒真；批量消息为空时我们按 1 算，所以这里只锁住基元语义
         var sem = new FairSemaphore(0);
         Assert.True(sem.TryAcquire(0, 0));
     }

@@ -2,20 +2,6 @@
 //（对应 python/verify_send_header_live.py、cpp/examples/live_send_header.cpp、
 //  rust/examples/live_send_header.rs 的 H0–H5）。
 //
-// 离线单测（tests/SendRetryTests.cs）锁的是**上线形状**：V2 头的单字母键 c/d/n 有没有
-// 真的写进 extFields、五种发送入口是不是带同一份值。但「字段上了线」和「broker 真拿它做
-// 了决定」是两件事，后者只有真集群能证：
-//   H1  默认值：不带任何配置发到新 topic，broker 按 min(d=4, TBW102.writeQueueNums) 建出
-//       队列（TopicConfigManager.java:289），与 Java 客户端默认行为一致。
-//   H2  DefaultTopicQueueNums=2 真的生效：建出来的 topic 只有 2 条队列。修之前这里写死 4，
-//       这条必然变 4 —— 那是那个假 setter 唯一可观测的后果。
-//   H3  CreateTopicKey=src 真的生效：先建一个带 PERM_INHERIT、3 条队列的模板 topic，再以
-//       它为 c 发送 → 新 topic 继承模板的 3 条队列，而不是 TBW102 的 8 条。
-//   H4  补上这三个字段之后，五种入口（同步 / 定点 / 单向 / 批量 320 / 异步）在真 broker
-//       上仍逐条落地，条数一条不差。
-//   H5  n（brokerName）：落点就是路由选中的那台 broker 名。⚠ 经典 broker 的发送链路里
-//       没有 requestHeader.getBrokerName() 的读者（5.5.1 源码 grep 过），所以 n 在线上的
-//       存在只能由离线抓帧证明，这里不假装能观测到它。
 //
 // 用法：rmq send-header [namesrv]（需本地 5.5.1 集群，autoCreateTopicEnable=true）
 using System.Text;

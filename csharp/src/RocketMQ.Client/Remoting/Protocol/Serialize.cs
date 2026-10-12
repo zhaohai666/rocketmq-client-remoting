@@ -1,6 +1,5 @@
 // 协议序列化：JSON（RemotingSerializable）与 RocketMQ 私有二进制（RocketMQSerializable）。
 //
-// 对应 org.apache.rocketmq.remoting.protocol.RemotingSerializable / RocketMQSerializable。
 //
 // RocketMQ 二进制 header 线格式：
 //   code(2) | language(1) | version(2) | opaque(4) | flag(4)
@@ -28,7 +27,6 @@ public sealed class ProtocolHeaderFields
     public PropertyMap ExtFields { get; set; } = new();
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.RemotingSerializable。</summary>
 public static class RemotingSerializable
 {
     /// <summary>JsonValue -> UTF-8 字节串。</summary>
@@ -41,12 +39,10 @@ public static class RemotingSerializable
         Json.TryParse(Encoding.UTF8.GetString(data), out value, out _);
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.RocketMQSerializable。</summary>
 public static class RocketMQSerializable
 {
     private static readonly Encoding Utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
 
-    /// <summary>十进制 ASCII 写入：先占位 int 长度，写完回补（对应 Java writeDecimalLong）。</summary>
     public static void WriteDecimalLong(ByteWriter buf, long value)
     {
         // 先占位 4 字节长度

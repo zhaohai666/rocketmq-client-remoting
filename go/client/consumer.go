@@ -158,16 +158,8 @@ type DefaultMQPushConsumer struct {
 	// popShareQueueNum is forwarded verbatim by SET_MESSAGE_REQUEST_MODE(401):
 	// it lets N following consumers in the cid list share this one's queues.
 	popShareQueueNum int32
-	// clientRebalance mirrors Java DefaultMQPushConsumer.clientRebalance
-	// (default TRUE). When false, rebalance stops computing the queue set
-	// locally and asks the broker instead: QUERY_ASSIGNMENT(400) — Java
-	// RebalanceImpl#getRebalanceResultFromBroker. Orderly consumption and
-	// BROADCASTING always stay on the local path (RebalancePushImpl
-	// #clientRebalance), and so does this port: orderly POP is rejected at
-	// config time and broadcasting has nothing to coordinate.
-	clientRebalance bool
-	// paused mirrors Java DefaultMQPushConsumerImpl.pause (SUSPEND_CONSUMER).
-	paused bool
+	clientRebalance  bool
+	paused           bool
 
 	nameServerAddrs []string
 	subscription    map[string]*remoting.SubscriptionData
@@ -400,9 +392,6 @@ func (c *DefaultMQPushConsumer) SetTLSEnable(enable bool) {
 	c.tlsEnable = &enable
 }
 
-// SetSocksProxy tunnels the consumer's remoting connections through a SOCKS
-// proxy (Java ClientConfig#socksProxyConfig). nil = direct connections. The
-// address-server HTTP fetch (TopAddressing) is not proxied.
 func (c *DefaultMQPushConsumer) SetSocksProxy(proxy *remoting.SocksProxyConfig) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -573,18 +562,6 @@ func (c *DefaultMQPushConsumer) IsPopMode() bool {
 	return c.popMode
 }
 
-// SetClientRebalance chooses WHO decides the queue set (Java
-// DefaultMQPushConsumer.setClientRebalance, default true).
-//
-//   - true (default): the client computes the assignment itself from the topic
-//     route + the group's client list, exactly as before this knob existed.
-//   - false: the client asks the broker instead — one QUERY_ASSIGNMENT(400)
-//     per subscribed topic per rebalance round, and the answer's queue set
-//     becomes the assignment (Java RebalanceImpl#getRebalanceResultFromBroker).
-//     This is what a Java 5.x push consumer does with clientRebalance=false,
-//     and what a group whose broker-side MessageRequestMode is POP expects:
-//     the broker then applies allocate4Pop, including the popShareQueueNum
-//     sharing and the queueID=-1 "pop every queue of this broker" form.
 func (c *DefaultMQPushConsumer) SetClientRebalance(enable bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -598,8 +575,6 @@ func (c *DefaultMQPushConsumer) IsClientRebalance() bool {
 	return c.clientRebalance
 }
 
-// SetPopInvisibleTime sets how long a popped batch stays invisible (ms). Java
-// requires [5000, 300000]; out of range fails at Start.
 func (c *DefaultMQPushConsumer) SetPopInvisibleTime(ms int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1567,22 +1542,6 @@ func (c *DefaultMQPushConsumer) checkConfigRangesLocked() error {
 
 // ---------------------------------------------------------------- rebalance
 
-// doRebalance is Java RebalanceImpl#doRebalance for every subscribed topic,
-// then syncPullLoops.
-//
-// BROADCASTING: every queue is ours, no broker coordination.
-// CLUSTERING, clientRebalance=true (the default): ask the broker for the
-// group's client list -> sort cidAll and mqAll -> run the strategy -> take our
-// slice (Java rebalanceByTopic).
-// CLUSTERING, clientRebalance=false: the broker decides — one
-// QUERY_ASSIGNMENT(400) per topic (Java getRebalanceResultFromBroker ->
-// MQClientAPIImpl#queryAssignment:405), and the returned MessageQueueAssignment
-// set IS the assignment. POP takes its queues from whichever path produced
-// them, one POP loop per assigned queue either way; the only difference is WHO
-// decides the queue set.
-//
-// A missing consumer list KEEPS the current assignment (Java warns). Never
-// degrade to "I own everything": co-instances would duplicate every message.
 func (c *DefaultMQPushConsumer) doRebalance() error {
 	c.mu.Lock()
 	instance := c.instance
@@ -1599,9 +1558,6 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 	was := c.assignedSet()
 	var assigned []common.MessageQueue
 	for _, topic := range topics {
-		// Java RebalanceImpl#doRebalance branches on clientRebalance(topic);
-		// RebalancePushImpl forces the local path for orderly and (implicitly,
-		// via rebalanceByTopic) for BROADCASTING.
 		if c.messageModel != MessageModelBroadcasting && !c.isOrderly() && !c.clientRebalanceValue() {
 			assigned = append(assigned, c.assignedFromBroker(topic, was)...)
 			continue
@@ -1707,7 +1663,6 @@ func (c *DefaultMQPushConsumer) doRebalance() error {
 	return nil
 }
 
-// queryAssignmentTimeoutMillis is Java RebalanceImpl#QUERY_ASSIGNMENT_TIMEOUT.
 const queryAssignmentTimeoutMillis int64 = 3000
 
 // clientRebalanceValue snapshots the flag.
@@ -1717,23 +1672,6 @@ func (c *DefaultMQPushConsumer) clientRebalanceValue() bool {
 	return c.clientRebalance
 }
 
-// assignedFromBroker is Java RebalanceImpl#getRebalanceResultFromBroker:345
-// (the clientRebalance==false branch of doRebalance), with the address lookup
-// of MQClientInstance#queryAssignment:1373: pick a broker by topic route,
-// refreshing the route once when there is none cached yet.
-//
-// The failure/empty semantics are Java's, per case:
-//
-//   - transport or broker error -> log and KEEP the current assignment (Java
-//     returns false; processQueueTable is not touched this round);
-//   - no broker address, even after the refresh -> same ("invalid result",
-//     Java's MQClientInstance answers null);
-//   - SUCCESS with no assignment set at all -> same (the Go decoder maps a
-//     missing set to nil, Java's null);
-//   - SUCCESS with an EMPTY set -> the topic's queues are all revoked: the
-//     broker's doLoadBalance javadoc says "empty set means the client should
-//     clear all load assigned to it before".
-//
 // The mode each assignment carries (POP vs PULL) is observed, not obeyed: this
 // consumer's consumption mode is fixed for its lifetime (popMode), and what the
 // rebalance consumes is the queue SET. A mixed answer is logged, not split —
@@ -1769,12 +1707,9 @@ func (c *DefaultMQPushConsumer) assignedFromBroker(topic string, was map[common.
 		return keepQueuesOf(was, topic)
 	}
 	if assignments == nil {
-		// Java: "null means invalid result, we should skip the update logic".
 		common.LogWarnf("queryAssignment: no assignment set for topic %s group %s, keep current assignment", topic, group)
 		return keepQueuesOf(was, topic)
 	}
-	// Java collects into a HashSet keyed by MessageQueue (assignment equality
-	// is messageQueue-only), which both dedups and drops null queues.
 	seen := make(map[common.MessageQueue]struct{}, len(assignments))
 	out := make([]common.MessageQueue, 0, len(assignments))
 	popCnt, pullCnt := 0, 0

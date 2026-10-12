@@ -12,7 +12,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// DefaultRequestTimeoutMillis mirrors Java DefaultMQProducer.requestTimeout.
 const DefaultRequestTimeoutMillis = int64(3000)
 
 // ---------------------------------------------------------------- future
@@ -25,11 +24,6 @@ type RequestCallback interface {
 	OnException(cause error)
 }
 
-// RequestResponseFuture is the waiting slot one in-flight Request occupies,
-// keyed by correlationId in the process-wide RequestFutureHolder (Java
-// RequestResponseFuture). The arrived channel is closed exactly once, so a
-// response that lands BEFORE anyone waits is not lost, and a wake-up after
-// timeout is harmless.
 type RequestResponseFuture struct {
 	CorrelationID  string
 	TimeoutMillis  int64
@@ -84,9 +78,6 @@ func (f *RequestResponseFuture) currentResponse() *common.MessageExt {
 	return f.response
 }
 
-// PutResponseMessage stores the reply and wakes the waiter. Like Java, it
-// allows repeated calls: the stored response is overwritten but the channel is
-// only ever closed once.
 func (f *RequestResponseFuture) PutResponseMessage(response *common.MessageExt) {
 	f.mu.Lock()
 	f.response = response
@@ -94,8 +85,6 @@ func (f *RequestResponseFuture) PutResponseMessage(response *common.MessageExt) 
 	f.arrivedOnce.Do(func() { close(f.arrived) })
 }
 
-// IsTimeout reports whether the future has outlived its budget (Java
-// isTimeout — the holder's scan uses it).
 func (f *RequestResponseFuture) IsTimeout() bool {
 	return time.Since(f.BeginTimestamp).Milliseconds() > f.TimeoutMillis
 }
@@ -114,8 +103,6 @@ func (f *RequestResponseFuture) IsSendRequestOK() bool {
 	return f.sendRequestOK.Load()
 }
 
-// SetFailed marks the future as send-failed (flipping sendRequestOK, like
-// Java's onException) and wakes the waiter.
 func (f *RequestResponseFuture) SetFailed(cause error) {
 	f.sendRequestOK.Store(false)
 	f.failWith(cause)
@@ -135,9 +122,6 @@ func (f *RequestResponseFuture) failWith(cause error) {
 	f.arrivedOnce.Do(func() { close(f.arrived) })
 }
 
-// ExecuteRequestCallback fires the callback at most once (Java
-// executeRequestCallback's CAS guard). Cause wins over response: a SetFailed
-// future delivers OnException even if a reply raced in afterwards.
 func (f *RequestResponseFuture) ExecuteRequestCallback() {
 	if f.callback == nil {
 		return
@@ -157,10 +141,6 @@ func (f *RequestResponseFuture) ExecuteRequestCallback() {
 
 // ---------------------------------------------------------------- holder
 
-// RequestFutureHolder is the process-wide correlationId -> future table (Java
-// RequestFutureHolder.getInstance()). The broker resolves the requester's
-// channel via REPLY_TO_CLIENT, so every started producer on this process can
-// receive 326 pushes through this one table.
 type RequestFutureHolder struct {
 	mu    sync.RWMutex
 	table map[string]*RequestResponseFuture
@@ -231,8 +211,6 @@ func (h *RequestFutureHolder) Size() int {
 
 // ---------------------------------------------------------------- reply side
 
-// CreateCorrelationID builds the v4-UUID-shaped correlationId Java stamps on
-// request messages.
 func CreateCorrelationID() string {
 	var raw [16]byte
 	_, _ = rand.Read(raw[:])
@@ -241,11 +219,6 @@ func CreateCorrelationID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16])
 }
 
-// CreateReplyMessage builds the message a RESPONDER sends back for a request
-// (Java MessageUtil.createReplyMessage): the reply topic derived from the
-// request's CLUSTER property — which the broker writes on delivery — plus the
-// correlation/parity properties copied verbatim, with MSG_TYPE forced to
-// "reply".
 func CreateReplyMessage(request *common.Message, body []byte) (*common.Message, error) {
 	cluster, ok := request.GetProperty(common.PropertyCluster)
 	if !ok || cluster == "" {
@@ -319,8 +292,6 @@ func i64Value(v *int64) int64 {
 
 // ---------------------------------------------------------------- requester
 
-// Request sends a request message and blocks until the reply is pushed back
-// over 326 (Java DefaultMQProducer.request(msg, timeout)).
 func (p *DefaultMQProducer) Request(msg *common.Message) (*common.MessageExt, error) {
 	return p.RequestWithTimeout(msg, p.requestTimeout)
 }
@@ -331,8 +302,6 @@ func (p *DefaultMQProducer) RequestWithTimeout(msg *common.Message, timeoutMilli
 	return p.requestSync(msg, nil, nil, nil, timeoutMillis)
 }
 
-// RequestWithMQ sends the request to a PINNED queue (Java
-// request(msg, mq, timeout)).
 func (p *DefaultMQProducer) RequestWithMQ(msg *common.Message, mq common.MessageQueue) (*common.MessageExt, error) {
 	return p.RequestWithMQAndTimeout(msg, mq, p.requestTimeout)
 }
@@ -341,8 +310,6 @@ func (p *DefaultMQProducer) RequestWithMQAndTimeout(msg *common.Message, mq comm
 	return p.requestSync(msg, &mq, nil, nil, timeoutMillis)
 }
 
-// RequestBySelector lets a selector pick the queue (Java
-// request(msg, selector, arg, timeout)).
 func (p *DefaultMQProducer) RequestBySelector(msg *common.Message, selector MessageQueueSelector, arg any) (*common.MessageExt, error) {
 	return p.RequestBySelectorWithTimeout(msg, selector, arg, p.requestTimeout)
 }
@@ -351,8 +318,6 @@ func (p *DefaultMQProducer) RequestBySelectorWithTimeout(msg *common.Message, se
 	return p.requestSync(msg, nil, selector, arg, timeoutMillis)
 }
 
-// AsyncRequest sends a request and delivers the reply through the callback
-// (Java request(msg, requestCallback, timeout)).
 func (p *DefaultMQProducer) AsyncRequest(msg *common.Message, callback RequestCallback) error {
 	return p.AsyncRequestWithTimeout(msg, callback, p.requestTimeout)
 }
@@ -399,9 +364,6 @@ func (p *DefaultMQProducer) prepareRequest(msg *common.Message, timeoutMillis in
 	msg.PutProperty(common.PropertyMessageTTL, strconv.FormatInt(timeoutMillis, 10))
 
 	begin := time.Now()
-	// Java prepareSendRequest: make sure the route is known, then send one
-	// heartbeat — without a registered producer the broker cannot find a
-	// channel to push the reply to. Both are best-effort.
 	if _, err := p.topicPublishInfo(topic); err != nil {
 		common.LogDebugf("request: prepare route of topic %s failed: %v", topic, err)
 	}
@@ -413,11 +375,6 @@ func (p *DefaultMQProducer) prepareRequest(msg *common.Message, timeoutMillis in
 	return future, topic, cost, nil
 }
 
-// requestSync is Java DefaultMQProducerImpl.request: send (any of the three
-// routing variants), then wait on the registered slot with the REMAINING
-// budget (timeout - cost, not reduced further by the send itself — the same
-// shape as the Rust port). A timeout after a successful send is
-// RequestTimeoutError; a failed send is wrapped with its cause.
 func (p *DefaultMQProducer) requestSync(msg *common.Message, mq *common.MessageQueue, selector MessageQueueSelector, arg any, timeoutMillis int64) (*common.MessageExt, error) {
 	future, topic, cost, err := p.prepareRequest(msg, timeoutMillis, nil)
 	if err != nil {
@@ -452,10 +409,6 @@ func (p *DefaultMQProducer) requestSync(msg *common.Message, mq *common.MessageQ
 	return nil, out
 }
 
-// requestAsync is Java DefaultMQProducerImpl.request with an async callback:
-// the send runs through the async kernel (only send failures are wired into
-// the future — a successful send result carries nothing the requester needs),
-// and a watchdog goroutine converts a quiet budget into a timeout exception.
 func (p *DefaultMQProducer) requestAsync(msg *common.Message, mq *common.MessageQueue, selector MessageQueueSelector, arg any, callback RequestCallback, timeoutMillis int64) error {
 	if callback == nil {
 		return common.ClientError("the request callback is null")

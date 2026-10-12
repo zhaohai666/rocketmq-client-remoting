@@ -1,25 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""POP 模式**消费侧**真机验证（推模式消费者走 POP）。
-
-用法：.venv/bin/python verify_pop_consumer_live.py 127.0.0.1:9876
-
-与协议层的 ``verify_pop_live.py`` 区别：那里只验 POP/ACK/延长不可见三个 RPC 本身，
-这里验**消费循环**——rebalance 出来的每个队列独立 POP、投递给 listener、
-按消费结果 ack 或延长不可见时间。
-
-⚠ 与 Java 的有意差异：Java 的 push-consumer POP 走 **broker 侧分配**
-（QUERY_ASSIGNMENT(400) + MessageQueueAssignment(mode=POP)），客户端不做 rebalance；
-本项目复用已有的**客户端 rebalance**，队列由本地按分配策略算出。语义等价（每队列一个
-POP 循环 + ack 确认），差别只在"谁决定分哪些队列"。
-
-场景：
-  S1 POP 消费：起消费者 → 发 12 条 → 全部收到、无重复、body 集合一致
-  S2 ack 生效：收满后再观察一段时间，不应被重复投递（ack 已抵消 checkpoint）
-  S3 RECONSUME_LATER：listener 持续返回 RECONSUME_LATER → 消息按延迟档位被重新投递
-  S4 多队列：消息确实落到了多个队列且都被消费（POP 是逐队列弹的）
-  S5 pullRT/pullTPS 进 307 状态表：POP 循环要和 pull 循环一样上报拉取统计
-"""
 from __future__ import annotations
 
 import sys
@@ -104,9 +84,6 @@ def main():
     consumer = DefaultMQPushConsumer(group)
     consumer.set_namesrv_addr(namesrv)
     consumer.pop_mode = True
-    # 消费池是 core/max 两档：只压 max 会让默认的 min(20) > max 顶掉启动期的
-    # `consumeThreadMin (20) is larger than consumeThreadMax (4)` 闸门
-    # （Java DefaultMQPushConsumerImpl:1116），两个一起压才是"小池子"。
     consumer.consume_thread_min = 4
     consumer.consume_thread_max = 4
     consumer.consume_message_batch_max_size = 4
@@ -214,13 +191,6 @@ def main():
     p2.shutdown()
     producer.shutdown()
 
-    # ------------------------------------------------ S5 pullRT/pullTPS 进 307
-    # Java 的 popMessage 回调（DefaultMQPushConsumerImpl:556-563）与 pull 回调一样要把
-    # incPullRT / incPullTPS 记进状态表，307 应答的 statusTable 就靠这两格。POP 循环漏掉
-    # 它们是**静默**的：消息照弹照 ack、消费完全正常，只有运维看板上一片 0 —— 而看板上
-    # "这个消费者没在拉取"和"这个消费者压根没起来"是两种完全不同的处置。
-    # ⚠ 快照每 10s 采样一次、窗口取 minute 差分，所以必须**持续有流量**并跨过两个采样点，
-    #   否则 pullTPS 仍是 0，那是夹具不够长，不是判据错。
     print("=== S5 POP 循环把 pullRT/pullTPS 写进 307 状态表 ===")
     stats_delivered = []
 

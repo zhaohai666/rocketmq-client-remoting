@@ -78,7 +78,7 @@ func checkJSONFrame() {
 	cmd.Remark = "hello 中文"
 	cmd.AddExtField("topic", "TopicTest")
 	cmd.AddExtField("namesrv", "127.0.0.1:9876")
-	cmd.AddExtField("html", "a<b>&c") // must survive unescaped (Java does not escape)
+	cmd.AddExtField("html", "a<b>&c")
 	cmd.SetBody([]byte{0x01, 0x02, 0x03, 'p', 'a', 'y'})
 
 	back, err := remoting.Decode(cmd.Encode())
@@ -135,9 +135,6 @@ func checkBinaryFrame() {
 		stype, back.SerializeTypeCurrentRPC, back.Remark, back.ExtFields().Keys()))
 }
 
-// 3) The heartbeat header's ext key is spelled `clientID` (capital ID). Java's
-// reflection writes the field name verbatim; "clientId" would be silently
-// dropped by the broker's fastjson2 and the client would look unnamed.
 func checkHeartbeatKeySpelling() {
 	const name = "HEART_BEAT header key spelling is `clientID` (exact case, single field)"
 
@@ -361,12 +358,6 @@ func checkMessageIDRoundTrip() {
 	check(name, ok, fmt.Sprintf("id=%s ip=%s port=%d offset=%d err=%v", id, ip, port, offset, err))
 }
 
-// 9) Crc32 contract. Pinned because this is the one place Go deliberately does
-// NOT match Java: Java's UtilAll.crc32 returns (int)(value & 0x7FFFFFFF), i.e.
-// the top bit cleared, so a Java-written BODYCRC differs from ours by 2^31 and
-// cross-language CRC comparison must never be attempted (compare each side's own
-// `match` field instead). BODYCRC is not checked on decode by default
-// (DecodeOptions.CheckCRC=false), which is what keeps interop working.
 func checkCrc32Vector() {
 	const name = "Crc32 standard IEEE vectors (b\"\"=0, b\"a\"=0xE8B7BE43, b\"abc\"=0x352441C2)"
 

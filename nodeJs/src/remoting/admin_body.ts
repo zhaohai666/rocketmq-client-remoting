@@ -1,22 +1,4 @@
 // -*- coding: utf-8 -*-
-/**
- * 管理端专用响应体（对应 org.apache.rocketmq.remoting.protocol.admin.* 与 body.* 中的管理类）：
- *
- * TopicStatsTable / TopicOffset / ConsumeStats / OffsetWrapper /
- * TopicConfigSerializeWrapper / ConsumeQueueData / QueryConsumeQueueResponseBody。
- *
- * ⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，fastjson2 会把键直接内联成 JSON 对象，
- * 产出**非法 JSON**，例如：
- *     {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
- * 所以必须用 RemotingSerializable.decode（fastjson 容错解析），再用 messageQueueKey /
- * decodeMessageQueueMap 把字符串键还原成 MessageQueue。
- * 字段名与结构均经服务端（broker）实际报文核对确认。
- *
- * 本模块复用 ./bodies.ts 中已实现的共享管理体（OffsetWrapper / ConsumeStats /
- * TopicConfigSerializeWrapper / TopicConfig / ConsumerRunningInfo 及其 MessageQueue 键助手），
- * 仅补充 bodies.ts 尚未覆盖的 TopicOffset / TopicStatsTable / ConsumeQueueData /
- * QueryConsumeQueueResponseBody。
- */
 import { MessageQueue } from '../common/message.ts';
 import { RemotingSerializable } from './serialize.ts';
 import {
@@ -44,7 +26,6 @@ export {
 
 // ---------------------------------------------------------------- TopicOffset
 export class TopicOffset {
-  /** 对应 org.apache.rocketmq.remoting.protocol.admin.TopicOffset。 */
   minOffset = 0;
   maxOffset = 0;
   lastUpdateTimestamp = 0;
@@ -86,10 +67,6 @@ export class TopicOffset {
 
 // ---------------------------------------------------------------- TopicStatsTable
 export class TopicStatsTable {
-  /** 对应 org.apache.rocketmq.remoting.protocol.admin.TopicStatsTable。
-   *
-   * 探针输出：{"offsetTable":{<MessageQueue>:{...}},"topicPutTps":0.0}
-   */
   offsetTable = new Map<MessageQueue, TopicOffset>();
   topicPutTps = 0.0;
 
@@ -121,10 +98,6 @@ export class TopicStatsTable {
 
 // ---------------------------------------------------------------- ConsumeQueueData
 export class ConsumeQueueData {
-  /** 对应 org.apache.rocketmq.remoting.protocol.body.ConsumeQueueData。
-   *
-   * 探针/源码字段：physicOffset, physicSize, tagsCode, extendDataJson, bitMap, eval, msg
-   */
   physicOffset = 0;
   physicSize = 0;
   tagsCode = 0;
@@ -180,11 +153,6 @@ export class ConsumeQueueData {
 
 // ---------------------------------------------------------------- QueryConsumeQueueResponseBody
 export class QueryConsumeQueueResponseBody {
-  /** 对应 org.apache.rocketmq.remoting.protocol.body.QueryConsumeQueueResponseBody。
-   *
-   * 探针输出：{"filterData":"*","maxQueueIndex":88,"minQueueIndex":1,"subscriptionData":{...}}
-   * （queueData 为 null 时不出现）
-   */
   subscriptionData: Record<string, any> | null = null;
   filterData: string | null = null;
   queueData: ConsumeQueueData[] | null = null;

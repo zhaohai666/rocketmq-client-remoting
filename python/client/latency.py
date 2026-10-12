@@ -1,19 +1,4 @@
 # -*- coding: utf-8 -*-
-"""发送延迟故障容错（对应 org.apache.rocketmq.client.latency.*）。
-
-实现 MQFaultStrategy + LatencyFaultToleranceImpl（带 FaultItem）：追踪每个 broker 的
-发送延迟，延迟过高或发生异常时**隔离**一段时间（不分配给新消息），默认关闭。
-
-与 Java 关键点逐条对齐：
-  * latencyMax / notAvailableDuration 两套阈值表；
-  * updateFaultItem 的 notAvailableDuration 取 ``computeNotAvailableDuration``，
-    隔离（异常）场景固定按 10000ms 算档位；
-  * FaultItem.isAvailable() = now >= startTimestamp（隔离期未过则不可用）；
-  * LatencyFaultToleranceImpl.isAvailable/isReachable 在没有记录时返回 true，
-    即"从未出过问题的 broker 默认可用/可达"。
-
-默认 sendLatencyFaultEnable=false，与 Java 一致；开启后才会记录与生效。
-"""
 from __future__ import annotations
 
 import logging
@@ -28,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class FaultItem:
-    """单个 broker 的故障项（对应 Java LatencyFaultToleranceImpl.FaultItem）。"""
+    pass
 
     def __init__(self, name: str):
         self.name = name
@@ -38,7 +23,6 @@ class FaultItem:
         self.reachable_flag: bool = True
 
     def update_not_available_duration(self, not_available_duration: float) -> None:
-        # Java：only when now + dur > startTimestamp 才更新（保持最长隔离期）
         if not_available_duration > 0 and time.time() * 1000.0 + not_available_duration > self.start_timestamp:
             self.start_timestamp = time.time() * 1000.0 + not_available_duration
 
@@ -54,23 +38,7 @@ class FaultItem:
 
 
 class LatencyFaultToleranceImpl:
-    """对应 Java client.latency.LatencyFaultToleranceImpl。
-
-    与 Java 一致的部件：
-      * ``detectByOneRound``：遍历故障表，``now >= checkStamp`` 的项重新探测 ——
-        resolver 解析不出地址则直接删表项；探测成功且原 reachableFlag=False 时
-        恢复 ``reachableFlag=True``（探测失败不清位，清位只发生在发送失败时）。
-      * ``startDetector``：后台守护线程，**固定** 3s 初始延迟 + 3s 周期
-        （Java ``scheduleAtFixedRate(..., 3, 3, TimeUnit.SECONDS)``），
-        每轮先看 ``startDetectorEnable`` 开关，关着就空转。
-      * ``detectTimeout``=200ms / ``detectInterval``=2000ms 两个可调参数。
-
-    ``resolver``: brokerName → addr（Java Resolver）；``service_detector``:
-    (addr, detect_timeout_millis) → bool（Java ServiceDetector）。生产者侧由
-    DefaultMQProducer 注入（find_broker_address_in_publish + GET_MAX_OFFSET 探测）；
-    单测可以直接塞假函数。两者为 None 时 startDetector 线程照起（Java 同样如此），
-    只是没有可用的探测逻辑。
-    """
+    pass
 
     def __init__(self, resolver: Optional[Callable[[str], Optional[str]]] = None,
                  service_detector: Optional[Callable[[str, float], bool]] = None,
@@ -120,12 +88,7 @@ class LatencyFaultToleranceImpl:
             self._fault_item_table.pop(name, None)
 
     def pick_one_at_least(self) -> Optional[str]:
-        """对应 Java ``LatencyFaultToleranceImpl.pickOneAtLeast:158-176``。
-
-        把故障表快照随机打乱，返回第一台 ``reachableFlag=True`` 的 broker 名；
-        全都不可达（或表空）返回 None。这就是主动探测的"候补集合"来源：
-        表里是哪些 broker，探测器就轮询哪些。
-        """
+        pass
         with self._lock:
             items = list(self._fault_item_table.values())
         random.shuffle(items)
@@ -138,7 +101,6 @@ class LatencyFaultToleranceImpl:
         with self._lock:
             return self._fault_item_table.get(name)
 
-    # ---- 可达性探测（对应 Java startDetectorEnable / detectByOneRound / startDetector）----
     def is_start_detector_enable(self) -> bool:
         return self._start_detector_enable
 
@@ -152,12 +114,7 @@ class LatencyFaultToleranceImpl:
         self.detect_interval_millis = detect_interval_millis
 
     def detect_by_one_round(self) -> None:
-        """对应 Java ``detectByOneRound``。
-
-        只把「探测成功」的项从不可达翻回可达；探测失败/解析不到地址**不会**把
-        reachableFlag 置 False（清位只来自 updateFaultItem(reachable=False)）。
-        resolver 解析不到地址时按 Java 语义直接删除该表项。
-        """
+        pass
         now_ms = time.time() * 1000.0
         with self._lock:
             items = list(self._fault_item_table.values())
@@ -177,20 +134,14 @@ class LatencyFaultToleranceImpl:
                 continue
             try:
                 service_ok = bool(detector(broker_addr, self.detect_timeout_millis))
-            except Exception:  # noqa: BLE001 - Java 侧 detect 异常按 false 处理
+            except Exception:
                 service_ok = False
             if service_ok and not broker_item.reachable_flag:
                 logger.info("%s is reachable now, then it can be used.", broker_item.name)
                 broker_item.reachable_flag = True
 
     def start_detector(self, initial_delay: float = 3.0, period: float = 3.0) -> None:
-        """对应 Java ``startDetector``：3s 后开始、每 3s 一轮的守护线程。
-
-        Java 里 start() 无条件启动 scheduled executor，跑不跑探测由
-        startDetectorEnable 决定 —— 这里同样：线程只起一次，开关随时可翻。
-        ``initial_delay`` / ``period`` 仅给单测提速用，默认与 Java 的
-        ``scheduleAtFixedRate(..., 3, 3, TimeUnit.SECONDS)`` 完全一致。
-        """
+        pass
         with self._lock:
             if self._detector_thread is not None and self._detector_thread.is_alive():
                 return
@@ -203,7 +154,7 @@ class LatencyFaultToleranceImpl:
                     try:
                         if self._start_detector_enable:
                             self.detect_by_one_round()
-                    except Exception:  # noqa: BLE001 - Java: log.warn("Unexpected exception ...")
+                    except Exception:
                         logger.warning("Unexpected exception raised while detecting service reachability",
                                        exc_info=True)
 
@@ -216,14 +167,7 @@ class LatencyFaultToleranceImpl:
 
 
 class MQFaultStrategy:
-    """对应 Java client.latency.MQFaultStrategy。
-
-    仅当 ``send_latency_fault_enable`` 为 True 时，发送选队列阶段会：
-      1) 优先选 available（隔离期已过）的 broker；
-      2) 否则选 reachable 的 broker；
-      3) 否则退化为普通轮询。
-    发送结果/异常会回调 ``update_fault_item`` 写延迟与隔离信息。
-    """
+    pass
 
     LATENCY_MAX = [50, 100, 550, 1800, 3000, 5000, 15000]
     NOT_AVAILABLE_DURATION = [0, 0, 2000, 5000, 6000, 10000, 30000]
@@ -245,11 +189,11 @@ class MQFaultStrategy:
         self._send_latency_fault_enable = enable
 
     def is_start_detector_enable(self) -> bool:
-        """对应 Java MQFaultStrategy.isStartDetectorEnable（默认 False）。"""
+        pass
         return self._start_detector_enable
 
     def set_start_detector_enable(self, enable: bool) -> None:
-        """对应 Java MQFaultStrategy.setStartDetectorEnable：同时打到容错器上。"""
+        pass
         self._start_detector_enable = enable
         self._latency_fault_tolerance.set_start_detector_enable(enable)
 

@@ -1,5 +1,3 @@
-// Topic 路由数据（对应 org.apache.rocketmq.remoting.protocol.route.*）。
-//
 // 用途：客户端向 NameServer 发 GET_ROUTEINFO_BY_TOPIC，响应 body 即 TopicRouteData
 // 的 JSON。据此得知集群里 broker 的地址（brokerDatas）与每个 topic 的读写队列数
 // （queueDatas），进而组装出可发送/可拉取的 MessageQueue 列表。
@@ -14,7 +12,6 @@ using RocketMQ.Common;
 
 namespace RocketMQ.Remoting.Protocol;
 
-/// <summary>org.apache.rocketmq.remoting.protocol.route.QueueData。</summary>
 public sealed class QueueData : IComparable<QueueData>
 {
     public string BrokerName { get; set; } = string.Empty;
@@ -90,7 +87,6 @@ public sealed class QueueData : IComparable<QueueData>
 
     public override bool Equals(object? obj) => obj is QueueData other && Equals(other);
 
-    // Java compareTo：仅按 brokerName
     public int CompareTo(QueueData? other)
     {
         if (other is null)
@@ -130,7 +126,6 @@ public sealed class QueueData : IComparable<QueueData>
         + ", topicSysFlag=" + TopicSysFlag.ToString(CultureInfo.InvariantCulture) + "]";
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.route.BrokerData。</summary>
 public sealed class BrokerData : IComparable<BrokerData>
 {
     public string Cluster { get; set; } = string.Empty;
@@ -175,7 +170,6 @@ public sealed class BrokerData : IComparable<BrokerData>
             return master;
         }
 
-        // 无 master：随机取一个从节点（对应 Java new Random().nextInt(size)）
         int idx = ThreadLocalRandom.Next(BrokerAddrs.Count);
         int i = 0;
         foreach (var kv in BrokerAddrs)
@@ -279,14 +273,12 @@ public sealed class BrokerData : IComparable<BrokerData>
         return b;
     }
 
-    // Java equals：cluster / brokerName / brokerAddrs
     public bool Equals(BrokerData? other) =>
         other is not null && Cluster == other.Cluster && BrokerName == other.BrokerName
         && BrokerAddrs.SequenceEqual(other.BrokerAddrs);
 
     public override bool Equals(object? obj) => obj is BrokerData other && Equals(other);
 
-    // Java compareTo：仅按 brokerName
     public int CompareTo(BrokerData? other)
     {
         if (other is null)
@@ -347,7 +339,6 @@ public sealed class BrokerData : IComparable<BrokerData>
     }
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.route.TopicRouteData。</summary>
 public sealed class TopicRouteData
 {
     public string OrderTopicConf { get; set; } = string.Empty;
@@ -363,21 +354,11 @@ public sealed class TopicRouteData
     /// 按 queueDatas + brokerDatas 组装全部**可写** MessageQueue
     /// （对应 MQClientInstance.topicRouteData2TopicPublishInfo 的组装逻辑）。
     /// topic 会回填进每个 MessageQueue，否则后续按 mq.topic 回查路由会查不到。
-    ///
-    /// 两条跳过条件逐字对应 Java MQClientInstance:294-303：路由里没有同名 broker，
-    /// 或者它的 brokerAddrs 里没有 MASTER_ID。后者不是冗余判断：从节点自己也会注册进
-    /// namesrv，且默认配置下照样带写位（RouteInfoManager:344-346 只在「prime slave 且
-    /// enableActingMaster」时才抹掉 WRITE）—— master 一旦掉线，路由里同一个 brokerName
-    /// 只剩 brokerId=1。漏判这条，生产者会把消息发到从节点上，而从节点对发送请求一律
-    /// reject（SendMessageProcessor:131 ⇒ SYSTEM_BUSY，还是可重试码），白烧一轮超时；
-    /// Java 那边这种队列压根进不了发布信息。
-    /// </summary>
     public List<MessageQueue> GetAllMessageQueue(string topic)
     {
         var mqs = new List<MessageQueue>();
         foreach (QueueData qd in QueueDatas)
         {
-            // 只挑有写权限的队列（Java: PermName.isWriteable）
             if (!PermName.CheckPerm(qd.Perm, PermName.PermWrite))
             {
                 continue;
@@ -403,23 +384,11 @@ public sealed class TopicRouteData
         return mqs;
     }
 
-    /// <summary>
-    /// 按 queueDatas 组装全部**可读** MessageQueue
-    /// （对应 Java MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332）。
-    ///
-    /// 与 <see cref="GetAllMessageQueue"/> 是两条口径，不能合成一条：这里只看**读**位与
-    /// readQueueNums，**不查 brokerDatas、也不要求 broker 有 master**。
-    /// ①perm=4 的只读 topic 在 Java 里可消费，发布信息里却为空；
-    /// ②master 掉线只剩从节点时 Java 的 rebalance 队列集不变（拉取可以走从节点），
-    /// 只有发布侧会因没有 master 而选不出队列。
-    /// 消费侧（rebalance / fetchSubscribeMessageQueues）必须用这一份。
-    /// </summary>
     public List<MessageQueue> GetAllSubscribeMessageQueue(string topic)
     {
         var mqs = new List<MessageQueue>();
         foreach (QueueData qd in QueueDatas)
         {
-            // 只挑有读权限的队列（Java: PermName.isReadable）
             if (!PermName.CheckPerm(qd.Perm, PermName.PermRead))
             {
                 continue;
@@ -434,7 +403,6 @@ public sealed class TopicRouteData
         return mqs;
     }
 
-    /// <summary>路由是否变化：先按 compareTo 排序再比较（与 Java topicRouteDataChanged 一致）。</summary>
     public bool TopicRouteDataChanged(TopicRouteData? oldData)
     {
         if (oldData is null)

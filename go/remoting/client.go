@@ -79,12 +79,7 @@ type ClientConfig struct {
 	// On GO_AWAY(1500) retry once over a fresh connection; off -> the
 	// SendRequest error surfaces directly (enableReconnectForGoAway = false).
 	EnableReconnectForGoAway bool
-	// SocksProxy, when set, tunnels every remoting TCP connection through the
-	// SOCKS proxy (Java NettyClientConfig#socksProxyConfig -> SocksProxyConfig):
-	// TCP connect to the proxy, SOCKS CONNECT to the target host, TLS (if
-	// enabled) layered on top of the tunnel. The address-server HTTP fetch
-	// (TopAddressing) is client-layer and NOT proxied.
-	SocksProxy *SocksProxyConfig
+	SocksProxy               *SocksProxyConfig
 }
 
 func NewClientConfig() ClientConfig {

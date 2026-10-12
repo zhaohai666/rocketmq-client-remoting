@@ -1,8 +1,4 @@
 // AclClientRPCHook 实现 + 自带的 SHA1 / HMAC-SHA1 / Base64。
-//
-// 为什么自己实现而不用 OpenSSL：仓库至今只依赖 zlib（压缩），CMakeLists 里
-// 没有 find_package(OpenSSL)。为了一个 20 字节摘要引入一个重量级依赖不划算，
-// 且 SHA1/HMAC/Base64 都是几十行的定长算法，自带实现更容易与 Java 逐字节对拍。
 #include "rocketmq/remoting/rpchook.h"
 
 #include <algorithm>
@@ -195,13 +191,9 @@ std::string hmacSha1Base64(const std::string& key, const Bytes& data) {
 // ---------------------------------------------------------------- AclClientRPCHook
 
 Bytes AclClientRPCHook::buildRequestContent(RemotingCommand& request) {
-    // 对应 Java AclClientRPCHook#parseRequestContent 的第一步：把 customHeader 的
-    // 字段展开进 extFields —— 它们同样是签名内容的一部分。
     request.makeCustomHeaderToNet();
 
     Bytes buf;
-    // extFields 是 std::map<std::string,...>，天然按 key 升序，与 Java TreeMap 等价
-    // （ACL 涉及的键都是 ASCII 属性名，字节序与 Java String 自然序一致）。
     for (const auto& kv : request.extFields) {
         if (kv.first == SessionCredentials::SIGNATURE) {
             continue;  // Signature 自身不参与签名（与 broker 侧一致）
@@ -222,9 +214,6 @@ std::string AclClientRPCHook::calcSignature(const std::string& secretKey,
 void AclClientRPCHook::doBeforeRequest(const std::string& remoteAddr,
                                        RemotingCommand& request) {
     (void)remoteAddr;
-    // 顺序必须与 Java doBeforeRequest 一致：
-    //   1) 写 AccessKey（2) 可选 SecurityToken）—— 它们参与签名
-    //   3) 算签名   4) 写 Signature —— 自身不参与签名
     request.addExtField(SessionCredentials::ACCESS_KEY, credentials_.accessKey());
     if (!credentials_.securityToken().empty()) {
         request.addExtField(SessionCredentials::SECURITY_TOKEN, credentials_.securityToken());
@@ -236,17 +225,12 @@ void AclClientRPCHook::doBeforeRequest(const std::string& remoteAddr,
 void StreamTypeRPCHook::doBeforeRequest(const std::string& remoteAddr,
                                         RemotingCommand& request) {
     (void)remoteAddr;
-    // Java: request.addExtField(MixAll.REQ_T, String.valueOf(RequestType.STREAM.getCode()))
-    // RequestType.STREAM 的 code 是 0，故写入字面量 "0"。
     request.addExtField(MixAll::REQ_T, std::to_string(RequestType::STREAM));
 }
 
 void NamespaceRpcHook::doBeforeRequest(const std::string& remoteAddr,
                                        RemotingCommand& request) {
     (void)remoteAddr;
-    // Java: if (StringUtils.isNotEmpty(clientConfig.getNamespaceV2())) { ... }
-    // 空命名空间时**什么都不加**（不物化 nsd/ns，也不动 extFields 里已有的键）；
-    // doAfterResponse 与 Java 同为空，不覆写基类默认。
     const std::string namespaceV2 = namespaceV2_ ? namespaceV2_() : std::string();
     if (namespaceV2.empty()) return;
     request.addExtField(MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD, "true");
@@ -270,13 +254,6 @@ void ChainedRPCHook::doAfterResponse(const std::string& remoteAddr, const Remoti
 std::shared_ptr<RPCHook> composeRequestHooks(bool enableStreamRequestType,
                                              const std::shared_ptr<RPCHook>& userHook,
                                              const std::function<std::string()>& namespaceV2Getter) {
-    // Java MQClientAPIImpl:329-335 的注册顺序是 Namespace → Stream → 用户钩子 →
-    // DynamicalExtField；本端口没有 DynamicalExtField 这一环（时区字段不写），其余三环
-    // 都在这里按同一顺序装链（见 rpchook.h 的链序说明）。
-    // 只要门面给了取值函数就**无条件**装 NamespaceRpcHook（Java 是无条件注册
-    // `new NamespaceRpcHook(clientConfig)`，命名空间在每笔请求的 doBeforeRequest 里现读）：
-    // 在这里按「装链那一刻 namespaceV2 为空」省掉它，会让 start() 之后再 setNamespaceV2
-    // 静默失效。getter 为空才代表「门面根本没接线」。
     const bool hasNamespace = namespaceV2Getter != nullptr;
     if (!hasNamespace && !enableStreamRequestType) return userHook;
     std::vector<std::shared_ptr<RPCHook>> hooks;

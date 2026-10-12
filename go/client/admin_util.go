@@ -23,9 +23,6 @@ func extInt64(response *remoting.RemotingCommand, key string) int64 {
 	return v
 }
 
-// adminParseInt64 parses a decimal string, reporting failure instead of
-// throwing (Java would throw NumberFormatException; the ports agree on "not a
-// number"). Distinct from process_queue's parseInt64, which returns an error.
 func adminParseInt64(text string) (int64, bool) {
 	v, err := strconv.ParseInt(text, 10, 64)
 	if err != nil {
@@ -34,9 +31,6 @@ func adminParseInt64(text string) (int64, bool) {
 	return v, true
 }
 
-// mustDecodeObject decodes a JSON body that must be an object. A malformed or
-// non-object body yields false rather than an error: several admin bodies
-// (335/345/…) are unstructured and Java just hands them back as a JsonObject.
 func mustDecodeObject(data []byte) (map[string]any, bool) {
 	if len(data) == 0 {
 		return map[string]any{}, false
@@ -61,8 +55,6 @@ func jsonArraySafe(v any) []any {
 	return nil
 }
 
-// sameDataVersion compares two decoded DataVersion objects by their rendered
-// JSON (Java compares the objects, and both sides come from the same decode).
 func sameDataVersion(a, b map[string]any) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
@@ -70,8 +62,6 @@ func sameDataVersion(a, b map[string]any) bool {
 	return string(remoting.EncodeJSON(a)) == string(remoting.EncodeJSON(b))
 }
 
-// sortByQueueOffset orders messages the way Java's MessageExt comparator does
-// (ascending queueOffset), across brokers.
 func sortByQueueOffset(messages []*common.MessageExt) {
 	sort.SliceStable(messages, func(i, j int) bool {
 		return messages[i].QueueOffset < messages[j].QueueOffset

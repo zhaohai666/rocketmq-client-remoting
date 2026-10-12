@@ -1,18 +1,5 @@
 // P6（#98）：经典拉模式消费者 / 轻量拉取消费者的**心跳**离线单测。
 //
-// 对齐基准（Java 5.5.1，逐行读过；与 python/tests/test_pull_consumer.py、
-// python/tests/test_lite_pull_consumer.py 同题）：
-//   * Java DefaultMQPullConsumerImpl.start():746 把本组注册进实例的 consumerTable，
-//     实例级周期任务再替它发心跳；心跳口径由 prepareHeartbeatData:1031-1045 取
-//     consumeType()（:348 恒为 CONSUME_ACTIVELY）、consumeFromWhere()（:353 恒为
-//     CONSUME_FROM_LAST_OFFSET）、messageModel() 与 subscriptions()（:357-385：
-//     逐条 buildSubscriptionData(topic, SUB_ALL) 并 **setSubVersion(0L)**）。
-//   * Java DefaultLitePullConsumerImpl.consumeType():1111-1112 同样是 CONSUME_ACTIVELY。
-//   * shutdown():689-692 = unregisterConsumer → mQClientFactory.shutdown()，即对每台
-//     broker 发 UNREGISTER_CLIENT(35)。
-// 为什么值得测：broker 的 ConsumerManager.consumerTable 是按台的，缺心跳时
-// consumerConnection/38 看不到本组，rejectPullConsumerEnabled 的 broker 会拒拉
-// （PullMessageProcessor:493-505），而拉取本身仍成功 —— 失效是静默的。
 //
 // 判据取自**线上报文**：进程内假端点从 socket 上收 HEART_BEAT 的 body（JSON）与
 // UNREGISTER_CLIENT 的 extFields，不靠调用方自说自话。
@@ -281,8 +268,6 @@ const char* kGroup = "PG_PullHbUnit";
 const char* kTopic = "PullHbTopic";
 const char* kBroker = "broker-a";
 
-// Java DefaultMQPullConsumer.registerMessageQueueListener(topic, listener) 兼作
-// 「登记 topic」入口（registerTopics.add(topic)），本端口同款，所以给一个空监听器。
 class NoopListener : public MessageQueueListener {
 public:
     void messageQueueChanged(const std::string&, const std::vector<MessageQueue>&,
@@ -322,8 +307,6 @@ bool waitFor(Fn fn, int timeoutMs = 5000) {
 
 // ---------------------------------------------------------------- 1. 启动即注册
 
-// Java start():746 注册 + 实例周期任务首个 1s 内发心跳；本端口 start() 里同步发一轮。
-// 判据：broker 真的收到 HEART_BEAT，且 ConsumerData 的四项口径与 Java 一致。
 void testStartAnnouncesTheGroupWithTheWireShape() {
     MockEndpoint namesrv;
     MockEndpoint broker;
@@ -360,8 +343,6 @@ void testStartAnnouncesTheGroupWithTheWireShape() {
             const SubscriptionData& sub = cd.subscriptionDataSet.front();
             expect(sub.topic == kTopic, "订阅 topic 原样（不加命名空间）", "got=" + sub.topic);
             expect(sub.subString == "*", "subString=SUB_ALL", "got=" + sub.subString);
-            // Java 显式 setSubVersion(0L)：拉模式没有订阅版本语义，带时间戳会让 broker
-            // 每轮心跳都以为订阅变了
             expectInt(sub.subVersion, 0, "subVersion=0（Java setSubVersion(0L)）");
         }
     }
@@ -371,9 +352,6 @@ void testStartAnnouncesTheGroupWithTheWireShape() {
 
 // ---------------------------------------------------------------- 2. 扇出到每一台
 
-// Java sendHeartbeatToAllBroker:732-750 遍历 brokerAddrTable 的**每个 brokerId**，
-// 仅当 consumerEmpty && id != MASTER_ID 才跳过；消费者心跳必带 ConsumerData，故从节点
-// 也发。broker 的 consumerTable 按台各一份，从节点漏发会让指向它的拉取走不到订阅表。
 void testHeartbeatFansOutToEveryBrokerId() {
     MockEndpoint namesrv;
     MockEndpoint master;
@@ -396,9 +374,6 @@ void testHeartbeatFansOutToEveryBrokerId() {
 
 // ---------------------------------------------------------------- 3. 没有订阅也要注册本组
 
-// Java subscriptions():357-385 在 registerTopics 为空时返回空集，但 ConsumerData 本身
-// 照样上线 —— 组是"注册过"，只是没有订阅条目（broker 侧的 ConsumerGroupInfo 会被建出来，
-// consumerConnection 看得到本组）。心跳收件人靠实例路由表，所以先显式取一次路由。
 void testHeartbeatStillAnnouncesTheGroupWithoutRegisterTopics() {
     MockEndpoint namesrv;
     MockEndpoint broker;
@@ -426,7 +401,6 @@ void testHeartbeatStillAnnouncesTheGroupWithoutRegisterTopics() {
 
 // ---------------------------------------------------------------- 4. 周期循环
 
-// Java 心跳是周期任务（默认 30s）；本端口是消费者自带线程。用 300ms 周期验证循环真的在跑。
 void testHeartbeatLoopRepeats() {
     MockEndpoint namesrv;
     MockEndpoint broker;
@@ -451,9 +425,6 @@ void testHeartbeatLoopRepeats() {
 
 // ---------------------------------------------------------------- 5. shutdown 注销
 
-// Java DefaultMQPullConsumerImpl.shutdown:689-692 → unregisterConsumer → 每台发 35。
-// 少了它，broker 要等心跳超时（默认 ~120s）才摘掉本组，这段时间 consumerConnection
-// 还挂着已退出的实例。
 void testShutdownUnregistersTheGroupOnEveryBroker() {
     MockEndpoint namesrv;
     MockEndpoint master;
@@ -489,8 +460,6 @@ void testShutdownUnregistersTheGroupOnEveryBroker() {
 
 // ---------------------------------------------------------------- 6. 轻量拉取也是 ACTIVELY
 
-// Java DefaultLitePullConsumerImpl.consumeType():1111-1112 同样 return CONSUME_ACTIVELY。
-// broker 侧读它的地方见 lite_pull_consumer.cpp buildHeartbeat 的注释。
 void testLitePullHeartbeatIsActivelyTyped() {
     MockEndpoint namesrv;
     MockEndpoint broker;

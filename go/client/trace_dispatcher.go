@@ -1,7 +1,3 @@
-// AsyncTraceDispatcher — the client-side trace producer
-// (Java org.apache.rocketmq.client.trace.AsyncTraceDispatcher, Python
-// trace_dispatcher.py, Rust trace_dispatcher.rs).
-//
 // Hooks append TraceContexts to an in-memory queue; a worker thread flushes
 // them either when batchNum records have piled up or 5s after the last flush,
 // and the encoded text goes to the trace topic through a DEDICATED internal
@@ -31,9 +27,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// TraceDispatcherType is Java TraceDispatcher.Type ("PRODUCE"/"CONSUME"). It
-// ends up in the internal producer's group name, so the broker sees which side
-// of the client a trace batch came from.
 type TraceDispatcherType string
 
 const (
@@ -42,18 +35,13 @@ const (
 )
 
 const (
-	// traceQueueCapacity is Java's ArrayBlockingQueue(2048). A full queue
-	// DISCARDS (counted) rather than blocking the business thread.
 	traceQueueCapacity = 2048
-	// traceMaxBatchNum caps the configured batch size — Java's comment is
-	// explicit that 20 is the ceiling.
-	traceMaxBatchNum = 20
+	traceMaxBatchNum   = 20
 	// traceMaxMsgSize is the 128K payload cap per trace message.
 	traceMaxMsgSize = 128000
 	// traceFlushIntervalMillis mirrors FLUSH_TRACE_INTERVAL.
 	traceFlushIntervalMillis = 5000
-	// traceWorkerIdleSleep keeps an idle worker from spinning (Java sleeps 5ms).
-	traceWorkerIdleSleep = 5 * time.Millisecond
+	traceWorkerIdleSleep     = 5 * time.Millisecond
 	// traceProducerSendTimeoutMillis is the internal producer's send timeout.
 	traceProducerSendTimeoutMillis = 5000
 	// traceWorkerJoinBudget bounds the wait for the worker to notice `stopped`.
@@ -61,14 +49,10 @@ const (
 	// traceSendDrainBudget bounds the wait for in-flight trace sends during
 	// Shutdown. Each send is itself capped by the 5s producer timeout, so this
 	// only fires when something is badly wedged.
-	traceSendDrainBudget = 30 * time.Second
-	// defaultTraceMsgBatchNum is Java's DefaultMQProducer/DefaultMQPushConsumer
-	// traceMsgBatchNum default.
+	traceSendDrainBudget    = 30 * time.Second
 	defaultTraceMsgBatchNum = 10
 )
 
-// traceProducerGroupCounter mints the per-dispatcher suffix of the internal
-// producer's group name (Java's AtomicInteger, Python's itertools.count).
 var traceProducerGroupCounter atomic.Int64
 
 // AsyncTraceDispatcher see the package comment above.
@@ -96,10 +80,6 @@ type AsyncTraceDispatcher struct {
 
 // NewAsyncTraceDispatcher builds the dispatcher and its internal producer. The
 // producer is NOT started here — Start does that with the name server address.
-//
-// rpcHook is the HOST client's hook (ACL signing, namespace fields); the
-// internal producer needs its own copy or every trace send is rejected on a
-// cluster that authenticates (Java passes the host hook the same way).
 func NewAsyncTraceDispatcher(group string, dispatcherType TraceDispatcherType,
 	batchNum int, traceTopic string, rpcHook remoting.RPCHook) *AsyncTraceDispatcher {
 
@@ -141,15 +121,11 @@ func NewAsyncTraceDispatcher(group string, dispatcherType TraceDispatcherType,
 	return d
 }
 
-// genGroupNameForTrace is Java
-// AsyncTraceDispatcher#getGroupNameForTrace: the trace producer's group must be
-// distinguishable in the broker's producer table from the host group.
 func (d *AsyncTraceDispatcher) genGroupNameForTrace() string {
 	return strings.Join([]string{TraceGroupNamePrefix, d.group, string(d.dispatcher),
 		i64Text(traceProducerGroupCounter.Add(1))}, "-")
 }
 
-// TraceTopicName is Java getTraceTopicName.
 func (d *AsyncTraceDispatcher) TraceTopicName() string { return d.traceTopic }
 
 // SetHostProducer points the dispatcher at the producer that owns it; the
@@ -159,9 +135,6 @@ func (d *AsyncTraceDispatcher) SetHostProducer(p *DefaultMQProducer) { d.hostPro
 // SetHostConsumer points the dispatcher at the owning consumer.
 func (d *AsyncTraceDispatcher) SetHostConsumer(c *DefaultMQPushConsumer) { d.hostCons = c }
 
-// clientID is Python's _client_id: the EndTransaction record's clientHost is
-// the HOST client's id, not the internal producer's (Java
-// EndTransactionTraceHookImpl uses the host context's client id).
 func (d *AsyncTraceDispatcher) clientID() string {
 	if d.hostProd != nil {
 		return d.hostProd.ClientID()
@@ -204,8 +177,6 @@ func (d *AsyncTraceDispatcher) Start(nameSrvAddr, accessChannel string) error {
 	return nil
 }
 
-// Append enqueues one context without blocking; a full queue discards it and
-// bumps the counter (Java logs and drops — trace data is best-effort).
 func (d *AsyncTraceDispatcher) Append(ctx *TraceContext) bool {
 	if ctx == nil {
 		return false
@@ -243,9 +214,6 @@ func (d *AsyncTraceDispatcher) workerLoop() {
 	}
 }
 
-// flushTraceContext is Java flushTraceContext: flush when forced, when the
-// batch is full, or when 5s have passed since the last send. Otherwise it
-// sleeps 5ms to keep the worker from spinning.
 func (d *AsyncTraceDispatcher) flushTraceContext(force bool) {
 	if len(d.traceQueue) > 0 {
 		now := common.CurrentTimeMillis()
@@ -285,9 +253,6 @@ func (d *AsyncTraceDispatcher) asyncSendTraceMessage(contexts []*TraceContext) {
 	}()
 }
 
-// Flush drains the queue and waits (bounded) for the sends to land. Java's
-// flush() only forces the flush; waiting here is what makes Shutdown able to
-// guarantee the last batch is out before the internal producer stops.
 func (d *AsyncTraceDispatcher) Flush() {
 	for len(d.traceQueue) > 0 {
 		func() {
@@ -346,9 +311,6 @@ func (d *AsyncTraceDispatcher) Shutdown() {
 
 type traceGroupKey struct{ topic, traceTopic string }
 
-// sendTraceData is Java sendTraceData: contexts are grouped by
-// (business topic, trace topic) — the business topic is the FIRST bean's — and
-// each group is encoded and chunked separately.
 func (d *AsyncTraceDispatcher) sendTraceData(contexts []*TraceContext) {
 	beanMap := map[traceGroupKey][]*TraceTransferBean{}
 	var order []traceGroupKey
@@ -361,9 +323,6 @@ func (d *AsyncTraceDispatcher) sendTraceData(contexts []*TraceContext) {
 			accessChannel = d.accessChan
 		}
 		region := ctx.RegionID
-		// Java skips a context with no region or no beans; client-side hooks
-		// always fill the region on the Pub path, so this only drops broken
-		// payloads.
 		if region == "" || len(ctx.TraceBeans) == 0 {
 			continue
 		}
@@ -386,7 +345,6 @@ func (d *AsyncTraceDispatcher) sendTraceData(contexts []*TraceContext) {
 	}
 }
 
-// flushData chunks one group's records at maxMsgSize (Java flushData).
 func (d *AsyncTraceDispatcher) flushData(beans []*TraceTransferBean, traceTopic string) {
 	if len(beans) == 0 {
 		return
@@ -412,16 +370,10 @@ func (d *AsyncTraceDispatcher) flushData(beans []*TraceTransferBean, traceTopic 
 	}
 }
 
-// sendTraceDataByMQ sends one trace message. Two ways in, exactly as Java:
-// plain send by default, or a selector restricted to the brokers that actually
-// host the trace topic (only meaningful once a route is known — a unit test
-// without a cluster takes the plain path).
 func (d *AsyncTraceDispatcher) sendTraceDataByMQ(keySet map[string]struct{}, data, traceTopic string) {
 	msg := common.NewMessage(traceTopic, []byte(data))
 	keys := make([]string, 0, len(keySet))
 	for k := range keySet {
-		// The empty key comes from splitting a KEYS property that ends in a
-		// space — Java's sorted(...).filter(non-empty) drops it the same way.
 		if k != "" {
 			keys = append(keys, k)
 		}
@@ -442,9 +394,6 @@ func (d *AsyncTraceDispatcher) sendTraceDataByMQ(keySet map[string]struct{}, dat
 	}
 }
 
-// tryGetMessageQueueBrokerSet is Java tryGetMessageQueueBrokerSet: the broker
-// names the trace topic is published on. No route yet (or no cluster) is an
-// empty set, which the caller reads as "plain send".
 func (d *AsyncTraceDispatcher) tryGetMessageQueueBrokerSet(topic string) map[string]struct{} {
 	out := map[string]struct{}{}
 	publish, err := d.traceProd.topicPublishInfo(topic)
@@ -457,10 +406,6 @@ func (d *AsyncTraceDispatcher) tryGetMessageQueueBrokerSet(topic string) map[str
 	return out
 }
 
-// traceBrokerSetSelector is Python's _BrokerSetSelector: round-robin over the
-// queues whose broker is in the set, falling back to every queue when the
-// filter leaves nothing (Java would throw IndexOutOfBounds there; the ports
-// treat it as "no cross-cluster filtering needed").
 type traceBrokerSetSelector struct{ d *AsyncTraceDispatcher }
 
 func (s traceBrokerSetSelector) Select(mqs []common.MessageQueue, msg *common.Message,

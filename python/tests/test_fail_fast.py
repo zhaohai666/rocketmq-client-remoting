@@ -1,21 +1,4 @@
 # -*- coding: utf-8 -*-
-"""连接断开时立刻失败在途请求（对应 Java ``NettyRemotingAbstract#failFast`` / ``#requestFail``）。
-
-Java 的 ``NettyRemotingHandler#close`` 在 ``closeChannel`` 之后紧接着调
-``failFast(ctx.channel())``（``NettyRemotingClient.java:1191``）：把 ``responseTable`` 里
-属于这条连接的请求逐条 ``requestFail`` —— ``setSendRequestOK(false)`` +
-``putResponse(null)`` + 投递一次回调。缺了这一步会错两件事：
-
-1. **时机**：同步调用方要等满 invoke 超时、异步回调要等 ``timeout + 1s``（清理线程的宽限
-   口径）才发现"连接早就没了"。对端重启 / broker 主备切换 / 网络抖动时，这段无意义等待
-   会直接压在发送链路上。
-2. **语义**：报出来的是 ``RemotingTimeoutException``，而 Java 报
-   ``RemotingSendRequestException``。异步发送的重试分类按这两个类型分流
-   （``client/producer.py`` 的 ``_classify_async_failure``），错类型等于错重试决策。
-
-这里用真 socket 对端（收到请求就关掉连接）来证明，而不是 mock：只有真 EOF 才会走到
-读线程退出这条路径。修复前三项全部不成立（等待时间等于 timeout、异常类型是超时）。
-"""
 from __future__ import annotations
 
 import socket
@@ -179,7 +162,7 @@ def test_async_callback_reports_send_failure_immediately():
 
 
 def test_fail_fast_callback_fires_exactly_once():
-    """断连与清理线程抢同一条请求：回调也只能有一次（Java 的 executeCallbackOnlyOnce）。"""
+    pass
     server = DropOnReadServer()
     client = RemotingClient()
     try:

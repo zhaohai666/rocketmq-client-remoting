@@ -1,18 +1,3 @@
-// 动态 name server 取址（对应 org.apache.rocketmq.common.namesrv.TopAddressing /
-// DefaultTopAddressing 与 MixAll.getWSAddr；Python 参考实现 client/top_addressing.py）。
-//
-// Java 语义（5.5.1 逐条核对，与 Python/C++ 侧逐条同源）：
-//   * WS 地址：``http://<domain>:8080/rocketmq/<subgroup>``；domain 自带端口（含 ':'）
-//     时不追加 :8080；
-//   * unitName 非空白 → URL 追加 ``-<unitName>?nofix=1``；para 非空 → ``?k=v&...``；
-//   * HTTP GET（超时 3000ms）code==200 → 响应体 clearNewLine（trim 后截断到第一个
-//     \r 或 \n）作为 NS 地址串；失败返回 null；
-//   * FetchAndApply（Java MQClientAPIImpl.fetchNameServerAddr）：地址**变化才应用**；
-//   * MQClientInstance：只在未配置静态地址时，Start() fetch 一次 + 10s/2min 周期刷新。
-//
-// 有意差异（与 Python/C++ 参考实现一致）：Java 默认 domain 是 jmenv.tbsite.net（依赖
-// /etc/hosts 绑定），我们若照抄，未配置的用户会被必然失败的域名拖 3s。因此 domain
-// 必须显式给出（构造参数或环境变量 ROCKETMQ_NAMESRV_DOMAIN），未配置 = 关闭动态取址。
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
@@ -24,7 +9,6 @@ namespace RocketMQ.Client;
 
 public sealed class DefaultTopAddressing
 {
-    // Java MixAll.DEFAULT_NAMESRV_ADDR_LOOKUP / 默认 subgroup
     public const string DefaultNamesrvAddrLookup = "jmenv.tbsite.net";
     public const string DefaultDomainSubgroup = "nsaddr";
 
@@ -36,7 +20,6 @@ public sealed class DefaultTopAddressing
     private readonly IReadOnlyDictionary<string, string>? _para;
 
     public string WsAddr { get; }
-    // Java 的 nameSrvAddr 缓存：上次成功应用的地址串
     private string _nsAddr = string.Empty;
 
     public DefaultTopAddressing(string? wsAddr = null, string? unitName = null,
@@ -112,7 +95,6 @@ public sealed class DefaultTopAddressing
         return url;
     }
 
-    /// <summary>Java DefaultTopAddressing.clearNewLine：trim 后截断到第一个 \r 或 \n。</summary>
     public static string ClearNewLine(string content)
     {
         string s = content.Trim();
@@ -123,7 +105,6 @@ public sealed class DefaultTopAddressing
         return s;
     }
 
-    /// <summary>取一次 NS 地址串；不可用 / 非 200 / 网络失败返回 null（Java 返回 null）。</summary>
     public string? FetchNsAddr(bool verbose = true)
     {
         if (string.IsNullOrEmpty(WsAddr)) return null;
@@ -153,7 +134,6 @@ public sealed class DefaultTopAddressing
         return null;
     }
 
-    /// <summary>Java MQClientAPIImpl.fetchNameServerAddr：地址变化才返回新串并记录。</summary>
     public string? FetchAndApply()
     {
         string? addrs = FetchNsAddr();

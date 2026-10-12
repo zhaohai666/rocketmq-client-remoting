@@ -1,24 +1,5 @@
 // C++ 管理客户端（DefaultMQAdminExt）的**真实集群**联调（对应 python/verify_admin_live.py）。
 //
-// 全部打真实 nameServer + broker，无 mock。覆盖：
-//   1. 集群探活 / fetchBrokerClusterInfo / getClusterList
-//   2. createTopic（队列数校验）→ fetchAllTopicList → examineTopicRoute
-//   3. examineTopicConfig / getAllTopicConfig
-//   4. getBrokerConfig（**properties 文本**，验证没被当 KVTable JSON 解析）
-//   5. updateBrokerConfig → 回读确认生效（可逆，测完还原）
-//   6. NameServer KV：createAndUpdateKvConfig → getKvConfig → getKvListByNamespace → delete
-//   7. 订阅组：create/update → 单查 → 分页全量 → examine → delete
-//   8. 生产 N 条 → examineTopicStats / examineConsumeStats / queryConsumeQueue /
-//      queryMessage（可达性）/ viewMessage(msgId)
-//   9. maxOffset / minOffset / searchOffset / earliestMsgStoreTime / examineConsumerOffset
-//  10. sendMessageBack：消费 1 条后重投 → 轮询 %RETRY%<group> 出现该消息
-//  11. resetOffsetByTimestamp（真实 INVOKE_BROKER_TO_RESET_OFFSET，language=JAVA：broker 只在
-//      发起方 language=CPP 时才推 ResetOffsetBodyForC，Java 客户端默认不启用）
-//  12. resetOffsetByQueueId（25 + 带 queueId/offset 的 222）：拉回 min ⇒ 首笔 pull 被
-//      OFFSET_RESET 短路成 PULL_OFFSET_MOVED、第二笔取到历史消息；越界目标被 broker 拒
-//      ⇒ 位点停在第 1 笔写入的非法值（两笔 RPC 非原子，与 Java 同构）
-//  13. queryTopicsByConsumerToBroker / queryTopicsByConsumer(group)（343，按 %RETRY% 路由扇出）
-//  14. 清理：deleteSubscriptionGroup / deleteTopic
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
 // autoCreateTopicEnable=true。用法：
@@ -447,12 +428,6 @@ int main(int argc, char** argv) {
         check("Offset 只读查询", false, e.what());
     }
 
-    // ---------- 7.5 searchOffset 的 boundaryType（Java DefaultMQAdminExt:133/:137）----------
-    // 单开一个 1 队列 topic：位点语义只在单队列上才确定（多队列时分不清落哪一条）。
-    // 3 条消息 ⇒ maxOffset=3；远未来时间戳下 UPPER = 最后一条自身位点(2)、
-    // LOWER = 它的下一个位点(3) = maxOffset（ConsumeQueue.binarySearchInQueueByTime:261-270
-    // 的 case 1）。两者不同即证明 boundaryType 字段真的到了 broker 并被解析 ——
-    // 若字段丢失或被忽略，两次都会落到 LOWER。
     const std::string bndTopic = "AdminBoundaryTopicCpp_" + stamp;
     try {
         admin.createTopic(MixAll::DEFAULT_TOPIC, bndTopic, 1);
@@ -491,7 +466,6 @@ int main(int argc, char** argv) {
         check("时间戳早于全部消息时 LOWER/UPPER 都塌到 minOffset",
               loPast == 0 && upPast == 0,
               "lower=" + std::to_string(loPast) + " upper=" + std::to_string(upPast));
-        // admin.searchOffset 走的就是 LOWER（Java MQAdminImpl:189）：同时间戳必须同结果
         check("searchOffset 默认边界与显式 LOWER 同结果",
               admin.searchOffset(bmq, nowMs() + 600000) == lo,
               "lower=" + std::to_string(lo));
@@ -524,7 +498,6 @@ int main(int argc, char** argv) {
 
         if (listener->count() >= 1) {
             MessageExt first = listener->first();
-            // 消费者仍在线时重投（对齐 Java：在消费线程内调用 sendMessageBack）
             try {
                 bool ok = cons.sendMessageBack(first, 0);
                 backsent = true;
@@ -561,12 +534,6 @@ int main(int argc, char** argv) {
               + "s；broker 把 delayLevel=0 改写为 3，约 10s 后可见）");
     }
 
-    // ---------- 8.5 fetchConsumeStatsInBroker（341）：按订阅组出行，本组带 offsetTable ----------
-    // Java `AdminBrokerProcessor#fetchAllConsumeStatsInBroker` 对
-    // `subscriptionGroupTable.keySet()` 的每个组建一行 {group: [ConsumeStats]}，内层 topic
-    // 才来自位点表 `whichTopicByConsumer`（所以要等消费者刷过位点）。
-    // ⚠ 响应 JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错键名时真机响应
-    // 会解析成空集合，看着像「这个 broker 没有积压」—— 这条断言就是回归护栏。
     {
         size_t rows = 0;
         bool groupWithOffsets = false;
@@ -617,8 +584,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---------- 9.5 resetOffsetByQueueId（Java DefaultMQAdminExtImpl:1827，两笔 RPC）+
-    //             queryTopicsByConsumer(343) ----------
     {
         const int32_t queueId = mq.getQueueId();
         int64_t minReset = -1;
@@ -631,8 +596,6 @@ int main(int argc, char** argv) {
             try {
                 std::map<MessageQueue, int64_t> table =
                     admin.resetOffsetByQueueId(brokerAddr, group, topic, queueId, minReset);
-                // Java 该方法是 void：broker 只在 language=CPP 时回可解析的 offsetTable，
-                // 空表合法；非空时必须是我们操作的那个队列。
                 bool consistent = table.empty() ||
                     table.begin()->first.getQueueId() == queueId;
                 check("resetOffsetByQueueId(回到 minOffset)", consistent,
@@ -647,11 +610,6 @@ int main(int argc, char** argv) {
                 check("resetOffsetByQueueId(回到 minOffset)", false, e.what());
             }
 
-            // 一次性 resetOffsetTable 真的被下一次 pull 取走：Java
-            // `PullMessageProcessor:539-548` 在 useServerSideResetOffset 下**不读消息**，
-            // 直接回 OFFSET_RESET ⇒ PULL_OFFSET_MOVED(:672)，客户端映射成
-            // PullStatus::OFFSET_ILLEGAL + nextBeginOffset=重置位点（MQClientAPIImpl:1098）。
-            // 所以第一笔 pull 必须是 OFFSET_ILLEGAL，第二笔才真正拿到历史消息。
             try {
                 DefaultMQPullConsumer pull(group);
                 pull.setNamesrvAddr(gNamesrv);
@@ -671,9 +629,6 @@ int main(int argc, char** argv) {
                 check("重置后回拉", false, e.what());
             }
 
-            // 越界负例：resetOffsetInner 的 [min, max+1] 校验必须拒掉。同时量化 Java 语义——
-            // 两笔 RPC **不是原子的**：commitOffset 无区间校验，第 1 笔已把非法位点落库，
-            // 所以失败后位点停在非法目标上（这里不断言"回滚"）。
             int64_t badTarget = -1;
             try {
                 badTarget = admin.maxOffset(mq) + 100;
@@ -702,8 +657,6 @@ int main(int argc, char** argv) {
             TopicList byBroker = admin.queryTopicsByConsumerToBroker(brokerAddr, group);
             check("queryTopicsByConsumerToBroker 读出本组消费过的 topic",
                   byBroker.contains(topic), "topics=" + std::to_string(byBroker.topicList.size()));
-            // Java 的 admin 级方法（DefaultMQAdminExtImpl:1078）只收 group：按
-            // %RETRY%<group> 路由逐 broker 扇出再合并（Set 语义去重）。
             TopicList byGroup = admin.queryTopicsByConsumer(group);
             check("queryTopicsByConsumer(group) 按 %RETRY% 路由扇出并合并",
                   byGroup.contains(topic), "topics=" + std::to_string(byGroup.topicList.size()));

@@ -1,23 +1,3 @@
-//! 静态主题（单元化主题）消费者侧路由支持，移植自 Java 客户端：
-//!   - `org.apache.rocketmq.remoting.rpc.ClientMetadata
-//!     .topicRouteData2EndpointsForStaticTopic`
-//!   - `org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingUtils
-//!     .getMockBrokerName`
-//!   - `org.apache.rocketmq.client.impl.factory.MQClientInstance
-//!     .getBrokerNameFromMessageQueue`（见 [`crate::client::mq_client::MQClientInstance
-//!     ::get_broker_name_from_message_queue`]）
-//!
-//! wire 事实（不得"简化"）：
-//!   - 路由解码侧把 `topicQueueMappingByBroker` 保持为不透明的
-//!     `Vec<(brokerName, serde_json::Value)>`；**类型化视图在这里解析**，
-//!     不动协议层透传。
-//!   - `TopicQueueMappingInfo.scope` 缺省为 `MixAll.METADATA_SCOPE_GLOBAL`
-//!     （`__global__`）；global scope 的 mock broker 名会剥掉开头两个下划线
-//!     （`__syslo__global__`）。
-//!   - Java 的 `maxTotalNumOfEpoch` 读了但从不赋值（恒 -1），所以
-//!     `epoch >= maxTotalNumOfEpoch` 守卫恒真，`maxTotalNums` 就是该 scope 的
-//!     `totalQueues` 最大值 —— 这个 quirk 照抄。
-//!   - 同 epoch 的后到条目**覆盖**先到条目（Java `oldEpoch <= epoch`）。
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -27,19 +7,18 @@ use crate::common::message::MessageQueue;
 use crate::remoting::protocol::route::TopicRouteData;
 
 /// `MixAll.METADATA_SCOPE_GLOBAL`。
-pub(crate) const METADATA_SCOPE_GLOBAL: &str = "__global__";
+pub const METADATA_SCOPE_GLOBAL: &str = "__global__";
 /// `MixAll.LOGICAL_QUEUE_MOCK_BROKER_PREFIX`。
-pub(crate) const LOGICAL_QUEUE_MOCK_BROKER_PREFIX: &str = "__syslo__";
+pub const LOGICAL_QUEUE_MOCK_BROKER_PREFIX: &str = "__syslo__";
 /// `MixAll.LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST`。
-pub(crate) const LOGICAL_QUEUE_MOCK_NOT_EXIST: &str = "__syslo__none__";
+pub const LOGICAL_QUEUE_MOCK_NOT_EXIST: &str = "__syslo__none__";
 
-/// Java `MixAll::isLogicalQueueMockBrokerName`（前缀判断）。
 pub(crate) fn is_logical_queue_mock_broker_name(broker_name: &str) -> bool {
     broker_name.starts_with(LOGICAL_QUEUE_MOCK_BROKER_PREFIX)
 }
 
 /// `getMockBrokerName`：`__global__`（scope 本身）剥掉头两个字符，其余 scope 原样加前缀。
-pub(crate) fn get_mock_broker_name(scope: &str) -> String {
+pub fn get_mock_broker_name(scope: &str) -> String {
     if scope == METADATA_SCOPE_GLOBAL {
         format!("{}{}", LOGICAL_QUEUE_MOCK_BROKER_PREFIX, &scope[2..])
     } else {
@@ -47,8 +26,6 @@ pub(crate) fn get_mock_broker_name(scope: &str) -> String {
     }
 }
 
-/// `topicQueueMappingByBroker[brokerName]` 单条目的类型化视图（Java
-/// `TopicQueueMappingInfo`）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct TopicQueueMappingInfo {
     pub scope: String,
@@ -59,8 +36,6 @@ pub(crate) struct TopicQueueMappingInfo {
     pub curr_id_map: BTreeMap<i32, i32>,
 }
 
-/// 从路由解码侧保留下来的原始 json 对象里解析类型化视图。
-/// 畸形条目丢弃（返回 `None`）—— Java 遇到会 NPE；能抢救的部分映射好过整个崩溃。
 pub(crate) fn parse_topic_queue_mapping_info(raw: &Value) -> Option<TopicQueueMappingInfo> {
     let obj = raw.as_object()?;
     let mut info = TopicQueueMappingInfo {
@@ -97,7 +72,7 @@ pub(crate) fn parse_topic_queue_mapping_info(raw: &Value) -> Option<TopicQueueMa
 /// `MessageQueue(topic, mockBrokerName(scope), globalId) -> 承载它的真实 broker 名`
 /// （total 范围内没有承载者的逻辑 id 指向 `__syslo__none__`）。
 /// 空映射（非静态主题）返回 `None`。
-pub(crate) fn topic_route_data_2_endpoints_for_static_topic(
+pub fn topic_route_data_2_endpoints_for_static_topic(
     topic: &str,
     route: &TopicRouteData,
 ) -> Option<HashMap<MessageQueue, String>> {
@@ -106,7 +81,6 @@ pub(crate) fn topic_route_data_2_endpoints_for_static_topic(
         return None;
     }
 
-    // 按 scope 分组（Java 里没有 scope 的条目不参与，同此）。
     let mut infos_by_scope: HashMap<String, Vec<(String, TopicQueueMappingInfo)>> = HashMap::new();
     for (broker, raw) in mapping {
         let Some(info) = parse_topic_queue_mapping_info(raw) else {
@@ -120,14 +94,10 @@ pub(crate) fn topic_route_data_2_endpoints_for_static_topic(
 
     let mut endpoints: HashMap<MessageQueue, String> = HashMap::new();
     for (scope, mut infos) in infos_by_scope {
-        // 先按 broker 名排序，再做稳定的 epoch 降序排序。Java 对
-        // ConcurrentHashMap 的 entrySet 做 epoch 降序排序，同 epoch 的覆盖顺序本就
-        // 未定义；钉死 broker 升序让结果可复现。
         infos.sort_by(|a, b| a.0.cmp(&b.0));
         infos.sort_by(|a, b| b.1.epoch.cmp(&a.1.epoch));
 
         let mut max_total_nums = 0i32;
-        // Java 从不更新 maxTotalNumOfEpoch —— 守卫恒真，照抄。
         let max_total_num_of_epoch: i64 = -1;
         let mock_name = get_mock_broker_name(&scope);
         // MessageQueue -> (epoch, bname)。

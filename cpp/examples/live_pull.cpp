@@ -159,13 +159,6 @@ int main(int argc, char** argv) {
               "sample=" + routes[0].brokerName + ":" + std::to_string(routes[0].queueId));
     }
 
-    // ---------------- S1b 平衡视图（fetchMessageQueuesInBalance）----------------
-    // 此刻本实例**一笔都没拉过**：算不动时的兜底是「保留现有分配」=空集，所以拿到非空
-    // 只可能来自真实路由 + broker 的 GET_CONSUMER_LIST_BY_GROUP(38) —— 也就是心跳真的把
-    // 本组注册进了 broker。心跳的订阅集来自 registerTopics（Java
-    // DefaultMQPullConsumerImpl.subscriptions():357-385），所以先 registerMessageQueueListener
-    // （listener 传 null 也要登记，Java 的 MQPullConsumerScheduleService:100 就这么用）、
-    // 再补一发心跳，然后轮询读视图（38 的可见性有 1s 量级延迟）。
     std::printf("\nS1b fetchMessageQueuesInBalance\n");
     {
         consumer.registerMessageQueueListener(topic, nullptr);

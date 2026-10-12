@@ -1,20 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Admin 发起端 consumeMessageDirectly(309) 的离线协议单测，不需要集群。
-
-对齐 Java `DefaultMQAdminExtImpl#consumeMessageDirectly:1323-1332` 与
-`MQClientAPIImpl#consumeMessageDirectly:2741`。这条链路有两个「错一点就静默失效」的
-口径，用例把它们锁死：
-
-  - msgId 带客户端 UNIQ_KEY 属性时必须改发 **offsetMsgId**：broker 端
-    `AdminBrokerProcessor:2629` 拿 msgId 当 commitLog 偏移 `selectOneByOffset`，
-    发客户端生成的 uniqKey 必然查空，broker 只能把 body=null 转下去。
-  - 头字段名必须与 Java `ConsumeMessageDirectlyResultRequestHeader` 的字段一致
-    （consumerGroup/clientId/msgId/topic），brokerName 是可空补充（Java 发起端
-    不设，这里路由对得上时才带）。
-
-viewMessage 的两条解析路径（offset msgId 直解 / uniqKey 索引兜底）已有覆盖，
-这里按 Java 的分层把 viewMessage 替身化，只测发起端自己的逻辑。
-"""
 from __future__ import annotations
 
 from client.admin import DefaultMQAdminExt
@@ -83,8 +67,6 @@ def _admin(client: _FakeClient, msg: MessageExt) -> DefaultMQAdminExt:
     admin = DefaultMQAdminExt()
     admin._mq_client = client
     admin._started = True
-    # Java `DefaultMQAdminExtImpl#consumeMessageDirectly` 第一步就是 viewMessage；
-    # 两条解析路径已由 view_message 自己的用例覆盖，这里替身化只测发起端逻辑。
     admin.view_message = lambda topic, msg_id: msg  # noqa: GTW
     return admin
 
@@ -143,8 +125,7 @@ def test_uniq_key_msg_id_is_replaced_by_offset_msg_id():
 
 
 def test_plain_offset_msg_id_is_forwarded_unchanged():
-    """消息没有 UNIQ_KEY 属性（msgId 本身就是 offsetMsgId）时原样透传——Java
-    `DefaultMQAdminExtImpl:1327-1328` 的 if 分支。"""
+    pass
     client = _FakeClient([_ok(_result_body())])
     admin = _admin(client, _msg(uniq_key=False))
 
@@ -155,8 +136,7 @@ def test_plain_offset_msg_id_is_forwarded_unchanged():
 
 
 def test_header_omits_absent_optional_fields():
-    """brokerName / topicSysFlag 是 Java 头里的可空字段，拿不到就**不发**这个键
-    （_ext 过滤 None，与 Java makeCustomHeaderToNet 一致），不能落成 "None"。"""
+    pass
     client = _FakeClient([_ok(_result_body())])
     admin = _admin(client, _msg(uniq_key=False))
 
@@ -169,8 +149,7 @@ def test_header_omits_absent_optional_fields():
 
 
 def test_broker_name_enriched_from_route_when_addr_matches():
-    """路由能对上 storeHost 时补 brokerName（本仓库 309 接收端用它构造 MessageQueue）；
-    Java 发起端不设该字段，这里只做尽力而为的补充。"""
+    pass
     client = _FakeClient([_ok(_result_body())],
                          route=_route(("broker-a", STORE_ADDR),
                                       ("broker-b", "127.0.0.1:10921")))

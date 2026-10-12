@@ -1,30 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""ACL 鉴权真机验证：连一个开了认证的 broker，验证签名被接受、缺失/错误凭据被拒绝。
-
-用法（需本地 RocketMQ 5.5.1 集群，broker 开了 authenticationEnabled）：
-    .venv/bin/python verify_acl_live.py 127.0.0.1:9876 [accessKey] [secretKey]
-
-broker 侧的账号来自 broker.conf：
-    authenticationEnabled=true
-    authenticationMetadataProvider=org.apache.rocketmq.auth.authentication.provider.LocalAuthenticationMetadataProvider
-    initAuthenticationUser={"username":"AK_TEST","password":"SK_TEST_SECRET_12345678"}
-    （AuthMigrator/initUser 会把 username 当 accessKey、password 当 secretKey 建 SUPER 用户）
-
-场景：
-  S1 正向：带正确凭据的 admin 建 topic → 成功（管理路径的签名被 broker 接受）
-  S2 反向：**不带凭据**的 admin 建 topic → broker 返回 NO_PERMISSION(16)
-  S3 反向：**secretKey 错误**的生产者发送 → NO_PERMISSION(16)
-  S4 正向：带正确凭据的生产者发 3 条 → SEND_OK（msgId 由 broker 赋值）
-  S5 正向：带正确凭据的消费者收满 3 条（心跳 / 长轮询拉取 / 位点提交都带签名）
-  S6 反向：**不带凭据**的直接 broker RPC（GET_CONSUMER_LIST_BY_GROUP）→ NO_PERMISSION(16)
-  S7 正向：不带凭据但访问 **NameServer**（路由查询）仍成功 —— 证明钩子只影响需要鉴权的目标，
-           没有把 namesrv 路径打坏
-
-⚠ S4/S5 必须**先起消费者再发送**：Java 默认 CONSUME_FROM_LAST_OFFSET 会把新消费组的初始
-  位点解析成该队列当时的 maxOffset（见 scenario_consumer_then_producer 的注释）。
-  反过来写会得到一个"正确但测不出东西"的假失败，且因 broker 异步分发而在三语言间结果不一致。
-"""
 from __future__ import annotations
 
 import sys
@@ -172,16 +147,7 @@ def scenario_bad_producer() -> None:
 
 
 def scenario_consumer_then_producer() -> None:
-    """S4 + S5 正向：**先起消费者、再发消息**。
-
-    顺序不能反过来（这是本文件最容易踩的坑）：Java 默认 CONSUME_FROM_LAST_OFFSET，
-    首次消费且无已提交位点时初始位点被解析为该队列**当时的** maxOffset
-    （RebalancePushImpl.java:174-190）。所以"先发 3 条、再起消费者"会（正确地）
-    一条都收不到。更麻烦的是 broker 的 consumequeue 是异步分发/刷盘的，刚发完立刻
-    查 maxOffset 可能读到 0 —— 于是同一场景在三种语言间**结果不确定**：
-    实测同一时序下 Python 收 0 条（读到 maxOffset=3），C++/C# 收 3 条（读到 0）。
-    先把消费者起好、等 rebalance 分配完队列，再发送，才是确定性的、只测 ACL 的顺序。
-    """
+    pass
     print("\nS4/S5 带正确凭据的生产者/消费者（先起消费者再发送）")
     consumer = DefaultMQPushConsumer(GROUP, rpc_hook=creds())
     consumer.set_namesrv_addr(NAMESRV)

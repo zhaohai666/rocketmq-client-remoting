@@ -1,12 +1,4 @@
 // POP 模式（5.x 轻量消费）单测 —— 不需要集群。
-//
-// 覆盖三块最容易出错、真机上又最难定位的契约：
-// 1. extra_info（CK 串）编解码：**空格**做段分隔、复刻 Java String.split 的
-//    "丢弃末尾空串"语义、段数校验、重复 key 拒绝、retryFlag 判定；
-// 2. 请求头的 extFields **键名逐字等于 Java 字段名** —— broker 用 fastjson2 按 Java
-//    属性名反序列化，错一个字母就**静默丢字段**，所以这里当回归守卫逐键断言；
-// 3. POP_CK 反构：普通 topic 直连 POP 时 broker **不写** POP_CK，必须由客户端用
-//    startOffsetInfo/msgOffsetInfo 拼出 8 段 CK 串，否则 ACK 无从下手。
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -84,7 +76,6 @@ int main() {
         expect(extra_info::split(ck7).size() == 7, "split into 7");
     }
 
-    // Java String.split 丢弃末尾空串；C++ 手写实现必须复刻，否则段数校验会不一致
     {
         std::vector<std::string> a = extra_info::split("1 2 3 ");
         expect(a.size() == 3, "split drops trailing empty (1 space)", std::to_string(a.size()));
@@ -225,7 +216,6 @@ int main() {
         }
         expect(ext["queueId"] == "-1", "queueId serialized");
         expect(ext["bornTime"] == "1789613086027", "bornTime serialized");
-        // Java 侧是 Boolean order = Boolean.FALSE（非 null），总是写出且小写
         expect(ext["order"] == "false", "order always serialized lowercase", ext["order"]);
 
         PopMessageRequestHeader minimal;
@@ -283,7 +273,6 @@ int main() {
         for (const char* k : expected) {
             expect(ext.find(k) != ext.end(), std::string("ChangeInvisibleTime has ") + k);
         }
-        // Java 是 primitive boolean，总是出现且小写
         expect(ext["suspend"] == "false", "suspend always serialized lowercase", ext["suspend"]);
 
         ChangeInvisibleTimeResponseHeader r;

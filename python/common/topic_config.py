@@ -1,17 +1,9 @@
 # -*- coding: utf-8 -*-
-"""TopicConfig（对应 org.apache.rocketmq.common.TopicConfig）。
-
-字段与默认值以 Java 5.x 为准（探针实测，勿凭记忆改）：
-``new TopicConfig("t")`` → readQueueNums=16, writeQueueNums=16, perm=6,
-topicFilterType=SINGLE_TAG, topicSysFlag=0, order=false, attributes={}。
-``attributes`` **会被序列化**（Java 的 ``getAttributes()`` 没有 serialize=false）。
-"""
 from __future__ import annotations
 
 import json
 from typing import Dict
 
-# org.apache.rocketmq.common.TopicConfig.defaultReadQueueNums / defaultWriteQueueNums
 DEFAULT_READ_QUEUE_NUMS = 16
 DEFAULT_WRITE_QUEUE_NUMS = 16
 # PermName.PERM_READ | PermName.PERM_WRITE

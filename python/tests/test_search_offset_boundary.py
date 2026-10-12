@@ -1,23 +1,4 @@
 # -*- coding: utf-8 -*-
-"""SEARCH_OFFSET_BY_TIMESTAMP(29) 的 ``boundaryType`` 字段（离线，无集群）。
-
-Java 锚点（5.5.1 逐条核对）：
-
-  * ``SearchOffsetRequestHeader``:41 ``private BoundaryType boundaryType;`` ——
-    **@CFNullable**，不 set 就为 null；``getBoundaryType()``:85 在 null 时回落 LOWER。
-  * ``RemotingCommand.makeCustomHeaderToNet``:430 ``fieldsMap.put(name, value.toString())``
-    ⇒ 枚举入网走的是 ``Enum.toString()`` = **大写枚举名** ``LOWER``/``UPPER``
-    （``BoundaryType.getName()`` 那个小写名 :33 只喂给 ``getType``，不上报文）；
-    值为 null 的字段**整键不写**。
-  * ``MQClientAPIImpl#searchOffset(addr, mq, ts, timeout)``:1377 直接转
-    ``...BoundaryType.LOWER...``:1381 —— 也就是 MQ 级入口**一定**带 LOWER；
-    真正不带字段的只有已废弃的 5 参重载 :1352（只 set topic/queueId/timestamp）。
-  * ``DefaultMQAdminExt``:133/:137 对外给的是
-    ``searchLowerBoundaryOffset`` / ``searchUpperBoundaryOffset`` 两个方法名。
-  * broker 侧解析：``RemotingCommand``:326 命中 ``BoundaryType`` 字段类型时调
-    ``BoundaryType.getType(value)``:41 —— 只有 ``equalsIgnoreCase("upper")`` 才是 UPPER，
-    其余（含 null / 未知值）一律 LOWER。缺键时字段保持 null，读取端回落 LOWER。
-"""
 from __future__ import annotations
 
 import threading
@@ -46,12 +27,7 @@ def _drop(inst: MQClientInstance) -> None:
 
 # ---------------------------------------------------------------- 报文形状
 def test_wire_value_is_the_uppercase_enum_name_not_the_lowercase_name():
-    """入网文本必须是 ``Enum.toString()`` 的大写枚举名。
-
-    Java 的 ``BoundaryType`` 有 ``getName()``（"lower"/"upper"）与枚举名两套写法，
-    报文里出现哪一套 broker 都认（``getType`` 大小写不敏感），但对拍 Java 客户端时
-    必须是大写名 —— 这条断言就是防止有人"顺手"写成小写。
-    """
+    pass
     for boundary, expected in ((BoundaryType.LOWER, "LOWER"), (BoundaryType.UPPER, "UPPER")):
         header = SearchOffsetRequestHeader()
         header.topic, header.queue_id, header.timestamp = MQ.topic, MQ.queue_id, 1700000000000
@@ -113,7 +89,7 @@ def _patched_client(prefix: str):
 
 
 def test_client_always_sends_lower_by_default():
-    """Java MQClientAPIImpl:1381：MQ 级入口默认就是显式的 LOWER。"""
+    pass
     inst, cap = _patched_client("soa_lower")
     try:
         assert inst.search_offset_by_timestamp(MQ, 1700000000000, addr=ADDR) == 42
@@ -137,7 +113,7 @@ def test_client_can_ask_for_upper():
 
 
 def test_none_boundary_keeps_the_field_off_the_wire():
-    """Java 已废弃的 5 参重载 :1352 是唯一"不写字段"的路径，保留以对齐报文。"""
+    pass
     inst, cap = _patched_client("soa_none")
     try:
         inst.search_offset_by_timestamp(MQ, 1, addr=ADDR, boundary_type=None)
@@ -149,7 +125,7 @@ def test_none_boundary_keeps_the_field_off_the_wire():
 
 # ---------------------------------------------------------------- admin facade
 def test_admin_exposes_the_boundary_method_names():
-    """Java DefaultMQAdminExt:133/:137 的两个方法各自固定 LOWER / UPPER。"""
+    pass
     admin = DefaultMQAdminExt()
 
     class _Stub:

@@ -1,11 +1,4 @@
-//! 消息系统标志位（对应 Java `org.apache.rocketmq.common.sysflag.*`，
-//! 参考实现 `python/common/sysflag.py`）。
-//!
-//! `sysFlag` 是一个 32 位整数，随消息一起落盘（17 段格式的第 8 项）并在
-//! pull / send 请求头里透传，所以位含义必须与 Java 逐位一致。
 
-/// 对应 Java `MessageSysFlag`。
-///
 /// 位含义（低 -> 高）：
 /// ```text
 /// bit0   COMPRESSED
@@ -45,10 +38,8 @@ impl MessageSysFlag {
     pub const LZ4_TYPE: i32 = 1;
     pub const ZSTD_TYPE: i32 = 2;
     pub const ZLIB_TYPE: i32 = 3;
-    /// Java 5.x 里没有 SNAPPY 的 Compressor 实现，落到 `CompressorFactory` 会抛异常。
     pub const SNAPPY_TYPE: i32 = 4;
 
-    /// Java: `(flag & COMPRESSION_TYPE_COMPARATOR) >> 8`。
     pub fn get_compression_type(sys_flag: i32) -> i32 {
         (sys_flag & Self::COMPRESSION_TYPE_COMPARATOR) >> Self::COMPRESSION_TYPE_SHIFT
     }
@@ -63,12 +54,10 @@ impl MessageSysFlag {
         (sys_flag & Self::COMPRESSED_FLAG) == Self::COMPRESSED_FLAG
     }
 
-    /// 只清 COMPRESSED_FLAG：解压后调用，压缩类型位**保留**（Java 同语义）。
     pub fn clear_compressed_flag(sys_flag: i32) -> i32 {
         sys_flag & !Self::COMPRESSED_FLAG
     }
 
-    /// Java: `flag & TRANSACTION_ROLLBACK_TYPE`（低 2 位即事务类型）。
     pub fn get_transaction_value(flag: i32) -> i32 {
         flag & Self::TRANSACTION_ROLLBACK_TYPE
     }
@@ -82,8 +71,6 @@ impl MessageSysFlag {
     }
 }
 
-/// 对应 Java `CommitLogFlag`（broker 写 commitlog 时的标志，客户端只用来读
-/// `MessageExt.sysFlag` 的派生信息）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitLogFlag;
 
@@ -93,7 +80,6 @@ impl CommitLogFlag {
     pub const ROLLBACK: i32 = 0x1 << 2;
 }
 
-/// 对应 Java `ConsumeInitMode`（`QueryConsumerOffsetResponseHeader.mode`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsumeInitMode;
 
@@ -104,7 +90,6 @@ impl ConsumeInitMode {
     pub const MAX: i32 = 1;
 }
 
-/// 对应 Java `PullSysFlag`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullSysFlag;
 
@@ -119,11 +104,8 @@ impl PullSysFlag {
     pub const FLAG_INNER_SQL: i32 = 0x1 << 7;
     pub const FLAG_MULTI_TAG: i32 = 0x1 << 8;
     pub const FLAG_START_OFFSET: i32 = 0x1 << 9;
-    /// ⚠ Python 参考实现与本仓库 Java 快照都**没有**这一位（上游 5.3+ 才引入）。
-    /// 这里按下一个空闲位实现，接 SQL 过滤哈希计算前必须与 broker 对拍。
     pub const FLAG_SUPPORT_FILTER_AND_COMPUTE_HASHING: i32 = 0x1 << 10;
 
-    /// 对应 Java `buildSysFlag(commitOffset, suspend, subscription, classFilter)`。
     pub fn build_sys_flag(
         commit_offset: bool,
         suspend: bool,
@@ -150,7 +132,6 @@ impl PullSysFlag {
         flag
     }
 
-    /// Java 的四参重载（不含 litePull）。
     pub fn build_sys_flag_basic(
         commit_offset: bool,
         suspend: bool,
@@ -211,7 +192,6 @@ impl PullSysFlag {
     }
 }
 
-/// 对应 Java `PermName`（Python 里也放在 `sysflag.py`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PermName;
 
@@ -222,13 +202,10 @@ impl PermName {
     pub const PERM_INHERIT: i32 = 0x1;
     pub const PERM_OWNER: i32 = 0x1 << 4;
 
-    /// Java `PermName.isValid`：`perm >= 0 && perm < PERM_PRIORITY`。
     pub fn is_valid(perm: i32) -> bool {
         (0..Self::PERM_PRIORITY).contains(&perm)
     }
 
-    /// Java `PermName.isValid(String)`：非数字在 Java 里抛 NumberFormatException，
-    /// 这里等价于 `false`（Python `admin._perm_is_valid` 也是这个口径）。
     pub fn is_valid_str(perm: &str) -> bool {
         match perm.trim().parse::<i32>() {
             Ok(v) => Self::is_valid(v),
@@ -236,7 +213,6 @@ impl PermName {
         }
     }
 
-    /// 对应 Java `PermName.perm2string`：`R/W/X` 三字符。
     pub fn perm_to_string(perm: i32) -> String {
         let mut sb = String::with_capacity(3);
         sb.push(if Self::PERM_READ == (perm & Self::PERM_READ) { 'R' } else { '-' });
@@ -245,7 +221,6 @@ impl PermName {
         sb
     }
 
-    /// Java 原名。
     pub fn perm2string(perm: i32) -> String {
         Self::perm_to_string(perm)
     }
@@ -255,7 +230,6 @@ impl PermName {
     }
 }
 
-/// 对应 Python `SubscriptionMode`（Java 侧是 `ConsumeMode` 的子集）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriptionMode;
 

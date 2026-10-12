@@ -1,6 +1,3 @@
-//! `MixAll` 常量与工具（对应 Java `org.apache.rocketmq.common.MixAll`，
-//! 参考实现 `python/common/mix_all.py`）。
-//!
 //! `PermName` 在 Python 里放在 `sysflag.py`，Rust 沿用该位置（见
 //! [`crate::common::sysflag::PermName`），此处只做 re-export，避免两处定义漂移。
 
@@ -13,7 +10,6 @@ use crate::remoting::protocol::ext_fields::StringMap;
 
 pub use crate::common::sysflag::PermName;
 
-/// 对应 Java `MixAll`（纯静态类，这里只作为常量与方法的作用域）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MixAll;
 
@@ -57,8 +53,6 @@ impl MixAll {
     pub const CLIENT_INNER_CONSUMER_GROUP: &'static str = "CLIENT_INNER_CONSUMER";
     pub const SELF_TEST_CONSUMER_GROUP2: &'static str = "SELF_TEST_C_GROUP2";
     pub const ONS_NAMESPACE: &'static str = "namespace";
-    /// ⚠ Java `MixAll.UNIQUE_MSG_QUERY_FLAG` 是 extFields 的**键名**（值为
-    /// "true"/"false"），不是数字标志位。
     pub const UNIQUE_MSG_QUERY_FLAG: &'static str = "_UNIQUE_KEY_QUERY";
     pub const TRACE_TOPIC: &'static str = "RMQ_SYS_TRACE_TOPIC";
     pub const REAL_TRACE_TOPIC: &'static str = "rmq_sys_TRACE_DATA";
@@ -72,16 +66,9 @@ impl MixAll {
     pub const RMQ_SYS_TRANS_CHECK_MAX_TIME: i32 = 15;
     pub const TRANS_CHECK_MAX_TIME: i32 = 15;
     pub const UNIT_PREFIX: &'static str = "unit_";
-    /// 对应 Java `MixAll.REQ_T`：`StreamTypeRPCHook` 写进 extFields 的键名。
     pub const REQ_T: &'static str = "ReqT";
-    /// 对应 Java `MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD`（`MixAll:122`）：
-    /// `NamespaceRpcHook` 用来告诉 broker「本请求带服务端命名空间」的 extFields 键名。
     pub const RPC_REQUEST_HEADER_NAMESPACED_FIELD: &'static str = "nsd";
-    /// 对应 Java `MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD`（`MixAll:123`）：
-    /// `NamespaceRpcHook` 写 namespaceV2 取值用的 extFields 键名。
     pub const RPC_REQUEST_HEADER_NAMESPACE_FIELD: &'static str = "ns";
-    /// 对应 Java `ClientConfig#buildMQClientId` 末尾拼的 `RequestType.STREAM`
-    /// **枚举名**（不是它的 code，code 只出现在 [`MixAll::REQ_T`] 的值里）。
     pub const STREAM_REQUEST_TYPE: &'static str = "STREAM";
     pub const LMQ_PREFIX: &'static str = "%LMQ%";
     pub const LMQ_QUEUE_ID: i32 = 0;
@@ -112,11 +99,8 @@ impl MixAll {
     /// `PermName.PERM_READ | PermName.PERM_WRITE`
     pub const READ_PERM_BY_DEFAULT: i32 = 4 | 2;
 
-    /// admin 侧「全部 topic」哨兵值。⚠ Python 参考实现与本仓库 Java 快照都没有这个
-    /// 常量，它也不参与线上编解码，只作为客户端层参数校验的哨兵。
     pub const ALL_TOPIC: &'static str = "all";
 
-    /// 对应 Java `MixAll.getRetryTopic`。
     pub fn get_retry_topic(consumer_group: &str) -> String {
         format!("{}{}", Self::RETRY_GROUP_TOPIC_PREFIX, consumer_group)
     }
@@ -128,7 +112,6 @@ impl MixAll {
         }
     }
 
-    /// 对应 Java `MixAll.getDLQTopic`。
     pub fn get_dlq_topic(consumer_group: &str) -> String {
         format!("{}{}", Self::DLQ_GROUP_TOPIC_PREFIX, consumer_group)
     }
@@ -140,8 +123,6 @@ impl MixAll {
         }
     }
 
-    /// 对应 Java `MixAll.getReplyTopic(clusterName)`。
-    ///
     /// 这**不是**控制台里那个 `%REPLY%<topic>` 前缀（那是另一套东西），只用于 request-reply。
     pub fn get_reply_topic(cluster_name: &str) -> String {
         format!("{}_{}", cluster_name, Self::REPLY_TOPIC_POSTFIX)
@@ -162,7 +143,6 @@ impl MixAll {
         }
     }
 
-    /// 对应 Java `MixAll.isLmq`（LMQ topic 以 `%LMQ%` 开头）。
     pub fn is_lmq(lmq_meta_data: Option<&str>) -> bool {
         match lmq_meta_data {
             Some(t) => t.starts_with(Self::LMQ_PREFIX),
@@ -170,7 +150,6 @@ impl MixAll {
         }
     }
 
-    /// 对应 Java `MixAll.isSysConsumerGroup`（`CID_RMQ_SYS_` 前缀）。
     pub fn is_sys_consumer_group(consumer_group: Option<&str>) -> bool {
         match consumer_group {
             Some(g) => g.starts_with(Self::CID_RMQ_SYS_PREFIX),
@@ -178,12 +157,10 @@ impl MixAll {
         }
     }
 
-    /// 对应 Java `MixAll.isPredefinedGroup` 的 `PREDEFINE_GROUP_SET`。
     pub fn is_predefined_group(consumer_group: &str) -> bool {
         Self::predefine_group_set().contains(&consumer_group)
     }
 
-    /// 对应 Java `MixAll.PREDEFINE_GROUP_SET`。
     pub fn predefine_group_set() -> &'static [&'static str] {
         &[
             Self::DEFAULT_CONSUMER_GROUP,
@@ -227,7 +204,6 @@ impl MixAll {
             || Self::is_dlq_topic(Some(topic))
     }
 
-    /// 对应 Java `MixAll.resetRetryAndDLQTopic`：剥掉 `%RETRY%` / `%DLQ%` 前缀。
     pub fn reset_retry_and_dlq_topic(topic: Option<&str>) -> Option<String> {
         let topic = topic?;
         if Self::is_retry_topic(Some(topic)) {
@@ -239,7 +215,6 @@ impl MixAll {
         Some(topic.to_string())
     }
 
-    /// 对应 Java `MixAll.compareAndIncreaseNamespace`。
     pub fn compare_and_increase_namespace(instance_name: &str, namespace: Option<&str>) -> String {
         let namespace = match namespace {
             Some(ns) if !ns.is_empty() => ns,
@@ -255,8 +230,6 @@ impl MixAll {
         format!("%{namespace}%%{instance_name}")
     }
 
-    /// 对应 Java `MixAll.createUniqName`（Python 用 `uuid4().hex`，这里用
-    /// 「纳秒 + PID + 进程内自增」拼 32 位十六进制，唯一性来源相同）。
     pub fn create_uniq_name(prefix: &str) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
@@ -278,8 +251,6 @@ impl MixAll {
         util_all::local_ip()
     }
 
-    /// 进程内缓存版 `get_ip_str`（对应 Java 的 `MixAll.LOCAL_INET_ADDRESS` 静态字段：
-    /// 每个进程只探测一次，msgId / clientId 都复用它）。
     pub fn cached_ip_str() -> &'static str {
         static IP: OnceLock<String> = OnceLock::new();
         IP.get_or_init(Self::get_ip_str)
@@ -289,18 +260,11 @@ impl MixAll {
         util_all::get_pid()
     }
 
-    /// 进程内缓存 PID（对应 Java `MixAll.CURRENT_JVM_PID`）。
     pub fn cached_pid() -> u32 {
         static PID: OnceLock<u32> = OnceLock::new();
         *PID.get_or_init(util_all::get_pid)
     }
 
-    /// 对应 Java `ClientConfig#buildMQClientId`：
-    /// `clientIP + "@" + instanceName + (@unitName 非空时) + (@STREAM 开启时)`。
-    ///
-    /// ⚠ Java 判空用的是 `UtilAll.isBlank(unitName)`，但**拼接时用的是原值**（没有
-    /// trim），所以 `"unit-a"` 会原样出现在 clientId 里；`@STREAM` 后缀来自
-    /// `enableStreamRequestType`（拉模式/轻量消费者默认 true，其余默认 false）。
     pub fn build_mq_client_id(
         client_ip: &str,
         instance_name: &str,
@@ -324,8 +288,6 @@ impl MixAll {
         sb
     }
 
-    /// 对应 Java 各消费者 facade 的 `if (messageModel == CLUSTERING)
-    /// changeInstanceNameToPID()`：广播模式故意不改写，让同进程的广播消费者共用实例。
     pub fn instance_name_for_model(instance_name: &str, clustering: bool) -> String {
         if clustering {
             Self::change_instance_name_to_pid(instance_name)
@@ -334,13 +296,6 @@ impl MixAll {
         }
     }
 
-    /// 对应 Java `ClientConfig#changeInstanceNameToPID`：instanceName 还是默认的
-    /// `DEFAULT` 时换成 `<pid>#<nanoTime>`，其余原样返回。
-    ///
-    /// 这一步决定了 clientId 的唯一性：不换的话同进程里两个客户端会算出同一个
-    /// clientId，被 `MQClientManager` 合并成一份 `MQClientInstance`（Java 只在
-    /// 生产者（非 `CLIENT_INNER_PRODUCER`）和 CLUSTERING 消费者 start 时调用它，
-    /// 所以条件由各个 facade 把，这里只做纯字符串变换）。
     pub fn change_instance_name_to_pid(instance_name: &str) -> String {
         if instance_name == Self::DEFAULT_INSTANCE_NAME {
             format!("{}#{}", Self::cached_pid(), util_all::nano_time())
@@ -349,11 +304,6 @@ impl MixAll {
         }
     }
 
-    /// Java `ClientConfig#buildMQClientId` 的默认口径：本机 IP 打头，
-    /// 后缀规则见 [`MixAll::build_mq_client_id`]。
-    ///
-    /// 调用前要先按 Java 的条件跑过 [`change_instance_name_to_pid`]
-    /// （[`client_id_for`] 一次做完这两步）。
     pub fn build_default_client_id(
         instance_name: &str,
         unit_name: Option<&str>,
@@ -369,10 +319,6 @@ impl MixAll {
 
     /// 未显式配置 clientId 时的默认值：
     /// `<本机 IP>@<pid>#<nanoTime>[@unitName][@STREAM]`。
-    ///
-    /// 对应 Java 里 `changeInstanceNameToPID()` + `buildMQClientId()` 的连用；
-    /// instanceName 被显式设成非 `DEFAULT` 时结果就稳定了（同进程、同 instanceName
-    /// 的两个客户端会共用一份实例，这正是 Java 的语义）。
     pub fn client_id_for(
         instance_name: &str,
         unit_name: Option<&str>,
@@ -385,13 +331,8 @@ impl MixAll {
         )
     }
 
-    /// 对应 Java `ClientConfig#instanceName` 的默认值
-    /// （`System.getProperty("rocketmq.client.name", "DEFAULT")`）。
     pub const DEFAULT_INSTANCE_NAME: &'static str = "DEFAULT";
 
-    /// 对应 Java `MixAll.brokerVIPChannel`：VIP 通道 = 端口 - 2。
-    ///
-    /// 端口不可解析时原样返回（Java 会抛 NumberFormatException，这里不让传输层崩掉）。
     pub fn broker_vip_channel(is_change: bool, broker_addr: &str) -> String {
         if !is_change {
             return broker_addr.to_string();
@@ -405,12 +346,10 @@ impl MixAll {
         }
     }
 
-    /// 对应 Java 4.x `MixAll.messageQueue2string`：`topic brokerName queueId`。
     pub fn message_queue_to_string(mq: &crate::common::message::MessageQueue) -> String {
         format!("{} {} {}", mq.topic, mq.broker_name, mq.queue_id)
     }
 
-    /// 对应 Java 4.x `MixAll.string2messageQueue`：按 `separator` 拆 3 段。
     pub fn string_to_message_queue(
         queue: &str,
         separator: &str,
@@ -431,8 +370,6 @@ impl MixAll {
         ))
     }
 
-    /// 对应 Java 4.x `MixAll.string2messageQueues`：换行分隔，**逐条容错**
-    /// （Java 里解析失败的行会被跳过并打日志）。
     pub fn string_to_message_queues(queues: &str) -> Vec<crate::common::message::MessageQueue> {
         let mut out = Vec::new();
         for line in queues.split('\n') {
@@ -447,7 +384,6 @@ impl MixAll {
         out
     }
 
-    /// 对应 Java `MixAll.properties2String`：每条 `key=value\n`，null 值跳过。
     pub fn properties_to_string(properties: &StringMap, is_sort: bool) -> String {
         let mut items: Vec<(&str, &str)> = properties
             .iter()
@@ -466,14 +402,6 @@ impl MixAll {
         buf
     }
 
-    /// 对应 Java `MixAll.string2Properties`（`java.util.Properties.load` 语义）：
-    /// - 跳过空行与 `#` / `!` 注释行；
-    /// - 行尾**未转义**的 `\` 表示续行，下一行前导空白被丢弃；
-    /// - 键与值以**第一个** `=`、`:` 或**空白**分隔（空白也是合法分隔符！）；
-    /// - 分隔符前后的空白被跳过；值的**尾部**空白保留（Java 不去尾空白）。
-    ///
-    /// 注：Java 还会处理 `\t \n \uXXXX` 等转义，broker 配置导出里不出现，
-    /// 这里不实现（避免把反斜杠语义做错反而不一致）。
     pub fn string_to_properties(text: &str) -> StringMap {
         const PROP_WS: &[char] = &[' ', '\t', '\u{c}'];
         let mut result = StringMap::new();
@@ -699,7 +627,6 @@ mod tests {
             MixAll::build_mq_client_id("10.0.0.1", "inst", Some("unit-a"), false),
             "10.0.0.1@inst@unit-a"
         );
-        // Java 的拼接顺序固定：unitName 在前、@STREAM 在后
         assert_eq!(
             MixAll::build_mq_client_id("10.0.0.1", "inst", Some("unit-a"), true),
             "10.0.0.1@inst@unit-a@STREAM"
@@ -709,7 +636,6 @@ mod tests {
             "10.0.0.1@inst@STREAM"
         );
         let id = MixAll::build_default_client_id("inst", None, false);
-        // Java `buildMQClientId`：IP 在前，instanceName 原样透传。
         assert!(id.ends_with("@inst"), "{id}");
 
         // changeInstanceNameToPID 只改默认名，显式设置的名字原样保留。
@@ -717,8 +643,6 @@ mod tests {
         let pid_prefix = format!("{}#", MixAll::cached_pid());
         let rewritten = MixAll::change_instance_name_to_pid("DEFAULT");
         assert!(rewritten.starts_with(&pid_prefix), "{rewritten}");
-        // 幂等：Java 就地覆盖 instanceName，第二次 start 不能再换名字，
-        // 否则重启一次就换一个 clientId、丢回原 clientId 的注册表。
         assert_eq!(MixAll::change_instance_name_to_pid(&rewritten), rewritten);
 
         // 默认 clientId = 本机 IP + '@' + 改写后的 instanceName；同进程两次调用

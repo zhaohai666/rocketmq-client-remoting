@@ -79,20 +79,10 @@ void DefaultMQPullConsumer::setNameServerAddresses(const std::vector<std::string
     nameServerAddrs_ = addrs;
 }
 
-// Java `DefaultMQPullConsumer#registerMessageQueueListener:328-335`：topic **无条件**进
-// registerTopics，listener 为 null 也登记（`MQPullConsumerScheduleService:100` 就是
-// 传 null 只登记不监听）。registerTopics 同时是拉模式心跳订阅集的唯一来源
-// （`DefaultMQPullConsumerImpl.subscriptions():357-385`），漏登记=心跳不带订阅=
-// broker 侧 `GET_CONSUMER_LIST_BY_GROUP(38)` 数不出本组。
-//
-// ⚠ 与 Java 的**存储口径**不同：Java 在入表时就 `withNamespace(topic)`（:330），本端口
-// 沿用「集合里存裸 topic、用到时再 wrapNamespace」的约定（同 fetchSubscribeMessageQueues
-// 的入参口径），所以下面 buildHeartbeat / refreshRouteForHeartbeat 各自负责拼命名空间。
 void DefaultMQPullConsumer::registerMessageQueueListener(
     const std::string& topic, std::shared_ptr<MessageQueueListener> listener) {
     if (topic.empty()) return;
     registerTopics_.insert(topic);
-    // Java :331-333 只在 listener 非 null 时覆盖，传 null 不清空既有监听器。
     if (listener != nullptr) {
         messageQueueListeners_[topic] = std::move(listener);
     }
@@ -101,14 +91,9 @@ void DefaultMQPullConsumer::registerMessageQueueListener(
 // ---------------------------------------------------------------- 生命周期
 void DefaultMQPullConsumer::start() {
     if (started_) return;
-    // 对齐 Java DefaultMQPullConsumer.start()：把消费组套上命名空间（ns%group），
-    // 之后所有面向 broker 的组名（心跳 / 位点 / 回投）都用包装后的值。
     if (!namespace_.empty()) {
         consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
     }
-    // 对应 Java DefaultMQPullConsumerImpl.checkConfig(:772) / Python：组名合法性 +
-    // 挡掉 DEFAULT_CONSUMER（共用默认组会混掉订阅关系与位点）。纯本地校验，
-    // 排在地址检查与建客户端实例之前，失败必须**不碰网络**。
     Validators::checkGroup(consumerGroup_);
     if (consumerGroup_ == MixAll::DEFAULT_CONSUMER_GROUP) {
         throw MQClientException(
@@ -117,31 +102,20 @@ void DefaultMQPullConsumer::start() {
     if (nameServerAddrs_.empty()) {
         throw MQClientException("name server address is not set");
     }
-    // 对应 Java DefaultMQPullConsumerImpl.checkConfig(:803) / 本端口 push 与 lite：
-    // 策略为空直接拒绝启动。
     if (!allocateStrategy_) {
         throw MQClientException("allocateMessageQueueStrategy is null");
     }
-    // Java `DefaultMQPullConsumerImpl#start`:712-714：CLUSTERING 才改写 instanceName，
-    // clientId 口径是 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
     if (messageModel_ == MessageModel::CLUSTERING) {
         instanceName_ = changeInstanceNameToPID(instanceName_);
     }
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);
     }
-    // 拉模式消费者默认开着 stream（Java `DefaultMQPullConsumer:113/126` 在构造函数里
-    // 就置了 true），unitName 只影响动态取址的 URL。
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         /*connectTimeoutMillis=*/3000,
                                         consumerPullTimeoutMillis_,
                                         MQClientInstance::tlsEnabledFromEnv(), unitName_,
                                         pollNameServerIntervalMillis_));
-    // 请求钩子（namespaceV2 的 `nsd`/`ns`、ACL 签名 / stream 的 `ReqT`）：必须在**实例
-    // start() 之前**绑定 ——
-    // Java 的 rpcHook 是在 MQClientAPIImpl 构造时传进去的（MQClientInstance:214 附近），
-    // 也就是实例发出的第一笔报文就带着它；放到 start() 之后，start 期间的动态取址、
-    // 首包路由就可能签不出 ReqT/AccessKey。namespaceV2 传**取值函数**（每笔请求实时读）。
     std::shared_ptr<RPCHook> requestHook =
         composeRequestHooks(enableStreamRequestType_, rpcHook_,
                             [this] { return namespaceV2_; });
@@ -150,13 +124,8 @@ void DefaultMQPullConsumer::start() {
                     + clientId_ + ")");
     }
     mqClient_->start();
-    // 拉模式也要登记 topic，路由才会被周期刷新（对齐 Java registerTopicInUse）。
-    // 心跳前的刷路由走同一个入口：`brokerAddrTable` 空着时心跳没有收件人。
     refreshRouteForHeartbeat();
     started_ = true;
-    // 同步发一轮让 broker 立刻认识本组，然后交给常驻循环。顺序对齐 lite 拉取消费者
-    // start（同一份理由），也贴合 Java 的 registerConsumer:746 → mQClientFactory.start():755
-    // （实例级心跳任务首个周期在 1s 内发出）。
     try {
         sendHeartbeatToAllBroker();
     } catch (const std::exception& e) {
@@ -172,11 +141,6 @@ void DefaultMQPullConsumer::shutdown() {
     heartbeatCv_.notify_all();
     if (heartbeatThread_.joinable()) heartbeatThread_.join();
     if (mqClient_ != nullptr) {
-        // 优雅注销（对齐 Java DefaultMQPullConsumerImpl.shutdown:689-692：
-        // unregisterConsumer → mQClientFactory.shutdown）：立刻从各 broker 的
-        // ConsumerManager 摘除本组，不必等心跳超时（默认 ~120s）。本端口没有 Java 的
-        // 本地位点表，所以 `persistConsumerOffset()` 那一步无对应物（位点由调用方
-        // updateConsumeOffset 直接写给 broker）。
         try {
             mqClient_->unregisterClientAllBrokers(clientId_, "", consumerGroup_);
         } catch (const std::exception& e) {
@@ -194,39 +158,17 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchSubscribeMessageQueues(
         throw MQClientException("consumer not started, call start() first");
     }
     const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
-    // Java DefaultMQPullConsumerImpl.fetchSubscribeMessageQueues:142 与 push 同源：读的是
-    // rebalanceImpl 的订阅信息（topicRouteData2TopicSubscribeInfo：读位 + readQueueNums、
-    // 不筛 master），不是发布信息。
     std::shared_ptr<TopicRouteData> route = mqClient_->getTopicRouteData(realTopic);
     if (route == nullptr) {
-        // 对齐 Java：topic 不存在（拿不到路由）时直接抛，而不是返回空列表。
         throw MQClientException("the topic[" + topic + "] not exist");
     }
     return route->getAllSubscribeMessageQueue(realTopic);
 }
 
 // ---------------------------------------------------------------- 平衡视图
-//
-// Java `MQPullConsumer#fetchMessageQueuesInBalance:187` →
-// `DefaultMQPullConsumerImpl:120-135`：读后台 rebalance 填出来的
-// `rebalanceImpl.getProcessQueueTable()` 键集，再经 `parseSubscribeMessageQueues:153-161`
-// 剥掉命名空间。本端口拉模式没有那条后台线程（见头文件的偏离说明），所以按
-// `RebalanceImpl#rebalanceByTopic` 的**同一条公式**当场算：
-//   * BROADCASTING：不查消费者列表，全量认领；
-//   * CLUSTERING：订阅信息（读位 + readQueueNums、不筛 master，与
-//     `fetchSubscribeMessageQueues` 同源）作 mqAll，GET_CONSUMER_LIST_BY_GROUP(38) 作
-//     cidAll，两边排序后交给本实例的分配策略取自己那一份。
-// 公式与 push 消费者的 `doRebalance`（`consumer.cpp`）共用同一条口径 —— 两处一旦分叉，
-// 同一队列会被两个实例同时认领。
-//
-// 拿不到路由/消费者列表时**保持现有分配**：退回本地 `pullFromWhichNode_`（Java 同名表
-// `pullFromWhichNodeTable`）的键集。绝不回退成「独占全部队列」——那会让同组多实例互相
-// 重复消费。「算出来确实是空」（队列全分给了同组别人）与「算不动」是两回事：前者如实
-// 返回空集（Java 的那张表当时也是空的），不走这条兜底。
 std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
     const std::string& topic) {
     if (mqClient_ == nullptr) {
-        // Java isRunning()：未启动直接抛。返回空表会让调用方以为「没我的队列」而停拉。
         throw MQClientException("consumer not started, call start() first");
     }
     const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
@@ -243,8 +185,6 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
     std::shared_ptr<TopicRouteData> route = mqClient_->getTopicRouteData(realTopic);
     if (route != nullptr) {
         std::vector<MessageQueue> mqAll = route->getAllSubscribeMessageQueue(realTopic);
-        // mqAll 与 cidAll 都必须先排序：不同实例见到的是同一次路由展开的同一份顺序，
-        // 排序后才分配（对齐 Java），否则两个实例算出的区间会错开。
         std::sort(mqAll.begin(), mqAll.end());
         if (messageModel_ == MessageModel::BROADCASTING) {
             allocated = mqAll;
@@ -258,8 +198,6 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
                     allocated = allocateStrategy_->allocate(consumerGroup_, clientId_, mqAll, cidAll);
                     computed = true;
                 } catch (const std::exception& e) {
-                    // 对应 Java rebalanceByTopic 的 catch (Throwable)：策略抛错只记日志，
-                    // 本轮保持现有分配，绝不能把已经分到的队列撤走。
                     logger_error("allocate message queue exception. strategy name: "
                                  + allocateStrategy_->getName() + ", ex: " + e.what());
                 }
@@ -272,8 +210,6 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
         return pulled;
     }
 
-    // Java :128-131 逐个比对表键的 topic，:153-161 再剥命名空间：别让策略的意外返回值
-    // 把别的 topic 混进调用方的拉取循环。
     std::vector<MessageQueue> result;
     for (const MessageQueue& mq : allocated) {
         if (mq.topic != realTopic) continue;
@@ -292,12 +228,6 @@ PullResult DefaultMQPullConsumer::pull(const MessageQueue& mq, const std::string
         throw MQClientException("consumer not started, call start() first");
     }
     const int32_t timeout = timeoutMillis > 0 ? timeoutMillis : consumerPullTimeoutMillis_;
-    // 对齐 Java DefaultMQPullConsumerImpl.pullSyncImpl（:248）：
-    //   sysFlag = PullSysFlag.buildSysFlag(false, block, true, false)
-    // 即 commitOffset=false、suspend=block。**pull() 的 block=false** ——
-    // 位点由调用方自己 updateConsumeOffset 提交，且这是**短轮询**不挂起。
-    // ⚠ 曾在这里写成 suspend=true：broker 在队尾会挂起到 brokerSuspendMaxTimeMillis
-    // （默认 20s），而客户端 5s 就超时 → RemotingTimeoutException（真机必现）。
     const int32_t sysFlag = PullSysFlag::buildSysFlag(/*commitOffset=*/false,
                                                       /*suspend=*/false,
                                                       /*subscription=*/true,
@@ -305,11 +235,9 @@ PullResult DefaultMQPullConsumer::pull(const MessageQueue& mq, const std::string
     MessageQueue real = mq;
     real.topic = NamespaceUtil::wrapNamespace(namespace_, mq.topic);
     const SubscriptionData sub = FilterAPI::buildSubscriptionData(real.topic, subExpression);
-    // Java PullAPIWrapper#pullKernelImpl：按 pullFromWhichNodeTable 选主/从
     PullResult result = mqClient_->pullMessage(
         consumerGroup_, real, offset, maxNums, sysFlag, /*commitOffset=*/0,
         sub.subString.empty() ? std::string("*") : sub.subString,
-        // Java：TAG 类型时 subVersion 传 0（isTagType ? 0L : subVersion）
         /*subVersion=*/0, ExpressionType::TAG, timeout, /*maxMsgBytes=*/-1,
         /*suspendTimeoutMillis=*/15000, /*addr=*/std::string(), /*requestSource=*/0,
         /*brokerId=*/recalculatePullFromWhichNode(real));
@@ -323,8 +251,6 @@ PullResult DefaultMQPullConsumer::pullBlockIfNotFound(const MessageQueue& mq,
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
-    // block=true：suspend=true 让 broker 挂起到有消息；超时用
-    // consumerTimeoutMillisWhenSuspend（Java :250 的 `block ? ... : timeout`）。
     const int32_t sysFlag = PullSysFlag::buildSysFlag(/*commitOffset=*/false,
                                                       /*suspend=*/true,
                                                       /*subscription=*/true,
@@ -342,15 +268,11 @@ PullResult DefaultMQPullConsumer::pullBlockIfNotFound(const MessageQueue& mq,
     return result;
 }
 
-// Java PullAPIWrapper#recalculatePullFromWhichNode：表里没有该队列时按 master=0。
 int64_t DefaultMQPullConsumer::recalculatePullFromWhichNode(const MessageQueue& mq) const {
     auto it = pullFromWhichNode_.find(mq);
     return it != pullFromWhichNode_.end() ? it->second : MixAll::MASTER_ID;
 }
 
-// Java PullAPIWrapper#updatePullFromWhichNode:157-164：把应答头里的 suggestWhichBrokerId
-// 写回表；缺省（老 broker 不带该字段）按 master=0 记账 —— 与 Java 的 long 原语口径一致，
-// 所以不能把「没有该字段」当成"保留旧值"。
 void DefaultMQPullConsumer::updatePullFromWhichNode(const MessageQueue& mq,
                                                     const PullResult& result) {
     pullFromWhichNode_[mq] = result.suggestWhichBrokerId.value_or(MixAll::MASTER_ID);
@@ -396,8 +318,6 @@ int64_t DefaultMQPullConsumer::earliestMsgStoreTime(const MessageQueue& mq) {
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
-    // Java `MQAdminImpl.earliestMsgStoreTime:250-264` 同样先用 findBrokerAddressInPublish
-    // （只认 master）+ 刷一次路由，拿不到就抛 "The broker[X] not exist"。
     const std::string addr = mqClient_->publishAddrFor(mq.brokerName, mq.topic);
     PropertyMap ext;
     ext["topic"] = mq.topic;
@@ -408,15 +328,6 @@ int64_t DefaultMQPullConsumer::earliestMsgStoreTime(const MessageQueue& mq) {
     return extInt(response, "timestamp", 0);
 }
 
-// ---------------------------------------------------------------- 回投 / 建 topic
-// 消息回投（对应 Java DefaultMQPullConsumer.sendMessageBack）。
-// 注意两点（真机踩过）：
-//   1. 地址靠 findBrokerAddressInPublish(msg.brokerName) 反查**发布地址表**（只认 master），
-//      所以调用方必须先用本 consumer 访问过该 topic（Java DefaultMQPullConsumerImpl:654
-//      走的也是 findBrokerAddressInPublish）。从节点不接 CONSUMER_SEND_MSG_BACK。
-//   2. 与 Java 的**有意差异**：Java 在失败时会吞掉异常、改用内部默认生产者把消息直接发到
-//      %RETRY%group（DefaultMQPullConsumerImpl:666 的 catch 分支）。本实现不做这个兜底 ——
-//      回投失败就抛，让调用方看见，而不是换一条路径静默重发。
 void DefaultMQPullConsumer::sendMessageBack(const MessageExt& msg, int32_t delayLevel) {
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
@@ -431,17 +342,7 @@ void DefaultMQPullConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
     header->delayLevel = delayLevel;
     header->originMsgId = msg.msgId;
     header->originTopic = msg.topic;
-    // ⚠ 有意超出 Java：Java 的 MQClientAPIImpl#consumerSendMessageBack(:1684-1693) 只填
-    // group/offset/delayLevel/originMsgId/originTopic/maxReconsumeTimes/brokerName，
-    // 从不写 unitMode，所以字段恒为 false —— 单元化模式下回投自动建出的 %RETRY%group
-    // 拿不到 UNIT_SUB 标记。broker 侧是读这个字段的
-    // （AbstractSendMessageProcessor:135-138 → TopicSysFlag.buildSysFlag(false, true)），
-    // 故这里按消费者配置如实上报。
     header->unitMode = unitMode_;
-    // ⚠ 不照抄 Java 弃用的 DefaultMQPullConsumerImpl#sendMessageBack（它直接传
-    // getMaxReconsumeTimes()，默认 -1）。客户端版本 ≥ V3_4_9 后 broker 无条件采信该
-    // 字段（`AbstractSendMessageProcessor:172-179`），-1 会让 reconsumeTimes(0) >= -1
-    // 成立、消息直接进 %DLQ%。留空交给订阅组的 retryMaxTimes 判定。
     header->maxReconsumeTimes = std::nullopt;
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::CONSUMER_SEND_MSG_BACK, header);
@@ -474,11 +375,6 @@ void DefaultMQPullConsumer::createTopic(const std::string& key, const std::strin
 // 缺心跳的失效是静默的：拉取照样成功，只是 broker 侧完全不知道本组存在。
 void DefaultMQPullConsumer::refreshRouteForHeartbeat() {
     if (mqClient_ == nullptr) return;
-    // Java 侧这条链路是间接的：`DefaultMQPullConsumerImpl.subscriptions():357-385`
-    // 返回 registerTopics 构出的订阅集，实例的 `updateTopicRouteInfoFromNameServer`
-    // 周期任务据此刷路由 → `brokerAddrTable` 有地址 → 心跳发得出去。本端口没有实例级
-    // 路由任务（心跳循环在消费者内，同 push / lite），所以显式刷一遍并按 registerTopics
-    // 登记「在用」，交给 MQClientInstance 的后台刷新任务保持新鲜。
     for (const std::string& t : registerTopics_) {
         const std::string real = NamespaceUtil::wrapNamespace(namespace_, t);
         mqClient_->registerTopicInUse(real);
@@ -490,27 +386,12 @@ void DefaultMQPullConsumer::refreshRouteForHeartbeat() {
     }
 }
 
-// Java `MQClientInstance#prepareHeartbeatData:1031-1045` 为拉模式消费者组出来的那一份：
-// `consumeType()` 恒为 CONSUME_ACTIVELY（`DefaultMQPullConsumerImpl:348`）、
-// `consumeFromWhere()` 恒为 CONSUME_FROM_LAST_OFFSET（:353）—— 与 push 消费者的
-// PASSIVELY 是两个口径，broker 侧两项都不是摆设（见本节开头那段）。
-// 订阅集取 `subscriptions():357-385`：逐条 `buildSubscriptionData(topic, "*")` 并显式
-// `setSubVersion(0L)`（Java 源码如此）—— 拉模式没有"订阅版本"语义，带上 SubscriptionData
-// 构造函数默认的当前时间戳会让 broker 每次心跳都认为订阅变了。
-// ⚠ 本端口没有 Java 的 `registerSubscriptions` 入口，订阅集只从 registerTopics 来。
 HeartbeatData DefaultMQPullConsumer::buildHeartbeat() const {
     HeartbeatData hb(clientId_);
     ConsumerData cd(consumerGroup_, ConsumeType::CONSUME_ACTIVELY, messageModel_,
                     ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
-    // Java `MQClientInstance:1039` 心跳里带 consumerData.setUnitMode(tc.isUnitMode())：
-    // broker 据此决定 %RETRY% topic 建出来带不带 UNIT_SUB 位。
     cd.unitMode = unitMode_;
     for (const std::string& t : registerTopics_) {
-        // Java 是 `FilterAPI.buildSubscriptionData(t, SubscriptionData.SUB_ALL)`（即 "*"）
-        // 这里的 t 在 Java 已含命名空间（入表时 withNamespace，:330）；本端口集合存裸名，
-        // 所以订阅必须拼上命名空间 —— 与 refreshRouteForHeartbeat 的收件人口径一致，
-        // 否则刷的是 "ns%topic" 的路由、报的却是 "topic" 的订阅，broker 建的订阅表
-        // 和实际拉取的 topic 对不上。
         const std::string subTopic = NamespaceUtil::wrapNamespace(namespace_, t);
         SubscriptionData sub = FilterAPI::buildSubscriptionData(subTopic, "*");
         sub.subVersion = 0;
@@ -526,10 +407,6 @@ int32_t DefaultMQPullConsumer::sendHeartbeatToAllBroker() {
     }
     std::vector<std::string> addrs;
     try {
-        // 每台都发（主 + 从）：Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750
-        // 遍历 `brokerAddrTable` 的每个 brokerId，仅当 `consumerEmpty && id != MASTER_ID`
-        // 才跳过；消费者心跳必带 ConsumerData，故从节点不跳。broker 的 ConsumerManager
-        // 每台各自一份，从节点收不到心跳，指向自己的拉取就要走没有订阅表的补偿分支。
         addrs = mqClient_->getAllBrokerAddrs();
     } catch (const std::exception& e) {
         logger_warn("heartbeat: gather brokers failed: " + std::string(e.what()));

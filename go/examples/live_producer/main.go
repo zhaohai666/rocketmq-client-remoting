@@ -450,8 +450,6 @@ func drainAsync(ch <-chan asyncOutcome, n int, budget time.Duration) (
 	}
 }
 
-// pickQueue always returns the queue with the requested id — the selector sees
-// the queues WITHOUT the namespace (Java invokeMessageQueueSelector).
 type pickQueue struct{ queueID int32 }
 
 func (s pickQueue) Select(mqs []common.MessageQueue, _ *common.Message, _ any) (common.MessageQueue, error) {

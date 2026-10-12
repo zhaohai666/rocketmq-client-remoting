@@ -869,11 +869,7 @@ def test_permits_are_borrowed_per_in_flight_send_and_given_back():
 
 
 def test_null_or_empty_body_still_costs_one_size_permit():
-    """Java :642 —— ``getBody() == null ? 1 : getBody().length``。
-
-    两种「没有 body」在链路上都被 ``Validators.checkMessage`` 先拒了（body 为 null /
-    长度为 0，四端口一致），所以这里断的是计价本身，而不是走一遍发送。
-    """
+    pass
     assert producer_module._back_pressure_msg_len(Message("T", b"")) == 1
     no_body = Message("T", b"x")
     no_body.body = None
@@ -884,7 +880,7 @@ def test_null_or_empty_body_still_costs_one_size_permit():
 
 
 def test_failure_also_gives_the_permits_back():
-    """归还挂在 on_exception 上（Java semaphoreProcessor 在两个回调里都跑），失败不能漏。"""
+    pass
     p = _backpressure_producer(
         num=10, outcomes=[_Deliver(error=MQBrokerException(
             ResponseCode.SYSTEM_ERROR, "store error"))])
@@ -913,7 +909,6 @@ def test_retry_chain_releases_once_not_once_per_attempt():
 def test_gate_waits_for_a_permit_instead_of_failing_early():
     """信号量是**等**到超时为止，不是看一眼不够就报错 —— 这才是背压限流的意义。"""
     gate = threading.Event()
-    # 条数闸的地板值是 10（Java :141-146），所以"占满"要占 10 笔而不是任意小数
     p = _backpressure_producer(num=MIN_ASYNC_SEND_NUM, block=gate)
     held = []
     for _ in range(MIN_ASYNC_SEND_NUM):
@@ -945,7 +940,7 @@ def test_gate_waits_for_a_permit_instead_of_failing_early():
 
 
 def test_runtime_resize_keeps_the_in_flight_share():
-    """Java DefaultMQProducerTest:593-595 的那条断言：空闲许可 + 在途份数 == 新配置。"""
+    pass
     gate = threading.Event()
     p = _backpressure_producer(num=10, block=gate)
     callbacks = []
@@ -963,8 +958,7 @@ def test_runtime_resize_keeps_the_in_flight_share():
 
 
 def test_growing_capacity_wakes_a_blocked_sender():
-    """本实现改容量不丢等待者（Java 换对象会把等待者留在旧信号量上等自己的超时）——
-    调大容量之后，正卡在闸上的调用方应当被叫醒并把这笔发出去。"""
+    pass
     gate = threading.Event()
     p = _backpressure_producer(num=10, block=gate)
     for _ in range(10):
@@ -985,8 +979,7 @@ def test_growing_capacity_wakes_a_blocked_sender():
 
 
 def test_queue_full_runs_inline_when_backpressure_is_on():
-    """Java :675-681：队满时**没有**背压才抛 "executor rejected"；有背压就就地跑完这一笔
-    （许可已经扣掉了，抛异常会让它悬着）。"""
+    pass
     gate = threading.Event()
     p = _backpressure_producer(num=10, block=gate)
     p._async_sender_executor = ConsumeExecutor(1, 1, thread_name_prefix="AsyncSenderExecutor",
@@ -1024,7 +1017,7 @@ def test_queue_full_runs_inline_when_backpressure_is_on():
 
 
 def test_batch_async_charges_the_sum_of_body_lengths():
-    """批量是 Java 没有的异步入口，这里按每条累加，别让一整批只算一笔的钱。"""
+    pass
     p = _backpressure_producer(num=10)
     seen = {}
     real_inner = p._send_async_inner
@@ -1055,7 +1048,7 @@ def test_batch_async_charges_the_sum_of_body_lengths():
 
 
 def test_request_goes_through_the_same_gate_and_leaks_nothing():
-    """request() 内部就是这条 ASYNC 链（Java 亦然），所以它同样受背压约束、同样要归还。"""
+    pass
     p = _backpressure_producer(num=10)
     client = _client(p)
     client.client_id = "fake-client-id"
@@ -1066,11 +1059,8 @@ def test_request_goes_through_the_same_gate_and_leaks_nothing():
         on_complete(SendResult(SendStatus.SEND_OK, msg_id="0" * 32, message_queue=mq), None)
 
     client.send_message_async = _capture      # type: ignore[assignment]
-    # 应答通道本来就不存在（fake 客户端没有 326 推送），所以按 Java 语义抛等应答超时
     with pytest.raises(RequestTimeoutException) as ei:
         p.request(Message("TopicTest", b"q" * 30), 300)
-    # 类型之外还要带上 10006：调用方按 response_code 分流时，"消息已发出去、只是没等到
-    # 应答"和别的客户端故障不是一类处置（Java RequestTimeoutException(10006, ...)）。
     assert ei.value.response_code == ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION
     assert "wait reply message timeout" in str(ei.value)
     assert delivered, "request() 应当走异步链"

@@ -1,26 +1,7 @@
 // 路由刷新周期 / 位点落盘周期 真机验证（C++ 参考 python/verify_interval_live.py 的 I1–I3）。
 //
-// 对应用户要求「基于真实集群测试是否正常」：`pollNameServerInterval`（Java 默认 30s）与
-// `persistConsumerOffsetInterval`（Java 默认 5s）都是**以时间为唯一可观测量**的配置项，
-// 不接真集群就只能断言「字段被读到了」，证明不了「周期真的按配置走」。这里两段都用真机行为断言：
 //
-//   I1 路由刷新周期：两个生产者同时 start，周期分别设 1000ms 与 Java 默认 30000ms；两者都
-//      用 `MQClientInstance::registerTopicInUse` 把一个**尚未创建**的 topic 登记进周期刷新
-//      集合。之后才用 admin 建 topic（NameServer 侧路由立即可见），于是「缓存里何时出现这个
-//      topic」只由各自的刷新周期决定：
-//        * 1s 组 ≤6s 看到；
-//        * 30s 组在那一刻**还看不到**（下一次刷新在启动后 30s）；
-//        * 30s 组最终也在 ≤40s 内看到（默认值不是「卡死」，只是慢 30 倍）。
-//      观测点必须用**只读缓存探测** `isTopicRouteCached`：`getTopicRouteData` 未命中会立刻
-//      拉一次，用它等于自己把缓存填上，周期就不可观测了。
 //
-//   I2 位点落盘周期：两个消费者（周期 1000ms / 60000ms）消费同一 topic 的 3 条消息后
-//      **不 commit、不 shutdown**，broker 侧位点只能由后台周期任务推上去。断言：
-//        * 首次落盘发生在 start 后 ~10s（Java `scheduleAtFixedRate` 的 initialDelay
-//          1000*10，不是立刻）；
-//        * 再发 3 条：1s 组在 5s 内把位点推到 6；此刻 60s 组仍是 3（它的下一次落盘在 ~70s）；
-//        * 60s 组 `shutdown()` 时把 6 落盘（Java persistConsumerOffset 的收尾语义），
-//          证明它只是「周期没到」，不是坏了。
 //
 //   I3 透传：生产者/消费者 start 之后，真机实例上的 `pollNameServerIntervalMillis()` 就是调用方
 //      设的值（不是只在门面上存着）。
@@ -144,10 +125,9 @@ int main(int argc, char* argv[]) {
     const std::string gFast = "G_persist_fast_" + stamp;
     const std::string gSlow = "G_persist_slow_" + stamp;
     const int32_t kFastPollMs = 1000;
-    const int32_t kSlowPollMs = 30000;  // Java ClientConfig.pollNameServerInterval 默认值
+    const int32_t kSlowPollMs = 30000;
     const int32_t kFastPersistMs = 1000;
     const int32_t kSlowPersistMs = 60000;
-    // Java startScheduledTask:423 的 initialDelay = 1000 * 10
     const double kPersistInitialDelaySec = 10.0;
 
     DefaultMQAdminExt admin;
@@ -186,7 +166,7 @@ int main(int argc, char* argv[]) {
         slowPoll = std::make_shared<DefaultMQProducer>(gPollSlow);
         slowPoll->setNamesrvAddr(nsAddr);
         slowPoll->setInstanceName("interval-poll-slow-" + stamp);
-        slowPoll->start();  // 不设周期 = Java 默认 30s
+        slowPoll->start();
 
         check("I3 生产者实例拿到配置的刷新周期（1s 组）",
               fastPoll->client().pollNameServerIntervalMillis() == kFastPollMs,
@@ -206,10 +186,6 @@ int main(int argc, char* argv[]) {
                   !slowPoll->client().isTopicRouteCached(tPoll),
               "登记后两边缓存都为空");
 
-        // 先让两个实例各自的**首跳**（Java scheduleAtFixedRate 的 initialDelay=10ms）跑完并把
-        // 这个还不存在的 topic 拉失败一次，再去建 topic。否则首跳可能落在建 topic 之后：
-        // 那一跳对两组都是"第一次拉"，30s 组照样当场拿到路由，两组间隔就退化成一个传输 RTT，
-        // 这条对照实验也就失去意义（真机上表现为 30s 组和 1s 组同时命中）。
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
         const int64_t t0 = nowMs();
@@ -338,7 +314,7 @@ int main(int argc, char* argv[]) {
         check("I2 60s 组的下一次周期还没到（距首笔落盘 < 周期 60s）",
               sinceSlowFirst < kSlowPersistMs, "elapsed=" + secs(0, sinceSlowFirst));
 
-        slowC->shutdown();  // Java persistConsumerOffset 的收尾语义：退出前把内存位点落盘
+        slowC->shutdown();
         consumers.erase(consumers.begin() + 1);
         const bool slowSecond =
             waitUntil([&] { return brokerOffset(admin, gSlow, mq) == 6; }, 10000, 300);

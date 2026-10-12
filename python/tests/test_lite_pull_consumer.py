@@ -1,13 +1,4 @@
 # -*- coding: utf-8 -*-
-"""DefaultLitePullConsumer 本地单测（不需要集群）。
-
-为什么存在：LitePullConsumer 是三个语言都缺失的能力（Java DefaultLitePullConsumer）。
-这里覆盖不需要 broker 的契约：生命周期守卫、assign / subscribe 两种模式的 pull 服务、
-本地缓冲 drain（poll）、seek 重置位点、auto-commit 提交、rebalance 单实例全量分配。
-
-通过把 ``_create_client`` 替换成内存 MockClient，验证后台拉取循环 + 本地缓冲 + poll 的
-端到端逻辑，而不依赖真实集群。
-"""
 from __future__ import annotations
 
 import time
@@ -88,7 +79,6 @@ class MockClient:
         return _Info()
 
     def get_topic_subscribe_info(self, topic):
-        # rebalance / fetch_message_queues 取的是订阅信息（Java RebalanceImpl.topicSubscribeInfoTable）
         self.events.append("route:%s" % topic)
         return [MessageQueue(topic, b, q) for (b, q) in self._store.keys()]
 
@@ -144,8 +134,6 @@ class _Lite(DefaultLitePullConsumer):
         store = kwargs.pop("_store", {})
         super().__init__(*args, **kwargs)
         self.client_id = "DEFAULT@testclient"
-        # 测试用的 MockClient 里消息是"已经存在"的，故默认从队首消费，
-        # 对齐 Java CONSUME_FROM_FIRST_OFFSET 语义（LAST 会从队尾之后开始，读不到预置消息）
         self.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
         self._mock = MockClient(self.client_id, store)
 
@@ -185,7 +173,6 @@ class TestLifecycle:
         assert c.pull_batch_size == 32
         assert c.poll_timeout_millis == 5000
         assert c.consume_from_where == "CONSUME_FROM_LAST_OFFSET"
-        # Java DefaultLitePullConsumer.java:168：默认 now-30min 的 14 位 yyyyMMddHHmmss
         assert len(c.consume_timestamp) == 14
         assert c.consume_timestamp.isdigit()
 
@@ -206,11 +193,6 @@ class TestLifecycle:
             c.shutdown()
 
     def test_heartbeat_declares_consume_actively_per_the_wire_contract(self):
-        # Java DefaultLitePullConsumerImpl.consumeType():1111-1112 返回 CONSUME_ACTIVELY
-        # —— 轻量拉取消费者同样是「拉模式」，与推送消费者的 PASSIVELY 不是一个口径。
-        # broker 按它分流：rejectPullConsumerEnabled 的 broker 跳过 ACTIVELY 心跳并把
-        # 未注册的拉取组拒掉（ClientManageProcessor:87-92、PullMessageProcessor:493-505）；
-        # :516-521 的冷数据流控也按 PASSIVELY/ACTIVELY 走两条不同分支。
         c = _Lite("LitePG_UT", _store=STORE)
         cd = list(c._build_heartbeat().consumer_data_set)[0]
         assert cd.consume_type == ConsumeType.CONSUME_ACTIVELY
@@ -267,13 +249,7 @@ class TestAssignMode:
         assert c.assignment() == [mq]
 
     def test_assign_before_start_leaves_the_start_point_to_start(self):
-        """assign 早于 start 时不许落一个「没问过 broker 的 0」。
-
-        Java 的 assign/seek 都先 checkServiceState()（没启动直接拒）；本端口允许先 assign
-        再 start，但解析起点必须真的问过 broker —— FIRST_OFFSET 那一支现在返回字面量 0
-        （Java RebalanceLitePullImpl 同），若在 assign 时就写进 _next_offset 就再也不会重算
-        （拉取循环只在缺值时补解析），起点会被永久钉死在 0。
-        """
+        pass
         c = _Lite("LitePG_UT", _store=STORE)
         mq = MessageQueue("T", "broker-a", 0)
         c.assign([mq])
@@ -379,14 +355,7 @@ class TestPauseResume:
 
 
 class TestCommitOffsetTable:
-    """commit() 的三个重载与 Java 的三张位点表（拉取游标 / 已消费游标 / 提交落点）。
-
-    对位 Java ``DefaultLitePullConsumerImpl``：``commit()`` → ``commitAll()``（取
-    ``assignedMessageQueue.getConsumerOffset``）、``commit(Map, persist)``（调用方指定位点，
-    只写 offsetStore）、``commit(Set, persist)``（只提交给定队列）。
-    本端口没有 Java 那份 MQClientInstance 5s 的 persistConsumerOffset 定时器，
-    所以 persist=True 就地发给 broker——这条偏离在 commit() 的文档里。
-    """
+    pass
 
     def _two_queue_store(self):
         return {("broker-a", 0): ["A0", "B1", "A2"], ("broker-a", 1): ["C0", "D1"]}
@@ -409,7 +378,6 @@ class TestCommitOffsetTable:
             assert c._offset_table == {q0: 2, q1: 7}
             assert c._mock.updates == []
             c.commit({q0: 9}, persist=True)
-            # 只发给定那条队列，并且 Java 的 persistAll 会把其余条目从表里清掉
             assert c._mock.updates == [("broker-a", 0, 9)]
             assert list(c._offset_table) == [q0]
         finally:
@@ -421,7 +389,6 @@ class TestCommitOffsetTable:
         c.assign([q0])
         c.start()
         try:
-            # 表里没有 → 回落 broker 并回填（Java readOffset 的 MEMORY_FIRST_THEN_STORE）
             c._mock.committed[("broker-a", 0)] = 4
             assert c.committed(q0) == 4
             queries = len(c._mock.queries)
@@ -470,10 +437,6 @@ class TestCommitOffsetTable:
             c.shutdown()
 
     def test_auto_commit_never_commits_what_poll_never_handed_out(self):
-        # 后台提交线程与 poll 抢的是同一份"已消费游标"，所以哪一轮真正触发提交
-        # 取决于线程时序，"停在第几格"却是不变量：**每次发出的位点都不许跑过 poll
-        # 交给调用方的那一格**。把拉取游标当提交源（Java 之外四语言的共同写法）会
-        # 在这里红：缓冲一满就提交到队列末尾，调用方崩了那段消息永久丢失。
         c = self._consumer({("broker-a", 0): ["A0", "B1", "A2", "B3", "A4"]})
         c.set_pull_batch_size(2)
         c.set_auto_commit(True)
@@ -532,8 +495,6 @@ class TestCommitOffsetTable:
         c.start()
         try:
             c.commit({q0: -1, stranger: 3})
-            # -1：Java 原话 consumerOffset is -1 in messageQueue [...]，跳过；
-            # 不是本实例持有的队列：Java 的 processQueue 守卫，静默跳过
             assert c._offset_table == {}
             assert c._mock.updates == []
         finally:
@@ -555,8 +516,6 @@ class TestCommitOffsetTable:
             c.shutdown()
 
     def test_seek_moves_the_consume_cursor_too(self):
-        # Java nextPullOffset：吃掉 seekOffset 时连同 consumeOffset 一起改写，
-        # 否则重放的那一段会被上一格的已提交位点盖过去
         c = self._consumer()
         c.set_pull_batch_size(2)
         q0 = MessageQueue("T", "broker-a", 0)
@@ -573,9 +532,6 @@ class TestCommitOffsetTable:
             c.shutdown()
 
     def test_revoked_queue_is_persisted_then_dropped(self):
-        # Java RebalanceLitePullImpl#removeUnnecessaryMessageQueue：先 persist(mq) 再 removeOffset(mq)。
-        # 这条清理挂在 **subscribe 模式**的 rebalance 上：队列是 broker 撤的，客户端必须
-        # 把最后那次提交补发出去，否则新持有者从上一格起重投一遍。
         store = {("broker-a", 0): ["A0", "B1", "A2"], ("broker-a", 1): ["C0", "D1"]}
         c = _Lite("LitePG_UT", _store=store)
         c.set_namesrv_addr("127.0.0.1:9876")
@@ -602,8 +558,6 @@ class TestCommitOffsetTable:
             c.shutdown()
 
     def test_assign_mode_revoke_does_not_persist(self):
-        # Java updateAssignedMessageQueue（assign 模式）：只把 MessageQueueState 丢掉，
-        # 既不发 persist 也不碰 offsetStore——位点是调用方自己管的。
         c = self._consumer()
         q0 = MessageQueue("T", "broker-a", 0)
         q1 = MessageQueue("T", "broker-a", 1)
@@ -657,9 +611,6 @@ class TestCommitOffsetTable:
             assert c.pending_commit_of(q0) == 777
             assert c.committed(q0) == 777
             assert c._mock.committed[("broker-a", 0)] == 1024
-            # 点名提交会把没点名的内存值清掉（Java persistAll 的 remove unused mq）：
-            # 这里 scope 只有一条 foreign，它自己没过 -1 守卫所以什么都没发，
-            # 但 q0 那格 777 在扫表时被丢掉，回读只剩 broker 的 1024
             updates_before = len(c._mock.updates)
             c.commit([stranger], persist=True)
             assert len(c._mock.updates) == updates_before, "没点名的队列不该被发出去"
@@ -670,12 +621,7 @@ class TestCommitOffsetTable:
 
 
 class TestPullCursorFollowsNextBeginOffset:
-    """拉取游标跟的是 broker 的 nextBeginOffset，不是「最后一条消息 + 1」。
-    Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：一轮拉取成功回来之后
-    无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都执行
-    `updatePullOffset(mq, pullResult.getNextBeginOffset(), pq)`；:808 的唯一刹车是
-    「这轮没人 seek 过」（:986 的入缓冲同样只在 seekOffset == -1 时发生）。
-    """
+    pass
 
     def _paused_consumer(self, store=None, batch=2):
         """start() 之后把队列 pause 住：后台循环不碰它，游标只由用例自己驱动。"""
@@ -720,8 +666,6 @@ class TestPullCursorFollowsNextBeginOffset:
             c.shutdown()
 
     def test_in_flight_seek_wins_over_the_pull_result(self):
-        # Java :986/:808 的 seekOffset == -1 检查：在途请求的结果不许盖掉这轮里刚 seek
-        # 出来的位点、也不许把旧窗口的消息灌进缓冲（seek 刚把它们清掉）。
         c, q0 = self._paused_consumer()
         try:
             def seek_mid_flight():
@@ -740,16 +684,7 @@ class TestPullCursorFollowsNextBeginOffset:
 
 
 class TestLitePullWireContract:
-    """#107：lite pull 必须带 FLAG_LITE_PULL_MESSAGE(0x10) 且请求码走 361。
-
-    Java 把这两件事拆在两处：消费者侧 `DefaultLitePullConsumerImpl#pullSyncImpl:1058`
-    以 `buildSysFlag(false, block, true, false, /*litePull*/ true)` 置位；客户端 API 侧
-    `MQClientAPIImpl#pullMessage:816-820` 按位选码 —— 有 lite 位用
-    `LITE_PULL_MESSAGE(361)`，否则 `PULL_MESSAGE(11)`。任一处漏掉，请求在线上依然
-    完全合法（broker 照常回消息），但走的是普通 pull 线程池、且**不受
-    `litePullMessageEnable` 开关管辖**（`PullMessageProcessor:325` 只拦 361）——
-    离线 mock 不会自己喊，只有真机把开关翻掉才露馅（对照组：push/classic pull 照常）。
-    """
+    pass
 
     def test_lite_pull_sets_the_lite_flag_and_only_that(self):
         c = _Lite("LitePG_UT", _store=STORE)
@@ -763,8 +698,6 @@ class TestLitePullWireContract:
             flag = c._mock.pull_sys_flags[-1]
             assert PullSysFlag.has_lite_pull_flag(flag) is True, \
                 "lite pull 必须置 FLAG_LITE_PULL_MESSAGE(0x10)：flag=%#x" % flag
-            # 与 Java pullSyncImpl:1058 的 (false, block, true, false, true) 对齐：
-            # 短轮询（suspend=False）+ 带订阅 + 不提交位点 + 非类过滤
             assert PullSysFlag.has_commit_offset_flag(flag) is False
             assert PullSysFlag.has_suspend_flag(flag) is False
             assert PullSysFlag.has_subscription_flag(flag) is True
@@ -800,7 +733,6 @@ class TestLitePullWireContract:
         return captured
 
     def test_client_api_switches_to_361_on_the_lite_bit(self):
-        # Java MQClientAPIImpl#pullMessage:816-820 的选码逻辑。
         lite = PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
                                           subscription=True, class_filter=False,
                                           lite_pull=True)

@@ -1,25 +1,4 @@
 # -*- coding: utf-8 -*-
-"""发送返回后**调用方的 Message 必须还原**（Java ``sendKernelImpl`` 的 ``finally``）的单测。
-
-对齐基准是 Java 5.5.1 ``DefaultMQProducerImpl#sendKernelImpl``：
-
-  * ``:930`` ``byte[] prevBody = msg.getBody();`` 记下原始 body；
-  * ``:1095-1096`` ``finally { msg.setBody(prevBody); msg.setTopic(
-    NamespaceUtil.withoutNamespace(msg.getTopic(), ns)); }`` —— 成功、抛异常、超时，
-    三条路都要还原成发送前的样子；
-  * ``:1028-1038`` 异步分支更早一步：压缩过就先克隆出带压缩 body 的副本、**立刻**还原
-    调用方那份（rocketmq-externals#66），拼过命名空间又没克隆过就再克隆一次、然后剥掉
-    调用方 topic 上的命名空间；
-  * 批量路径例外：``batch()`` 给**每条子消息**拼命名空间后不还原（Java 也如此），
-    子消息 body 不参与压缩，所以没有损坏问题。
-
-不还原的后果是**静默的数据损坏**：同一个 Message 再发一次时 body 已是上一轮的压缩流，
-长度掉到阈值以下、``tryToCompressMessage`` 这次返回 false、压缩标志也不置位，broker 照存、
-消费者照收，业务侧解出来的是 zlib 裸流 —— 发送、存储、消费全程零报错。
-
-C++ / C# 是靠「发之前拷贝一份」达到同一效果的（``producer.cpp`` 里 ``Message out = msg``、
-C# ``CloneMessage``），Rust 见 ``src/client/producer.rs`` 的同名测试。
-"""
 from __future__ import annotations
 
 import threading
@@ -151,7 +130,7 @@ class _Selector:
 
 
 class _Listener(TransactionListener):
-    """记录本地事务看到的 body（Java 里这时调用方的 Message 已被 finally 还原）。"""
+    pass
 
     def __init__(self):
         self.body: Optional[bytes] = None
@@ -186,14 +165,7 @@ def _compression_flag(p: DefaultMQProducer) -> int:
 
 
 def _wait_restored(msg: Message, body: bytes = ORIGINAL, timeout: float = 2.0) -> None:
-    """等异步链的还原跑完（同步链的还原在调用返回前必然发生，不需要它）。
-
-    还原跑在 ``AsyncSenderExecutor`` 工作线程上（Java 的 finally 也是这个线程），
-    回调则在 ``NettyClientPublicExecutor`` 上：两边谁先谁后没有保证。Java 因为
-    「克隆带压缩 body 的副本去发」可以**在派发前**就还原调用方那份；本实现把调用方
-    对象直接发上线，只能等派发之后还原 —— 所以这里轮询等它出现，而不是断言某一
-    瞬间的状态。
-    """
+    pass
     deadline = time.monotonic() + timeout
     while msg.body != body and time.monotonic() < deadline:
         time.sleep(0.005)
@@ -236,10 +208,7 @@ def test_sync_send_restores_the_namespaced_topic():
 
 # ---------------------------------------------------------------- 批量
 def test_batch_send_keeps_sub_message_topic_namespaced():
-    """批量是例外：Java ``batch()`` 拼完命名空间**不**还原，子消息 body 也不压缩。
-
-    这里把差别钉住，免得日后有人"顺手"把批量也一起还原了 —— 那会与 Java 分道扬镳。
-    """
+    pass
     p = _producer(NS)
     client = p._mq_client
     m1 = Message("TopicTest", b"a")
@@ -288,7 +257,7 @@ def test_async_send_restores_the_namespaced_topic():
 
 
 def test_async_send_restores_the_body_even_when_the_send_fails():
-    """失败路径同样要还原：Java 的还原在 finally 里，与成败无关。"""
+    pass
     p = _producer()
     client = p._mq_client
     cb = _Callback()
@@ -327,7 +296,6 @@ def test_selector_send_restores_the_callers_message():
 
     p.send_by_selector(msg, sel, None)
 
-    # 选择器在压缩之前跑（Java sendSelectImpl 的顺序），看到的是原始 body
     assert sel.seen_body == ORIGINAL
     assert client.topics[0] == "%s%%TopicTest" % NS
     assert msg.body == ORIGINAL
@@ -336,12 +304,7 @@ def test_selector_send_restores_the_callers_message():
 
 # ---------------------------------------------------------------- 事务
 def test_transaction_send_restores_the_message_and_keeps_the_wire_topic():
-    """半消息发完即还原：本地事务看到原始 body，endTransaction 报**已剥命名空间**的 topic。
-
-    最后这点容易想反：Java 5.5.1 ``endTransaction:1543`` 是 ``requestHeader.setTopic(
-    msg.getTopic())`` —— 用的正是**调用方**那条 msg，而它的 topic 已经被 sendKernelImpl
-    的 finally（:1096）剥掉了命名空间。``queueWithNamespace`` 只用来定位 brokerName。
-    """
+    pass
     p = _producer(NS)
     client = p._mq_client
     listener = _Listener()

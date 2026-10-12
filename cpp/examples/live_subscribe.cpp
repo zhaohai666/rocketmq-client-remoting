@@ -1,23 +1,3 @@
-// 后置订阅真机验证（C++ 对齐 Java `subscribe` 之后的「立即推一轮心跳」，与
-// python/verify_subscribe_live.py、rust/examples/live_subscribe.rs、
-// csharp/examples/RocketMQ.Examples/LiveSubscribe.cs 一一对应）。
-//
-// Java `DefaultMQPushConsumerImpl.subscribe:1265-1275` 只做两件事：
-// `subscriptionInner.put(...)` + `if (this.mQClientFactory != null)
-// this.mQClientFactory.sendHeartbeatToAllBrokerWithLock();` —— 允许 `start()` 之后订阅，
-// 而且**同步**推一轮心跳。观测点是 broker 的 topic→group 表
-// （`ConsumerManager#registerConsumer` 维护，`QUERY_TOPIC_CONSUME_BY_WHO(300)` 读取）：
-// 订阅路径不推心跳的话，表里要等下一个 30s 心跳周期才出现本组。
-//
-//   S0 正对照：`start()` 之后基础 topic B 已登记本组（心跳链路与 300 查询本身是通的）。
-//   S1 负对照：本轮**还没**订阅的 L，300 查不到本组。
-//   S2 后置订阅立即生效：`subscribe(L)` 之后不睡直接查 300(L) → 本组已在表里，
-//      且耗时远小于心跳周期（默认 30s）⇒ 只可能来自订阅路径那一轮同步心跳。
-//   S3 后置订阅真会被消费：L 进分配集 → 发一条消息 → listener 收到。
-//   S4 活订阅表：`unsubscribe(L)` 后本组订阅集立刻少掉 L。
-//      （Java:1317-1319 只删表项、**不**推心跳，且 broker 的 topicGroupTable 只在整组
-//      无订阅时才清 —— 所以这里不拿 broker 的表当断言。）
-//
 // 前置：NameServer + Broker 已起（本仓库 /tmp/rmq_rust_live/broker.conf）。
 // 用法：./rmq_live_subscribe 127.0.0.1:9876
 #include <chrono>
@@ -69,7 +49,6 @@ bool waitUntil(const std::function<bool()>& pred, int64_t timeoutMs, int64_t int
     return pred();
 }
 
-// Java ClientConfig#heartbeatBrokerInterval 默认 30s：登记必须远快于它。
 const int64_t kHeartbeatPeriodMs = 30000;
 
 std::string join(const std::set<std::string>& v) {
@@ -157,7 +136,6 @@ int main(int argc, char* argv[]) {
     BodySink sink;
 
     try {
-        // 先建 topic：消费者不做默认 topic 兜底（对齐 Java），topic 不存在就拿不到路由。
         admin.createTopic(tBase, tBase, 4, 0);
         admin.createTopic(tLate, tLate, 4, 0);
 

@@ -1,9 +1,3 @@
-// org.apache.rocketmq.common.message 的 C# 对应：消息模型。
-//
-// 对齐 cpp/include/rocketmq/common/message.h 与 message.cpp：
-//   - MessageQueue.hashCode 与 Java 逐位一致（32 位有符号回绕）；
-//   - 属性快捷方式（TAGS/KEYS/DELAY/WAIT）读写 Properties；
-//   - MessageBatch.generateFromList 的约束：非空 / 同 topic / 同 waitStoreMsgOK / 禁延时 / 禁重试 topic。
 using System.Globalization;
 using System.Text;
 
@@ -29,7 +23,6 @@ public class MessageQueue : IComparable<MessageQueue>
 
     public string QueueIdStr => QueueId.ToString(CultureInfo.InvariantCulture);
 
-    // 与 Java 对齐：((31 + brokerHash) * 31 + queueId) * 31 + topicHash，按 32 位有符号回绕。
     public int HashCode()
     {
         long brokerHash = LegacyHash.StringHash(BrokerName);
@@ -68,7 +61,6 @@ public class MessageQueue : IComparable<MessageQueue>
 
     public override bool Equals(object? obj) => Equals(obj as MessageQueue);
 
-    // Java MessageQueue 的 hashCode 用上面的 HashCode()，因此 GetHashCode 与之对齐。
     public override int GetHashCode() => HashCode();
 
     public static bool operator ==(MessageQueue left, MessageQueue right) => left.Equals(right);
@@ -162,12 +154,6 @@ public class Message
         set => Properties[MessageConst.PropertyDelayTimeLevel] = value.ToString(CultureInfo.InvariantCulture);
     }
 
-    /// <summary>Java <c>Message.isWaitStoreMsgOK()</c>：属性**缺省即 true**，其余走
-    /// <c>Boolean.parseBoolean</c> —— 只有忽略大小写的 "true" 为真。</summary>
-    /// <remarks>别把缺省判成 false：本类的构造器（同 Python / Rust）<b>不</b>预写 WAIT，
-    /// 所以"属性缺省"是常态。缺省判成 false 会让 <c>MessageBatch.GenerateFromList</c> 攒出
-    /// <c>WAIT=false</c> 的批量，broker 不等刷盘就回 SEND_OK（持久性静默降级）。
-    /// Rust / Python / C++ 三端同名判据完全一致。</remarks>
     public bool WaitStoreMsgOk
     {
         get => !Properties.TryGetValue(MessageConst.PropertyWaitStoreMsgOk, out var s)
@@ -192,32 +178,19 @@ public class Message
 
     public void ClearProperty() => Properties.Clear();
 
-    // ---- 定时消息的三个类型化写入器（对齐 Java Message.setDelayTimeSec/setDelayTimeMs/
-    // setDeliverTimeMs，common/message/Message.java:238-267）----
-    // Java 侧就是 putProperty(键, String.valueOf(值)) —— 没有范围校验；真正的合法性
-    // （是否超过 maxDelayTime、三个键的优先级）由 broker 的 TimerMessageStore 与
-    // 客户端发送链路（DefaultMQProducerImpl 的 delayTimeForbid 检查）负责。这里保持
-    // 同一职责边界：写键、不拦截。键值同时至多一个生效是**调用方**的约定（Java 亦然）。
-    /// <summary>Java <c>setDelayTimeSec</c>：写 TIMER_DELAY_SEC（相对当前时刻的秒数）。</summary>
     public void SetDelayTimeSec(long sec) =>
         PutProperty(MessageConst.PropertyTimerDelaySec, sec.ToString(CultureInfo.InvariantCulture));
 
-    /// <summary>Java <c>getDelayTimeSec</c>：读 TIMER_DELAY_SEC，缺省 0；值非法时与 Java 的
-    /// <c>Long.parseLong</c> 一样直接抛（FormatException），不静默当 0。</summary>
     public long GetDelayTimeSec() => GetTimerProperty(MessageConst.PropertyTimerDelaySec);
 
-    /// <summary>Java <c>setDelayTimeMs</c>：写 TIMER_DELAY_MS（绝对毫秒时刻）。</summary>
     public void SetDelayTimeMs(long timeMs) =>
         PutProperty(MessageConst.PropertyTimerDelayMs, timeMs.ToString(CultureInfo.InvariantCulture));
 
-    /// <summary>Java <c>getDelayTimeMs</c>：读 TIMER_DELAY_MS，缺省 0，非法值直接抛。</summary>
     public long GetDelayTimeMs() => GetTimerProperty(MessageConst.PropertyTimerDelayMs);
 
-    /// <summary>Java <c>setDeliverTimeMs</c>：写 TIMER_DELIVER_MS（绝对毫秒时刻）。</summary>
     public void SetDeliverTimeMs(long timeMs) =>
         PutProperty(MessageConst.PropertyTimerDeliverMs, timeMs.ToString(CultureInfo.InvariantCulture));
 
-    /// <summary>Java <c>getDeliverTimeMs</c>：读 TIMER_DELIVER_MS，缺省 0，非法值直接抛。</summary>
     public long GetDeliverTimeMs() => GetTimerProperty(MessageConst.PropertyTimerDeliverMs);
 
     private long GetTimerProperty(string name)
@@ -316,9 +289,6 @@ public class MessageExt : Message
         ", msgId=" + MsgId + ", topic=" + Topic + "]";
 }
 
-// ---------------------------------------------------------------- MessageBatch
-// 对应 org.apache.rocketmq.common.message.MessageBatch：自身不新增序列化字段，
-// body 由 Encode() 生成（MessageDecoder 的 6 段轻量格式拼接结果）。
 public class MessageBatch : Message
 {
     public List<Message> Messages { get; set; } = new List<Message>();
@@ -336,8 +306,6 @@ public class MessageBatch : Message
 
     public int Size => Messages.Count;
 
-    // 对应 Java MessageBatch.generateFromList：
-    // 非空 / 同 topic / 同 waitStoreMsgOK / 禁止延时 / 禁止重试 topic。
     public static MessageBatch GenerateFromList(List<Message> msgs)
     {
         if (msgs == null || msgs.Count == 0)
@@ -375,17 +343,11 @@ public class MessageBatch : Message
         var batch = new MessageBatch { Messages = msgs };
         batch.Topic = first.Topic;
         batch.WaitStoreMsgOk = first.WaitStoreMsgOk;
-        // 对应 Java MessageBatch.generateFromList + DefaultMQProducer.batch():1176-1182 的**顺序**：
-        // 每条子消息先写好 UNIQ_KEY，编码后随 body 一起下发给 broker（落地 + 消费侧反查的
-        // 轨迹 msgId 来源）。发送侧只对非批量消息补 UNIQ_KEY，所以批量消息的 ID 必须在这里逐条写。
         foreach (Message m in msgs)
         {
             MessageClientIDSetter.SetUniqId(m);
         }
 
-        // Java batch():1179 在 generateFromList 之后给整批那条消息也补一个 ID（inner-batch 时
-        // broker 把它原样回在 batchUniqId 里），它就是这个端口的 SendResult.MsgId；
-        // 最后才编码 body（对应 batch():1181 setBody(encode())）。
         MessageClientIDSetter.SetUniqId(batch);
         batch.Body = batch.Encode();
         batch.IsBatch = true; // 让发送侧把 SendMessageRequestHeader.batch 置 true
@@ -393,8 +355,6 @@ public class MessageBatch : Message
     }
 }
 
-/// <summary>对应 org.apache.rocketmq.common.message.MessageClientIDSetter。
-/// 生成/读取消息属性里的客户端唯一 ID（UNIQ_KEY，32 位十六进制）。</summary>
 public static class MessageClientIDSetter
 {
     /// <summary>UNIQ_KEY 缺失时写入一个 32 位十六进制唯一 ID（幂等）。</summary>

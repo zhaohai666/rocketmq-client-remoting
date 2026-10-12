@@ -5,22 +5,6 @@
 //! 而喂给它们的数据全部来自真实 broker 的往返（真实的 msgId、storeHost、
 //! commitlog offset、实测 RPC 耗时），不是手搓的假数据。
 //!
-//! 场景：
-//! - T1 `top_addressing`：本地起一个地址服务器桩，验证动态 namesrv 取址的
-//!   URL 拼装、换行裁剪、「变化才应用」语义，并**用取到的地址真查一次路由**。
-//! - T2 `latency`：把实测的成/败 RPC 延迟喂给 `MQFaultStrategy`（假时钟 pin
-//!   隔离窗口），验证档位、可用性、以及选队列确实会绕开被隔离的 broker。
-//! - T3 `consumer_stats`：真实拉取的 RT/TPS 过 `ConsumerStatsManager`，
-//!   再用固定时间戳采样，核对 `StatsSnapshot` 的 sum/tps/avgpt/times 算术。
-//! - T4 `hook`：五类钩子跑在真实 SendResult / 真实拉回的消息上，
-//!   重点验证「Send/Consume 吞异常、CheckForbidden 传播异常」这条相反语义。
-//! - T5 `trace`：用真实 msgId 组 `TraceContext`，编码后**当成消息体发到 broker
-//!   再拉回来**，验证 SOH/STX 文本能原样穿过 broker，且解码结果与原始上下文一致。
-//! - T6 `metrics`：真实成功 + 真实失败（连不上的地址）两次记账后的快照。
-//! - T7 `request_reply`：correlationId 形状/唯一性，`RequestFutureHolder`
-//!   投递真实 `MessageExt` 作为应答，并用 broker 写在消息上的 CLUSTER
-//!   属性走 `create_reply_message`（这是 Java 侧唯一的 reply topic 来源）。
-//! - T8 清理：删 broker 侧 topic + namesrv 侧路由。
 //!
 //! ⚠ 唯一非真实的数据：本地集群只有一个 broker，T2 需要一个「第二个 broker」
 //! 才能观察绕开效果，所以按真实 topic 手工补了一组 `broker-b-sim` 队列，
@@ -260,7 +244,6 @@ async fn send_message(
     let mut msg = Message::new(topic, Some(body));
     msg.set_tags(tags);
     msg.set_keys(&format!("{topic}-key"));
-    // Java：非批量消息在发请求前补 UNIQ_KEY，它决定 SendResult.msgId。
     message_client_id_setter::set_uniq_id(&mut msg);
     msg.put_property(message_const::PROPERTY_WAIT_STORE_MSG_OK, "true");
 
@@ -471,7 +454,6 @@ async fn t1_top_addressing(
         &format!("got line={second_get:?}"),
     );
 
-    // 「地址变化才应用」（Java fetchNameServerAddr 的核心语义）。
     let mut applying = ta.clone();
     ck.check(
         "T1 first fetch is applied",
@@ -1259,9 +1241,6 @@ async fn t5_trace(
             && got.msg_type == MessageType::NormalMsg,
         &format!("got={got:?}"),
     );
-    // ⚠ 实测/对拍 Java `TraceDataEncoder` 的 Pub 分支：一行只有 13/14/>=15 段，
-    // **不含 storeTime**，且 clientHost 仅在第 15 段以后才有。所以解出来的 bean
-    // storeTime 必为 0、clientHost 必回落成本机地址 —— 这是格式本身的信息缺失，不是 bug。
     ck.check(
         "T5 a Pub record carries no storeTime (Java's 14-field layout)",
         got.store_time == 0 && got.client_host == local_address(),
@@ -1499,7 +1478,6 @@ async fn t7_request_reply(
         &format!("len={} before={before}", holder.len()),
     );
 
-    // 用真实拉回的消息充当应答投喂（Java 的 processReplyMessage 就是这么做的）。
     let response = match pulled.first() {
         Some(m) => m.clone(),
         None => return Err("no real message to use as a reply".to_string()),
@@ -1578,9 +1556,6 @@ async fn t7_request_reply(
     );
     let mut no_cluster = Message::new(topic, Some(b"x"));
     no_cluster.set_topic(topic);
-    // Java `MessageUtil:49` 抛的是带 `CREATE_REPLY_MESSAGE_EXCEPTION`(10007) 的
-    // MQClientException，不是裸的本地错误：应答 listener 在业务代码里，按码分流才能把
-    //「这条请求不能回话」和别的本地故障分开。
     match create_reply_message(&no_cluster, b"y") {
         Ok(_) => ck.check(
             "T7 create_reply_message refuses a request without CLUSTER",

@@ -1,17 +1,8 @@
-//! 错误类型（对应 `org.apache.rocketmq.remoting.exception.*` 与 `org.apache.rocketmq.client.exception.*`）。
 
 use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// 对应 `org.apache.rocketmq.client.exception.ClientErrorCode`
-/// （Python `rocketmq/client/exception.py:ClientErrorCode`）。
-///
-/// 七个常量与 Java 一一对应：10001~10005 是发送重试的定性，10006/10007 各有各的
-/// 抛出点（request-reply 等不到应答、由请求消息造应答消息失败）。
-/// `sendDefaultImpl` 重试耗尽后用它给最终的 `MQClientException` 定性：
-/// 连不上 broker→10001，等响应超时→10002，客户端自身问题→10003，
-/// 一个 name server 地址都没有→10004，路由查不到→10005。
 pub mod client_error_code {
     pub const CONNECT_BROKER_EXCEPTION: i32 = 10001;
     pub const ACCESS_BROKER_TIMEOUT: i32 = 10002;
@@ -40,14 +31,6 @@ pub enum Error {
     Client { response_code: Option<i32>, message: String },
     /// MQBrokerException
     Broker { response_code: i32, message: String },
-    /// 对应 Python `RequestTimeoutException` / Java `MQClientRequestTimeoutException`
-    /// （两者都是 `MQClientException` 的子类）：请求消息**已经发成功**，但超时窗口内
-    /// 没等到应答。与 [`Error::Timeout`]（remoting 层的 `RemotingTimeoutException`，
-    /// 连响应帧都没等到）区分开 —— 前者应答方可能只是没回，消息其实已投递。
-    ///
-    /// Java 抛的时候带 `ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION`(10006)，所以这一档
-    /// 在 [`Error::response_code`] 上也有值：调用方按码分流时，「没等到应答」（对方可能
-    /// 只是慢）和别的客户端故障不是一类处置。
     RequestTimeout { topic: String, timeout_millis: i64 },
     /// 帧或结构体解码失败
     Decode(String),
@@ -109,13 +92,11 @@ impl From<serde_json::Error> for Error {
 }
 
 impl Error {
-    /// 对应 Java/Python 侧的 `response_code`：只有 broker/客户端业务错误才有值。
     pub fn response_code(&self) -> Option<i32> {
         match self {
             Error::Server { response_code, .. } => Some(*response_code),
             Error::Client { response_code: Some(code), .. } => Some(*code),
             Error::Broker { response_code, .. } => Some(*response_code),
-            // Java 的 RequestTimeoutException 构造时就带上 10006，不是「只有类型没有码」。
             Error::RequestTimeout { .. } => {
                 Some(client_error_code::REQUEST_TIMEOUT_EXCEPTION)
             }
@@ -159,13 +140,9 @@ mod tests {
             e.to_string(),
             "send request message to <TopicTest> OK, but wait reply message timeout, 3000 ms."
         );
-        // Java `RequestTimeoutException(ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, ...)`：
-        // 类型之外码也要带上，调用方按码分流才能把「没等到应答」和别的客户端故障分开。
         assert_eq!(e.response_code(), Some(client_error_code::REQUEST_TIMEOUT_EXCEPTION));
     }
 
-    /// Java `ClientErrorCode` 的七个常量一个都不能改名、改值（只在设置了
-    /// `ROCKETMQ_JAVA_SRC` 时跑，否则静默跳过）。
     #[test]
     fn test_client_error_codes_match_server_contract() {
         let Ok(root) = std::env::var("ROCKETMQ_JAVA_SRC") else {
@@ -194,7 +171,6 @@ mod tests {
         }
     }
 
-    /// 从 Java 源码里抠出 `public static final int <name> = <value>;` 的值。
     fn java_const(text: &str, name: &str) -> Option<i32> {
         let at = text.find(name)?;
         let rhs = &text[at + name.len()..];

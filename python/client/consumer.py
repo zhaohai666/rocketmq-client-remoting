@@ -1,10 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消费者（对应 org.apache.rocketmq.client.consumer.* 的核心能力）。
-
-提供：DefaultMQPushConsumer（注册监听器 + 拉取循环消费）、DefaultMQPullConsumer
-（手动拉取与 offset 管理）、MessageSelector、AllocateMessageQueueStrategy 分配策略、
-MessageQueueListener、消费进度管理、消息重投（sendMessageBack）等。
-"""
 from __future__ import annotations
 
 import bisect
@@ -756,7 +750,6 @@ class DefaultMQPushConsumer:
         self.tls_enable: Optional[bool] = kwargs.pop("tls_enable", None)
         # TLS 细项（caCert=严格 CA 校验；clientCert/clientKey=mTLS；serverName=主机名覆盖）
         self.tls_options: Optional[Dict[str, str]] = kwargs.pop("tls_options", None)
-        # SOCKS 代理（对应 Java SocksProxyConfig + NettyRemotingClient 的代理接入）
         self.socks_proxy_config: Optional[SocksProxyConfig] = kwargs.pop("socks_proxy_config", None)
         self.namespace = namespace
         self.instance_name = MixAll.DEFAULT_INSTANCE_NAME
@@ -968,11 +961,7 @@ class DefaultMQPushConsumer:
         return self.namespace_v2
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
-        """SOCKS 代理配置（对齐 Java SocksProxyConfig：类型/地址/端口/用户名/密码/enable）。
-
-        只在 ``start()`` 建 MQClientInstance 时取一次快照（与 tls_enable 同口径）；
-        传 None 或 enable=False 即不走代理。
-        """
+        pass
         self.socks_proxy_config = socks_proxy_config
 
     def get_socks_proxy_config(self) -> Optional[SocksProxyConfig]:
@@ -1436,9 +1425,6 @@ class DefaultMQPushConsumer:
             if self.client_id is None:
                 self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
                                                       self.enable_stream_request_type)
-            # 对应 Java DefaultMQPushConsumerImpl.start:952 → MQClientManager
-            # .getOrCreateMQClientInstance：同 clientId 复用同一份实例。rpcHook 与
-            # Java 同口径：只认创建实例时的那份（created=True），复用方不重复注册。
             def _create_instance() -> MQClientInstance:
                 return MQClientInstance(
                     self.client_id, self.name_server_addrs,
@@ -1605,15 +1591,10 @@ class DefaultMQPushConsumer:
         with self._lock:
             self._last_pull_table.clear()
         if self._mq_client is not None:
-            # 先把自己从实例的 consumerTable 摘掉（对应 Java unregisterConsumer）：
-            # 复用场景下实例可能还服务其他消费组，残留的死消费者会被 40 通知 /
-            # rebalance_immediately 白白唤醒。
             unregister_consumer = getattr(self._mq_client, "unregister_consumer", None)
             if unregister_consumer is not None:
                 unregister_consumer(self.consumer_group)
             try:
-                # 对应 Java MQClientInstance.shutdown 的引用计数语义：只有最后一个
-                # 持有者（计数归零）才真正关闭实例。
                 MQClientManager.get_instance().unregister_client(
                     self.client_id or "", self._mq_client)
             except Exception:  # noqa: BLE001
@@ -3574,14 +3555,7 @@ class DefaultMQPushConsumer:
 
 
 class PullCallback:
-    """异步拉取回调（对应 Java ``org.apache.rocketmq.client.consumer.PullCallback``）。
-
-    ``on_success`` 收 ``PullResult``（与同步 ``pull()`` 的返回值同型，FOUND /
-    NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL 四态都算成功，只有 RPC 层失败才走
-    ``on_exception``）。回调跑在 ``PullCallbackExecutor_N`` 工作线程上，**不在调用方
-    线程**，所以回调里再发同步 pull / 阻塞操作不会毒化在途请求（对齐 Java 把
-    PullCallback 交给 publicExecutor 的分工）。
-    """
+    pass
 
     def on_success(self, pull_result: PullResult) -> None:
         raise NotImplementedError
@@ -3591,7 +3565,7 @@ class PullCallback:
 
 
 class DefaultMQPullConsumer:
-    """拉模式消费者（对应 org.apache.rocketmq.client.consumer.DefaultMQPullConsumer）。"""
+    pass
 
     def __init__(self, consumer_group: str = MixAll.DEFAULT_CONSUMER_GROUP,
                  rpc_hook: Optional[RPCHook] = None, namespace: str = "",
@@ -3617,7 +3591,6 @@ class DefaultMQPullConsumer:
         self.namespace_v2 = ""
         self.message_model = message_model
         self.broker_suspend_max_time_millis = 20000
-        # SOCKS 代理（对应 Java SocksProxyConfig + NettyRemotingClient 的代理接入）
         self.socks_proxy_config: Optional[SocksProxyConfig] = socks_proxy_config
         self.consumer_pull_timeout_millis = 10000
         self.consumer_timeout_millis_when_suspend = 30000
@@ -3647,18 +3620,8 @@ class DefaultMQPullConsumer:
         self._heartbeat_stop = threading.Event()
         self._mq_client: Optional[MQClientInstance] = None
         self._started = False
-        # ---- 异步拉取（pull_async，对应 Java pull(K, subString, offset, maxNums,
-        # PullCallback, timeout)）----
-        # 双池风格与本端 producer.send_async 一致（AsyncSenderExecutor /
-        # NettyClientPublicExecutor）：
-        # * ``AsyncPullExecutor_N`` —— 在后台线程跑完整 RPC（本端口 client.pull_message
-        #   是同步核，Java 的 invokeAsync 在这里等价于「工作线程里的同步拉」，
-        #   对调用方的契约不变：立即返回、回调恰好一次）。
-        # * ``PullCallbackExecutor_N`` —— 用户回调在这里跑，业务代码不占用拉取工作线程。
-        # 池在**首次 pull_async 时惰性创建**（未 start 时 pull_async 直接同步抛，
-        # 与 producer 的「未 start 同步抛」同口径），shutdown 时关掉。
         self.async_pull_queue_capacity = 50000
-        self.pull_callback_executor_threads = 0  # 0 → CPU 核数（Java publicExecutor 兜底）
+        self.pull_callback_executor_threads = 0
         self._async_pull_executor: Optional[ConsumeExecutor] = None
         self._pull_callback_executor: Optional[ConsumeExecutor] = None
         self._async_pull_lock = threading.Lock()
@@ -3725,11 +3688,7 @@ class DefaultMQPullConsumer:
         return self.namespace_v2
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
-        """SOCKS 代理配置（对齐 Java SocksProxyConfig：类型/地址/端口/用户名/密码/enable）。
-
-        只在 ``start()`` 建 MQClientInstance 时取一次快照（与 tls_enable 同口径）；
-        传 None 或 enable=False 即不走代理。
-        """
+        pass
         self.socks_proxy_config = socks_proxy_config
 
     def get_socks_proxy_config(self) -> Optional[SocksProxyConfig]:
@@ -3855,8 +3814,6 @@ class DefaultMQPullConsumer:
         if self.client_id is None:
             self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
                                                   self.enable_stream_request_type)
-        # 对应 Java DefaultMQPullConsumerImpl.start:716 → MQClientManager
-        # .getOrCreateMQClientInstance：同 clientId 复用同一份实例。
         def _create_instance() -> MQClientInstance:
             return MQClientInstance(self.client_id, self.name_server_addrs,
                                     socks_proxy_config=self.socks_proxy_config,
@@ -3903,11 +3860,6 @@ class DefaultMQPullConsumer:
             if self._pull_callback_executor is not None:
                 self._pull_callback_executor.shutdown()
                 self._pull_callback_executor = None
-        # 优雅注销（对齐 Java DefaultMQPullConsumerImpl.shutdown:689-692：
-        # unregisterConsumer → mQClientFactory.shutdown）：立刻从各 broker 的
-        # ConsumerManager 摘除本组，不必等心跳超时（默认 ~120s）。本端口没有 Java 的
-        # 本地位点表，所以 `persistConsumerOffset()` 那一步无对应物（位点由调用方
-        # update_consume_offset 直接写给 broker）。
         client = self._mq_client
         if client is not None:
             try:
@@ -4051,25 +4003,7 @@ class DefaultMQPullConsumer:
     def pull_async(self, mq: MessageQueue, sub_expression: str = "*", offset: int = 0,
                    max_nums: int = 32, callback: Optional[PullCallback] = None,
                    timeout_millis: Optional[int] = None) -> None:
-        """异步拉取（对应 Java ``DefaultMQPullConsumer.pull(K, subString, offset, maxNums,
-        PullCallback, timeout)``）。
-
-        **调用方立即返回**：RPC 在 ``AsyncPullExecutor_N`` 工作线程上完成（本端口
-        ``client.pull_message`` 是同步核，所以异步 = 后台线程跑同步拉，与 producer 批量
-        异步走「线程池里的同步内核」同一手法），完成后把回调投递到
-        ``PullCallbackExecutor_N`` 上执行，恰好一次：
-
-        * 正常应答（含 OFFSET_ILLEGAL 等四个 PullStatus）→ ``on_success(PullResult)``；
-        * RPC 异常（超时 / broker 错误 / 无路由）→ ``on_exception(e)``；
-        * 排队等不到出站就超预算 → 不发请求，直接 ``on_exception(
-          RemotingTooMuchRequestException)``（Java ``sendDefaultImpl`` 排队超时同款止损）；
-        * 队列满（``async_pull_queue_capacity``，默认 50000）→ **同步抛** MQClientException
-          ("executor rejected")（与本端 producer.send_async 一致，不走回调）。
-
-        超时预算从调用时刻起算，包含排队时间；``timeout_millis`` 省略时用
-        ``consumer_pull_timeout_millis``（与同步 ``pull()`` 同一默认）。
-        未 start / 已 shutdown 直接同步抛（与本端 send_async 的有意差别同口径）。
-        """
+        pass
         self._require_client()  # 未启动同步抛，不等回调（排查友好，同 send_async）
         if callback is None:
             raise MQClientException("callback is required for pull_async")
@@ -4229,7 +4163,6 @@ class DefaultLitePullConsumer:
         # nsd=true / ns=<值>，见 remoting/rpchook.py 的 NamespaceRpcHook。
         self.namespace_v2 = ""
         self.message_model = message_model
-        # SOCKS 代理（对应 Java SocksProxyConfig + NettyRemotingClient 的代理接入）
         self.socks_proxy_config: Optional[SocksProxyConfig] = socks_proxy_config
         self.name_server_addrs: List[str] = []
         self.rpc_hook = rpc_hook
@@ -4342,11 +4275,7 @@ class DefaultLitePullConsumer:
         return self.namespace_v2
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
-        """SOCKS 代理配置（对齐 Java SocksProxyConfig：类型/地址/端口/用户名/密码/enable）。
-
-        只在 ``start()`` 建 MQClientInstance 时取一次快照（与 tls_enable 同口径）；
-        传 None 或 enable=False 即不走代理。
-        """
+        pass
         self.socks_proxy_config = socks_proxy_config
 
     def get_socks_proxy_config(self) -> Optional[SocksProxyConfig]:
@@ -4488,9 +4417,6 @@ class DefaultLitePullConsumer:
         if self.client_id is None:
             self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
                                                   self.enable_stream_request_type)
-        # 对应 Java DefaultLitePullConsumerImpl.start:293 → MQClientManager
-        # .getOrCreateMQClientInstance：同 clientId 复用同一份实例（_create_client
-        # 只在缓存未命中时才被调用，测试替身也经由此处进入缓存）。
         self._mq_client, created = MQClientManager.get_instance() \
             .get_or_create_mq_client_instance(self.client_id, self._create_client)
         if created and self.rpc_hook is not None:
@@ -4834,8 +4760,6 @@ class DefaultLitePullConsumer:
     def poll(self, timeout: Optional[int] = None) -> List[MessageExt]:
         if timeout is None:
             timeout = self.poll_timeout_millis
-        # Java poll() 进来先按截止时刻试一次自动提交（拿锁之前做：提交要发 RPC，
-        # 抱着缓冲锁等网络会把 _enqueue 一起卡住）。
         if self.auto_commit:
             self._maybe_auto_commit()
         deadline = time.time() + (timeout / 1000.0)
@@ -4848,9 +4772,6 @@ class DefaultLitePullConsumer:
             out: List[MessageExt] = []
             while self._local_buffer and len(out) < 1024:
                 out.append(self._local_buffer.popleft())
-        # 对位 Java poll()：消息交到调用方手上才推进"已消费游标"
-        # （assignedMessageQueue.updateConsumeOffset(mq, processQueue.removeMessage(msgs))）。
-        # 拉取游标 _next_offset 一律不动——提交位点绝不能改掉"下次从哪拉"。
         held = {(q.topic, q.broker_name, q.queue_id): q for q in self._next_offset}
         advanced: Dict[MessageQueue, int] = {}
         for m in out:
@@ -4866,8 +4787,6 @@ class DefaultLitePullConsumer:
     def seek(self, mq: MessageQueue, offset: int) -> None:
         self._seek_offset[mq] = offset
         self._next_offset[mq] = offset
-        # Java 的 seek 只置 seekOffset，下一次拉取时 nextPullOffset() 才把它同时写进
-        # consumeOffset（"跳回去"意味着"那里之前都还没消费"，否则重放的消息会被位点跳过）。
         self._consume_offset[mq] = offset
         with self._buffer_cond:
             kept = [m for m in self._local_buffer
@@ -4988,32 +4907,15 @@ class DefaultLitePullConsumer:
         return list(self._assigned)
 
     def fetch_message_queues(self, topic: str) -> List[MessageQueue]:
-        # Java DefaultLitePullConsumer#fetchMessageQueues 的入口套命名空间（:325-327），
-        # Impl 这一层不再套 —— 见 _fetch_message_queues_by_full_name。
         return self._fetch_message_queues_by_full_name(self._with_namespace(topic))
 
     def _fetch_message_queues_by_full_name(self, full_topic: str) -> List[MessageQueue]:
-        """按**已套好命名空间**的 topic 全名取订阅队列集合。
-
-        对应 Java DefaultLitePullConsumerImpl#fetchMessageQueues:1224 →
-        MQAdminImpl#fetchSubscribeMessageQueues:169-183（订阅信息：读位、不筛 master）。
-        ⚠ 两件事必须在这里做对，否则队列变更监听会静默失真：
-        1. 入参已是全名。Java 的 withNamespace 发生在外层 DefaultLitePullConsumer:325-327，
-           Impl 这一层直接拿 map key 去查（:1234）；本端口的 ``NamespaceUtil`` 与 Java 一样
-           幂等（已带前缀原样返回），所以按全名取只是省掉一次无谓重拼，并把分层写清楚。
-        2. 每轮都直接问 nameserver，**不吃 30s 周期刷新的路由缓存**。
-           少了强制刷新，扩容最快也要等一次路由轮询才看得见，监听回调就滞后一个
-           周期（默认 30s+30s）。
-        3. 空队列集一律当"查不到"抛错，不返回空列表：返回空会被监听器读成"这个 topic
-           缩到 0 队列"，于是 nameserver 抖动 = 一次假缩容回调 + 快照被清空。
-        """
+        pass
         if self._mq_client is None:
             raise MQClientException("consumer not started, call start() first")
         try:
             self._mq_client.update_topic_route_info_from_name_server(full_topic)
         except Exception as e:  # noqa: BLE001
-            # 拉不到就用当下缓存再判一次：缓存里还有路由时不该把瞬时网络抖动报成
-            # "这个 topic 没队列"（Java 的 fetch 失败会被外层 catch 成一条 error 日志）。
             logger.debug("fetch queues: route refresh for %s failed: %s", full_topic, e)
         queues = self._mq_client.get_topic_subscribe_info(full_topic)
         if not queues:
@@ -5033,16 +4935,7 @@ class DefaultLitePullConsumer:
     # ---------------- topic 队列集合变更监听 ----------------
     def register_topic_message_queue_change_listener(
             self, topic: str, listener: TopicMessageQueueChangeListener) -> None:
-        """对应 Java registerTopicMessageQueueChangeListener（DefaultLitePullConsumer:325 →
-        Impl:1267-1279）：后台任务按 ``topic_metadata_check_interval_millis`` 拉取该 topic 的
-        订阅队列集合，与上一次快照做集合相等比对，**有变化**才回调 ``on_changed``。
-
-        与 Java 逐条对齐：
-        * topic/listener 为空 → 抛 ``MQClientException("Topic or listener is null")``；
-        * 重复注册同一 topic → 覆盖旧监听器并 warn 一条（Java :1272）；
-        * 键取 ``withNamespace(topic)``（Java :327 在入口就套好），回调收到的也是它；
-        * 运行中注册立刻记一版快照（:1275-1277），否则首轮比对会把"当前集合"误报成变化。
-        """
+        pass
         if not topic or listener is None:
             raise MQClientException("Topic or listener is null")
         ns = self._with_namespace(topic)
@@ -5060,13 +4953,7 @@ class DefaultLitePullConsumer:
                 logger.debug("register listener: fetch queues for %s failed: %s", ns, e)
 
     def fetch_topic_message_queues_and_compare(self) -> int:
-        """对应 Java Impl#fetchTopicMessageQueuesAndCompare:1230-1244，返回回调次数。
-
-        ⚠ 与 Java 的一处**有意差别**：Java 的 catch 在 startScheduleTask 的包装层
-        （Impl:382-393），所以一个 topic 取路由失败会放弃**本轮其余 topic**；本端口把
-        catch 收进循环体，只跳过那一个 topic，避免一个长期无路由的 topic 把排在它后面的
-        监听器永久饿死（Java 里 HashMap 顺序决定谁被饿死）。快照仍只在"真的取到"之后推进。
-        """
+        pass
         with self._topic_listener_lock:
             entries = list(self._topic_change_listeners.items())
         fired = 0
@@ -5086,8 +4973,6 @@ class DefaultLitePullConsumer:
     @staticmethod
     def _is_set_equal(set1: Optional[Set[MessageQueue]],
                       set2: Optional[Set[MessageQueue]]) -> bool:
-        # Java Impl#isSetEqual:1246-1260 逐条照搬：双 None 才算相等，
-        # 单边 None 或数量不等直接不等，最后逐元素包含。
         if set1 is None and set2 is None:
             return True
         if set1 is None or set2 is None or len(set1) != len(set2):
@@ -5095,9 +4980,6 @@ class DefaultLitePullConsumer:
         return all(mq in set1 for mq in set2)
 
     def _metadata_loop(self, first_delay_millis: float = 10000) -> None:
-        # Java startScheduleTask（Impl:382-393）：启动后 10s 首查，此后每
-        # topicMetadataCheckIntervalMillis 一趟。首查延迟做成入参只为单测能缩短等待，
-        # 默认值仍是 Java 的 10s。
         deadline = time.monotonic() + first_delay_millis / 1000.0
         while self._running:
             time.sleep(0.2)

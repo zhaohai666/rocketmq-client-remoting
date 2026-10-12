@@ -381,11 +381,6 @@ class DefaultMQProducer
     public ?bool $tlsEnable;
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
-    /**
-     * SOCKS 代理（对应 Java ClientConfig 的 socksProxyConfig → SocksProxyConfig）：
-     * 配了则 NameServer + Broker 的 remoting 连接都经代理（TCP→SOCKS CONNECT→TLS）。
-     * 动态取址的 HTTP 请求不走代理。只在 start() 建 MQClientInstance 时透传一次。
-     */
     public ?SocksProxyConfig $socksProxy = null;
     /** W3C traceparent 透传（opt-in） */
     public bool $enableTraceContext;
@@ -448,23 +443,13 @@ class DefaultMQProducer
     // 路由刷新周期（默认 30000ms）。
     // 只在 start() 建 MQClientInstance 时透传一次，之后修改不生效：排期按启动时的周期定下。
     public int $pollNameServerInterval = 30000;
-    // 发送延迟故障规避：默认关闭，与 Java sendLatencyFaultEnable 一致
     public bool $sendLatencyFaultEnable = false;
     public MQFaultStrategy $mqFaultStrategy;
 
-    // ---- 主动探活（对应 Java ClientConfig 的 startDetectorEnable / detectTimeout /
-    // detectInterval，默认值一致：关 / 200ms / 2000ms。Java 的 startDetectorEnable 还能从
-    // 系统属性 com.rocketmq.startDetectorEnable 读初始值，PHP 无此机制，一律默认关。）
-    // 探测轮收敛在 MQClientInstance::tick() 里同步跑（无线程），见 registerFaultStrategy。----
     public bool $startDetectorEnable = false;
     public int $detectTimeout = 200;
     public int $detectInterval = 2000;
 
-    // ---- 自动攒批（对应 Java DefaultMQProducer 的 autoBatch / batchMaxDelayMs /
-    // batchMaxBytes / totalBatchMaxBytes）----
-    // 四个配置在 Java 里都是"先记在 producer 上、start() 建累加器时再同步下去"，
-    // 因为累加器是按 clientId 复用的（同 clientId 的第二个 producer 会**复用**第一个
-    // 的累加器，此时 setter 立即生效、不再重新初始化）。-1 表示"不动累加器的默认值"。
     public bool $autoBatch = false;
     public int $batchMaxDelayMs = -1;
     public int $batchMaxBytes = -1;
@@ -554,12 +539,9 @@ class DefaultMQProducer
         ];
         $this->metrics = new ClientMetrics();
         $this->mqFaultStrategy = new MQFaultStrategy(false);
-        // 对应 Java MQFaultStrategy 构造器把 ClientConfig 的探测配置同步进容错表
-        // （setStartDetectorEnable / setDetectInterval / setDetectTimeout）
         $this->mqFaultStrategy->setStartDetectorEnable($this->startDetectorEnable);
         $this->mqFaultStrategy->setDetectTimeout($this->detectTimeout);
         $this->mqFaultStrategy->setDetectInterval($this->detectInterval);
-        // Java 在建 impl 时按配置建两个公平信号量，并对越界的配置兜地板值
         $this->semaphoreAsyncSendNum = new FairSemaphore(
             self::backPressurePermits(
                 $this->backPressureForAsyncSendNum,
@@ -728,7 +710,6 @@ class DefaultMQProducer
         $this->instanceName = $name;
     }
 
-    /** 对应 Java `ClientConfig#setUnitName`：影响 clientId 后缀与动态取址 URL。 */
     public function setUnitName(?string $unitName): void
     {
         $this->unitName = $unitName;
@@ -739,7 +720,6 @@ class DefaultMQProducer
         return $this->unitName;
     }
 
-    /** 对应 Java `ClientConfig#setUnitMode`：随请求头/心跳上报给 broker。 */
     public function setUnitMode(bool $unitMode): void
     {
         $this->unitMode = $unitMode;
@@ -750,17 +730,11 @@ class DefaultMQProducer
         return $this->unitMode;
     }
 
-    /** 对应 Java `ClientConfig#setEnableStreamRequestType`。 */
     public function setEnableStreamRequestType(bool $enable): void
     {
         $this->enableStreamRequestType = $enable;
     }
 
-    /**
-     * 对应 Java `ClientConfig#setNamespaceV2`：服务端命名空间（`nsd`/`ns` 扩展头），
-     * 不改 topic/group 名；与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
-     * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
-     */
     public function setNamespaceV2(string $namespaceV2): void
     {
         $this->namespaceV2 = $namespaceV2;
@@ -769,13 +743,11 @@ class DefaultMQProducer
         }
     }
 
-    /** 对应 Java `ClientConfig#getNamespaceV2`。 */
     public function getNamespaceV2(): string
     {
         return $this->namespaceV2;
     }
 
-    /** 对应 Java `NettyClientConfig#setSocksProxyConfig`：null 清除。start() 前设置。 */
     public function setSocksProxy(?SocksProxyConfig $proxy): void
     {
         $this->socksProxy = $proxy;
@@ -821,7 +793,6 @@ class DefaultMQProducer
         return $this->retryAnotherBrokerWhenNotStoreOk;
     }
 
-    // ---------------- 异步发送背压（Java DefaultMQProducer:1368-1408）----------------
 
     public function setEnableBackpressureForAsyncMode(bool $enable): void
     {
@@ -833,18 +804,6 @@ class DefaultMQProducer
         return $this->enableBackpressureForAsyncMode;
     }
 
-    /**
-     * 运行时改「在途条数」上限（Java ``setBackPressureForAsyncSendNum:1383-1391``）。
-     *
-     * 语义不是「设成 num」而是「总量变成 num、已经在途的那几份原样保留」：改完之后
-     * ``空闲许可 = num - 在途份数``（Java 写成先算 ``acquired = 旧配置 - 空闲``、再
-     * ``new Semaphore(num - acquired)``，同一个结果，它的测试断言的正是这个和，见
-     * ``DefaultMQProducerTest:593-595``）。所以调小之后空闲许可可能是负数（在途超额），
-     * 归还许可时才慢慢回正 —— Java 的 ``new Semaphore(负数)`` 同样接受。
-     *
-     * ⚠ 改容量要走这个方法，别直接赋 ``backPressureForAsyncSendNum``：
-     * 直接改字段只动配置值，信号量不会跟着变（Java 的字段是 private，没这个坑）。
-     */
     public function setBackPressureForAsyncSendNum(int $num): void
     {
         $num = max($num, FairSemaphore::MIN_ASYNC_SEND_NUM);
@@ -870,7 +829,6 @@ class DefaultMQProducer
         return $this->backPressureForAsyncSendSize;
     }
 
-    /** 对应 Java ``DefaultMQProducerImpl:200-202``（观测用，也是改容量的输入）。 */
     public function getSemaphoreAsyncSendNumAvailablePermits(): int
     {
         return $this->semaphoreAsyncSendNum->availablePermits();
@@ -929,20 +887,13 @@ class DefaultMQProducer
         $this->producerGroup = $group;
     }
 
-    /** 对应 Java DefaultMQProducer.setSendLatencyFaultEnable。默认关闭。 */
     public function setSendLatencyFaultEnable(bool $enable): void
     {
         $this->sendLatencyFaultEnable = $enable;
         $this->mqFaultStrategy->setSendLatencyFaultEnable($enable);
     }
 
-    // ---------------- 主动探活（对应 Java DefaultMQProducer.setStartDetectorEnable /
-    // setDetectTimeout / setDetectInterval：ClientConfig 与策略两处同时写，运行中可翻转）----------------
 
-    /**
-     * 对应 Java DefaultMQProducer.setStartDetectorEnable（DefaultMQProducer:1449-1452：
-     * super 写 ClientConfig，再写 impl 的 mqFaultStrategy）。默认关闭。
-     */
     public function setStartDetectorEnable(bool $enable): void
     {
         $this->startDetectorEnable = $enable;
@@ -954,7 +905,6 @@ class DefaultMQProducer
         return $this->startDetectorEnable;
     }
 
-    /** 单次探测的超时预算（Java ClientConfig.detectTimeout，默认 200ms）。 */
     public function setDetectTimeout(int $timeoutMillis): void
     {
         $this->detectTimeout = $timeoutMillis;
@@ -966,7 +916,6 @@ class DefaultMQProducer
         return $this->detectTimeout;
     }
 
-    /** 每个 broker 的探测周期（Java ClientConfig.detectInterval，默认 2000ms）。 */
     public function setDetectInterval(int $intervalMillis): void
     {
         $this->detectInterval = $intervalMillis;
@@ -984,19 +933,7 @@ class DefaultMQProducer
         $this->requestTimeout = $timeoutMillis;
     }
 
-    // ---------------- 自动攒批（对应 Java DefaultMQProducer:1189-1243）----------------
-    // 这套 setter 是"两处记账"：先写 producer 自己的字段（保证 start() 之前设置也生效），
-    // 累加器已存在时**立刻**同步下去（Java 同）。三个 getter 在累加器还没建时返回 0，
-    // 与 Java 的 `if (produceAccumulator == null) return 0;` 一致（不是 -1）。
 
-    /**
-     * 开关自动攒批（Java ``setAutoBatch``，默认 false）。
-     *
-     * 打开后 ``send(Message)``（未显式给 timeout、且不是批量消息）会按
-     * ``AggregateKey(topic, mq, waitStoreMsgOK, tag)`` 攒批，攒够 ``batchMaxDelayMs``
-     * 或 ``batchMaxBytes`` 再发。**没 start 时 getAutoBatch() 恒为 false**（Java 的
-     * ``getAutoBatch`` 有 ``produceAccumulator == null`` 短路）。
-     */
     public function setAutoBatch(bool $autoBatch): void
     {
         $this->autoBatch = $autoBatch;
@@ -1015,7 +952,6 @@ class DefaultMQProducer
         return $this->getAutoBatch();
     }
 
-    /** 单批最大等待毫秒（Java ``batchMaxDelayMs``，取值 (0, 30000]）。 */
     public function setBatchMaxDelayMs(int $holdMs): void
     {
         $this->batchMaxDelayMs = $holdMs;
@@ -1032,7 +968,6 @@ class DefaultMQProducer
         return $this->produceAccumulator->getBatchMaxDelayMs();
     }
 
-    /** 单批最大字节（Java ``batchMaxBytes``，取值 (0, 2MB]）。 */
     public function setBatchMaxBytes(int $holdSize): void
     {
         $this->batchMaxBytes = $holdSize;
@@ -1049,11 +984,6 @@ class DefaultMQProducer
         return $this->produceAccumulator->getBatchMaxBytes();
     }
 
-    /**
-     * **全部**在途批次的总字节上限（Java ``totalBatchMaxBytes``，> 0）。
-     *
-     * 超过之后 ``tryAddMessage`` 会拒绝新消息，``send()`` 自动退回直发。
-     */
     public function setTotalBatchMaxBytes(int $totalHoldSize): void
     {
         $this->totalBatchMaxBytes = $totalHoldSize;
@@ -1076,14 +1006,7 @@ class DefaultMQProducer
         return $this->metrics;
     }
 
-    // ---------------- 消息轨迹配置（对应 Java ClientConfig / DefaultMQProducer）----------------
 
-    /**
-     * 开关消息轨迹（Java ``ClientConfig.setEnableTrace``，默认 false）。
-     *
-     * 开启后 ``start()`` 会注册 SendMessageTraceHook，把每条消息的发送轨迹
-     * 异步发到轨迹 topic。**内部轨迹生产者自身必须保持关闭**，否则无限递归。
-     */
     public function setEnableTrace(bool $enable): void
     {
         $this->enableTrace = $enable;
@@ -1094,7 +1017,6 @@ class DefaultMQProducer
         return $this->enableTrace;
     }
 
-    /** 自定义轨迹 topic（Java ``ClientConfig.setTraceTopic``）；空则用系统默认。 */
     public function setTraceTopic(?string $traceTopic): void
     {
         $this->traceTopic = $traceTopic;
@@ -1105,7 +1027,6 @@ class DefaultMQProducer
         $this->traceMsgBatchNum = $n;
     }
 
-    /** 注册发送钩子（对应 Java DefaultMQProducerImpl.registerSendMessageHook）。 */
     public function registerSendMessageHook(SendMessageHook $hook): void
     {
         $this->sendMessageHookList[] = $hook;
@@ -1116,9 +1037,7 @@ class DefaultMQProducer
         return $this->sendMessageHookList !== [];
     }
 
-    // ---------------- 发送前拦截钩子（对应 Java CheckForbiddenHook 三个方法）----------------
 
-    /** 注册发送前拦截钩子（Java DefaultMQProducerImpl.registerCheckForbiddenHook:186）。 */
     public function registerCheckForbiddenHook(CheckForbiddenHook $hook): void
     {
         $this->checkForbiddenHookList[] = $hook;
@@ -1134,11 +1053,6 @@ class DefaultMQProducer
         return $this->sendMessageHookList !== [] || $this->checkForbiddenHookList !== [];
     }
 
-    /**
-     * ⚠ 与 send/consume 钩子不同：这里**不吞异常**（Java 签名 ``throws MQClientException``）。
-     *
-     * 钩子抛出的异常会沿 sendDefaultImpl 的重试链向上传播，这正是"禁止发送"的实现方式。
-     */
     public function executeCheckForbiddenHook(CheckForbiddenContext $context): void
     {
         if (!$this->hasCheckForbiddenHook()) {
@@ -1149,7 +1063,6 @@ class DefaultMQProducer
         }
     }
 
-    /** 注册事务收尾钩子（对应 Java registerEndTransactionHook）。 */
     public function registerEndTransactionHook(EndTransactionHook $hook): void
     {
         $this->endTransactionHookList[] = $hook;
@@ -1166,9 +1079,7 @@ class DefaultMQProducer
         }
     }
 
-    // ---------------- 发送钩子调用（对应 Java executeSendMessageHookBefore/After）----------------
 
-    /** 钩子异常一律吞掉并记 warn（Java DefaultMQProducerImpl:1159）。 */
     public function executeSendMessageHookBefore(SendMessageContext $context): void
     {
         foreach ($this->sendMessageHookList as $hook) {
@@ -1191,12 +1102,6 @@ class DefaultMQProducer
         }
     }
 
-    /**
-     * 构造 SendMessageContext（对齐 Java DefaultMQProducerImpl:969-989）。
-     *
-     * msgType 的判定顺序也照抄：TRAN_MSG=true → Trans_Msg_Half；
-     * 带任何延迟类属性 → Delay_Msg；否则 Normal_Msg。
-     */
     private function buildSendContext(
         Message $msg,
         MessageQueue $mq,
@@ -1246,20 +1151,6 @@ class DefaultMQProducer
         $this->executeCheckForbiddenHook($context);
     }
 
-    /**
-     * 每次发请求都要带上、且只来源于 producer 配置的那几个头字段（键名即
-     * ``MQClientInstance::sendMessage`` 的命名参数，可直接 ``...`` 展开）。
-     *
-     * 对位 Java `DefaultMQProducerImpl.sendKernelImpl`：
-     *   - :996-997 `setDefaultTopic(producer.getCreateTopicKey())` /
-     *     `setDefaultTopicQueueNums(producer.getDefaultTopicQueueNums())` ——
-     *     broker 侧新建 topic 时用这两个值决定队列数，写死默认值会让
-     *     `setCreateTopicKey` / `setDefaultTopicQueueNums` 变成假 setter。
-     *   - :1007 `setBrokerName(brokerName)`，V2 编码成单字母键 `n`。
-     *   - unit_mode 同 :991。
-     *
-     * @return array{unitMode: bool, defaultTopic: string, defaultTopicQueueNums: int}
-     */
     private function sendHeaderArgs(): array
     {
         return [
@@ -1269,16 +1160,6 @@ class DefaultMQProducer
         ];
     }
 
-    /**
-     * 真正发起请求的那一步（对应 Java sendKernelImpl 内的钩子点）。
-     *
-     * 执行顺序严格照抄 Java `sendKernelImpl:956-990`：
-     *   1. **CheckForbiddenHook**（每次尝试都跑；异常**不吞**，直接抛给重试链）
-     *   2. SendMessageHook.before
-     *   3. 发请求
-     *   4. SendMessageHook.after（成功带 sendResult / 失败带 exception）
-     * 重试时每轮都会重建 context，所以钩子会被调用多次 —— 与 Java 一致。
-     */
     private function sendWithHooks(
         MQClientInstance $client,
         Message $msg,
@@ -1334,15 +1215,9 @@ class DefaultMQProducer
         if ($this->started) {
             return;
         }
-        // 生产者组也拼命名空间（对齐 Java DefaultMQProducer.start:375
-        // setProducerGroup(withNamespace(producerGroup))），broker 侧按带前缀的组名登记
         if ($this->namespace !== '') {
             $this->producerGroup = NamespaceUtil::wrapNamespace($this->namespace, $this->producerGroup);
         }
-        // 对应 Java DefaultMQProducerImpl.checkConfig（:295）：组名校验排在拼完命名空间之后
-        // （Java 也是 start() 先 withNamespace 再 impl.start()），并且要挡住
-        // DEFAULT_PRODUCER —— 多进程共用默认组会互相踢下线。checkConfig 是 Java start() 的
-        // 第一步，所以这里也领先于 name server 地址检查。
         Validators::checkGroup($this->producerGroup);
         if ($this->producerGroup === MixAll::DEFAULT_PRODUCER_GROUP) {
             throw new MQClientException(sprintf(
@@ -1351,17 +1226,8 @@ class DefaultMQProducer
             ));
         }
         if ($this->nameServerAddrs === [] && !DefaultTopAddressing::isConfigured()) {
-            // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用。
-            // 码值用 Java 的 10004（``validateNameServerSetting`` 对同一个故障给的码）：
-            // Java 不在 start() 里查，故障要等第一次发送才以 10004 冒出来，本端口
-            // 提前到 start（更可预期），但不能让调用方看到两种不同的码。
             throw new MQClientException('name server address is not set', ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
         }
-        // 对应 Java `DefaultMQProducerImpl#start`:250-252 的两步：先
-        // `changeInstanceNameToPID`（Java 只对非 CLIENT_INNER_PRODUCER 的生产者做，
-        // 本客户端没有内部生产者，所以无条件执行），再由 `ClientConfig#buildMQClientId`
-        // 拼 `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。instanceName 就地写回，
-        // 和 Java 一样：第二次 start() 复用同一个 clientId，而不是每重启一次换一个名字。
         $this->instanceName = MixAll::changeInstanceNameToPid($this->instanceName);
         if ($this->clientId === null) {
             $this->clientId = MixAll::clientIdFor($this->instanceName, $this->unitName, $this->enableStreamRequestType);
@@ -1392,19 +1258,10 @@ class DefaultMQProducer
             RequestCode::CHECK_TRANSACTION_STATE,
             $this->handleCheckTransactionState(...)
         );
-        // 异步发送的两个线程池（Java 在构造器里 new，线程本身按需创建）
         $this->createAsyncExecutors();
-        // 自动攒批：按 clientId 复用累加器（Java DefaultMQProducerImpl:256 →
-        // MQClientManager.getOrCreateProduceAccumulator），并把 producer 上先设好的
-        // 三个阈值同步过去。放在 registerProducer 之前，与 Java 同序。
         $this->initProduceAccumulator();
         $this->started = true;
         $this->heartbeatRunning = true;
-        // 对应 Java DefaultMQProducerImpl.start:266 的 initTopicRoute()：把构造时声明的
-        // topic 逐个 tryToFindTopicPublishInfo（拉路由并登记"在用"）。路由拉不到只记日志
-        // 不报错（Java 同）。紧随其后的主动探活挂接依赖这一步——Java 探测器的 pickTopic
-        // 就是从这里填充的 topicPublishInfoTable 取第一个 topic；PHP 的探测 topic 取自
-        // 实例的 topicsInUse（topicPublishInfo 登记时写入）。
         foreach ($this->topics as $topic) {
             $newTopic = $this->withNamespace($topic);
             try {
@@ -1416,31 +1273,13 @@ class DefaultMQProducer
                 Logger::warning(sprintf('initTopicRoute failed for %s: %s', $newTopic, $e->getMessage()));
             }
         }
-        // 主动探活挂接（Java DefaultMQProducerImpl.start:272 的 mqFaultStrategy.startDetector()，
-        // 即 LatencyFaultToleranceScheduledThread 的 scheduleAtFixedRate(3s)）：PHP 无线程，
-        // 把策略注册进客户端实例，探测轮由实例的 tick() 按到期判定驱动（开关每轮现读，
-        // 运行中 setStartDetectorEnable 照样生效）。
         $this->mqClient->registerFaultStrategy($this->mqFaultStrategy);
-        // 守卫线程要在生产者本体起来之后再拉（Java DefaultMQProducer.start:377-379：
-        // impl.start() 返回后 accumulated.start()）。
-        // ⚠ PHP 无线程：心跳线程（Python _heartbeat_loop）不启动，改由调用方显式
-        // ``heartbeatOnce()`` 驱动；不注册心跳时 COMMIT/ROLLBACK 仍能成功（客户端主动
-        // END_TRANSACTION），但 UNKNOW 的半消息不会被回查。
         if ($this->produceAccumulator !== null) {
             $this->produceAccumulator->start();
         }
-        // 轨迹分发器在锁外启动（Java 同样在 defaultMQProducerImpl.start() 之后做）：
-        // 它要新建内部生产者并拉路由，属网络操作。
         $this->startTraceDispatcher();
     }
 
-    /**
-     * 对应 Java DefaultMQProducer.start():380-405。
-     *
-     * enableTrace=true 时建 AsyncTraceDispatcher（Type=PRODUCE）并注册
-     * SendMessageTraceHook；随后无论新建还是复用，都要 start 它。
-     * 任何异常都只记日志 —— 轨迹挂了不能影响正常发送。
-     */
     private function startTraceDispatcher(): void
     {
         if ($this->enableTrace) {
@@ -1453,8 +1292,6 @@ class DefaultMQProducer
                     $this->rpcHook
                 );
                 $dispatcher->setHostProducer($this);
-                // 对应 Java DefaultMQProducer.start:384：轨迹走的是分发器**自己的**内部生产者，
-                // 它也得带 namespaceV2，否则 serverless 实例里轨迹被 broker 当默认实例丢掉。
                 $dispatcher->setNamespaceV2($this->namespaceV2);
                 $this->traceDispatcher = $dispatcher;
                 $this->registerSendMessageHook(new SendMessageTraceHook($dispatcher));
@@ -1478,10 +1315,6 @@ class DefaultMQProducer
             return;
         }
         $this->heartbeatRunning = false;
-        // 对齐 Java DefaultMQProducerImpl.shutdown:313-317：先关异步发送池，再关客户端实例。
-        // ⚠ Java 这里用的是不等待的 shutdown()，所以「send_async 完立刻 shutdown」会丢掉
-        // 还没跑完的任务（回调里拿到 RemotingConnectException）。本实现照抄：不等。
-        // 调用方要确保发完，自己等回调。
         if ($this->asyncSenderExecutor !== null) {
             $this->asyncSenderExecutor->shutdown();
             $this->asyncSenderExecutor = null;
@@ -1490,15 +1323,6 @@ class DefaultMQProducer
             $this->callbackExecutor->shutdown();
             $this->callbackExecutor = null;
         }
-        // 优雅注销（对齐 Java DefaultMQProducerImpl.shutdown:313 →
-        // MQClientInstance.unregisterProducer:1198-1201 → unregisterClient(group, null)）：
-        // 逐台 broker 发 UNREGISTER_CLIENT(35)，让 broker 端 ProducerManager 立刻把本
-        // clientId 从 groupChannelTable 摘掉。不发的话只能等心跳超时（默认 ~120s）清理，
-        // 这段时间 broker 仍认为该组有连接（`examineProducerConnectionInfo` 看得见、
-        // 事务回查也会挑到这个已经退出的 channel）。
-        // ⚠ 必须在 mqClient->shutdown() **之前**：35 只能走还开着的长连接，
-        //   broker 侧也只摘除「这条 frame 到达的那条 channel」（ClientManageProcessor:226-230）。
-        // 与消费侧同一口径：任何异常只记 debug，shutdown 不因网络抖动抛异常。
         if ($this->mqClient !== null) {
             try {
                 $this->mqClient->unregisterClientAllBrokers($this->clientId ?? '', $this->producerGroup, '');
@@ -1508,14 +1332,9 @@ class DefaultMQProducer
             $this->mqClient->shutdown();
         }
         $this->started = false;
-        // Java DefaultMQProducer.shutdown():410-412：impl.shutdown() 之后关累加器的
-        // 两个守卫线程。注意**只停线程**，不清表：在途批次没了守卫线程唤醒，同步
-        // send 会一直等到自己的 holdMs 阈值再自己发出去（与 Java 同）。
         if ($this->produceAccumulator !== null) {
             $this->produceAccumulator->shutdown();
         }
-        // 顺序对齐 Java DefaultMQProducer.shutdown()：先关本生产者，再 flush 并关轨迹分发器
-        // （分发器用的是**自己的**内部生产者，与本客户端实例无关，所以关掉了照样能发完）
         if ($this->traceDispatcher !== null) {
             try {
                 $this->traceDispatcher->shutdown();
@@ -1525,11 +1344,6 @@ class DefaultMQProducer
         }
     }
 
-    /**
-     * 周期性向所有已知 broker 发心跳（含 ProducerData）—— Python ``_heartbeat_loop``
-     * 线程体的**单轮**显式泵（PHP 无线程，由调用方按 ``heartbeatIntervalMillis``
-     * 周期驱动）。对齐 Java 的生产者注册。
-     */
     public function heartbeatOnce(int $timeoutMillis = 5000): int
     {
         return $this->sendHeartbeatToAllBroker($timeoutMillis);
@@ -1578,16 +1392,6 @@ class DefaultMQProducer
 
     // ================================================================ 压缩
 
-    /**
-     * 满足阈值且非批量时**就地压缩 msg.body**，返回应下发的 sys_flag。
-     *
-     * 与 Java 逐条对齐：
-     *   * 批量消息（MessageBatch）**永不压缩**；
-     *   * body 长度 >= compressMsgBodyOverHowmuch（默认 4096）才压缩；
-     *   * 压缩失败按 Java 的做法**降级为不压缩**并记日志，而不是让发送失败；
-     *   * 压缩后不比较体积（Java 也不比较）。
-     * 不压缩时返回 0。
-     */
     public function tryToCompressMessage(Message $msg): int
     {
         if ($msg instanceof MessageBatch) {
@@ -1600,7 +1404,6 @@ class DefaultMQProducer
         try {
             $compressed = $this->compressBody($body, $this->compressType, $this->compressLevel);
         } catch (\Throwable $e) {
-            // 对齐 Java：压缩失败降级为不压缩
             Logger::warning('tryToCompressMessage failed, send uncompressed: ' . $e->getMessage());
             return 0;
         }
@@ -1636,7 +1439,6 @@ class DefaultMQProducer
         throw new \RuntimeException(sprintf('unsupported compression type: %d', $compressionType));
     }
 
-    /** 给 topic 拼上命名空间前缀（对应 Java ClientConfig.withNamespace）。 */
     private function withNamespace(string $topic): string
     {
         if ($this->namespace === '') {
@@ -1645,16 +1447,6 @@ class DefaultMQProducer
         return NamespaceUtil::wrapNamespace($this->namespace, $topic);
     }
 
-    /**
-     * 定点发送的 topic 一致性守卫（Java ``DefaultMQProducerImpl:1234-1236`` 同步 /
-     * ``:1277-1278`` 异步，两处文案不同，由调用方给）。
-     *
-     * 比较的是**各自拼过命名空间之后**的名字 —— Java 的公开入口先
-     * ``msg.setTopic(withNamespace(...))``、再把 mq 过 ``ClientConfig.queueWithNamespace``，
-     * 所以比的是同一命名空间下的两个资源名（``wrapNamespace`` 幂等，已经带前缀的入参不会
-     * 套两层）。少了这道守卫，topic 与目标队列不符的消息照样发得出去：broker 按请求里带的
-     * 队列名写入，SendResult 一切正常，而消息落进了**另一个 topic** 的分区，谁也消费不到。
-     */
     private function checkPinnedTopic(string $topic, MessageQueue $mq, string $message): void
     {
         if ($this->withNamespace($mq->topic) !== $topic) {
@@ -1662,13 +1454,6 @@ class DefaultMQProducer
         }
     }
 
-    /**
-     * 对应 Java DefaultMQProducerImpl.tryToFindTopicPublishInfo。
-     *
-     * 先拉**真实**路由；只有确实拉不到（新 topic 尚未在 NameServer 注册）时才按 Java 的做法
-     * 回退到默认 topic（TBW102）为该 topic 合成发布信息，否则新 topic 的**首条**消息没队列可选。
-     * 消费者路径不做这个兜底（理由见 MQClientInstance.updateTopicRouteInfoFromNameServer）。
-     */
     private function topicPublishInfo(string $topic): TopicPublishInfo
     {
         $client = $this->requireClient();
@@ -1679,26 +1464,12 @@ class DefaultMQProducer
             try {
                 return $client->getTopicPublishInfo($topic, true);
             } catch (MQClientException $inner) {
-                // Java 的三条「拿不到路由」分支都是先 validateNameServerSetting() 再抛
-                // no-route：一个 name server 地址都没有（配了地址服务器却没返回地址也算）
-                // 时报 10004，而不是把寻址故障说成"这个 topic 没路由"。
                 $this->validateNameServerSetting();
                 throw $inner;
             }
         }
     }
 
-    /**
-     * 对应 Java ``DefaultMQProducerImpl#validateNameServerSetting``。
-     *
-     * 只在「拿不到路由」这条分支上跑，把两种完全不同的故障分开：
-     * * 压根一个 name server 地址都没有（配了地址服务器却没返回地址也算这种）
-     *   → 10004 ``No name server address, please set it.``
-     * * 地址有、只是这个 topic 没路由 → 让调用方原来那条异常照旧抛（10005 等）。
-     * 少了这一步，用户把地址服务器配错拿到空列表，看到的却是"No route info of this
-     * topic"——那是"topic 不存在"的意思，把人往建 topic 的方向查，而真正坏的是寻址。
-     * Java 的文案后面拼了 ``FAQUrl.suggestTodo(...)``，本仓库按约定不带后缀。
-     */
     private function validateNameServerSetting(): void
     {
         $client = $this->mqClient;
@@ -1735,10 +1506,6 @@ class DefaultMQProducer
         if (is_array($msg)) {
             return $this->sendBatch($msg, $mq, $timeoutMillis ?? $this->sendMsgTimeout);
         }
-        // 自动攒批分流（Java DefaultMQProducer.send(Message):472-478）。两个不分流的情况
-        // 与 Java 一一对应：显式给了 timeout 的重载直接进 impl；
-        // 批量消息（MessageBatch）被 `!(msg instanceof MessageBatch)` 挡住 —— 那正是
-        // accumulator 自己发出去的东西，不挡就会无限递归。
         if ($timeoutMillis === null
             && $this->getAutoBatch()
             && !($msg instanceof MessageBatch)) {
@@ -1748,7 +1515,6 @@ class DefaultMQProducer
         try {
             return $this->sendSingle($msg, $timeoutMillis, $mq);
         } finally {
-            // Java ``sendKernelImpl:1095-1096`` 的 finally：成功/失败/钩子异常都还原
             $this->restoreCallerMessage($msg, $prevBody);
         }
     }
@@ -1761,16 +1527,10 @@ class DefaultMQProducer
         $msg->setTopic($this->withNamespace($msg->getTopic()));
         $this->checkMessage($msg);
         if ($mq !== null) {
-            // Java 的顺序：Validators → 定点守卫 → sendKernelImpl（压缩在核里）→ 超时复检。
-            // 排在压缩之前，拒绝时调用方那条消息连次数都不用还原。
             $this->checkPinnedTopic($msg->getTopic(), $mq, self::PINNED_TOPIC_MISMATCH_SYNC);
         }
-        // 在重试循环**之外**压缩一次：Java 是在循环内调用 tryToCompressMessage 的，
-        // 而它会就地 setBody，重试时会把已压缩的 body 再压一遍（zlib(zlib(x))），
-        // 消费端只解一层就拿到压缩流。这里避免该问题。
         $sysFlag = $this->tryToCompressMessage($msg);
         if ($mq !== null) {
-            // 定点发送同样要过钩子（Java：目标是 mq 也走 sendKernelImpl）
             if ($this->hasSendInterceptors()) {
                 return $this->sendWithHooks($client, $msg, $mq, $timeout, $sysFlag);
             }
@@ -1784,13 +1544,9 @@ class DefaultMQProducer
             );
         }
 
-        // 对应 Java sendDefaultImpl：重试分类逐异常类型走，不用"啥都重试"糊过去。
         try {
             $publish = $this->topicPublishInfo($msg->getTopic());
         } catch (MQClientException $e) {
-            // Java：路由拿不到时立刻按 NOT_FOUND_TOPIC_EXCEPTION 定性，不把重试次数空转掉。
-            // 已经带码的（10004「没有 name server」，在 topicPublishInfo 里判的）原样透传，
-            // 别把它改写成 10005 —— 那是两种故障，覆盖掉就白判了。
             throw new MQClientException(
                 $e->getMessage(),
                 $e->responseCode ?: ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION,
@@ -1808,9 +1564,6 @@ class DefaultMQProducer
             $selected = null;
             $began = $this->monoMillis();
             try {
-                // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
-                // 关闭时退化为普通轮询（策略内部判断）。重试时 resetIndex 让轮询从头开始，
-                // 从而能避开 lastBrokerName 选到别的 broker。
                 $selected = $this->mqFaultStrategy->selectOneMessageQueue($publish, $lastBrokerName, $attempt > 0);
                 if ($selected === null) {
                     break;
@@ -1841,8 +1594,6 @@ class DefaultMQProducer
                 $this->metrics->recordSendSuccess($sendStart);
                 // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
                 $this->updateFaultItem($selected, $began, false, true);
-                // Java：非 SEND_OK 且开了 retryAnotherBrokerWhenNotStoreOK 才换 broker，
-                // 否则把这个"存了但没存好"的结果原样返回
                 if ($result !== null && $result->sendStatus !== SendStatus::SEND_OK
                     && $this->retryAnotherBrokerWhenNotStoreOk) {
                     continue;
@@ -1860,13 +1611,9 @@ class DefaultMQProducer
                 }
                 throw $e;
             } catch (RemotingException $e) {
-                // 连不上/超时/发不出去：隔离该 broker。reachable 按 Java 同分支
-                // （DefaultMQProducerImpl:821）取 !isStartDetectorEnable()：探测调度开着时
-                // 置不可达、交给探测轮验证恢复；没开探测就保持可达（仅隔离期生效）。
                 $this->updateFaultItem($selected, $began, true, !$this->mqFaultStrategy->isStartDetectorEnable());
                 $lastExc = $e;
             } catch (MQClientException $e) {
-                // 客户端自己的问题（选不到队列、路由没了…）：Java 同样只记延迟、不隔离
                 $this->updateFaultItem($selected, $began, false, true);
                 $lastExc = $e;
             }
@@ -1899,24 +1646,6 @@ class DefaultMQProducer
         throw new MQClientException($info, $code, $lastExc);
     }
 
-    /**
-     * Request-Reply（5.x）：发一条请求消息并**同步等应答**，返回应答消息。
-     *
-     * 对应 Java ``DefaultMQProducerImpl#request(msg, mq, timeout)``（:1738-1767）。
-     * 请求方做三件事：
-     *   1. 给请求消息写上 CORRELATION_ID（随机 UUID）、REPLY_TO_CLIENT（**本客户端 clientId**）、
-     *      TTL（= timeout）；后两个是 broker 找回本连接、应答方原样带回的依据。
-     *   2. 把等待槽按 correlationId 登记到进程内的 REQUEST_FUTURE_HOLDER。
-     *   3. 发送后阻塞等待；应答由 broker 经 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 推回，
-     *      由 ``MQClientInstance.processReplyMessage`` 投递进等待槽。
-     *
-     * 超时抛 ``RequestTimeoutException``（消息已发出但没等到应答）；
-     * 发送本身失败则抛 ``MQClientException``（带着底层 cause），与 Java 一致。
-     *
-     * ``REPLY_TO_CLIENT`` 是 clientId —— broker 要靠它反查 channel，
-     * 所以本生产者必须先发过心跳（这里会补一次，对齐 Java
-     * ``prepareSendRequest`` 的 ``sendHeartbeatToAllBrokerWithLock``）。
-     */
     public function request(Message $msg, ?int $timeoutMillis = null, ?MessageQueue $mq = null): Message
     {
         $timeout = $timeoutMillis ?? $this->requestTimeout;
@@ -1930,8 +1659,6 @@ class DefaultMQProducer
         $msg->putProperty(MessageConst::PROPERTY_MESSAGE_TTL, (string) $timeout);
 
         $begin = $this->wallMillis();
-        // 对齐 Java prepareSendRequest：确保路由已知，然后补一次心跳 ——
-        // 没在 broker 上登记为 producer，broker 就找不到 channel 把应答推回来。
         try {
             $this->topicPublishInfo($msg->getTopic());
             $this->sendHeartbeatToAllBroker();
@@ -1944,12 +1671,6 @@ class DefaultMQProducer
         RequestFutureHolder::getInstance()->putRequest($correlationId, $future);
         $cost = (int) ($this->wallMillis() - $begin);
         try {
-            // Java 这里也是 ASYNC + 等 latch：send_async 把发送丢进 AsyncSenderExecutor
-            // 立即返回，本线程只等 326 推回来的应答。
-            // 协议上无差别 —— 应答是 broker 通过**另一条** 326 通道推回来的，
-            // 与本次发送的 CommunicationMode 无关。
-            // 发送失败时回调会把 future 标成 !send_request_ok 并主动唤醒等待方，
-            // 所以发送失败不会等满 timeout。
             $this->sendAsync($msg, new NullSendCallback($future), $timeout > $cost ? $timeout - $cost : $timeout, $mq);
             return $this->waitRequestResponse($msg, $timeout, $future, $cost);
         } finally {
@@ -1957,7 +1678,6 @@ class DefaultMQProducer
         }
     }
 
-    /** 对应 Java ``waitResponse``：超时/发送失败分别抛不同异常。 */
     private function waitRequestResponse(Message $msg, int $timeout, RequestResponseFuture $future, int $cost): Message
     {
         // PHP 单线程：future 的 waitResponseMessage 不阻塞（返回当前已到达的应答），
@@ -1989,9 +1709,6 @@ class DefaultMQProducer
             return $response;
         }
         if ($future->sendRequestOk) {
-            // Java ``RequestTimeoutException(ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, ...)``：
-            // 光有类型和文案不够，10006 这个码也要带上 —— 调用方按码分流时
-            // "没等到应答"（可能对方只是慢，消息其实已投出去）和别的客户端故障不是一类处置。
             throw new RequestTimeoutException(
                 sprintf(
                     'send request message to <%s> OK, but wait reply message timeout, %d ms.',
@@ -2008,34 +1725,11 @@ class DefaultMQProducer
         );
     }
 
-    /**
-     * Request-Reply 应答侧：由收到的请求消息派生应答并**同步发送**。
-     *
-     * 对应 nodeJs ``producer.reply``（Java 范式 = ``MessageUtil.createReplyMessage``
-     * + ``producer.send``）。createReplyMessage 取请求里的 CLUSTER 派生
-     * topic=<CLUSTER>_REPLY_TOPIC、回填 CORRELATION_ID / REPLY_TO_CLIENT / TTL，
-     * 并打上 MSG_TYPE="reply" —— 发送路径据此换码 SEND_REPLY_MESSAGE_V2(325)，
-     * broker 才会把应答按 REPLY_TO_CLIENT 推回请求方（326）。
-     *
-     * 注意：请求消息必须来自 broker 投递（带 CLUSTER 属性）；对手工 new 的
-     * Message 直接调用会抛 MQClientException(CREATE_REPLY_MESSAGE_EXCEPTION)。
-     */
     public function reply(Message $requestMessage, string $body, ?int $timeoutMillis = null): SendResult
     {
         return $this->send(MessageUtil::createReplyMessage($requestMessage, $body), $timeoutMillis);
     }
 
-    /**
-     * 建异步发送链的两个池（对应 Java DefaultMQProducerImpl:133-140 与
-     * NettyRemotingClient:152-157）：
-     *
-     * * ``AsyncSenderExecutor_N`` —— 把 send_async 的准备工作（拉路由、选队列、建请求、
-     *   换 broker 重试）从调用方线程挪走；队列**有界**，满了抛 "executor rejected"。
-     * * ``NettyClientPublicExecutor_N`` —— 用户回调与 ``SendMessageHook.after`` 在这里跑。
-     *
-     * 两个池都是 core==max、keepAlive 60s（Java 同款）。PHP 无线程：池由 ``pumpAsyncSend``
-     * 显式驱动。
-     */
     private function createAsyncExecutors(): void
     {
         $cores = self::cpuCount();
@@ -2050,7 +1744,6 @@ class DefaultMQProducer
         );
         $callbackThreads = $this->clientCallbackExecutorThreads;
         if ($callbackThreads <= 0) {
-            // Java：默认 availableProcessors；显式配成 <=0 时 NettyRemotingClient 兜到 4
             $callbackThreads = $cores;
         }
         $this->callbackExecutor = new ConsumeExecutor(
@@ -2077,49 +1770,17 @@ class DefaultMQProducer
         return 4;
     }
 
-    /**
-     * 异步发送（对应 Java ``DefaultMQProducerImpl.send(msg, SendCallback, timeout)``）。
-     *
-     * **调用方立即返回**的语义在 PHP 里以「注册回调后内部泵到完成」呈现（见文件头注释），
-     * 四段与 Java 逐段对齐：
-     *
-     * 1. 任务投到 ``AsyncSenderExecutor_N``（池大小 = CPU 核数、队列有界
-     *    ``asyncSenderQueueCapacity``，默认 50000，同 Java 的 ``LinkedBlockingQueue(50000)``）。
-     *    队列满了 Java 抛 ``MQClientException("executor rejected")``，这里同样**抛给调用方**
-     *    而不是走回调 —— 只有开了背压时才改为就地跑（见 ``executeAsyncMessageSend``）。
-     * 2. 出队之后才算真实耗时：预算被排队吃掉就直接回调
-     *    ``RemotingTooMuchRequestException("DEFAULT ASYNC send call timeout")``，不再发请求。
-     * 3. ``sendKernelImpl`` 的 ASYNC 分支：拦截钩子 → 建请求 → ``invokeAsync``。
-     * 4. 失败进 ``onSendException``（Java ``onExceptionImpl``）：换一台 broker 的队列、给
-     *    **同一个请求**换新 opaque 再试，上限 ``retryTimesWhenSendAsyncFailed``；
-     *    超时预算是所有尝试**共享**的剩余时间，不是每次尝试各给一份。
-     *
-     * 用户回调和 ``SendMessageHook.after`` 跑在 ``NettyClientPublicExecutor_N`` 上（Java 的
-     * ``NettyRemotingAbstract.executeInvokeCallback`` 就是把回调 submit 到 publicExecutor，
-     * 为的是不让业务代码占着连接读线程）。
-     *
-     * 开了 ``enableBackpressureForAsyncMode`` 之后，投队列**之前**还要过一道闸
-     * （``executeAsyncMessageSend``，Java ``executeAsyncMessageSend``）：按条数和字节数
-     * 两个维度各拿一份许可，拿不到就直接回调 ``RemotingTooMuchRequestException``。注意这道闸
-     * **在调用方线程上等**，所以「异步」在背压打满时会退化成「等满 timeout 再报错」。
-     *
-     * 与 Java 的两处有意差别：未 start 时**同步抛**（Java 走回调，那样问题更难查）；
-     * 批量消息复用同步批量内核（只是不阻塞调用方，见 ``sendAsyncInner``）。
-     */
     public function sendAsync(
         Message|array $msg,
         SendCallback|InternalSendCallback $callback,
         ?int $timeoutMillis = null,
         ?MessageQueue $mq = null,
     ): void {
-        // 自动攒批分流（Java DefaultMQProducer.send(Message, SendCallback):517-527）：
-        // 整段包在 try 里，异常统一转给回调。
         if ($timeoutMillis === null && $this->getAutoBatch()
             && !is_array($msg) && !($msg instanceof MessageBatch)) {
             try {
                 $this->sendByAccumulator($msg, $mq, $callback);
             } catch (\Throwable $e) {
-                // Java：catch (Throwable) → onException
                 $callback->onException($e);
             }
             return;
@@ -2131,7 +1792,6 @@ class DefaultMQProducer
         }
         $timeout = $timeoutMillis ?? $this->sendMsgTimeout;
         $begin = $this->monoMillis();
-        // Java ``:555`` —— 进链的是包了一层的新回调：链的终点先归还许可，再转交用户
         $gated = new BackPressureSendCallback(
             $callback,
             $this->semaphoreAsyncSendNum,
@@ -2153,7 +1813,6 @@ class DefaultMQProducer
             try {
                 $this->sendAsyncInner($msg, $mq, $gated, $timeout - $cost);
             } catch (\Throwable $e) {
-                // Java：runnable 的 catch → newCallBack.onException(e)
                 $this->complete($gated, null, $e, null);
             }
         };
@@ -2164,14 +1823,6 @@ class DefaultMQProducer
         $this->pumpAsyncSend($gated, $timeout);
     }
 
-    /**
-     * 对应 Java ``DefaultMQProducerImpl.executeAsyncMessageSend:635-682``。
-     *
-     * 两个许可**顺序**申请、都用「从 ``begin`` 算起的剩余预算」去等，所以第一个闸就能把
-     * 预算花光；哪个没拿到就回调哪个，消息文案也与 Java 逐字一致。已经拿到手的由
-     * ``gated`` 在回调里原样归还（Java 靠 ``isSemaphoreAsyncNumAcquired`` /
-     * ``isSemaphoreAsyncSizeAcquired`` 两个标记做到这一点）。
-     */
     private function executeAsyncMessageSend(
         \Closure $runnable,
         BackPressureSendCallback $gated,
@@ -2205,8 +1856,6 @@ class DefaultMQProducer
             $executor->submit($runnable);
         } catch (RejectedExecutionError $e) {
             if ($this->enableBackpressureForAsyncMode) {
-                // Java ``:675-681``：许可已经扣掉了，就地跑完这一笔（**阻塞调用方**），
-                // 好让回调把许可还回来；否则队列一满就直接抛，白扣的容量还得等超时。
                 $runnable();
             } else {
                 throw new MQClientException('executor rejected', null, $e);
@@ -2242,14 +1891,6 @@ class DefaultMQProducer
         }
     }
 
-    /**
-     * 出队后的准备工作（Java ``sendDefaultImpl(ASYNC)`` → ``sendKernelImpl``）。
-     *
-     * 还原放在这一层而不是 ``sendAsync``：Java 5.5.1 的异步链把**调用方那条消息**
-     * 交给 ``AsyncSenderExecutor`` 的 runnable，`finally` 是在**工作线程**上跑的
-     * （调用方从 ``send_async`` 返回时消息还是压缩后的样子，发完才还原），
-     * 还原跟到工作层才等价。
-     */
     private function sendAsyncInner(
         Message|array $msg,
         ?MessageQueue $mq,
@@ -2257,12 +1898,6 @@ class DefaultMQProducer
         int $timeout,
     ): void {
         if (is_array($msg)) {
-            // 批量异步：Java 走 SEND_BATCH_MESSAGE + invokeAsync，本实现的批量发送只有同步内核，
-            // 所以这里是「在 AsyncSenderExecutor 里同步发一批」。对调用方语义没差别 ——
-            // 不阻塞发送方、回调照样在 callbackExecutor 上跑。
-            // 定点时带上异步那处文案（Java ``:1277-1278``）；没有队列就无从比较，
-            // 沿用内核默认的三参调用（同步文案也用不上）。
-            // （批量路径不做还原，与 Python 装饰器的 isinstance 分支一致。）
             if ($mq === null) {
                 $result = $this->sendBatch($msg, $mq, $timeout);
             } else {
@@ -2291,15 +1926,11 @@ class DefaultMQProducer
         $msg->setTopic($this->withNamespace($msg->getTopic()));
         $this->checkMessage($msg);
         if ($mq !== null) {
-            // Java ``:1277-1278``：异步分支在同一位置用另一处文案抛，异常由 runnable 的
-            // catch 转给 ``newCallBack.onException``（这里由 ``sendAsync`` 的 `$run` 收口）。
             $this->checkPinnedTopic($msg->getTopic(), $mq, self::PINNED_TOPIC_MISMATCH_ASYNC);
         }
         // 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍
         $sysFlag = $this->tryToCompressMessage($msg);
         if ($mq !== null) {
-            // Java send(msg, mq, cb, timeout) → sendKernelImpl 直接定点发，传下去的
-            // topicPublishInfo 是 null，所以失败只会在**同一台 broker** 上换 opaque 重试。
             $this->sendKernelAsync($client, $msg, $mq, $callback, $timeout, $sysFlag, null);
             return;
         }
@@ -2313,8 +1944,6 @@ class DefaultMQProducer
                 $e->getPrevious()
             );
         }
-        // Java sendDefaultImpl:756 —— ASYNC 的 timesTotal 固定为 1：外层循环只跑一次，
-        // 换 broker 的重试全部发生在 onExceptionImpl 里。
         $selected = $this->mqFaultStrategy->selectOneMessageQueue($publish, null, false);
         if ($selected === null) {
             throw new MQClientException(sprintf(
@@ -2333,7 +1962,6 @@ class DefaultMQProducer
         );
     }
 
-    /** Java ``sendKernelImpl`` 的 ASYNC 分支：钩子 + 建请求 + 交给 sendMessageAsync。 */
     private function sendKernelAsync(
         MQClientInstance $client,
         Message $msg,
@@ -2344,10 +1972,6 @@ class DefaultMQProducer
         ?TopicPublishInfo $publish,
     ): void {
         $began = $this->monoMillis();
-        // 地址解析两步，与 Java ``sendKernelImpl:919-924`` 一致：先查已缓存的**发布**地址
-        // （只认 master），查不到再按 topic 刷一次路由重查，仍查不到照 ``:1100`` 报
-        // 「The broker[X] not exist」。定点发送（调用方给了 mq）不会在 sendDefaultImpl
-        // 里取发布信息，这一步是它唯一的路由来源 —— 少了这一步，第一次定点发送必然拿到空地址。
         $brokerAddr = $client->publishAddrFor($mq->brokerName, $mq->topic);
         if ($this->hasCheckForbiddenHook()) {
             $this->executeCheckForbidden($msg, $mq, $brokerAddr, null, CommunicationMode::ASYNC);
@@ -2355,8 +1979,6 @@ class DefaultMQProducer
         if ($this->enableTraceContext) {
             TraceContextPropagator::injectTraceContext($msg);
         }
-        // 请求只建一次：跨重试复用同一个对象（Java onExceptionImpl 只换 opaque），
-        // 所以 header 里的 queueId 也跟着上一次 —— 这是 Java 的真实行为，别"修"它。
         $request = $client->buildSendRequest(
             $this->producerGroup,
             $msg,
@@ -2370,10 +1992,6 @@ class DefaultMQProducer
             $context = $this->buildSendContext($msg, $mq, $brokerAddr, CommunicationMode::ASYNC);
             $this->executeSendMessageHookBefore($context);
         }
-        // Java ``sendKernelImpl:1043-1046``：ASYNC 分支自己的总闸 —— 钩子、压缩、路由
-        // 都算耗时，预算被它们吃光就不再发起请求。RemotingTooMuchRequestException 是
-        // RemotingException 的子类，所以 Java 在 :1088 先跑 hook.after 再抛给回调，
-        // 这里用 complete 复刻同一顺序（且**不重试**）。
         $costAsync = (int) ($this->monoMillis() - $began);
         if ($timeout < $costAsync) {
             $this->complete($callback, null, new RemotingTooMuchRequestException('sendKernelImpl call timeout'), $context);
@@ -2394,7 +2012,6 @@ class DefaultMQProducer
         );
     }
 
-    /** 一笔在途尝试（对应 Java ``MQClientAPIImpl#sendMessageAsync``）。 */
     private function sendMessageAsync(
         MQClientInstance $client,
         string $addr,
@@ -2456,8 +2073,6 @@ class DefaultMQProducer
         try {
             $client->sendMessageAsync($addr, $request, $msg, $mq, $timeout, $onComplete);
         } catch (\Throwable $e) {
-            // Java sendMessageAsync 的外层 catch：就地失败（连不上/通道没了），
-            // 异常**原样**传递（不包装）、needRetry=true。
             $cost = (int) ($this->monoMillis() - $began);
             $this->updateFaultItem($mq, $began, true, false);
             $this->onSendException(
@@ -2477,7 +2092,6 @@ class DefaultMQProducer
         }
     }
 
-    /** 对应 Java ``MQClientAPIImpl#onExceptionImpl``：还能试就换队列重试，否则终止。 */
     private function onSendException(
         MQClientInstance $client,
         string $brokerName,
@@ -2498,8 +2112,6 @@ class DefaultMQProducer
             $retryBroker = $brokerName;
             $retryMq = $mq;
             if ($publish !== null) {
-                // Java: producer.selectOneMessageQueue(topicPublishInfo, brokerName, false)
-                // —— 第三个参数是 false，所以按 lastBrokerName 避开刚失败的那台
                 $selected = $this->mqFaultStrategy->selectOneMessageQueue($publish, $brokerName, false);
                 if ($selected !== null) {
                     $retryMq = new MessageQueue($msg->getTopic(), $selected->brokerName, $selected->queueId);
@@ -2508,8 +2120,6 @@ class DefaultMQProducer
             }
             $addr = $client->findBrokerAddressInPublish($retryBroker);
             if ($addr === null || $addr === '') {
-                // Java onExceptionImpl:725 只查发布地址表（同样只认 master）、不刷路由；
-                // 查不到就带着 null 撞进 invokeAsync。这里就地终止，别让 null 传进传输层。
                 $this->complete(
                     $callback,
                     null,
@@ -2546,10 +2156,6 @@ class DefaultMQProducer
         $this->complete($callback, null, $error, $context);
     }
 
-    /**
-     * 在 ``NettyClientPublicExecutor_N`` 上跑回调处理（Java executeInvokeCallback 的
-     * publicExecutor 分支）；池子已关或投不进去时**就地跑**，与 Java 的 runInThisThread 一致。
-     */
     private function executeOnCallbackThread(\Closure $fn): void
     {
         $pool = $this->callbackExecutor;
@@ -2564,12 +2170,6 @@ class DefaultMQProducer
         }
     }
 
-    /**
-     * 异步链的终点：先跑 SendMessageHook.after，再回调用户。
-     *
-     * 用户回调抛的异常必须吞掉（Java 两处都是 ``catch (Throwable)``），否则它会带走
-     * 回调线程池的 worker。
-     */
     private function complete(
         SendCallback|InternalSendCallback $callback,
         ?SendResult $result,
@@ -2595,7 +2195,6 @@ class DefaultMQProducer
         }
     }
 
-    /** 单向发送（对应 Java sendOneway）。 */
     public function sendOneway(Message $msg, ?MessageQueue $mq = null): void
     {
         $prevBody = (string) $msg->getBody();
@@ -2614,7 +2213,6 @@ class DefaultMQProducer
         $sysFlag = $this->tryToCompressMessage($msg);
         if ($mq !== null) {
             if ($this->hasCheckForbiddenHook()) {
-                // Java sendOneway 同样走 sendKernelImpl → 拦截钩子照跑（communicationMode=ONEWAY）
                 $this->executeCheckForbidden(
                     $msg,
                     $mq,
@@ -2660,9 +2258,6 @@ class DefaultMQProducer
         );
     }
 
-    /**
-     * 使用 MessageQueueSelector 选择队列发送（对应 Java send(msg, selector, arg)）。
-     */
     public function sendBySelector(
         Message $msg,
         MessageQueueSelector $selector,
@@ -2693,7 +2288,6 @@ class DefaultMQProducer
         $this->checkMessage($msg);
         $sysFlag = $this->tryToCompressMessage($msg);
         if ($this->hasSendInterceptors()) {
-            // arg 要透传给 CheckForbiddenContext（Java sendKernelImpl 的 context.setArg）
             return $this->sendWithHooks($client, $msg, $mqSel, $timeout, $sysFlag, $arg);
         }
         return $client->sendMessage(
@@ -2706,20 +2300,7 @@ class DefaultMQProducer
         );
     }
 
-    // ---------------- 定时消息撤回（对应 Java recallMessage）----------------
 
-    /**
-     * 撤回一条定时/延迟消息，返回被撤回消息的 uniqKey。
-     *
-     * 校验顺序与 Java ``DefaultMQProducerImpl#recallMessage``(:1570-1601) 逐条对齐：
-     * 状态 → checkTopic → 禁 retry/DLQ → 解句柄 → 预热路由 → 定位 broker → 发请求。
-     * 句柄来自定时消息的 ``SendResult.recallHandle``，普通消息没有。
-     *
-     * 与 Java 的差异：Java 的 ``findBrokerAddrByTopic`` 返回该 topic 的**全部** broker
-     * 地址再随机取一个，这里直接取路由里的第一个可用地址——单 broker 场景等价，
-     * 多 broker 场景两者都只会命中句柄里那个 broker 之外的地址，最终由 broker 用
-     * ``ILLEGAL_OPERATION``（brokerName 不匹配）拒绝，语义不变。
-     */
     public function recallMessage(string $topic, string $recallHandle): string
     {
         $client = $this->requireClient();
@@ -2730,13 +2311,9 @@ class DefaultMQProducer
         }
         /** @var HandleV1 $handle */
         $handle = RecallMessageHandle::decodeHandle($recallHandle);
-        // Java 只是调用 tryToFindTopicPublishInfo 预热路由，返回值并不使用，但**异常照抛**
-        // （DefaultMQProducerImpl:1586）—— 连路由都拿不到时，后面的 broker 定位也没有意义。
         $this->topicPublishInfo($topic);
         $addr = $client->findBrokerAddressInPublish($handle->brokerName ?? '');
         if ($addr === null || $addr === '') {
-            // Java :1586-1594：发布地址表里没有（主掉了 / 是多 proxy 端点）时退到
-            // findBrokerAddrByTopic —— 那条路走 select_broker_addr()，**允许**落到从节点上。
             $addr = $client->findBrokerAddrByTopic($topic);
         }
         if ($addr === null || $addr === '') {
@@ -2752,9 +2329,7 @@ class DefaultMQProducer
         return $client->recallMessage($addr, $header, $this->sendMsgTimeout);
     }
 
-    // ---------------- 自动攒批的转发层（对应 Java DefaultMQProducer:434-452/759-793）----------------
 
-    /** Java ``DefaultMQProducer.initProduceAccumulator()``：建/复用累加器并同步阈值。 */
     public function initProduceAccumulator(): void
     {
         $this->produceAccumulator = ProduceAccumulator::getOrCreateProduceAccumulator(
@@ -2773,17 +2348,6 @@ class DefaultMQProducer
         }
     }
 
-    /**
-     * Java ``DefaultMQProducer.canBatch:434-452``。
-     *
-     * ⚠ 先过全局字节闸门 ``tryAddMessage``：**放行即记账**，而后面四条「不能攒批」
-     * 的判断只是让调用方退回直发 —— 那条消息的字节数**不会被归还**（上游遗漏，
-     * 照抄；改掉就与 Java 对不上了）。四条排除项：
-     *   1. 延时/定时消息（DELAY / TIMER_DELAY_MS / TIMER_DELAY_SEC / TIMER_DELIVER_MS）
-     *      任何一个 > 0 都不攒批 —— 一个 MessageBatch 只能有一个延时属性；
-     *   2. 重试 topic（``%RETRY%`` 前缀）：重试消息的位点语义特殊；
-     *   3. 已带 PGROUP 属性的消息（事务半消息那种）：broker 侧要按组找连接。
-     */
     private function canBatch(Message $msg): bool
     {
         if ($this->produceAccumulator === null || !$this->produceAccumulator->tryAddMessage($msg)) {
@@ -2801,7 +2365,6 @@ class DefaultMQProducer
         return true;
     }
 
-    /** Java ``DefaultMQProducer.sendDirect``：绕过累加器直发（同步或异步）。 */
     public function sendDirect(Message $msg, ?MessageQueue $mq, SendCallback|InternalSendCallback|null $sendCallback): ?SendResult
     {
         if ($sendCallback === null) {
@@ -2818,13 +2381,6 @@ class DefaultMQProducer
         return null;
     }
 
-    /**
-     * Java ``DefaultMQProducer.sendByAccumulator:778-793``。
-     *
-     * 不能攒批（见 ``canBatch``）→ 退回直发；否则先过 ``Validators.checkMessage``
-     * 再给本条消息打 UNIQ_KEY，然后交给累加器（同步版返回本条自己的 SendResult，
-     * 异步版立刻返回 null、结果走回调）。
-     */
     public function sendByAccumulator(
         Message $msg,
         ?MessageQueue $mq,
@@ -2872,12 +2428,6 @@ class DefaultMQProducer
         if ($msgs === []) {
             throw new MQClientException('message list is empty');
         }
-        // 对应 Java DefaultMQProducer.batch():1172-1184：**每条子消息**先 Validators
-        // .checkMessage（在拼命名空间之前、用原始 topic），再 MessageClientIDSetter
-        // .setUniqID，然后才拼命名空间；批量消息本身也要一个 UNIQ_KEY（broker 判 inner-batch
-        // 用得到，SendMessageProcessor:617），最后**编码** —— 顺序错了就会把没有 UNIQ_KEY 的
-        // 子消息体写进 body，消费端每条子消息都没有客户端 ID。
-        // 少 checkMessage 这一步等于批量路径绕过了所有本地校验——超长/空 body/非法 topic 都能发出去。
         foreach ($msgs as $m) {
             Validators::checkMessage($m, $this->maxMessageSize);
             MessageClientIdSetter::setUniqId($m);
@@ -2887,9 +2437,6 @@ class DefaultMQProducer
         MessageClientIdSetter::setUniqId($batch);
         $batch->setBody($batch->encode());
         if ($mq !== null) {
-            // Java：`impl.send(batch(msgs), queueWithNamespace(mq), timeout)` 与单条共用同一处
-            // 同步守卫（MessageBatch extends Message），异步入口则是另一处文案。
-            // ``pinnedGuardMessage`` 由调用方按入口选：同步默认，异步传 ASYNC。
             $this->checkPinnedTopic($batch->getTopic(), $mq, $pinnedGuardMessage);
         }
         // MessageBatch 会被 tryToCompressMessage 直接跳过（返回 0），批量消息永不压缩
@@ -2923,15 +2470,7 @@ class DefaultMQProducer
         );
     }
 
-    // ================================================================ 事务消息
-    // 对齐 Java DefaultMQProducerImpl.sendMessageInTransaction（L1433-1509）的**两阶段**：
-    //   1) 半消息：给 msg 打 TRAN_MSG / PGROUP 属性，发送时 sysFlag 置 TRANSACTION_PREPARED_TYPE；
-    //   2) 本地事务：仅 SEND_OK 时执行，结果/异常汇总为 LocalTransactionState；
-    //   3) endTransaction：以 END_TRANSACTION(37, oneway) 告知 broker 提交/回滚/未知；
-    //   4) 若 UNKNOW（或本地事务没执行成功），broker 会回查 CHECK_TRANSACTION_STATE(39)，
-    //      由 handleCheckTransactionState 调 listener.checkLocalTransaction 后再 END_TRANSACTION。
 
-    /** LocalTransactionState -> Java MessageSysFlag 的 commitOrRollback 值。 */
     private static function transactionFlag(LocalTransactionState $state): int
     {
         if ($state === LocalTransactionState::COMMIT_MESSAGE) {
@@ -2943,22 +2482,11 @@ class DefaultMQProducer
         return MessageSysFlag::TRANSACTION_NOT_TYPE;           // 0（UNKNOW）
     }
 
-    /**
-     * 发送事务消息（对应 Java sendMessageInTransaction）。
-     *
-     * 与 Java 一致的两阶段语义；返回 TransactionSendResult，其中
-     * localTransactionState 是本地事务的最终状态。
-     */
     public function sendMessageInTransaction(Message $msg, TransactionListener $listener, mixed $arg = null): TransactionSendResult
     {
-        // Java `sendKernelImpl:930` 的 `prevBody`：半消息发完就还原调用方那份 body，
-        // 所以随后的 `executeLocalTransaction(msg, arg)` 看到的是**原始 body**（不是压缩流）。
-        // 这一层不能用 restoreCallerMessage：那样要等方法结束才还原，
-        // listener 与 `endTransaction` 都会拿到压缩后的消息。
         $prevBody = (string) $msg->getBody();
         $msg->setTopic($this->withNamespace($msg->getTopic()));
 
-        // Java ensureNotDelayedForTransactional：事务消息不支持任何形式的延迟投递
         foreach ([MessageConst::PROPERTY_DELAY_TIME_LEVEL, MessageConst::PROPERTY_DELAY_TIME,
             'TIMER_DELAY_MS', 'TIMER_DELAY_SEC', 'TIMER_DELIVER_MS'] as $key) {
             if ($msg->getProperty($key) !== null) {
@@ -2979,8 +2507,6 @@ class DefaultMQProducer
         $selected = $publish->selectOneMessageQueue();
         $mqSel = new MessageQueue($msg->getTopic(), $selected->brokerName, $selected->queueId);
 
-        // 压缩与普通发送一致（Java 的事务发送同样走 sendKernelImpl），
-        // 再叠加事务类型位（对应 Java L951-953 检测 TRAN_MSG 后置 TRANSACTION_PREPARED）
         $sysFlag = $this->tryToCompressMessage($msg);
         $sysFlag = MessageSysFlag::resetTransactionValue($sysFlag, MessageSysFlag::TRANSACTION_PREPARED_TYPE);
 
@@ -2991,10 +2517,6 @@ class DefaultMQProducer
         } catch (\Throwable $e) {
             throw new MQClientException('send message Exception', null, $e);
         } finally {
-            // 与 Java 的 finally 同点位（`sendKernelImpl:1095-1096`）：**半消息发完**就还原，
-            // 所以下面的 `executeLocalTransaction` 和 `endTransaction` 看到的是原始
-            // body + 已剥命名空间的 topic（Java 5.5.1 的 `endTransaction:1543` 用的正是
-            // `msg.getTopic()`）。属性不动：UNIQ_KEY 那些 Java 也不还原。
             $msg->setBody($prevBody);
             $msg->setTopic(NamespaceUtil::withoutNamespace($msg->getTopic(), $this->namespace));
         }
@@ -3011,7 +2533,6 @@ class DefaultMQProducer
             }
             try {
                 $ret = $listener->executeLocalTransaction($msg, $arg);
-                // Java：返回 null 视为 UNKNOW（PHP 非空返回类型天然覆盖）
                 $state = $ret;
             } catch (\Throwable $e) {
                 Logger::error('executeLocalTransactionBranch exception, topic=' . $msg->getTopic());
@@ -3028,7 +2549,6 @@ class DefaultMQProducer
         try {
             $this->endTransaction($sendResult, $msg, $state, $localException, false);
         } catch (\Throwable $e) {
-            // Java：end broker transaction 失败只 warn，不影响返回结果
             Logger::warning(sprintf(
                 'local transaction execute %s, but end broker transaction failed: %s',
                 $state->name,
@@ -3039,13 +2559,6 @@ class DefaultMQProducer
         return new TransactionSendResult($sendResult, $state);
     }
 
-    /**
-     * 向 broker 发送 END_TRANSACTION(37, oneway)，对齐 Java endTransaction + checkTransactionState。
-     *
-     * - 普通收尾（fromTransactionCheck=false）：偏移/事务号取自 send_result；
-     * - 回查收尾（fromTransactionCheck=true）：偏移/事务号取自 broker 的回查 header
-     *   （send_result/mq 此时不可用），msgId 取 message_ext 的 UNIQ_KEY。
-     */
     private function endTransaction(
         ?SendResult $sendResult,
         ?Message $msg,
@@ -3076,7 +2589,6 @@ class DefaultMQProducer
             if ($sendResult === null || $msg === null) {
                 throw new MQClientException('send result and message are required for normal end transaction');
             }
-            // Java：id = decodeMessageId(offsetMsgId != null ? offsetMsgId : msgId)
             [, , $offset] = MessageDecoder::decodeMessageId($sendResult->offsetMsgId ?? $sendResult->msgId ?? '');
             $brokerName = $sendResult->messageQueue !== null ? $sendResult->messageQueue->brokerName : '';
             $header->commitLogOffset = $offset;
@@ -3085,9 +2597,6 @@ class DefaultMQProducer
             $header->bname = $brokerName;
             $header->topic = $msg->getTopic();
             $header->msgId = $sendResult->msgId;
-            // Java endTransaction:1541 用的也是 findBrokerAddressInPublish（只认 master），
-            // 且**不做 null 检查**就直接 oneway；这里保留本端提前报错的守卫（比 Java 的
-            // NPE 干净），但地址来源必须同样是 master-only。
             $brokerAddr = $client->findBrokerAddressInPublish($brokerName);
         }
 
@@ -3106,8 +2615,6 @@ class DefaultMQProducer
             throw new MQClientException('no broker address for end transaction', null);
         }
         $client->remotingClient->invokeOneway($brokerAddr, $cmd);
-        // 对应 Java endTransaction 末尾的 executeEndTransactionHook：无论主动提交还是
-        // broker 回查后提交，都会落一条 EndTransaction 轨迹
         if ($this->endTransactionHookList !== []) {
             $ctx = new EndTransactionContext();
             $ctx->producerGroup = $this->producerGroup;
@@ -3122,17 +2629,6 @@ class DefaultMQProducer
         }
     }
 
-    /**
-     * 处理 broker 主动发来的事务回查（CHECK_TRANSACTION_STATE=39）。
-     *
-     * 对齐 Java ClientRemotingProcessor.checkTransactionState + DefaultMQProducerImpl
-     * .checkTransactionState：broker 是 **oneway** 发来的（body 为整条编码后的
-     * MessageExt），因此**不回响应**，而是在新线程里调 listener.checkLocalTransaction，
-     * 再以 END_TRANSACTION(fromTransactionCheck=true) 把最终状态告知 broker。
-     *
-     * ⚠ PHP 单线程：Python 在新线程里跑 ``_run``，这里改为**内联**执行（注册处理器在
-     * remoting 层收帧分发时被调用，不会死锁——END_TRANSACTION 走 oneway 纯写）。
-     */
     private function handleCheckTransactionState(RemotingCommand $cmd, string $addr): ?RemotingCommand
     {
         $header = new CheckTransactionStateRequestHeader();
@@ -3194,7 +2690,6 @@ class DefaultMQProducer
     public function createTopic(string $key, string $newTopic, int $queueNum = 4, int $topicSysFlag = 0): void
     {
         $client = $this->requireClient();
-        // 对应 Java DefaultMQProducerImpl.createTopic：checkTopic + isSystemTopic
         Validators::checkTopic($newTopic);
         Validators::isSystemTopic($newTopic);
         $perm = 6; // PermName.PERM_READ | PERM_WRITE
@@ -3216,13 +2711,6 @@ class DefaultMQProducer
         return $this->requireClient()->getMinOffset($mq);
     }
 
-    /**
-     * Java MQAdminImpl:250：earliestMsgStoreTime 与 max/min/search 同一个形状 —— 只认 master。
-     *
-     * ⚠ 移植差异：Python 调了 MQClientInstance 的私有 ``_publish_addr_in_admin`` /
-     * ``_invoke_sync`` / ``_check_response``；PHP 端这三个是 private，这里用公开面等价复刻
-     * （publishAddrFor 逻辑 + remotingClient->invokeSync + 本地状态码检查），语义不变。
-     */
     public function earliestMsgStoreTime(MessageQueue $mq): int
     {
         $client = $this->requireClient();
@@ -3245,7 +2733,6 @@ class DefaultMQProducer
         return $respHeader->timestamp ?? 0;
     }
 
-    /** 查询消息（返回原始 body），对应 Java queryMessage。 */
     public function queryMessage(string $topic, string $key, int $maxNum, int $begin, int $end): array
     {
         $client = $this->requireClient();
@@ -3263,12 +2750,6 @@ class DefaultMQProducer
 
     // ================================================================ 辅助
 
-    /**
-     * 对应 ``Validators.checkMessage(msg, this)``——纯本地、打网络之前就跑完。
-     *
-     * 校验项与顺序都跟着 Java 走：topic（blank/长度/字符表）→ 禁发 topic →
-     * body（null/零长/超过 maxMessageSize）→ ``INNER_MULTI_DISPATCH`` 不能带路径分隔符。
-     */
     private function checkMessage(Message $msg): void
     {
         Validators::checkMessage($msg, $this->maxMessageSize);
@@ -3276,14 +2757,10 @@ class DefaultMQProducer
 
     private static function needAddr(MQClientInstance $client, MessageQueue $mq): string
     {
-        // 单向发送没有应答，地址只能提前解析；口径同 Java sendKernelImpl（只认 master）
         return $client->publishAddrFor($mq->brokerName, $mq->topic);
     }
 }
 
-/**
- * 事务消息生产者（对应 Java TransactionMQProducer）。
- */
 final class TransactionMQProducer extends DefaultMQProducer
 {
     public ?TransactionListener $transactionListener = null;

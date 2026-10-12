@@ -7,24 +7,6 @@ namespace RocketMQ\Client;
 use RocketMQ\Common\Message;
 use RocketMQ\Common\MessageExt;
 
-/**
- * OpenTracing 风格的轨迹钩子（P3 项，Java classic 的
- * ``OpenTracingMessageTraceInterceptor`` 等价物；本仓库五端此前都没有）。
- *
- * 设计约束与取舍：
- *
- *  - **零第三方依赖**（仓库铁律）：不 require opentracing/opentracing 包，tracer/span
- *    用下面的最小 duck-type 接口表达。真实 OpenTracing API 的对象（GlobalTracer::get()
- *    返回的 tracer、其 span）天然满足这些签名，直接 new OpenTracingHook($tracer) 即可接入；
- *    OpenTelemetry SDK 的 tracer 也只差 extract/inject 两个方法，包一层适配即可。
- *
- *  - **span 随消息走**：发送侧 startSpan('RocketMQ/send') 后把 span context 以 JSON
- *    注入消息属性 ``OT_CARRIER``；消费侧从首条消息解出 carrier，作为 child-of 引用
- *    startSpan('RocketMQ/consume')。跨进程传播链由此贯通。
- *
- *  - **幂等安全**：span 按对象（SplObjectStorage）记账，同一 context 的 after 不会被
- *    另一条消息的 span 误 finish；properties 注入只做一次。
- */
 final class OpenTracingHook implements SendMessageHook, ConsumeMessageHook
 {
     /** 跨进程传播用的消息属性名（JSON 编码的 tracer carrier）。 */

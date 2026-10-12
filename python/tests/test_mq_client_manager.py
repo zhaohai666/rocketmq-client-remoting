@@ -1,25 +1,4 @@
 # -*- coding: utf-8 -*-
-"""MQClientManager（跨门面复用 MQClientInstance）单测。
-
-对应 Java ``client/src/test`` 侧的 MQClientManager 语义（Java 无独立单测类，
-行为由集成测试锁定）：
-
-* 同 clientId 的两个门面 start 后共享**同一个** MQClientInstance（计数 2）——
-  Java ``MQClientManager.getOrCreateMQClientInstance`` 的 factoryTable 命中；
-* 先关一个：实例仍存活（Java ``MQClientInstance.shutdown`` 在 producerTable/
-  consumerTable 非空时直接 return 的引用计数等价物）；
-* 全关：计数归零，实例才真正 shutdown 并从缓存摘除；
-* 不同 clientId：绝不共享（Java 按 clientId 键控）。
-
-另锁三件复用后不能坏的事：
-
-* ``MQClientInstance.start()`` 幂等 —— 复用方再 start 不重复拉起路由刷新/
-  弹性巡检这些**实例级**后台线程（Java ServiceState 守卫）；
-* ``CHECK_TRANSACTION_STATE(39)`` 实例级分派器按登记扇给各门面处理器、
-  重复登记去重、注销摘除（Java producerTable 按组分派的等价物）；
-* start 失败的实例从缓存摘除（Java ``cleanupAfterStartFailure`` +
-  ``removeClientFactory``），半启动实例不许毒化后续的 get_or_create。
-"""
 from __future__ import annotations
 
 import threading
@@ -66,7 +45,7 @@ def test_same_client_id_reuses_instance():
 
 
 def test_different_client_ids_do_not_share():
-    """不同 clientId：各建各的（Java 按 clientId 键控，绝不串台）。"""
+    pass
     mgr = _fresh_manager()
     a, _ = mgr.get_or_create_mq_client_instance("a@one", lambda: _make_instance("a@one"))
     b, _ = mgr.get_or_create_mq_client_instance("a@two", lambda: _make_instance("a@two"))
@@ -163,7 +142,7 @@ def test_register_client_registers_unmanaged_instance():
 
 
 def test_remove_client_factory_drops_entry_without_shutdown():
-    """start 失败清理路径：只摘表、不 shutdown（对应 Java removeClientFactory）。"""
+    pass
     mgr = _fresh_manager()
     inst, _ = mgr.get_or_create_mq_client_instance("drop@id", lambda: _make_instance("drop@id"))
     mgr.remove_client_factory("drop@id", inst)
@@ -178,7 +157,7 @@ def test_remove_client_factory_drops_entry_without_shutdown():
 # ---------------------------------------------------------------- 实例生命周期幂等
 
 def test_instance_start_is_idempotent():
-    """复用方再 start：不重复拉起实例级后台线程（Java ServiceState 守卫）。"""
+    pass
     inst = _make_instance("idem@id")
     inst.start()
     route_thread = inst._route_refresh_thread
@@ -194,8 +173,7 @@ def test_instance_start_is_idempotent():
 
 
 def test_instance_start_failure_removes_itself_from_cache(monkeypatch):
-    """start 抛错：实例把自己从 MQClientManager 缓存摘掉（Java
-    cleanupAfterStartFailure → removeClientFactory），且 _started 回落为 False。"""
+    pass
     mgr = _fresh_manager()
     # 空 name server + 动态取址失败 → _start_locked 在 dynamic 分支抛 10004
     inst, created = mgr.get_or_create_mq_client_instance(
@@ -238,7 +216,7 @@ def test_transaction_check_handlers_register_dispatch_unregister():
 
 
 def test_transaction_check_dispatch_swallows_handler_exception():
-    """一个门面处理器抛错不能影响其他门面（Java catch (Exception ignored)）。"""
+    pass
     inst = _make_instance("txerr@id")
 
     def bad(cmd, addr):
@@ -259,9 +237,6 @@ def test_two_producers_share_instance_and_refcount_survives_partial_shutdown():
     from client.mq_client_manager import MQClientManager as Mgr
 
     mgr = Mgr.get_instance()
-    # Java 口径：changeInstanceNameToPID 只改写默认名 "DEFAULT"（且会拼 nanoTime），
-    # 显式设置的同名 instanceName 才会让两个门面算出同一个 clientId —— 这正是
-    # Java "同进程内 producer/consumer 共享 MQClientInstance" 的前提。
     p1 = DefaultMQProducer("MgrSharePG1")
     p1.set_namesrv_addr(NS)
     p1.set_instance_name("MGR-SHARED-IT")

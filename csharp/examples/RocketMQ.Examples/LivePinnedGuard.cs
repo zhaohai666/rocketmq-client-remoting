@@ -1,27 +1,3 @@
-// 定点发送 topic 一致性守卫真机联调（Java DefaultMQProducerImpl:1234-1236 / :1277-1278）
-//（对应 python/verify_pinned_guard_live.py、rust/examples/live_pinned_guard.rs、
-//  cpp/examples/live_pinned_guard.cpp 的 S0–S6）。
-//
-// 离线假集群证明的是「拒了、且报文没上线」；真机这一趟要证明的是**另一面**：
-//   * 守卫不能误伤真业务 —— 从真实路由取出的队列（broker 名与队列号都是集群给的）在同步
-//     单条/同步批量/异步单条/异步批量四条入口上照常 SEND_OK，消息一条不少地被消费到；
-//   * 拒的时候要**守在本端** —— 亚毫秒、无 broker 码，而且 **broker 上的 maxOffset 一动不
-//     动**：这是真机版的 wire 反证（拒绝不会留下任何痕迹，也不会事后偷发）；
-//   * 命名空间腿看 Java queueWithNamespace 的幂等：ns%topic 与裸 topic 都不误拒，
-//     ns2%topic 才拒；
-//   * 单向定点**没有**守卫（Java :1303-1310 有意留的口子，本端口新补的
-//     SendOneway(msg, mq) 同）：报文按 msg 自己的 topic 落库 —— 在真机上用「A 收到、
-//     B 的 maxOffset 还是 0」把这条语义钉死。
-//
-// 场景：
-//   S1 正腿：真实路由队列上的同步单条/批量定点发送 SEND_OK，且落在指定队列上
-//   S2 反腿：同步单条/批量 topic 不符 ⇒ 本端亚毫秒拒（Java 原文案、无 broker 码），
-//          broker 的 maxOffset 不动
-//   S3 命名空间：ns%topic 与裸 topic 都放行（且真落库）；ns2%topic 拒（对照腿）
-//   S4 异步：单条/批量都在回调里拿到**异步那处文案**；放行腿 SEND_OK
-//   S5 单向：无守卫，msg 自己的 topic 说了算（A 收到、B 的 maxOffset 保持 0）
-//   S6 收尾：push 消费者把前面所有正腿消息一条不少地收齐
-//
 // 用法：rmq pinned-guard [namesrv]（需本地 5.5.1 集群，autoCreateTopicEnable=true）
 using System.Diagnostics;
 using System.Globalization;
@@ -35,7 +11,6 @@ namespace RocketMQ.Examples;
 
 public static class LivePinnedGuard
 {
-    // 定点发送守卫的两处 Java 文案（同步 :1235、异步 :1278），逐字保留。
     private const string SyncWording = "message's topic not equal mq's topic";
     private const string AsyncWording =
         "Topic of the message does not match its target message queue";
@@ -367,7 +342,6 @@ public static class LivePinnedGuard
                 offAsync == offAfterS1 + 3,
                 "maxOffset=" + offAsync.ToString(CultureInfo.InvariantCulture));
 
-            // ---------------- S5 单向：Java 有意没有守卫 ----------------
             Console.WriteLine("=== S5 单向定点没有守卫：msg 自己的 topic 说了算 ===");
             string kOw = "pinned-live-oneway";
             prod.SendOneway(Keyed(topic, "oneway", kOw), mqOther);

@@ -1,16 +1,5 @@
 // P5：postSubscriptionWhenPull + updatePullFromWhichNode（PullAPIWrapper 移植）的离线单测。
 //
-// 对齐基准（Java 5.5.0，逐行读过）：
-//   * DefaultMQPushConsumer#postSubscriptionWhenPull 默认 false；
-//     DefaultMQPushConsumerImpl.pullMessage:458-468 里
-//     `subExpression = (postSubscriptionWhenPull && !sd.isClassFilterMode()) ? sd.getSubString() : null`，
-//     sysFlag 的 SUBSCRIPTION 位 = `subExpression != null`。默认关闭是安全的：tag 过滤由客户端
-//     FilterMessagesForDelivery 兜底。
-//   * PullAPIWrapper#pullKernelImpl:197-205 用 recalculatePullFromWhichNode(mq) 调
-//     MQClientInstance#findBrokerAddressInSubscribe:1307-1336；命中从节点时
-//     PullSysFlag.clearCommitOffsetFlag(:219-221)。
-//   * PullAPIWrapper#processPullResult:77 用应答头的 suggestWhichBrokerId 回写
-//     pullFromWhichNodeTable（:157-164 的 updatePullFromWhichNode）。
 //
 // 与 python/tests/test_pull_post_subscription.py 同题；报文形状（SUBSCRIPTION 位、
 // `subscription` 键是否上线、打给 master 还是 slave、COMMIT_OFFSET 清位）在这里用
@@ -287,11 +276,6 @@ public class PullPostSubscriptionTests
 
     // ---------------------------------------------------------------- findBrokerAddressInSubscribe
 
-    /// <summary>
-    /// Java <c>findBrokerAddressInSubscribe:1307-1336</c> 的四个分支：命中直接用；
-    /// 从节点没命中按 id+1 再试；都不命中且不限定时回退到 id 最小那台。`IsSlave` 一律按
-    /// **命中的 id** 判，不是传进来的 brokerId。
-    /// </summary>
     [Fact]
     public void FindBrokerAddressInSubscribeBranches()
     {
@@ -307,7 +291,6 @@ public class PullPostSubscriptionTests
         Assert.Equal(("127.0.0.1:10921", true),
             MQClientInstance.FindBrokerAddressInSubscribe(addrs, 1));
 
-        // 从节点 id 缺失：按 id+1 再试（Java 的从节点编号约定）
         var sparse = new SortedDictionary<long, string>
         {
             [0] = "127.0.0.1:10911",
@@ -316,7 +299,6 @@ public class PullPostSubscriptionTests
         Assert.Equal(("127.0.0.1:10931", true),
             MQClientInstance.FindBrokerAddressInSubscribe(sparse, 1));
 
-        // 都不命中且不限定时回退到 id 最小的（Java 取 map 首项，这里取确定性形态）
         Assert.Equal(("127.0.0.1:10911", false),
             MQClientInstance.FindBrokerAddressInSubscribe(addrs, 9));
         Assert.Equal(("127.0.0.1:10921", true),
@@ -333,11 +315,6 @@ public class PullPostSubscriptionTests
 
     // ---------------------------------------------------------------- 线上报文
 
-    /// <summary>
-    /// brokerId=1（从节点）：请求打到 slave 地址；COMMIT_OFFSET 位被清掉
-    /// （Java pullKernelImpl:219-221）；SUBSCRIPTION 位关闭时 `subscription` 键整个不上线
-    /// （Java 的 subExpression=null + makeCustomHeaderToNet 跳过 null）。
-    /// </summary>
     [Fact]
     public void PullToSlaveClearsCommitOffsetAndOmitsSubscription()
     {
@@ -419,12 +396,6 @@ public class PullPostSubscriptionTests
         }
     }
 
-    /// <summary>
-    /// 从节点不存在（brokerId=1 但路由里只有 master）：Java 的
-    /// `findBrokerAddressInSubscribe` 在 onlyThisBroker=false 时会**回退到主节点**，
-    /// 所以这里必须打到 master 而不是抛异常。注意 `IsSlave` 按命中的 id 判，于是
-    /// COMMIT_OFFSET 位**保留**（回退到的是 master）。
-    /// </summary>
     [Fact]
     public void MissingSlaveFallsBackToMasterAndKeepsCommitOffset()
     {
@@ -457,16 +428,12 @@ public class PullPostSubscriptionTests
 
     // ---------------------------------------------------------------- 消费者配置与记账
 
-    /// <summary>
-    /// Java `postSubscriptionWhenPull` 默认 false：默认**不上送**订阅表达式；打开后且非类过滤
-    /// 模式才上送（空表达式归一成 "*"）。
-    /// </summary>
     [Fact]
     public void ConsumerSubscriptionGatingFollowsLegacyDefault()
     {
         var consumer = new DefaultMQPushConsumer(Group);
         var sub = new SubscriptionData(Topic, "TagA");
-        Assert.False(consumer.PostSubscriptionWhenPull);  // Java 5.x 默认 false
+        Assert.False(consumer.PostSubscriptionWhenPull);
         Assert.Null(consumer.PullSubscriptionExpressionForTest(sub));
 
         consumer.PostSubscriptionWhenPull = true;
@@ -480,11 +447,6 @@ public class PullPostSubscriptionTests
         Assert.Null(consumer.PullSubscriptionExpressionForTest(classMode));
     }
 
-    /// <summary>
-    /// Java `PullAPIWrapper#recalculatePullFromWhichNode` / `#updatePullFromWhichNode`：
-    /// 首轮无记录按 master=0；应答缺 suggestWhichBrokerId 也按 0 记账（Java long 原语，
-    /// 不是「保留旧值」）；表按队列 key 隔离。
-    /// </summary>
     [Fact]
     public void PullFromWhichNodeDefaultsToMasterAndRoundTrips()
     {
@@ -544,7 +506,6 @@ public class PullPostSubscriptionTests
     {
         string dead = DeadAddr();
         var addrs = new SortedDictionary<long, string> { [MixAll.MasterId] = dead };
-        // 命中与否只按表内容判，连通性是调用方的事（Java 亦然）
         Assert.Equal((dead, false), MQClientInstance.FindBrokerAddressInSubscribe(addrs, 0));
     }
 }

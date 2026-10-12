@@ -6,10 +6,6 @@ import (
 	"testing"
 )
 
-// LZ4/ZSTD tests: round trips + hardcoded cross-check vectors produced by the
-// real `lz4` / `zstd` CLIs (same wire formats as Java lz4-java / zstd-jni on
-// the broker), so the hand-rolled codecs are pinned to the official formats.
-
 // `printf 'rocketmq-compressed-payload-'*40 | lz4 -B4 --no-frame-crc -f -z`
 // — no content size, no checksums (FLG=0x60).
 const lz4CliFixtureNoSize = "04224d186040822b000000ff0d726f636b65746d712d636f6d707265737365642d7061796c6f61642d1c00ffffffff30506c6f61642d00000000"

@@ -1,25 +1,5 @@
-// CHECK_CLIENT_CONFIG(46) 的离线单测（对应 Java MQClientInstance#checkClientInBroker）。
-//
-// 为什么要有这一步：SQL92 表达式写错时 broker **不会**报错 ——
-// ExpressionMessageFilter#isMatched 在 ConsumeQueue 阶段拿不到编译好的过滤数据就直接
-// return true（静默放行全部消息），消费者启动照常成功。Java 因此在
-// DefaultMQPushConsumerImpl.start:1014 主动发一笔 46 号请求，把「写错的表达式」变成
-// 启动期错误。本端口此前只有 RequestCode 常量、没有调用方，所以这里锁死协议形状与
-// 分支语义（真机行为见 examples/RocketMQ.Examples/LiveSql92.cs）。
-//
 // 与 python/tests/test_check_client_config.py、cpp/tests/test_check_client_config.cpp、
 // rust/src/client/mq_client.rs 的同一组断言对拍。
-//
-// 对齐基准（Java 5.5.1，逐行读过）：
-//   * MQClientAPIImpl#checkClientInBroker:3256：请求头是 **null**，body 是
-//     CheckClientRequestBody 的 JSON（clientId / group / subscriptionData）；
-//     响应码非 SUCCESS 时抛 MQClientException(响应码, remark)。
-//   * MQClientInstance#checkClientInBroker:534：只查非 TAG 订阅
-//     （ExpressionType.isTagType：null / "" / TAG 都算 TAG）；broker 地址来自
-//     findBrokerAddrByTopic（**只读缓存**路由、随机一个 broker、优先 master），
-//     取不到就跳过；网络类异常包装成固定文案的 MQClientException（"…server has not
-//     been upgraded to support…"）。
-//   * ClientConfig#mqClientApiTimeout 默认 **3000ms**，这笔请求用的就是它。
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -350,7 +330,6 @@ public class CheckClientConfigTests
 
     // ---------------------------------------------------------------- 用例
 
-    /// <summary>TAG（含 null / 空串）一律不发 46：Java ExpressionType.isTagType 短路。</summary>
     [Fact]
     public void TagOnlySubscriptionsSendNothing()
     {
@@ -386,7 +365,6 @@ public class CheckClientConfigTests
         Assert.Equal(Topic, sd!.Get("topic").StringValue());
         Assert.Equal("a > 10", sd.Get("subString").StringValue());
         Assert.Equal(RocketMQ.Common.ExpressionType.Sql92, sd.Get("expressionType").StringValue());
-        // Java SubscriptionData 的序列化字段名（filterClassSource 是 @JSONField(serialize=false)）
         string[] keys = sd.ObjectItems().Select(kv => kv.Key).OrderBy(k => k, StringComparer.Ordinal)
             .ToArray();
         Assert.Equal(new[]
@@ -413,7 +391,6 @@ public class CheckClientConfigTests
         Assert.Contains("bad sql92", e.Message);
     }
 
-    /// <summary>broker 未开 enablePropertyFilter 时回 SYSTEM_ERROR(1)（Java 同码）。</summary>
     [Fact]
     public void BrokerWithoutPropertyFilterReportsSystemError()
     {
@@ -427,7 +404,6 @@ public class CheckClientConfigTests
         Assert.Equal(ResponseCode.SystemError, e.ResponseCode);
     }
 
-    /// <summary>查不到路由 → 跳过（Java findBrokerAddrByTopic 返回 null 即 continue）。</summary>
     [Fact]
     public void NoRouteSkipsTheSubscription()
     {
@@ -448,7 +424,6 @@ public class CheckClientConfigTests
         }
     }
 
-    /// <summary>连不上 broker 时 Java 不吞异常，而是换成一段固定文案再抛。</summary>
     [Fact]
     public void TransportErrorIsWrappedWithLegacyMessage()
     {
@@ -525,7 +500,6 @@ public class CheckClientConfigTests
         Assert.Equal("nsA", back2.Namespace);
     }
 
-    /// <summary>MQClientApiTimeoutMillis 就是 Java ClientConfig.mqClientApiTimeout 的默认值。</summary>
     [Fact]
     public void MqClientApiTimeoutMatchesLegacy()
     {

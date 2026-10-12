@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""MQClientInstance：RocketMQ 客户端核心编排（对应 org.apache.rocketmq.client.impl.factory.MQClientInstance
-与 MQClientAPIImpl 的核心调用面，Python 单机版）。
-
-职责：NameServer 地址管理、Topic 路由获取与缓存、Broker 地址解析、
-消息发送（SEND_MESSAGE / SEND_MESSAGE_V2）、拉取（PULL_MESSAGE）、
-offset 查询/更新、心跳、管理类 API（创建/删除 Topic、集群信息等）。
-"""
 from __future__ import annotations
 
 import random
@@ -72,7 +65,7 @@ logger = get_logger()
 
 
 class TopicPublishInfo:
-    """对应 org.apache.rocketmq.client.impl.producer.TopicPublishInfo。"""
+    pass
 
     def __init__(self):
         self.order_topic = False
@@ -88,11 +81,7 @@ class TopicPublishInfo:
         self._index = 0
 
     def select_one_message_queue(self, *filters) -> Optional[MessageQueue]:
-        """轮询选队列（对应 Java TopicPublishInfo.selectOneMessageQueue）。
-
-        ``*filters`` 为可调用 ``f(mq) -> bool``，全部通过才选中。无过滤器时固定返回一个
-        轮询队列（永不返回 None）；带过滤器且一轮内无匹配时返回 None，由调用方退化选择。
-        """
+        pass
         with self._lock:
             if not self.msg_queue_list:
                 raise MQClientException("no message queue for publish info")
@@ -133,67 +122,27 @@ class MQClientInstance:
                  socks_proxy_config=None):
         self.client_id = client_id
         self.name_server_addrs: List[str] = list(name_server_addrs)
-        # 在用 topic 的路由刷新周期（对应 Java ClientConfig.pollNameServerInterval，
-        # 默认 30000ms —— MQClientInstance.startScheduledTask:406 把它作为
-        # scheduleAtFixedRate 的周期参数）。和各 facade 上的同名字段一样，**只在
-        # start() 时取一次**：循环起来之后改这个值不会改变已经排定的周期（Java 的
-        # scheduledExecutorService 同理）。
         self.poll_name_server_interval = poll_name_server_interval
-        # namespaceV2（对应 Java ClientConfig.namespaceV2）：非空时 NamespaceRpcHook
-        # 给每笔请求加 nsd=true / ns=<值> 两个扩展头。与各 facade 的其余 ClientConfig
-        # 开关一样，**只在 start() 建实例时取一次快照**。
         self.namespace_v2 = namespace_v2 or ""
-        # SOCKS 代理（对应 Java NettyRemotingClient 的 socksProxyConfig）：透传给
-        # 传输层，在每条 remoting 连接建连时做 SOCKS 握手。NameServer HTTP 动态取址
-        # （DefaultTopAddressing 的普通 HTTP 请求）不经此配置，与 Java 口径一致。
         self.socks_proxy_config = socks_proxy_config
         self.remoting_client = RemotingClient(connect_timeout_millis, invoke_timeout_millis,
                                               tls_enable=tls_enable, tls_options=tls_options,
                                               socks_proxy_config=socks_proxy_config)
-        # 对应 Java `MQClientAPIImpl:329-335` 的注册顺序：Namespace → Stream →
-        # 用户 rpcHook（ACL 签名）→ DynamicalExtField。Java 无条件注册 NamespaceRpcHook
-        # （未配置 namespaceV2 时它自己 no-op），这里照抄；本钩子必须排在最前，
-        # nsd/ns 才会被算进 ACL 签名内容。
         self.remoting_client.register_rpc_hook(NamespaceRpcHook(self.namespace_v2))
-        # 对应 Java `MQClientAPIImpl:330-332`：stream 钩子必须注册在用户 rpcHook 之前，
-        # 这样 `ReqT` 才会被算进 ACL 签名内容（注释原文 "Inject stream rpc hook first
-        # to make reserve field signature"）。各 facade 都是在构造完本实例之后才
-        # `register_rpc_hook(self.rpc_hook)`，所以在这里注册天然满足顺序。
         if enable_stream_request_type:
             self.remoting_client.register_rpc_hook(StreamTypeRPCHook())
         self.topic_route_table: Dict[str, TopicRouteData] = {}
         self.topic_publish_info_table: Dict[str, TopicPublishInfo] = {}
-        # 对应 Java `MQClientInstance.brokerAddrTable`：**按 brokerName 平的**一张表，
-        # 每次刷到任一条路由就整批覆盖（`updateTopicRouteInfoFromNameServer:962-964`）。
-        # 别改用「扫 topic_route_table 找第一台」的写法：路由是**按 topic** 刷的，
-        # master 掉线后先刷过的 topic 已经无主、没刷过的还留着旧的主地址，扫出来是谁
-        # 全看字典顺序 —— 而 Java 的平表在第一次刷新后对**所有** topic 都无主了。
         self.broker_addr_table: Dict[str, Dict[int, str]] = {}
-        # 仅静态主题：MessageQueue(逻辑, mock broker 名, globalId) -> 真实 broker 名。
-        # Java `MQClientInstance#topicEndPointsTable`：每次路由刷新时由
-        # TopicQueueMappingUtils 那套推导重建，mock 名通过
-        # getBrokerNameFromMessageQueue 解析。非静态主题路由会把旧条目清掉。
         self.topic_end_points_table: Dict[str, Dict[MessageQueue, str]] = {}
         self.topic_route_lock = threading.RLock()
         self._started = False
         self._last_route_fetch = 0.0
-        # 本客户端「在用」的 topic（消费者订阅 + 生产者发过的），对应 Java 的
-        # MQConsumerInner.subscriptions() / MQProducerInner.getPublishTopicList()，
-        # 由周期任务 updateTopicRouteInfoFromNameServer() 逐个刷新路由。
         self._topics_in_use: set = set()
         self._route_refresh_thread: Optional[threading.Thread] = None
         self._route_refresh_stop = threading.Event()
-        # Request-Reply：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回来。
-        # 对应 Java MQClientAPIImpl 构造函数里的
-        # ``registerProcessor(RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, clientRemotingProcessor, null)``
-        # —— 它是**客户端实例级**的（与具体 producer 无关，应答按 clientId 推回），所以在这里注册。
         self.remoting_client.register_processor(
             RequestCode.PUSH_REPLY_MESSAGE_TO_CLIENT, self._process_reply_message)
-        # broker 主动请求 220/221/307/309（对应 Java ClientRemotingProcessor）：
-        # 与 326 一样是**客户端实例级**注册，但处理时要按 consumerGroup 找到对应的消费者
-        # 实例（同一进程多消费组时不能只认最后一个）。注意这些回调跑在 remoting 的**读线程**
-        # 上（见 client.py _dispatch），因此任何会触发 invokeSync 的动作（如 220 的 rebalance）
-        # 必须丢到后台线程，否则会卡死该连接上所有响应（静默自死锁）。
         self.remoting_client.register_processor(
             RequestCode.RESET_CONSUMER_CLIENT_OFFSET, self._process_reset_offset)
         self.remoting_client.register_processor(
@@ -202,53 +151,26 @@ class MQClientInstance:
             RequestCode.GET_CONSUMER_RUNNING_INFO, self._process_get_consumer_running_info)
         self.remoting_client.register_processor(
             RequestCode.CONSUME_MESSAGE_DIRECTLY, self._process_consume_message_directly)
-        # NOTIFY_CONSUMER_IDS_CHANGED(40)：消费组成员变化时 broker 沿长连接反向推过来。
-        # 对应 Java ``MQClientAPIImpl`` 构造函数 —— 它注册的是**实例级**的
-        # ``clientRemotingProcessor``，不是每个消费者各注册一份：处理器按 code 建表，
-        # 同组多消费者时后注册的会覆盖前一个（Java 里一个 clientId 只有一个连接，
-        # 覆盖就等于「只有最后一个消费者会被叫醒」）。
         self.remoting_client.register_processor(
             RequestCode.NOTIFY_CONSUMER_IDS_CHANGED, self._process_notify_consumer_ids_changed)
         # 40 只能由 broker 发出，用例无法注入反向请求，所以计数是唯一能断言
         # 「本端确实收到并处理过」的落点（见 python/tests/test_broker_requests.py）。
         self._consumer_ids_changed_count = 0
-        # 事务回查 CHECK_TRANSACTION_STATE(39)：实例级注册一个**分派器**，按 PGROUP
-        # 扇给各门面生产者注册进来的处理器（见 register_transaction_check_handler）。
-        # 对应 Java MQClientAPIImpl 构造器里实例级注册的 ClientRemotingProcessor +
-        # MQClientInstance.producerTable 的按组查找——跨门面复用后同一实例上多个
-        # 生产者各自注册不会互相覆盖。
         self.remoting_client.register_processor(
             RequestCode.CHECK_TRANSACTION_STATE, self._dispatch_check_transaction_state)
         self._consumer_table: Dict[str, "DefaultMQPushConsumer"] = {}
-        # 事务回查 CHECK_TRANSACTION_STATE(39) 的**门面级**处理器列表。39 本身是
-        # 实例级注册（一个 code 只有一个处理器槽位），但处理要按 PGROUP 属性找到
-        # 对应的生产者——跨门面复用后同一实例上可能挂着多个不同组的生产者，
-        # 逐个调用让每个处理器自己按组过滤（对齐 Java 的 producerTable 分派）。
         self._transaction_check_handlers: List[Callable] = []
-        # 动态 name server（对应 Java MQClientAPIImpl.topAddressing）。
-        # 未配置 ROCKETMQ_NAMESRV_DOMAIN 时 ws_addr 为空串 → fetch 是 no-op，行为不变。
-        # unitName 要透传（Java `new DefaultTopAddressing(MixAll.getWSAddr(), clientConfig.getUnitName())`）：
-        # 有 unit 时取址 URL 变成 `<wsAddr>-<unitName>?nofix=1`，取到的是该单元的 name server 列表。
         self.top_addressing = DefaultTopAddressing(unit_name=unit_name or "")
-        # 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）
         self.consumer_stats_manager = ConsumerStatsManager()
         self._namesrv_refresh_stop = threading.Event()
         self._namesrv_refresh_thread: Optional[threading.Thread] = None
-        # 线程弹性巡检线程（对应 Java MQClientInstance.startScheduledTask 里
-        # scheduleAtFixedRate(adjustThreadPool, 1, 1, MINUTES)）
         self._adjust_pool_stop = threading.Event()
         self._adjust_pool_thread: Optional[threading.Thread] = None
-        # 生命周期锁：跨门面复用后 start()/shutdown() 可能来自不同门面的线程，
-        # 幂等性必须靠锁保证（对应 Java MQClientInstance 各服务的 synchronized start）。
         self._lifecycle_lock = threading.RLock()
         MQClientInstance.INSTANCE_MAP[client_id] = self
 
     def fetch_name_server_addr(self) -> Optional[str]:
-        """对应 Java ``MQClientAPIImpl.fetchNameServerAddr``：地址**变化才应用**。
-
-        应用 = 按 ``;`` 切分后更新本实例的 name_server_addrs（Java 的
-        ``updateNameServerAddressList``）。返回新地址串；没变化 / 不可用返回 None。
-        """
+        pass
         if self.top_addressing is None or not self.top_addressing.ws_addr:
             return None
         changed = self.top_addressing.fetch_and_apply()
@@ -258,26 +180,18 @@ class MQClientInstance:
         return changed
 
     def adjust_thread_pool(self) -> None:
-        """对应 Java ``MQClientInstance.adjustThreadPool``：遍历 consumerTable。
-
-        ⚠ 被调用的 push consumer 的 ``adjust_thread_pool()`` 在 Java 5.5.1 是 no-op
-        （inc/dec 空实现），本实现照抄。异常按 Java 语义逐实例吞掉（``catch (Exception
-        ignored)``），保证一个消费者的异常不影响其它消费者。
-        """
+        pass
         for group, consumer in list(self._consumer_table.items()):
             if consumer is None:
                 continue
             try:
                 consumer.adjust_thread_pool()
-            except Exception as e:  # noqa: BLE001 —— Java 也是 catch (Exception ignored)
+            except Exception as e:
                 logger.debug("adjustThreadPool failed for group %s: %s", group, e)
 
     # ---------------- 消费者注册（broker 主动请求按 group 分派） ----------------
     def register_consumer(self, group: str, consumer: "DefaultMQPushConsumer") -> None:
-        """登记一个消费者实例，供 broker 主动请求按 consumerGroup 分派到正确的实例。
-
-        对应 Java ``MQClientInstance.consumerTable`` + ``findConsumer``。
-        """
+        pass
         self._consumer_table[group] = consumer
 
     def unregister_consumer(self, group: str) -> None:
@@ -288,13 +202,7 @@ class MQClientInstance:
 
     # ---------------- 事务回查处理器登记（39 分派的门面侧） ----------------
     def register_transaction_check_handler(self, handler: Callable) -> None:
-        """登记一个生产者的 ``_handle_check_transaction_state(cmd, addr)``。
-
-        处理器内部按消息 PGROUP 属性自过滤（见 producer 同名方法），分派器逐个
-        调用即可 —— 同一实例上多个不同组的生产者互不干扰（Java 的
-        ``DefaultMQProducerImpl.checkTransactionState`` 先按组查 producerTable）。
-        重复登记同一处理器是 no-op（幂等，防复用场景下重复注册）。
-        """
+        pass
         with self._lifecycle_lock:
             if handler not in self._transaction_check_handlers:
                 self._transaction_check_handlers.append(handler)
@@ -319,34 +227,17 @@ class MQClientInstance:
 
     # ---------------- CHECK_CLIENT_CONFIG(46)：订阅表达式向 broker 求证 ----------------
     def check_client_in_broker(self) -> None:
-        """对应 Java ``MQClientInstance#checkClientInBroker:534``。
-
-        遍历本实例登记的每个消费者的订阅，只把**非 TAG**（SQL92 / CLASS_FILTER）的表达式
-        发给 broker 校验。为什么必须发：SQL92 表达式写错时 broker 的
-        ``ExpressionMessageFilter`` 在 ConsumeQueue 阶段拿不到编译好的过滤数据就**直接放行**
-        （返回 true），也就是静默变成「订阅全部消息」，消费者启动照样成功、一条错误都不报。
-        这一调用把「写错的表达式」变成启动期的一次显式失败。
-
-        与 Java 一致的两个细节：
-        * 某个消费者「无订阅」时是 ``return`` 而不是 ``continue``（Java 源码如此，
-          后面的消费者这一轮就不再查了）；
-        * 查不到路由（``findBrokerAddrByTopic`` 返回 None）时**跳过**该订阅而不是报错。
-        """
+        pass
         for group, consumer in list(self._consumer_table.items()):
             subs = consumer.subscriptions() if consumer is not None else None
             if not subs:
-                # 对齐 Java 的 `return`：不是 continue。
                 return
             self.check_subscriptions_in_broker(group, subs)
 
     def check_subscriptions_in_broker(self, group: str,
                                       subs: Iterable[SubscriptionData]) -> None:
-        """``check_client_in_broker`` 的内层循环，单独暴露给未登记进 consumerTable 的消费者
-        （拉模式 / lite 消费者的订阅存在自己那份，Java 通过 ``MQConsumerInner#subscriptions``
-        走同一张表，本端口的 consumerTable 只收推模式消费者）。
-        """
+        pass
         for sub in subs:
-            # Java ``ExpressionType.isTagType``：null / "" / "TAG" 都算 TAG，一律跳过。
             if sub is None or not sub.expression_type or sub.expression_type == ExpressionType.TAG:
                 continue
             addr = self.find_broker_addr_by_topic(sub.topic or "")
@@ -357,8 +248,6 @@ class MQClientInstance:
             except MQClientException:
                 raise
             except Exception as e:  # noqa: BLE001
-                # 连不上/超时也当启动失败：Java 抛的是同一段文案的 MQClientException，
-                # 由调用方（consumer.start）收拾。老 broker 不认 46 码时就落在这里。
                 raise MQClientException(
                     "Check client in broker error, maybe because you use %s to filter "
                     "message, but server has not been upgraded to support!This error would "
@@ -373,13 +262,7 @@ class MQClientInstance:
         return self._consumer_ids_changed_count
 
     def rebalance_immediately(self) -> None:
-        """对应 Java ``MQClientInstance#rebalanceImmediately``（一行 ``rebalanceService.wakeup()``）。
-
-        Java 只有一个共享的重平衡线程，唤醒它即可；这里没有实例级重平衡线程，
-        改成对 consumerTable 里每个消费者点一次名，让它叫醒自己那份循环
-        （等价于 Java ``doRebalance()`` 逐个 ``impl.tryRebalance()``）。
-        拉模式消费者没有后台循环，``rebalance_immediately`` 在它们那边是 no-op。
-        """
+        pass
         for consumer in list(self._consumer_table.values()):
             if consumer is None:
                 continue
@@ -388,16 +271,12 @@ class MQClientInstance:
                 continue
             try:
                 wake()
-            except Exception as e:  # noqa: BLE001 —— Java 整段包在 try/catch 里
+            except Exception as e:
                 logger.warning("rebalance_immediately failed: %s", e)
 
     def _process_notify_consumer_ids_changed(self, cmd: RemotingCommand,
                                              addr: str) -> Optional[RemotingCommand]:
-        """对应 Java ``ClientRemotingProcessor#notifyConsumerIdsChanged``。
-
-        broker 用 ``invokeOneway`` 发的，Java 返回 null ⇒ 不回包。group 只用于日志：
-        Java 不读它来决定叫醒谁，整组一起唤醒（本实现照抄）。
-        """
+        pass
         header = NotifyConsumerIdsChangedRequestHeader()
         header.from_ext_fields(cmd.ext_fields)
         self._consumer_ids_changed_count += 1
@@ -420,12 +299,6 @@ class MQClientInstance:
         if consumer is None:
             logger.warning("RESET_CONSUMER_CLIENT_OFFSET: no consumer for group=%s", group)
             return None
-        # 222 的 body 有两种形状：map（ResetOffsetBody，Java 管理端恒用这种）与数组
-        # （ResetOffsetBodyForC，只有 222 发起方 language=CPP 时 broker 才推，见
-        # Broker2Client.resetOffset:158-163）。Java 处理器只认 map
-        # （ClientRemotingProcessor.resetOffset:153）—— Java 管理端恒发 JAVA 故碰不到数组；
-        # 本端口为与 language=CPP 的旧 C++ SDK 管理端互通而兜底它：map 解析器对数组只会
-        # 抛错/得空表，不兜底等于整笔重置静默丢弃（与 C++ parseResetOffsetBody 同口径）。
         topic = header.topic
         offset_table: Dict[MessageQueue, int] = {}
         if cmd.body:
@@ -438,8 +311,6 @@ class MQClientInstance:
                     for e in ResetOffsetBodyForC.decode(cmd.body).offset_table:
                         offset_table[MessageQueue(e.topic, e.broker_name, e.queue_id)] = e.offset
                 except Exception as e:  # noqa: BLE001
-                    # 连 JSON 都不是：与 Java 一致地整笔丢弃（Java 的解码异常从处理器里抛出、
-                    # 由 netty 侧吞掉），本地位点一根手指都不许碰。
                     logger.warning("RESET_CONSUMER_CLIENT_OFFSET: bad body: %s", e)
                     return None
 
@@ -508,13 +379,7 @@ class MQClientInstance:
 
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
-        """幂等启动：实例被多个门面共享时，重复 start 不重复拉起后台线程。
-
-        对应 Java ``MQClientInstance.start`` 的 ServiceState 守卫（CREATE_JUST 之外
-        直接 return）。启动失败时把实例从 MQClientManager 缓存摘掉（对应 Java
-        ``cleanupAfterStartFailure`` + ``removeClientFactory``），半启动实例不许
-        留在表里毒化后续的 ``getOrCreateMQClientInstance``。
-        """
+        pass
         with self._lifecycle_lock:
             if self._started:
                 return
@@ -527,27 +392,17 @@ class MQClientInstance:
                 raise
 
     def _start_locked(self) -> None:
-        # 消费统计采样线程（Java ConsumerStatsManager.start 是空的——采样挂在
-        # 各 StatsItem 的调度器上；这里收敛为一个统一线程，采样精度不变 10s）
         self.consumer_stats_manager.start()
-        # 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置
-        # 地址时先 fetch 一次；取不到就直接报错（比 Java 更严格——Java 会让运行期各处
-        # 各自失败，这里在 start 时给一个明确错误，行为可预期）。
         dynamic_ns = (not self.name_server_addrs
                       and self.top_addressing is not None
                       and bool(self.top_addressing.ws_addr))
         if dynamic_ns:
             self.fetch_name_server_addr()
             if not self.name_server_addrs:
-                # Java 在这一步不报错（``MQClientInstance.start`` 只是 fetch 一次，取不到
-                # 照样启动），故障要等到第一次发送才以 ``validateNameServerSetting`` 的
-                # 10004 冒出来；本端口在 start 时就失败（更可预期），码值仍用同一条 10004，
-                # 别让"配了地址服务器却没返回地址"落到 no-route(10005) 那种误导性文案上。
                 raise MQClientException(
                     "name server address is not set and address server (%s) returned none"
                     % self.top_addressing.ws_addr,
                     ClientErrorCode.NO_NAME_SERVER_EXCEPTION)
-            # 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
             self._namesrv_refresh_stop.clear()
             t = threading.Thread(target=self._namesrv_refresh_loop, daemon=True,
                                  name="rmq-namesrv-refresh-%s" % self.client_id)
@@ -578,18 +433,8 @@ class MQClientInstance:
             self.remoting_client.shutdown()
 
     def _namesrv_refresh_loop(self) -> None:
-        """动态 name server 周期刷新。
-
-        Java ``MQClientInstance.startScheduledTask``::
-
-            if (null == this.clientConfig.getNamesrvAddr()) {
-                scheduledExecutorService.scheduleAtFixedRate(() -> fetchNameServerAddr(),
-                    1000 * 10, 1000 * 60 * 2, MILLISECONDS);
-            }
-
-        ——首次延迟 10s、周期 2 分钟，且只在"未配置静态地址"时调度。
-        """
-        if self._namesrv_refresh_stop.wait(10.0):    # Java initialDelay = 10s
+        pass
+        if self._namesrv_refresh_stop.wait(10.0):
             return
         while True:
             if not self._started:
@@ -598,46 +443,29 @@ class MQClientInstance:
                 self.fetch_name_server_addr()
             except Exception as e:  # noqa: BLE001
                 logger.debug("fetchNameServerAddr exception: %s", e)
-            if self._namesrv_refresh_stop.wait(120.0):    # Java 周期 = 2 分钟
+            if self._namesrv_refresh_stop.wait(120.0):
                 return
 
     def _adjust_thread_pool_loop(self) -> None:
-        """周期触发线程弹性巡检。
-
-        Java ``MQClientInstance.startScheduledTask``::
-
-            scheduleAtFixedRate(() -> adjustThreadPool(), 1, 1, TimeUnit.MINUTES);
-
-        ——首次延迟 1 分钟、周期 1 分钟。虽然 inc/dec 是空实现（见
-        ``DefaultMQPushConsumer.adjust_thread_pool``），调度本身照抄以保持行为一致。
-        """
-        if self._adjust_pool_stop.wait(60.0):    # Java initialDelay = 1 分钟
+        pass
+        if self._adjust_pool_stop.wait(60.0):
             return
         while True:
             if not self._started:
                 return
             self.adjust_thread_pool()
-            if self._adjust_pool_stop.wait(60.0):    # Java 周期 = 1 分钟
+            if self._adjust_pool_stop.wait(60.0):
                 return
 
     def register_topic_in_use(self, topic: str) -> None:
-        """登记需要在后台周期刷新路由的 topic（对应 Java 的订阅/发布 topic 列表）。"""
+        pass
         if topic:
             self._topics_in_use.add(topic)
 
     def _route_refresh_loop(self) -> None:
-        """周期刷新在用 topic 的路由（对应 Java MQClientInstance.startScheduledTask:400-406 中
-        ``scheduleAtFixedRate(updateTopicRouteInfoFromNameServer, 10, pollNameServerInterval)``，
-        initialDelay 10ms、周期取 ``clientConfig.getPollNameServerInterval()`` 默认 30s）。
-        周期由 ``poll_name_server_interval``（毫秒）决定，只在 start() 时读一次。
-        没有这个任务，路由变化（如新 topic 被 broker 创建、队列扩容）只能等
-        消费者自己的 rebalance 轮次或生产者的下次发送才被发现。
-        """
-        if self._route_refresh_stop.wait(0.01):  # Java 首个任务延迟 10ms
+        pass
+        if self._route_refresh_stop.wait(0.01):
             return
-        # 周期在循环入口取一次：Java 的 scheduleAtFixedRate 也是启动时把周期排定，
-        # 之后改 clientConfig 不影响已排定的任务。首轮刷新就发生在 initialDelay 之后
-        # （不是 initialDelay + 一个周期后），调用顺序与 scheduleAtFixedRate 一致。
         period = self.poll_name_server_interval / 1000.0
         while True:
             if not self._started:
@@ -667,18 +495,8 @@ class MQClientInstance:
     # ---------------- 路由管理 ----------------
     def update_topic_route_info_from_name_server(self, topic: str, timeout_millis: int = 5000,
                                                  is_default: bool = False) -> bool:
-        """拉取并落库 topic 路由。
-
-        ``is_default`` 对应 Java ``MQClientInstance.updateTopicRouteInfoFromNameServer(topic,
-        isDefault, defaultMQProducer)``：**只有生产者**在真实路由拉不到时才回退到默认 topic
-        （TBW102）来为新 topic 合成发布信息（见 Java DefaultMQProducerImpl:905）。
-        消费者路径**绝不允许**兜底——否则 ``%RETRY%group`` 这类尚未由 broker 创建的主题会
-        被合成出一组假队列，两个实例在不同时刻拉取会得到不同的队列数，rebalance 视图不一致。
-        """
+        pass
         if not self.name_server_addrs:
-            # Java 这里只 log.warn 并返回 false，故障最终由生产者的
-            # ``validateNameServerSetting`` 以 10004 报出；本端口的路由拉取是拉不到就抛，
-            # 所以直接把同一个码带上 —— 一个地址都没有时不能报成"这个 topic 没路由"(10005)。
             raise MQClientException("name server address list is empty",
                                     ClientErrorCode.NO_NAME_SERVER_EXCEPTION)
 
@@ -690,19 +508,8 @@ class MQClientInstance:
                 try:
                     response = self._invoke_sync(ns_addr, request, timeout_millis)
                 except Exception as e:  # noqa: BLE001
-                    # 连接/发送/超时级别的失败 → **换下一个** name server 再试（对齐
-                    # Java NettyRemotingClient#getAndCreateNameserverChannel 的语义：
-                    # 逐个试到建连成功为止）。⚠ 原实现只是记住异常继续循环，循环结束后
-                    # 又把 `last_exc` 原样重抛 —— 于是「ns[0] 已死 + ns[1] 活着并给出了
-                    # 权威答复（如 %RETRY%group 的 TOPIC_NOT_EXIST）」会被 ns[0] 那次的
-                    # RemotingConnectException 盖掉，表现为：多 NameServer 下杀掉
-                    # ns[0]，生产者能切到存活节点（它的路由查询总拿得到 SUCCESS），
-                    # 消费者 start() 却直接抛 connect to failed。
                     last_exc = e
                     continue
-                # 拿到应答：无论 SUCCESS 还是 TOPIC_NOT_EXIST，这已经是选定 name
-                # server 的终局答复 —— 语义上等价于 Java 的单次应答（allowTopicNotExist），
-                # 不再轮询、也绝不能让更早的传输级异常盖过它。
                 if response.code == ResponseCode.SUCCESS and response.body:
                     return TopicRouteData.decode(response.body)
                 return None
@@ -712,9 +519,6 @@ class MQClientInstance:
 
         route = _fetch(topic)
         if route is None and is_default and topic != MixAll.DEFAULT_TOPIC:
-            # RocketMQ 5.x nameServer 不为未知 topic 合成默认路由（返回 TOPIC_NOT_EXIST），
-            # **生产者**需要像 Java 客户端那样回退到默认 topic（TBW102）来为该 topic
-            # 构造发布信息。消费者不做这个兜底（见方法 docstring）。
             route = _fetch(MixAll.DEFAULT_TOPIC)
             if route is not None:
                 # 新 topic 由 broker 用 default_topic_queue_nums 创建队列，而默认 topic 自身
@@ -727,14 +531,8 @@ class MQClientInstance:
             return False
         with self.topic_route_lock:
             self.topic_route_table[topic] = route
-            # Java 只在路由"变了"时覆盖（`if (changed)`），但 route 是刚解码出来的新对象，
-            # 这里一律覆盖 —— Java 的 brokerAddrTable 条目本身就是**共享引用**
-            # （`put(bd.getBrokerName(), bd.getBrokerAddrs())` 存的是 route 里那张 map），
-            # 所以它那边的"没变就不覆盖"并不会留下旧值，两边等价。
             for bd in route.get_broker_datas():
                 self.broker_addr_table[bd.broker_name] = dict(bd.broker_addrs)
-            # 静态主题：同一路由落库块里刷新「逻辑队列 -> 真实 broker」端点表
-            # （Java 在同处构建 topicEndPointsTable）；非静态路由清掉旧条目。
             endpoints = static_topic.topic_route_data_2_endpoints_for_static_topic(topic, route)
             if endpoints is not None:
                 self.topic_end_points_table[topic] = endpoints
@@ -771,15 +569,7 @@ class MQClientInstance:
             return self.topic_route_table.get(topic)
 
     def get_topic_subscribe_info(self, topic: str) -> List[MessageQueue]:
-        """本实例订阅该 topic 时应看到的全部队列（Java ``RebalanceImpl.topicSubscribeInfoTable``）。
-
-        取值口径是 ``topicRouteData2TopicSubscribeInfo:318-332``（**读**位 + readQueueNums、
-        不要求 broker 有 master），**不是**发布信息 —— 两者在 perm=4 的只读 topic 和
-        「master 掉线只剩从节点」两种路由上会给出不同答案，消费侧必须用这一份
-        （消费比发布更宽：从节点也能服务拉取）。
-        路由没缓存时补拉一次；仍然没有返回空列表（Java ``rebalanceByTopic`` 对空表只 warn，
-        不会因此撤走已有分配）。
-        """
+        pass
         route = self.get_topic_route_data(topic)
         if route is None:
             return []
@@ -793,14 +583,7 @@ class MQClientInstance:
         return None
 
     def find_broker_addr_by_topic(self, topic: str) -> Optional[str]:
-        """对应 Java ``MQClientInstance#findBrokerAddrByTopic:1390``：从路由里随机挑一个
-        broker（优先 master 地址）；查不到返回 ``None``（不抛）。
-
-        与 ``_broker_addr_for_topic``（拿不到就抛，给管理类 API 用）的分工照抄 Java：
-        这里返回 null 由调用方决定跳过。与 Java 的一点不同：Java 只读缓存（它依赖调用前的
-        ``updateTopicSubscribeInfoWhenSubscriptionChanged`` 预热），这里用
-        ``get_topic_route_data``，缓存空了会顺手补拉一次。
-        """
+        pass
         route = self.get_topic_route_data(topic)
         if route is None:
             return None
@@ -811,24 +594,7 @@ class MQClientInstance:
 
     # ---------------- 消息发送 ----------------
     def publish_addr_for(self, broker_name: str, topic: str) -> str:
-        """Java 侧「**只要主**」的地址解析，出现处都是同一个形状。
-
-        对应 ``DefaultMQProducerImpl.sendKernelImpl:919-924``（发送）、
-        ``DefaultMQPushConsumerImpl.changePopInvisibleTimeAsync:869-876`` /
-        ``ackAsync``（POP 的 ack 与延长不可见时间走
-        ``findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)``，只要主），
-        以及 ``MQAdminImpl`` 的 offset 查询（见 ``_publish_addr_in_admin``）。
-        形状一致：查发布地址（**只认 brokerId=0**）→ 查不到按 topic 刷一次路由 →
-        重查 → 仍查不到照 ``sendKernelImpl:1100`` 抛
-        ``MQClientException("The broker[X] not exist", null)``。（Java 的双参构造器把
-        ``responseCode`` 置 -1；本端口用 ``response_code=None`` 表示「不是 broker 回的
-        码」，Rust/C++/C# 三端同一个口径。）
-
-        定点发送不会在 ``sendDefaultImpl`` 里取发布信息，这里是它唯一的路由来源；
-        主从切换期间这也是「本端立刻报错」与「把请求打到从节点上白挨一轮
-        SYSTEM_BUSY(2)」的分水岭 —— 从节点不接 SEND_MESSAGE / CONSUMER_SEND_MSG_BACK /
-        CHANGE_INVISIBLE_TIME 这些写请求。
-        """
+        pass
         addr = self.find_broker_address_in_publish(broker_name)
         if not addr:
             self.update_topic_route_info_from_name_server(topic)
@@ -838,10 +604,7 @@ class MQClientInstance:
         return addr
 
     def get_broker_name_from_message_queue(self, mq: MessageQueue) -> str:
-        """Java ``MQClientInstance#getBrokerNameFromMessageQueue``：把静态主题的
-        **逻辑**队列（mock broker 名 ``__syslo__<scope>``）经 topicEndPointsTable
-        解析成承载它的真实 broker 名。非静态主题 —— 或者表里没有的队列 ——
-        原样透传自己的 broker 名。"""
+        pass
         with self.topic_route_lock:
             endpoints = self.topic_end_points_table.get(mq.topic)
         if endpoints:
@@ -851,15 +614,7 @@ class MQClientInstance:
         return mq.broker_name
 
     def pop_ack_addr(self, broker_name: str, topic: str, queue_id: int) -> str:
-        """POP ack / changeInvisibleTime 的地址解析（Go ``popAckAddress`` 同形）。
-
-        Java ``ackAsync`` / ``changePopInvisibleTimeAsync`` 对静态主题：来自
-        **逻辑**队列的 checkpoint 第 5 段带的是 MOCK broker 名
-        （``__syslo__<scope>``）；真实承载者要用实例的 topicEndPointsTable +
-        checkpoint **自己的** queueId 解析 —— 同一静态主题的各 globalId 可能落在
-        **不同**真实 broker 上，用 queueId 0 会解析错机器。请求头里保留**原样**
-        （mock）名；只有地址查找走真实名。
-        """
+        pass
         def _resolve_des() -> str:
             if static_topic.is_logical_queue_mock_broker_name(broker_name):
                 return self.get_broker_name_from_message_queue(
@@ -870,8 +625,6 @@ class MQClientInstance:
         addr = self.find_broker_address_in_publish(des)
         if not addr:
             self.update_topic_route_info_from_name_server(topic)
-            # Java 在路由刷新之后**重新解析** desBrokerName —— 刷新后的映射可能把
-            # 这个逻辑队列搬到了新 broker 上。
             des = _resolve_des()
             addr = self.find_broker_address_in_publish(des)
         if not addr:
@@ -914,11 +667,7 @@ class MQClientInstance:
                            unit_mode: bool = False,
                            default_topic: Optional[str] = None,
                            default_topic_queue_nums: Optional[int] = None) -> RemotingCommand:
-        """只**构建** SEND_MESSAGE 请求对象、不发送。
-
-        异步发送链需要跨重试复用同一个请求（Java ``onExceptionImpl:728-730`` 只做
-        ``request.setOpaque(createNewRequestId())`` 再递归），所以请求构建要拆出来给调用方持有。
-        """
+        pass
         return self._build_send_request(producer_group, msg, mq, timeout_millis, sys_flag,
                                         unit_mode, default_topic, default_topic_queue_nums)
 
@@ -926,17 +675,7 @@ class MQClientInstance:
                            mq: MessageQueue, timeout_millis: int,
                            on_complete: Callable[[Optional[SendResult], Optional[BaseException]],
                                                  None]) -> None:
-        """异步发出一个已构建好的发送请求（对应 Java ``MQClientAPIImpl#sendMessageAsync``）。
-
-        ``on_complete(result, error)`` 恰好回调一次（由 remoting 层保证）。响应解析也放在这一层
-        做，和 Java 一样：``processSendResponse`` 是在 ``operationSucceed`` 里调的，它抛出的
-        ``MQBrokerException`` 会流进 ``onExceptionImpl`` —— 也就是说 broker 明确回了错误码时
-        **不会**换 broker 重试（needRetry=false），只有连不上/超时/发不出去才重试。这一点和同步
-        发送的 ``retryResponseCodes`` 语义**不同**，别照搬。
-
-        抛异常（``addr`` 解析不到、remoting 层就地拒绝）不走回调，直接向上抛，
-        对应 Java ``sendMessageAsync`` 外层 try-catch 的 ``needRetry=true`` 分支。
-        """
+        pass
         def _callback(response: Optional[RemotingCommand],
                       error: Optional[BaseException]) -> None:
             if error is not None:
@@ -954,18 +693,7 @@ class MQClientInstance:
                             unit_mode: bool = False,
                             default_topic: Optional[str] = None,
                             default_topic_queue_nums: Optional[int] = None) -> RemotingCommand:
-        """sys_flag 由 Producer 算好（压缩标志 + 压缩类型位），见
-        DefaultMQProducer.try_to_compress_message。
-
-        ``default_topic`` / ``default_topic_queue_nums`` 对位 Java
-        ``sendKernelImpl:996-997`` 读的生产者 ``createTopicKey`` 与
-        ``defaultTopicQueueNums``（不传则用 ``TBW102`` / 4 这两个 Java 默认值）。
-        """
-        # 对齐 Java DefaultMQProducerImpl.sendKernelImpl:932-935：非批量消息在
-        # **发请求之前**补一个客户端唯一 ID（UNIQ_KEY）；批量消息的 ID 在
-        # MessageBatch.generateFromList 时已逐条写好，不覆盖。
-        # 这个字段决定 SendResult.msgId 的取值，也是消息轨迹里 msgId 的来源 ——
-        # 控制台正是按它把发送轨迹与消费轨迹串起来。
+        pass
         if not isinstance(msg, MessageBatch):
             set_uniq_id(msg)
         header = SendMessageRequestHeaderV2()
@@ -982,18 +710,7 @@ class MQClientInstance:
         header.properties = message_properties_2_string(msg.properties)
         header.reconsume_times = 0
         header.unit_mode = unit_mode
-        # ⚠ maxReconsumeTimes 只在「发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES 属性」时
-        # 才下发（Java sendKernelImpl:1003-1018）。客户端版本升到 V3_4_9 之后 broker
-        # 会无条件采信这个字段（AbstractSendMessageProcessor:172-179），固定发 0 会让
-        # 重试消息第一次回投就判定 reconsumeTimes(0) >= 0 直接进 %DLQ%。
         header.max_reconsume_times = None
-        # Java sendKernelImpl:1004-1018：发往 ``%RETRY%<group>`` 时这两个重试属性要**抬进
-        # 请求头**，因为 broker 的 handleRetryAndDLQ（SendMessageProcessor:197-210）读的是
-        # requestHeader.reconsumeTimes / maxReconsumeTimes，而不是报文里的属性；漏抬的后果
-        # 不是报错而是**静默错位**：broker 退回用订阅组默认的 retryMaxTimes(16) 判定，
-        # 该三次就进死信的消息会在重试 topic 上一直转。
-        # ⚠ 抬完的 clear 只作用在本地这条 msg 上：properties 字符串在上面已经序列化过，
-        #   Java 也是这个先后顺序（线上属性里 RECONSUME_TIME 依然在），别"顺手"调换。
         if header.topic.startswith(MixAll.RETRY_GROUP_TOPIC_PREFIX):
             reconsume_times = MessageAccessor.get_reconsume_time(msg)
             if reconsume_times is not None:
@@ -1004,16 +721,7 @@ class MQClientInstance:
                 header.max_reconsume_times = int(max_reconsume_times)
                 MessageAccessor.clear_property(msg, MessageConst.PROPERTY_MAX_RECONSUME_TIMES)
         header.batch = isinstance(msg, MessageBatch)
-        # Java sendKernelImpl:1007 `requestHeader.setBrokerName(brokerName)` —— V2 的键是
-        # 单字母 `n`（SendMessageRequestHeaderV2:63）。发往哪台 broker 由路由选中，
-        # 这里跟着 mq 走：请求跨重试复用时它也保持第一次的那个值（Java 同样只建一次头）。
         header.broker_name = mq.broker_name or None
-        # Request-Reply：MSG_TYPE == "reply" 的应答消息走 SEND_REPLY_MESSAGE_V2(325)，
-        # 而不是普通的 SEND_MESSAGE_V2(310)。broker 只在 324/325 上注册了
-        # ReplyMessageProcessor（它负责按 REPLY_TO_CLIENT 把应答推回请求方）。
-        # 批量消息走 SEND_BATCH_MESSAGE(320)：Java 的判据是 msg instanceof MessageBatch
-        # （MQClientAPIImpl:562），先判 reply 再判 batch。
-        # 对齐 Java MQClientAPIImpl.sendMessage:550-563（sendSmartMsg 默认 true → V2）。
         if is_reply_message(msg):
             code = RequestCode.SEND_REPLY_MESSAGE_V2
         elif header.batch:
@@ -1026,11 +734,7 @@ class MQClientInstance:
 
     @staticmethod
     def _encode_body(msg: Message) -> bytes:
-        """对应 Java MQClientAPIImpl.sendMessage：request.setBody(msg.getBody())。
-
-        普通消息的 body 就是原始消息体；批量消息的 body 由 MessageBatch 在构造时
-        用 MessageDecoder.encodeMessages 编码好（DefaultMQProducer.batch）。
-        """
+        pass
         return msg.get_body() or b""
 
     def _parse_send_response(self, response: RemotingCommand, msg: Message, mq: MessageQueue) -> SendResult:
@@ -1043,19 +747,6 @@ class MQClientInstance:
         if response.code in status_map:
             header = SendMessageResponseHeader()
             header.from_ext_fields(response.ext_fields)
-            # 对应 Java MQClientAPIImpl.processSendResponse(:785-793, :794-806)：
-            #   msgId         = 客户端唯一 ID：批量消息用**批量自身**的 UNIQ_KEY
-            #                   （inner-batch 时 broker 会把它原样回在 batchUniqId 里）
-            #   offsetMsgId   = 响应头里的 msgId（broker 生成的 offset 消息 ID）
-            #   regionId      = 响应头 MSG_REGION，缺省回落 DefaultRegion
-            #   traceOn       = 响应头 TRACE_ON != "false"（broker 默认 true）
-            # ⚠ 有意偏离 Java：Java 在 broker **没**回 batchUniqId（= 普通 topic 上的客户端
-            # 批量，不是 inner-batch）时把 msgId 换成「逐条子消息 UNIQ_KEY 的逗号串」
-            # （processSendResponse:786-793）。本端口的解析层只拿得到「这一条发出去的消息」，
-            # 拿不到子消息列表（Rust/C++ 同样如此），而且四语言要能互相对拍 —— 所以统一用批量
-            # 自身的 ID。要紧的那一半已对齐：每条子消息在编码前就写好了自己的 UNIQ_KEY
-            # （DefaultMQProducer._send_batch），broker 拆开后消费端与轨迹看到的逐条 ID 与
-            # Java 完全一致。
             uniq_msg_id = get_uniq_id(msg) or header.batch_uniq_id
             result = SendResult(
                 send_status=status_map[response.code],
@@ -1076,11 +767,7 @@ class MQClientInstance:
     # ---------------- 定时消息撤回 ----------------
     def recall_message(self, addr: str, header: RecallMessageRequestHeader,
                        timeout_millis: int) -> str:
-        """RECALL_MESSAGE(370)，对应 Java ``MQClientAPIImpl#recallMessage``(:3749-3767)。
-
-        与 Java 一样：SUCCESS 才取响应头的 ``msgId``（被撤回那条消息的 UNIQ_KEY），
-        其余码一律抛 ``MQBrokerException``。
-        """
+        pass
         request = RemotingCommand.create_request_command(RequestCode.RECALL_MESSAGE, header)
         response = self._invoke_sync(addr, request, timeout_millis)
         if response.code == ResponseCode.SUCCESS:
@@ -1094,19 +781,11 @@ class MQClientInstance:
 
     # ---------------- Request-Reply：接收 broker 推回的应答 ----------------
     def _process_reply_message(self, cmd: RemotingCommand, addr: str) -> Optional[RemotingCommand]:
-        """处理 PUSH_REPLY_MESSAGE_TO_CLIENT(326)：把应答交给等待中的 request()。
-
-        对应 Java ``ClientRemotingProcessor#receiveReplyMessage``（:222-271）。
-        与 Java 一样**必须回一个响应**：broker 侧 ``Broker2Client.callClient`` 是
-        ``invokeSync``（10s 超时），不回响应它那边就会超时并记 ``push reply message to
-        <id> fail``，应答虽然已经投递成功，broker 日志里却是失败。
-        """
+        pass
         header = ReplyMessageRequestHeader()
         header.from_ext_fields(cmd.ext_fields)
         try:
             body = cmd.body or b""
-            # sysFlag 里带压缩标志时要先解压：326 推的是**裸包**，不走消息解码路径
-            # （对齐 Java 同处的 Compressor 分支）。
             if MessageSysFlag.is_compressed(header.sys_flag or 0):
                 body = decompress_body(body, MessageSysFlag.get_compression_type(header.sys_flag or 0))
             msg = MessageExt(topic=header.topic or "", body=body)
@@ -1124,7 +803,6 @@ class MQClientInstance:
                 int(time.time() * 1000))
             correlation_id = msg.properties.get(MessageConst.PROPERTY_CORRELATION_ID)
             if REQUEST_FUTURE_HOLDER.put_response(correlation_id, msg) is None:
-                # 查不到是正常情况（请求已超时 / 应答重复），Java 此处也是 warn
                 logger.warning("receive reply message, but not matched any request, "
                                "CorrelationId: %s, reply from host: %s",
                                correlation_id, header.born_host)
@@ -1149,8 +827,6 @@ class MQClientInstance:
             if route is None:
                 raise MQClientException("No route info of this topic: %s" % mq.topic)
             if broker_id is not None:
-                # 对应 Java pullKernelImpl 的 findBrokerAddressInSubscribe(brokerName,
-                # recalculatePullFromWhichNode(mq), false)：按 brokerId 选主/从。
                 broker_data = next((bd for bd in route.broker_datas
                                     if bd.broker_name == mq.broker_name), None)
                 if broker_data is None:
@@ -1164,7 +840,6 @@ class MQClientInstance:
                 if addr is None:
                     raise MQClientException("Broker %s not found in route of topic %s" % (mq.broker_name, mq.topic))
         if slave:
-            # Java pullKernelImpl:219-221：从节点上位点提交没有意义，清 COMMIT_OFFSET 位
             sys_flag = PullSysFlag.clear_commit_offset_flag(sys_flag)
         header = PullMessageRequestHeader()
         header.consumer_group = consumer_group
@@ -1180,9 +855,6 @@ class MQClientInstance:
         header.expression_type = expression_type
         header.max_msg_bytes = max_msg_bytes
         header.request_source = request_source
-        # Java MQClientAPIImpl#pullMessage:816-820：lite pull 位决定请求码
-        # LITE_PULL_MESSAGE(361) vs PULL_MESSAGE(11)；broker 用 361 走独立线程池
-        # 并被 litePullMessageEnable 开关单独管辖（PullMessageProcessor:325）
         code = (RequestCode.LITE_PULL_MESSAGE
                 if PullSysFlag.has_lite_pull_flag(sys_flag)
                 else RequestCode.PULL_MESSAGE)
@@ -1216,11 +888,7 @@ class MQClientInstance:
     @staticmethod
     def find_broker_addr_in_subscribe(broker_addrs: Dict[int, str], broker_id: int,
                                       only_this_broker: bool = False):
-        """对应 Java `MQClientInstance#findBrokerAddressInSubscribe`：按 brokerId 选地址。
-        命中 brokerId 直接用；brokerId 是从节点且没命中时按 brokerId+1 再试
-        （Java 对从节点 id 的 +1 约定）；仍没有且不限定 brokerId 时取 id 最小的
-        （即 master，Java 取 map 第一个 entry，这里取确定性形态）。
-        返回 ``(addr, is_slave)``；找不到时 ``(None, False)``。"""
+        pass
         if not broker_addrs:
             return None, False
         addr = broker_addrs.get(broker_id)
@@ -1271,11 +939,6 @@ class MQClientInstance:
             # 挑完照样只认它的 master。
             broker_name = brokers[0].broker_name
         if addr is None:
-            # Java PullAPIWrapper#popAsync:369-373：findBrokerAddressInSubscribe(brokerName,
-            # MASTER_ID, true) —— **只认主**，查不到按 topic 刷一次路由再查，仍查不到抛
-            # 「The broker[X] not exist」。不能退到从节点：从节点不接 POP 这族写请求
-            # （ack / 延长不可见时间都要落在 broker 侧的 revive 表上），退过去只会换一个
-            # 可重试的 SYSTEM_BUSY(2)。见 publish_addr_for。
             addr = self.publish_addr_for(broker_name, topic)
 
         header = PopMessageRequestHeader()
@@ -1293,7 +956,6 @@ class MQClientInstance:
         request = RemotingCommand.create_request_command(RequestCode.POP_MESSAGE, header)
         response = self._invoke_sync(addr, request, timeout_millis)
 
-        # 响应码映射照 Java MQClientAPIImpl.processPopResponse。
         if response.code == ResponseCode.SUCCESS:
             status = PopStatus.FOUND
         elif response.code == ResponseCode.POLLING_FULL:
@@ -1311,12 +973,8 @@ class MQClientInstance:
         found: List[MessageExt] = []
         if status == PopStatus.FOUND and response.body:
             found = decode_messages(response.body)
-            # 必须在改写 topic 之前反构 POP_CK —— retryFlag 是从消息**原始** topic
-            # 推出来的（broker 可能改写 topic，见 Java buildQueueOffsetSortedMap 注释）。
             self._stamp_pop_ck(found, broker_name, resp_header)
 
-        # Java processPopResponse 收尾：统一盖 brokerName，并把 topic 还原成请求的
-        # topic（不带命名空间），这样消费方不用关心 retry topic。
         for m in found:
             m.broker_name = broker_name
             m.topic = topic
@@ -1332,25 +990,14 @@ class MQClientInstance:
 
     @staticmethod
     def _pop_queue_map_key(extra, m: MessageExt) -> str:
-        """``startOffsetInfo`` / ``msgOffsetInfo`` / sortMap 的查表 key。
-
-        Java ``getStartOffsetInfoMapKey(topic, popCk, key)`` 的规则：消息**已带**
-        ``POP_CK``（说明是从 retry topic 弹回来的）时 retryFlag 取自 POP_CK 第 5 段，
-        否则由消息 topic 推断 —— 因为 broker 可能改写 topic。
-        """
+        pass
         ck = m.properties.get(MessageConst.PROPERTY_POP_CK)
         if ck:
             return extra.get_retry(extra.split(ck)) + "@" + str(m.queue_id)
         return extra.get_start_offset_info_map_key(m.topic, m.queue_id)
 
     def _stamp_pop_ck(self, found: List[MessageExt], broker_name: str, resp_header) -> None:
-        """给 POP 出来的消息反构 ``POP_CK`` 与 ``1ST_POP_TIME``。
-
-        **这是 POP 最容易踩的坑**：普通 topic 直连 POP 时 broker **不写** ``POP_CK``
-        属性（只在 retry topic 重编码路径才写），必须由客户端用响应头的
-        ``startOffsetInfo`` / ``msgOffsetInfo`` 反构 —— 没有它就无法发 ACK。
-        逐条对齐 Java ``MQClientAPIImpl.processPopResponse``。
-        """
+        pass
         from remoting.protocol import extra_info as extra
 
         pop_time = resp_header.pop_time or 0
@@ -1358,8 +1005,6 @@ class MQClientInstance:
         revive_qid = resp_header.revive_qid or 0
 
         if not resp_header.start_offset_info:
-            # Java 的 startOffsetInfo == null 分支：用消息自身 queueOffset 当
-            # ckQueueOffset 拼 7 段，再手工补一段凑成 8 段。
             per_queue: Dict[str, str] = {}
             for m in found:
                 key = str(m.topic) + str(m.queue_id)
@@ -1373,8 +1018,6 @@ class MQClientInstance:
             start_map = extra.parse_start_offset_info(resp_header.start_offset_info) or {}
             msg_map = extra.parse_msg_offset_info(resp_header.msg_offset_info) or {}
 
-            # Java 先按队列收集 queueOffset 并排序，再用 indexOf 求下标去取
-            # msgOffsetInfo 里对应的 msgQueueOffset。
             sorted_offsets: Dict[str, List[int]] = {}
             for m in found:
                 queue_key = self._pop_queue_map_key(extra, m)
@@ -1401,7 +1044,6 @@ class MQClientInstance:
                     start_offset, pop_time, invisible_time, revive_qid,
                     m.topic, broker_name, m.queue_id, offsets[index])
 
-        # Java 用 computeIfAbsent：只在缺失时补。
         for m in found:
             m.properties.setdefault(MessageConst.PROPERTY_FIRST_POP_TIME, str(pop_time))
 
@@ -1441,8 +1083,6 @@ class MQClientInstance:
         if broker_name is None:
             broker_name = extra.get_broker_name(extra.split(extra_info))
         if addr is None:
-            # 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync /
-            # changePopInvisibleTimeAsync 的只要主 + 重写语义）。
             addr = self.pop_ack_addr(broker_name, topic, queue_id)
 
         header = AckMessageRequestHeader()
@@ -1474,8 +1114,6 @@ class MQClientInstance:
         if broker_name is None:
             broker_name = extra.get_broker_name(extra.split(extra_info))
         if addr is None:
-            # 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync /
-            # changePopInvisibleTimeAsync 的只要主 + 重写语义）。
             addr = self.pop_ack_addr(broker_name, topic, queue_id)
 
         header = ChangeInvisibleTimeRequestHeader()
@@ -1494,8 +1132,6 @@ class MQClientInstance:
 
         new_extra = None
         if response.code == ResponseCode.SUCCESS:
-            # 与 Java MQClientAPIImpl.changeInvisibleTimeAsync 一致：
-            # 7 段 build（ckQueueOffset 用本次的 offset）再补一段凑 8 段。
             new_extra = extra.build_extra_info(
                 offset, resp_header.pop_time, resp_header.invisible_time,
                 resp_header.revive_qid, topic, broker_name, queue_id,
@@ -1506,10 +1142,6 @@ class MQClientInstance:
                                          resp_header.revive_qid or 0,
                                          new_extra)
 
-    # ---------------- Offset 查询/更新 ----------------
-    # set_zero_if_not_found 默认 False：Java 的 fetchConsumeOffsetFromBroker 从不设置该字段，
-    # 新消费组因此回 QUERY_NOT_FOUND（None）而非 0，调用方才会按 consume_from_where 算起点。
-    # 默认 True 会把首次启动的消费者钉在队首重放历史消息，并让 LAST_OFFSET / TIMESTAMP 形同虚设。
     def query_consumer_offset(self, consumer_group: str, mq: MessageQueue,
                               timeout_millis: int = 5000, addr: Optional[str] = None,
                               set_zero_if_not_found: bool = False) -> Optional[int]:
@@ -1571,12 +1203,7 @@ class MQClientInstance:
     def search_offset_by_timestamp(self, mq: MessageQueue, timestamp: int,
                                    timeout_millis: int = 5000, addr: Optional[str] = None,
                                    boundary_type: Optional[BoundaryType] = BoundaryType.LOWER) -> int:
-        """对应 Java MQClientAPIImpl#searchOffset(addr, mq, timestamp, boundaryType, timeout)。
-
-        ``boundary_type`` 默认 LOWER（Java 同签名重载 :1381 直接传 ``BoundaryType.LOWER``）；
-        传 ``None`` 就不写 ``boundaryType`` 字段，对应 Java 那个已废弃的
-        5 参重载（只 set topic/queueId/timestamp，“边界”由 broker 的默认值兜底）。
-        """
+        pass
         if addr is None:
             addr = self._publish_addr_in_admin(mq)
         header = SearchOffsetRequestHeader()
@@ -1596,12 +1223,7 @@ class MQClientInstance:
                       addr: Optional[str] = None,
                       index_type: Optional[str] = None,
                       uniq_key: bool = False) -> Optional[bytes]:
-        """按 key 查消息（对应 Java MQClientAPIImpl.queryMessage）。
-
-        ``index_type`` 取 MessageConst.INDEX_KEY_TYPE("K") / INDEX_UNIQUE_TYPE("U")；
-        ``uniq_key=True`` 时还会额外下发 extFields["_UNIQUE_KEY_QUERY"]="true"，
-        broker 端据此强制走到 uniqKey 索引（并覆盖 maxNum 为默认查询条数）。
-        """
+        pass
         if addr is None:
             addr = self._broker_addr_for_topic(topic)
         header = QueryMessageRequestHeader()
@@ -1637,11 +1259,7 @@ class MQClientInstance:
                                   index_type: Optional[str] = None,
                                   uniq_key: bool = False,
                                   timeout_millis: int = 15000) -> List:
-        """对应 Java MQAdminImpl.queryMessage：查该 topic **所有** broker 并合并去重后的消息。
-
-        Java 还会做客户端侧二次校验（uniqKey 命中要求 msgId == key；普通 key 命中要求
-        message.keys 拆分后含 key 且 topic 相同），这里保持一致。
-        """
+        pass
         from common.message_const import MessageConst
         messages: List = []
         route = self.get_topic_route_data(topic)
@@ -1678,12 +1296,7 @@ class MQClientInstance:
 
     def lock_batch_mq(self, consumer_group: str, client_id: str, mqs: List[MessageQueue],
                       timeout_millis: int = 1000) -> List[MessageQueue]:
-        """批量锁队列（对应 Java MQClientAPIImpl.lockBatchMQ，RequestCode.LOCK_BATCH_MQ）。
-
-        按 broker 分组发送；返回 broker 确认锁定成功的队列集（lockOKMQSet）。
-        body：LockBatchRequestBody{consumerGroup, clientId, mqSet(JSON 数组)}；
-        响应：LockBatchResponseBody.lockOKMQSet。
-        """
+        pass
         from remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
         from remoting.protocol.codes import RequestCode
         from remoting.protocol.headers import LockBatchMqRequestHeader
@@ -1692,10 +1305,6 @@ class MQClientInstance:
         for mq in mqs:
             by_broker.setdefault(mq.broker_name, []).append(mq)
         for broker_name, broker_mqs in by_broker.items():
-            # Java RebalanceImpl#lock:153 / lockAll:195 走 findBrokerAddressInSubscribe(brokerName,
-            # MASTER_ID, true) —— 只认主、**不刷路由**，拿不到就整台跳过（队列这一轮锁不上，
-            # 等下一次重投）。退到从节点上锁等于锁在 broker 侧的锁管理器里，master 不知情，
-            # 顺序消费的互斥保证静默失效。
             addr = self.find_broker_address_in_publish(broker_name)
             if addr is None:
                 continue
@@ -1718,7 +1327,7 @@ class MQClientInstance:
 
     def unlock_batch_mq(self, consumer_group: str, client_id: str, mqs: List[MessageQueue],
                         timeout_millis: int = 1000) -> None:
-        """批量解锁队列（对应 Java MQClientAPIImpl.unlockBatchMQ，RequestCode.UNLOCK_BATCH_MQ）。"""
+        pass
         from remoting.protocol.body import UnlockBatchRequestBody
         from remoting.protocol.codes import RequestCode
         from remoting.protocol.headers import UnlockBatchMqRequestHeader
@@ -1726,7 +1335,6 @@ class MQClientInstance:
         for mq in mqs:
             by_broker.setdefault(mq.broker_name, []).append(mq)
         for broker_name, broker_mqs in by_broker.items():
-            # 同 lock_batch_mq：Java RebalanceImpl#unlock:74 / unlockAll:104 只认主、不刷路由。
             addr = self.find_broker_address_in_publish(broker_name)
             if addr is None:
                 continue
@@ -1752,20 +1360,10 @@ class MQClientInstance:
 
     def unregister_client(self, addr: str, client_id: str, producer_group: str,
                           consumer_group: str, timeout_millis: int = 3000) -> None:
-        """UNREGISTER_CLIENT(35)：把本 clientId 从这台 broker 摘掉。
-
-        超时用 3000ms —— Java ``MQClientInstance#unregisterClient:1170`` 传的是
-        ``clientConfig.getMqClientApiTimeout()``（``ClientConfig.java:81`` = 3 * 1000），
-        与发送/拉取的超时预算无关；注销在 shutdown 路径上，预算越短退出越快。
-        """
+        pass
         from remoting.protocol.headers import UnregisterClientRequestHeader
         header = UnregisterClientRequestHeader()
         header.client_id = client_id
-        # Java 没用的那个槽位传的是 null，`_ext` 会把 None 整个丢掉 —— 空串不一样，它会带着
-        # `consumerGroup: ""` 上线，而 broker 的 ClientManageProcessor:228/237 判的是
-        # `group != null`，于是会拿 "" 去 findSubscriptionGroupConfig 并白做一轮 unregister。
-        # 纯空白同样按「没这个组」处理：合法组名不可能全是空白（Validators 那一关就过不去），
-        # 传进来只可能是调用方漏了值，与空串同处理。
         header.producer_group = (producer_group or "").strip() or None
         header.consumer_group = (consumer_group or "").strip() or None
         request = RemotingCommand.create_request_command(RequestCode.UNREGISTER_CLIENT, header)
@@ -1775,14 +1373,7 @@ class MQClientInstance:
     def check_client_config(self, broker_addr: str, consumer_group: str, client_id: str,
                             subscription_data: SubscriptionData,
                             timeout_millis: int = 3000) -> None:
-        """CHECK_CLIENT_CONFIG(46)：让 broker 校验一份订阅表达式（对应 Java
-        ``MQClientAPIImpl#checkClientInBroker:3256``）。
-
-        请求头是 null、body 是 ``CheckClientRequestBody`` 的 JSON；broker 非 SUCCESS 时
-        Java 用 **响应码** 抛 MQClientException（``SUBSCRIPTION_PARSE_FAILED=23``、
-        ``SYSTEM_ERROR=1``「broker 没开 enablePropertyFilter」都走这里）。
-        Java 的 ``brokerVIPChannel(vipChannelEnabled=false)`` 是恒等变换，这里不实现。
-        """
+        pass
         request = RemotingCommand.create_request_command(RequestCode.CHECK_CLIENT_CONFIG, None)
         body = CheckClientRequestBody()
         body.client_id = client_id
@@ -1824,12 +1415,7 @@ class MQClientInstance:
                                topic_filter_type: str = TopicFilterType.SINGLE_TAG,
                                order: bool = False, attributes: Optional[str] = None,
                                timeout_millis: int = 5000, retry_times: int = 5) -> None:
-        """对应 Java MQClientAPIImpl.createTopic。
-
-        ⚠ 必须下发 topicFilterType：broker 的 CreateTopicRequestHeader.checkFields()
-        会把它转成枚举，为空直接报 "topicFilterType = [null] value invalid"。
-        Java 的 MQAdminImpl.createTopic 对每个 broker 还会重试 5 次。
-        """
+        pass
         header = CreateTopicRequestHeader()
         header.topic = topic
         header.default_topic = default_topic
@@ -1839,7 +1425,6 @@ class MQClientInstance:
         header.topic_filter_type = topic_filter_type
         header.topic_sys_flag = topic_sys_flag
         header.order = order
-        # Java: AttributeParser.parseToString(map) —— 空 map 输出 ""，不是 null
         header.attributes = attributes if attributes is not None else ""
         header.force = False
         request = RemotingCommand.create_request_command(RequestCode.UPDATE_AND_CREATE_TOPIC, header)
@@ -1863,7 +1448,7 @@ class MQClientInstance:
                               perm: int = 6, topic_sys_flag: int = 0,
                               attributes: Optional[str] = None,
                               timeout_millis: int = 5000) -> None:
-        """对应 Java MQAdminImpl.createTopic：只对默认 topic 路由里的 **master** 下发。"""
+        pass
         route = self.get_topic_route_data(MixAll.DEFAULT_TOPIC)
         if route is None:
             raise MQClientException("No route info of default topic %s" % MixAll.DEFAULT_TOPIC)
@@ -1918,16 +1503,7 @@ class MQClientInstance:
 
     # ---------------- 工具 ----------------
     def _consumer_offset_addr(self, mq: MessageQueue) -> str:
-        """Java ``RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241`` 的地址口径。
-
-        先**只认主**（``findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)``）→
-        查不到按 topic 刷一次路由 → 重查时**放宽**（``onlyThisBroker=false``，可以落到从
-        节点：位点是 HA 复制来的同一份数据，Java 允许从从节点读）→ 仍没有才抛
-        ``MQClientException("The broker[X] not exist")``。
-
-        与 ``_publish_addr_in_admin`` 的差别只在最后那一步：管理侧的 offset 查询一律打主、
-        主没了就报错；位点读取允许退到从节点。
-        """
+        pass
         addr = self.find_broker_address_in_publish(mq.broker_name)
         if not addr:
             self.update_topic_route_info_from_name_server(mq.topic)
@@ -1937,11 +1513,7 @@ class MQClientInstance:
         return addr
 
     def _broker_addr(self, mq: MessageQueue) -> str:
-        """Java ``findBrokerAddressInAdmin`` 口径：主优先、没主退一台从节点。
-
-        位点查询/提交（``query_consumer_offset`` / ``update_consumer_offset``）用它 ——
-        Java 那边就是 ``findBrokerAddressInAdmin``（从节点上报的位点是同一份，允许）。
-        """
+        pass
         route = self.get_topic_route_data(mq.topic)
         if route is None:
             raise MQClientException("No route info of this topic: %s" % mq.topic)
@@ -1951,13 +1523,7 @@ class MQClientInstance:
         return addr
 
     def _publish_addr_in_admin(self, mq: MessageQueue) -> str:
-        """Java ``MQAdminImpl`` 的 offset 查询口径（``:195/214/232/250``）。
-
-        四步与 Java 逐条对齐：查**发布地址**（只认 master）→ 刷一次该 topic 的路由 →
-        重查 → 仍拿不到就抛 ``MQClientException("The broker[X] not exist", null)``。
-        从节点上的 store 是 HA 复制来的同一份数据，但 Java 的管理类 API 一律打主，
-        本端不"顺手"退到从节点 —— 主掉线期间这里就该报错，让调用方看见。
-        """
+        pass
         addr = self.find_broker_address_in_publish(mq.broker_name)
         if not addr:
             self.update_topic_route_info_from_name_server(mq.topic)
@@ -1974,17 +1540,7 @@ class MQClientInstance:
         return None
 
     def find_broker_address_in_publish(self, broker_name: str) -> Optional[str]:
-        """对应 Java ``MQClientInstance#findBrokerAddressInPublish:1295-1305``。
-
-        **只**从 ``broker_addr_table`` 取 ``brokerId=0`` 的地址，没有就返回 ``None``
-        （Java 的 ``map.get(MixAll.MASTER_ID)``）。与 ``broker_addr_of`` 是两码事：
-        后者走 ``select_broker_addr()``（主优先、没主退任意一台），给「问到一台就行」
-        的心跳/拉取用；**发送**不行 —— 主没了还发到从节点上，broker 回 SYSTEM_BUSY(2)，
-        白烧一整轮重试，错误类型也和 Java 不一样（Java 是本端直接报「broker 不存在」）。
-
-        返回 ``None`` 是正常结果（master 掉线就是这个形状），报什么错由调用方决定
-        （``sendKernelImpl`` 报 MQClientException、``endTransaction`` 什么都不报）。
-        """
+        pass
         with self.topic_route_lock:
             addrs = self.broker_addr_table.get(broker_name)
             if not addrs:
@@ -2001,15 +1557,7 @@ class MQClientInstance:
         return addrs
 
     def get_all_broker_addrs(self) -> List[str]:
-        """路由里出现过的**每一台** broker 地址（主 + 从），不去重到「一个 brokerName 一台」。
-
-        `get_route_of_all_brokers` 走的是 `select_broker_addr()`（主优先，没主才随机），
-        心跳、拉取这类「问到一台就行」的调用用它。注销(35) 不行：Java
-        `MQClientInstance#unregisterClient`:1158-1182 遍历的是 `brokerAddrTable` 的
-        **每个 brokerId**，从节点也在里面 —— broker 的 `ProducerManager` /
-        `ConsumerManager` 是**每台 broker 各自一份**状态，漏掉从节点就等于那台的注册要等
-        通道扫描（默认 ~120s）才回收。
-        """
+        pass
         addrs = []
         for route in self.topic_route_table.values():
             for broker_data in route.get_broker_datas():
@@ -2020,13 +1568,7 @@ class MQClientInstance:
 
     def get_consumer_id_list_by_group(self, topic: str, consumer_group: str,
                                       timeout_millis: int = 5000) -> Optional[List[str]]:
-        """查询消费组内所有 clientId（对应 Java MQClientInstance.findConsumerIdList）。
-
-        Java 取该 topic 路由里的 master broker 发 GET_CONSUMER_LIST_BY_GROUP(38)：
-        所有客户端都会向集群内每台 broker 心跳注册，故任取一台即持有**完整**消费者列表。
-        查不到（无路由 / 非 SUCCESS / 异常）返回 None；调用方按 Java 语义「保留当前分配」，
-        不要回退成"自己独占全部队列"（那会让多实例互相重复消费）。
-        """
+        pass
         try:
             addr = self._broker_addr_for_topic(topic)
         except MQClientException as e:
@@ -2053,16 +1595,7 @@ class MQClientInstance:
 
     def unregister_client_all_brokers(self, client_id: str, producer_group: str,
                                       consumer_group: str, timeout_millis: int = 3000) -> None:
-        """向所有已知 broker 注销本 clientId（对应 Java MQClientInstance.unregisterClient）。
-
-        Java 在生产者/消费者 shutdown 时会逐台 broker 发 UNREGISTER_CLIENT(35)。
-        不发的话 broker 端 Producer/ConsumerManager 只能等心跳超时（默认 ~120s）清理，
-        期间事务回查、消费者变更通知仍可能发往已退出的实例。
-        单台失败只记 debug —— shutdown 路径不应因网络抖动抛异常。
-        """
-        # 主 + 从都要发：Java :1159-1166 遍历的是 brokerAddrTable 的**每个 brokerId**，
-        # 而 Producer/ConsumerManager 是每台 broker 各自一份状态，漏掉从节点就等于那台的
-        # 注册要等通道扫描才回收。
+        pass
         for addr in self.get_all_broker_addrs():
             try:
                 self.unregister_client(addr, client_id, producer_group, consumer_group,

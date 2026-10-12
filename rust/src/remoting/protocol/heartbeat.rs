@@ -1,29 +1,11 @@
-//! 心跳数据（对应 `org.apache.rocketmq.remoting.protocol.heartbeat.*`）。
-//!
 //! 移植 `python/remoting/protocol/heartbeat.py`：`ProducerData` /
 //! `ConsumerData` / `HeartbeatData`，以及 `ConsumerData.subscriptionDataSet` 需要的
 //! [`SubscriptionData`]。
 //!
 //! ## 为什么本层自带 `SubscriptionData`
 //!
-//! Python 把它放在 `rocketmq.common.subscription_data`，`heartbeat.py` 再从那里
-//! import。Rust 里心跳报文与它是同一套编解码，因此类型声明在本层，字段名 / 顺序 /
-//! 缺省值与 Python 的 `to_dict()` 逐一对齐；`filterClassSource` 在 Java 上是
-//! `@JSONField(serialize = false)`，**故意不出现**在本结构里。
-//! [`FilterAPI`] 计算 `codeSet` 要用 `common::util_all::java_string_hash` ——
-//! 协议层用到 `common` 的工具函数在本 crate 是常态（`route.rs`、`extra_info.rs`、
-//! `serialize.rs` 同样如此）。
 //!
 //! ## 报文细节
-//!
-//! * `clientID` 的 `ID` 全大写（Java 字段名如此），不是 `clientId`。
-//! * `heartbeatFingerprint` 恒写 0、`withoutSub` 恒写 `false`：broker 见到 0 才走
-//!   V1 全量注册路径（用完整 `subscriptionDataSet` 注册），最稳妥；非 0 会进
-//!   heartBeatV2 增量优化。因此编码**不**回写这两个值，只在解码时读出来供诊断。
-//! * 解码兼容 Java 的另一路拼写 `isWithoutSub`（fastjson2 读 `isXxx` 布尔属性时
-//!   认这个键）。
-//! * 顶层键按字母序写出，与 Java fastjson2 的实际输出一致（对象键顺序对 broker
-//!   无语义，但便于与 cpp/Java 的黄金报文逐字节比对）。
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,7 +25,6 @@ pub fn now_millis() -> i64 {
 
 // ---------------------------------------------------------------- 枚举常量
 
-/// `ConsumeType`：值必须是 Java 枚举名原文。
 pub struct ConsumeType;
 
 impl ConsumeType {
@@ -51,7 +32,6 @@ impl ConsumeType {
     pub const CONSUME_ACTIVELY: &'static str = "CONSUME_ACTIVELY";
     /// 被动消费（push 客户端）
     pub const CONSUME_PASSIVELY: &'static str = "CONSUME_PASSIVELY";
-    /// Java 5.x POP 消费。Python 的 `heartbeat.py` 里没有这一项，此处按 Java 补齐。
     pub const CONSUME_POP: &'static str = "CONSUME_POP";
 }
 
@@ -61,7 +41,6 @@ pub struct MessageModel;
 impl MessageModel {
     pub const BROADCASTING: &'static str = "BROADCASTING";
     pub const CLUSTERING: &'static str = "CLUSTERING";
-    /// Java 5.x 轻量选择性模型；Python 侧同样缺席，按 Java 补齐。
     pub const LITE_SELECTIVE: &'static str = "LITE_SELECTIVE";
 }
 
@@ -85,12 +64,6 @@ impl ExpressionType {
 
 // ---------------------------------------------------------------- SubscriptionData
 
-/// 对应 Java `SubscriptionData`（心跳里 `subscriptionDataSet` 的元素）。
-///
-/// `tags_set` / `code_set` 在 Python 里是 `set`，`to_dict()` 写出前 `sorted()`；
-/// Rust 直接用**已排序去重**的 `Vec` 表达同一语义（见 [`SubscriptionData::set_tags`]）。
-/// `code_set` 是 Java `String.hashCode()`（broker 侧按 tag 哈希过滤的依据），
-/// 由调用方用 `common::util_all::java_string_hash` 算好后填入。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubscriptionData {
     pub class_filter_mode: bool,
@@ -206,27 +179,12 @@ impl SubscriptionData {
 
 // ---------------------------------------------------------------- FilterAPI
 
-/// 订阅表达式 → [`SubscriptionData`]（对应 Java `FilterAPI.buildSubscriptionData`，
-/// Python `common/subscription_data.FilterAPI`）。
 pub struct FilterAPI;
 
 impl FilterAPI {
-    /// Java `FilterAPI.SUB_ALL`。
     pub const SUB_ALL: &'static str = "*";
 
     /// 按订阅表达式构造订阅数据。
-    ///
-    /// Java 行为（Python 侧用探针实测过，这里是同一批向量）：
-    /// * `None` / `""` / `"*"` ⇒ `subString` 归一成 `"*"`，**`tagsSet` 与 `codeSet` 都留空**。
-    ///   留空不是省事：`tagsSet` 非空是客户端二次 tag 过滤的开关
-    ///   （`PullAPIWrapper.processPullResult` 的 `!tagsSet.isEmpty()`），塞了 `"*"`
-    ///   会把订阅全量时所有带 tag 的消息自己过滤掉；`codeSet` 则是 broker 侧
-    ///   按 tag 哈希过滤的依据。
-    /// * `" TagA || TagB "` ⇒ `subString` **原样保留空格**，标签各自 trim。
-    /// * `"   "`（纯空白）⇒ 走切分分支，标签 trim 后为空 ⇒ 两个集合都空，
-    ///   但 `subString` 仍是那三个空格（Java `StringUtils.isEmpty` 只认 null/`""`）。
-    /// * `"|||"` ⇒ `tagsSet={"|"}`、`codeSet={124}`（切分只丢**末尾**空串）。
-    /// * `"||"` / `"||||"` ⇒ 报错 `subString split error`（Java 的切分结果长度为 0）。
     pub fn build_subscription_data(
         topic: &str,
         sub_string: Option<&str>,
@@ -239,13 +197,11 @@ impl FilterAPI {
         if raw.is_empty() || raw == Self::SUB_ALL {
             return Ok(normalise_sub_all(sub));
         }
-        // Java String.split("\\|\\|")：丢掉**末尾**空串，中间的留着。
         let mut parts: Vec<&str> = raw.split("||").collect();
         while parts.last() == Some(&"") {
             parts.pop();
         }
         if parts.is_empty() {
-            // Java: throw new Exception("subString split error")
             return Err(Error::client("subString split error"));
         }
         let mut tags: Vec<String> = Vec::new();
@@ -263,7 +219,6 @@ impl FilterAPI {
     }
 }
 
-/// Java 的 SUB_ALL 归一：`subString = "*"`，两个集合保持为空。
 fn normalise_sub_all(mut sub: SubscriptionData) -> SubscriptionData {
     sub.sub_string = FilterAPI::SUB_ALL.to_string();
     sub.tags_set.clear();
@@ -273,7 +228,6 @@ fn normalise_sub_all(mut sub: SubscriptionData) -> SubscriptionData {
 
 // ---------------------------------------------------------------- ProducerData
 
-/// 对应 Java `ProducerData`：只有一个 `groupName`。
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProducerData {
     pub group_name: String,
@@ -300,10 +254,6 @@ impl ProducerData {
 
 // ---------------------------------------------------------------- ConsumerData
 
-/// 对应 Java 5.x `ConsumerData`。
-///
-/// 字段集合严格对齐 Java 5.x：**没有** 4.x 的 `consumeTimestamp` /
-/// `maxReconsumeTimes`，多写一个就会被 broker 侧 fastjson2 判为未知字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumerData {
     pub group_name: String,
@@ -396,7 +346,6 @@ impl ConsumerData {
 
 // ---------------------------------------------------------------- HeartbeatData
 
-/// 对应 Java `HeartbeatData`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeartbeatData {
     pub client_id: String,
@@ -474,8 +423,6 @@ impl HeartbeatData {
         for item in jarray(value, "consumerDataSet")? {
             consumer_data_set.push(ConsumerData::from_json_value(item)?);
         }
-        // isWithoutSub / withoutSub 两种拼写都认（Java 字段名是 isWithoutSub，
-        // fastjson2 读 `isXxx` 布尔属性时两种键都会落到同一个字段）。
         let without_sub = jboolean(value, "withoutSub", jboolean(value, "isWithoutSub", false));
         Ok(HeartbeatData {
             client_id: jstring_or(value, "clientID", ""),
@@ -529,7 +476,6 @@ mod tests {
         assert!(!text.contains("class_filter_mode"), "不得出现 snake_case 键");
         assert_eq!(SubscriptionData::from_json_value(&sd.to_json_value()).unwrap(), sd);
 
-        // Java equals 含 subVersion（Python 的 __eq__ 不含，这里跟 Java）。
         let mut other = sd.clone();
         other.sub_version = 1700000000001;
         assert_ne!(other, sd);

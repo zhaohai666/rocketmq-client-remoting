@@ -1,5 +1,3 @@
-// 消息轨迹钩子实现（对应 org.apache.rocketmq.client.trace.hook 包）。
-//
 // 三条硬性约定见 trace_hook.h 头注释：轨迹消息不再被追踪、是否落轨迹由 broker / 消息属性
 // 决定、消费侧 msgId 用 offset 侧 ID（对齐 SendResult.offsetMsgId，而不是 SendResult.msgId /
 // UNIQ_KEY）。

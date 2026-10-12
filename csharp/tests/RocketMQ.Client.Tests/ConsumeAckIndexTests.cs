@@ -1,14 +1,4 @@
 // classic 并发消费路径的 ackIndex 语义单测 —— 不需要集群。
-//
-// 为什么必须离线锁死：这条路径错了是**静默丢消息**。Java
-// ConsumeMessageConcurrentlyService#processConsumeResult:207-269 用 listener 写的
-// ackIndex 把本批切成「已认可前缀 / 待回投后缀」，RECONSUME_LATER 强制 ackIndex=-1
-//（整批回投）。两个方向写错在真机短期窗口里都看不出差别：
-//   - 忽略 ackIndex：尾巴既没回投也没重投，直接丢；
-//   - 默认值写成 -1：CONSUME_SUCCESS 也把整批回投，消息无限重复。
-// 未 Start 的消费者 SendMessageBack 必定抛，所以这里能锁的是「失败分支」
-//（回投失败 → 塞回队首 + 位点不越过它）；「回投成功 → 位点整批前进」只能靠真机
-//（examples 的 ackIndex 场景）。与 Python/Rust/C++ 的同名测试一一对应。
 
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -38,7 +28,6 @@ public class ConsumeAckIndexTests
     private static List<MessageExt> OffsetBatch(int n)
         => Enumerable.Range(0, n).Select(i => Ext(i)).ToList();
 
-    /// <summary>按 Java listener 契约：可选地把 ackIndex 收窄，返回指定状态或直接抛异常。</summary>
     private sealed class AckListener : IMessageListenerConcurrently
     {
         private readonly ConsumeConcurrentlyStatus _status;
@@ -92,10 +81,6 @@ public class ConsumeAckIndexTests
                         bool @throw = false)
         {
             _consumer.SetMessageListener(new AckListener(status, ackIndex, @throw));
-            // 走真机路径的形状：先入缓冲 → dispatchLoop 取批（取走与登记在途同一临界区）
-            // → 消费。少了「取批」这一步，这些批次对回投的 containsMessage 闸门
-            //（Java ConsumeMessageConcurrentlyService:243-248）就是「已被 cleanExpiredMsg
-            // 清扫」的样子，整批回投会被跳过 —— 真机上 batch 一定来自这次取批。
             _consumer.ConsumeMessageBatchMaxSize = Math.Max(1, batch.Count);
             _consumer.SetPendingForTest(_key, new List<MessageExt>(batch));
             List<MessageExt> taken = _consumer.TakeBatchForConsume(_key, out long epoch);
@@ -116,8 +101,6 @@ public class ConsumeAckIndexTests
     [Fact]
     public void ContextDefaultsLikeLegacy()
     {
-        // Java ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE（= 整批认可）。
-        // 默认值写成 -1 会让每次 CONSUME_SUCCESS 都整批回投 —— 消息无限重复。
         var ctx = new ConsumeConcurrentlyContext(Queue0());
         Assert.Equal(int.MaxValue, ctx.AckIndex);
         Assert.Equal(0, ctx.DelayLevelWhenNextConsume);
@@ -136,7 +119,6 @@ public class ConsumeAckIndexTests
     [Fact]
     public void AckIndexWiderThanBatchIsClamped()
     {
-        // listener 写了 99（Java:207-211 钳到 size-1）：等价整批认可
         var h = new Harness();
         h.Run(OffsetBatch(3), ConsumeConcurrentlyStatus.ConsumeSuccess, 99);
         Assert.Empty(h.Pending());
@@ -146,9 +128,6 @@ public class ConsumeAckIndexTests
     [Fact]
     public void PartialAckBacksTheTailAndHoldsTheOffsetAtTheFirstUnacked()
     {
-        // 部分 ack（认可第 0 条）：尾巴 [1,2] 回投；离线回投必败 → 塞回队首
-        //（reconsumeTimes +1），位点钳在第 1 条不越过它（Java removeMessage 返回 firstKey），
-        // 已认可的第 0 条计入消费量
         var h = new Harness();
         Assert.False(h.Run(OffsetBatch(3), ConsumeConcurrentlyStatus.ConsumeSuccess, 0));
         Assert.Equal(new List<(long, int)> { (1, 1), (2, 1) }, h.Pending());
@@ -170,7 +149,6 @@ public class ConsumeAckIndexTests
     [Fact]
     public void ReconsumeLaterOverridesAWiderAckIndex()
     {
-        // Java:210-212 —— RECONSUME_LATER 强制 ackIndex=-1，listener 写的宽 ackIndex 无效
         var h = new Harness();
         Assert.False(h.Run(OffsetBatch(3), ConsumeConcurrentlyStatus.ReconsumeLater, 1));
         Assert.Equal(new List<(long, int)> { (0, 1), (1, 1), (2, 1) }, h.Pending());
@@ -180,7 +158,6 @@ public class ConsumeAckIndexTests
     [Fact]
     public void ListenerExceptionIsTreatedAsReconsumeLater()
     {
-        // Java：listener 抛异常按 RECONSUME_LATER 处理，整批回投
         var h = new Harness();
         h.Run(OffsetBatch(2), ConsumeConcurrentlyStatus.ConsumeSuccess, 5, @throw: true);
         Assert.Equal(new List<(long, int)> { (0, 1), (1, 1) }, h.Pending());
@@ -190,8 +167,6 @@ public class ConsumeAckIndexTests
     [Fact]
     public void BroadcastingDropsTheTailWithoutSendBack()
     {
-        // 广播模式没有 %RETRY% 可回投：未认可的尾巴只 warn 就丢掉，整批位点前进
-        //（Java:232-237，重启后不重投）
         var h = new Harness(MessageModel.Broadcasting);
         Assert.True(h.Run(OffsetBatch(3), ConsumeConcurrentlyStatus.ConsumeSuccess, 0));
         Assert.Empty(h.Pending());
@@ -229,10 +204,6 @@ public class ConsumeAckIndexTests
     [Fact]
     public void HookStatusIsTheLegacyEnumName()
     {
-        // Java 写进 ConsumeMessageContext.status 的是 status.toString()
-        //（ConsumeMessageConcurrentlyService:408），默认实现就是**裸成员名**：
-        // CONSUME_SUCCESS / RECONSUME_LATER。C# 的枚举拼写（ConsumeSuccess / ReconsumeLater）
-        // 不是 Java 的形态 —— 钩子是公开扩展点，用户按 Java 文档取值会拿到错的东西。
         var success = new Harness();
         var successHook = new RecordingConsumeHook();
         success.RegisterHook(successHook);

@@ -1,21 +1,7 @@
-// 定点发送 topic 一致性守卫真机验证（Java `DefaultMQProducerImpl:1234-1236` / `:1277-1278`）。
-// 用法：rmq_live_pinned_guard 127.0.0.1:9876
-//
 // 与 `python/verify_pinned_guard_live.py`（S1..S6）、`rust/examples/live_pinned_guard.rs`、
 // `csharp/examples/RocketMQ.Examples/LivePinnedGuard.cs` 同题。
 //
 // 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
-//
-// 离线单测（`tests/test_send_retry.cpp::pinnedTopicGuard` / `test_producer_async.cpp::
-// pinnedTopicGuardAsync`）用假端点证明的是「拒了、且报文没上线」；真机这一趟证明**另一面**：
-//   S1/S6 守卫不误伤真业务：从真路由取到的队列在同步单条/同步批量/异步单条/异步批量四条
-//         入口上照常 SEND_OK，消息按 keys 一条不少地被消费到；
-//   S2/S4 拒的时候守在本端：亚毫秒、无 broker 码，而且 broker 上的 maxOffset 一动不动
-//         （真机版的 wire 反证：拒绝不留痕，也不会事后偷发）；
-//   S3    命名空间的比较用 Java `queueWithNamespace` 的幂等：`ns%topic` 与裸 topic 都不误拒，
-//         `ns2%topic` 才拒；
-//   S5    单向定点**没有**守卫（Java `:1303-1310` 有意留的口子）：报文按 msg 自己的 topic
-//         落库 —— 用「A 收到、B 的 maxOffset 还是 0」把这条语义钉死。
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -421,7 +407,6 @@ int main(int argc, char* argv[]) {
             check("S4e 异步放行腿同样真落库（单条 1 + 批量子消息 2，maxOffset 再涨 3）",
                   offAfterAsync == offAfterS1 + 3, "maxOffset=" + std::to_string(offAfterAsync));
 
-            // ---------------- S5 单向：Java 有意没有守卫 ----------------
             const std::string kOw = "pinned-oneway-" + tag;
             producer->sendOneway(keyed(topicA, Bytes{'o', 'w'}, kOw), mqB);
             int64_t offAfterOw = -1;

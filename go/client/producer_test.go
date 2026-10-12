@@ -30,9 +30,6 @@ func twoBrokerRouteBody(master1, master2 string) string {
 		`"filterServerTable":{}}`
 }
 
-// sendBrokerOnReq answers the SEND family with a Java-shaped success response
-// and everything else with the given status. sendCode (non-zero) overrides the
-// SEND answer so the retry/error paths can be exercised.
 type sendBrokerOnReq struct {
 	sendCode int32
 	offset   int64
@@ -150,8 +147,6 @@ func TestProducerSendSyncHeaderShapeAndResult(t *testing.T) {
 	if got := *h.BrokerName; got != "b1" {
 		t.Errorf("n(brokerName) = %q, want b1", got)
 	}
-	// maxReconsumeTimes must stay absent for a non-retry topic (Java only
-	// hoists it for %RETRY%), otherwise a >= 3.4.9 broker takes it literally.
 	if _, ok := req.GetExtField("l"); ok {
 		t.Errorf("l(maxReconsumeTimes) must not be sent for topic %q", topic)
 	}
@@ -202,7 +197,6 @@ func TestProducerCompressesOnceAndRestoresCallerMessage(t *testing.T) {
 	const topic = "ProdCompressTopic"
 	p, broker, _ := startProducerFixture(t, topic, "GID_prod_compress")
 
-	// Java compresses when body.length >= compressMsgBodyOverHowmuch.
 	original := []byte(strings.Repeat("a", DefaultCompressMsgBodyOverHowmuch+100))
 	msg := common.NewMessage(topic, original)
 	if _, err := p.Send(msg); err != nil {
@@ -236,7 +230,6 @@ func TestProducerCompressesOnceAndRestoresCallerMessage(t *testing.T) {
 	if string(back) != string(original) {
 		t.Errorf("decompressed body mismatch: %d vs %d bytes", len(back), len(original))
 	}
-	// Java's sendKernelImpl finally clause restores the caller's message.
 	if string(msg.Body) != string(original) {
 		t.Errorf("caller body must be restored after send, got %d bytes", len(msg.Body))
 	}
@@ -306,10 +299,6 @@ func TestProducerBatchEncodingAndPerMessageUniqKeys(t *testing.T) {
 	if result.SendStatus != SendOK {
 		t.Errorf("status = %s", result.SendStatus)
 	}
-	// Java processSendResponse:786: a client batch's SendResult.msgId is the
-	// comma-joined per-member UNIQ_KEYs (built CLIENT-SIDE — the broker
-	// replies a single wrapper id). Consumers and traces join on the member
-	// ids, not on the batch wrapper's.
 	id1, _ := common.GetUniqID(first)
 	id2, _ := common.GetUniqID(second)
 	if result.MsgID != id1+","+id2 {
@@ -320,9 +309,6 @@ func TestProducerBatchEncodingAndPerMessageUniqKeys(t *testing.T) {
 	}
 }
 
-// decodeBatchBody splits a batch body into its per-message light frames. Java's
-// batch unit is the compact 6-segment form (MessageDecoder.decodeMessage, NOT
-// the 17-segment store format), so DecodeBatchMessage is the matching decoder.
 func decodeBatchBody(t *testing.T, body []byte) []*common.Message {
 	t.Helper()
 	var out []*common.Message
@@ -391,8 +377,6 @@ func TestProducerRetrySkipsTheFailingBroker(t *testing.T) {
 
 func TestProducerDoesNotRetryNonRetryableBrokerCode(t *testing.T) {
 	const topic = "ProdNoRetryTopic"
-	// MESSAGE_ILLEGAL(13) is NOT in Java's retryResponseCodes: retrying would
-	// fail identically everywhere, so it must surface immediately.
 	handler := &sendBrokerOnReq{offset: 1, sendCode: remoting.RespMessageIllegal}
 	broker := startMockServer(t, handler.handle)
 	ns := startMockServer(t, nameserverOnReq(map[string]string{topic: routeBodyFor(broker.addr, "")}))
@@ -439,7 +423,6 @@ func TestProducerValidatorsRejectBeforeAnyRequest(t *testing.T) {
 }
 
 func TestProducerRequiresGroupAndNameServer(t *testing.T) {
-	// A blank group fails in the constructor (Java: producerGroup is empty).
 	if _, err := NewDefaultMQProducer("  "); err == nil {
 		t.Error("a blank producer group must be rejected")
 	}
@@ -452,7 +435,6 @@ func TestProducerRequiresGroupAndNameServer(t *testing.T) {
 	}
 	def.Shutdown()
 
-	// No nameserver is a start-time rejection carrying Java's 10004.
 	noNS := MustNewDefaultMQProducer("GID_prod_nons")
 	if err := noNS.Start(); err == nil {
 		t.Fatal("Start without a nameserver must fail")
@@ -527,8 +509,6 @@ func TestProducerRetryTopicHoistsReconsumeTimes(t *testing.T) {
 	if h.MaxReconsumeTimes == nil || *h.MaxReconsumeTimes != 2 {
 		t.Errorf("l(maxReconsumeTimes) = %v, want 2", h.MaxReconsumeTimes)
 	}
-	// The clear happens AFTER the properties were serialized (Java's order), so
-	// the wire property is still present.
 	if !strings.Contains(*h.Properties, common.PropertyReconsumeTime+"\x013") {
 		t.Errorf("properties = %q, want RECONSUME_TIME=3 preserved", *h.Properties)
 	}

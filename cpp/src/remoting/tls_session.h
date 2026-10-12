@@ -1,11 +1,3 @@
-// 客户端 TLS 会话（对应 Java NettyRemotingClient 的 pipeline.addFirst(SslHandler)）。
-//
-// 语义（Java 5.5.1 TlsSystemConfig/TlsHelper 核对）：
-//   - TLS 包住**整个流**：任何 RocketMQ 帧之前完成握手；
-//   - test mode（tls.test.mode.enable 默认 true）：信任 broker 自签证书、不校验主机名、
-//     不带客户端证书 —— broker 用 PERMISSIVE + 自签证书即可即配即通；
-//   - broker 侧 PERMISSIVE（tls.server.mode）在同一端口按首字节嗅探，明文客户端不受影响。
-//
 // 编译期开关：CMake `RMQ_ENABLE_TLS`（找到 OpenSSL 时默认 ON）。找不到 OpenSSL 时
 // 本头文件提供**报错型占位**：setTlsEnable(true) 会抛出带说明的异常，其余路径零影响。
 #ifndef ROCKETMQ_REMOTING_TLS_SESSION_H
@@ -25,18 +17,10 @@ namespace rocketmq {
 
 #ifdef RMQ_HAS_TLS
 
-// test-mode 客户端 SSL_CTX（verify=NONE、无客户端证书、默认 TLS1.2+）。
-// 返回的 shared_ptr 持有 SSL_CTX*（deleter 内 SSL_CTX_free）。
-// certPath/keyPath 非空时也加载客户端证书（test-mode + mTLS 客户端证书可并存，
-// 对齐 Java tls.client.certPath 独立于 test.mode 的行为）。
 std::shared_ptr<void> createClientSslContext(std::string& err,
                                              const std::string& certPath = std::string(),
                                              const std::string& keyPath = std::string());
 
-// 严格校验客户端 SSL_CTX（对齐 Java tls.test.mode.enable=false + tls.client.trustCertPath）：
-//   * verify=SSL_VERIFY_PEER，CA 信任锚 = caPath（load_verify_locations）；
-//   * 主机名/SAN 校验在 handshake() 里按连接逐个做（OpenSSL 需显式 set1_host/IP param）；
-//   * certPath/keyPath 非空时加载客户端证书（mTLS，须 PEM；私钥 PKCS#1/PKCS#8 都吃）。
 std::shared_ptr<void> createStrictClientSslContext(const std::string& caPath,
                                                    const std::string& certPath,
                                                    const std::string& keyPath,

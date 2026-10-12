@@ -725,12 +725,6 @@ func runS2(ns, prefix string, topics map[string]string) {
 	check("S2 重投 listener 看到的仍是业务 topic",
 		second.topic == topic && first.topic == topic,
 		fmt.Sprintf("first=%q second=%q want=%q", first.topic, second.topic, topic))
-	// 1ST_POP_TIME is computeIfAbsent in Java (MQClientAPIImpl:1224) and in this
-	// port: a value the broker provided must be KEPT, never overwritten with the
-	// current pop's time. That is the observable form of the rule — if the stamp
-	// equalled the redelivery's OWN popTime, the client had thrown the broker's
-	// value away and stamped a fresh one.
-	//
 	// It is deliberately NOT asserted to be byte-identical to the first
 	// delivery's value. The broker stamps popCheckPoint.getPopTime() of whichever
 	// checkpoint the revive picked up, and with enablePopBufferMerge=false more

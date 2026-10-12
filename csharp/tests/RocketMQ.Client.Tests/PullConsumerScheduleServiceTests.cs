@@ -1,18 +1,3 @@
-// PullConsumerScheduleService（Java MQPullConsumerScheduleService 的本端口对位物）离线单测。
-//
-// 对齐基准（Java 5.5.1，逐行读过，client/consumer/MQPullConsumerScheduleService.java）：
-//   * 构造：内部现建 DefaultMQPullConsumer 并置 CLUSTERING（:51-58）；pullThreadNums 默认 20（:46）。
-//   * registerPullTaskCallback：入 callbackTable + registerMessageQueueListener(topic, null)
-//     只登记不监听（:98-101）；本端口的键是**裸 topic**（实现文件头差异 2）。
-//   * putTask：topic 下不在新集合的任务 setCancelled+remove，新集合里没建过的建任务并
-//     delay 0 排一轮（:61-81）。
-//   * PullTaskImpl.run：取消检查 → 查回调（缺失只 warn 不重排）→ 跑回调（Throwable →
-//     下一轮延迟罚 1000ms）→ 未取消则按 context.pullNextDelayTimeMillis 重排（:171-199）。
-//   * PullTaskContext 默认 pullNextDelayTimeMillis = 200。
-// 本端口的差异 1（queue 展开由周期扫描 FetchMessageQueuesInBalance 驱动）在测试里用
-// RebalanceScanIntervalMillis 的小值 + 公开 ScanOnce 观测，行为口径与 Java 的
-// rebalance → messageQueueChanged → putTask 链一致。
-//
 // 全程走 MockCluster 假服务端（真 socket、脚本化应答），不碰真集群；队列展开用
 // BROADCASTING（全量分配，不依赖 38 号消费者列表应答）或 SetReplyBody 精确喂 CLUSTERING。
 using System.Collections.Concurrent;
@@ -85,18 +70,14 @@ public class PullConsumerScheduleServiceTests
     public void Defaults_MatchJava()
     {
         var svc = new PullConsumerScheduleService("GID_sched_defaults");
-        // Java :46 pullThreadNums = 20；PullTaskContext.java:21 pullNextDelayTimeMillis = 200；
-        // PullTaskImpl.run:183 异常罚则 1000ms。
         Assert.Equal(20, svc.PullThreadNums);
         Assert.Equal(200, PullTaskContext.DefaultNextDelayMillis);
         Assert.Equal(1000, PullTaskContext.FailureNextDelayMillis);
-        // Java scheduledRebalanceEveryTimeSeconds 的 20s 默认（本端口差异 1 的扫描周期）
         Assert.Equal(20000, svc.RebalanceScanIntervalMillis);
         Assert.Equal("GID_sched_defaults", svc.ConsumerGroup);
         Assert.False(svc.IsStarted);
         Assert.Empty(svc.CallbackTable);
 
-        // PullThreadNums 下限钳 1（Java 不做，本端口防 0 线程池饿死任务）
         svc.PullThreadNums = 0;
         Assert.Equal(1, svc.PullThreadNums);
     }
@@ -106,12 +87,9 @@ public class PullConsumerScheduleServiceTests
     {
         var svc = new PullConsumerScheduleService("GID_sched_reg");
 
-        // null 回调：ArgNull（Java 的 ConcurrentHashMap.put(null) 同样当场炸）
         Assert.Throws<ArgumentNullException>(
             () => svc.RegisterPullTaskCallback(Topic, (IPullTaskCallback)null!));
 
-        // 空 topic：等价 Java :100 registerMessageQueueListener 对空串直接 return ——
-        // 登记了也不会刷路由，任务永远起不来，这里拒绝入表。
         svc.RegisterPullTaskCallback("", (mq, ctx) => { });
         Assert.Empty(svc.CallbackTable);
         Assert.Empty(svc.PullConsumer.RegisterTopics);
@@ -121,7 +99,6 @@ public class PullConsumerScheduleServiceTests
         Assert.True(svc.CallbackTable.ContainsKey(Topic));
         Assert.Contains(Topic, svc.PullConsumer.RegisterTopics);
 
-        // 同 topic 重复注册 = 覆盖（Java callbackTable.put 同语义）
         var other = new NeverPullCallback();
         svc.RegisterPullTaskCallback(Topic, other);
         Assert.Single(svc.CallbackTable);
@@ -146,8 +123,6 @@ public class PullConsumerScheduleServiceTests
         svc.Start();
         try
         {
-            // Java setDefaultMQPullConsumer 无守卫，但运行中换门面 = 新旧门面双心跳双位点表，
-            // 本端口 Start() 之后拒绝（实现注释口径），测试锁住这条有意差异。
             Assert.Throws<MQClientException>(
                 () => svc.SetPullConsumer(new DefaultMQPullConsumer("GID_other")));
             Assert.True(svc.IsStarted);
@@ -188,7 +163,6 @@ public class PullConsumerScheduleServiceTests
         svc.Start();
         try
         {
-            // 展开到位（≡ Java rebalanceImmediately 的第一轮）：一把队列一个任务
             Assert.True(WaitFor(() => svc.TaskCount == 3), "TaskCount=3, actual=" + svc.TaskCount);
             Assert.True(WaitFor(() => seen.Count == 3 && seen.Values.All(v => v > 0)),
                 "三把队列都被回调点到");
@@ -385,7 +359,6 @@ public class PullConsumerScheduleServiceTests
             Assert.True(WaitFor(() => rounds.Count == 2
                                    && rounds.Values.All(v => v >= 3), 8000),
                 "两把队列都轮到了多轮，rounds=[" + string.Join(",", rounds.Select(kv => kv.Key + "=" + kv.Value)) + "]");
-            // Java 的结构保证：下一轮只在上一轮回调返回后才排（PullTaskImpl.run:187-189）
             foreach ((string key, int max) in maxInflight)
             {
                 Assert.Equal(1, max);
@@ -430,7 +403,6 @@ public class PullConsumerScheduleServiceTests
                 t0 = stamps[0]; t1 = stamps[1];
             }
 
-            // 回调里写的 0 被异常罚则改写为 1000ms（Java :183 setPullNextDelayTimeMillis(1000)）
             Assert.True(t1 - t0 >= 900, $"异常后下一轮延迟罚到 1s，实际间隔={t1 - t0}ms");
             Assert.True(t1 - t0 <= 3000, "罚的是 1s 不是永远不再来");
         }
@@ -485,8 +457,6 @@ public class PullConsumerScheduleServiceTests
     [Fact]
     public void MissingCallback_WarnsAndDoesNotReschedule()
     {
-        // Java run():193-195 查不到回调只 warn、**不重排**（任务就此终结）。
-        // 本端口用公开 PutTask 造出「任务在表、回调不在表」的组合直接锁这条口径。
         using var cluster = MockCluster.Start(1);
         var svc = new PullConsumerScheduleService("GID_sched_nocb");
         svc.PullConsumer.SetNamesrvAddr(cluster.NamesrvAddr);
@@ -499,7 +469,6 @@ public class PullConsumerScheduleServiceTests
             svc.PutTask("GhostTopic", new[] { mq });
             Assert.Equal(1, svc.TaskCount);
             Thread.Sleep(800); // delay 0 的首轮早就该跑完（回调缺失 → 不重排）
-            // 任务对象**留在表里**（Java 同款：只有 putTask 收缩才摘除）——但一轮之后就断了
             Assert.Equal(1, svc.TaskCount);
             // 表里是它：但 800ms 里没有任何 GhostTopic 的 PULL_MESSAGE 上线
             Assert.Equal(0, cluster.Records().Count(r =>
@@ -531,8 +500,6 @@ public class PullConsumerScheduleServiceTests
         svc.Start();
         Assert.True(WaitFor(() => Volatile.Read(ref entered) == 1), "第一轮进来了");
 
-        // Shutdown 不硬切在途轮次（Java executor.shutdown() 同口径）：调用方拿到返回时
-        // 回调还阻塞着，这轮没被打断
         svc.Shutdown();
         Assert.False(svc.IsStarted);
         Assert.Equal(0, svc.TaskCount); // 任务表清空

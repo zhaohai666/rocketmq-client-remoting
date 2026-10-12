@@ -1,18 +1,3 @@
-// SOCKS proxy support for the remoting transport (Java SocksProxyConfig +
-// NettyRemotingClient's proxy bootstraps).
-//
-// Java keys proxy configs by destination CIDR (socksProxyConfig JSON) and lets
-// Netty's Socks5ProxyHandler run the handshake inside the pipeline. This port
-// keeps the SocksProxyConfig fields (addr / username / password) and applies
-// ONE proxy to every remoting connection: the TCP connection is opened to the
-// proxy, the SOCKS CONNECT handshake runs against it, and only then is TLS
-// layered on top of the tunnel. The handshake is hand-written on the standard
-// library — no third-party dependency — covering SOCKS5 (no-auth and
-// username/password sub-negotiation) and SOCKS4/4a.
-//
-// The TopAddressing-style address-server HTTP fetch lives in the client layer
-// and deliberately does NOT go through this path (same as Java, where the
-// proxy only wraps the Netty channel bootstrap).
 package remoting
 
 import (
@@ -27,8 +12,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// Supported proxy types (SocksProxyConfig.Type). An empty type means SOCKS5,
-// matching the Java default where only SOCKS5 is implemented.
 const (
 	SocksProxyTypeSocks5  = "SOCKS5"
 	SocksProxyTypeSocks4  = "SOCKS4"
@@ -48,9 +31,6 @@ const (
 	socks4ReplyGranted      = 0x5A // 90
 )
 
-// SocksProxyConfig mirrors org.apache.rocketmq.remoting.proxy.SocksProxyConfig:
-// the proxy address plus optional username/password. Type extends it with the
-// protocol selector (SOCKS5 by default, SOCKS4/4A for legacy proxies).
 type SocksProxyConfig struct {
 	// Addr is the proxy endpoint, "host:port" (IPv6 as "[host]:port").
 	Addr string
@@ -62,18 +42,14 @@ type SocksProxyConfig struct {
 	Type string
 }
 
-// NewSocksProxyConfig builds a no-auth proxy config (Java SocksProxyConfig(addr)).
 func NewSocksProxyConfig(addr string) *SocksProxyConfig {
 	return &SocksProxyConfig{Addr: addr}
 }
 
-// NewSocksProxyConfigWithAuth builds a proxy config with credentials
-// (Java SocksProxyConfig(addr, username, password)).
 func NewSocksProxyConfigWithAuth(addr, username, password string) *SocksProxyConfig {
 	return &SocksProxyConfig{Addr: addr, Username: username, Password: password}
 }
 
-// String mirrors Java SocksProxyConfig#toString but masks the password.
 func (c *SocksProxyConfig) String() string {
 	password := ""
 	if c.Password != "" {

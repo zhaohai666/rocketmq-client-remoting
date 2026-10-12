@@ -9,43 +9,12 @@ use RocketMQ\Common\MessageConst;
 use RocketMQ\Common\MessageQueue;
 use RocketMQ\Common\UtilAll;
 
-/**
- * 异步轨迹分发器（对应 org.apache.rocketmq.client.trace.AsyncTraceDispatcher，
- * 移植自 python/client/trace_dispatcher.py）。
- *
- * 职责：钩子把 TraceContext 丢进内存队列（append），按「攒够 batchNum 条 或 距上次
- * 发送超过 5s」两个条件触发刷写，再把编码后的文本用**独立的内部生产者**发到轨迹
- * topic（默认 RMQ_SYS_TRACE_TOPIC）。
- *
- * ⚠ PHP 无线程（见 php/PORTING.md「异步模型」）：Python 的后台线程 + 线程池
- *   （_async_run / ThreadPoolExecutor）在这里改由**调用方驱动**：
- *     - append() 只入队（与 Java/Python 一致，绝不阻塞业务）；
- *     - flush() 强制排空队列；pumpOnce() 是「跑一轮后台循环」的显式等价物，
- *       两个方法都在**当前线程同步**把批量发送做完。**不起线程/子进程**。
- *
- * 与 Java 的对应关系：
- *   - traceContextQueue      ← ArrayBlockingQueue<TraceContext>(2048)
- *   - flushTraceContext      ← flushTraceContext（含 forceFlush 语义）
- *   - sendTraceData          ← AsyncDataSendTask.sendTraceData（按 topic@traceTopic 分组）
- *   - flushData              ← flushData（按 maxMsgSize 切块）
- *   - sendTraceDataByMq      ← sendTraceDataByMQ（带 broker 过滤的选择器）
- *   - 内部生产者组名          ← _INNER_TRACE_PRODUCER-<group>-<PRODUCE|CONSUME>-<N>
- *
- * **防递归**：内部生产者自身的 enableTrace 必须为 False，且 SendMessageTraceHook 会
- * 跳过 topic 以轨迹 topic 开头的消息 —— 两道保险都要有，否则轨迹会自我复制到无限。
- */
 enum TraceDispatcherType: string
 {
     case PRODUCE = 'PRODUCE';
     case CONSUME = 'CONSUME';
 }
 
-/**
- * 只在指定 broker 集合里轮询选队列（对应 Java 里那个匿名 MessageQueueSelector，
- * 移植自 trace_dispatcher.py 的 _BrokerSetSelector）。
- *
- * 构造时按引用接住 dispatcher 的 sendWhichQueue，保证跨多次发送共享同一个游标。
- */
 final class BrokerSetSelector
 {
     private int $counter;
@@ -69,8 +38,6 @@ final class BrokerSetSelector
             }
         }
         if ($filtered === []) {
-            // Java 在这里会 filterMqs.get(pos) 抛越界；退化为全量轮询更安全，
-            // 语义上等价于「没有跨集群过滤需求」。
             $filtered = array_values($mqs);
         }
         if ($filtered === []) {
@@ -94,7 +61,6 @@ final class AsyncTraceDispatcher
 
     public const WAIT_FOR_SHUTDOWN = 5000;
     public const FLUSH_TRACE_INTERVAL = 5000;
-    /** 对应 Java ArrayBlockingQueue<TraceContext>(2048)。 */
     public const MAX_QUEUE_SIZE = 2048;
 
     public int $batchNum;
@@ -110,12 +76,6 @@ final class AsyncTraceDispatcher
     /** PHP 无线程：恒为 null（保留字段只为逐字对照 Python）。 */
     public mixed $worker = null;
     public AccessChannel $accessChannel = AccessChannel::LOCAL;
-    /**
-     * 对应 Java `AsyncTraceDispatcher.namespaceV2`：轨迹内部 producer 也走服务端命名空间
-     * （`nsd`/`ns` 扩展头），否则 serverless 实例里轨迹会被 broker 当默认实例丢掉。
-     * {@see start()} 里在 setInstanceName 之后、setEnableTrace 之前透传给 traceProducer
-     * （Java `AsyncTraceDispatcher:155` 的同位置）。
-     */
     public string $namespaceV2 = '';
     public mixed $hostProducer = null;
     public mixed $hostConsumer = null;
@@ -132,7 +92,7 @@ final class AsyncTraceDispatcher
         ?string $traceTopicName = null,
         mixed $rpcHook = null,
     ) {
-        $this->batchNum = min($batchNum, 20);      // Java 注释明说最大 20
+        $this->batchNum = min($batchNum, 20);
         $this->traceInstanceId = self::$instanceNum++;
         $this->group = $group;
         $this->type = $type;
@@ -195,17 +155,11 @@ final class AsyncTraceDispatcher
         $this->hostConsumer = $host;
     }
 
-    /**
-     * 对应 Java `AsyncTraceDispatcher#setNamespaceV2`：宿主 producer/consumer 在
-     * 建轨迹分发器时把自己的 namespaceV2 灌进来（Java `DefaultMQProducer.start:384`
-     * 同位置），本类只存不校验；真正生效靠 {@see start()} 透传给 traceProducer。
-     */
     public function setNamespaceV2(string $namespaceV2): void
     {
         $this->namespaceV2 = $namespaceV2;
     }
 
-    /** 对应 Java `AsyncTraceDispatcher#getNamespaceV2`。 */
     public function getNamespaceV2(): string
     {
         return $this->namespaceV2;
@@ -255,8 +209,6 @@ final class AsyncTraceDispatcher
                     sprintf('%s_%s', TraceConstants::TRACE_INSTANCE_NAME, $nameSrvAddr)
                 );
             }
-            // Java AsyncTraceDispatcher:155：轨迹 producer 必须继承宿主的 namespaceV2，
-            // 否则 serverless 实例下轨迹请求不带 nsd/ns，broker 按默认实例丢弃。
             if (method_exists($this->traceProducer, 'setNamespaceV2')) {
                 $this->traceProducer->setNamespaceV2($this->namespaceV2);
             }
@@ -290,7 +242,6 @@ final class AsyncTraceDispatcher
 
     // ---------------- 入队 / 刷写 ----------------
 
-    /** 把一个 TraceContext 入队。队列满时计数并丢弃（与 Java 一致，不阻塞业务）。 */
     public function append(TraceContext $ctx): bool
     {
         if (count($this->traceContextQueue) >= self::MAX_QUEUE_SIZE) {
@@ -302,7 +253,6 @@ final class AsyncTraceDispatcher
         return true;
     }
 
-    /** 强制刷空队列（Java flush()）。 */
     public function flush(): void
     {
         while ($this->traceContextQueue !== []) {
@@ -346,12 +296,10 @@ final class AsyncTraceDispatcher
                 return;
             }
         }
-        // 对应 Java Thread.sleep(5) 的让路：PHP 由调用方驱动，不在这里 sleep。
     }
 
     // ---------------- 发送 ----------------
 
-    /** 按 (业务 topic, 轨迹 topic) 分组后逐组发送（对应 Java sendTraceData）。 */
     private function sendTraceData(array $contextList): void
     {
         if ($contextList === []) {
@@ -381,10 +329,6 @@ final class AsyncTraceDispatcher
         }
     }
 
-    /**
-     * 按 maxMsgSize 把多条编码结果攒成一条消息体，超限即切块发送
-     * （对应 Java flushData；Python 用 len(buffer) 计数，这里用 mb_strlen 对齐 code point）。
-     */
     private function flushData(array $transBeanList, string $topic, string $traceTopic): void
     {
         if ($transBeanList === []) {
@@ -447,13 +391,6 @@ final class AsyncTraceDispatcher
         }
     }
 
-    /**
-     * 取该 topic 涉及的 broker 名集合（对应 Java tryGetMessageQueueBrokerSet）。
-     *
-     * 只有跨集群（CLOUD）场景才需要按 broker 过滤；本地场景返回空集即走普通轮询。
-     *
-     * @return array<string,true>
-     */
     private static function tryGetMessageQueueBrokerSet(mixed $producer, string $topic): array
     {
         $brokerSet = [];

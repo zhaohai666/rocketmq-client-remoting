@@ -1,8 +1,3 @@
-// -*- coding: utf-8 -*-
-// RemotingCommand: RocketMQ remote command (org.apache.rocketmq.remoting.protocol.RemotingCommand).
-// Wire: totalLength(4) | headerLength(4, high 8 bits = serialize type) | header | body
-// Header (JSON): RemotingSerializable JSON. Header (ROCKETMQ): code(2) language(1) version(2)
-//   opaque(4) flag(4) remark(int+utf8) extFields(int + key(short+utf8) value(int+utf8)).
 import os from 'node:os';
 import { Buffer } from 'node:buffer';
 import { LanguageCode, SerializeType } from './codes.ts';

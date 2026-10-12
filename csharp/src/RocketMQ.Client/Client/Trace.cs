@@ -1,26 +1,8 @@
-// 消息轨迹（对应 org.apache.rocketmq.client.trace 包 + org.apache.rocketmq.client.AccessChannel）。
-//
-// 包含：
-//   * TraceConstants     —— 常量（org.apache.rocketmq.client.trace.TraceConstants）
-//   * TraceType           —— Pub / Recall / SubBefore / SubAfter / EndTransaction
-//   * AccessChannel       —— LOCAL / CLOUD（org.apache.rocketmq.client.AccessChannel）
-//   * TraceMessageType    —— 被追踪消息的类型（Normal/Trans/TransCommit/Delay/Order）
-//   * TraceBean           —— 轨迹里被追踪的那条消息
-//   * TraceContext        —— 一次追踪上下文（Pub/SubBefore/... 各一份）
-//   * TraceTransferBean   —— 编码结果：trans_data + trans_key
-//   * TraceDataEncoder    —— 文本编解码（与 Java 逐字节一致，对拍向量见 TraceTests.cs）
-//
-// ⚠ 两个必须保留的 Java 语义差异（否则编解码对不上）：
-//   1. CONTENT_SPLITOR = \x01、FIELD_SPLITOR = \x02，编码时**每条记录末尾补 FIELD_SPLITOR**；
-//      解码用 Java 的 String.split 语义（**丢弃末尾空串**）切分 —— 见 LegacySplit。
-//   2. C# 的 string.Split(char) 会保留末尾空串（与 Java 不同），直接用它切分会把字段整体
-//      错位；本模块一律走 LegacySplit。
 using System.Globalization;
 using RocketMQ.Common;
 
 namespace RocketMQ.Client;
 
-/// <summary>对应 org.apache.rocketmq.client.trace.TraceConstants。</summary>
 public static class TraceConstants
 {
     public const string GroupNamePrefix = "_INNER_TRACE_PRODUCER";
@@ -47,7 +29,6 @@ public static class TraceConstants
     public const string RocketmqRetryTimers = "rocketmq.retry_times";
 }
 
-/// <summary>对应 org.apache.rocketmq.client.trace.TraceType（枚举名即线上字段第 1 段）。</summary>
 public enum TraceType
 {
     Pub = 0,
@@ -57,15 +38,12 @@ public enum TraceType
     EndTransaction = 4,
 }
 
-/// <summary>对应 org.apache.rocketmq.client.AccessChannel。只在 SubAfter 编码时起作用。</summary>
 public enum AccessChannel
 {
     Local = 0,
     Cloud = 1,
 }
 
-/// <summary>对应 org.apache.rocketmq.common.message.MessageType（轨迹字段 msgType 的枚举）。
-/// 注意序数必须与 Java 一致：Normal=0、Trans=1、TransCommit=2、Delay=3、Order=4。</summary>
 public enum TraceMessageType
 {
     Normal = 0,
@@ -75,11 +53,6 @@ public enum TraceMessageType
     Order = 4,
 }
 
-/// <summary>
-/// 复刻 Java String.split：**丢弃末尾的空串**。C# 的 Split(char) 会保留，直接用它切分
-/// 多出一个空记录、把字段整体错位（编码结果末尾正好补了 FIELD_SPLITOR）。这条差异是真金
-/// 白银的对拍坑，勿改成 string.Split。
-/// </summary>
 public static class LegacySplit
 {
     public static List<string> Split(string value, string sep)
@@ -94,7 +67,6 @@ public static class LegacySplit
     }
 }
 
-/// <summary>对应 org.apache.rocketmq.client.trace.TraceBean。</summary>
 public sealed class TraceBean
 {
     public string Topic { get; set; } = string.Empty;
@@ -113,9 +85,6 @@ public sealed class TraceBean
     public bool FromTransactionCheck { get; set; }
 }
 
-/// <summary>对应 org.apache.rocketmq.client.trace.TraceContext。
-/// RequestId 默认取 UtilAll.CreateUniqId()（与 Java 一致）—— SubBefore 与 SubAfter
-/// 共用一个 request_id，是控制台把一次消费前后串起来的关键。</summary>
 public sealed class TraceContext
 {
     public TraceType? TraceType { get; set; }
@@ -131,26 +100,16 @@ public sealed class TraceContext
     public List<TraceBean> TraceBeans { get; set; } = new();
 }
 
-/// <summary>对应 org.apache.rocketmq.client.trace.TraceTransferBean。</summary>
 public sealed class TraceTransferBean
 {
     public string TransData { get; set; } = string.Empty;
     public HashSet<string> TransKey { get; set; } = new();
 }
 
-/// <summary>对应 org.apache.rocketmq.client.trace.TraceDataEncoder。
-/// 编码结果的字段顺序**逐字节对齐 Java**，回归守卫是 TraceTests.cs 里由 Java 官方实现
-/// 打印出来的固定字符串。</summary>
 public static class TraceDataEncoder
 {
-    /// <summary>对应 Java TraceBean 静态块里的 LOCAL_ADDRESS（storeHost/clientHost 默认值）。</summary>
     public static readonly string LocalAddress = MixAll.GetIpStr();
 
-    /// <summary>
-    /// 把线上轨迹文本解回 TraceContext 列表（对应 Java decoderFromTraceDataString）。
-    /// 按 FIELD_SPLITOR 切分记录，再按 CONTENT_SPLITOR 切分字段；兼容 Pub 的
-    /// 13 / 14 / &gt;=15 段、SubAfter 的 &gt;=7 / &gt;=9 段等老版本分支。
-    /// </summary>
     public static List<TraceContext> DecoderFromTraceDataString(string? traceData)
     {
         var res = new List<TraceContext>();
@@ -174,8 +133,6 @@ public static class TraceDataEncoder
             catch (Exception e) when (e is ArgumentOutOfRangeException or IndexOutOfRangeException
                                       or FormatException or OverflowException)
             {
-                // 有意偏离 Java（Java 会把异常抛给调用方，导致**整条**轨迹消息全丢）：
-                // 单条坏记录只跳过自己，其余记录照常解出。
                 continue;
             }
 
@@ -252,9 +209,6 @@ public static class TraceDataEncoder
                 {
                     MsgId = line[5],
                     RetryTimes = int.Parse(line[6], CultureInfo.InvariantCulture),
-                    // 无 keys 的消息，其 SubBefore 末段为空，被 Java 的 split 语义（丢弃末尾空串）
-                    // 一并丢掉 → 只剩 7 段。Java 原生此处 line[7] 抛 AIOOBE（上游真实缺陷），
-                    // 我们按空串兜底，否则无 keys 消息的 SubBefore 轨迹全丢。
                     Keys = line.Count > 7 ? line[7] : string.Empty,
                 };
                 ctx.TraceBeans = new List<TraceBean> { bean };
@@ -334,7 +288,6 @@ public static class TraceDataEncoder
         return null;
     }
 
-    /// <summary>把 TraceContext 编成可发送的文本（对应 Java encoderFromContextBean）。</summary>
     public static TraceTransferBean? EncoderFromContextBean(TraceContext? ctx)
     {
         if (ctx is null)
@@ -386,7 +339,6 @@ public static class TraceDataEncoder
                     ctx.IsSuccess ? "true" : "false", bean.Keys,
                     ctx.ContextCode.ToString(CultureInfo.InvariantCulture),
                 });
-                // Java：非 CLOUD 才补 timestamp + groupName（accessChannel 为 null 时按 LOCAL）。
                 if ((ctx.AccessChannel ?? RocketMQ.Client.AccessChannel.Local) != RocketMQ.Client.AccessChannel.Cloud)
                 {
                     sb.Add(ctx.TimeStamp.ToString(CultureInfo.InvariantCulture));
@@ -422,7 +374,6 @@ public static class TraceDataEncoder
             tb.TransData = string.Join(soh, sb) + stx;
         }
 
-        // 收集 keys：msgId + 按空格拆开的业务 keys（Java split(KEY_SEPARATOR)）。
         foreach (TraceBean bean in ctx.TraceBeans)
         {
             tb.TransKey.Add(bean.MsgId);

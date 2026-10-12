@@ -1,19 +1,3 @@
-//! 客户端基础指标（对应 `python/client/metrics.py` 的 `ClientMetrics`，
-//! 口径同 Java `MQClientAPIImpl` / `DefaultMQPushConsumer` 内部的 sendRT / sendCount /
-//! sendFailureCount 与 consumeRT / consumeCount / consumeFailureCount 统计）。
-//!
-//! Java 语义锚点（Python 参考实现逐行照抄）：
-//!
-//! 1. `record_send_start()` / `record_consume_start()` **只返回当前毫秒时间戳**，
-//!    不改任何状态（Java 用局部变量 `beginTime`，这里同样无副作用）。
-//! 2. 成功与失败**共用**同一条 RT 累加链：`count` 只在成功时 +1，`failure_count`
-//!    只在失败时 +1，而 `rt_sum` 两者都加。所以 `RTAvg = rt_sum / count` 的分子含失败
-//!    耗时、分母不含失败次数 —— 这是 Python/Java 的原始口径，照抄不"修"。
-//! 3. min/max 靠一个 `started` 标志位初始化：首条记录无论成败都同时写入 max 和 min，
-//!    之后 max 只增、min 只减（不是"重置为 +inf/-inf"那种写法）。
-//! 4. `snapshot()` 里所有浮点都做 `round(x, 3)`；平均数在 `count == 0` 时给 `0.0`
-//!    而不是 NaN。
-//!
 //! 与本仓库其它端的有意差异（语义不变）：
 //! - Python 的 `snapshot()` 返回 dict，这里返回强类型 [`MetricsSnapshot`]，
 //!   [`MetricsSnapshot::to_json_value`] 的键名与顺序和 Python dict 完全一致；

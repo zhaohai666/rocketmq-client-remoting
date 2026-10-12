@@ -1,10 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消息编解码测试（对应 org.apache.rocketmq.common.message.MessageDecoder）。
-
-覆盖两条互不相同的编码路径：
-  * 17 段存储格式：encode_message_ext / decode_message / decode_messages
-  * 6 段批量轻量格式：MessageBatch.encode / encode_messages / decode_batch_messages
-"""
 from __future__ import annotations
 
 import struct
@@ -73,15 +67,14 @@ class TestPropertiesCodec:
         assert string_2_message_properties(message_properties_2_string(props)) == props
 
     def test_garbage_segments_ignored(self):
-        """Java：长度 < 3 或无 kv 分隔符的片段会被跳过。"""
+        pass
         assert string_2_message_properties("a\x02") == {}
         assert string_2_message_properties("ab\x02") == {}
         assert string_2_message_properties("no-separator\x02") == {}
         assert string_2_message_properties("k\x01v\x02") == {"k": "v"}
 
     def test_empty_value_is_dropped(self):
-        """与 Java 一致：newIndex-index>=3 且 kvSep < newIndex-1 才计入，
-        空 value ``k\\x01\\x02`` 会被判定为非法片段而丢失，这里锁住该行为。"""
+        pass
         raw = message_properties_2_string({"WAIT": ""})
         assert raw == "WAIT\x01\x02"
         assert string_2_message_properties(raw) == {}
@@ -351,27 +344,12 @@ def test_compressed_message_roundtrip(compress_type):
     got = decode_message(bytes(buf))
     assert got is not None
     assert got.get_body() == body
-    # Java: sysFlag &= ~COMPRESSED_FLAG，仅清标志位，压缩类型位（bit8~10）保留
     assert got.get_sys_flag() == MessageSysFlag.clear_compressed_flag(sys_flag)
     assert got.get_sys_flag() == MessageSysFlag.set_compression_type(0, compress_type)
 
 
 def test_unsupported_compression_type_raises_instead_of_passthrough():
-    """未支持的压缩类型必须抛错，绝不原样透传。
-
-    对齐 Java：``CompressionType.findByValue`` 只认 0/3(ZLIB)、1(LZ4)、2(ZSTD)，
-    其余返回 null，``CompressorFactory.getCompressor`` 随即抛异常
-    （C++ ``CompressorFactory::decompress`` 同语义）。
-
-    为什么这条重要：``decode_message`` 解压后会清掉 ``COMPRESSED_FLAG``。
-    若这里透传，调用方拿到的是**压缩字节流**且标志位已丢 → 事后无法识别，
-    属于静默数据损坏。SNAPPY(4) 在 Java 5.x 里就是这种"未支持"类型。
-
-    两层语义都要钉住：
-      * ``_decompress`` 本身**抛错**（对齐 Java CompressorFactory）；
-      * ``decode_message`` 返回 ``None``（对齐 Java decode 的 catch -> null；
-        消息被丢弃，而不是被当成压缩流原样交出去）。
-    """
+    pass
     body = b"payload-that-should-never-be-returned-as-is" * 20
     sys_flag = MessageSysFlag.COMPRESSED_FLAG | MessageSysFlag.set_compression_type(
         0, MessageSysFlag.SNAPPY_TYPE)
@@ -399,10 +377,8 @@ def test_unsupported_compression_type_raises_instead_of_passthrough():
     buf += struct.pack(">B", len(topic_bytes)) + topic_bytes
     buf += struct.pack(">H", 0)
 
-    # 上层：消息被丢弃（Java decode 的 catch -> null），而不是交回压缩流
     assert decode_message(bytes(buf)) is None
 
-    # 下层：解压助手直接抛错（对齐 Java CompressorFactory.getCompressor）
     with pytest.raises(RuntimeError, match="unsupported compression type"):
         _decompress(payload, MessageSysFlag.SNAPPY_TYPE)
 

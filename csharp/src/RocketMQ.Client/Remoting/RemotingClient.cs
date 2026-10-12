@@ -1,5 +1,3 @@
-// Socket 长连接客户端（对应 org.apache.rocketmq.remoting.netty.NettyRemotingClient 的核心能力）。
-//
 // 提供：连接管理（惰性建连 + 复用 + TCP_NODELAY）、invokeSync / invokeAsync /
 // invokeOneway、opaque 到响应回调的分发、超时控制、连接状态探活。
 //
@@ -12,13 +10,6 @@
 //
 // 线格式：totalLength(4) | headerLength(4) | header | body
 //   totalLength = 4 + headerLength + bodyLength（即首 4 字节之后的所有字节数）
-//
-// 与 Java 的一处口径差异（刻意如此）：NettyRemotingClient#scanChannelTablesOfNameServer
-// （channelNotActiveInterval=60s）在 Java 客户端里**从未被调度** —— client + remoting 全树
-// grep 不到调用点，属于死代码，所以这里不做空闲连接回收；对端真断开时读线程立刻见到 EOF，
-// 惰性清理已覆盖真实场景。异步请求的超时清理（scanResponseTable）则有实现，连接断开时立刻
-// 失败该连接名下的在途请求（failFast / requestFail）也有实现：读线程退出时把这些请求判为
-// RemotingSendRequestException（不是超时），并唤醒还在等响应的同步调用方。
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Globalization;
@@ -34,24 +25,10 @@ namespace RocketMQ.Remoting;
 /// <summary>带超时控制的 TCP 传输客户端。</summary>
 public sealed class RemotingClient : IDisposable
 {
-    /// <summary>
-    /// 异步调用回调（对应 Java InvokeCallback 的 operationSucceed / operationFail 二分）：
-    /// 成功时 response 非空、error 为空；超时或发送失败时 response 为空、error 非空。
-    /// 在读线程或超时清理线程中触发，实现需自行保证线程安全。
-    /// </summary>
     public delegate void InvokeCallback(RemotingCommand? response, Exception? error);
 
-    /// <summary>
-    /// broker 主动发来的**请求**（而非响应）的处理器：handler(请求命令, 对端地址)。
-    /// 对应 Java NettyRemotingAbstract 的 processor 表。返回非 null 的 RemotingCommand
-    /// 表示「要回一个响应」——典型是 PUSH_REPLY_MESSAGE_TO_CLIENT(326)，broker 侧是
-    /// invokeSync，不回响应它那边会超时；返回 null 表示「不回响应」，与 Java
-    /// ClientRemotingProcessor.checkTransactionState 返回 null 的语义一致（broker 用
-    /// invokeOneway 发的回查本来也不期待响应）。
-    /// </summary>
     public delegate RemotingCommand? RequestProcessor(RemotingCommand request, string addr);
 
-    /// <summary>单帧上限（与 Java NettyRemotingClient 的 16MB 限制一致）。</summary>
     public const int MaxFrameLength = 16 * 1024 * 1024;
 
     private sealed class Connection
@@ -75,29 +52,18 @@ public sealed class RemotingClient : IDisposable
         public readonly ManualResetEventSlim Done = new(false);
         public RemotingCommand Response = new();
 
-        // 响应是否真的到达（对应 Java 的 responseCommand != null）。断连 failFast 只会
-        // 置 Done 唤醒同步等待方而没有响应，同步路径靠这个位区分"抛发送失败"还是"返回响应"。
         public bool HasResponse;
         public InvokeCallback? Callback;
 
-        // 异步请求的超时账目（对应 Java ResponseFuture 的 timeoutMillis + beginTimestamp）。
-        // Addr/DeadlineMs/TimeoutMs 只在登记时写入；CallbackFired 由读线程与清理线程争抢。
-        // DeadlineMs == 0 表示不由清理线程负责（同步路径自己等、自己摘除）。
         public string Addr = string.Empty;
         public long DeadlineMs;
         public long TimeoutMs;
         public bool CallbackFired;
 
-        // 请求真正写出去时所用的连接（对应 Java ResponseFuture 的 channel 字段）。
-        // 断连时按**对象引用**认领在途请求，见 FailFast()。null = 还没写出去，
-        // 这条连接的断开不该牵连它（写失败时调用方就地拿到异常并自己摘掉条目）。
         public Connection? Conn;
 
-        // 失败原因（对应 Java 的 cause）：同步等待方据此抛 RemotingSendRequestException
-        // 而不是等满 timeout 抛 RemotingTimeoutException。
         public Exception? Cause;
 
-        // 单调时钟：不受系统时间调整影响（Java 用 currentTimeMillis，这里刻意取更稳的口径）
         public static long MonoNowMs() => Environment.TickCount64;
     }
 
@@ -106,8 +72,6 @@ public sealed class RemotingClient : IDisposable
     private readonly int _invokeTimeoutMillis;
     private readonly bool _tlsEnable;
     private readonly TlsOptions? _tlsOptions;
-    // SOCKS 代理（对应 Java NettyRemotingClient 的 proxyMap / Socks5ProxyHandler）。
-    // 非 null 时 TCP 直连代理，目标地址只出现在 SOCKS CONNECT 里。
     private readonly SocksProxyConfig? _socksProxy;
 
     private readonly object _connMutex = new();
@@ -115,9 +79,6 @@ public sealed class RemotingClient : IDisposable
 
     private readonly ConcurrentDictionary<int, Future> _respTable = new();
 
-    // 在途请求超时清理（对应 Java NettyRemotingAbstract.scanResponseTable 及其定时线程）。
-    // 异步请求只有被这张表按时摘掉并回调一次，调用方才知道失败；缺了它回调会永久悬挂、
-    // 条目永久泄漏。首次 InvokeAsync 时才创建，纯同步用法不留线程。
     private readonly object _sweepLock = new();
     private Timer? _sweeper;
 
@@ -135,20 +96,6 @@ public sealed class RemotingClient : IDisposable
     private readonly object _hookLock = new();
     private IRpcHook? _rpcHook;
 
-    /// <summary>
-    /// 安装 RPC 钩子（对应 Java NettyRemotingClient#registerRPCHook）。钩子在每次请求
-    /// **编码之前**于发送路径上被调用，从而能把 AccessKey/Signature 写进 ExtFields。
-    /// </summary>
-    /// <remarks>
-    /// <b>first-wins</b>：已有钩子时返回 false 且不覆盖，与 Java 在构造 MQClientInstance 时
-    /// 绑定钩子的行为一致（同一 clientId 复用实例）。因此钩子必须在 Start() 之前设置。
-    /// <para>
-    /// 注意（与 Java 的差异）：Java 在响应完成回调里对 sync/async 都调 DoAfterResponse；
-    /// 本实现只在<b>同步</b>路径调用（请求对象在栈上，无需为在途表保留 Body）——异步路径
-    /// 请求挂在在途表上，为不拖累每个在途请求的内存占用而省略。AclClientRPCHook 的
-    /// DoAfterResponse 是空实现，目前唯一依赖它的是轨迹 recall 钩子（recall 是同步 RPC）。
-    /// </para>
-    /// </remarks>
     public bool RegisterRpcHook(IRpcHook hook)
     {
         lock (_hookLock)
@@ -189,8 +136,6 @@ public sealed class RemotingClient : IDisposable
     {
         _connectTimeoutMillis = connectTimeoutMillis;
         _invokeTimeoutMillis = invokeTimeoutMillis;
-        // TLS（对应 Java NettyRemotingClient 的 isUseTLS / tls.enable）。显式参数优先，
-        // 否则读 ROCKETMQ_TLS_ENABLE（Java 是 JVM 系统属性 -Dtls.enable，这里等价为 env）。
         _tlsEnable = tlsEnable ?? EnvTlsEnabled();
         _tlsOptions = tlsOptions;
         _socksProxy = socksProxy;
@@ -257,12 +202,6 @@ public sealed class RemotingClient : IDisposable
         return cert.Extensions.OfType<X509SubjectAlternativeNameExtension>().Any();
     }
 
-    /// <summary>
-    /// 对应 Java NettyClientConfig.enableReconnectForGoAway（默认 <c>true</c>）：
-    /// broker / proxy 优雅下线时给在途请求回 <c>GO_AWAY(1500)</c>，语义是「这条连接别再用了」。
-    /// 开启时换一条连接重发一次（只一次），第二次仍是 GO_AWAY 就报发送失败；关掉直接失败。
-    /// 必须在首条连接建立前设置。
-    /// </summary>
     public bool EnableReconnectForGoAway { get; set; } = true;
 
     public int ConnectTimeoutMillis => _connectTimeoutMillis;
@@ -281,10 +220,6 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    /// <summary>
-    /// 当前在途请求数（测试/诊断用）。对应 Java <c>NettyRemotingAbstract.responseTable</c>
-    /// 的大小：真机验证用它证明"对端断开后在途表被 failFast 排空"，而不是等超时清理线程慢慢扫。
-    /// </summary>
     public int PendingRequestCount => _respTable.Count;
 
     // ---------------------------------------------------------------- 建连
@@ -370,12 +305,6 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    /// <summary>
-    /// 经 SOCKS 代理建连：TCP 直连<b>代理</b>，完成 SOCKS 握手（CONNECT 到目标）后
-    /// 返回的 socket 已经端到端打通（对应 Java fetchBootstrap/createBootstrap +
-    /// Socks5ProxyHandler 的管道位置 —— 代理握手先于 TLS 与任何 RocketMQ 帧）。
-    /// 目标为主机名时不在本端解析，交给代理解析（对应 Java NoopAddressResolverGroup）。
-    /// </summary>
     private Socket ConnectViaSocks(string addr, string destHost, int destPort)
     {
         SocksProxyConfig proxy = _socksProxy!;
@@ -395,7 +324,6 @@ public sealed class RemotingClient : IDisposable
 
         try
         {
-            // 握手预算复用 connectTimeoutMillis（对应 Java CONNECT_TIMEOUT_MILLIS 盖住整段建连）
             SocksProxy.Handshake(sock, proxy, destHost, destPort, _connectTimeoutMillis);
             return sock;
         }
@@ -473,10 +401,6 @@ public sealed class RemotingClient : IDisposable
 
         var conn = new Connection { Addr = addr, Sock = sock };
 
-        // TLS：在任何 RocketMQ 帧之前完成握手（对应 Java pipeline.addFirst(SslHandler)）。
-        // test mode（无 CaCert）信任 broker 自签证书（Java tls.test.mode.enable 默认 true
-        // 的等价语义）；CaCert 给出则**严格校验**：证书链必须到该 CA（CustomRootTrust）
-        // 且主机名/SAN 匹配（SslStream 按 TargetHost 校验，ServerName 显式覆盖）。
         if (_tlsEnable)
         {
             try
@@ -503,9 +427,6 @@ public sealed class RemotingClient : IDisposable
                     var chainPolicy = new X509ChainPolicy
                     {
                         TrustMode = X509ChainTrustMode.CustomRootTrust,
-                        // 默认 RevocationMode=Online 会对没有 CRL/OCSP 分发点的证书回
-                        // RevocationStatusUnknown 直接判死（Java/OpenSSL 严格校验在未配
-                        // crlPath 时也不查吊销，对齐这个口径才不会把自家 CA 的证书全拒）。
                         RevocationMode = X509RevocationMode.NoCheck,
                     };
                     chainPolicy.CustomTrustStore.Add(caCert);
@@ -582,8 +503,6 @@ public sealed class RemotingClient : IDisposable
             _conns[addr] = conn;
         }
 
-        // 每连接一个读线程，命名后日志里能直接看出是哪条链路（对应 Java 的
-        // NettyClientWorkerThread；Java 用线程池复用，这里是一连接一线程，故带上地址）。
         var reader = new Thread(() =>
         {
             ClientLog.SetThreadName("RemotingClientReader-" + addr);
@@ -631,8 +550,6 @@ public sealed class RemotingClient : IDisposable
 
             if (n <= 0)
             {
-                // n == 0 对端正常关闭。Java 侧 Netty 的 channelInactive 会打一行，
-                // 但正常 shutdown 也会走到这里，为免默认 INFO 下变成噪声同样降到 DEBUG。
                 if (_running)
                 {
                     ClientLog.Debug("remoting reader: connection " + conn.Addr + " closed by peer");
@@ -658,8 +575,6 @@ public sealed class RemotingClient : IDisposable
                 int totalLen = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(consumed, 4));
                 if (totalLen <= 0 || totalLen > MaxFrameLength)
                 {
-                    // 真正的协议异常（对应 Java NettyRemotingAbstract 的 "decode message length error"）：
-                    // 必须可见，否则会表现为"请求莫名超时"而没人知道原因。
                     ClientLog.Warn("remoting reader: illegal frame length "
                         + totalLen.ToString(CultureInfo.InvariantCulture)
                         + " from " + conn.Addr + ", dropping "
@@ -692,9 +607,6 @@ public sealed class RemotingClient : IDisposable
             }
         }
 
-        // ---- 连接生命周期收口，顺序照 Java 的 NettyRemotingHandler#close ----
-        // 先 closeChannel（摘出连接表 + 关掉 socket），再 failFast。反过来会白丢一次重试：
-        // 条目还挂在表里时投递回调，回调里的重发会拿到这条已死的连接继续写。
         lock (_connMutex)
         {
             if (_conns.TryGetValue(conn.Addr, out Connection? found) && ReferenceEquals(found, conn))
@@ -708,26 +620,6 @@ public sealed class RemotingClient : IDisposable
         conn.ReaderDone = true;
     }
 
-    /// <summary>
-    /// <paramref name="conn"/> 这条连接已经关了：把它名下还没响应的在途请求全部判为
-    /// **发送失败**（对应 Java <c>NettyRemotingAbstract#failFast</c> + <c>#requestFail</c>）。
-    /// </summary>
-    /// <remarks>
-    /// Java 的 <c>NettyRemotingHandler#close</c> 在 <c>closeChannel</c> 之后紧接着调
-    /// <c>failFast(ctx.channel())</c>（NettyRemotingClient.java:1191），逐条
-    /// <c>requestFail</c>：<c>setSendRequestOK(false)</c> → <c>putResponse(null)</c> →
-    /// 恰好投递一次回调。缺了这一步会错两件事，都不只是"慢一点"：
-    /// <list type="number">
-    /// <item><description>时机——同步调用要等满 invoke 超时、异步回调要等
-    /// <c>timeout + 1s</c>（清理线程的宽限口径）才发现对端早就断了；broker 重启、主备切换、
-    /// 网络抖动时这段空等直接压在发送链路上。</description></item>
-    /// <item><description>语义——报的是 <c>RemotingTimeoutException</c>，Java 报
-    /// <c>RemotingSendRequestException</c>。异步发送的重试分类按异常类型分流，错类型等于错决策。</description></item>
-    /// </list>
-    /// 按 Connection **对象引用**认领，不按地址：地址相同但连接已换新是常见形状
-    /// （GO_AWAY 换连接重发、写失败后关连接），旧读线程收尾时不能误伤新连接的请求。
-    /// 返回被判死的条数，只为日志与测试断言服务。
-    /// </remarks>
     private int FailFast(Connection conn)
     {
         List<(Future Future, int Opaque)>? doomed = null;
@@ -762,7 +654,7 @@ public sealed class RemotingClient : IDisposable
             lock (f.Done)
             {
                 f.Cause = error;
-                f.Done.Set(); // 对应 Java 的 putResponse(null)：同步等待方立刻醒
+                f.Done.Set();
                 if (!f.CallbackFired)
                 {
                     f.CallbackFired = true;
@@ -784,7 +676,6 @@ public sealed class RemotingClient : IDisposable
     {
         if (!RemotingCommand.TryDecode(frame, out RemotingCommand cmd, out _))
         {
-            // Java 侧这里同样是 warn（解码失败意味着这条响应永久丢失，调用方只会看到超时）。
             ClientLog.Warn("remoting reader: drop undecodable frame ("
                 + frame.Length.ToString(CultureInfo.InvariantCulture) + " bytes) from " + from);
             return; // 解不出的帧直接丢，不影响其它请求
@@ -849,8 +740,6 @@ public sealed class RemotingClient : IDisposable
         {
             future.Response = cmd;
             future.HasResponse = true;
-            // 与超时清理线程抢同一个回调：谁先置位谁投递，另一个只能放弃
-            // （Java 用 ResponseFuture.executeCallbackOnlyOnce 表达同一约束）。
             if (!future.CallbackFired)
             {
                 future.CallbackFired = true;
@@ -862,11 +751,6 @@ public sealed class RemotingClient : IDisposable
         cb?.Invoke(cmd, null);
     }
 
-    /// <summary>
-    /// 注册 broker 主动请求的处理器（对应 Java NettyRemotingAbstract 的 processor 表）。
-    /// 只有「请求类型且不在本地在途响应表里」的命令才会派发到这里，不会影响现有的
-    /// InvokeSync / InvokeAsync 响应分发。处理器在读线程里执行，需自保证线程安全。
-    /// </summary>
     public void RegisterProcessor(int requestCode, RequestProcessor handler)
     {
         lock (_procLock)
@@ -942,11 +826,6 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    /// <summary>
-    /// 把**响应**写回对端（对应 Java processRequestCommand 里给处理器产出响应走
-    /// ctx.writeAndFlush）。不走 RPC 钩子（响应不需要重签名），且调用方已设好 Opaque
-    /// 与响应位。仅复用了连接写锁与分帧发送。
-    /// </summary>
     private void SendResponse(string addr, RemotingCommand response)
     {
         Connection conn = GetOrCreateConnection(addr);
@@ -976,12 +855,6 @@ public sealed class RemotingClient : IDisposable
     // ---------------------------------------------------------------- opaque 登记
 
     // 取得一个**在途请求中唯一**的 opaque，并在同一把锁内登记 future。
-    //
-    // 为什么不能简单用 "opaque == 0 就重分配"：RemotingCommand 的 opaque 计数器从 0
-    // 开始，所以 createRequestCommand() 产出的**第一个**请求 opaque 就是 0，把 0 当
-    // "未设置"会把它改掉，导致调用方与服务端回填的 opaque 不一致（调用方拿不到响应）。
-    // 这里只在**真的与在途请求冲突**时才重分配，其余情况原样保留（含 0），与 Java
-    // NettyRemotingClient 从不改写调用方 opaque 的行为一致。
     private Future RegisterFutureAcquiringOpaque(RemotingCommand request, InvokeCallback? cb,
         string addr = "", long timeoutMillis = 0)
     {
@@ -1055,13 +928,8 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    /// <summary>
-    /// 摘除已超时的在途请求并回调一次（对应 Java scanResponseTable）。
-    /// </summary>
     private void SweepExpired()
     {
-        // 与 Java 同式：beginTimestamp + timeoutMillis + 1000 <= now。这 1s 宽限是给
-        // "响应已经在路上"留的余量——超时后 1s 内到达的响应仍按成功投递。
         const long GraceMs = 1000;
         long now = Future.MonoNowMs();
         List<(Future Future, int Opaque)>? expired = null;
@@ -1117,14 +985,6 @@ public sealed class RemotingClient : IDisposable
 
     // ---------------------------------------------------------------- 公开调用
 
-    /// <summary>
-    /// 同步调用：等到响应或超时，含 GO_AWAY 换连接重发（对应 Java
-    /// <c>NettyRemotingClient#invokeImpl:828-873</c>）。超时抛 RemotingTimeoutException；
-    /// 建连失败抛 RemotingConnectException；发送失败抛 RemotingSendRequestException。
-    /// 对端在响应之前断开连接时也立刻抛 RemotingSendRequestException（Java 的 failFast
-    /// 唤醒等待方），不会让调用方等满 timeout 才拿到一个语义错误的超时。
-    /// timeoutMillis &lt; 0 表示使用 invokeTimeoutMillis。
-    /// </summary>
     public RemotingCommand InvokeSync(string addr, RemotingCommand request, int timeoutMillis = -1)
     {
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _invokeTimeoutMillis;
@@ -1169,18 +1029,12 @@ public sealed class RemotingClient : IDisposable
         if (!future.HasResponse)
         {
             UnregisterFuture(opaque);
-            // Done 却没有响应 = 连接断开时被 FailFast 判死（Java 的 invokeSyncImpl 把这条
-            // 路径上的 ExecutionException 翻成 RemotingSendRequestException）。
             throw future.Cause is not null
                 ? new RemotingSendRequestException(future.Cause.Message)
                 : new RemotingSendRequestException(addr + " connection closed before response, opaque="
                     + opaque.ToString(CultureInfo.InvariantCulture));
         }
 
-        // 同步路径补上 DoAfterResponse（Java 在响应完成回调里对 sync/async 都调；本实现只在
-        // **持有请求对象**的同步路径调——异步路径请求挂在在途表上，按上面的差异说明不调）。
-        // 现有钩子（ACL/stream）的 DoAfterResponse 都是空实现，唯一用它的是轨迹的
-        // recall 钩子（RECALL_MESSAGE 是同步 RPC）。钩子的异常绝不改变 RPC 结果。
         try
         {
             CurrentRpcHook()?.DoAfterResponse(addr, request, future.Response);
@@ -1193,11 +1047,6 @@ public sealed class RemotingClient : IDisposable
         return future.Response;
     }
 
-    /// <summary>
-    /// GO_AWAY 的收口：开关关掉直接报错；否则换连接重发一次，第二次还是 GO_AWAY 就抛。
-    /// <paramref name="deadlineMs"/> 是整次调用（含首发）的绝对截止时间，重发只花剩余预算
-    /// ——Java 用同一个 Stopwatch 扣减 timeoutMillis。
-    /// </summary>
     private RemotingCommand RetryAfterGoAway(string addr, RemotingCommand request, long deadlineMs)
     {
         if (!EnableReconnectForGoAway)
@@ -1226,11 +1075,6 @@ public sealed class RemotingClient : IDisposable
         return response;
     }
 
-    /// <summary>
-    /// GO_AWAY 重发用的请求副本（对应 Java 的 createRequestCommand + setBody + setExtFields）。
-    /// 必须是**新** opaque：旧请求已经拿到应答，复用会让下一次响应错配。
-    /// ExtFields 按值复制——ACL 签名（AccessKey/Signature）就在里面，重发要带原签名。
-    /// </summary>
     private static RemotingCommand CopyForRetry(RemotingCommand request)
     {
         return new RemotingCommand
@@ -1250,16 +1094,6 @@ public sealed class RemotingClient : IDisposable
         };
     }
 
-    /// <summary>
-    /// 异步调用：发送后立即返回。回调**恰好触发一次**——响应到达时在读线程里带 response，
-    /// 超时或无响应时由清理线程带 error（对应 Java scanResponseTable → operationFail），
-    /// 对端在响应之前断开连接时由该连接的读线程**立刻**带 RemotingSendRequestException
-    /// （对应 Java failFast → requestFail，不等清理线程、也不报成超时）。
-    /// timeoutMillis &lt; 0 表示使用 invokeTimeoutMillis。
-    ///
-    /// GO_AWAY 与同步路径同一套语义（Java 里两条路共用 invokeImpl）：重发要建新连接并等
-    /// 它的读线程投递响应，绝不能压在回调所在的读线程上，所以交给线程池。
-    /// </summary>
     public void InvokeAsync(string addr, RemotingCommand request, InvokeCallback callback, int timeoutMillis = -1)
     {
         int timeout = timeoutMillis >= 0 ? timeoutMillis : _invokeTimeoutMillis;
@@ -1300,7 +1134,6 @@ public sealed class RemotingClient : IDisposable
         }
     }
 
-    /// <summary>单向调用：置 oneway 标志后发送，不等响应（对应 Java invokeOneway）。</summary>
     public void InvokeOneway(string addr, RemotingCommand request)
     {
         request.MarkOnewayRpc();

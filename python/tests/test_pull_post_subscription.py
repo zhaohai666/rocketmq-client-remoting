@@ -1,17 +1,4 @@
 # -*- coding: utf-8 -*-
-"""P5：postSubscriptionWhenPull 与 updatePullFromWhichNode（PullAPIWrapper 移植）离线单测。
-
-对齐 Java：
-  - `DefaultMQPushConsumer#postSubscriptionWhenPull`（默认 false）+ `DefaultMQPushConsumerImpl
-    .pullMessage:458-468`：默认**不发**订阅表达式（subscription 位清零），tag 过滤由客户端
-    processPullResult 兜底；打开且非类过滤模式时才发 subString。
-  - `PullAPIWrapper#pullKernelImpl:197-205`：按 `recalculatePullFromWhichNode(mq)` 选
-    brokerId，对应 `MQClientInstance#findBrokerAddressInSubscribe`（命中 brokerId；从节点
-    未命中按 brokerId+1 再试；不限定时回退到任一节点）；选中从节点时清 COMMIT_OFFSET 位
-    （:219-221）。
-  - `PullAPIWrapper#processPullResult:77`：每轮应答的 `suggestWhichBrokerId` 更新
-    pullFromWhichNodeTable（缺省按 master=0）。
-"""
 import threading
 
 from client.consumer import DefaultMQPushConsumer
@@ -32,7 +19,6 @@ SLAVE = "127.0.0.1:10921"
 SLAVE2 = "127.0.0.1:10931"
 
 
-# ---------------- find_broker_addr_in_subscribe（Java findBrokerAddressInSubscribe）----------------
 
 def _addrs():
     return {0: MASTER, 1: SLAVE, 2: SLAVE2}
@@ -45,7 +31,6 @@ def test_find_broker_addr_in_subscribe_hits_exact_id():
 
 
 def test_find_broker_addr_in_subscribe_slave_miss_tries_next_id():
-    # Java 的从节点 id+1 约定：建议 id=1 不存在时试 id=2
     addrs = {0: MASTER, 2: SLAVE2}
     assert MQClientInstance.find_broker_addr_in_subscribe(addrs, 1) == (SLAVE2, True)
 
@@ -159,7 +144,7 @@ def _run_one_pull(c, client):
 
 def test_push_subscription_bit_off_by_default():
     c = _push_consumer()
-    assert c.post_subscription_when_pull is False  # Java 5.x 默认 false
+    assert c.post_subscription_when_pull is False
 
     client = _PullCapture()
     _run_one_pull(c, client)
@@ -189,11 +174,9 @@ def test_push_updates_pull_from_which_node_from_suggest():
     client = _PullCapture(suggest=1)
     _run_one_pull(c, client)
 
-    # Java processPullResult:77：本轮应答的 suggest 写回表，下一轮按它选路
     assert c._pull_from_which_node[MQ] == 1
     assert client.calls[0]["broker_id"] == MixAll.MASTER_ID
 
-    # 缺省 suggest（老 broker）按 master=0 记账（Java long 原语口径）
     c2 = _push_consumer()
     client2 = _PullCapture(suggest=None)
     _run_one_pull(c2, client2)

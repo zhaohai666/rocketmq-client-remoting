@@ -1,5 +1,3 @@
-// 异步轨迹分发器实现（对应 org.apache.rocketmq.client.trace.AsyncTraceDispatcher）。
-//
 // 职责：钩子把 TraceContext 丢进内存队列（``append``），后台线程按
 // 「攒够 batchNum 条 或 距上次发送超过 5s」两个条件触发刷写，再把编码后的文本
 // 用**独立的内部生产者**发到轨迹 topic（默认 RMQ_SYS_TRACE_TOPIC）。

@@ -1,16 +1,3 @@
-// Tests for the LitePull topic-queue-change listener
-// (Java DefaultLitePullConsumer:325 → DefaultLitePullConsumerImpl:1267 +
-// fetchTopicMessageQueuesAndCompare:1230). The capability was missing from
-// this port entirely, so these lock down the contract rather than incidental
-// details:
-//
-//   - guards and overwrite semantics (Java :1268-1273);
-//   - the snapshot-on-register rule (Java :1275-1277): registering while
-//     RUNNING records the current set, so "what already exists" is not
-//     reported as a change on the next round;
-//   - change detection is SET equality (isSetEqual:1246), so scale-out and
-//     scale-in both fire exactly once and a stable set never re-fires;
-//   - the background loop really drives the comparison.
 package client
 
 import (
@@ -103,7 +90,6 @@ func TestLiteQueueChangeListenerGuards(t *testing.T) {
 	if len(c.topicChangeListeners) != 0 {
 		t.Fatalf("rejected registrations must not be stored: %v", c.topicChangeListeners)
 	}
-	// Default matches Java DefaultLitePullConsumer:160 (30s).
 	if got := c.TopicMetadataCheckIntervalMillis(); got != DefaultLiteTopicMetadataCheckIntervalMillis {
 		t.Fatalf("default check interval = %d, want %d", got, DefaultLiteTopicMetadataCheckIntervalMillis)
 	}
@@ -125,8 +111,6 @@ func TestLiteQueueChangeListenerDetectsScaleOutAndIn(t *testing.T) {
 	if err := c.RegisterTopicMessageQueueChangeListener("T", rec); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	// Registered while RUNNING ⇒ Java :1275-1277 snapshots the current set, so
-	// a round with an unchanged route must stay silent.
 	if n := c.FetchTopicMessageQueuesAndCompare(); n != 0 {
 		t.Fatalf("first round fired %d listeners, want 0 (snapshot on register)", n)
 	}
@@ -195,8 +179,6 @@ func TestLiteQueueChangeListenerBeforeStartHasNoSnapshot(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	defer c.Shutdown()
-	// Java behaves the same way: with no snapshot the first round reports the
-	// set it sees, because "unknown" is not "equal".
 	if n := c.FetchTopicMessageQueuesAndCompare(); n != 1 {
 		t.Fatalf("first round after start fired %d, want 1", n)
 	}
@@ -212,8 +194,6 @@ func TestLiteQueueChangeListenerLoopRunsTheComparison(t *testing.T) {
 	if err := c.RegisterTopicMessageQueueChangeListener("T", rec); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	// Drive a second loop with the delays tests can afford; Start's own loop
-	// keeps Java's 10s/30s timings and simply finds nothing changed.
 	stop := make(chan struct{})
 	go c.metadataLoop(stop, 50*time.Millisecond, 100*time.Millisecond)
 	defer close(stop)

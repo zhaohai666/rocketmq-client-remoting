@@ -1,13 +1,9 @@
-//! 管理端响应体（对应 `org.apache.rocketmq.remoting.protocol.admin.*` 与 `body.*` 中的管理类）。
-//!
 //! 移植 `python/remoting/protocol/admin_body.py`：
 //! `TopicStatsTable` / `TopicOffset` / `ConsumeStats` / `OffsetWrapper` /
 //! `TopicConfigSerializeWrapper` / `ConsumeQueueData` / `QueryConsumeQueueResponseBody`。
 //!
 //! ## 关键坑：MessageQueue 做 map 键
 //!
-//! Java 侧 `Map<MessageQueue, TopicOffset>`，fastjson2 会把键**内联成 JSON 对象**，
-//! 产出的是**非法 JSON**：
 //!
 //! ```text
 //! {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
@@ -44,7 +40,6 @@ pub fn jfield<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
 pub fn jstring(value: &Value, key: &str) -> Option<String> {
     match jfield(value, key)? {
         Value::String(s) => Some(s.clone()),
-        // Java 偶尔把字符串写在数字里（例如 `version: 400`），按 fastjson 转成文本。
         other => Some(other.to_string()),
     }
 }
@@ -168,9 +163,6 @@ fn number_or_null(v: i64) -> Value {
 // ---------------------------------------------------------------- MessageQueue 键
 
 /// `MessageQueue` 在本层的最小形态：只用作 map 键与路由产物。
-///
-/// 字段顺序刻意按 Java `MessageQueue` 的语义字段；fastjson2 的**文本**键顺序由
-/// [`message_queue_key`] 固定为字母序（`brokerName` / `queueId` / `topic`）。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MessageQueueKey {
     pub topic: String,
@@ -206,9 +198,6 @@ impl MessageQueueKey {
 }
 
 /// 把 `MessageQueue` 序列化成 fastjson2 风格的内联对象键（键按字母序）。
-///
-/// 与 Python 唯一的差别：topic / brokerName 里的引号与控制字符会被转义
-/// （Python 用 `%s` 直插，遇到特殊字符会写出更不合法的 JSON；Java fastjson2 是转义的）。
 pub fn message_queue_key(mq: &MessageQueueKey) -> String {
     format!(
         "{{\"brokerName\":{},\"queueId\":{},\"topic\":{}}}",
@@ -267,7 +256,6 @@ where
 
 // ---------------------------------------------------------------- TopicOffset
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.admin.TopicOffset`。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TopicOffset {
     pub min_offset: i64,
@@ -307,9 +295,6 @@ impl TopicOffset {
 
 // ---------------------------------------------------------------- TopicStatsTable
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.admin.TopicStatsTable`。
-///
-/// Java 探针输出：`{"offsetTable":{<MessageQueue>:{...}},"topicPutTps":0.0}`
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TopicStatsTable {
     pub offset_table: Vec<(MessageQueueKey, TopicOffset)>,
@@ -360,7 +345,6 @@ impl TopicStatsTable {
 
 // ---------------------------------------------------------------- OffsetWrapper
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.admin.OffsetWrapper`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OffsetWrapper {
     pub broker_offset: i64,
@@ -379,7 +363,6 @@ impl OffsetWrapper {
         }
     }
 
-    /// 与 Java `OffsetWrapper.getLag()` 一致：`brokerOffset - consumerOffset`。
     pub fn lag(&self) -> i64 {
         self.broker_offset - self.consumer_offset
     }
@@ -406,9 +389,6 @@ impl OffsetWrapper {
 
 // ---------------------------------------------------------------- ConsumeStats
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.admin.ConsumeStats`。
-///
-/// Java 探针输出：`{"consumeTps":1.5,"offsetTable":{<MessageQueue>:<OffsetWrapper>}}`
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConsumeStats {
     pub offset_table: Vec<(MessageQueueKey, OffsetWrapper)>,
@@ -458,11 +438,6 @@ impl ConsumeStats {
 
 // ---------------------------------------------------------------- TopicConfigSerializeWrapper
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.TopicConfigSerializeWrapper`。
-///
-/// `topicConfigTable` 的 value 是 common 层的 `TopicConfig`；协议层不引用 common 层，
-/// 所以这里原样保存 JSON，由上层自己 `TopicConfig::from_json_value`。
-/// `dataVersion` 同理（Java `DataVersion{counter,timestamp}`）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TopicConfigSerializeWrapper {
     pub topic_config_table: Vec<(String, Value)>,
@@ -514,11 +489,6 @@ impl TopicConfigSerializeWrapper {
 
 // ---------------------------------------------------------------- QueryConsumeQueue
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ConsumeQueueData`。
-///
-/// 字段：`physicOffset, physicSize, tagsCode, extendDataJson, bitMap, eval, msg`。
-/// 与 Java 一致：`extendDataJson` / `msg` 为 null 时**不出现**在报文里，
-/// 其余字段（含 `bitMap: null`）恒定写出。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConsumeQueueData {
     pub physic_offset: i64,
@@ -526,7 +496,6 @@ pub struct ConsumeQueueData {
     pub tags_code: i64,
     pub extend_data_json: Option<String>,
     pub bit_map: Option<String>,
-    /// Java 字段名 `eval`（`isEval`）。
     pub eval: bool,
     pub msg: Option<String>,
 }
@@ -576,10 +545,6 @@ impl ConsumeQueueData {
     }
 }
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.QueryConsumeQueueResponseBody`。
-///
-/// Java 探针输出：`{"filterData":"*","maxQueueIndex":88,"minQueueIndex":1,"subscriptionData":{...}}`
-/// （`queueData` 为 null 时整个键不出现。）
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QueryConsumeQueueResponseBody {
     pub subscription_data: Option<Value>,
@@ -651,8 +616,6 @@ impl QueryConsumeQueueResponseBody {
 mod tests {
     use super::*;
 
-    /// Java fastjson2 真实输出（内联对象键 —— 非法 JSON），来自
-    /// `python/tests/test_admin_models.py::WIRE_TOPIC_STATS`。
     pub const WIRE_TOPIC_STATS: &str = concat!(
         r#"{"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:"#,
         r#"{"lastUpdateTimestamp":1700000000000,"maxOffset":500,"minOffset":0}},"#,

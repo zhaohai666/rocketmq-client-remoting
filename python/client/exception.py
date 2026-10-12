@@ -1,21 +1,11 @@
 # -*- coding: utf-8 -*-
-"""客户端异常（对应 org.apache.rocketmq.client.exception.*）。"""
 from __future__ import annotations
 
 from typing import Optional
 
 
 class ClientErrorCode:
-    """对应 org.apache.rocketmq.client.common.ClientErrorCode（七个常量，逐个齐全）。
-
-    sendDefaultImpl 重试耗尽后用它给最终的 MQClientException 定性：
-    连不上 broker→10001，等响应超时→10002，客户端自身问题→10003，
-    地址服务器没给地址→10004，路由查不到→10005。
-    另两个不在重试定性里，各有各的抛出点：
-    * 10006 —— request-reply 等到点没等到应答（``DefaultMQProducerImpl#waitResponse``，
-      以及 Java ``RequestFutureHolder#scanExpiredRequest`` 的清理路径）。
-    * 10007 —— 由请求消息造应答消息失败（``MessageUtil#createReplyMessage``）。
-    """
+    pass
 
     CONNECT_BROKER_EXCEPTION = 10001
     ACCESS_BROKER_TIMEOUT = 10002
@@ -59,12 +49,7 @@ class MQQueueException(MQClientException):
 
 
 class RequestTimeoutException(MQClientException):
-    """对应 Java ``RequestTimeoutException extends MQClientException``。
-
-    Request-Reply 专用语义：请求消息**已经发成功**，但在超时窗口内没等到应答。
-    与「发送本身失败」（会抛 MQClientException / RemotingException）区分开 ——
-    前者可能只是应答方没回，消息其实已经投递；后者连 broker 都没收到。
-    """
+    pass
 
     def __init__(self, message: str = "", response_code: Optional[int] = None,
                  cause: Optional[Exception] = None):

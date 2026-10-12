@@ -353,8 +353,6 @@ int main() {
         }
         CHECK(fired.load() == 1, "invokeAsync timeout fires the callback once");
         CHECK(errLen.load() > 0, "invokeAsync timeout carries an error");
-        // 超时必须是 TIMEOUT：异步发送的重试判定按异常**类型**分流（Java 的
-        // RemotingTimeoutException 会重试，unknown reason 不会），文案不可作为依据。
         CHECK(timeoutKind.load() == static_cast<int32_t>(InvokeError::Kind::TIMEOUT),
               "invokeAsync timeout carries kind TIMEOUT");
         client.shutdown();
@@ -415,7 +413,6 @@ int main() {
         CHECK(!client.isChannelWritable(addr), "not writable after shutdown");
     }
 
-    // ------------------------- 8. GO_AWAY(1500)：换连接重发一次（Java invokeImpl 同语义）
     {
         // 8.1 第一条连接回 GO_AWAY，第二条正常 -> 调用方只看到成功
         TestServer server(ServerMode::GoAway, 4, 1);
@@ -475,8 +472,6 @@ int main() {
         client.shutdown();
     }
     {
-        // 8.4 异步路径共用同一套语义（Java 里同步/异步都走 invokeImpl）。
-        //     重发不能在 reading 线程上等，所以由清理线程代跑 —— 这里等回调落地。
         TestServer server(ServerMode::GoAway, 4, 1);
         RemotingClient client;
         const std::string addr = server.address();

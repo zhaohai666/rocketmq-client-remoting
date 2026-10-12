@@ -1,14 +1,4 @@
 // 钩子单测：CheckForbiddenHook（发送前拦截）与 FilterMessageHook（投递前过滤）。
-//
-// 这两个钩子是 send/consume 钩子体系之外**语义最反直觉**的两个，所以离线必须锁死：
-//   * CheckForbiddenHook 的异常**不被吞掉**（与 send/consume/endTransaction 钩子相反），
-//     它是靠"抛异常沿发送重试链传播"来实现"禁止发送"的；
-//   * FilterMessageHook 的 MsgList 是**可变**的，被摘掉的消息在拉取路径是"静默跳过"
-//     （位点照常推进），在 POP 路径则必须**补 ack**（否则 invisibleTime 后复活重投）；
-//   * 过滤顺序：先客户端二次 tag 过滤，再跑钩子（对齐 Java processPullResult 113-128）。
-//
-// 订阅语义（tagsSet / codeSet）的 Java 对拍向量在 RouteHeartbeatTests.BuildSubscriptionData，
-// 这里只补"客户端二次 tag 过滤"的开关语义：SUB_ALL 的 tagsSet 为空 ⇒ 不做 tag 过滤。
 using System;
 using System.Collections.Generic;
 
@@ -153,7 +143,6 @@ public class HookTests
         Assert.Equal(1, producer.CheckForbiddenHookCount());
         Assert.True(producer.HasSendInterceptors());
 
-        // 注册 null 不得进入列表（Java registerCheckForbiddenHook 同样判空）
         producer.RegisterCheckForbiddenHook(null!);
         Assert.Equal(1, producer.CheckForbiddenHookCount());
 
@@ -184,7 +173,6 @@ public class HookTests
     [Fact]
     public void CheckForbiddenHook_ExceptionIsNotSwallowed()
     {
-        // ★ 关键语义：拦截钩子的异常**不被吞掉**，原样传给调用方（Java 签名就是 throws）
         var producer = new DefaultMQProducer("GID_HookUnitBlocker");
         var strict = new ForbidHook(forbid: true);
         var after = new ForbidHook(forbid: false);
@@ -229,7 +217,6 @@ public class HookTests
         Assert.Equal(CommunicationMode.Sync, ctx.CommunicationMode);
         Assert.Null(ctx.Exception);
 
-        // 三种发送模式（对齐 Java CommunicationMode 枚举 ordinal）
         Assert.Equal(0, (int)CommunicationMode.Sync);
         Assert.Equal(1, (int)CommunicationMode.Async);
         Assert.Equal(2, (int)CommunicationMode.Oneway);
@@ -294,7 +281,6 @@ public class HookTests
     [Fact]
     public void FilterMessageHook_SubAllDoesNotClientFilterTags()
     {
-        // SUB_ALL 的 tagsSet 为空 ⇒ 客户端不做 tag 过滤（这是 Java 的守卫语义）
         var consumer = new DefaultMQPushConsumer(Group + "All");
         var noop = new DropHook("nothing-matches-this-");
         consumer.RegisterFilterMessageHook(noop);

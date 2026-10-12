@@ -1,21 +1,6 @@
-// 管理客户端（对应 org.apache.rocketmq.client.admin.DefaultMQAdminExt /
-// MQAdminExt 与 org.apache.rocketmq.tools.admin.DefaultMQAdminExtImpl）。
-//
 // 覆盖：Topic 增删查/配置、Broker 集群信息与运行时信息/配置、NameServer KV 配置、
 // 订阅组管理、消费者/生产者连接、消费统计、offset 管理（含真实 broker 位点重置）、
 // 消息查询（key / uniqKey / msgId / ConsumeQueue）。
-//
-// 与 C++ 实现（cpp/src/client/admin.cpp）逐项对齐。对齐要点（Java 5.x 探针 +
-// 源码核对结论，勿凭记忆改）：
-//  - GET_BROKER_CONFIG 的 body 是 **properties 文本**（"k=v\n"），不是 JSON。
-//  - UPDATE_AND_CREATE_SUBSCRIPTIONGROUP 的 body 是 SubscriptionGroupConfig JSON。
-//  - GET_TOPIC_CONFIG 请求头带 topic + lo，响应体是 TopicConfig JSON。
-//  - GET_ALL_SUBSCRIPTIONGROUP_CONFIG 是**分页**接口（groupSeq / maxGroupNum / dataVersion）。
-//  - ResetOffsetBody.offsetTable 是 Map<MessageQueue, Long>（222 的响应体恒为此形状）。
-//  - KV 配置类请求打到 **NameServer**，且 PUT/DELETE 要广播到**每一个** NameServer。
-//  - INVOKE_BROKER_TO_RESET_OFFSET 的 force 标志在 extFields 里叫 **isForce**（Java 用
-//    字段名做键，见 RemotingCommand.makeCustomHeaderToNet），language 默认**不**覆盖：
-//    只有 C++ 系的消费者才需要 CPP（broker 对 CPP 发起方推数组形状的 ResetOffsetBodyForC）。
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -27,9 +12,6 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
 
-/// <summary>
-/// 对应 Java org.apache.rocketmq.tools.admin.api.TrackType（字符串值即枚举名）。
-/// </summary>
 public enum TrackType
 {
     Consumed,
@@ -41,8 +23,6 @@ public enum TrackType
     Unknown,
 }
 
-/// <summary>对应 Java org.apache.rocketmq.tools.admin.api.MessageTrack：
-/// 一条消息在某消费组的投递判定。</summary>
 public sealed class MessageTrack
 {
     public string ConsumerGroup { get; set; } = string.Empty;
@@ -54,10 +34,6 @@ public sealed class MessageTrack
            + ", exceptionDesc=" + ExceptionDesc + "]";
 }
 
-/// <summary>
-/// 对应 org.apache.rocketmq.remoting.protocol.subscription.GroupForbidden：
-/// UPDATE_AND_GET_GROUP_FORBIDDEN(353) 的响应体（topic/group/readable 三字段）。
-/// </summary>
 public sealed class GroupForbidden
 {
     public string Topic { get; set; } = string.Empty;
@@ -76,10 +52,6 @@ public sealed class GroupForbidden
     }
 }
 
-/// <summary>
-/// 对应 C++ DefaultMQAdminExt（org.apache.rocketmq.client.admin.DefaultMQAdminExt）。
-/// 管理端对外操作的统一入口：内部持有 <see cref="MQClientInstance"/> 复用其底层调用。
-/// </summary>
 public sealed class DefaultMQAdminExt
 {
     // 对应 DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3
@@ -101,7 +73,6 @@ public sealed class DefaultMQAdminExt
 
     // ---------------------------------------------------------------- 配置与生命周期
 
-    /// <summary>分号分隔的 namesrv 地址列表（对应 Java / C++ 的 setNamesrvAddr）。</summary>
     public void SetNamesrvAddr(string addr)
     {
         _nameServerAddrs.Clear();
@@ -144,10 +115,6 @@ public sealed class DefaultMQAdminExt
 
     public List<string> GetNameServerAddressList() => new List<string>(_nameServerAddrs);
 
-    // ---------------- unitName / enableStreamRequestType ----------------
-    // 对应 Java ClientConfig 的同名开关（admin 只用到 unitName：clientId 与动态取址 URL；
-    // Java 的 DefaultMQAdminExt 从不置 unitMode / stream，默认全关）。
-    /// <summary>单元名：进 clientId 的 <c>@&lt;unitName&gt;</c> 段，也拼进动态取址 URL。</summary>
     public string UnitName
     {
         get => _unitName;
@@ -161,9 +128,6 @@ public sealed class DefaultMQAdminExt
         set => _enableStreamRequestType = value;
     }
 
-    /// <summary>对应 Java <c>ClientConfig#namespaceV2</c>（5.x 新命名空间）：非空时由
-    /// <see cref="NamespaceRpcHook"/>（钩子链首）给每笔请求加 <c>nsd=true</c> / <c>ns</c>
-    /// 扩展头。钩子每笔请求现读本属性（Java 同款），Start() 之后设置也从下一笔请求起生效。</summary>
     public string NamespaceV2
     {
         get => _namespaceV2;
@@ -172,29 +136,18 @@ public sealed class DefaultMQAdminExt
 
     private string _namespaceV2 = string.Empty;
 
-    /// <summary>
-    /// Java <c>ClientConfig#vipChannelEnabled</c>（5.x 默认 false）：true 时 broker 请求
-    /// 改走 VIP 端口（端口 - 2，MixAll.BrokerVipChannel）。只对本 admin 的 broker 调用
-    /// 生效——admin 不发消息、不注册消费者，普通收发路径的同一开关本项目四端均未接线。
-    /// </summary>
     public bool VipChannelEnabled
     {
         get => _vipChannelEnabled;
         set => _vipChannelEnabled = value;
     }
 
-    /// <summary>
-    /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
-    /// 路由刷新周期，Start() 时透传给 MQClientInstance（之后改不重排已启动的周期任务）。
-    /// </summary>
     public int PollNameServerIntervalMillis
     {
         get => _pollNameServerIntervalMillis;
         set => _pollNameServerIntervalMillis = value;
     }
 
-    // ---------------- ACL 鉴权（对应 Java DefaultMQAdminExt(rpcHook)）----------------
-    // 必须在 Start() 之前调用。
     public void SetRpcHook(IRpcHook hook) => _rpcHook = hook;
 
     /// <summary>便捷入口：用 accessKey/secretKey（可选 securityToken）构造 AclClientRPCHook。</summary>
@@ -206,14 +159,12 @@ public sealed class DefaultMQAdminExt
     private string _unitName = string.Empty;
     private bool _enableStreamRequestType;
     private bool _vipChannelEnabled;
-    // Java ClientConfig#pollNameServerInterval 的默认值（:58）
     private int _pollNameServerIntervalMillis = 30000;
 
     public void SetTimeoutMillis(int millis) => _timeoutMillis = millis;
 
     public int GetTimeoutMillis() => _timeoutMillis;
 
-    /// <summary>删除 topic 时一并清理的 KV namespace（对应 Java kvNamespaceToDeleteList）。</summary>
     public void AddKvNamespaceToDeleteList(string ns) => _kvNamespaceToDeleteList.Add(ns);
 
     public void Start()
@@ -224,22 +175,13 @@ public sealed class DefaultMQAdminExt
             throw new MQClientException("name server address is not set");
         }
 
-        // Java `DefaultMQAdminExtImpl#start`:161 无条件 `changeInstanceNameToPID`，
-        // clientId 再走 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
-        // 本端口的 admin 默认 instanceName 是 "ADMIN"（不是 Java 的 "DEFAULT"，因为 admin
-        // 用私有实例、不和其他客户端共用），所以这一步只在调用方显式设成 "DEFAULT" 时才起作用。
         _instanceName = ClientIds.ChangeInstanceNameToPID(_instanceName);
         if (string.IsNullOrEmpty(_clientId))
         {
             _clientId = ClientIds.Build(_instanceName, _unitName, _enableStreamRequestType);
         }
 
-        // 请求钩子（ACL 签名 / stream 的 ReqT）：绑定在 Start() **之前**（Java 的 rpcHook
-        // 随 MQClientAPIImpl 构造传入，实例第一笔报文就带着它）。
-        // admin 在 Java 里既不置 unitMode 也不置 stream，默认全关。
         IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
-        // 跨门面复用（Java DefaultMQAdminExtImpl 也走 getOrCreateMQClientInstance）：同
-        // clientId 命中即复用已有实例，只有第一个到达者的实例级参数生效；Start 是幂等的。
         _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
             () => new MQClientInstance(_clientId, _nameServerAddrs, unitName: _unitName,
                 pollNameServerIntervalMillis: _pollNameServerIntervalMillis));
@@ -267,8 +209,6 @@ public sealed class DefaultMQAdminExt
     {
         if (!_started) return;
         _started = false;
-        // 归还引用（Java MQAdminExt 注销后那句 mQClientFactory.shutdown() 的等价物）：
-        // 计数归零才真正关停实例。
         if (_mqClient is not null)
         {
             MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
@@ -309,9 +249,6 @@ public sealed class DefaultMQAdminExt
 
     private static string FindFirstBrokerAddr(MQClientInstance client) => FirstBrokerAddr(client);
 
-    /// <summary>Java MQAdminImpl 的 offset 查询口径（:195/214/232/250）：只认 master，
-    /// 拿不到照 :210 抛「The broker[X] not exist」—— 从节点上的 store 是 HA 复制来的同一份
-    /// 数据，但管理类 API 一律打主，本端不「顺手」退到从节点。</summary>
     private static string PublishAddrForMq(MQClientInstance client, MessageQueue mq) =>
         client.PublishAddrFor(mq.BrokerName, mq.Topic);
 
@@ -324,7 +261,6 @@ public sealed class DefaultMQAdminExt
         return addrs;
     }
 
-    /// <summary>把 int 写进 extFields（Java 侧 extFields 全是字符串）。</summary>
     private static string I64Str(long v) => v.ToString(CultureInfo.InvariantCulture);
 
     /// <summary>取响应 extFields 中的整数（缺失/空/非法返回 fallback）。</summary>
@@ -349,7 +285,6 @@ public sealed class DefaultMQAdminExt
     // 直接走 createTopicInRoute（默认 TopicConfig defaultTopic=TBW102，perm=READ|WRITE）。
     public void CreateTopic(string key, string newTopic, int queueNum = 4, int topicSysFlag = 0)
     {
-        // 对应 Java DefaultMQProducerImpl.createTopic 的本地校验：非法/系统 topic 名不该打到 broker
         Validators.CheckTopic(newTopic);
         Validators.IsSystemTopic(newTopic);
         RequireClient().CreateTopicInRoute(newTopic, queueNum, queueNum, MixAll.ReadPermByDefault);
@@ -540,7 +475,6 @@ public sealed class DefaultMQAdminExt
         bool specialTopic = false, int timeoutMillis = -1)
     {
         TopicConfigSerializeWrapper wrapper = GetAllTopicConfig(brokerAddr, timeoutMillis);
-        // 对应 Java getUserTopicConfig：剔除系统 topic 与 %RETRY%/%DLQ%
         TopicList sysTopics = GetSystemTopicListFromBroker(brokerAddr, timeoutMillis);
         var sysSet = new HashSet<string>(sysTopics.Topics);
 
@@ -638,7 +572,6 @@ public sealed class DefaultMQAdminExt
 
     public void UpdateBrokerConfig(string brokerAddr, PropertyMap properties, int timeoutMillis = -1)
     {
-        // 对应 Java Validators.checkBrokerConfig 的 brokerPermission 校验
         if (properties.TryGetValue("brokerPermission", out string? permStr))
         {
             int perm = -1;
@@ -706,7 +639,6 @@ public sealed class DefaultMQAdminExt
 
     // ---------------------------------------------------------------- NameServer KV
 
-    /// <summary>Java putKVConfigValue：广播到**每一个** NameServer。</summary>
     public void CreateAndUpdateKvConfig(string ns, string key, string value)
     {
         MQClientInstance client = RequireClient();
@@ -848,10 +780,6 @@ public sealed class DefaultMQAdminExt
         return true;
     }
 
-    /// <summary>
-    /// 对应 Java getAllSubscriptionGroup：**分页**累积，直到 groupSeq >= totalGroupNum-1。
-    /// 老版本 broker 不带 totalGroupNum，此时一次性返回全部（单轮即结束）。
-    /// </summary>
     public SubscriptionGroupWrapper GetAllSubscriptionGroup(string brokerAddr, int timeoutMillis = -1)
     {
         MQClientInstance client = RequireClient();
@@ -1076,13 +1004,7 @@ public sealed class DefaultMQAdminExt
         return groups;
     }
 
-    // ---------------- 消息轨迹（Java DefaultMQAdminExtImpl.messageTrackDetail） ----------------
 
-    /// <summary>
-    /// 对应 Java <c>examineConsumeStats(group[, topic])</c>（:389-424）：按
-    /// <c>%RETRY%&lt;group&gt;</c> 的路由扇出全部 broker，逐台取统计并合并
-    /// （offsetTable 并入、consumeTps 累加）；全空时抛错（Java 的 MQClientException 同口径）。
-    /// </summary>
     public ConsumeStats ExamineConsumeStatsGroup(string consumerGroup, string topic = "")
     {
         TopicRouteData route = ExamineTopicRoute(MixAll.GetRetryTopic(consumerGroup));
@@ -1105,10 +1027,6 @@ public sealed class DefaultMQAdminExt
         return merged;
     }
 
-    /// <summary>
-    /// 对应 Java <c>DefaultMQAdminExtImpl.consumed:1533-1557</c>：该组在本队列的
-    /// consumerOffset 是否已越过这条消息的 queueOffset（位点越过 ⇒ 已消费）。
-    /// </summary>
     public bool Consumed(MessageExt msg, string group)
     {
         ConsumeStats cstats = ExamineConsumeStatsGroup(group);
@@ -1122,8 +1040,6 @@ public sealed class DefaultMQAdminExt
             {
                 if (bd.BrokerAddrs.TryGetValue(MixAll.MasterId, out string? addr))
                 {
-                    // Java 先把 master 地址规范化成 ip:port 再比对（convert2IpString）；
-                    // 四端存的 broker 地址本来就是注册时的 ip:port 形态，直接比。
                     if (addr == storeHost && kv.Value.ConsumerOffset > msg.QueueOffset)
                     {
                         return true;
@@ -1135,10 +1051,6 @@ public sealed class DefaultMQAdminExt
         return false;
     }
 
-    /// <summary>
-    /// 对应 Java <c>DefaultMQAdminExtImpl.messageTrackDetail:1349-1427</c>：查谁在消费
-    /// 这个 topic，逐组判 CONSUMED / FILTERED / PULL / NOT_ONLINE / BROADCASTING…。
-    /// </summary>
     public List<MessageTrack> MessageTrackDetail(MessageExt msg)
     {
         var result = new List<MessageTrack>();
@@ -1159,7 +1071,6 @@ public sealed class DefaultMQAdminExt
         HashSet<string> groups = QueryTopicConsumeByWho(brokerAddr, msg.Topic);
         foreach (string group in groups.OrderBy(g => g, StringComparer.Ordinal))
         {
-            // Java 按 broker 返回顺序遍历；这里排序让输出确定
             var mt = new MessageTrack { ConsumerGroup = group };
             ConsumerConnection cc;
             try
@@ -1235,9 +1146,6 @@ public sealed class DefaultMQAdminExt
                     if (ifConsumed)
                     {
                         mt.TrackType = TrackType.Consumed;
-                        // Java 遍历订阅表找本 topic：tagsSet 非空、既不含消息 tag 也不含
-                        // "*" ⇒ 订阅比消息窄，消息是被过滤掉的那部分（SQL92 订阅 tagsSet
-                        // 为空，同样落回 Consumed —— 忠实保留 Java 语义）。
                         JsonValue? sub = cc.SubscriptionTable.Find(msg.Topic);
                         if (sub is not null)
                         {
@@ -1272,12 +1180,6 @@ public sealed class DefaultMQAdminExt
         return result;
     }
 
-    /// <summary>
-    /// 对应 Java MQClientAPIImpl#queryTopicsByConsumer:2525（343）的单 broker 原始调用。
-    /// broker 端走 AdminBrokerProcessor#queryTopicsByConsumer:2421 →
-    /// ConsumerOffsetManager#whichTopicByConsumer：**从位点表**（topic@group 键）反查该组
-    /// 消费过哪些 topic，所以组从没提交过位点时回空表，这是预期而不是 bug。
-    /// </summary>
     public TopicList QueryTopicsByConsumerToBroker(string brokerAddr, string group)
     {
         PropertyMap ext = new() { ["group"] = group };
@@ -1287,11 +1189,6 @@ public sealed class DefaultMQAdminExt
         return tl;
     }
 
-    /// <summary>
-    /// 对应 Java DefaultMQAdminExt#queryTopicsByConsumer（DefaultMQAdminExtImpl:1078）：
-    /// 先按 %RETRY%&lt;group&gt; 查路由，再对路由里每个 broker 下发 343 并合并
-    /// （Java 的 TopicList.topicList 是 Set&lt;string&gt;，所以这里同样去重）。
-    /// </summary>
     public TopicList QueryTopicsByConsumer(string group)
     {
         TopicRouteData route = ExamineTopicRoute(MixAll.GetRetryTopic(group));
@@ -1352,18 +1249,12 @@ public sealed class DefaultMQAdminExt
 
     public long MinOffset(MessageQueue mq) => RequireClient().GetMinOffset(mq);
 
-    /// <summary>对应 Java MQAdminImpl:189：显式下发 LOWER 边界。</summary>
     public long SearchOffset(MessageQueue mq, long timestamp) =>
         SearchLowerBoundaryOffset(mq, timestamp);
 
-    /// <summary>对应 Java DefaultMQAdminExt:133。</summary>
     public long SearchLowerBoundaryOffset(MessageQueue mq, long timestamp) =>
         RequireClient().SearchOffsetByBoundary(mq, timestamp, BoundaryType.Lower);
 
-    /// <summary>
-    /// 对应 Java DefaultMQAdminExt:137。时间戳落在队尾之后时 UPPER 给最后一条自身的位点，
-    /// LOWER 给它的下一个位点（maxOffset）。
-    /// </summary>
     public long SearchUpperBoundaryOffset(MessageQueue mq, long timestamp) =>
         RequireClient().SearchOffsetByBoundary(mq, timestamp, BoundaryType.Upper);
 
@@ -1392,20 +1283,8 @@ public sealed class DefaultMQAdminExt
         MessageQueue mq, long offset) =>
         RequireClient().UpdateConsumerOffset(consumerGroup, mq, offset, 5000, brokerAddr);
 
-    /// <summary>
-    /// 对应 Java resetOffsetByTimestamp：逐 broker 下发 INVOKE_BROKER_TO_RESET_OFFSET
-    /// （broker 端按 timestamp 计算新位点，并同步在线消费者 + 更新 offset 表）。
-    ///
     /// 注意：这里**不再**走"逐队列 searchOffset + updateConsumerOffset"的旧本地实现——
     /// 那不会同步在线消费者，也不会做 broker 端一致性校验。
-    ///
-    /// <paramref name="isCpp"/> 只影响 broker 推给<b>在线消费者</b>的 220 报文形状：
-    /// <c>AdminBrokerProcessor.resetOffset:2263</c> 按<b>发起方</b>（也就是本请求）的
-    /// language 判 <c>isC</c>（仅 CPP 置真），CPP 回 <c>ResetOffsetBodyForC</c>（JSON 数组），
-    /// 其余回 <c>ResetOffsetBody</c>（对象即键的 map）。Java 管理端两个重载传的都是 false
-    /// （<c>MQClientAPIImpl:2405/2408</c>），本端口同样默认 false。222 的<b>响应</b>体恒为
-    /// map 形状（<c>Broker2Client:232</c>），与 isC 无关。
-    /// </summary>
     public SortedDictionary<MessageQueue, long> ResetOffsetByTimestamp(string topic, string group,
         long timestamp, bool isForce = true, string clusterName = "", bool isCpp = false)
     {
@@ -1424,7 +1303,6 @@ public sealed class DefaultMQAdminExt
         {
             string addr = bd.SelectBrokerAddr();
             if (addr.Length == 0) continue;
-            // queueId/offset 都传 -1：Java 的"按 timestamp 重置整个 topic"那个重载
             foreach (var kv in InvokeBrokerToResetOffset(addr, topic, group, timestamp, isForce,
                          isCpp, -1, -1))
             {
@@ -1442,12 +1320,6 @@ public sealed class DefaultMQAdminExt
 
     /// <summary>
     /// 一笔 INVOKE_BROKER_TO_RESET_OFFSET(222)，回 broker 实际重置的队列表。
-    ///
-    /// Java 在这里有**两个**重载：不带 queueId 的按 timestamp 重置整个 topic，带
-    /// queueId + offset 的只重置单个队列（MQClientAPIImpl#invokeBrokerToResetOffset）。
-    /// 这里用哨兵值表达"字段为空"：queueId &lt; 0 即 Java 的默认 -1，offset &lt; 0 即
-    /// Java 的"offset=-1 表示 offset 为 null"。
-    /// </summary>
     private SortedDictionary<MessageQueue, long> InvokeBrokerToResetOffset(string brokerAddr,
         string topic, string group, long timestamp, bool isForce, bool isCpp, int queueId,
         long offset)
@@ -1458,15 +1330,7 @@ public sealed class DefaultMQAdminExt
             ["topic"] = topic,
             ["group"] = group,
             ["timestamp"] = I64Str(timestamp),
-            // 键名是 **isForce** 不是 force：Java `RemotingCommand.makeCustomHeaderToNet:437-450`
-            // 拿 requestHeader 的**字段名**做 ext key，而 `ResetOffsetRequestHeader` 声明的字段是
-            // `private boolean isForce`（getter `isForce()` 不参与命名）。写成 force 时 broker 侧
-            // isForce 恒为 false ⇒ `Broker2Client.resetOffset:152-158` 的分支退化成「取时间戳位点」，
-            // 前重（timestamp=-1）会把 consumerOffset 原样回显而不是跳到 maxOffset。
-            // 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
-            //               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
             ["isForce"] = isForce ? "true" : "false",
-            // Java：offset=-1 表示 offset 为空
             ["offset"] = I64Str(offset),
         };
         if (queueId >= 0) ext["queueId"] = I64Str(queueId);
@@ -1489,37 +1353,15 @@ public sealed class DefaultMQAdminExt
         return offsets;
     }
 
-    /// <summary>
-    /// 对应 Java DefaultMQAdminExt#resetOffsetByQueueId（DefaultMQAdminExtImpl:1827）：
-    /// **两笔** RPC，缺一不可。
-    /// 1. UpdateConsumerOffset(25) 直接把 offsetTable 改成目标位点；
-    /// 2. 带 queueId + offset 的 222 走 AdminBrokerProcessor#resetOffsetInner，先按
-    ///    [min, max+1] 校验目标位点（越界回 SYSTEM_ERROR
-    ///    "Target offset N not in consume queue range [min-max]"），再
-    ///    ConsumerOffsetManager#assignResetOffset——它同时写 resetOffsetTable（一次性，
-    ///    下次 pull 用 queryThenEraseResetOffset 取走）和 offsetTable，并清掉该队列的 POP
-    ///    在途计数。只做第 1 步的话在线消费者仍按自己内存里的位点继续拉。
-    ///
-    /// Java 返回 void（只打日志），这里把 broker 报回的队列表返回，便于调用方核对。
-    ///
-    /// 注意实测（5.5.1 真机）这两笔 RPC **不是原子的**：ConsumerOffsetManager#commitOffset
-    /// 只做覆盖写（offset 变小也只打 [NOTIFYME] warn，不做区间校验），所以第 2 笔被
-    /// resetOffsetInner 以 "Target offset N not in consume queue range" 拒绝时，第 1 笔
-    /// 已经把非法位点落库。Java 同样如此，这里不做保护性回滚。
-    /// </summary>
     public SortedDictionary<MessageQueue, long> ResetOffsetByQueueId(string brokerAddr,
         string consumerGroup, string topic, int queueId, long resetOffset)
     {
         UpdateConsumerOffsetToBroker(brokerAddr, consumerGroup,
             new MessageQueue(topic, string.Empty, queueId), resetOffset);
-        // Java 的单队列重载不传 force（默认 false）、timestamp 传 0（位点已给定，不参与算）
         return InvokeBrokerToResetOffset(brokerAddr, topic, consumerGroup, 0, false, false,
             queueId, resetOffset);
     }
 
-    /// <summary>
-    /// 对应 Java resetOffsetNew：先试新版（broker 端重置），消费者不在线再退化到旧版。
-    /// </summary>
     public void ResetOffsetNew(string consumerGroup, string topic, long timestamp)
     {
         try
@@ -1538,9 +1380,6 @@ public sealed class DefaultMQAdminExt
         }
     }
 
-    /// <summary>
-    /// 对应 Java resetOffsetByTimestampOld：逐队列 searchOffset 后按 force 决策写回。
-    /// </summary>
     public SortedDictionary<MessageQueue, long> ResetOffsetByTimestampOld(string consumerGroup,
         string topic, long timestamp, bool force = true)
     {
@@ -1600,9 +1439,6 @@ public sealed class DefaultMQAdminExt
     /// </summary>
     public bool QueryMessageByUniqKey(string topic, string uniqKey, out MessageExt outMsg)
     {
-        // 对应 Java queryMessageByUniqKey：indexType="U" + extFields["_UNIQUE_KEY_QUERY"]="true"。
-        // 注意：broker 侧 uniqKey 倒排索引只有 RocksDB 索引实现（IndexRocksDBStore）支持；
-        // 默认文件索引下该查询会返回空，属 broker 配置差异而非客户端问题。
         long now = UtilAll.CurrentTimeMillis();
         List<MessageExt> msgs = RequireClient().QueryMessageAllBrokers(
             topic, uniqKey, 32, 0, now + 3600L * 1000, MessageConst.IndexUniqueType, true);
@@ -1623,11 +1459,6 @@ public sealed class DefaultMQAdminExt
             topic, key, maxNum, 0, now + 3600L * 1000, MessageConst.IndexKeyType, false);
     }
 
-    /// <summary>
-    /// 对应 Java DefaultMQAdminExtImpl.viewMessage：先按 offset msgId 直查 commitLog，
-    /// 解不出或查不到就退回 uniqKey（5.x 客户端返回的 msgId 本身就是 uniqKey，
-    /// 硬解只会得到越界的垃圾端口）。
-    /// </summary>
     public MessageExt ViewMessage(string topic, string msgId)
     {
         Exception? byIdError;
@@ -1663,7 +1494,6 @@ public sealed class DefaultMQAdminExt
         }
         catch (Exception e)
         {
-            // Java 同样只 warn，然后走 uniqKey 兜底
             byIdError = e;
         }
 
@@ -1677,22 +1507,10 @@ public sealed class DefaultMQAdminExt
             + " of " + topic, byIdError, ResponseCode.NoMessage);
     }
 
-    /// <summary>
-    /// 对应 Java DefaultMQAdminExtImpl#consumeMessageDirectly:1323 →
-    /// CONSUME_MESSAGE_DIRECTLY(309)：先 <see cref="ViewMessage" /> 定位消息，再向
-    /// **存储该消息的 broker**（msg.storeHost）下发"直接消费"探针 —— broker 把消息转发给
-    /// 目标 clientId 的在线消费者，回传其监听器判定（ConsumeMessageDirectlyResult）。
-    /// msgId 解出 uniqKey 时改传 offset msgId（Java MessageClientExt.getOffsetMsgId 同口径；
-    /// broker 侧要用物理位点在 commitLog 找到消息体才能转发）。
-    /// 非 SUCCESS 响应由 <c>InvokeSync</c> 抛 MQBrokerException（Java 的
-    /// MQClientException(code, remark) 同语义）。
-    /// </summary>
     public ConsumeMessageDirectlyResult ConsumeMessageDirectly(string consumerGroup, string clientId,
         string topic, string msgId)
     {
         MessageExt msg = ViewMessage(topic, msgId);
-        // Java：消息带 UNIQ_KEY ⇒ (MessageClientExt).getOffsetMsgId()；nodeJs 端同样加了
-        // offsetMsgId 非空守卫 —— 解码侧没拿到物理 ID 时原样透传，宁可信调用方给的原始 msgId。
         string outMsgId = msgId;
         if (msg.Properties.TryGetValue(MessageConst.PropertyUniqClientMessageIdKeyidx, out string? uniq)
             && !string.IsNullOrEmpty(uniq)
@@ -1740,13 +1558,7 @@ public sealed class DefaultMQAdminExt
         return body;
     }
 
-    // ------------------------------------------------- 批量配置 / 单元化（Java 有实现，此前 C# 缺失）
 
-    /// <summary>
-    /// 对应 Java createAndUpdateTopicConfigList → UPDATE_AND_CREATE_TOPIC_LIST(18)。
-    /// wire 事实：custom header 为**空**（topic 名在 body 里做授权资源），
-    /// body 是 CreateTopicListRequestBody JSON，即 {"topicConfigList":[...]}。
-    /// </summary>
     public void CreateAndUpdateTopicConfigList(string brokerAddr, List<TopicConfig> configs)
     {
         if (configs is not { Count: > 0 })
@@ -1762,11 +1574,6 @@ public sealed class DefaultMQAdminExt
             new PropertyMap(), RemotingSerializable.Encode(body), true, _timeoutMillis);
     }
 
-    /// <summary>
-    /// 对应 Java createAndUpdateSubscriptionGroupConfigList → 225。
-    /// 与 topic-list 同形，但 body 的 key 是 <c>groupConfigList</c>；
-    /// 单组版（200）的 body 是裸 SubscriptionGroupConfig 对象，两处字段名不同。
-    /// </summary>
     public void CreateAndUpdateSubscriptionGroupConfigList(string brokerAddr,
         List<SubscriptionGroupConfig> configs)
     {
@@ -1785,12 +1592,6 @@ public sealed class DefaultMQAdminExt
             new PropertyMap(), RemotingSerializable.Encode(body), true, _timeoutMillis);
     }
 
-    /// <summary>
-    /// 对应 Java createStaticTopic → UPDATE_AND_CREATE_STATIC_TOPIC(513)。
-    /// header 复用 CreateTopicRequestHeader 字段（topic/defaultTopic/队列数/perm/
-    /// topicFilterType/topicSysFlag/order/force，bool 转 "true"/"false" 小写），
-    /// body 是 TopicQueueMappingDetail 的 JSON 文档（单元化静态 topic 的映射信息）。
-    /// </summary>
     public void CreateStaticTopic(string brokerAddr, string defaultTopic, TopicConfig config,
         JsonValue mappingDetail, bool force = false)
     {
@@ -1812,10 +1613,6 @@ public sealed class DefaultMQAdminExt
             ext, RemotingSerializable.Encode(mappingDetail), true, _timeoutMillis);
     }
 
-    /// <summary>
-    /// 对应 Java updateAndGetGroupReadForbidden → UPDATE_AND_GET_GROUP_FORBIDDEN(353)。
-    /// readable=null 表示仅查询（Java 不设该字段）；返回 broker 解码出的 GroupForbidden。
-    /// </summary>
     public GroupForbidden UpdateAndGetGroupReadForbidden(string brokerAddr, string group,
         string topic, bool? readable = null)
     {
@@ -1841,12 +1638,6 @@ public sealed class DefaultMQAdminExt
         return outValue;
     }
 
-    /// <summary>
-    /// 对应 Java resumeCheckHalfMessage → RESUME_CHECK_HALF_MESSAGE(323)。
-    /// Java（MQClientAPIImpl:3279）对非 SUCCESS **返回 false 而不抛错**——网络层异常才上抛；
-    /// broker 拒绝（如 msgId 不是半消息，表现为 SYSTEM_ERROR）通过返回值表达。
-    /// InvokeSync 会把非 SUCCESS 转成异常，所以这里用 InvokeSyncRaw 拿原始响应自己判断。
-    /// </summary>
     public bool ResumeCheckHalfMessage(string brokerAddr, string topic, string msgId = "")
     {
         if (topic.Length == 0)
@@ -1861,12 +1652,6 @@ public sealed class DefaultMQAdminExt
         return response.Code == ResponseCode.Success;
     }
 
-    /// <summary>
-    /// 对应 Java createOrUpdateOrderConf：**不是独立请求**，是 NameServer KV
-    /// namespace=ORDER_TOPIC_CONFIG 上的读改写。
-    /// 集群模式把 value 原样写入；非集群模式把存储值当作 ";" 分隔的 "topic:conf" 列表，
-    /// 替换 key 匹配的条目后整体写回（一次只动单个 topic，不动整个集群）。
-    /// </summary>
     public void CreateOrUpdateOrderConf(string key, string value, bool isCluster = false)
     {
         if (key.Length == 0 || value.Length == 0)
@@ -1887,11 +1672,9 @@ public sealed class DefaultMQAdminExt
         }
         catch (Exception)
         {
-            // Java 打印后按空表继续：key 缺失是首写的常态，不是失败。
             oldValue = string.Empty;
         }
 
-        // 条目 key -> 完整 "key:value" 文本（Java HashMap 语义：重复 key 后写胜出）
         var entries = new Dictionary<string, string>();
         foreach (string raw in oldValue.Split(';'))
         {
@@ -1913,7 +1696,6 @@ public sealed class DefaultMQAdminExt
         PutKvConfig(MixAll.NamespaceOrderTopicConfig, key, string.Join(";", entries.Values));
     }
 
-    // ------------------------------------------------- 运维清理（Java 有实现，此前 C# 缺失）
 
     /// <summary>CLEAN_EXPIRED_CONSUMEQUEUE(306)：broker 丢弃 <c>timeHours</c> 小时前的
     /// consume-queue 条目。</summary>
@@ -1924,8 +1706,6 @@ public sealed class DefaultMQAdminExt
             ext, null, false, _timeoutMillis);
     }
 
-    /// <summary>Java 的 ByAddr 形态：逐个地址执行，返回**失败的地址**列表（不 fail-fast，
-    /// 一台 broker 挂了不掩盖其他台的结果）。</summary>
     public List<string> CleanExpiredConsumerQueueByAddr(List<string> addrs, int timeHours)
     {
         var failed = new List<string>();
@@ -1972,21 +1752,12 @@ public sealed class DefaultMQAdminExt
         return failed;
     }
 
-    /// <summary>
-    /// 对应 Java cleanUnusedTopicByAddr → MQClientAPIImpl:2696：**单请求**
-    /// CLEAN_UNUSED_TOPIC(316)，由 broker 自行清理未使用 topic。客户端绝不遍历 topic 表
-    /// 逐个删——broker 自建的 BenchmarkTest、重试/死信 topic 会被 broker 以 SYSTEM_ERROR 拒绝。
-    /// </summary>
     public void CleanUnusedTopicByAddr(string brokerAddr)
     {
         RequireClient().InvokeSync(AddrForRpc(brokerAddr), RequestCode.CleanUnusedTopic,
             new PropertyMap(), null, false, _timeoutMillis);
     }
 
-    /// <summary>
-    /// 对应 Java queryConsumeTimeSpan：按 topic 路由扇出到每个 master，聚合响应 body 里
-    /// consumeTimeSpanSet JSON 数组（返回聚合后的数组）。
-    /// </summary>
     public JsonValue QueryConsumeTimeSpan(string topic, string group)
     {
         TopicRouteData route = ExamineTopicRoute(topic);
@@ -2010,13 +1781,8 @@ public sealed class DefaultMQAdminExt
         return spans;
     }
 
-    /// <summary>
-    /// Java 有 GetClusterList / GetTopicClusterList 两个名字、同一实现（Go 同口径做别名）。
-    /// </summary>
     public HashSet<string> GetTopicClusterList(string topic) => GetClusterList(topic);
 
-    /// <summary>对应 Java setMessageRequestMode → SET_MESSAGE_REQUEST_MODE(401)：
-    /// 在 POP 与 Pull 模式间切换消费组（单元化场景）。popShareQueueNum 仅在 &gt;0 时带。</summary>
     public void SetMessageRequestMode(string brokerAddr, string topic, string consumerGroup,
         string mode, int popShareQueueNum = 0)
     {
@@ -2031,13 +1797,7 @@ public sealed class DefaultMQAdminExt
             ext, null, false, _timeoutMillis);
     }
 
-    // ------------------------------------------------- NameServer 配置（318/319，Java 有实现，此前 C# 缺失）
 
-    /// <summary>
-    /// 对应 Java updateNameServerConfig → UPDATE_NAMESRV_CONFIG(318)：
-    /// properties 以 **k=v\n 文本**进 body，广播到每个 NameServer，
-    /// 任一失败即抛（Java 记 errResponse 最后统一抛）。
-    /// </summary>
     public void UpdateNameServerConfig(PropertyMap properties, int timeoutMillis = -1)
     {
         string text = MixAll.Properties2String(properties ?? new PropertyMap());
@@ -2067,10 +1827,6 @@ public sealed class DefaultMQAdminExt
         }
     }
 
-    /// <summary>
-    /// 对应 Java getNameServerConfig → GET_NAMESRV_CONFIG(319)：逐个 NameServer 查询
-    /// （默认全部），body 是 properties 文本；返回 {地址: properties 字典}。
-    /// </summary>
     public Dictionary<string, PropertyMap> GetNameServerConfig(List<string>? namesrvAddrs = null,
         int timeoutMillis = -1)
     {

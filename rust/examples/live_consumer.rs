@@ -5,54 +5,6 @@
 //! 失败重投与 `%RETRY%` 主题还原、POP + ack、广播位点落盘、顺序消费的 broker 锁、
 //! 多实例分摊与撤位、位点持久化到 broker、以及运维接口读到的运行时状态。
 //!
-//! 场景：
-//! - C1 构造与 `start()` 校验：空白组名、三道启动校验（名字服务/订阅/listener）、
-//!   幂等 start、启动后禁改订阅、`shutdown()` 幂等；并核对首轮**同步**心跳与
-//!   首轮重平衡在 `start()` 返回前就已完成。
-//! - C2 长轮询全量消费：24 条不重不丢、字段齐全，位点推进并**刷到 broker**
-//!   （`QUERY_CONSUMER_OFFSET` 读回来求和 == 24），runningInfo 与之一致。
-//! - C3 tag 过滤：broker 侧确实存了 20 条（`GET_MAX_OFFSET` 求和），
-//!   客户端只投递 10 条 TagA。
-//! - C4 消费失败重投：`RECONSUME_LATER` 后同一条 body 再次到达，`reconsumeTimes`
-//!   递增，且 listener 看到的 topic 已被还原成原始 topic（不是 `%RETRY%<group>`）
-//!   —— 这条只有真 broker 能验。
-//! - C4b 死信终态：`maxReconsumeTimes=2` ⇒ 恰好投递 3 次（0/1/2），第 3 次回投后
-//!   broker 把消息改投 `%DLQ%<group>`（自动建 topic 并注册路由），死信里
-//!   `reconsumeTimes=3`、`RETRY_TOPIC` 保留业务 topic，原组不再有第 4 次投递。
-//! - C4c 部分 ack：listener 在首批（`consumeMessageBatchMaxSize=3`）上设
-//!   `context.ack_index = 0` ⇒ 只有第一条被认可，后两条经 `%RETRY%` 二次到达
-//!   （`reconsumeTimes>=1`、listener 看到的仍是业务 topic），被 ack 的那条整个窗口
-//!   只投一次，3 条最终一条不丢，业务队列位点仍整批前进到 3；对照腿（不碰
-//!   `ack_index`，Java 默认 `Integer.MAX_VALUE`）一条都不回投。
-//! - C5 POP 模式：弹出即带 `POP_CK`，消费成功后 `waitAckCounter` 归零，
-//!   等过一个 invisibleTime 窗口**不再重投**（证明 ack 真的写到了 broker）；
-//!   且 POP 路径完全不写消费位点。
-//! - C5b POP 循环的拉取统计：持续 26s 有流量后，用**独立 admin 实例**走真实 307
-//!   （admin → broker → 目标客户端）读回 `statusTable`，`pullRT`/`pullTPS` 必须非 0
-//!   —— 漏记是静默故障：消息照弹照 ack、消费完全正常，只有运维看板一片 0。
-//! - C6 广播模式：同组两个实例各拿到全量（不分摊）；位点**不落 broker**，
-//!   而是按 `$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json` 落盘并可解回。
-//! - C7 顺序消费：`LOCK_BATCH_MQ` 被 5.5.1 接受（runningInfo 的 `locked`），
-//!   同队列内 `queueOffset` 严格递增投递。
-//! - C8 多实例：同组两实例队列**不重不漏**；撤掉一个后另一个在 40 通知/定时
-//!   重平衡下接管全部队列并继续消费，全量消息一条不丢。
-//! - C9 运维接口与背压：流控只暂停拉取不丢消息、核心线程数守卫、积压统计、
-//!   手工心跳/重平衡/订阅队列查询、经实例注册表调 `persist_consumer_offset()`。
-//! - C11 拉取停摆自愈（Java `ProcessQueue.isPullExpired` / 120s）：1 队列 topic 先消费 3 条，
-//!   把该队列的拉取盖章倒拨 125s（等价于"这条循环已经两分钟没动静"），走**生产** rebalance
-//!   确认它被撤掉重建（同一趟里换新属主、重新盖章），随后再发 3 条照样消费、
-//!   broker 位点从 3 前进到 6 且**不回退**，6 条各只投一次（撤走前持久化了位点）。
-//! - C10 清理：删掉本次建的 topic 与广播位点目录。
-//! - C12 顺序消费毒消息：listener 一直 SUSPEND + `max_reconsume_times=2` ⇒ 本地恰好投 3 次
-//!   （`reconsumeTimes` 0/1/2，每次自己 +1），第 3 次交 broker 后业务队列继续前进，
-//!   消息因 rebalance 锁未过期被 broker 立刻改投 `%DLQ%<group>`（`reconsumeTimes=3`、
-//!   `RETRY_TOPIC` 保留业务 topic）。
-//! - C12b 顺序侧的 `-1` 是**不设上限**（投过 >=18 次、`%DLQ%` 空），不是并发侧的 16。
-//! - C13 顺序消费的显式提交/回滚（Java `ConsumeMessageOrderlyService:244-300`）：关掉
-//!   `autoCommit` 后回 `COMMIT` 就是一批三条一次认可的**批量 ack**（位点直接到 3）；回
-//!   `ROLLBACK` 则把这批退回队首**本地**重投（间隔贴着 200ms 挂起、`reconsumeTimes`
-//!   不动、topic 不变，后面的消息不越位）；开着 `autoCommit` 回 `ROLLBACK` 是非法用法，
-//!   只 warn 并按成功 ack（同一个返回值，开关只有 autoCommit 一位）。
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
 //! ```text
@@ -113,7 +65,6 @@ fn stamp() -> String {
     }
 }
 
-/// 毫秒墙钟：`lastPullAt` / `lastPullTimestamp` 用的就是这个口径（Java `System.currentTimeMillis`）。
 fn now_ms() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_millis() as i64,
@@ -182,7 +133,6 @@ fn ids_changed_count(client_id: &str) -> usize {
         .unwrap_or_default()
 }
 
-/// 分配结果里剔除 `%RETRY%<group>` 那条队列：`start()` 一定把它和业务 topic 一起/// 订阅（Java `copySubscription`），比较「分摊是否不重不漏」时只该看业务队列。
 fn main_queues(keys: &[String]) -> Vec<String> {
     keys.iter()
         .filter(|k| !k.starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX))
@@ -269,9 +219,6 @@ struct LiveListener {
     fail_always: bool,
     /// 每批固定耗时（C9 用来制造待消费积压以触发流控）。
     batch_cost: Duration,
-    /// 顺序 listener 命中该 body 时返回 SUSPEND_CURRENT_QUEUE_A_MOMENT（C12 毒消息）。
-    /// 与 `fail_once` 分开：并发侧的「失败」在顺序侧必须是**挂起**，两者走的
-    /// 是 Java 里两套完全不同的处理分支（回投 broker vs 本地原地重试）。
     suspend_body: Option<String>,
     orderly: Arc<OrderlyState>,
 }
@@ -681,10 +628,6 @@ fn table_sum(table: &BTreeMap<String, JsonValue>, field: &str) -> i64 {
 }
 
 /// 运行信息里业务那一路的拉取时钟距今多少毫秒（没有记录时 `None`，调用方直接判失败）。
-///
-/// 必须排除 `%RETRY%` 那条：Java 的 processQueueTable 按**分配队列**逐条填，自动订阅的重试
-/// 队列也在表里、也在被拉，取 `.max()` 会命中它的心跳，业务队列停摆就被掩盖掉了。
-/// C11 整段锁在单队列上，所以业务条目就是剩下的唯一一条。
 fn pull_clock_age_ms(info: &ConsumerRunningInfo) -> Option<i64> {
     let table = running_table(info);
     let stamp = table
@@ -717,7 +660,6 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
         return ck.abort("C1 create topic", &e);
     }
 
-    // 三道校验按 Java/Python 的顺序逐个命中
     if DefaultTopAddressing::is_configured() {
         ck.skip("C1 missing name server is rejected", "domain addressing is configured in this environment");
     } else {
@@ -810,11 +752,6 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
         again.is_ok() && c.is_started(),
         &format!("{:?}", again.err()),
     );
-    // Java `DefaultMQPushConsumerImpl#subscribe:1265-1275` 只把订阅 put 进表再推一轮心跳，
-    // **没有 already-started 守卫**：活着的消费者必须能接新 topic。这里曾经断言「后置订阅
-    // 必须被拒」（那是四个移植版早期的自造规矩），5d5ebe7 按 Java 拆掉守卫后这条就成了假失败
-    // —— 别再把它改回去。broker 侧「登记真的发生了」由 examples/live_subscribe.rs 的
-    // S1 负对照 / S2 后置订阅（300 查询）负责，这里只锁本地语义：接受 + 进表 + unsubscribe 摘掉。
     let late = fx.topic_name("Late");
     let accepted = c.subscribe(&late, "*").is_ok();
     ck.check(
@@ -828,7 +765,6 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
         !c.subscriptions().iter().any(|s| s.topic == late),
         &format!("{:?}", c.subscriptions()),
     );
-    // 与 Java/Python 的显式 setter 不同：本项目 update_config 是裸写字段（已在模块头记为差异）
     let before = c.config().message_model.clone();
     c.update_config(|x| x.message_model = MessageModel::BROADCASTING.to_string());
     ck.check(
@@ -961,7 +897,6 @@ async fn c2_pull_consume_and_offset_persist(ck: &mut Checker, fx: &Fixture) {
         ),
     );
 
-    // 进程内已消费位点求和 == 24（Java offsetStore.readOffset 的口径）
     let status = c.get_consumer_status(Some(&topic));
     ck.check(
         "C2 consume offsets are tracked per assigned queue and cover all 24",
@@ -981,10 +916,6 @@ async fn c2_pull_consume_and_offset_persist(ck: &mut Checker, fx: &Fixture) {
         &format!("buffered={}", c.buffered_message_count()),
     );
 
-    // 运维接口：runningInfo 的 mqTable 每队列一条，且 commitOffset 与进程内一致。
-    // Java 的 processQueueTable 以「已分配的 MessageQueue」为键，而 `%RETRY%<group>` 那个
-    // 队列同样会被分配并建 ProcessQueue（Java consumerRunningInfo 直接遍历这张表），
-    // 所以这里必须数出 4 把业务队列 + 1 把重试队列；只数业务队列会漏掉自愈/位点视图。
     let info = c.consumer_running_info();
     let table = running_table(&info);
     let business: Vec<String> = main_queues(&table.keys().cloned().collect::<Vec<_>>());
@@ -1223,7 +1154,6 @@ async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
     });
     let control_listener = Arc::new(PartialAckListener {
         inbox: control_inbox.clone(),
-        // 对照腿：完全不碰 ackIndex（Java 默认 Integer.MAX_VALUE = 整批认可）
         ack_index_first_batch: None,
         first_batch: Mutex::new(Vec::new()),
     });
@@ -1286,7 +1216,6 @@ async fn c4c_partial_ack(ck: &mut Checker, fx: &Fixture) {
         inbox.bodies().len() == 3,
         &format!("distinct={}", inbox.bodies().len()),
     );
-    // 尾巴已经交给 broker 重投，业务队列的位点仍要整批前进（Java:266 removeMessage(整批)）
     let committed = fx.wait_committed(&group, &topic, 1, 3).await;
     ck.check(
         "C4c the business queue offset still advances past the whole batch",
@@ -1406,16 +1335,6 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
 
 /// 死信终态：为什么只能真机验。
 ///
-/// 「重试到第几次算用尽」这件事**两端各写一半**：客户端只负责把 `maxReconsumeTimes`
-/// 塞进 `CONSUMER_SEND_MSG_BACK` 的请求头（Java `DefaultMQPushConsumerImpl`
-/// `#sendMessageBack:773`，`-1` 时按 16 传，见 `#getMaxReconsumeTimes:890`），
-/// 而**判定和改投 `%DLQ%<group>` 全在 broker**
-/// （`AbstractSendMessageProcessor#consumerSendMsgBack:183`：
-/// `msgExt.getReconsumeTimes() >= maxReconsumeTimes || delayLevel < 0`，注意是 `>=`
-/// 而不是 `>`；转死信时 topic 换成 `MixAll.getDLQTopic(group)`、队列数取
-/// `DLQ_NUMS_PER_GROUP`（5.5.1 = 1）并顺手建 topic，`#226` 又给 reconsumeTimes +1）。
-/// 于是两种写反都会「看起来正常」：客户端漏传 header ⇒ broker 用订阅组默认值（16 次），
-/// 测试等到天荒地老；把 `>=` 写成 `>` ⇒ 多投一次才进死信。离线单测锁不住任何一个。
 ///
 /// 这里用 `maxReconsumeTimes=2` 把终态压到几十秒内，逐条钉住：
 /// 投递恰为 3 次（reconsumeTimes 0/1/2）、第 3 次回投后原组不再有第 4 次、
@@ -1527,7 +1446,6 @@ async fn c5_pop_mode(ck: &mut Checker, fx: &Fixture) {
     };
     c.update_config(|x| {
         x.pop_mode = true;
-        // Java 钳制区间 [5s, 300s] 的下界：复活观察窗口够短
         x.pop_invisible_time = 5_000;
         x.pop_batch_nums = 32;
     });
@@ -1569,8 +1487,6 @@ async fn c5_pop_mode(ck: &mut Checker, fx: &Fixture) {
     );
     let info = c.consumer_running_info();
     let pop_table = table_of(&info.mq_pop_table);
-    // pop 模式下每个分配队列（含 `%RETRY%<group>`）都有 PopProcessQueue，
-    // 与 Java `rebalanceByTopic` 给 processQueueTablePop 建队列的口径一致。
     let want: BTreeSet<String> = c.assigned_queue_keys().into_iter().collect();
     let reported: BTreeSet<String> = pop_table.keys().cloned().collect();
     ck.check(
@@ -1592,11 +1508,6 @@ async fn c5_pop_mode(ck: &mut Checker, fx: &Fixture) {
 
 // ------------------------------------------- C5b POP 路径的拉取统计（307 statusTable）
 
-/// Java `popMessage` 的 `PopCallback.onSuccess:556-563`：POP 循环和 pull 循环一样要把
-/// `incPullRT` / `incPullTPS` 记进状态表，307 应答的 `statusTable` 全靠这两格。漏记是
-/// **静默**故障 —— 消息照弹照 ack、消费完全正常，只有运维看板上一片 0，而看板上
-/// "这个消费者没在拉取"和"这个消费者压根没起来"是两种完全不同的处置。
-///
 /// ⚠ 采样器每 10s 落一个 minute 点、快照取首尾差分，所以流量必须**持续**跨过两个采样点
 ///   （这里 13 轮 × 2s ≈ 26s），否则 `pullTPS` 仍是 0 —— 那是夹具不够长，不是判据错。
 /// ⚠ 读的是 admin 侧的 307（经 broker 转发回本实例），不是进程内自查：序列化与转发那两段
@@ -1800,8 +1711,6 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
     if written {
         match std::fs::read_to_string(&file_a) {
             Ok(text) => {
-                // Java fastjson2 落盘格式（真实 rocketmq-client 5.5.0 实测）：
-                // {"offsetTable":{{"brokerName":..,"queueId":..,"topic":..}:off,...}}
                 let offsets = canonical_format_offsets(&text);
                 ck.check(
                     "C6 the local offset file uses Java's object-as-key offsetTable format with 2 entries summing to 8",
@@ -1820,7 +1729,6 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
                     "offsets.json.tmp survived",
                 );
 
-                // 同 clientId 重启：读回本地位点，广播不重投（Java load() 同口径）
                 let inbox_r = Arc::new(Inbox::default());
                 let mut cfg_r = cfg_a.clone();
                 cfg_r.instance_name = client_a.clone();
@@ -2129,9 +2037,6 @@ async fn c9_admin_and_flow_control(ck: &mut Checker, fx: &Fixture) {
         Ok(v) => v,
         Err(e) => return ck.abort("C9 build consumer", &e),
     };
-    // 队列内缓冲 1 条就流控 —— 消费慢于拉取时才会真的命中。
-    // 另外两道闸门这里要"关掉"，但写法不能是 0：Java checkConfig（:1099-1209）把
-    // 它们的合法下界都定在 1，`start()` 会直接拒（见 S5/C13），所以用各自的上界。
     c.update_config(|x| {
         x.pull_threshold_for_queue = 1;
         x.pull_threshold_size_for_queue = 1024;
@@ -2158,7 +2063,6 @@ async fn c9_admin_and_flow_control(ck: &mut Checker, fx: &Fixture) {
         &format!("buffered={}", c.buffered_message_count()),
     );
 
-    // 积压统计（Java ProcessQueue.msgAccCnt，取自 broker 的 MAX_OFFSET 属性）
     let key = c.assigned_queue_keys().first().cloned().unwrap_or_default();
     let acc = c.msg_acc_cnt(Some(&key));
     let total_acc = c.compute_accumulation_total();
@@ -2168,7 +2072,6 @@ async fn c9_admin_and_flow_control(ck: &mut Checker, fx: &Fixture) {
         &format!("key={key} acc={acc} total={total_acc}"),
     );
 
-    // 线程池守卫（Java DefaultMQPushConsumerImpl.updateCorePoolSize 的三道守卫）
     ck.check(
         "C9 updateCorePoolSize rejects 0",
         !c.update_core_pool_size(0),
@@ -2215,7 +2118,6 @@ async fn c9_admin_and_flow_control(ck: &mut Checker, fx: &Fixture) {
         &format!("{:?}", c.assigned_queue_keys()),
     );
 
-    // 经实例注册表拿回消费者并主动刷位点（Java MQClientInstance.persistAllConsumerOffset）
     let reg = MQClientInstance::find_instance(&c.client_id()).and_then(|i| i.find_consumer(&group));
     match reg {
         Some(rc) => match rc.persist_consumer_offset().await {
@@ -2327,7 +2229,6 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
         &format!("ageMs={:?}", pull_clock_age_ms(&c.consumer_running_info())),
     );
 
-    // ---- 注入停摆 → 自愈（Java updateProcessQueueTableInRebalance 的 [BUG] 分支）----
     let healed = heal_once(&c, &key).await;
     let stalled_after = c.pull_stalled(&key);
     let fresh = c.last_pull_at(&key).unwrap_or_default();
@@ -2381,14 +2282,6 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
 
 /// 顺序消费的毒消息终态：为什么只能真机验。
 ///
-/// Java `ConsumeMessageOrderlyService#processConsumeResult:236-307` 的 SUSPEND 分支先过
-/// `checkReconsumeTimes:322-339`：次数没用尽就**本地** `reconsumeTimes + 1` 并原地挂起
-/// （broker 那边压根没记这次失败）；用尽了才 `sendMessageBack:341-362` 把整条投给
-/// `%RETRY%<group>`，**投成功就不再挂起**、commit 位点让路（所以下一条必须被消费）。
-/// 而「投给 `%RETRY%` 之后进不进 `%DLQ%`」全在 broker：`SendMessageProcessor#handleRetryAndDLQ:185-234`
-/// 读 SEND_MESSAGE_V2 的 `j`/`l`（`AbstractSendMessageProcessor:427` 把 `j` 直接写成存储消息的
-/// reconsumeTimes），且只有本组的 rebalance 锁还没过期（`:202-207` isLockAllExpired=false，
-/// 也就是这个实例真的握着 `LOCK_BATCH_MQ`）才「立刻改投死信」。
 ///
 /// 三种写错在客户端本地都表现为「看起来正常」：少 +1 ⇒ 毒消息原地转到天荒地老且永远不进死信；
 /// 把 `-1` 读成并发侧的 16 ⇒ 顺序消费凭空多出死信；回投成功后仍挂起 ⇒ 队列永久卡死，
@@ -2432,8 +2325,6 @@ async fn c12_orderly_dlq(ck: &mut Checker, fx: &Fixture) {
         three && times.starts_with(&[0, 1, 2]),
         &format!("times={times:?}"),
     );
-    // 交棒判据：回投成功后 Java commit 位点，队列必须往前走。少了这一步就是「毒消息把
-    // 整个队列钉住」，与消费者死掉无法区分；多了（回投还没成功就前进）则是静默丢消息。
     let after = format!("{topic}-001");
     let handed = poll_until(|| !inbox.matching(&after).is_empty(), 60).await;
     ck.check(
@@ -2494,13 +2385,6 @@ async fn c12_orderly_dlq(ck: &mut Checker, fx: &Fixture) {
 }
 
 /// 顺序侧的 `-1` 是**不设上限**，不是并发侧的 16。
-///
-/// Java 两处 `getMaxReconsumeTimes` 故意不同：`ConsumeMessageOrderlyService:313-320` 把 `-1`
-/// 读成 `Integer.MAX_VALUE`（顺序消费一直在本地原地重试，broker 侧没有计数，默认就该重试到
-/// 成功为止）；`DefaultMQPushConsumerImpl:890` 把 `-1` 读成 16（那边每轮都过一遍 broker，
-/// 16 是 broker 默认的 retryMaxTimes）。合成一个常量的两种坏法都得分别挡住：顺序侧读成 16
-/// ⇒ 第 17 次投给 broker，而锁还没过期 ⇒ 直接造出一条死信；并发侧读成 MAX ⇒ 毒消息永远不进
-/// `%DLQ%`（C4b 用 `maxReconsumeTimes=2` 覆盖了「阈值生效」，这条覆盖「默认值绝不生效」）。
 async fn c12b_orderly_no_cap(ck: &mut Checker, fx: &Fixture) {
     println!("-- C12b maxReconsumeTimes=-1 时顺序消费不设上限（不是并发侧的 16）");
     let topic = fx.topic_name("OrdNoCap");
@@ -2613,11 +2497,8 @@ struct OrderlyManualListener {
 
 #[derive(PartialEq, Clone, Copy)]
 enum ManualMode {
-    /// autoCommit=false + COMMIT：显式**批量 ack**（Java:275-277）。
     CommitOnce,
-    /// autoCommit=false：head 头 N 次回 ROLLBACK、之后回 COMMIT（Java:278-285）。
     RollbackThenCommit,
-    /// **不碰** autoCommit（保持默认 true）却回 ROLLBACK —— Java:246-250 的非法用法。
     IllegalRollback,
 }
 
@@ -2728,10 +2609,6 @@ fn median(xs: &[f64]) -> f64 {
 
 /// #74：`suspendCurrentQueueTimeMillis` 在 context 上优先于消费者配置。
 ///
-/// Java `ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234`：`-1`（默认）→ 回落
-/// 消费者配置，再钳到 `[10, 30000]`。真机这一条证的是「listener 在 context 上设的值真的决定
-/// 等待时长」：配置故意设 900ms、context 要 70ms ⇒ 相邻投递的中位间隔必须贴着 70ms ——
-/// 把 context 读丢或读成配置，间隔会落到 0.9s 以上。
 ///
 /// 钳位的两个端点用同一条链路的间隔只能兜「不忙等」（`>= 10ms`）：分发循环本身有 50ms 固定
 /// 节拍，间隔法分不出 10ms 与 1ms —— 精确值由 `orderly_suspend_millis` 的离线矩阵锁死
@@ -2815,21 +2692,7 @@ async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
     cb.shutdown();
 }
 
-/// C13 顺序消费的显式批量 ack 与显式回滚（Java `ConsumeMessageOrderlyService:244-300`）。
-///
 /// 三条腿的差别只在**返回值**与 **autoCommit 这一个布尔位**，但真机行为完全可分：
-///
-/// - C13a `autoCommit=false` + `COMMIT` = 显式**批量 ack**（Java:275-277）：三条一批一次
-///   认可，broker 位点一次走到 3，同一批在观察窗口内不再投递。把 COMMIT 当"不提交"
-///   处理时这批会被挂起节奏重投几十次。
-/// - C13b `autoCommit=false` + `ROLLBACK` = 显式**回滚 + 立即重投**（Java:278-285）：
-///   这一批退回队首、按（钳过的）挂起时长在**本地**重投 —— 不过 broker、不换 topic、
-///   `reconsumeTimes` 不动。判据落在间隔量级上：挂起 200ms ⇒ 中位间隔百毫秒级；任何
-///   "交给 broker 走 %RETRY%"的实现最快也只能等第一个延迟档（delayLevel=3 即 10s）。
-///   同时验"回滚期间后面的消息不越位、显式提交后立刻放行"。
-/// - C13c `autoCommit=true`（默认）+ `ROLLBACK` 是**非法用法**：Java:246-250 只 warn、
-///   不写 break，顺势落进 SUCCESS 分支（消息照 ack）。同一个返回值在 C13b/C13c 行为
-///   相反，开关只有 autoCommit 一位 —— 任一边写反都必然在其中一条上红。
 async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     println!("-- C13 顺序消费的显式批量 ack / 显式回滚（立即重投）/ 非法用法");
 

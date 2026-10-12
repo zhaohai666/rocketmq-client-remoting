@@ -68,34 +68,11 @@ if (!function_exists(__NAMESPACE__ . '\\client_side_tag_filter')) {
 final class DefaultMQPushConsumer
 {
     // ---------------- POP 模式（5.x 轻量消费）配置 ----------------
-    //
-    // Java 的 push-consumer POP 走 **broker 侧分配**：rebalance 不在本地算队列，而是每个
-    // topic 发一次 QUERY_ASSIGNMENT(400)，返回的 (MessageQueue, mode) 集就是分配
-    // （RebalancePushImpl#clientRebalance:138-141 决定走哪条路：
-    // ``isClientRebalance() || 顺序消费 || BROADCASTING`` 才本地算，否则问 broker）。
-    //
-    // 本端口照此对齐，opt-in 字段就是 Java 同名的 ``clientRebalance``（默认 true = 本地
-    // rebalance，与 Java 一致）：``popMode = true`` **且** ``clientRebalance = false``
-    // 且非广播、非顺序时，队列分配改由 {@see MQClientInstance} 的 tick 阶段⑦周期发
-    // QUERY_ASSIGNMENT 决定（PHP 无 RebalanceService 线程，见该类注释）。
-    //
-    // 三条铁律（都是 Java 的口径，改动前先看）：
-    //  - **拿不到有效答复就保留上一次分配**：RPC 失败 / 找不到 broker / broker 回 null 集
-    //    一律不更新（getRebalanceResultFromBroker:351-359），绝不退化成"这个 topic 我全要"
-    //    —— 那样同组实例会把每条消息重复消费一遍；
-    //  - broker **明示空集**才撤销该 topic 的队列（doLoadBalance:149 的 empty 分支）；
-    //  - 分配里的 mode 只观测、不服从：本消费者的消费模式在 ``popMode`` 上已经定死，
-    //    rebalance 消费的是**队列集合**，谁决定队列集才是两档分配的差别。
 
     public string $consumerGroup;
     public ?bool $tlsEnable = null;
     /** TLS 细项（caCert/clientCert/clientKey/serverName），语义见 RemotingClient::$tlsOptions。 */
     public ?array $tlsOptions = null;
-    /**
-     * SOCKS 代理（对应 Java ClientConfig 的 socksProxyConfig → SocksProxyConfig）：
-     * 配了则 NameServer + Broker 的 remoting 连接都经代理；动态取址的 HTTP 不走代理。
-     * 只在 start() 建 MQClientInstance 时透传一次。
-     */
     public ?SocksProxyConfig $socksProxy = null;
     public string $namespace = '';
     public string $instanceName = MixAll::DEFAULT_INSTANCE_NAME;
@@ -136,7 +113,6 @@ final class DefaultMQPushConsumer
      * broker 立即返回，默认压到 5000 —— 卡死的连接不必等 30s。
      */
     public int $pullTimeoutMillis = 5000;
-    /** 短轮询的空闲退避（PHP 适配新增；对应 Java pullInterval 的运行时角色）。 */
     public int $pullIntervalMillis = 1000;
     /** 单队列单次 tick 内最多短轮询轮数（PHP 适配新增，吞吐旋钮）。 */
     public int $maxPullsPerQueuePerTick = 8;
@@ -166,7 +142,6 @@ final class DefaultMQPushConsumer
     private array $inflightMsgs = [];
     /** @var array<string,int> 拉取游标（nextBeginOffset） */
     private array $offsetTable = [];
-    /** @var array<string,list<MessageExt>> 已拉未消费缓冲（Java ProcessQueue） */
     private array $pending = [];
     /** @var array<string,MessageQueue> 已分配队列注册表 */
     private array $mqMap = [];
@@ -181,11 +156,6 @@ final class DefaultMQPushConsumer
     private int $flowControlTriggered = 0;
     /** @var array<string,float> 每队列最近一次发起拉取/弹出的时刻（秒） */
     private array $lastPullTable = [];
-    /**
-     * 对应 Java DefaultMQPushConsumerImpl 的 `private volatile boolean pause = false`：
-     * **整个消费者**级别的挂起开关（suspend()/resume() 翻动），与逐队列的空闲退避
-     * （idleUntil）、顺序挂起重试（suspendedUntil）都不是同一回事。
-     */
     private bool $paused = false;
     /** @var array<string,int> MessageQueue key → 下一轮拉取应选的 brokerId */
     private array $pullFromWhichNode = [];
@@ -196,12 +166,10 @@ final class DefaultMQPushConsumer
     private array $suspendedUntil = [];
     private float $startTime = 0.0;
 
-    // ---- 心跳（对齐 Java heartbeatBrokerInterval 默认 30s）----
     public bool $heartbeatEnabled = true;
     public int $heartbeatIntervalMillis = 30000;
     /** 路由刷新周期（只在 start() 建 MQClientInstance 时透传一次）。 */
     public int $pollNameServerInterval = 30000;
-    /** 已消费位点落盘周期（对齐 Java persistConsumerOffsetInterval 默认 5000ms）。 */
     public int $persistConsumerOffsetInterval = 5000;
     private int $heartbeatCount = 0;
 
@@ -217,11 +185,6 @@ final class DefaultMQPushConsumer
     public int $popTimeoutMillis = 5000;
     public int $popIntervalMillis = 1000;
     public int $maxPopsPerQueuePerTick = 8;
-    /**
-     * broker 侧分配（{@see $clientRebalance} 为 false 时）的轮询周期，默认 20s ——
-     * Java 的 QUERY_ASSIGNMENT 就挂在这个 rebalance 调度周期上
-     * （``rocketmq.client.rebalance.waitInterval``）。
-     */
     public int $popAssignmentIntervalMillis = MQClientInstance::POP_ASSIGNMENT_INTERVAL_MILLIS;
     /** 向实例注册的分配轮询方（仅 broker 侧分配路径非空；tick 阶段⑦的驱动对象）。 */
     private ?PopAssignmentPoller $popAssignmentPoller = null;
@@ -240,7 +203,6 @@ final class DefaultMQPushConsumer
     public array $filterMessageHookList = [];
     public ?AsyncTraceDispatcher $traceDispatcher = null;
 
-    /** 消费统计（Java ConsumerStatsManager），start() 时绑定到实例的 manager。 */
     private ?ConsumerStatsManager $statsManager = null;
 
     // ---- tick 定时器（PHP 适配：原后台线程的到点时刻，秒）----
@@ -298,11 +260,6 @@ final class DefaultMQPushConsumer
         $this->unitMode = $unitMode;
     }
 
-    /**
-     * 对应 Java `ClientConfig#setNamespaceV2`：服务端命名空间（`nsd`/`ns` 扩展头），
-     * 不改 topic/group 名；与 `$namespace` 那个「客户端拼 `namespace%` 前缀」的机制互不相干。
-     * start() 之后改也生效——钩子每笔请求实时读 {@see MQClientInstance::$namespaceV2}。
-     */
     public function setNamespaceV2(string $namespaceV2): void
     {
         $this->namespaceV2 = $namespaceV2;
@@ -311,13 +268,11 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** 对应 Java `ClientConfig#getNamespaceV2`。 */
     public function getNamespaceV2(): string
     {
         return $this->namespaceV2;
     }
 
-    /** 对应 Java `NettyClientConfig#setSocksProxyConfig`：null 清除。start() 前设置。 */
     public function setSocksProxy(?SocksProxyConfig $proxy): void
     {
         $this->socksProxy = $proxy;
@@ -397,7 +352,6 @@ final class DefaultMQPushConsumer
         return $this->consumerGroup;
     }
 
-    /** 对应 Java ``MQConsumerInner#subscriptions()``：给 checkClientInBroker 用。 */
     public function subscriptions(): array
     {
         return array_values($this->subscriptionData);
@@ -405,10 +359,6 @@ final class DefaultMQPushConsumer
 
     // ---------------- 订阅 ----------------
 
-    /**
-     * 订阅 topic（对应 Java DefaultMQPushConsumerImpl#subscribe:1265-1275）。
-     * start() 之后仍可调用：订阅表是活的，put 进去之后立即发一次心跳。
-     */
     public function subscribe(string $topic, string $subExpression = '*'): void
     {
         $topic = $this->withNamespace($topic);
@@ -433,20 +383,11 @@ final class DefaultMQPushConsumer
         $this->notifySubscriptionChanged($topic);
     }
 
-    /**
-     * 取消订阅。Java 这里**只删表项、不发心跳**（后一轮心跳自然带出新订阅集），
-     * 所以刻意不调 notifySubscriptionChanged。
-     */
     public function unsubscribe(string $topic): void
     {
         unset($this->subscriptionData[$this->withNamespace($topic)]);
     }
 
-    /**
-     * 订阅表新增/更新后的立即动作，对齐 Java subscribe 里的第二句：
-     * ``sendHeartbeatToAllBrokerWithLock`` —— broker 的 ConsumerManager 只在收到
-     * 心跳时才把 topic→group 记进它自己那张表，晚一轮就是默认 30s 的空窗。
-     */
     private function notifySubscriptionChanged(string $topic): void
     {
         if (!$this->started || $this->mqClient === null) {
@@ -470,10 +411,6 @@ final class DefaultMQPushConsumer
 
     // ---------------- 配置数值闸门 ----------------
 
-    /**
-     * 对应 Java ``DefaultMQPushConsumerImpl#checkConfig`` 的数值段（:1099-1209），
-     * 逐条照抄 Java 的**顺序、区间和文案**。
-     */
     private function checkConfigRanges(): void
     {
         if ($this->consumeThreadMin < 1 || $this->consumeThreadMin > 1000) {
@@ -554,12 +491,9 @@ final class DefaultMQPushConsumer
         if ($this->started) {
             return;
         }
-        // 消费组也拼命名空间（对齐 Java DefaultMQPushConsumer.start:763）。必须在算
-        // 重试主题之前：重试主题 = %RETRY% + 带前缀的组名。
         if ($this->namespace !== '') {
             $this->consumerGroup = NamespaceUtil::wrapNamespace($this->namespace, $this->consumerGroup);
         }
-        // 对应 Java checkConfig：先 Validators.checkGroup，再挡 DEFAULT_CONSUMER。
         Validators::checkGroup($this->consumerGroup);
         if ($this->consumerGroup === MixAll::DEFAULT_CONSUMER_GROUP) {
             throw new MQClientException(sprintf(
@@ -576,15 +510,11 @@ final class DefaultMQPushConsumer
         if ($this->messageListener === null) {
             throw new MQClientException('message listener is not set');
         }
-        // Java :1058：启动即无条件校验起点时间。
         $this->consumeTimestampMillis();
-        // Java :1067：策略为 None 直接拒绝启动。
         if (!isset($this->allocateStrategy)) {
             throw new MQClientException('allocateMessageQueueStrategy is null');
         }
-        // Java 数值段：排在所有 null 检查之后、任何网络动作之前。
         $this->checkConfigRanges();
-        // Java :934-936：只有 CLUSTERING 才 changeInstanceNameToPID。
         if ($this->messageModel === MessageModel::CLUSTERING) {
             $this->instanceName = MixAll::changeInstanceNameToPid($this->instanceName);
         }
@@ -617,10 +547,9 @@ final class DefaultMQPushConsumer
         $this->startTime = microtime(true);
         $this->nextHeartbeatAt = $this->startTime + $this->heartbeatIntervalMillis / 1000.0;
         $this->nextRebalanceAt = $this->startTime + 20.0;
-        $this->nextPersistAt = $this->startTime + 10.0; // Java initialDelay = 1000 * 10
+        $this->nextPersistAt = $this->startTime + 10.0;
         $this->nextLockAt = $this->startTime;
         $this->nextCleanAt = $this->startTime + max(1, $this->consumeTimeout) * 60.0;
-        // 集群模式自动订阅重试 topic（对齐 Java copySubscription → retryTopic）。
         if ($this->messageModel !== MessageModel::BROADCASTING) {
             $retryTopic = MixAll::getRetryTopic($this->consumerGroup);
             if (!isset($this->subscriptionData[$retryTopic])) {
@@ -628,7 +557,6 @@ final class DefaultMQPushConsumer
                 $this->subscriptionData[$retryTopic] = FilterAPI::buildSubscriptionData($retryTopic, '*');
             }
         }
-        // 对齐 Java start 顺序：拉一次路由 → CHECK_CLIENT_CONFIG → 心跳 → 立即 rebalance。
         $this->refreshRoutes();
         try {
             $this->mqClient->checkClientInBroker();
@@ -669,7 +597,6 @@ final class DefaultMQPushConsumer
                     $this->rpcHook,
                 );
                 $dispatcher->setHostConsumer($this);
-                // 对应 Java DefaultMQPushConsumer.start:769：轨迹 producer 也得带 namespaceV2。
                 $dispatcher->setNamespaceV2($this->namespaceV2);
                 $this->traceDispatcher = $dispatcher;
                 $this->registerConsumeMessageHook(new ConsumeMessageTraceHook($dispatcher));
@@ -692,8 +619,6 @@ final class DefaultMQPushConsumer
             return;
         }
         $this->started = false;
-        // POP broker 侧分配：立刻摘掉轮询方，之后的 tick 不再发 QUERY_ASSIGNMENT
-        // （对应 Java shutdown 停 RebalanceService 线程）。
         if ($this->popAssignmentPoller !== null) {
             $this->mqClient?->unregisterPopAssignmentPoller($this->popAssignmentPoller->key);
             $this->popAssignmentPoller = null;
@@ -706,14 +631,11 @@ final class DefaultMQPushConsumer
             $this->popQueues = [];
             $this->popOrderlyRequests = [];
         }
-        // 退出前把已消费位点持久化一次（对齐 Java MQClientInstance.shutdown）。
         try {
             $this->persistOffsetsOnce();
         } catch (\Throwable $e) {
             Logger::debug('persist offsets on shutdown failed: ' . $e->getMessage());
         }
-        // 顺序消费清退时解锁队列（对齐 Java ConsumeMessageOrderlyService.shutdown → unlockAll）。
-        // ⚠ 不能走 requireClient()：started 已置 false，它会抛"not started"把解锁变成死代码。
         if ($this->isOrderly() && !$this->popMode
             && $this->messageModel !== MessageModel::BROADCASTING
             && $this->mqClient !== null) {
@@ -797,7 +719,6 @@ final class DefaultMQPushConsumer
             $this->messageModel,
             $this->consumeFromWhere,
         );
-        // Java `MQClientInstance`:1039 把 `impl.isUnitMode()` 写进 ConsumerData。
         $cd->unitMode = $this->unitMode;
         foreach ($this->subscriptionData as $sub) {
             $cd->subscriptionDataSet[] = $sub;
@@ -868,7 +789,6 @@ final class DefaultMQPushConsumer
         return $n;
     }
 
-    // ---------------- POP 观察点（真机验证 live_pop 用，对齐 Java 可观察口径） ----------------
 
     /** POP：在途 PopProcessQueue 数。 */
     public function popQueueCount(): int
@@ -958,7 +878,6 @@ final class DefaultMQPushConsumer
             $this->pullRound($now);
             // ⑥ 分发消费（每轮拉取后紧接分发；对齐 Python 分发线程）。
             $this->dispatchRound();
-            // ⑦ 过期消息清扫（只在经典并发路径；Java 只为它建调度）。
             if (!$this->isOrderly() && $now >= $this->nextCleanAt) {
                 $this->nextCleanAt = $now + max(1, $this->consumeTimeout) * 60.0;
                 try {
@@ -988,13 +907,6 @@ final class DefaultMQPushConsumer
 
     // ---------------- 重平衡 ----------------
 
-    /**
-     * 按当前分配的队列同步本地状态，并清理被撤销/已停摆队列的状态。
-     *
-     * 对齐 Java ``RebalanceImpl.updateProcessQueueTableInRebalance``：队列被撤走时必须
-     * ①persist 该队列**已消费**位点 ②丢弃 ProcessQueue（在途消息不再消费）③顺序消费
-     * 还要 UNLOCK_BATCH_MQ。刻意保持 Java 的**先撤后建**顺序，撤的收尾放在建之前。
-     */
     private function rebalancePullState(): void
     {
         $current = [];
@@ -1003,7 +915,6 @@ final class DefaultMQPushConsumer
         }
         $retired = [];
         $pop = $this->popMode;
-        // ①撤：被分走的 + 拉取停摆的（Java 的 !mqSet.contains / isPullExpired 两支）。
         foreach (array_keys($this->mqMap) as $key) {
             if (!isset($current[$key])) {
                 $this->retireQueue($key, null, $retired);
@@ -1036,14 +947,6 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /**
-     * 丢弃一个队列的全部本地状态，位点交给调用方在撤收尾里持久化。
-     *
-     * 代号 +1 ⇒ 在途批次的 ack 全部失效（Java setDropped(true)）；冻结标记**保留**到
-     * 队列重建为止，避免纠错后的位点被旧 ack 覆盖。
-     *
-     * @param list<array{0:MessageQueue,1:int|null}> $retired
-     */
     private function retireQueue(string $key, ?MessageQueue $fallbackMq, array &$retired): void
     {
         unset($this->pending[$key], $this->idleUntil[$key], $this->suspendedUntil[$key]);
@@ -1067,10 +970,6 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /**
-     * 该队列的拉取/弹出循环是否已停摆（Java ProcessQueue.isPullExpired）。
-     * PHP 单线程下没有"线程死了"分支，只有超时判据。
-     */
     private function pullStalled(string $key): bool
     {
         $began = $this->lastPullTable[$key] ?? null;
@@ -1080,11 +979,6 @@ final class DefaultMQPushConsumer
         return (microtime(true) - $began) > ConsumerDefaults::PULL_MAX_IDLE_TIME;
     }
 
-    /**
-     * 被撤销队列的收尾（对应 Java RebalanceImpl.removeUnnecessaryMessageQueue）。
-     *
-     * @param list<array{0:MessageQueue,1:int|null}> $revoked
-     */
     private function onQueuesRevoked(array $revoked): void
     {
         $broadcast = $this->messageModel === MessageModel::BROADCASTING;
@@ -1122,12 +1016,6 @@ final class DefaultMQPushConsumer
         return $mq->topic . $mq->brokerName . (string) $mq->queueId;
     }
 
-    /**
-     * topic 的全部队列（对应 Java RebalanceImpl.topicSubscribeInfoTable）。
-     * 取自**订阅信息**（读位 + readQueueNums、不筛 master），不是发布信息。
-     *
-     * @return list<MessageQueue>
-     */
     private function allQueuesOfTopic(string $topic): array
     {
         $client = $this->requireClient();
@@ -1138,16 +1026,6 @@ final class DefaultMQPushConsumer
         return $queues;
     }
 
-    /**
-     * 按 Java RebalanceImpl.rebalanceByTopic 计算分配，再同步本地状态。
-     * 查不到消费者列表时**保留现有分配**（Java 仅告警；绝不回退成"独占全部队列"）。
-     *
-     * POP + ``clientRebalance=false`` 时整个本地策略路径一格都不跑：队列集由 broker 说了算
-     * （Java RebalanceImpl#doRebalance:239 的 ``!clientRebalance(topic)`` 分支 →
-     * getRebalanceResultFromBroker）。周期性那一轮挂在 MQClientInstance::tick 的阶段⑦上，
-     * 这里只是**同步入口**：start() 的首轮分配、resume()/resetOffset() 之后的即时重平衡
-     * （Java start 末尾 rebalanceImmediately 的同位）。
-     */
     public function doRebalance(): void
     {
         if ($this->usesBrokerPopAssignment()) {
@@ -1220,7 +1098,6 @@ final class DefaultMQPushConsumer
                 count($assigned),
             ));
         }
-        // 新分配的队列**立刻**解析初始位点（对齐 Java updateProcessQueueTableInRebalance）。
         foreach ($newAssigned as $key => $mq) {
             if (isset($was[$key])) {
                 continue;
@@ -1245,14 +1122,6 @@ final class DefaultMQPushConsumer
         $this->rebalancePullState();
     }
 
-    /**
-     * 本消费者是否走 broker 侧队列分配（POP 路径的 QUERY_ASSIGNMENT）。
-     *
-     * 判据就是 Java RebalancePushImpl#clientRebalance:138-141 的取反：
-     * ``isClientRebalance() || isConsumeOrderly() || BROADCASTING`` 任一成立 → 本地算。
-     * 顺序消费与广播在 Java 里被**强制**走本地路径，这里照办：broker 侧分配只服务于
-     * CLUSTERING 并发 POP，其余路径维持本端口原有的本地 rebalance。
-     */
     public function usesBrokerPopAssignment(): bool
     {
         return $this->popMode
@@ -1303,16 +1172,6 @@ final class DefaultMQPushConsumer
         $this->requireClient()->runPopAssignmentRound($poller);
     }
 
-    /**
-     * 把 broker 对一个 topic 的指配并入本地分配（Java getRebalanceResultFromBroker:360-372
-     * → updateMessageQueueAssignment 的队列集语义）。
-     *
-     * 只替换**该 topic** 的条目，其它 topic 的分配一格不动；队列状态的对账
-     * （新队列建 PopProcessQueue、被撤队列 dropped、在途批次不再 ack）由
-     * {@see rebalancePullState()} 统一完成 —— 于是下一轮 tick 的 popRound 立刻按新队列集弹出。
-     *
-     * @param list<array{mq: MessageQueue, mode: MessageRequestMode}> $assignments
-     */
     public function applyPopAssignment(string $topic, array $assignments): void
     {
         $was = [];
@@ -1325,15 +1184,11 @@ final class DefaultMQPushConsumer
                 $newAssigned[$key] = $mq;
             }
         }
-        // Java updateMessageQueueAssignment:514-524 先把集分成 pop/pull 两档，本消费者
-        // 只消费队列集（消费模式由 popMode 定死），所以这里只做去重 + 记账。
         $popCnt = 0;
         $pullCnt = 0;
         foreach ($assignments as $one) {
             $mq = $one['mq'];
             if ($mq->topic !== $topic) {
-                // broker 对单个 topic 的答复里混进别的 topic：Java 的按 topic 分表更新不会
-                // 出现这种输入，这里一律忽略，免得把未订阅的队列喂进弹出循环。
                 Logger::warning(sprintf(
                     'queryAssignment for %s/%s returned a queue of foreign topic %s, ignored',
                     $this->consumerGroup, $topic, (string) $mq,
@@ -1368,18 +1223,9 @@ final class DefaultMQPushConsumer
                 count($assignments),
             ));
         }
-        // POP 没有客户端位点（进度在 broker 的 revive 队列里），所以这里**不**像本地路径
-        // 那样给新队列解析初始位点 —— 对齐 Java PopProcessQueue 无 offset 的语义，
-        // 也省掉每队列一次 QUERY_CONSUMER_OFFSET/GET_MAX_OFFSET 空转。
         $this->rebalancePullState();
     }
 
-    /**
-     * 实例收到 broker 的 40 通知后触发即时重平衡（对应 Java rebalanceImmediately）。
-     *
-     * broker 侧分配路径没有 20s 的 rebalance 计时器可拨（阶段③被跳过），唤醒的是实例的
-     * 分配轮：下一个 tick 就重查（Java RebalanceService#wakeUp 的同位）。
-     */
     public function rebalanceImmediately(): void
     {
         if ($this->usesBrokerPopAssignment()) {
@@ -1389,26 +1235,12 @@ final class DefaultMQPushConsumer
         $this->rebalanceNow = true;
     }
 
-    /**
-     * 挂起本消费者（对应 Java DefaultMQPushConsumer#suspend:890 → Impl#suspend:1312-1315）。
-     *
-     * 只翻一个布尔：pullOnce/popOnce 在**盖完时刻**之后看到它就返回，不再发起报文，
-     * 但队列、缓冲、位点游标一律不动，所以挂起 ≠ 停摆（PULL_MAX_IDLE_TIME 判据不会命中），
-     * rebalance 也就不会把分配摘走。已拉到本地的消息照常消费。
-     *
-     * PHP 适配：Java 的循环线程在这里 sleep 1s（PULL_TIME_DELAY_WHEN_SUSPEND）后重试；
-     * PHP 没有常驻循环，节奏由调用方的 tick 决定 —— 下一次 tick 仍然会盖章并跳过拉取。
-     */
     public function suspend(): void
     {
         $this->paused = true;
         Logger::info("suspend this consumer, {$this->consumerGroup}");
     }
 
-    /**
-     * 解除挂起（对应 Java Impl#resume:741-745：置回 false 并立刻 doRebalance）。
-     * 挂起期间可能有队列增减没被处理，所以 Java 主动叫醒一次重平衡。
-     */
     public function resume(): void
     {
         $this->paused = false;
@@ -1416,7 +1248,6 @@ final class DefaultMQPushConsumer
         Logger::info("resume this consumer, {$this->consumerGroup}");
     }
 
-    /** 当前是否处于挂起态（对应 Java DefaultMQPushConsumer#isPause:902）。 */
     public function isPaused(): bool
     {
         return $this->paused;
@@ -1454,15 +1285,7 @@ final class DefaultMQPushConsumer
             return false;
         }
         $client = $this->requireClient();
-        // Java DefaultMQPushConsumerImpl.pullMessage:253 —— 每次**发起**拉取就盖时刻。
         $this->lastPullTable[$key] = microtime(true);
-        // Java :263-266 的挂起闸门（suspend()/resume()）。
-        // ⚠ 顺序要紧：闸门必须落在**盖章之后**。放前面的话，一个只是被 suspend() 暂停、
-        // 并没有真死的消费者会因为超过 PULL_MAX_IDLE_TIME 没发起拉取，被停摆判据
-        // （pullStalled / Java ProcessQueue.isPullExpired）判成死循环，rebalance
-        // 于是把分配整个摘掉重建 —— 表现是"挂起两分钟，恢复后位点重投一遍"。
-        // PHP 适配：Java 在这里等 PULL_TIME_DELAY_WHEN_SUSPEND（1s）再重新入队，
-        // 这里直接返回 false，节奏交给调用方的 tick。
         if ($this->paused) {
             return false;
         }
@@ -1478,7 +1301,6 @@ final class DefaultMQPushConsumer
         if (isset($this->suspendedUntil[$key]) && $now < $this->suspendedUntil[$key]) {
             return false;
         }
-        // 流控（对齐 Java ProcessQueue.putMessage / checkReconsumeTimes 五阈值）。
         if ($this->flowControlHit($mq, $key)) {
             return false;
         }
@@ -1498,7 +1320,6 @@ final class DefaultMQPushConsumer
             $this->offsetTable[$key] = $offset;
         }
         try {
-            // Java :458-468：仅当 postSubscriptionWhenPull 打开且非类过滤模式才带订阅表达式。
             $subExpression = ($this->postSubscriptionWhenPull && !$sub->isClassFilterMode())
                 ? ($sub->subString ?? '*') : null;
             $sysFlag = PullSysFlag::buildSysFlag(
@@ -1507,7 +1328,6 @@ final class DefaultMQPushConsumer
                 subscription: $subExpression !== null,
                 classFilter: false,
             );
-            // Java PullAPIWrapper#pullKernelImpl：按上轮应答的 suggestWhichBrokerId 选主/从。
             $brokerId = $this->pullFromWhichNode[$key] ?? MixAll::MASTER_ID;
             $pullBegan = microtime(true);
             $result = $client->pullMessage(
@@ -1525,7 +1345,6 @@ final class DefaultMQPushConsumer
                 suspendTimeoutMillis: $this->pullSuspendTimeoutMillis,
                 brokerId: $brokerId,
             );
-            // Java PullAPIWrapper#processPullResult:77 —— 每轮应答都更新 pullFromWhichNodeTable。
             $this->pullFromWhichNode[$key] = $result->suggestWhichBrokerId ?? MixAll::MASTER_ID;
             // 消费统计：RT 每次都记，TPS 只在有消息时记。
             if ($this->statsManager !== null) {
@@ -1548,8 +1367,6 @@ final class DefaultMQPushConsumer
             return false;
         }
 
-        // 投递前的客户端侧过滤（对齐 Java processPullResult:113-128）。拉取路径被摘掉的
-        // 消息不 ack：位点照常推进 = 静默跳过。
         $found = $result->status === PullStatus::FOUND && $result->msgFoundList !== [];
         if ($found) {
             $result->msgFoundList = filter_messages_for_delivery(
@@ -1577,12 +1394,10 @@ final class DefaultMQPushConsumer
         if ($result->nextBeginOffset !== null) {
             $this->offsetTable[$key] = $result->nextBeginOffset;
             if ($result->status === PullStatus::OFFSET_ILLEGAL) {
-                // Java :402-427 —— 位点被 broker 纠正时必须连纠错带重建一起做。
                 $this->frozenOffsets[$key] = true;
                 $this->consumeOffsets[$key] = (int) $result->nextBeginOffset;
                 $illegal = true;
             } else {
-                // Java :394-401 —— 空应答（NO_NEW_MSG / NO_MATCHED_MSG）修正"已消费位点"。
                 $this->correctTagsOffset($key, $result->status, $result->nextBeginOffset);
             }
         }
@@ -1598,7 +1413,6 @@ final class DefaultMQPushConsumer
         return false;
     }
 
-    /** 对应 Java ``ProcessQueue.putMessage`` 里的 ``msgAccCnt`` 计算（取本批最后一条）。 */
     private function updateMsgAccCnt(string $key, array $msgs): void
     {
         if ($msgs === []) {
@@ -1624,16 +1438,11 @@ final class DefaultMQPushConsumer
         return $this->msgAccCntTable[$key] ?? 0;
     }
 
-    /** Java ``DefaultMQPushConsumerImpl.computeAccumulationTotal``。 */
     public function computeAccumulationTotal(): int
     {
         return array_sum($this->msgAccCntTable);
     }
 
-    /**
-     * Java ``DefaultMQPushConsumerImpl.adjustThreadPool`` —— ⚠ 在 Java 5.5.1 这是 no-op，
-     * 我们照抄 no-op（真正生效的是显式的 updateCorePoolSize；不要"修好"它）。
-     */
     public function adjustThreadPool(): void
     {
         $accTotal = $this->computeAccumulationTotal();
@@ -1647,7 +1456,6 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** 运行时调整消费并发度（对应 Java updateCorePoolSize → setCorePoolSize）。 */
     public function updateCorePoolSize(int $corePoolSize): bool
     {
         if ($corePoolSize <= 0 || $corePoolSize > 32767) {
@@ -1665,7 +1473,6 @@ final class DefaultMQPushConsumer
         return $this->corePoolSize;
     }
 
-    /** 是否触发流控（对齐 Java ProcessQueue.putMessage 的五个阈值检查）。 */
     private function flowControlHit(MessageQueue $mq, string $key): bool
     {
         $dq = $this->pending[$key] ?? [];
@@ -1728,19 +1535,16 @@ final class DefaultMQPushConsumer
             return $client->getMaxOffset($mq);
         }
         if ($this->messageModel === MessageModel::BROADCASTING) {
-            // 广播模式：offset 只存本地（对齐 Java LocalFileOffsetStore）
             $stored = $this->loadLocalOffsets();
             $key = self::mqKey($mq);
             if (isset($stored[$key])) {
                 return $stored[$key];
             }
             if ($this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-                // Java RebalancePushImpl:197-208：FIRST_OFFSET 且本地没有位点时直接给 0。
                 return 0;
             }
             return $client->getMaxOffset($mq);
         }
-        // 集群模式：先查 broker 上已提交的位点（对齐 Java RemoteBrokerOffsetStore.readOffset）。
         try {
             $stored = $client->queryConsumerOffset($this->consumerGroup, $mq, 5000, null, false);
             if ($stored !== null && $stored >= 0) {
@@ -1750,14 +1554,12 @@ final class DefaultMQPushConsumer
             Logger::debug("query consumer offset for $mq not found: " . $e->getMessage());
         }
         if ($this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-            // Java RebalancePushImpl:197-208：**不**发 minOffset 查询，越界由 broker 纠正。
             return 0;
         }
         if ($this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
             return $client->searchOffsetByTimestamp($mq, $this->consumeTimestampMillis());
         }
         if (NamespaceUtil::isRetryTopic($mq->topic)) {
-            // Java RebalancePushImpl:181-182：%RETRY% 主题首次消费且无位点时从 0 开始。
             return 0;
         }
         // 默认 CONSUME_FROM_LAST_OFFSET
@@ -1821,7 +1623,6 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** 对应 Java DefaultMQPushConsumerImpl.resetRetryAndNamespace（分发前调用）。 */
     private function resetRetryTopicAndNamespace(array $msgs): void
     {
         $groupTopic = MixAll::getRetryTopic($this->consumerGroup);
@@ -1838,12 +1639,6 @@ final class DefaultMQPushConsumer
 
     // ---------------- broker 主动请求：220 / 221 / 307 / 309 ----------------
 
-    /**
-     * 对应 Java MQClientInstance.resetOffset（220 的处理逻辑）。
-     * 新位点先落进表，再走统一撤销路径，撤销收尾把**新位点**持久化，最后 rebalance 重建。
-     *
-     * @param list<array{mq: MessageQueue, offset: int}> $offsetTable
-     */
     public function resetOffset(string $topic, array $offsetTable): void
     {
         if ($topic === '' || $offsetTable === []) {
@@ -1886,12 +1681,6 @@ final class DefaultMQPushConsumer
         ));
     }
 
-    /**
-     * 对应 Java MQClientInstance.getConsumerStatus（221 的应答数据源）——
-     * **已消费位点**表（不是拉取游标）。
-     *
-     * @return list<array{mq: MessageQueue, offset: int}>
-     */
     public function getConsumerStatus(?string $topic): array
     {
         $out = [];
@@ -1907,7 +1696,6 @@ final class DefaultMQPushConsumer
         return $out;
     }
 
-    /** 对应 Java DefaultMQPushConsumerImpl.consumerRunningInfo（307 的应答）。 */
     public function consumerRunningInfo(): ConsumerRunningInfo
     {
         $info = new ConsumerRunningInfo();
@@ -1930,7 +1718,6 @@ final class DefaultMQPushConsumer
             $pqi->commitOffset = (int) ($this->consumeOffsets[$key] ?? 0);
             $pqi->cachedMsgCount = count($this->pending[$key] ?? []);
             $pqi->droped = false;
-            // Java ProcessQueue.fillOutRunningInfo:456 —— 运维看的就是这个时刻。
             $pqi->lastPullTimestamp = (int) (($this->lastPullTable[$key] ?? 0) * 1000);
             $info->mqTable[message_queue_key($mq)] = $pqi->toDict();
         }
@@ -1959,9 +1746,6 @@ final class DefaultMQPushConsumer
         return $info;
     }
 
-    /**
-     * 对应 Java 的 consumeMessageDirectly（并发 :102-139 / 顺序 :103-161）。
-     */
     public function consumeMessageDirectly(MessageExt $msg, ?string $brokerName): ConsumeMessageDirectlyResult
     {
         $result = new ConsumeMessageDirectlyResult();
@@ -1997,7 +1781,6 @@ final class DefaultMQPushConsumer
             $result->consumeResult = CMResult::CR_THROW_EXCEPTION;
             $result->remark = get_class($e) . ': ' . $e->getMessage();
         }
-        // Java 顺序 :156 —— autoCommit 读的是 **listener 跑完之后**的上下文值。
         $result->autoCommit = $orderly ? $context->autoCommit : true;
         $result->spentTimeMills = UtilAll::currentTimeMillis() - $begin;
         return $result;
@@ -2010,10 +1793,6 @@ final class DefaultMQPushConsumer
         return $this->messageListener instanceof MessageListenerOrderly;
     }
 
-    /**
-     * 消费一个批次并处理回投/挂起。``epoch``：这批消息所属的 ProcessQueue 代号；
-     * 不一致说明队列已被撤销/重建，**整批作废**（Java isDropped() 短路）。
-     */
     private function consumeBatch(string $key, MessageQueue $mq, array $batch, ?int $epoch = null): bool
     {
         if ($epoch !== null && $epoch !== ($this->queueEpoch[$key] ?? 0)) {
@@ -2031,7 +1810,6 @@ final class DefaultMQPushConsumer
         $listener = $this->messageListener;
         $broadcast = $this->messageModel === MessageModel::BROADCASTING;
         $this->resetRetryTopicAndNamespace($batch);
-        // ---- 顺序消费（Java ConsumeMessageOrderlyService）----
         if ($this->isOrderly()) {
             $ocontext = new ConsumeOrderlyContext($mq);
             $ohookCtx = null;
@@ -2044,7 +1822,6 @@ final class DefaultMQPushConsumer
             try {
                 $status = $listener->consumeMessage($batch, $ocontext);
             } catch (\Throwable $e) {
-                // Java:463-469 —— 异常只置 hasException，status 留 null ⇒ 挂起。
                 Logger::debug('orderly listener error (retry in place): ' . $e->getMessage());
                 $status = null;
                 $ohasException = true;
@@ -2073,16 +1850,13 @@ final class DefaultMQPushConsumer
                 hookStatus: $status,
             );
             if ($ocontext->autoCommit) {
-                // Java processConsumeResult:244-269
                 if ($status === ConsumeOrderlyStatus::COMMIT || $status === ConsumeOrderlyStatus::ROLLBACK) {
-                    // Java:246-250 —— autoCommit=true 时 COMMIT/ROLLBACK 是非法用法，警告后照 ack。
                     Logger::warning('the message queue consume result is illegal, '
                         . "we think you want to ack these message $mq");
                     $status = ConsumeOrderlyStatus::SUCCESS;
                 }
                 if ($status === ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT) {
                     $this->recordConsumeStats($mq->topic, count($batch), $obeginMs, failed: true);
-                    // Java:256-266 —— 挂起之前先过 checkReconsumeTimes。
                     if ($this->checkOrderlyReconsumeTimes($batch)) {
                         $this->requeuePending($key, $batch);
                         $this->suspendedUntil[$key] = microtime(true) + $this->orderlySuspendMillis($ocontext) / 1000.0;
@@ -2094,7 +1868,6 @@ final class DefaultMQPushConsumer
                 $this->advanceConsumeOffset($key, $batch, null, $epoch);
                 return true;
             }
-            // ---- autoCommit=False（Java:270-300，binlog 消费场景）----
             if ($status === ConsumeOrderlyStatus::COMMIT) {
                 $this->recordConsumeRt($mq->topic, $obeginMs);
                 $this->advanceConsumeOffset($key, $batch, null, $epoch);
@@ -2112,18 +1885,13 @@ final class DefaultMQPushConsumer
                     $this->requeuePending($key, $batch);
                     $this->suspendedUntil[$key] = microtime(true) + $this->orderlySuspendMillis($ocontext) / 1000.0;
                 }
-                // Java:288-296 —— 毒消息交给 broker 后**不 commit**。
                 return false;
             }
-            // SUCCESS + autoCommit=False：Java 把消息留在 ProcessQueue 里等显式 commit()；
-            // 本端口没有暴露 commit 口子，等价地塞回队首并等一个挂起周期（见 Python 注释）。
             $this->recordConsumeStats($mq->topic, count($batch), $obeginMs, failed: false);
             $this->requeuePending($key, $batch);
             $this->suspendedUntil[$key] = microtime(true) + $this->orderlySuspendMillis($ocontext) / 1000.0;
             return false;
         }
-        // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
-        // 登记在途消息：cleanExpiredMsg 的"队首"清扫与 containsMessage 判据都看它。
         if (!isset($this->inflightMsgs[$key])) {
             $this->inflightMsgs[$key] = [];
         }
@@ -2154,13 +1922,11 @@ final class DefaultMQPushConsumer
         $beginMs = UtilAll::currentTimeMillis();
         $hasException = false;
         try {
-            // Java:366-370 —— 交给 listener **之前**逐条盖 CONSUME_START_TIME。
             foreach ($batch as $m) {
                 MessageAccessor::setConsumeStartTimestamp($m, UtilAll::currentTimeMillis());
             }
             $status = $listener->consumeMessage($batch, $context);
         } catch (\Throwable $e) {
-            // Java：消费抛异常按 RECONSUME_LATER 处理
             Logger::debug('listener error, treat as RECONSUME_LATER: ' . $e->getMessage());
             $status = ConsumeConcurrentlyStatus::RECONSUME_LATER;
             $hasException = true;
@@ -2175,7 +1941,6 @@ final class DefaultMQPushConsumer
             ));
             $status = ConsumeConcurrentlyStatus::RECONSUME_LATER;
         }
-        // Java processConsumeResult:207-229 —— ackIndex 划分「已认可前缀 / 待回投后缀」。
         $ackIndex = $context->ackIndex;
         if ($status === ConsumeConcurrentlyStatus::CONSUME_SUCCESS) {
             if ($ackIndex >= count($batch)) {
@@ -2184,7 +1949,6 @@ final class DefaultMQPushConsumer
         } else {
             $ackIndex = -1;
         }
-        // 统计口径同 Java 的 ok/failed 计数：部分 ack 时尾巴算 failed。
         $this->recordConsumeStats(
             $mq->topic,
             count($batch),
@@ -2202,7 +1966,6 @@ final class DefaultMQPushConsumer
             hookStatus: $status,
         );
         if ($broadcast) {
-            // Java:232-237 —— 广播模式不回投：未认可的尾巴打 warn 丢弃，整批位点照样前进。
             $dropped = count($batch) - $ackIndex - 1;
             if ($dropped > 0) {
                 Logger::warning(sprintf(
@@ -2221,7 +1984,6 @@ final class DefaultMQPushConsumer
         }
         // 集群模式：未认可的 [ack_index+1, size) 逐条回投 %RETRY%topic。
         $msgBackFailed = $this->sendBackBatch($key, array_slice($batch, $ackIndex + 1), $context);
-        // Java:256-260 —— 回投失败的那几条塞回队首稍后再消费。
         if ($msgBackFailed !== []) {
             if (isset($this->pending[$key])) {
                 foreach (array_reverse($msgBackFailed) as $m) {
@@ -2240,8 +2002,6 @@ final class DefaultMQPushConsumer
             $batch,
             static fn(MessageExt $m): bool => !isset($failedIds[spl_object_id($m)]),
         ));
-        // Java:266-269 —— 提交「本批已处理条目里最大的 queueOffset + 1」，且不能越过
-        // 仍留在 ProcessQueue 里的那几条（floor = 回投失败条目的最小 queueOffset）。
         $floor = null;
         if ($msgBackFailed !== []) {
             $floor = min(array_map(static fn(MessageExt $m) => $m->queueOffset, $msgBackFailed));
@@ -2250,7 +2010,6 @@ final class DefaultMQPushConsumer
         return $msgBackFailed === [];
     }
 
-    /** 把这一批塞回本地队列队首，等价 Java makeMessageToConsumeAgain/rollback。 */
     private function requeuePending(string $key, array $batch): void
     {
         if (isset($this->pending[$key])) {
@@ -2281,7 +2040,6 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** Java ``ProcessQueue.msgTreeMap`` 的等价视图：在途 ∪ 已拉未分发（按身份去重）。 */
     private function processQueueEntries(string $key): array
     {
         $out = [];
@@ -2303,7 +2061,6 @@ final class DefaultMQPushConsumer
         return $out;
     }
 
-    /** 队首 = 最小 ``queueOffset`` 的那条（Java ``msgTreeMap.firstEntry()``）。 */
     private function processQueueFirstEntry(string $key): ?MessageExt
     {
         $entries = $this->processQueueEntries($key);
@@ -2319,7 +2076,6 @@ final class DefaultMQPushConsumer
         return $first;
     }
 
-    /** Java ``ProcessQueue.containsMessage``：这条消息还挂在队列上吗。 */
     private function processQueueContains(string $key, MessageExt $msg): bool
     {
         foreach (($this->inflightMsgs[$key] ?? []) as $m) {
@@ -2350,9 +2106,6 @@ final class DefaultMQPushConsumer
 
     // ---------------- cleanExpiredMsg：挂起 listener 的逃生口 ----------------
 
-    /**
-     * 对应 Java ``cleanExpireMsg()``（:192-200）：遍历当前持有的队列逐个清扫。
-     */
     public function cleanExpiredMsgOnce(): void
     {
         foreach (array_keys($this->mqMap) as $key) {
@@ -2360,14 +2113,9 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /**
-     * 对应 Java ``ProcessQueue.cleanExpiredMsg``（:80-127），逐句转写。
-     * 语义三件套：只看队首（最小位点）、单条判定严格大于 consumeTimeout、每轮最多 16 条。
-     */
     private function cleanExpiredQueue(string $key): void
     {
         if ($this->isOrderly()) {
-            // Java:76-78 —— 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）。
             return;
         }
         $loop = min(count($this->processQueueEntries($key)), 16);
@@ -2376,19 +2124,17 @@ final class DefaultMQPushConsumer
             $first = $this->processQueueFirstEntry($key);
             if ($first !== null) {
                 $stamp = MessageAccessor::getConsumeStartTimestamp($first);
-                // Java:87-90 —— 没盖过章的直接当成未过期；过期判据是**严格**大于。
                 if ($stamp !== null
                     && (UtilAll::currentTimeMillis() - (float) $stamp) > $this->consumeTimeout * 60 * 1000) {
                     $msg = $first;
                 }
             }
             if ($msg === null) {
-                break; // Java:97-99 —— 队首没过期，后面的更不可能过期
+                break;
             }
             try {
-                $this->sendMessageBack($msg, 3); // Java:103 —— delayLevel 固定 3
+                $this->sendMessageBack($msg, 3);
             } catch (\Throwable $e) {
-                // Java:122-125 —— 回投失败只记日志：消息留在原地，绝不摘除（摘了就真丢了）。
                 Logger::error('send expired msg exception: ' . $e->getMessage());
                 continue;
             }
@@ -2400,7 +2146,6 @@ final class DefaultMQPushConsumer
                 (string) $msg->queueId,
                 (string) $msg->queueOffset,
             ));
-            // Java:106-115 —— 只有它**仍是**队首时才摘除。
             if ($this->processQueueFirstEntry($key) === $msg) {
                 $this->removeProcessQueueEntry($key, $msg);
             }
@@ -2409,17 +2154,12 @@ final class DefaultMQPushConsumer
 
     // ---------------- 并发回投 ----------------
 
-    /**
-     * 把未认可的条目逐条回投 broker，返回回投失败的那些。
-     * 对齐 Java ``ConsumeMessageConcurrentlyService#processConsumeResult:238-254``。
-     */
     private function sendBackBatch(string $key, array $batch, ConsumeConcurrentlyContext $context): array
     {
         $failed = [];
         foreach ($batch as $msg) {
             $present = $this->processQueueContains($key, $msg);
             if (!$present) {
-                // Java:243-248 —— 已被 cleanExpiredMsg 清扫（或队列已撤销）的条目跳过回投。
                 Logger::info(sprintf(
                     'Message is not found in its process queue; skip send-back-procedure, topic=%s, '
                     . 'brokerName=%s, queueId=%s, queueOffset=%s',
@@ -2434,7 +2174,6 @@ final class DefaultMQPushConsumer
                 // 重投次数在 MessageExt 线上格式第 13 字段，broker 重投时会 +1。
                 $delayLevel = $context->delayLevelWhenNextConsume;
                 if (!$delayLevel) {
-                    // Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
                     $delayLevel = 3 + $msg->getReconsumeTimes();
                 }
                 $this->sendMessageBack($msg, $delayLevel);
@@ -2447,18 +2186,14 @@ final class DefaultMQPushConsumer
         return $failed;
     }
 
-    /** 消息重投（对应 Java sendMessageBack，CONSUMER_SEND_MSG_BACK(36)）。 */
     public function sendMessageBack(MessageExt $msg, int $delayLevel, ?string $brokerName = null): void
     {
         $client = $this->requireClient();
         $brokerName = $brokerName ?? (string) $msg->brokerName;
-        // Java :768 用的是 findBrokerAddressInPublish（只认 master）；
-        // 从节点不接 CONSUMER_SEND_MSG_BACK。
         $addr = $client->findBrokerAddressInPublish($brokerName);
         if ($addr === null || $addr === '') {
             throw new MQClientException("Broker[$brokerName] master node does not exist");
         }
-        // Java：maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）。
         $maxReconsume = $this->maxReconsumeTimes === -1 ? 16 : $this->maxReconsumeTimes;
         $header = new ConsumerSendMsgBackRequestHeader();
         $header->offset = $msg->commitLogOffset;
@@ -2477,10 +2212,6 @@ final class DefaultMQPushConsumer
 
     // ---------------- 顺序消费的重试计数与回投 ----------------
 
-    /**
-     * Java ``ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234``：
-     * 解析 -1 → 回落到消费者配置，再钳到 [10, 30000]。
-     */
     private function orderlySuspendMillis(ConsumeOrderlyContext $context): int
     {
         $ms = $context->suspendCurrentQueueTimeMillis;
@@ -2496,10 +2227,6 @@ final class DefaultMQPushConsumer
         return $ms;
     }
 
-    /**
-     * Java ConsumeMessageOrderlyService#getMaxReconsumeTimes:313-320。
-     * 顺序侧 `-1` 是「不设限」（Integer.MAX_VALUE）；并发侧 `-1 → 16` 是另一套语义。
-     */
     private function orderlyMaxReconsumeTimes(): int
     {
         if ($this->maxReconsumeTimes === -1) {
@@ -2508,7 +2235,6 @@ final class DefaultMQPushConsumer
         return $this->maxReconsumeTimes;
     }
 
-    /** Java ConsumeMessageOrderlyService#checkReconsumeTimes:322-336。返回是否还要原地挂起。 */
     private function checkOrderlyReconsumeTimes(?array $msgs): bool
     {
         $suspend = false;
@@ -2528,11 +2254,6 @@ final class DefaultMQPushConsumer
         return $suspend;
     }
 
-    /**
-     * Java ConsumeMessageOrderlyService#sendMessageBack:338-360。
-     * 拿实例自带的内部生产者，把这条消息**当普通消息**发到 `%RETRY%<group>`。
-     * 失败只返回 false、绝不抛。
-     */
     private function orderlySendMessageBack(MessageExt $msg): bool
     {
         try {
@@ -2571,13 +2292,6 @@ final class DefaultMQPushConsumer
 
     // ---------------- 位点推进 / 修正 / 纠错 ----------------
 
-    /**
-     * 推进"已消费位点"（Java ConsumeMessageConcurrentlyService:266 的 updateOffset）。
-     *
-     * ``epoch`` 与当前代号不一致说明队列已被撤销/重建，**整批 ack 作废**；
-     * ``frozenOffsets`` 里的是被 OFFSET_ILLEGAL 纠错冻结的位点，同样不许改。
-     * 判据与写入必须在同一"临界区"（单线程下即同一段顺序代码）。
-     */
     private function advanceConsumeOffset(string $key, array $batch, ?int $floor = null, ?int $epoch = null): void
     {
         if ($batch === []) {
@@ -2604,13 +2318,6 @@ final class DefaultMQPushConsumer
         $this->consumeOffsets[$key] = max($cur, $nextOff);
     }
 
-    /**
-     * Java ``DefaultMQPushConsumerImpl#correctTagsOffset``（:713-717）。
-     *
-     * 拉取应答是 ``NO_NEW_MSG``（队列里真没消息）或 ``NO_MATCHED_MSG`` 时，"已消费位点"
-     * 必须跟着拉取游标走，否则会**永久卡死**。闸门：``0L == processQueue.getMsgCount()``
-     * —— ``pending`` 为空**且**在途批次为 0 才允许推进。
-     */
     private function correctTagsOffset(string $key, PullStatus $status, ?int $nextOff): void
     {
         if ($status !== PullStatus::NO_NEW_MSG && $status !== PullStatus::NO_MATCHED_MSG) {
@@ -2632,16 +2339,10 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /**
-     * Java ``DefaultMQPushConsumerImpl`` 的 OFFSET_ILLEGAL 分支（:402-427）。
-     * 置位点 + 冻结 → 撤队列（代号 +1，等价 setDropped）→ 锁外把修正位点推给 broker
-     * （等价 persist）→ 触发 rebalance 重建。
-     */
     private function offsetIllegalRecover(string $key): void
     {
         $retired = [];
         $this->retireQueue($key, null, $retired);
-        // persist：把修正后的位点立刻写回 broker（Java 显式的一次 persist）。
         $this->onQueuesRevoked($retired);
         $this->rebalanceImmediately();
         Logger::warning("the pull request offset illegal, fix it, queue=$key");
@@ -2669,7 +2370,6 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** Java LocalFileOffsetStore：$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json */
     private function localOffsetPath(): string
     {
         $home = getenv('HOME') ?: '';
@@ -2682,11 +2382,6 @@ final class DefaultMQPushConsumer
         ]);
     }
 
-    /**
-     * 把本地位点表写盘（Java ``LocalFileOffsetStore.persist``）。
-     *
-     * @param list<array{0:MessageQueue,1:int|null}>|null $extra 刚被撤下来、已不在表里的队列位点
-     */
     private function saveLocalOffsets(?array $extra = null): void
     {
         $items = $this->consumeOffsets;
@@ -2705,7 +2400,6 @@ final class DefaultMQPushConsumer
             @mkdir($dir, 0777, true);
         }
         $text = build_local_offsets_json($items, $mqMap);
-        // Java MixAll.string2File：旧内容先滚到 .bak 再写新文件
         if (is_file($path)) {
             $prev = (string) @file_get_contents($path);
             if ($prev !== '') {
@@ -2717,7 +2411,6 @@ final class DefaultMQPushConsumer
         @rename($tmp, $path);
     }
 
-    /** Java readLocalOffset：主文件缺失/为空/解析失败 → .bak。 */
     private function loadLocalOffsets(): array
     {
         foreach ([$this->localOffsetPath(), $this->localOffsetPath() . '.bak'] as $path) {
@@ -2738,7 +2431,6 @@ final class DefaultMQPushConsumer
 
     // ---------------- 顺序消费队列锁 ----------------
 
-    /** 每 20s 批量锁分到的队列（Java ConsumeMessageOrderlyService.lockMQ；tick 内到点调用）。 */
     private function lockQueuesOnce(): void
     {
         try {
@@ -2770,7 +2462,6 @@ final class DefaultMQPushConsumer
     public function fetchSubscribeMessageQueues(string $topic): array
     {
         $client = $this->requireClient();
-        // Java #fetchSubscribeMessageQueues:198 读订阅信息（读位、不筛 master），不是发布信息。
         return $client->getTopicSubscribeInfo($topic);
     }
 
@@ -2807,10 +2498,6 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /**
-     * 对应 Java 的 returnType 判定（决定轨迹的 contextCode）。
-     * 顺序消费把「挂起」等价于 FAILED、成功等价于 SUCCESS。
-     */
     private function consumeReturnType(
         ?object $status,
         bool $hasException,
@@ -2830,7 +2517,6 @@ final class DefaultMQPushConsumer
         return ConsumeReturnType::SUCCESS;
     }
 
-    /** 消费耗时记数（Java ConsumeRequest.run 里那条**无条件**的 incConsumeRT）。 */
     private function recordConsumeRt(string $topic, int $beginMs): void
     {
         if ($this->statsManager === null) {
@@ -2839,10 +2525,6 @@ final class DefaultMQPushConsumer
         $this->statsManager->incConsumeRt($this->consumerGroup, $topic, UtilAll::currentTimeMillis() - $beginMs);
     }
 
-    /**
-     * 消费侧 TPS 记数（Java ``processConsumeResult`` 的 ok/failed 分支）。
-     * ``ackCount`` 对应 Java :217-220 的 ``ok = ackIndex + 1``。
-     */
     private function recordConsumeStats(
         string $topic,
         int $msgCount,
@@ -2865,11 +2547,6 @@ final class DefaultMQPushConsumer
         $this->recordConsumeRt($topic, $beginMs);
     }
 
-    /**
-     * 把 returnType/status/success 写回上下文并触发 after 钩子（对齐 Java）。
-     * ``status`` 是决定 returnType 的那一个（归一化**前**）；``hookStatus`` 是写进上下文的
-     * 那一个（归一化**后**）—— Java 里这两步用的**不是同一个值**。
-     */
     private function finishConsumeHook(
         ?ConsumeMessageContext $hookCtx,
         ?object $status,
@@ -2930,10 +2607,8 @@ final class DefaultMQPushConsumer
         $invisible = $this->popInvisibleTime;
         if ($invisible < ConsumerDefaults::MIN_POP_INVISIBLE_TIME
             || $invisible > ConsumerDefaults::MAX_POP_INVISIBLE_TIME) {
-            // Java 的钳制：超出 [5s, 300s] 一律回落到 60s
             $invisible = 60000;
         }
-        // Java PopRequest 默认 ConsumeInitMode.MAX；按 consume_from_where 映射。
         $initMode = $this->consumeFromWhere === ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET
             ? ConsumerDefaults::CONSUME_INIT_MODE_MIN
             : ConsumerDefaults::CONSUME_INIT_MODE_MAX;
@@ -2945,9 +2620,6 @@ final class DefaultMQPushConsumer
         $now = microtime(true);
         $this->lastPullTable[$key] = $now;
         $pq->lastPopTimestamp = $now;
-        // Java popMessage:518-521：POP 模式读同一个挂起布尔，且同样落在盖章之后
-        // （理由见 pullOnce）。挂起期间继续盖章，队列才不会被撤、在途批次才不会被丢给
-        // broker 的 revive 重投。
         if ($this->paused) {
             return false;
         }
@@ -2955,7 +2627,6 @@ final class DefaultMQPushConsumer
         if ($sub === null) {
             return false;
         }
-        // 流控：已弹未 ack 太多就先缓一缓（Java popThresholdForQueue）。
         if ($pq->waitAckCount() > $this->popThresholdForQueue) {
             return false;
         }
@@ -2995,7 +2666,6 @@ final class DefaultMQPushConsumer
         }
         $found = $result->status === PopStatus::FOUND;
         if ($found) {
-            // Java PopCallback.onSuccess:556-563：RT 在 FOUND 分支入口就记，TPS 按弹到的条数记。
             if ($this->statsManager !== null) {
                 $this->statsManager->incPullRt($this->consumerGroup, $mq->topic,
                     (int) ((microtime(true) - $began) * 1000));
@@ -3007,8 +2677,6 @@ final class DefaultMQPushConsumer
         }
         if ($found && $result->msgFoundList !== []) {
             $pq->incFoundMsg(count($result->msgFoundList));
-            // 投递前过滤（对齐 Java processPopResult:621-661）：POP 路径**必须 ack 被摘掉的**，
-            // 否则 invisibleTime 到期后 broker 会复活重投 —— 表现为"过滤没生效"。
             $kept = filter_messages_for_delivery(
                 $this->consumerGroup,
                 $this->filterMessageHookList,
@@ -3045,11 +2713,6 @@ final class DefaultMQPushConsumer
         return false;
     }
 
-    /**
-     * Java DefaultMQPushConsumerImpl:960-990 按 listener 类型选服务：顺序监听器 +
-     * POP 走 ConsumeMessagePopOrderlyService —— 上游 5.5.0 那是个未完成骨架（POPTODO）：
-     * 消息**不消费、不 ack**，invisibleTime 到期由 broker 复活重投。照抄这个行为，别"修好"。
-     */
     private function submitPopConsumeRequest(array $msgs, PopProcessQueue $pq, MessageQueue $mq): void
     {
         if ($this->isOrderly()) {
@@ -3062,14 +2725,10 @@ final class DefaultMQPushConsumer
             if ($batch === []) {
                 continue;
             }
-            // PHP 单线程：消费批次内联执行（Java 的 consumeExecutor 线程池无对应物）。
             $this->consumePopBatch($batch, $pq, $mq);
         }
     }
 
-    /**
-     * 对应 Java ConsumeMessagePopOrderlyService.submitConsumeRequest:178-191：锁下去重。
-     */
     private function submitPopOrderlyRequest(PopProcessQueue $pq, MessageQueue $mq, bool $force = false): void
     {
         $key = self::mqKey($mq);
@@ -3083,10 +2742,6 @@ final class DefaultMQPushConsumer
         $this->runPopOrderlyRequest($pq, $mq);
     }
 
-    /**
-     * 对应 Java ConsumeMessagePopOrderlyService$ConsumeRequest.run:315-324 —— 上游
-     * 5.5.0 的骨架到此为止：pq 被撤销才摘请求；否则**什么都不做**。
-     */
     private function runPopOrderlyRequest(PopProcessQueue $pq, MessageQueue $mq): void
     {
         if ($pq->isDropped()) {
@@ -3096,13 +2751,11 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** 请求集条数（Java consumeRequestSet.size()；去重行为要能离线锁死）。 */
     public function popOrderlyRequestCount(): int
     {
         return count($this->popOrderlyRequests);
     }
 
-    /** 消费一个 POP 批次并按结果 ack / 延长不可见时间（Java ConsumeMessagePopConcurrentlyService$ConsumeRequest.run）。 */
     private function consumePopBatch(array $msgs, PopProcessQueue $pq, MessageQueue $mq): void
     {
         if ($pq->isDropped() || $msgs === []) {
@@ -3128,8 +2781,6 @@ final class DefaultMQPushConsumer
 
         $this->resetRetryTopicAndNamespace($msgs);
         $context = new ConsumeConcurrentlyContext($mq);
-        // 对齐 Java ackIndex = Integer.MAX_VALUE 的默认值，显式钳成 size-1：CONSUME_SUCCESS
-        // 默认全部 ack。若写成 -1，一条都不会 ack —— 短观测窗口下会伪装成通过。
         $context->ackIndex = count($msgs) - 1;
         $hookCtx = null;
         if ($this->consumeMessageHookList !== []) {
@@ -3139,18 +2790,15 @@ final class DefaultMQPushConsumer
         $beginMs = UtilAll::currentTimeMillis();
         $hasException = false;
         try {
-            // Java :379-385 —— 交给 listener 前逐条盖 CONSUME_START_TIME。
             foreach ($msgs as $m) {
                 MessageAccessor::setConsumeStartTimestamp($m, UtilAll::currentTimeMillis());
             }
             $status = $this->messageListener->consumeMessage($msgs, $context);
         } catch (\Throwable $e) {
-            // Java：消费抛异常按 RECONSUME_LATER 处理
             Logger::debug('pop listener error, treat as RECONSUME_LATER: ' . $e->getMessage());
             $status = ConsumeConcurrentlyStatus::RECONSUME_LATER;
             $hasException = true;
         }
-        // Java POP :396-405 —— listener 返回 null 同样按 RECONSUME_LATER 处理。
         $rawStatus = $status;
         if ($status === null) {
             Logger::warning(sprintf(
@@ -3185,7 +2833,6 @@ final class DefaultMQPushConsumer
         $this->processPopConsumeResult($status, $context, $msgs, $pq, $mq);
     }
 
-    /** Java ConsumeRequest.isPopTimeout：不能解析出 popTime/invisibleTime 时按超时处理。 */
     private static function isPopTimeout(array $msgs, int $popTime, int $invisible): bool
     {
         if ($msgs === [] || $popTime <= 0 || $invisible <= 0) {
@@ -3194,7 +2841,6 @@ final class DefaultMQPushConsumer
         return UtilAll::currentTimeMillis() - $popTime >= $invisible;
     }
 
-    /** 对应 Java ConsumeMessagePopConcurrentlyService.processConsumeResult。 */
     private function processPopConsumeResult(
         ConsumeConcurrentlyStatus $status,
         ConsumeConcurrentlyContext $context,
@@ -3220,7 +2866,6 @@ final class DefaultMQPushConsumer
         for ($i = $ackIndex + 1; $i < count($msgs); $i++) {
             $pq->ack();
             $msg = $msgs[$i];
-            // 超过最大重试次数：Java 走 checkNeedAckOrDelay。
             if ($this->maxReconsumeTimes >= 0 && $msg->getReconsumeTimes() >= $this->maxReconsumeTimes) {
                 $this->checkNeedAckOrDelay($msg);
                 continue;
@@ -3229,10 +2874,6 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /**
-     * Java checkNeedAckOrDelay：重试次数用尽后的兜底。
-     * 存活时间已超过最大延迟档位的 2 倍 → 直接 ack 丢弃；否则按存活时间选档位续命。
-     */
     private function checkNeedAckOrDelay(MessageExt $msg): void
     {
         $table = $this->popDelayLevel;
@@ -3284,7 +2925,6 @@ final class DefaultMQPushConsumer
         return [$topic, $brokerName, $queueId, $offset, $ck];
     }
 
-    /** 单条 ack（对应 Java DefaultMQPushConsumerImpl.ackAsync）。 */
     private function ackPopMsg(MessageExt $msg): void
     {
         $target = $this->popCkTarget($msg);
@@ -3294,9 +2934,6 @@ final class DefaultMQPushConsumer
         [$topic, $brokerName, $queueId, $offset, $ck] = $target;
         try {
             $client = $this->requireClient();
-            // Java ackAsync 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)：**只要主**。
-            // 静态主题：mock broker 名先经 topicEndPointsTable 重写成真实承载者
-            // （用 checkpoint 自己的 queueId —— 各 globalId 可能落在不同 broker）。
             $client->ackMessage(
                 $this->consumerGroup,
                 $topic,
@@ -3312,10 +2949,6 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /**
-     * 延长不可见时间（对应 Java changePopInvisibleTime）。
-     * ``delayLevel == 0`` 时 Java 用消息已重试次数当档位；档位表是**秒**，接口要毫秒。
-     */
     private function changePopInvisibleTime(MessageExt $msg, int $delayLevel): void
     {
         $target = $this->popCkTarget($msg);
@@ -3332,8 +2965,6 @@ final class DefaultMQPushConsumer
             : $table[max(0, $delayLevel)];
         try {
             $client = $this->requireClient();
-            // Java changePopInvisibleTimeAsync:869-876 同样是「只要主」+ 刷一次路由；
-            // mock 名重写同 ack 路径。
             $client->changeInvisibleTime(
                 $this->consumerGroup,
                 $topic,

@@ -1,6 +1,3 @@
-//! 消息属性键常量（对应 Java `org.apache.rocketmq.common.message.MessageConst`，
-//! 参考实现 `python/common/message_const.py`）。
-//!
 //! 这些字符串就是 broker 与客户端之间的**协议字面量**（写进 17 段消息的第 17 项
 //! 属性区，也被 broker 侧过滤/轨迹/事务逻辑按名字读取），所以取值一个字符都不能改；
 //! 常量名沿用 Python（去掉 `PROPERTY_` 前缀会丢语义，故保留）。
@@ -52,15 +49,11 @@ pub const PROPERTY_INNER_MULTI_QUEUE_OFFSET: &str = "INNER_MULTI_QUEUE_OFFSET";
 pub const PROPERTY_POP_CK: &str = "POP_CK";
 pub const PROPERTY_POP_CK_OFFSET: &str = "POP_CK_OFFSET";
 pub const PROPERTY_POP_TIME: &str = "POP_TIME";
-/// Java 侧写的是 `1ST_POP_TIME`（`PROPERTY_FIRST_POP_TIME`），客户端仅在缺失时补。
 pub const PROPERTY_FIRST_POP_TIME: &str = "1ST_POP_TIME";
 pub const PROPERTY_INVISIBLE_TIME: &str = "INVISIBLE_TIME";
 pub const PROPERTY_DELAY_TIME: &str = "DELAY_TIME";
-/// Java `MessageConst.PROPERTY_TIMER_DELAY_SEC`：定时消息「延迟秒数」。
 pub const PROPERTY_TIMER_DELAY_SEC: &str = "TIMER_DELAY_SEC";
-/// Java `MessageConst.PROPERTY_TIMER_DELAY_MS`：定时消息「延迟毫秒数」。
 pub const PROPERTY_TIMER_DELAY_MS: &str = "TIMER_DELAY_MS";
-/// Java `MessageConst.PROPERTY_TIMER_DELIVER_MS`：定时消息「绝对投递时刻（毫秒）」。
 pub const PROPERTY_TIMER_DELIVER_MS: &str = "TIMER_DELIVER_MS";
 pub const PROPERTY_START_TIME: &str = "START_TIME";
 pub const PROPERTY_END_TIME: &str = "END_TIME";
@@ -73,9 +66,6 @@ pub const PROPERTY_KEYS_CONST: &str = "KEYS";
 pub const PROPERTY_ORIGIN_QUEUE_ID: &str = "ORIGIN_QID";
 pub const PROPERTY_ORIGIN_TOPIC: &str = "ORIGIN_TOPIC";
 
-/// Java 4.x 的 `MessageConst.STRING_ALL_PROPERTY`（5.x 已删，Python 里降级成了
-/// `STRING_HASH_SET = 1` 这个占位整数）。这里按 Python 的声明顺序给出全量属性键，
-/// 供「区分系统属性与用户属性」的场景使用（如轨迹、控制台展示）。
 pub const STRING_ALL_PROPERTY: &[&str] = &[
     PROPERTY_KEYS,
     PROPERTY_TAGS,
@@ -121,7 +111,6 @@ pub const STRING_ALL_PROPERTY: &[&str] = &[
     PROPERTY_INVISIBLE_TIME,
 ];
 
-/// Python 遗留占位（Java 原本是 `Set<String> STRING_HASH_SET`），仅为常量表完整。
 pub const STRING_HASH_SET: i32 = 1;
 
 pub const KEY_SEPARATOR: &str = " ";
@@ -135,7 +124,6 @@ pub const INDEX_KEY_TYPE: &str = "K";
 pub const INDEX_UNIQUE_TYPE: &str = "U";
 pub const INDEX_TAG_TYPE: &str = "T";
 
-/// 对应 Java `MessageConst#messageIdPrefix`（Python 里是 staticmethod）。
 pub fn message_id_prefix() -> &'static str {
     MESSAGE_ID_PREFIX
 }
@@ -163,7 +151,6 @@ mod tests {
         assert_eq!(PROPERTY_MSG_REGION, "MSG_REGION");
         assert_eq!(PROPERTY_TRACE_SWITCH, "TRACE_ON");
         assert_eq!(PROPERTY_FIRST_POP_TIME, "1ST_POP_TIME");
-        // 定时消息三个键：与 Java MessageConst 一字不差（写进消息属性区的协议字面量）
         assert_eq!(PROPERTY_TIMER_DELAY_SEC, "TIMER_DELAY_SEC");
         assert_eq!(PROPERTY_TIMER_DELAY_MS, "TIMER_DELAY_MS");
         assert_eq!(PROPERTY_TIMER_DELIVER_MS, "TIMER_DELIVER_MS");

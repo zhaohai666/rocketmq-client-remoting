@@ -131,9 +131,6 @@ def main() -> int:
     msg_collector = _MsgCollector()
     consumer = DefaultMQPushConsumer(CONSUMER_GROUP)
     consumer.set_namesrv_addr(NAMESRV)
-    # ⚠ 必须 CONSUME_FROM_LAST_OFFSET：S1 的预热消息**没有 keys**，用 FIRST_OFFSET 会被
-    #   业务消费者一起吃掉 —— 除让计数断言变脏，还会产生一条 keys 为空的 SubBefore
-    #   （Java 解码器正是在这一条上 AIOOBE）。从队尾起算，只消费本次要验证的消息。
     consumer.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_LAST_OFFSET)
     consumer.subscribe(TOPIC, "*")
     consumer.set_message_listener(msg_collector)
@@ -176,9 +173,6 @@ def main() -> int:
           got and len(msgs) == 1, "count=%d" % len(msgs))
     recv = msgs[0] if msgs else None
     recv_msg_id = recv.msg_id if recv else None
-    # Java 语义（MessageDecoder:557-561）：消费侧 MessageExt.getMsgId() **就是** offset 基 ID
-    # —— 它先 setMsgId(msgId) 再 setOffsetMsgId(msgId)，两者同值；UNIQ_KEY 只在属性里。
-    # 因此能与消费侧 msg_id 对齐的是 SendResult.offset_msg_id，不是 SendResult.msg_id。
     check("S7 消费侧 msg_id == SendResult.offset_msg_id，且 UNIQ_KEY 经属性带到消费侧",
           recv is not None and recv_msg_id == result.offset_msg_id
           and get_uniq_id(recv) == result.msg_id,
@@ -272,10 +266,6 @@ def main() -> int:
     check("S15 enable_trace=false 的生产者不产生 Pub 轨迹", len(leaked) == 0,
           "leaked=%d" % len(leaked))
 
-    # ---------- S16 编码结构自检 ----------
-    # 每条轨迹记录都以 FIELD_SPLITOR 结尾（Java encoderFromContextBean 的 `+ STX`），
-    # 所以「STX 出现次数」就是记录数；解码侧用 Java split 语义丢掉末尾空串后应得到同样条数。
-    # 这条断言的价值在于：只要解码器丢过任何一条记录（真机踩过），这里立刻红。
     all_segments = sum(text.count(TraceConstants.FIELD_SPLITOR)
                        for _k, t, text in raw if t == MixAll.TRACE_TOPIC)
     check("S16 轨迹文本记录数（STX 计数）== 解码出的记录数（Java split 语义）",

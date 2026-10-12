@@ -1,14 +1,4 @@
 // 钩子单测：CheckForbiddenHook（发送前拦截）与 FilterMessageHook（投递前过滤）——不需要集群。
-//
-// 这两个钩子是 send/consume 钩子体系之外**语义最反直觉**的两个，所以离线必须锁死：
-//   * CheckForbiddenHook 的异常**不被吞掉**（与 send/consume/endTransaction 钩子相反），
-//     它是靠"抛异常沿发送重试链传播"来实现"禁止发送"的；
-//   * FilterMessageHook 的 msgList 是**可变**的，被摘掉的消息在拉取路径是"静默跳过"
-//     （位点照常推进），在 POP 路径则必须**补 ack**（否则 invisibleTime 后复活重投）；
-//   * 过滤顺序：先客户端二次 tag 过滤，再跑钩子（对齐 Java processPullResult 113-128）。
-//
-// 同时把"订阅语义"的 Java 对拍向量固化在这里（* / 空 / 纯空白 / 全分隔符 / 单竖线），
-// 探针见 /tmp/subprobe/{SubProbe,BlankProbe,EdgeProbe}.java。
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -125,9 +115,7 @@ public:
     int32_t calls = 0;
 };
 
-// ---------------------------------------------------------------- 订阅语义（Java 对拍向量）
 void testSubscriptionFieldParity() {
-    // "*" / "" → SUB_ALL 且两集合都空（Java setSubString("*") 后直接 return）
     SubscriptionData all1 = FilterAPI::buildSubscriptionData("T", "*");
     expect(all1.subString == "*" && all1.tagsSet.empty() && all1.codeSet.empty(),
            "sub '*': SUB_ALL + empty sets");
@@ -156,7 +144,6 @@ void testSubscriptionFieldParity() {
     expect(spaced.tagsSet.count("TagA") == 1 && spaced.tagsSet.count("TagB") == 1,
            "sub spaced: tags trimmed");
 
-    // "|||" → Java split("\\|\\|") == ["", "|"] → 丢末尾空串后剩 ["|"] → 字面量标签 "|"（hash 124）
     SubscriptionData pipes = FilterAPI::buildSubscriptionData("T", "|||");
     expect(pipes.tagsSet.size() == 1 && pipes.tagsSet.count("|") == 1,
            "sub '|||': literal '|' tag (only TRAILING empties dropped)");
@@ -167,7 +154,6 @@ void testSubscriptionFieldParity() {
     expect(star.tagsSet.size() == 2 && star.codeSet.count(42) == 1,
            "sub '*||TagA': '*' is a literal tag with hash 42");
 
-    // "||" / "||||" → Java-split 结果数组长度为 0 → 抛 "subString split error"
     for (const char* bad : {"||", "||||"}) {
         bool threw = false;
         try {
@@ -192,7 +178,6 @@ void testCheckForbiddenHook() {
     expect(producer.hasCheckForbiddenHook() && producer.checkForbiddenHookCount() == 1,
            "forbidden: register makes has/count true");
     expect(producer.hasSendInterceptors(), "forbidden: registering enables the hook path");
-    // 注册 nullptr 不得进入列表（Java registerCheckForbiddenHook 同样判空）
     producer.registerCheckForbiddenHook(nullptr);
     expectInt(producer.checkForbiddenHookCount(), 1, "forbidden: nullptr not registered");
 
@@ -218,7 +203,6 @@ void testCheckForbiddenHook() {
     expect(!hook->lastArgIsNull, "forbidden: selector arg is passed through");
     expect(hook->lastBody == "hello", "forbidden: context carries the message");
 
-    // 每个钩子都被执行（Java 是 for 循环，不像 send hook 那样需要成对）
     auto hook2 = std::make_shared<ForbidHook>(false);
     producer.registerCheckForbiddenHook(hook2);
     producer.executeCheckForbiddenHook(ctx);
@@ -347,7 +331,6 @@ void testContextDefaults() {
     expect(fm.unitMode == false, "ctx: FilterMessageContext unitMode defaults false");
     expect(fm.arg == nullptr, "ctx: FilterMessageContext arg defaults null");
 
-    // 三种发送模式（对齐 Java CommunicationMode 枚举）
     expectInt(static_cast<int>(CommunicationMode::SYNC), 0, "ctx: SYNC ordinal");
     expectInt(static_cast<int>(CommunicationMode::ASYNC), 1, "ctx: ASYNC ordinal");
     expectInt(static_cast<int>(CommunicationMode::ONEWAY), 2, "ctx: ONEWAY ordinal");

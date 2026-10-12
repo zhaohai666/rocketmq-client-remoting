@@ -56,8 +56,6 @@ func startDetectorFixture(t *testing.T, probeAnswer func() int32) (*DefaultMQPro
 	if _, err := p.topicPublishInfo(detectTestTopic); err != nil {
 		t.Fatalf("warm route: %v", err)
 	}
-	// Shrink Java's fixed 3s scheduler tick. tickMillis is an atomic the loop
-	// reads between rounds, so the write is race-free.
 	p.faultStrategy.latencyFaultTolerance.tickMillis.Store(50)
 	return p, broker
 }
@@ -73,9 +71,6 @@ func TestFaultDetectorProbesPeriodicallyAndRestoresReachability(t *testing.T) {
 	})
 	tolerance := p.faultStrategy.latencyFaultTolerance
 
-	// What a send failure with the detector on writes (Java :821): b1 becomes
-	// unreachable. The isolation window is zeroed so only the reachable flag
-	// gates the second selection pass.
 	tolerance.updateFaultItem("b1", 0, 0, false)
 	if tolerance.isReachable("b1") {
 		t.Fatal("precondition: b1 must start unreachable")
@@ -130,8 +125,6 @@ func TestFaultDetectorTimeoutKeepsBrokerUnreachable(t *testing.T) {
 
 func TestFaultDetectorDisabledNeverProbes(t *testing.T) {
 	p, broker := startDetectorFixture(t, func() int32 { return 0 })
-	// The switch is consulted every tick, so a runtime flip is honoured
-	// (Java ClientConfig semantics).
 	p.SetStartDetectorEnable(false)
 	tolerance := p.faultStrategy.latencyFaultTolerance
 	tolerance.updateFaultItem("b1", 0, 0, false)
@@ -157,7 +150,7 @@ func TestDetectByOneRoundCoversRouteGoneAndSelection(t *testing.T) {
 	tol.setDetector(
 		func(name string) (string, bool) {
 			if name == "gone" {
-				return "", false // Java Resolver: null -> drop the record
+				return "", false
 			}
 			return "127.0.0.1:1", true
 		},

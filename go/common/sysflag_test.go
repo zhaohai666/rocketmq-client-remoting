@@ -68,7 +68,6 @@ func TestCompressionTypeBits(t *testing.T) {
 	if !IsCompressed(set) {
 		t.Fatal("compressed bit must survive SetCompressionType")
 	}
-	// 解压后只清 COMPRESSED，类型位保留（Java 同语义）
 	cleared := ClearCompressedFlag(MessageSysFlagCompressed | MessageSysFlagCompressionZlib)
 	if IsCompressed(cleared) {
 		t.Fatal("compressed bit must be cleared")

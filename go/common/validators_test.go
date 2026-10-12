@@ -7,8 +7,6 @@ import (
 
 func repeatByte(b byte, n int) string { return strings.Repeat(string([]byte{b}), n) }
 
-// clientErrOf unwraps an *Error and returns (message, code, hasCode) so the
-// tests can assert Java's "pure client error has no code" rule explicitly.
 func clientErrOf(t *testing.T, err error) (string, int32, bool) {
 	t.Helper()
 	if err == nil {
@@ -30,7 +28,6 @@ func TestCheckGroupRulesAndTextsMatchServerValidation(t *testing.T) {
 		if text != "the specified group is blank" {
 			t.Fatalf("blank group %q: message %q", blank, text)
 		}
-		// Pure client error: no broker code (Java's -1).
 		if hasCode || code != 0 {
 			t.Fatalf("blank group %q must carry no code, got (%d,%v)", blank, code, hasCode)
 		}
@@ -89,8 +86,6 @@ func TestSystemAndForbiddenTopicsAreCodeless(t *testing.T) {
 	if text != "Sending message to topic[SCHEDULE_TOPIC_XXXX] is forbidden." {
 		t.Fatalf("forbidden topic text: %q", text)
 	}
-	// Java's isNotAllowedSendTopic is also (String, null) => no broker code,
-	// deliberately NOT MESSAGE_ILLEGAL.
 	if hasCode || code != 0 {
 		t.Fatalf("forbidden topic must be codeless, got (%d,%v)", code, hasCode)
 	}
@@ -122,14 +117,12 @@ func TestCheckMessageBodyBranchesCarryCode13(t *testing.T) {
 		t.Fatalf("oversize body must carry 13, got %d", code)
 	}
 
-	// Exactly at the threshold passes: Java uses >, not >=.
 	if err := CheckMessage(&Message{Topic: "T1", Body: make([]byte, 4096)}, 4096); err != nil {
 		t.Fatalf("body at the threshold must pass: %v", err)
 	}
 }
 
 func TestCheckMessageValidatesTopicBeforeBody(t *testing.T) {
-	// Illegal topic + empty body reports the topic problem: order is Java's.
 	text, code, hasCode := clientErrOf(t, CheckMessage(&Message{Topic: "bad.topic"}, 4096))
 	if !strings.HasPrefix(text, "The specified topic[bad.topic]") {
 		t.Fatalf("topic must be checked first, got %q", text)

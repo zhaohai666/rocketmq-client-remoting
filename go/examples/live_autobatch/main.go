@@ -93,13 +93,6 @@ func main() {
 	}
 	defer p.Shutdown()
 
-	// ---- 1. sync auto-batch: CONCURRENT senders coalesce into batches ----
-	// Java semantics: a sync Add blocks until its batch is flushed, so a
-	// single-threaded sequential sender legitimately gets one batch per
-	// message (flushed at the hold deadline). Coalescing shows up with
-	// concurrent senders: 6 goroutines racing inside the 1s hold window must
-	// share batches, and every caller still gets its OWN per-message SendResult
-	// (split from the batch reply).
 	ids := map[string]bool{}
 	distinct := true
 	var idsMu sync.Mutex

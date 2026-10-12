@@ -1,20 +1,8 @@
-//! 定点发送 topic 一致性守卫真机验证（Java `DefaultMQProducerImpl:1234-1236` / `:1277-1278`）。
-//!
 //! 与 `python/verify_pinned_guard_live.py`（S1..S6）、`cpp/examples/live_pinned_guard.cpp`、
 //! `csharp/examples/RocketMQ.Examples/LivePinnedGuard.cs` 同题。
 //!
 //! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
 //!
-//! 离线单测（`src/client/producer/send_retry_tests.rs`）用假集群证明的是「拒了、且报文没上线」；
-//! 真机这一趟证明**另一面**：
-//! - S1/S6 守卫不误伤真业务：从真路由取到的队列在同步单条/同步批量/异步单条/异步批量四条
-//!   入口上照常 `SEND_OK`，消息按 keys 一条不少地被消费到；
-//! - S2/S4 拒的时候守在本端：亚毫秒、无 broker 码，而且 **broker 上的 maxOffset 一动不动**
-//!   （真机版的 wire 反证：拒绝不留痕，也不会事后偷发）；
-//! - S3 命名空间的比较用 Java `queueWithNamespace` 的幂等：`ns%topic` 与裸 topic 都不误拒，
-//!   `ns2%topic` 才拒；
-//! - S5 单向定点**没有**守卫（Java `:1303-1310` 有意留的口子）：报文按 msg 自己的 topic
-//!   落库 —— 用「A 收到、B 的 maxOffset 还是 0」把这条语义钉死。
 //!
 //! 用法：
 //! ```text
@@ -619,7 +607,6 @@ async fn run(namesrv: &str) -> Checker {
         &format!("maxOffset={off_after_async}"),
     );
 
-    // ---------------- S5 单向：Java 有意没有守卫 ----------------
     println!("\n-- S5 单向定点没有守卫：msg 自己的 topic 说了算 --");
     let k_ow = format!("pinned-oneway-{stamp}");
     let mut ow = Message::new(&topic_a, Some(b"oneway"));

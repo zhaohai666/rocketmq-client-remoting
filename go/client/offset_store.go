@@ -1,11 +1,3 @@
-// Consumer offset stores (Java org.apache.rocketmq.client.consumer.store.*).
-//
-// RemoteBrokerOffsetStore is the CLUSTERING store: offsets live broker-side,
-// the local table is a write-through cache. LocalFileOffsetStore is the
-// BROADCASTING store: offsets live under
-// $HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json in Java fastjson2's
-// MessageQueue-as-object-key format, with offsets.json.bak as the previous
-// generation.
 package client
 
 import (
@@ -21,14 +13,12 @@ import (
 // ReadOffsetMode selects where ReadOffset looks.
 type ReadOffsetMode int
 
-// Java OffsetStore.ReadOffsetMode.
 const (
 	ReadFromMemory ReadOffsetMode = iota // MEMORY_FIRST semantics handled by caller
 	ReadMemoryFirst
 	ReadFromStore
 )
 
-// OffsetStore is the shared interface (Java OffsetStore).
 type OffsetStore interface {
 	// Load pulls persisted offsets in (remote: nothing to do).
 	Load() error
@@ -36,8 +26,6 @@ type OffsetStore interface {
 	UpdateOffset(mq common.MessageQueue, offset int64, increaseOnly bool)
 	// ReadOffset answers the committed offset. -1 means "unknown".
 	ReadOffset(mq common.MessageQueue, mode ReadOffsetMode) (int64, error)
-	// PersistAll flushes the named queues and drops table entries for queues
-	// not named (Java's "remove unused mq").
 	PersistAll(mqs []common.MessageQueue) error
 	// Persist flushes one queue.
 	Persist(mq common.MessageQueue) error
@@ -66,9 +54,6 @@ func NewRemoteBrokerOffsetStore(instance *Instance, group string) *RemoteBrokerO
 // Load is a no-op: remote offsets are fetched on demand.
 func (s *RemoteBrokerOffsetStore) Load() error { return nil }
 
-// UpdateOffset records the offset. A missing entry is created even for offset
-// 0 (Java updateOffset's putIfAbsent — the second commit of a pair may carry
-// the lower value and must not erase the first).
 func (s *RemoteBrokerOffsetStore) UpdateOffset(mq common.MessageQueue, offset int64, increaseOnly bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -108,10 +93,6 @@ func (s *RemoteBrokerOffsetStore) ReadOffset(mq common.MessageQueue, mode ReadOf
 	return offset, nil
 }
 
-// PersistAll flushes the given queues to their brokers and removes table
-// entries for queues not in the list (Java's "remove unused mq" — rebalanced-
-// away queues must not re-appear on the next load). Broadcasting is the
-// caller's concern; this store only ever runs for clustering consumers.
 func (s *RemoteBrokerOffsetStore) PersistAll(mqs []common.MessageQueue) error {
 	if len(mqs) == 0 {
 		return nil
@@ -130,7 +111,7 @@ func (s *RemoteBrokerOffsetStore) PersistAll(mqs []common.MessageQueue) error {
 		if err := s.updateConsumeOffsetToBroker(mq, offset); err != nil && firstErr == nil {
 			firstErr = err
 		}
-	} // Drop entries the caller did not name — Java's removal condition is
+	}
 	// literally `!mqs.contains(mq)`, so a named queue keeps its table slot
 	// even when its offset was negative and never committed.
 	requested := make(map[common.MessageQueue]struct{}, len(mqs))
@@ -169,9 +150,6 @@ func (s *RemoteBrokerOffsetStore) Table() map[common.MessageQueue]int64 {
 	return out
 }
 
-// updateConsumeOffsetToBroker picks the address Java-style: master from the
-// publish table first, then "any addr for this broker in a cached route"
-// (findBrokerAddrByTopic fallback inside Java persistAll).
 func (s *RemoteBrokerOffsetStore) updateConsumeOffsetToBroker(mq common.MessageQueue, offset int64) error {
 	addr, ok := s.instance.FindBrokerAddressInPublish(mq.BrokerName)
 	if !ok {
@@ -200,9 +178,6 @@ type LocalFileOffsetStore struct {
 	storePath string
 }
 
-// NewLocalFileOffsetStore builds the store under the default path
-// (~/.rocketmq_offsets). An env override rocketmq.client.localOffsetStoreDir
-// takes the place of the base directory, matching Java.
 func NewLocalFileOffsetStore(clientID, group string) *LocalFileOffsetStore {
 	base := os.Getenv("rocketmq.client.localOffsetStoreDir")
 	if base == "" {
@@ -216,8 +191,6 @@ func NewLocalFileOffsetStore(clientID, group string) *LocalFileOffsetStore {
 	}
 }
 
-// Load reads offsets.json, falling back to offsets.json.bak when the main
-// file is missing; both missing is an empty table, not an error (Java same).
 func (s *LocalFileOffsetStore) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -230,8 +203,6 @@ func (s *LocalFileOffsetStore) Load() error {
 	}
 	table, err := decodeLocalOffsetTable(data)
 	if err != nil {
-		// A corrupt file must not brick the consumer; Java logs and keeps an
-		// empty table.
 		common.LogWarnf("load local offset store %s failed: %v", s.storePath, err)
 		s.table = map[common.MessageQueue]int64{}
 		return nil
@@ -270,7 +241,6 @@ func (s *LocalFileOffsetStore) PersistAll(mqs []common.MessageQueue) error {
 	return s.persistFile()
 }
 
-// Persist writes the whole table too (Java keeps one file per group).
 func (s *LocalFileOffsetStore) Persist(mq common.MessageQueue) error {
 	return s.persistFile()
 }
@@ -285,8 +255,6 @@ func (s *LocalFileOffsetStore) persistFile() error {
 	s.mu.Unlock()
 
 	body := encodeLocalOffsetTable(table)
-	// Java MixAll.string2File: the FIRST write creates the file, every later
-	// write rolls the previous content to offsets.json.bak before replacing.
 	if _, err := os.Stat(path); err == nil {
 		prev, err := os.ReadFile(path)
 		if err == nil {
@@ -304,12 +272,7 @@ func (s *LocalFileOffsetStore) persistFile() error {
 // StorePath exposes the backing file path (diagnostics).
 func (s *LocalFileOffsetStore) StorePath() string { return s.storePath }
 
-// encodeLocalOffsetTable writes Java fastjson2's shape:
-//
-//	{"offsetTable":{"{\"brokerName\":\"b\",\"queueId\":1,\"topic\":\"T\"}":9}}
-//
-// the outer keys being compact MessageQueue JSON text (Java fastjson2 writes
-// object keys alphabetically: brokerName, queueId, topic).
+// {"offsetTable":{"{\"brokerName\":\"b\",\"queueId\":1,\"topic\":\"T\"}":9}}
 func encodeLocalOffsetTable(table map[common.MessageQueue]int64) []byte {
 	entries := make(map[string]any, len(table))
 	for mq, offset := range table {
@@ -318,10 +281,6 @@ func encodeLocalOffsetTable(table map[common.MessageQueue]int64) []byte {
 	return remoting.EncodeJSON(map[string]any{"offsetTable": entries})
 }
 
-// decodeLocalOffsetTable parses Java's compact and pretty variants. Legacy
-// flat "topic+broker+queueId" string keys cannot round-trip through a
-// MessageQueue-keyed table and are skipped (the file is rewritten in the Java
-// shape on the next persist).
 func decodeLocalOffsetTable(data []byte) (map[common.MessageQueue]int64, error) {
 	out := map[common.MessageQueue]int64{}
 	value, err := remoting.DecodeJSON(data)

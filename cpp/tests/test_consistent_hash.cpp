@@ -1,5 +1,3 @@
-// 一致性哈希环单测：MD5 官方向量 + Java 落点口径（前 4 字节大端 / 含端点 tailMap / 回绕）。
-//
 // 期望值与 rust/src/common/consistent_hash.rs 的测试**逐值一致**（四语言对拍）。
 #include <algorithm>
 #include <cstdint>
@@ -86,7 +84,6 @@ void testMd5MatchesReferenceVectors() {
     }
 }
 
-// Java 只取摘要前 4 字节大端拼接，不是完整 128 bit
 void testMd5HashTakesOnlyFourBytes() {
     Md5Hash hash;
     CHECK_EQ(hash.hash(""), static_cast<int64_t>(0xD41D8CD9), "MD5Hash(\"\")");
@@ -117,7 +114,6 @@ void testEmptyRingRoutesToNothing() {
     CHECK_EQ(router.ringHashes().size(), static_cast<size_t>(0), "空环没有 hash");
 }
 
-// Java 构造器只是遍历 pNodes 调 addNode ⇒ 空集合时负数不会触发检查；检查在 addNode 里
 void testNegativeVirtualNodeCountIsRejected() {
     bool threwOnEmpty = false;
     try {
@@ -161,7 +157,6 @@ void testRemoveNodeDropsOnlyThatPhysicalNode() {
     CHECK_EQ(routedKey(router, "whatever"), std::string("b"), "剩下的队列都归 b");
 }
 
-// 注入的 HashFunction 必须真的参与每一次查找（Java 允许注入）
 struct FirstByte : public HashFunction {
     mutable int calls = 0;
     int64_t hash(const std::string& key) const override {
@@ -180,7 +175,6 @@ void testCustomHashFunctionDrivesEveryLookup() {
     CHECK(injected->calls > 0, "自定义哈希没被调用");
 }
 
-// 环上的 hash 升序 = Java TreeMap 的遍历序（用来确认 lower_bound/回绕口径一致）
 void testRingHashesAreSorted() {
     const ConsistentHashRouter router(nodesOf({"CID-0", "CID-1", "CID-2"}), 3);
     const std::vector<int64_t> hashes = router.ringHashes();

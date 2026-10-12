@@ -1,5 +1,3 @@
-// 一致性哈希环实现 + 自带 MD5，逐条对齐 Java
-// `common/consistenthash/{ConsistentHashRouter,VirtualNode,Node,HashFunction}.java`。
 #include "rocketmq/common/consistent_hash.h"
 
 #include <cstdint>
@@ -17,9 +15,6 @@ const uint32_t kMd5Shifts[64] = {
     6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
 
 // K[i] = floor(abs(sin(i + 1)) * 2^32)（RFC 1321 §3.4 的表）。
-//
-// 写成常量而不是运行时用 `std::sin` 算：`floor(abs(sin(x)) * 2^32)` 落在整数边界附近时
-// 不同 libm 的最后一位可能差 1，那样 hash 就与 Java 不一致了。
 const uint32_t kMd5K[64] = {
     0xd76aa478u, 0xe8c7b756u, 0x242070dbu, 0xc1bdceeeu, 0xf57c0fafu, 0x4787c62au, 0xa8304613u,
     0xfd469501u, 0x698098d8u, 0x8b44f7afu, 0xffff5bb1u, 0x895cd7beu, 0x6b901122u, 0xfd987193u,
@@ -101,8 +96,6 @@ std::vector<uint8_t> md5Digest(const std::string& input) {
 }
 
 int64_t Md5Hash::hash(const std::string& key) const {
-    // Java：`for (int i = 0; i < 4; i++) { h <<= 8; h |= ((int) digest[i]) & 0xFF; }`
-    // —— 那个 `& 0xFF` 是必须的，因为 Java 的 byte 有符号；这里 uint8_t 升位即同值。
     const std::vector<uint8_t> digest = md5Digest(key);
     int64_t value = 0;
     for (int i = 0; i < 4; ++i) value = (value << 8) | digest[static_cast<size_t>(i)];
@@ -127,7 +120,6 @@ void ConsistentHashRouter::addNode(const std::shared_ptr<Node>& pNode, int32_t v
     const int32_t existingReplicas = getExistingReplicas(pNode);
     for (int32_t i = 0; i < vNodeCount; ++i) {
         VirtualNode vNode{pNode, i + existingReplicas};
-        // Java 是 TreeMap.put：同 hash 时后来者覆盖，位置不变。
         ring_[hashFunction_->hash(vNode.getKey())] = vNode;
     }
 }
@@ -144,10 +136,9 @@ void ConsistentHashRouter::removeNode(const std::shared_ptr<Node>& pNode) {
 
 std::shared_ptr<Node> ConsistentHashRouter::routeNode(const std::string& objectKey) const {
     if (ring_.empty()) return nullptr;
-    // Java：`ring.tailMap(hashVal)` —— **含端点**，故 lower_bound 正确（相等的 hash 归自己）。
     const int64_t hashVal = hashFunction_->hash(objectKey);
     auto it = ring_.lower_bound(hashVal);
-    if (it == ring_.end()) it = ring_.begin();  // Java 的 ring.firstKey()：越过末尾回绕
+    if (it == ring_.end()) it = ring_.begin();
     return it->second.physicalNode;
 }
 

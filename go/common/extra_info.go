@@ -6,9 +6,6 @@ import (
 	"strings"
 )
 
-// ExtraInfoUtil — a faithful port of
-// org.apache.rocketmq.remoting.protocol.header.ExtraInfoUtil.
-//
 // This is the POP checkpoint ("POP_CK"). The broker hands the client a
 // checkpoint string in the POP response headers; the client rebuilds it per
 // message and sends it back verbatim on ACK / CHANGE_INVISIBLETIME. Any

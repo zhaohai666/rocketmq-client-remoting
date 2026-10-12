@@ -1,9 +1,3 @@
-// org.apache.rocketmq.common.UtilAll 的 C++ 实现。
-//
-// 对齐 python/common/util_all.py：
-//   - bytes2String 输出**大写**十六进制（msgId 依赖大小写）；
-//   - string2Bytes 是十六进制解码（非 UTF-8），非法字符返回空串；
-//   - crc32 为标准 CRC32（poly 0xEDB88320），与 Java/zlib 一致。
 #include "rocketmq/common/util_all.h"
 
 #include <atomic>
@@ -99,7 +93,6 @@ std::string UtilAll::timeToHumanString(int64_t ts, const std::string& pattern) {
 }
 
 std::string UtilAll::timeMillisToHumanString3(int64_t ts) {
-    // %Y%m%d%H%M%S 与 Java 的 String.format("%04d%02d%02d%02d%02d%02d") 逐位等价（同为本地时区）
     return timeToHumanString(ts, "%Y%m%d%H%M%S");
 }
 
@@ -235,7 +228,7 @@ std::string UtilAll::localIp() {
 std::string UtilAll::userHome() {
     const char* home = std::getenv("HOME");
     if (home != nullptr && *home != '\0') return std::string(home);
-    const char* profile = std::getenv("USERPROFILE");  // Windows 下 Java user.home 的来源
+    const char* profile = std::getenv("USERPROFILE");
     if (profile != nullptr && *profile != '\0') return std::string(profile);
     return std::string();
 }
@@ -267,12 +260,10 @@ std::string InnerIdGenerator::createUniqId() {
     int32_t pidv = UtilAll::pid();
     putInt16(result, pidv & 0xFFFF);
 
-    // 类加载 hash（Java 为 abs(_classLoaderHash)）：此处用稳定的字符串哈希替代进程随机 hash
     int32_t classHash = javaStringHash("RocketMQClient");
     if (classHash < 0) classHash = -classHash;
     putInt32U(result, static_cast<uint32_t>(classHash));
 
-    // 当日毫秒（Java 用"当月毫秒"，Python 实现为当日毫秒，这里保持一致）
     std::time_t now = std::time(nullptr);
     std::tm tmv{};
 #if defined(_WIN32)

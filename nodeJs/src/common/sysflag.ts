@@ -1,5 +1,3 @@
-// -*- coding: utf-8 -*-
-// System flag bit constants (org.apache.rocketmq.common.sysflag.*).
 
 export const MessageSysFlag = {
   COMPRESSED_FLAG: 0x1,

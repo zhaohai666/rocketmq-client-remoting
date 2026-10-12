@@ -1,5 +1,3 @@
-// OFFSET_ILLEGAL 纠错分支（Java `DefaultMQPushConsumerImpl:402-427`）真机验证。
-//
 // 与 `python/verify_offset_illegal_live.py`、`rust/examples/live_offset_illegal.rs`、
 // C# 的对应场景同题、逐条对应（S1/S2）。
 //
@@ -9,14 +7,6 @@
 //（`removeProcessQueue` + `rebalanceImmediately`）。离线单测（tests/test_offset_illegal_recover.cpp）
 // 只能锁住本地状态怎么清、哪个 ack 被作废，下面两件事只有真集群能证明：
 //
-//   S1「丢队列」——broker 判定位点非法时，队列上**已取回但还没消费/没 ack** 的消息必须整批
-//      作废。做法：让 listener 卡住第一条（在途 1 条、缓冲里 2 条），再用
-//      resetOffsetByQueueId 把位点重置到 3（服务端重置 ⇒ 下一笔 pull 被
-//      PullMessageProcessor:539-545 短路成 OFFSET_RESET ⇒ 客户端 OFFSET_ILLEGAL）。
-//      修复前：缓冲里的第 1、2 条照常投递（listener 实收 3 条）；修复后：只剩在途的第 0 条，
-//      且它的 ack 因队列已被丢（Java ConsumeMessageConcurrentlyService:267）而作废。最后再发
-//      第 4 条，验证重建后的队列从修正位点续跑、冻结已随重建解除（新消息的 ack 让 broker 上
-//      的位点继续前进到 4）。
 //
 //   S2「立刻落盘」——纠错后的位点必须马上推给 broker，不能等周期落盘。做法：利用
 //      resetOffsetByQueueId 两笔 RPC 非原子（第 1 笔 commitOffset 无区间校验先落库、第 2 笔
@@ -25,11 +15,6 @@
 //      从 103 起拉。窗口内唯一能把 103 写回 3（maxOffset）的路径就是纠错分支自带的那次 persist，
 //      且全程零投递。
 //
-// 说明：发现延迟 = 客户端在途长轮询的返回时间 + broker 侧的巡检周期。本端口按下发
-// suspendTimeoutMillis=20000（Java `PullAPIWrapper.brokerSuspendMaxTimeMillis` 默认值 20s）
-// 请求挂起，broker 的 PullRequestHoldService 每 5s 巡检一次到期请求，命中前那笔 pull 不会
-// 重读 resetOffsetTable。Python 侧实测 24.3s，与 Java 同构（长轮询语义如此，不是缺陷）
-// —— 这里给 45s 余量。
 //
 // 用法：./rmq_live_offset_illegal 127.0.0.1:9876
 #include <chrono>

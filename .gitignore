@@ -44,3 +44,13 @@ logs/
 
 # 本地 agent 工作目录（项目记忆 / 临时脚本），不入库
 .workbuddy/
+
+# cmake 杂散产物（在仓库根或非构建目录误跑 cmake 生成；cpp/go 等正规构建
+# 目录各自维护，不在此列）
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+Makefile
+cpp/build_scrub_b/
+nodeJs/selfcheck.ts.log

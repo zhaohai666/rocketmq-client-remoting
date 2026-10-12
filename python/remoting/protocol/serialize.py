@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-"""协议序列化：JSON（RemotingSerializable）与 RocketMQ 私有二进制（RocketMQSerializable）。
-
-对应 org.apache.rocketmq.remoting.protocol.RemotingSerializable / RocketMQSerializable。
-"""
 from __future__ import annotations
 
 import json

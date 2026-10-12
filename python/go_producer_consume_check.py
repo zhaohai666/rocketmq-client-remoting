@@ -96,9 +96,6 @@ def main():
     if tx is not None:
         check("事务消息带 PGROUP", bool(tx.get_property("PGROUP")),
               "pgroup=%r" % tx.get_property("PGROUP"))
-        # TRAN_MSG **留**在已提交消息上，不是「应该被剥掉」。这一点用 Python 自己的
-        # 生产者做过对照实验（见本文件 docstring）：Python/Java 都保留该属性，
-        # broker 只在半消息阶段用它做路由判定，提交后不清理。
         check("事务消息保留 TRAN_MSG=true", tx.get_property("TRAN_MSG") == "true",
               "TRAN_MSG=%r" % tx.get_property("TRAN_MSG"))
         check("事务消息带 __transactionId__", bool(tx.get_property("__transactionId__")),
@@ -112,7 +109,6 @@ def main():
         check("压缩消息解压后长度=6000", len(m.body) == 6000, "len=%d" % len(m.body))
         check("压缩消息内容完整", m.body == (b"compress-me-" * 500),
               "head=%r" % m.body[:24])
-        # 解压后 COMPRESSED_FLAG 必须已经清掉（对齐 Java MessageDecoder:520-523）
         check("压缩消息 COMPRESSED 位已清", not (m.sys_flag & 0x1),
               "sys_flag=%#x" % m.sys_flag)
     else:

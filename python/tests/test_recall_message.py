@@ -1,15 +1,4 @@
 # -*- coding: utf-8 -*-
-"""定时消息撤回（RECALL_MESSAGE 370）离线单测，不需要集群。
-
-对齐基准是 Java 5.5.1 的 ``RecallMessageHandle`` / ``RecallMessageRequestHeader`` /
-``DefaultMQProducerImpl#recallMessage``。盯的是三类错得很安静的东西：
-  * 句柄编解码：分隔符是**空格**、版本段是 ``v1``、编码是 base64url **带 ``=`` 填充**；
-    Java 解码器不吃无填充串，这里两种都吃（见模块 docstring），所以两种都要测。
-  * 报文键名：``RecallMessageRequestHeader`` 在 Java 里继承 ``RpcRequestHeader``，
-    brokerName 的**反射名是 bname**，写成 ``brokerName`` 会被 broker 静默丢掉。
-  * 客户端校验顺序：状态 → checkTopic → 禁 retry/DLQ → 解句柄 → 定位 broker，
-    前三步都不该打网络。
-"""
 from __future__ import annotations
 
 import time
@@ -36,14 +25,14 @@ ADDR = "127.0.0.1:10911"
 
 # ---------------- 句柄编解码 ----------------
 def test_build_handle_matches_the_wire_vector():
-    """向量是拿 Java 的 Base64.getUrlEncoder() 实算出来的，改动即失配。"""
+    pass
     handle = recall_message_handle.build_handle(TOPIC, BROKER, "1700000000000", UNIQ_KEY)
     assert handle == ("djEgVG9waWNSZWNhbGxVbml0IGJyb2tlci1hIDE3MDAwMDAwMDAwMDAg"
                       "MDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlhYmNkZWY=")  # noqa: E501
 
 
 def test_build_handle_keeps_the_field_padding():
-    """Java 用带填充的 getUrlEncoder；无填充会让 broker 侧某些实现解不出来。"""
+    pass
     handle = recall_message_handle.build_handle("a", "b", "1", "c")
     assert len(handle) % 4 == 0
 
@@ -71,7 +60,7 @@ def _b64(text: str) -> str:
 
 
 @pytest.mark.parametrize("bad", [
-    "",                                             # Java: StringUtils.isEmpty
+    "",
     "not-a-handle",                                 # 解出来不是 v1 开头的 5 段
     "!!!!",                                         # 非法 base64 字符 -> DecoderException
     _b64("v2 TopicA broker-a 1 " + UNIQ_KEY),       # 版本不对

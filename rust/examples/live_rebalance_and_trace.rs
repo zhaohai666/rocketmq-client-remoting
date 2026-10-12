@@ -251,7 +251,6 @@ async fn bootstrap_topic(client: &RemotingClient, namesrv: &str, topic: &str) ->
 
 // ------------------------------------------------------ 真实收发（共用）
 
-/// 一条待发消息：tags/keys 可空，UNIQ_KEY 与 WAIT 标记按 Java 发送路径补齐。
 fn build_message(topic: &str, body: &[u8], tags: &str, keys: &str) -> Message {
     let mut msg = Message::new(topic, Some(body));
     if !tags.is_empty() {
@@ -260,7 +259,6 @@ fn build_message(topic: &str, body: &[u8], tags: &str, keys: &str) -> Message {
     if !keys.is_empty() {
         msg.set_keys(keys);
     }
-    // Java：非批量消息在发请求前补 UNIQ_KEY，它决定 SendResult.msgId。
     message_client_id_setter::set_uniq_id(&mut msg);
     msg.put_property(message_const::PROPERTY_WAIT_STORE_MSG_OK, "true");
     msg
@@ -478,8 +476,6 @@ async fn r1_allocate_strategy(
         .into_iter()
         .map(|k| MessageQueue::new(&k.topic, &k.broker_name, k.queue_id))
         .collect();
-    // Java `RebalanceImpl#rebalanceByTopic` 与 Python 都在分配前排序；策略只保证
-    // 「输出是输入的有序子序列」，所以排序是调用方的责任。
     mq_all.sort();
     ck.check(
         "R1 the real route exposes exactly the writable queues we created",
@@ -522,7 +518,6 @@ async fn r1_allocate_strategy(
         &format!("A={a_two:?} B={b_two:?}"),
     );
 
-    // 3 个消费者：average=1、余数 1 ⇒ 第一个消费者多拿一条（Java/Python 同一算式）。
     let three = cids(3);
     let mut avg3: Vec<Vec<i32>> = Vec::new();
     let mut circle3: Vec<Vec<i32>> = Vec::new();
@@ -682,8 +677,6 @@ impl MessageListenerConcurrently for LiveListener {
     }
 }
 
-/// 一个「消费批次」= 一个任务：先过一道门闩，再同步调用 listener
-/// （对齐 Java：listener 是阻塞接口，线程池只负责并发度）。
 fn make_consume_task(
     idx: usize,
     batch: Arc<Vec<MessageExt>>,
@@ -944,7 +937,6 @@ struct LiveTraceSink {
     accepted: AtomicUsize,
     sent: Arc<AtomicUsize>,
     failures: Arc<Mutex<Vec<String>>>,
-    /// `false` 模拟分发器已停止：`report` 返回 false，钩子按 Java/Python 口径忽略它。
     accepting: AtomicBool,
 }
 
@@ -998,7 +990,6 @@ impl TraceReportSink for LiveTraceSink {
 
     fn report(&self, context: TraceContext) -> bool {
         if !self.accepting.load(Ordering::SeqCst) {
-            // 对应 Java/Python `append()` 在分发器停止后返回 false
             return false;
         }
         let Some(bean) = TraceDataEncoder::encoder_from_context_bean(Some(&context)) else {
@@ -1174,7 +1165,6 @@ async fn r3_trace_hook(
         &format!("group={} region={}", first_pub.group_name, first_pub.region_id),
     );
 
-    // 轨迹 topic 自身不再被追踪（Java/Python 都在 before/after 开头判前缀）。
     let trace_msg = build_message(trace_topic, format!("trace-in-trace-{topic}").as_bytes(), "", "");
     let mut skip_ctx = send_context(&trace_msg, producer_group, broker_addr, MessageType::NormalMsg);
     execute_send_message_hook_before(&send_hooks, &mut skip_ctx);
@@ -1187,7 +1177,6 @@ async fn r3_trace_hook(
         &format!("holder={held} accepted={before}->{}", sink.accepted()),
     );
 
-    // 分发器拒收时业务链路照常（Java/Python 都忽略 append() 的返回值）。
     sink.accepting.store(false, Ordering::SeqCst);
     let mut off_ctx =
         send_context(&build_message(topic, b"trace-off", "", ""), producer_group, broker_addr, MessageType::NormalMsg);
@@ -1379,8 +1368,6 @@ async fn r3_trace_hook(
             decoded_pubs.iter().map(|c| c.trace_beans[0].msg_id.clone()).collect::<Vec<_>>()
         ),
     );
-    // ⚠ 实测 Java Pub 布局：14 段里没有 storeTime，clientHost 只在第 15 段之后才有，
-    // 所以从 broker 读回来的 Pub bean storeTime=0、clientHost 回落成本机地址。
     let store_time_ok = decoded_pubs
         .iter()
         .zip(pubs.iter())

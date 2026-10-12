@@ -1,8 +1,5 @@
 // GO_AWAY(1500) 的传输层处理（镜像 Rust / C++ / Python 的 go_away 用例）。
 //
-// 对应 Java NettyRemotingClient#invokeImpl:828-873：broker / proxy 优雅下线时会给
-// 在途请求回 GO_AWAY，语义是"这条连接别再用了"。客户端必须换连接重发一次，且**只**
-// 重发一次；第二次还是 GO_AWAY 就报发送失败。enableReconnectForGoAway 关掉时不重连。
 //
 // 修之前这条码被当成普通业务响应交给上层：同步调用拿到 GO_AWAY 就当"发送成功"，
 // 消息其实没落到 broker。
@@ -155,7 +152,6 @@ public class GoAwayTests
         RemotingSendRequestException err = Assert.Throws<RemotingSendRequestException>(
             () => client.InvokeSync(broker.EndPoint.ToString()!, MakeRequest(), 5000));
 
-        // 文案对齐 Java：RemotingSendRequestException("Receive GO_AWAY twice ...")
         Assert.Contains("GO_AWAY twice", err.Message);
         Assert.Equal(2, broker.Connections);
     }

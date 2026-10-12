@@ -1,5 +1,3 @@
-//! 请求码 / 响应码 / 语言码 / 序列化类型
-//! （对应 `org.apache.rocketmq.remoting.protocol.RequestCode`、`ResponseCode`、`LanguageCode`、`SerializeType`）。
 
 /// `RequestCode`
 pub mod request_code {
@@ -292,7 +290,6 @@ pub mod response_code {
     pub const RPC_TIME_OUT: i32 = -1006;
 }
 
-/// `LanguageCode`（byte 码与 Java 枚举顺序一致）
 pub mod language_code {
     pub const JAVA: i32 = 0;
     pub const CPP: i32 = 1;

@@ -1,5 +1,3 @@
-// -*- coding: utf-8 -*-
-// UtilAll-style helpers (org.apache.rocketmq.common.UtilAll).
 import os from 'node:os';
 import { Buffer } from 'node:buffer';
 
@@ -15,7 +13,6 @@ const CRC_TABLE = (() => {
   return table;
 })();
 
-// Standard CRC32 (poly 0xEDB88320) — matches Java UtilAll.crc32 / zlib.crc32.
 export function crc32(buf) {
   const data = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
   let c = 0xffffffff;
@@ -25,13 +22,10 @@ export function crc32(buf) {
   return (c ^ 0xffffffff) >>> 0;
 }
 
-// Compression "match" field: Java UtilAll.crc32 returns (int)(value & 0x7FFFFFFF),
-// dropping the top bit. Cross-language, only compare each side's own match field.
 export function crc32Match(buf) {
   return crc32(buf) & 0x7fffffff;
 }
 
-// Java String.hashCode (31*h + c), 32-bit signed wrap.
 export function serverStringHash(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) {

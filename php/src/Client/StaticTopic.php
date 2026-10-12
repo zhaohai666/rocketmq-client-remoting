@@ -7,35 +7,12 @@ namespace RocketMQ\Client;
 use RocketMQ\Common\MessageQueue;
 use RocketMQ\Remoting\Protocol\TopicRouteData;
 
-/**
- * 静态主题（单元化主题）消费者侧路由支持，移植自 Java 客户端：
- *
- * - org.apache.rocketmq.remoting.rpc.ClientMetadata
- *   .topicRouteData2EndpointsForStaticTopic
- * - org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingUtils
- *   .getMockBrokerName
- * - org.apache.rocketmq.client.impl.factory.MQClientInstance
- *   .getBrokerNameFromMessageQueue（见 MQClientInstance 同名方法）
- *
- * wire 事实（不得"简化"）：
- *
- * - 路由解码侧把 topicQueueMappingByBroker 保持为不透明的
- *   `array<brokerName, array>`；类型化视图在这里解析，不动协议层透传。
- * - TopicQueueMappingInfo.scope 缺省为 MixAll::METADATA_SCOPE_GLOBAL
- *   （"__global__"）；global scope 的 mock broker 名会剥掉开头两个下划线
- *   （"__syslo__global__"）。
- * - Java 的 maxTotalNumOfEpoch 读了但从不赋值（恒 -1），所以
- *   epoch >= maxTotalNumOfEpoch 守卫恒真，maxTotalNums 就是该 scope 的
- *   totalQueues 最大值 —— 这个 quirk 照抄。
- * - 同 epoch 的后到条目覆盖先到条目（Java `oldEpoch <= epoch`）。
- */
 final class StaticTopic
 {
     public const METADATA_SCOPE_GLOBAL = '__global__';
     public const LOGICAL_QUEUE_MOCK_BROKER_PREFIX = '__syslo__';
     public const LOGICAL_QUEUE_MOCK_NOT_EXIST = '__syslo__none__';
 
-    /** Java MixAll::isLogicalQueueMockBrokerName（前缀判断）。 */
     public static function isLogicalQueueMockBrokerName(string $brokerName): bool
     {
         return str_starts_with($brokerName, self::LOGICAL_QUEUE_MOCK_BROKER_PREFIX);
@@ -62,12 +39,6 @@ final class StaticTopic
         return $mq->topic . '@' . $mq->brokerName . '@' . $mq->queueId;
     }
 
-    /**
-     * 从路由解码侧保留下来的原始 json 对象里解析类型化视图。
-     * 畸形条目返回 null —— Java 遇到会 NPE；能抢救的部分映射好过整个崩溃。
-     *
-     * @return array{scope: string, totalQueues: int, bname: string, epoch: int, currIdMap: array<int, int>}|null
-     */
     public static function parseTopicQueueMappingInfo(mixed $raw): ?array
     {
         if (!is_array($raw)) {
@@ -123,7 +94,6 @@ final class StaticTopic
             return null;
         }
 
-        // 按 scope 分组（Java 里没有 scope 的条目不参与，同此）。
         $infosByScope = [];
         foreach ($route->topicQueueMappingByBroker as $broker => $raw) {
             $info = self::parseTopicQueueMappingInfo($raw);
@@ -135,14 +105,10 @@ final class StaticTopic
 
         $endpoints = [];
         foreach ($infosByScope as $scope => $infos) {
-            // 先按 broker 名排序，再做稳定的 epoch 降序排序。Java 对
-            // ConcurrentHashMap 的 entrySet 做 epoch 降序排序，同 epoch 的覆盖顺序本就
-            // 未定义；钉死 broker 升序让结果可复现。
             ksort($infos, SORT_STRING);
             uasort($infos, static fn (array $a, array $b) => $b['epoch'] <=> $a['epoch']);
 
             $maxTotalNums = 0;
-            // Java 从不更新 maxTotalNumOfEpoch —— 守卫恒真，照抄。
             $maxTotalNumOfEpoch = -1;
             $mockName = self::getMockBrokerName($scope);
             $mqEndPoints = []; // queueKey => [epoch, bname]

@@ -1,24 +1,4 @@
 # -*- coding: utf-8 -*-
-"""ProduceAccumulator（自动攒批）单测。
-
-对应 Java ``client/src/test/java/org/apache/rocketmq/client/producer/ProduceAccumulatorTest.java``
-的三个场景（sync / async / 指定 MessageQueue），另补：
-
-* 参数三档校验与"累加器未建时 getter 返回 0"的语义；
-* ``try_add_message`` 全局字节闸门（放行即记账、归还、拒绝后调用方直发）；
-* 批量应答**拆条**（逗号分隔 msgId/offsetMsgId → 每条各自的 SendResult、queueOffset 递增）；
-* ``AggregateKey`` 的四维分区（topic / mq / waitStoreMsgOK / tag）；
-* 守卫线程把"已发完的空批次"置 closed 并摘表；
-* ``can_batch`` 的四条排除项（延时 / 重试 topic / PGROUP）；
-* ``MessageBatch`` 不再进累加器（防无限递归）。
-
-⚠ Java 的单测是**直接调累加器**的 ``send``/``send(msg, callback)``，绕过了
-``DefaultMQProducer.sendByAccumulator`` 里的 ``MessageClientIDSetter.setUniqID`` ——
-所以两边子消息都没有 UNIQ_KEY，``MessageBatch.encode()`` 出来的 body 才可比。
-同理 ``MessageBatch.generateFromList`` 只用 topic + waitStoreMsgOK 组装批对象，
-**不含** batch 级 KEYS，而累加器的 ``batch()`` 会写 KEYS（空集合即空串）——
-batch 级属性不进 body，所以 body 相等仍然成立。
-"""
 from __future__ import annotations
 
 import threading
@@ -40,7 +20,7 @@ TOPIC = "AccumTestTopic"
 # ---------------------------------------------------------------- 夹具
 
 class FakeProducer:
-    """只实现累加器需要的那一个方法（Java 单测里的 ``MockMQProducer`` 同款）。"""
+    pass
 
     def __init__(self, result: Optional[SendResult] = None):
         self.sent: List[tuple] = []
@@ -78,7 +58,6 @@ class CollectingCallback(SendCallback):
 
 
 def make_messages(n: int = 5) -> List[Message]:
-    # 与 Java 单测同款 body（1/22/333/4444/55555 字节）
     return [Message(TOPIC, b"1" * (i + 1)) for i in range(n)]
 
 
@@ -114,7 +93,6 @@ def test_default_params_match_the_producer_contract():
     assert acc.get_batch_max_delay_ms() == 10
     assert acc.get_batch_max_bytes() == 32 * 1024
     assert acc.total_hold_size == 32 * 1024 * 1024
-    # Java 的 getTotalBatchMaxBytes 实际返回 holdSize（上游笔误，照抄）
     assert acc.get_total_batch_max_bytes() == 32 * 1024
     assert acc.currently_hold_size == 0
 
@@ -141,14 +119,13 @@ def test_param_guards_use_the_documented_ranges():
 
 
 def test_producer_getters_return_zero_before_accumulator_exists():
-    """Java：累加器为 null 时三个 getter 返回 0，getAutoBatch() 返回 false。"""
+    pass
     producer = DefaultMQProducer("PG_AccumGetter")
     assert producer.get_batch_max_delay_ms() == 0
     assert producer.get_batch_max_bytes() == 0
     assert producer.get_total_batch_max_bytes() == 0
     assert producer.get_auto_batch() is False
     producer.set_auto_batch(True)
-    # 仍然没有累加器 → 依然 false（Java 的 getAutoBatch 有 null 短路）
     assert producer.get_auto_batch() is False
 
 
@@ -166,7 +143,6 @@ def test_init_produce_accumulator_syncs_thresholds_and_reuses_by_client_id():
     assert acc.get_batch_max_delay_ms() == 50
     assert acc.get_batch_max_bytes() == 1024
     assert acc.total_hold_size == 4096
-    # 累加器建好之后 setter 立刻生效（Java 同）
     producer.set_batch_max_delay_ms(80)
     assert acc.get_batch_max_delay_ms() == 80
     # 再来一个同 clientId 的 producer → 复用同一个累加器
@@ -182,7 +158,6 @@ def test_try_add_message_gate_and_release():
     msg = Message(TOPIC, b"1234567890")          # 10 字节
     assert acc.try_add_message(msg) is True
     assert acc.currently_hold_size == 10
-    # 额度已满（Java：`currentlyHoldSize < totalHoldSize` 才放行）
     assert acc.try_add_message(Message(TOPIC, b"x")) is False
     assert acc.currently_hold_size == 10
     acc.release_hold(10)
@@ -241,15 +216,9 @@ def test_sync_batch_merges_messages_and_returns_per_message_results():
     assert isinstance(sent_msg, MessageBatch)
     assert sent_mq is None                      # 没指定 mq → 由 producer 轮询选
     assert sent_cb is None                      # 同步路径没有回调
-    # 子消息集合与 reference 一致。⚠ 只比长度不比字节：5 条是**不同线程**并发 add 的，
-    # 批内顺序不确定（Java 的同步用例也因此只断言长度，只有单线程的异步用例才全等比较）。
     assert len(sent_msg.body) == len(reference_batch_body(messages))
 
     assert len(collected) == 5
-    # 拆条结果是**按批内位置**下发的，而位置由 add 的先后决定 —— 5 条消息是并发 add 的，
-    # 「哪条消息拿哪个下标」不确定（Java 的单测同样只能断言"成套"关系，不能按完成顺序对号）。
-    # 所以这里验两件事：① 五条 MsgId 一个不少；② 同一条结果里 id-N ↔ off-N ↔ 100+N 必须
-    # 成套（串了就说明 split_send_results 的下标算错了）。
     assert sorted(r.msg_id for r in collected) == ["id-%d" % i for i in range(5)]
     for result in collected:
         position = int(result.msg_id.split("-")[1])
@@ -288,7 +257,6 @@ def test_async_batch_merges_and_fires_every_callback():
     assert sent_cb is not None                  # 异步路径回调不为 None
     # 单线程依次 add → 批内顺序确定，可以逐字节比
     assert sent_msg.body == reference_batch_body(messages)
-    # 异步批次**不**收集 keys（Java 的不对称行为），所以 batch 级 KEYS 为空串
     assert sent_msg.get_keys() == ""
     assert acc.currently_hold_size == 0
 
@@ -322,7 +290,7 @@ def test_skip_results_are_shared_when_msg_id_has_no_comma():
 
 
 def test_send_with_message_queue_pins_the_batch():
-    """指定 mq（Java 的 send(msg, mq, producer)）：mq 原样透传给 sendDirect。"""
+    pass
     mq = MessageQueue(TOPIC, "broker-pinned", 2)
     producer = FakeProducer()
     acc = ProduceAccumulator("pinned")
@@ -396,7 +364,6 @@ def test_aggregate_key_partitions_by_topic_mq_wait_and_tag():
     other_wait = Message(TOPIC, b"y", tags="TagA")
     other_wait.set_wait_store_msg_ok(False)
     assert AggregateKey.of_message(base) != AggregateKey.of_message(other_wait)
-    # 回归：**没设过 WAIT** 的普通消息要按 Java 的「缺省即 true」归类，不能落进 false 那一档
     plain = Message(TOPIC, b"y", tags="TagA")
     assert plain.get_wait_store_msg_ok() is None
     assert AggregateKey.of_message(plain).wait_store_msg_ok is True
@@ -427,13 +394,7 @@ def test_different_tags_do_not_merge():
 # ---------------------------------------------------------------- 守卫线程
 
 def test_guard_keeps_closed_batch_until_next_send():
-    """守卫线程的清理口径（Java ``GuardForSyncSendService.doWork``）：**只**清理
-    ``messagesSize == 0`` 的批次。
-
-    ⚠ 发完的批次 ``messagesSize`` 仍 > 0（``send()`` 只置 ``closed``，不重置
-    ``messagesSize``）—— 所以它会**留在表里**，直到下一次同键 ``send`` 拿到它、
-    ``add`` 返回 -1 才被摘掉重取。别把"发完即摘表"当成 Java 行为。
-    """
+    pass
     producer = FakeProducer()
     acc = ProduceAccumulator("guard-keep")
     acc.start()
@@ -459,12 +420,7 @@ def test_guard_keeps_closed_batch_until_next_send():
 
 
 def test_accumulator_can_restart_after_shutdown():
-    """守卫线程必须能**重建**：累加器按 clientId 复用，同一个实例会经历
-    ``start → shutdown → start``（生产者重启；Java 的 ``ServiceThread`` 同样可重复 start）。
-
-    ⚠ 回归守卫：守卫原先继承 ``threading.Thread``，而 ``Thread`` 只能 ``start()`` 一次 ——
-    第二次会抛 ``RuntimeError: threads can only be started once``。
-    """
+    pass
     acc = ProduceAccumulator("restart")
     acc.start()
     acc.shutdown()
@@ -523,7 +479,6 @@ def test_can_batch_rejects_delay_retry_and_pgroup():
     grouped.put_property("PGROUP", "PG_x")
     assert producer._can_batch(grouped) is False
 
-    # ⚠ 被拒的四条**不归还**已经在闸门里记下的字节数（Java 遗漏，照抄）
     assert acc.currently_hold_size > 0
 
 
@@ -541,7 +496,7 @@ class StubProducer(DefaultMQProducer):
 
 
 def test_send_by_accumulator_stamps_uniq_id_then_accumulates():
-    """``send_by_accumulator`` 先过本地校验、补 UNIQ_KEY，再交给累加器（Java :778-793）。"""
+    pass
     from common.message_client_id_setter import get_uniq_id
 
     acc = ProduceAccumulator("send-by-accum")
@@ -568,7 +523,7 @@ def test_send_by_accumulator_stamps_uniq_id_then_accumulates():
 
 
 def test_message_batch_never_enters_accumulator():
-    """batch 消息不再攒批（Java ``!(msg instanceof MessageBatch)``）→ 直接进直发路径。"""
+    pass
     producer = DefaultMQProducer("PG_NoRecurse")
     producer.client_id = "accum-norecurse-%d" % time.time_ns()
     producer.init_produce_accumulator()

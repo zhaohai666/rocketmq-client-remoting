@@ -1,12 +1,3 @@
-// 消费线程弹性单测（对应 Java DefaultMQPushConsumer 的线程池配置与 updateCorePoolSize）。
-//
-// 为什么单独一个文件：Java 的 ThreadPoolExecutor 在 LinkedBlockingQueue（无界）下，
-// **真实并发度 == corePoolSize**（max 永远用不到），所以 updateCorePoolSize 是"运行时能改
-// 并发度"的 API。C# 侧此前 POP 路径是"每批一个裸线程"（无上限）且
-// SetConsumeThreadNums() 完全没作用 —— 换成有界 core/max 执行器后，本文件把语义钉死。
-//
-// 另一个必须钉住的反直觉事实：**Java 5.5.1 的自动弹性（inc/decCorePoolSize）是空实现**，
-// adjustThreadPool() 整套是 no-op。我们照抄 no-op，不允许"顺手修好"。
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -60,7 +51,6 @@ public class ConsumeExecutorTests
     [Fact]
     public void RaisingCoreSpawnsForQueuedTasks()
     {
-        // Java setCorePoolSize 的启发式：k = min(delta, 队列长度)，逐个补线程，队列空则停。
         var ex = new ConsumeExecutor(1, 8, keepAliveSeconds: 30);
         var release = new ManualResetEventSlim(false);
         ex.Submit(() => release.Wait(TimeSpan.FromSeconds(5)));
@@ -115,7 +105,6 @@ public class ConsumeExecutorTests
     {
         var ex = new ConsumeExecutor(1, 2);
         ex.Shutdown();
-        // Java 的 RejectedExecutionException（Python/C++/Rust 同源）：池已关与队列满同一个类型
         Assert.Throws<RejectedExecutionException>(() => ex.Submit(() => { }));
         ex.Shutdown(true);
     }
@@ -123,7 +112,6 @@ public class ConsumeExecutorTests
     [Fact]
     public void BoundedQueueRejectsWhenFullAndWorkersSaturated()
     {
-        // 有界队列 ≡ Java LinkedBlockingQueue(N)：core==max 的池，线程全忙 + 队列满 ⇒ reject
         var ex = new ConsumeExecutor(1, 1, keepAliveSeconds: 30, maxQueueSize: 2);
         var busy = new ManualResetEventSlim(false);
         var release = new ManualResetEventSlim(false);
@@ -145,7 +133,6 @@ public class ConsumeExecutorTests
     [Fact]
     public void ThreadNamesFollowLegacyThreadFactoryImpl()
     {
-        // Java ThreadFactoryImpl：序号从 **1** 开始、分隔符由调用方给（AsyncSenderExecutor_1…）
         var ex = new ConsumeExecutor(2, 2, keepAliveSeconds: 30, "AsyncSenderExecutor",
             threadNameSep: "_", threadIndexFrom: 1);
         var names = new List<string>();
@@ -190,7 +177,6 @@ public class ConsumeExecutorTests
     [Fact]
     public void ShutdownWaitDrainsQueuedTasks()
     {
-        // Java shutdown() 不丢已提交任务：wait=true 要等队列跑完
         var ex = new ConsumeExecutor(1, 2, keepAliveSeconds: 30);
         int done = 0;
         for (int i = 0; i < 5; i++)
@@ -208,7 +194,6 @@ public class ConsumeExecutorTests
     [Fact]
     public void ZeroCoreStillRunsTasks()
     {
-        // Java execute 的兜底分支：入队后若 workerCount == 0 仍要补一个线程
         var ex = new ConsumeExecutor(0, 2, keepAliveSeconds: 0.1);
         var ran = new ManualResetEventSlim(false);
         ex.Submit(ran.Set);
@@ -226,7 +211,7 @@ public class ConsumeExecutorTests
         Assert.Equal(5, ex.GetCorePoolSize());
         ex.SetCorePoolSize(2);
         Assert.Equal(2, ex.GetCorePoolSize());
-        ex.SetCorePoolSize(12);   // Java 允许 core > max（等价于把 max 抬到 core）
+        ex.SetCorePoolSize(12);
         Assert.Equal(12, ex.GetMaximumPoolSize());
         ex.Shutdown(true);
     }
@@ -237,8 +222,8 @@ public class ConsumeExecutorTests
     public void LegacyDefaults()
     {
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
-        Assert.Equal(20, c.ConsumeThreadMin);       // Java consumeThreadMin 默认 20 (:162)
-        Assert.Equal(20, c.ConsumeThreadMax);       // Java consumeThreadMax 默认 20 (:169)
+        Assert.Equal(20, c.ConsumeThreadMin);
+        Assert.Equal(20, c.ConsumeThreadMax);
         Assert.Equal(100000L, c.AdjustThreadPoolNumsThreshold);
         Assert.Equal(20, c.GetCorePoolSize());      // = consumeThreadMin
     }
@@ -247,7 +232,6 @@ public class ConsumeExecutorTests
     public void UpdateCorePoolSizeGuards()
     {
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
-        // Java 用无界队列 ⇒ 真实并发度 == core；默认 max=20，故 core 只能往**下**调
         Assert.True(c.UpdateCorePoolSize(15));
         Assert.Equal(15, c.GetCorePoolSize());
         Assert.False(c.UpdateCorePoolSize(0));
@@ -265,16 +249,11 @@ public class ConsumeExecutorTests
     [Fact]
     public void DefaultMaxIsTwentyNotSixtyFour()
     {
-        // 回归：默认 max 曾照抄 4.x 的 64，于是 20~63 这些 Java 会**忽略**的值能生效。
-        // Java 5.5.1 的 consumeThreadMax 与 min 同为 20（DefaultMQPushConsumer:169），
-        // 守卫 n < max 把默认配置下的上调全挡掉；差异不报错，只表现为
-        // "同一个 UpdateCorePoolSize(30)，本端口真的改了并发度、Java 没改"。
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
         Assert.Equal(20, c.ConsumeThreadMax);
         Assert.False(c.UpdateCorePoolSize(30));
         Assert.False(c.UpdateCorePoolSize(21));
         Assert.Equal(20, c.GetCorePoolSize());      // 一个都没落下去
-        // 抬 max 之后区间重新打开（setter 与 Java 一样是裸赋值，只夹 >= 1）
         c.SetConsumeThreadMax(30);
         Assert.True(c.UpdateCorePoolSize(25));
         Assert.Equal(25, c.GetCorePoolSize());
@@ -322,7 +301,6 @@ public class ConsumeExecutorTests
     [Fact]
     public void MsgAccCntIsMaxOffsetMinusLastQueueOffset()
     {
-        // Java ProcessQueue:148-158 —— accTotal = MAX_OFFSET - queueOffset，取最后一条
         var c = new DefaultMQPushConsumer("GID_ThreadPoolUnit");
         c.UpdateMsgAccCnt("k1", new List<MessageExt> { MakeMsg(10, "100"), MakeMsg(12, "100") });
         Assert.Equal(88, c.MsgAccCnt("k1"));        // 100 - 12
@@ -398,7 +376,6 @@ public class ConsumeExecutorTests
         Assert.Equal(13, c.GetCorePoolSize());
         Assert.False(c.UpdateCorePoolSize(20));     // 守卫仍按 consumeThreadMax 判
         Assert.Equal(13, ex.GetCorePoolSize());
-        // 抬 max 之后即可上调（core 变大 → 执行器按 Java 启发式补线程）
         c.SetConsumeThreadMax(40);
         Assert.True(c.UpdateCorePoolSize(33));
         Assert.Equal(33, ex.GetCorePoolSize());

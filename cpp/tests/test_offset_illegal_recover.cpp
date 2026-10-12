@@ -1,5 +1,3 @@
-// OFFSET_ILLEGAL 纠错分支（Java DefaultMQPushConsumerImpl:402-427）单测 —— 不需要集群。
-//
 // 为什么必须离线锁死：这条路径错了是**静默**的两种极端 ——
 //   - 只把拉取游标拨到 nextBeginOffset 而不丢队列/不冻结：broker 刚把位点纠正到合法区间，
 //     这条队列上**已经取回还没 ack** 的旧批次一 ack 又把位点推回非法值，下一轮拉取再被
@@ -9,15 +7,6 @@
 // 两个方向在真机短期窗口里都看不出差别（消息照消费、只是一直在弹 / 一次崩溃才暴露），
 // 所以断言尽量放离线；真机另有一条链路证明（examples/live_offset_illegal.cpp 的 S1/S2：
 // 「发现延迟 + 重建后位点恢复推进」与「纠错值 0.0-0.5s 内出现在 broker 上且零投递」）。
-//
-// 判据来源：PullMessageProcessor 对 OFFSET_OVERFLOW_BADLY / OFFSET_TOO_SMALL / OFFSET_RESET
-// 一律回 PULL_OFFSET_MOVED，MQClientAPIImpl:1099 映射成 PullStatus::OFFSET_ILLEGAL，修正值在
-// 应答头 nextBeginOffset。Java 的处理是 setNextOffset → ProcessQueue.setDropped(true) →
-// { updateAndFreezeOffset; persist; removeProcessQueue } → rebalanceImmediately。
-// 本端口：改位点（覆盖写）+ 冻结 → retireQueueLocked（代号 +1）→ onQueuesRevoked 锁外落盘
-// → wakeRebalanceLoop。与 python/tests/test_offset_illegal_recover.py 的同名测试同题；
-// 「重建后解冻」在 Python 侧离线锁死（那边能直接驱动一轮 rebalance），C++ 侧的
-// rebalancePullThreads 依赖已分配集（离线拿不到），由真机 S1 的「committed 推进到 4」证明。
 #include <cstdio>
 #include <optional>
 #include <string>
@@ -178,8 +167,6 @@ void testFrozenOffsetIgnoresAck() {
     h.recover(0);                         // 纠错到 0 并冻结
     const int callsBefore = h.listener().calls;
 
-    // 旧批次（offset 0..2 已取回、还没 ack）迟到的 ack：把位点推回 3 就是 Java 的弹跳现场。
-    // 冻结必须挡住它 —— 位点表里不能再出现任何条目（周期落盘也就无物可写）。
     const uint64_t epoch = h.consumer().queueEpoch(h.key());
     h.consumer().consumeBatch(h.key(), queue0(), offsetBatch(3), epoch);
 
@@ -195,9 +182,6 @@ void testFrozenOffsetIgnoresCorrectTagsOffset() {
 }
 
 void testFrozenOffsetSurvivesTheDrop() {
-    // 有意偏差：Java 在 removeOffset 时解冻、靠 ProcessQueue.isDropped() 兜底；本端口没有
-    // per-batch 的 ProcessQueue 对象，冻结一直留到队列重建（更严）——重建前任何 ack 都不许
-    // 动位点，宁可让位点停在纠错值上等重建。
     Harness h;
     h.recover(0);
     h.seedConsumed(2);                    // 试图把位点从「无」推到 2
@@ -205,11 +189,8 @@ void testFrozenOffsetSurvivesTheDrop() {
     expect(h.consumer().offsetFrozen(h.key()), "frozenSurvives.stillFrozen");
 }
 
-// ------------------------------------------------- 旧代号的批次整批作废（Java :267/:339）
 
 void testConsumeBatchEpochGate() {
-    // 代号对不上 ⇒ 队列已被撤销/重建，这批消息**连 listener 都不进**（Java
-    // ConsumeMessageConcurrentlyService:339 的 isDropped() 短路），也不 ack。
     {
         Harness h;
         const uint64_t epoch = h.consumer().queueEpoch(h.key());

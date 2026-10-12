@@ -54,9 +54,6 @@ func (l *concurrentVerdictListener) ConsumeMessage(msgs []*common.MessageExt, _ 
 	return l.status
 }
 
-// directProbeError is a named error type so the CR_THROW_EXCEPTION remark has a
-// deterministic %T — Java's remark is `UtilAll.exceptionSimpleDesc(e)`, i.e.
-// the class name followed by the message.
 type directProbeError struct{}
 
 func (directProbeError) Error() string { return "direct probe boom" }
@@ -167,16 +164,12 @@ func TestConsumerRunningInfoUnstartedConsumerShape(t *testing.T) {
 	if got, want := info.Properties[remoting.PropThreadPoolCoreSize], strconv.Itoa(corePoolSize); got != want {
 		t.Errorf("PROP_THREADPOOL_CORE_SIZE = %q, want %q", got, want)
 	}
-	// The effective core size, never the raw field: Java asks the executor, and
-	// "0 consume threads" is a state a started consumer cannot be in.
 	if got := info.Properties[remoting.PropThreadPoolCoreSize]; got == "0" {
 		t.Error("PROP_THREADPOOL_CORE_SIZE = 0; the effective core size must be reported")
 	}
 	if got := info.Properties[remoting.PropConsumeOrderly]; got != "false" {
 		t.Errorf("PROP_CONSUMEORDERLY = %q, want %q", got, "false")
 	}
-	// Java's consumerStartTimestamp is a `long` that stays 0 until start(). Go's
-	// time.Time zero value is not 0 epoch, so this is the regression guard.
 	if got := info.Properties[remoting.PropConsumerStartTimestamp]; got != "0" {
 		t.Errorf("PROP_CONSUMER_START_TIMESTAMP = %q, want \"0\" before Start", got)
 	}
@@ -319,11 +312,6 @@ func TestConsumerRunningInfoClassicConsumerFillsOnlyMqTable(t *testing.T) {
 	if !ok {
 		t.Fatalf("mqTable key mismatch: %v", info.MQTable)
 	}
-	// processQueueInfo has 14 keys, all always present: every Java field is a
-	// primitive, so fastjson2 has nothing to omit. The cached span is the
-	// interesting part — Java only WRITES cachedMsgMin/MaxOffset and
-	// cachedMsgCount when the buffer is non-empty, but the JSON key travels
-	// either way, so an empty queue reports a zero range and not a missing one.
 	if len(pqi) != 14 {
 		t.Errorf("processQueueInfo has %d keys, want 14: %v", len(pqi), pqi)
 	}
@@ -384,9 +372,6 @@ func TestConsumerRunningInfoPopConsumerFillsOnlyMqPopTable(t *testing.T) {
 	_ = f
 }
 
-// A pull consumer answers properties + subscriptionSet only. Java's
-// DefaultMQPullConsumerImpl has no process queue table, so a fabricated mqTable
-// would claim a rebalance state the consumer does not track.
 func TestConsumerRunningInfoPullConsumerHasNoTables(t *testing.T) {
 	topic := uniqueTopic("Go307Pull", t)
 	f := newClusterFixture(t, map[string]int{topic: 1})
@@ -422,8 +407,6 @@ func assertConsumeStatusKeys(t *testing.T, status map[string]any) {
 			t.Errorf("consumeStatus is missing %s: %v", k, status)
 		}
 	}
-	// consumeFailedMsgs is a Java long, so it renders as 0 with no point; the
-	// five rates are Java doubles and keep theirs.
 	if _, ok := status["consumeFailedMsgs"].(int64); !ok {
 		t.Errorf("consumeFailedMsgs = %#v, want a plain int64", status["consumeFailedMsgs"])
 	}
@@ -462,12 +445,6 @@ func asFloat(v any) float64 {
 
 // ---------------------------------------------------------------- 307: the wire
 
-// The end-to-end 307: a real consumer registers itself, the broker pushes the
-// request over the warm connection, and the answer must be byte-parseable by
-// fastjson2 — which means the mqTable key is an UNQUOTED inline object. The
-// escaped spelling (`"{\"brokerName\":...}"`) is silently accepted by this
-// client's own tolerant parser and rejected by Java, so it is asserted on the
-// raw bytes.
 func TestGetConsumerRunningInfoPushWire(t *testing.T) {
 	topic := uniqueTopic("Go307Wire", t)
 	const group = "GID_go_307_wire"
@@ -552,9 +529,6 @@ func TestGetConsumerRunningInfoPushWire(t *testing.T) {
 	requireKeys(t, resp2.Body, "jstack", "mqPopTable", "mqTable", "properties", "statusTable", "subscriptionSet", "userConsumerInfo")
 }
 
-// An unknown group is the error both 307 and 309 answer, and the remark is the
-// one the console prints verbatim. Java builds it with the SAME text for both
-// codes, so a divergence here shows up as a wrong console message, not an error.
 func TestGetConsumerRunningInfoUnknownGroupIsSystemError(t *testing.T) {
 	topic := uniqueTopic("Go307Unknown", t)
 	f := newClusterFixture(t, map[string]int{topic: 1})
@@ -576,9 +550,6 @@ func TestGetConsumerRunningInfoUnknownGroupIsSystemError(t *testing.T) {
 	}
 }
 
-// A group registered by a consumer that is NOT a push consumer has no running
-// info; Java answers the same "not exist" error rather than an empty body, and a
-// console that received `{}` would show a healthy-but-empty consumer.
 func TestGetConsumerRunningInfoNonPushConsumerIsSystemError(t *testing.T) {
 	topic := uniqueTopic("Go307Stub", t)
 	f := newClusterFixture(t, map[string]int{topic: 1})
@@ -744,9 +715,6 @@ func TestConsumeMessageDirectlyPanicBecomesThrowException(t *testing.T) {
 	})
 }
 
-// A %RETRY% message reaches the listener under its ORIGINAL topic (Java
-// resetRetryAndNamespace). Without it a caller's listener sees a topic it never
-// subscribed to and typically drops the message.
 func TestConsumeMessageDirectlyRestoresRetryTopicBeforeTheListener(t *testing.T) {
 	const group = "GID_go_309_retry"
 	c := MustNewDefaultMQPushConsumer(group)
@@ -821,10 +789,6 @@ func TestConsumeMessageDirectlyPushWire(t *testing.T) {
 	}
 }
 
-// Both 309 error arms answer the same remark as 307. The second one is the
-// subtle case: a pull/lite consumer group IS registered, but Java's
-// MQClientInstance.consumeMessageDirectly returns null for anything that is not
-// a DefaultMQPushConsumerImpl, so it must NOT get a silent success.
 func TestConsumeMessageDirectlyErrorArms(t *testing.T) {
 	topic := uniqueTopic("Go309Errs", t)
 	const pushGroup = "GID_go_309_err_push"
@@ -870,18 +834,6 @@ func TestConsumeMessageDirectlyErrorArms(t *testing.T) {
 	})
 }
 
-// Java's MQClientAPIImpl registers exactly EIGHT broker->client processors on
-// its shared ClientRemotingProcessor (MQClientAPIImpl:336-350). Any of them
-// missing here means the broker's push logs "no processor for request code" and
-// gets no answer — which, for a ONEWAY push, is indistinguishable from a client
-// that silently ignored it.
-//
-// 39 (CHECK_TRANSACTION_STATE) is registered by the transaction producer rather
-// than the instance, because the handler has to match the check against ITS OWN
-// producer group (Java registers one shared processor and dispatches by group;
-// the Go transport keeps one handler per request code). That is a deliberate,
-// documented divergence — see the note at producer.go's RegisterProcessor call
-// — so it is asserted separately.
 func TestInstanceRegistersEveryProtocolRequestCode(t *testing.T) {
 	inst := CreateOrGetInstance(uniqueClientID(t), nil, testConfig())
 	t.Cleanup(inst.Shutdown)
@@ -910,10 +862,6 @@ func TestInstanceRegistersEveryProtocolRequestCode(t *testing.T) {
 	if remoting.ReqNotifyUnsubscribeLite != 200073 {
 		t.Errorf("ReqNotifyUnsubscribeLite = %d, want 200073", remoting.ReqNotifyUnsubscribeLite)
 	}
-	// 200073 must NOT be answered: Java's switch has no case for it, so its
-	// registered processor falls through and returns null. Replying SUCCESS
-	// would be inventing a protocol the broker does not expect (it sends
-	// oneway and is not waiting).
 	if inst.remoting.HasProcessor(remoting.ReqCheckTransactionState) {
 		t.Log("39 is registered (a transaction producer is live); expected only with one started")
 	}
@@ -921,14 +869,6 @@ func TestInstanceRegistersEveryProtocolRequestCode(t *testing.T) {
 
 // NOTIFY_UNSUBSCRIBE_LITE(200073) must be swallowed WITHOUT a reply, and must not
 // disturb the connection.
-//
-// The broker sends it with invokeOneway (Broker2Client:66) and Java answers
-// nothing at all — its registered ClientRemotingProcessor has no case for the
-// code, so it falls through to `return null`. The observable contract is
-// therefore "the client sends nothing back, and the next request on the same
-// connection still works". A future "fix" that replied SUCCESS would be
-// inventing a reply the broker does not expect; one that dropped the
-// registration would take the WARN path instead.
 func TestNotifyUnsubscribeLiteIsSwallowedWithoutAReply(t *testing.T) {
 	topic := uniqueTopic("Go200073", t)
 	const group = "GID_go_200073"

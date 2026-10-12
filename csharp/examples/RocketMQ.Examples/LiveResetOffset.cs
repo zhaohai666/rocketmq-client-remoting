@@ -1,7 +1,3 @@
-// 220 RESET_CONSUMER_CLIENT_OFFSET（Java MQClientInstance.resetOffset:1403-1450）真机联调
-//（对应 python/verify_reset_offset_live.py、cpp/examples/live_reset_offset.cpp、
-//  rust/examples/live_reset_offset.rs 的同题场景）。
-//
 // 220 是 broker 推给**消费端**的重置指令；管理端那笔 INVOKE_BROKER_TO_RESET_OFFSET(222) 的
 // 响应只是一张「每个队列重置到哪」的表，真正让消费端改位点的是 broker 随后 oneway 推的
 // 220（Broker2Client.resetOffset:181-238）。broker 只在 useServerSideResetOffset=false 时才
@@ -443,8 +439,6 @@ public static class LiveResetOffset
                     "arrivals=" + Join(arr) + " pending=" + N(pending));
                 if (!arranged) return;
 
-                // 等周期落盘的**首跳**过去（Java initialDelay＝start 后 10s，之后才是 60s 周期）。
-                // 不等它，重置后那次 persist 会与首跳混在一起，"broker 位点之所以是 3" 就说不清。
                 WaitUntil(() => NowMs() - tStart > 12000, 15000, 200);
                 Check("S1-首跳周期落盘已过（此后 60s 内不再有周期写）",
                     NowMs() - tStart > 12000 && AllBack(admin, group, mq, Msgs),

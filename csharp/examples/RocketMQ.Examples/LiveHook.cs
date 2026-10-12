@@ -1,7 +1,3 @@
-// CheckForbiddenHook / FilterMessageHook 真机验证（对齐 Java client.hook，
-// 与 cpp/examples/live_hook.cpp、python/verify_hook_live.py 同套场景）。
-// 用法：rmq hook [namesrv]
-//
 // 前置：NameServer + Broker 已起（普通配置即可，**不需要** traceTopicEnable）：
 //   - CheckForbiddenHook 纯客户端行为（发请求之前拦截），broker 无感；
 //   - FilterMessageHook 的拉取路径依赖 broker 按 codeSet 哈希过滤 + 客户端字符串二次过滤；

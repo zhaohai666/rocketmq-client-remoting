@@ -1,26 +1,3 @@
-// -*- coding: utf-8 -*-
-// MQClientManager — 同进程内按 clientId 复用 MQClient（org.apache.rocketmq.client.impl.MQClientManager）。
-//
-// Java 的经典设计：同进程内同 clientId（`<ip>@<instanceName>[@<unitName>][@STREAM]`，
-// 见 MixAll.clientIdFor）的 producer / consumer / admin 共享**同一个** MQClient 实例
-// （factoryTable：clientId → instance）——路由缓存、broker 地址表、心跳与路由刷新定时器、
-// 与 broker 的长连接、client 级反向请求处理器（39/326/36/220/221/307/309）都只有一份；
-// 引用计数归零时才真正 shutdown()（停后台定时器、断连接），并把条目从表里摘掉。
-//
-// 生命周期契约（与 Java getOrCreateMQClientInstance / MQClientInstance.shutdown 一致，
-// 语义对齐本仓库 python/client/mq_client_manager.py 与 csharp MQClientManager）：
-//
-// * 门面 start()：getOrCreateMQClientInstance 拿实例（没有就建）→ registerClient 计数 +1
-//   → instance.start()（幂等，复用时不会重复拉起路由刷新 / name server 寻址 /
-//   线程池巡检这些**实例级**后台定时器）。
-// * 门面 shutdown()：unregisterClient 计数 -1；**归零**时把实例摘出缓存并真正 shutdown()；
-//   仍有其他门面持有（计数 > 0）时实例继续存活，其后台定时器与连接不受影响。
-// * 配置以**第一次创建**时的快照为准（Java cloneClientConfig 同口径）：复用方后设的
-//   tls / 代理 / 超时等不会改写已存在的实例；rpcHook 同理只在 created=true 时注册。
-//
-// Node 是单事件循环，不存在 Java/C#/Python 那把表锁；"归零 → 摘表 → shutdown" 在同步
-// 代码段里天然原子。真正的 shutdown()（销毁 socket）统一在表更新之后执行：摘表后其他
-// 门面的 getOrCreateMQClientInstance 只会建新实例，不会拿到半死的旧实例。
 import type { MQClient } from './mq_client.ts';
 import { getLogger } from '../logging.ts';
 
@@ -41,7 +18,6 @@ class FactoryEntry {
 export class MQClientManager {
   private static _singleton: MQClientManager | null = null;
 
-  // 进程级单例（对应 Java MQClientManager.getInstance()）。
   static getInstance(): MQClientManager {
     if (MQClientManager._singleton == null) {
       MQClientManager._singleton = new MQClientManager();
@@ -49,19 +25,12 @@ export class MQClientManager {
     return MQClientManager._singleton;
   }
 
-  // 对应 Java factoryTable：clientId → 条目。
   private _factoryTable: Map<string, FactoryEntry>;
 
   private constructor() {
     this._factoryTable = new Map();
   }
 
-  // ---------------- 查询 / 创建 ----------------
-  // 按 clientId 取缓存实例；没有就用 factory() 建一个并落表。**不**加引用计数 ——
-  // 计数由门面显式 registerClient（与 Python 端同口径），便于 start() 失败路径
-  // 精确回退。返回 { instance, created }：created=true 表示本调用方是创建者，
-  // 门面据此决定要不要注册自己的 rpcHook / TLS 快照（复用方不注册，与 Java 只认
-  // 创建时那份同口径）。
   getOrCreateMQClientInstance(clientId: string, factory: MQClientFactory): { instance: MQClient; created: boolean } {
     if (clientId == null || !String(clientId).trim()) {
       throw new Error('clientId is empty');
@@ -133,9 +102,6 @@ export class MQClientManager {
     }
   }
 
-  // 把实例从缓存摘掉但**不** shutdown（对应 Java removeClientFactory）。
-  // 门面 start() 失败时由调用方收尾用：半启动的实例不能留在表里毒化后续的
-  // getOrCreate；传 instance 时只摘自己的条目，防止误删一个已顶替上来的新实例。
   removeClientFactory(clientId: string, instance?: MQClient | null): void {
     const entry = this._factoryTable.get(clientId);
     if (entry == null) return;

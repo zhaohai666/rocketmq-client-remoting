@@ -1,15 +1,7 @@
-// 异步轨迹分发器（对应 org.apache.rocketmq.client.trace.AsyncTraceDispatcher）。
-//
 // 职责：钩子把 TraceContext 丢进内存队列（Append），后台线程按
 // 「攒够 batchNum 条 或 距上次发送超过 5s」两个条件触发刷写，再把编码后的文本
 // 用**独立的内部生产者**发到轨迹 topic（默认 RMQ_SYS_TRACE_TOPIC）。
 //
-// 与 Java / Python 的对应关系：
-//   * 队列          ← ArrayBlockingQueue<TraceContext>(2048)
-//   * _flush        ← flushTraceContext（含 force_flush 语义）
-//   * 分组发送       ← sendTraceData（按 topic + '\u0001' + traceTopic 分组）
-//   * 切块           ← flushData（按 maxMessageSize 128K 切）
-//   * 内部生产者组名  ← "_INNER_TRACE_PRODUCER-<group>-<PRODUCE|CONSUME>-<N>"
 //
 // **防递归**：内部生产者自身的 EnableTrace 必须为 false，且
 // SendMessageTraceHook 会跳过 topic 以轨迹 topic 开头的消息 —— 两道保险都要有，
@@ -23,7 +15,6 @@ using RocketMQ.Remoting;
 
 namespace RocketMQ.Client;
 
-/// <summary>对应 org.apache.rocketmq.client.trace.TraceDispatcher.Type。</summary>
 public enum TraceDispatcherType
 {
     Produce = 0,
@@ -62,7 +53,7 @@ public sealed class AsyncTraceDispatcher
     public AsyncTraceDispatcher(string group, TraceDispatcherType type, int batchNum = 10,
         string? traceTopicName = null, IRpcHook? rpcHook = null)
     {
-        _batchNum = Math.Min(batchNum, MaxBatch); // Java 注释明说最大 20
+        _batchNum = Math.Min(batchNum, MaxBatch);
         _group = group;
         _type = type;
         _traceTopicName = traceTopicName ?? MixAll.TraceTopic;
@@ -90,9 +81,6 @@ public sealed class AsyncTraceDispatcher
 
     public string GetTraceTopicName() => _traceTopicName;
 
-    /// <summary>对应 Java AsyncTraceDispatcher#namespaceV2（:79/:147）：宿主设置，Start 时
-    /// 传导给内部轨迹生产者（Java start():155 <c>traceProducer.setNamespaceV2(...)</c>），
-    /// 轨迹消息的发送同样要带 ns/nsd 扩展头。</summary>
     public string NamespaceV2 { get; set; } = string.Empty;
 
     /// <summary>当前待发送的轨迹条数（对应 Python 的 trace_context_queue.qsize()）。
@@ -129,8 +117,6 @@ public sealed class AsyncTraceDispatcher
                 _traceProducer.NamesrvAddr = string.Join(";", nameSrvAddr);
                 _traceProducer.InstanceName = TraceConstants.TraceInstanceName + "_"
                                               + string.Join(";", nameSrvAddr);
-                // 对应 Java AsyncTraceDispatcher.start():155：宿主的 namespaceV2 传导给
-                // 轨迹生产者（Start 在锁内、宿主 StartTraceDispatcher 设置之后执行，时序安全）。
                 _traceProducer.NamespaceV2 = NamespaceV2;
                 _traceProducer.EnableTrace = false;
                 _traceProducer.Start();
@@ -180,7 +166,6 @@ public sealed class AsyncTraceDispatcher
     // ---------------- 入队 / 刷写 ----------------
     public bool Append(TraceContext ctx)
     {
-        // 队列满时直接丢弃（与 Java 一致，不阻塞业务）；返回 false 让调用方记计数。
         return _queue.TryAdd(ctx);
     }
 
@@ -240,7 +225,6 @@ public sealed class AsyncTraceDispatcher
             }
         }
 
-        // 防止忙等（Java Thread.sleep(5)）
         Thread.Sleep(5);
     }
 
@@ -268,13 +252,11 @@ public sealed class AsyncTraceDispatcher
     // ---------------- 发送 ----------------
     private void SendTraceData(List<TraceContext> contextList)
     {
-        // 按 (业务 topic, 轨迹 topic) 分组后逐组发送（对应 Java sendTraceData）。
         var beanMap = new Dictionary<string, List<TraceTransferBean>>();
         foreach (TraceContext context in contextList)
         {
             AccessChannel ac = context.AccessChannel ?? _accessChannel;
             string regionId = context.RegionId;
-            // region 为空或 bean 为空则跳过（与 Java 一致）
             if (string.IsNullOrEmpty(regionId) || context.TraceBeans.Count == 0)
             {
                 continue;

@@ -1,22 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消息轨迹（对应 org.apache.rocketmq.client.trace 包 + client.AccessChannel）。
-
-包含：
-  * ``TraceConstants``     —— 常量（org.apache.rocketmq.client.trace.TraceConstants）
-  * ``TraceType``          —— Pub / Recall / SubBefore / SubAfter / EndTransaction
-  * ``AccessChannel``      —— LOCAL / CLOUD（org.apache.rocketmq.client.AccessChannel）
-  * ``TraceBean``          —— 轨迹里被追踪的那条消息
-  * ``TraceContext``       —— 一次追踪上下文（Pub/SubBefore/... 各一份）
-  * ``TraceTransferBean``  —— 编码结果：trans_data + trans_key
-  * ``TraceDataEncoder``   —— 文本编解码（与 Java 逐字节一致，见 tests/test_trace.py 的对拍向量）
-
-⚠ 两个必须保留的 Java 语义差异（否则编解码对不上）：
-  1. ``TraceConstants.CONTENT_SPLITOR`` = \\x01、``FIELD_SPLITOR`` = \\x02，
-     编码时**每条记录末尾补 FIELD_SPLITOR**；解码用 Java 的 ``String.split``
-     语义（**丢弃末尾空串**）切分 —— 见 ``split_dropping_trailing_empty``。
-  2. Python 的 ``str.split`` 保留末尾空串，直接用它切分会多出一个空段并把
-     字段整体错位。本模块一律走 ``split_dropping_trailing_empty``。
-"""
 from __future__ import annotations
 
 import socket
@@ -34,7 +16,7 @@ logger = get_logger()
 
 
 class TraceConstants:
-    """对应 org.apache.rocketmq.client.trace.TraceConstants。"""
+    pass
 
     GROUP_NAME_PREFIX = "_INNER_TRACE_PRODUCER"
     CONTENT_SPLITOR = "\u0001"
@@ -61,7 +43,7 @@ class TraceConstants:
 
 
 class TraceType(Enum):
-    """对应 org.apache.rocketmq.client.trace.TraceType（枚举名即线上字段第 1 段）。"""
+    pass
 
     PUB = "Pub"
     RECALL = "Recall"
@@ -71,23 +53,14 @@ class TraceType(Enum):
 
 
 class AccessChannel(Enum):
-    """对应 org.apache.rocketmq.client.AccessChannel。
-
-    只在 SubAfter 编码时起作用：非 CLOUD 才追加 timestamp + groupName 两段
-    （Java TraceDataEncoder:208）。
-    """
+    pass
 
     LOCAL = "LOCAL"
     CLOUD = "CLOUD"
 
 
 def split_dropping_trailing_empty(value: str, sep: str) -> List[str]:
-    """复刻 Java ``String.split``：**丢弃末尾的空串**。
-
-    Python 的 ``str.split`` 会保留末尾空串，而编码结果末尾正好补了 FIELD_SPLITOR，
-    所以直接 split 会多出一段空记录；对内容段（CONTENT_SPLITOR）同理。
-    这条差异是真金白银的对拍坑，勿改成 str.split。
-    """
+    pass
     parts = value.split(sep)
     while parts and parts[-1] == "":
         parts.pop()
@@ -95,22 +68,12 @@ def split_dropping_trailing_empty(value: str, sep: str) -> List[str]:
 
 
 def _field(line: List[str], index: int, default: str = "") -> str:
-    """按下标取段，越界返回 ``default``。
-
-    ⚠ 这是**有意偏离 Java** 的一处健壮性处理。Java ``decoderFromTraceDataString``
-    直接 ``line[7]``，而 SubBefore 的加密串形如
-    ``SubBefore\\x01ts\\x01region\\x01group\\x01reqId\\x01msgId\\x01retryTimes\\x01<keys>\\x01\\x02``：
-    当被消费的消息**没有 keys** 时，``<keys>`` 为空，Java ``String.split`` 会连同末尾
-    的 CONTENT_SPLITOR 一起丢弃 → 数组只剩 7 段 → ``line[7]`` 抛
-    ArrayIndexOutOfBoundsException（我们的 Python 参考实现照抄后同样抛 IndexError）。
-    轨迹读取方（控制台 / 本项目的验证脚本）不该因为一条无 key 的合法记录就崩掉，
-    所以这里改为「缺段当空串」，其余字段顺序与 Java 逐字保持一致。
-    """
+    pass
     return line[index] if index < len(line) else default
 
 
 def _local_address() -> str:
-    """对应 Java TraceBean 静态块里的 LOCAL_ADDRESS（storeHost/clientHost 默认值）。"""
+    pass
     ip = MixAll.get_ip_str()
     if UtilAll.is_ipv4(ip):
         return ip
@@ -125,7 +88,7 @@ LOCAL_ADDRESS = _local_address()
 
 
 class TraceBean:
-    """对应 org.apache.rocketmq.client.trace.TraceBean。"""
+    pass
 
     def __init__(self) -> None:
         self.topic: str = ""
@@ -145,11 +108,7 @@ class TraceBean:
 
 
 class TraceContext:
-    """对应 org.apache.rocketmq.client.trace.TraceContext。
-
-    ``request_id`` 默认取 MessageClientIDSetter.createUniqID()，与 Java 一致 ——
-    SubBefore 与 SubAfter 共用一个 request_id，是控制台把一次消费前后串起来的关键。
-    """
+    pass
 
     def __init__(self) -> None:
         self.trace_type: Optional[TraceType] = None
@@ -164,12 +123,11 @@ class TraceContext:
         self.access_channel: Optional[AccessChannel] = None
         self.trace_beans: List[TraceBean] = []
 
-    # Java 属性名 accessChannel/isSuccess 的别名，便于移植时逐字对照
     @property
     def access_channel_or_local(self) -> AccessChannel:
         return self.access_channel or AccessChannel.LOCAL
 
-    def __repr__(self) -> str:  # 对应 Java TraceContext.toString
+    def __repr__(self) -> str:
         beans = "".join("%s_%s_" % (b.msg_id, b.topic) for b in (self.trace_beans or []))
         return "TraceContext{%s_%s_%s_%s_%s}" % (
             self.trace_type.value if self.trace_type else "", self.group_name,
@@ -177,7 +135,7 @@ class TraceContext:
 
 
 class TraceTransferBean:
-    """对应 org.apache.rocketmq.client.trace.TraceTransferBean。"""
+    pass
 
     def __init__(self) -> None:
         self.trans_data: str = ""
@@ -185,15 +143,11 @@ class TraceTransferBean:
 
 
 class TraceDataEncoder:
-    """对应 org.apache.rocketmq.client.trace.TraceDataEncoder。
-
-    编码结果的字段顺序**逐字节对齐 Java**，回归守卫是 tests/test_trace.py 里
-    由 Java 官方实现打印出来的固定字符串。
-    """
+    pass
 
     @staticmethod
     def decoder_from_trace_data_string(trace_data: Optional[str]) -> List[TraceContext]:
-        """把线上轨迹文本解回 TraceContext 列表（对应 Java decoderFromTraceDataString）。"""
+        pass
         res: List[TraceContext] = []
         if not trace_data:
             return res
@@ -203,8 +157,6 @@ class TraceDataEncoder:
             try:
                 ctx = TraceDataEncoder._decode_context(context)
             except Exception as e:  # noqa: BLE001
-                # 有意偏离 Java（Java 此处会把异常抛给调用方，整条轨迹消息全丢）：
-                # 单条坏记录只跳过自己，其余记录照常解出。
                 logger.warning("decode trace context failed: %s, context=%r", e, context)
                 continue
             if ctx is not None:
@@ -307,7 +259,7 @@ class TraceDataEncoder:
 
     @staticmethod
     def encoder_from_context_bean(ctx: Optional[TraceContext]) -> Optional[TraceTransferBean]:
-        """把 TraceContext 编成可发送的文本（对应 Java encoderFromContextBean）。"""
+        pass
         if ctx is None:
             return None
         SOH = TraceConstants.CONTENT_SPLITOR
@@ -333,8 +285,6 @@ class TraceDataEncoder:
             for bean in ctx.trace_beans:
                 sb += [t.value, ctx.request_id, bean.msg_id, str(ctx.cost_time),
                        str(ctx.is_success).lower(), bean.keys, str(ctx.context_code)]
-                # Java：非 CLOUD 才补 timestamp + groupName（accessChannel 为 null 时
-                # Java 会 NPE，这里按 LOCAL 处理 —— 唯一一处有意的健壮性偏离）
                 if ctx.access_channel_or_local != AccessChannel.CLOUD:
                     sb += [str(ctx.time_stamp), ctx.group_name]
                 tb.trans_data += SOH.join(sb) + STX
@@ -354,7 +304,6 @@ class TraceDataEncoder:
             sb += [t.value, str(ctx.time_stamp), ctx.region_id, ctx.group_name,
                    bean.topic, bean.msg_id, str(ctx.is_success).lower()]
             tb.trans_data = SOH.join(sb) + STX
-        # 收集 keys：msgId + 按空格拆开的业务 keys（Java split(KEY_SEPARATOR)）
         for bean in ctx.trace_beans:
             tb.trans_key.add(bean.msg_id)
             if bean.keys:

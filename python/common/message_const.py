@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消息属性键常量（对应 org.apache.rocketmq.common.message.MessageConst）。"""
 from __future__ import annotations
 
 
@@ -54,8 +53,6 @@ class MessageConst:
     PROPERTY_POP_CK = "POP_CK"
     PROPERTY_POP_CK_OFFSET = "POP_CK_OFFSET"
     PROPERTY_POP_TIME = "POP_TIME"
-    # Java 侧写的是 "1ST_POP_TIME"（MessageConst.PROPERTY_FIRST_POP_TIME），
-    # 客户端在 POP 响应后处理时"仅在缺失时"补上，值为响应头的 popTime。
     PROPERTY_FIRST_POP_TIME = "1ST_POP_TIME"
     PROPERTY_INVISIBLE_TIME = "INVISIBLE_TIME"
     PROPERTY_DELAY_TIME = "DELAY_TIME"

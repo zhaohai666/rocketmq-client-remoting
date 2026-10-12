@@ -7,11 +7,6 @@ declare(strict_types=1);
 //   php examples/live_compression.php send <topic> <group> <size> <namesrv> [codec]
 //   php examples/live_compression.php recv <topic> <group> <size> <namesrv>
 //
-// 载荷由每端按**同一配方本地重建**（同一行文本重复后截断）——必须与 Java
-// CompressProbe.buildPayload 逐字节一致，否则两边算的是"同一个载荷"的不同 CRC，
-// 所有腿都无理由失败。判定只看接收端打印的 `match=1`（标准 CRC-32 IEEE，
-// PHP 的 crc32() 可能返回负数，用 sprintf('%u') 转无符号；**不是** Java
-// UtilAll.crc32 的 &0x7FFFFFFF 口径，两边数字本来就差 2^31，不比数字）。
 //
 // codec 面覆盖 zlib（gzcompress）+ lz4（CompressionCodec 的纯 PHP **LZ4 Frame**
 // 实现，frame 内部块就是 block-format）+ zstd（优先 `zstd` CLI，退回纯 PHP

@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消息模型测试（对应 org.apache.rocketmq.common.message 包）。"""
 from __future__ import annotations
 
 import pytest
@@ -10,7 +9,7 @@ from common.message_const import MessageConst
 
 
 class TestMessageQueue:
-    """MessageQueue.hashCode 必须与 Java 逐步一致（否则 consumer rebalance 会算错）。"""
+    pass
 
     @staticmethod
     def _utf16_int32_hash(s: str) -> int:
@@ -21,7 +20,7 @@ class TestMessageQueue:
 
     @staticmethod
     def _reference_hash(topic: str, broker_name: str, queue_id: int) -> int:
-        """按 Java hashCode 实现逐位推导：((1*31+bh)*31+qid)*31+th。"""
+        pass
         r = 1
         r = (31 * r + TestMessageQueue._utf16_int32_hash(broker_name)) & 0xFFFFFFFF
         r = (31 * r + queue_id) & 0xFFFFFFFF
@@ -197,12 +196,7 @@ class TestMessageBatch:
             MessageBatch.generate_from_list([m1, m2])
 
     def test_batch_defaults_wait_store_msg_ok_to_true(self):
-        """回归：**没设过 WAIT** 的普通消息组成的批量必须是 WAIT=true。
-
-        曾经写成 ``first.get_wait_store_msg_ok() == "true"`` —— 缺省（None）被判成 False，
-        于是 ``send_batch`` 把 Java 的 ``WAIT=true`` 发成了 ``WAIT=false``：broker 不再等刷盘
-        就回 SEND_OK，持久性静默降级。Rust 侧同款缺陷一起修掉了。
-        """
+        pass
         messages = [Message(topic="T", body=b"a"), Message(topic="T", body=b"b")]
         # 前提：Message.__init__（同 Rust 的 Message::new）不预写 WAIT
         assert messages[0].get_wait_store_msg_ok() is None
@@ -215,7 +209,7 @@ class TestMessageBatch:
         assert MessageBatch.generate_from_list(messages).get_wait_store_msg_ok() == "false"
 
     def test_is_wait_store_msg_ok_follows_the_strict_boolean_parse_rule(self):
-        """Java ``Message.isWaitStoreMsgOK()`` = 缺省 true + ``Boolean.parseBoolean``。"""
+        pass
         msg = Message(topic="T", body=b"a")
         assert is_wait_store_msg_ok(msg)                      # 缺省
         msg.set_wait_store_msg_ok(True)

@@ -1,9 +1,5 @@
-// -*- coding: utf-8 -*-
-// Message model: MessageQueue, Message, MessageExt, MessageBatch.
-// Mirrors org.apache.rocketmq.common.message.*.
 import { encodeMessages } from './messageDecoder.ts';
 
-// Java hashCode for MessageQueue: ((31 + brokerHash) * 31 + queueId) * 31 + topicHash, 32-bit signed.
 function _strHash(s: string): number {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
@@ -43,7 +39,6 @@ export class MessageQueue {
   toString() { return `MessageQueue [topic=${this.topic}, brokerName=${this.brokerName}, queueId=${this.queueId}]`; }
 }
 
-// Java: isWaitStoreMsgOK() — property absent => true, else "true" (case-insensitive) only.
 export function isWaitStoreMsgOK(msg: any): boolean {
   const v = msg.getWaitStoreMsgOK ? msg.getWaitStoreMsgOK() : null;
   if (v == null) return true;
@@ -71,14 +66,10 @@ export class Message {
   getKeys() { return this.properties['KEYS'] || null; }
   setDelayTimeLevel(level: number) { this.properties['DELAY'] = String(level); }
   getDelayTimeLevel() { return this.properties['DELAY'] || null; }
-  // Java Message#setDelayTimeSec (5.x timer wheel): delivered `sec` seconds
-  // from now, expressed through the TIMER_DELAY_SEC property alias of DELAY.
   setDelayTimeSec(sec: number) { this.properties['TIMER_DELAY_SEC'] = String(sec); }
   getDelayTimeSec() { return this.properties['TIMER_DELAY_SEC'] || null; }
-  // Java Message#setDelayTimeMs: delivered `ms` milliseconds from now.
   setDelayTimeMs(ms: number) { this.properties['TIMER_DELAY_MS'] = String(ms); }
   getDelayTimeMs() { return this.properties['TIMER_DELAY_MS'] || null; }
-  // Java Message#setDeliverTimeMs: delivered AT the given wall-clock timestamp.
   setDeliverTimeMs(ms: number) { this.properties['TIMER_DELIVER_MS'] = String(ms); }
   getDeliverTimeMs() { return this.properties['TIMER_DELIVER_MS'] || null; }
   setWaitStoreMsgOK(ok: boolean) { this.properties['WAIT'] = ok ? 'true' : 'false'; }
@@ -166,10 +157,6 @@ export class MessageBatch extends Message {
   constructor(messages: Message[] | null = null) {
     super();
     this.messages = messages ? Array.from(messages) : [];
-    // Java's MessageBatch constructor is private and generateFromList derives
-    // the batch topic/waitStoreMsgOK from the FIRST message. A directly
-    // constructed batch must do the same, or send() fails with
-    // "The specified topic is blank".
     if (this.messages.length > 0) {
       const first = this.messages[0];
       this.setTopic(first.getTopic());

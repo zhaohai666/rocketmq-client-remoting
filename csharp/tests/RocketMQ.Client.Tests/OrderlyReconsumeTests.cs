@@ -1,14 +1,3 @@
-// 顺序消费（Java ConsumeMessageOrderlyService）的重试计数与回投闸门单测 —— 不需要集群。
-//
-// 为什么必须离线锁死：这条路径错了是**静默的队列卡死或凭空死信**。Java
-// #processConsumeResult:236-307 在 SUSPEND 分支先过 #checkReconsumeTimes:322-339，
-// 三种写错在真机短期窗口里都看不出差别：
-//   - 漏掉本地 reconsumeTimes+1：broker 侧压根没记这次失败，阈值永远到不了，毒消息占住队列；
-//   - 把 -1 读成并发侧的 16：顺序消费凭空多出死信（Java 顺序侧是 Integer.MAX_VALUE）；
-//   - 回投成功后仍挂起：位点永不前进，看起来跟「消费者死了」一模一样。
-// 未 Start 的消费者拿不到内部生产者，回投必定失败，所以这里能锁的是「失败分支」
-//（回投失败 → 塞回队首 + 位点不越过它）；「回投成功 → 位点前进、毒消息进 %DLQ%」只能靠
-// 真机（examples 的 S3 顺序消费场景）。与 Python/Rust/C++ 的同名测试一一对应。
 
 using System.Globalization;
 using System.Text;
@@ -147,9 +136,6 @@ public class OrderlyReconsumeTests
     [Fact]
     public void MinusOneMeansUnlimitedOnTheOrderlySideNotTheConcurrentSixteen()
     {
-        // Java 故意让两条链路的 -1 含义不同：OrderlyService#getMaxReconsumeTimes:313-320
-        // → Integer.MAX_VALUE；DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890 → 16。
-        // 并成一个常量等于要么给顺序消费凭空造死信，要么让并发消息无限重投。
         var h = new Harness(-1);
         Assert.Equal(int.MaxValue, h.OrderlyMax());
         Assert.Equal(16, h.ConcurrentMax());
@@ -183,8 +169,6 @@ public class OrderlyReconsumeTests
     [Fact]
     public void AtCapWithFailedSendBackStillSuspends()
     {
-        // 未 Start → Client() 抛 → 回投必败。Java :328-331 这时 suspend=true 并且再 +1，
-        // 下一轮再来；写成「失败也前进位点」就等于把毒消息丢掉。
         var h = new Harness(2);
         List<MessageExt> batch = OffsetBatch(7, new[] { 2 });
         Assert.True(h.CheckGate(batch));
@@ -248,12 +232,6 @@ public class OrderlyReconsumeTests
 
     // ---------------- 挂起时长（context 优先 + 钳位） ----------------
 
-    /// <summary>
-    /// Java <c>submitConsumeRequestLater:211-234</c> —— context（默认 -1 = 没指定）优先，
-    /// -1 回落消费者配置，结果钳到 [10, 30000]。三个坏法都是静默的：不回落到配置等于吞掉
-    /// 用户的配置；不钳下限则 listener 传 0 会把消费线程变成忙等；不钳上限则一次挂起能顶到
-    /// 天亮。
-    /// </summary>
     [Fact]
     public void OrderlySuspendMillisResolvesThenClampsLikeLegacy()
     {
@@ -275,18 +253,12 @@ public class OrderlyReconsumeTests
         Assert.Equal(30000, Resolve(30001));  // 钳上限
         Assert.Equal(30000, Resolve(int.MaxValue));
 
-        // 配置侧也是 -1：Java 这时读到的还是 -1，落到钳位下限 10ms
         h.Consumer().SuspendCurrentQueueTimeMillis = -1;
         Assert.Equal(10, Resolve(-1));
     }
 
     // ---------------- AutoCommit=true 下的非法状态 ----------------
 
-    /// <summary>
-    /// Java <c>processConsumeResult:246-250</c> —— AutoCommit=true 时 Commit/Rollback 是
-    /// <b>非法</b>用法（只给 binlog 消费用）：Java 只 warn、<b>不写 break</b>，顺势落进
-    /// Success 分支。写错方向（当回滚处理）会让普通消费者被一个手滑的返回值永久卡住队列。
-    /// </summary>
     [Theory]
     [InlineData(ConsumeOrderlyStatus.Commit)]
     [InlineData(ConsumeOrderlyStatus.Rollback)]
@@ -300,7 +272,6 @@ public class OrderlyReconsumeTests
 
     // ---------------- AutoCommit=false（手动提交） ----------------
 
-    /// <summary>Java <c>:275-277</c> —— 显式提交：位点前进、不回投（<b>不记 TPS</b>，RT 照记）。</summary>
     [Fact]
     public void ManualCommitAdvancesWithoutRequeueing()
     {
@@ -311,7 +282,6 @@ public class OrderlyReconsumeTests
         Assert.Empty(h.Pending());
     }
 
-    /// <summary>Java <c>:278-285</c> —— rollback() 把消息退回 ProcessQueue 并延后重试，位点不动。</summary>
     [Fact]
     public void ManualRollbackRequeuesAndHoldsTheOffset()
     {
@@ -323,10 +293,6 @@ public class OrderlyReconsumeTests
         Assert.Equal(new[] { (0L, 0), (1L, 0), (2L, 0) }, h.Pending().ToArray());
     }
 
-    /// <summary>
-    /// Java <c>:272-274</c> —— AutoCommit=false 的 Success 只记 OK TPS、<b>不提交</b>。本端口的
-    /// 等价处理是把批次塞回队首（没有 ProcessQueue 可留给 listener），位点必须原地不动。
-    /// </summary>
     [Fact]
     public void ManualSuccessHoldsTheBatchWithoutCommitting()
     {
@@ -337,10 +303,6 @@ public class OrderlyReconsumeTests
         Assert.Equal(new[] { (0L, 0) }, h.Pending().ToArray());
     }
 
-    /// <summary>
-    /// Java <c>:288-296</c> —— 与自动提交分支的差别：毒消息交给 broker 之后<b>不 commit</b>，
-    /// 位点前不前进由 binlog 消费方自己拿主意（写错成「照常提交」会静默丢消息）。
-    /// </summary>
     [Fact]
     public void ManualSuspendNeverCommitsTheOffset()
     {
@@ -354,11 +316,6 @@ public class OrderlyReconsumeTests
 
     // ---------------- 309 CONSUME_MESSAGE_DIRECTLY 的映射 ----------------
 
-    /// <summary>
-    /// Java 顺序 <c>consumeMessageDirectly:103-161</c> —— 比并发侧多 CR_COMMIT/CR_ROLLBACK
-    /// 两档，且 Order=true、AutoCommit 取 listener 跑完之后的值（broker 按它决定这条直接消费
-    /// 算不算已提交）。映射写错是静默的：真机上只表现为 mqadmin 的返回少一档语义。
-    /// </summary>
     [Theory]
     [InlineData(ConsumeOrderlyStatus.Success, "CR_SUCCESS")]
     [InlineData(ConsumeOrderlyStatus.SuspendCurrentQueueAMoment, "CR_LATER")]
@@ -384,12 +341,6 @@ public class OrderlyReconsumeTests
 
     // ---------------- %RETRY% 属性抬进发送头 ----------------
 
-    /// <summary>
-    /// Java <c>sendKernelImpl:1004-1018</c>：发往 <c>%RETRY%</c> 时把 RECONSUME_TIME /
-    /// MAX_RECONSUME_TIMES 抬进请求头（V2 的 <c>j</c> / <c>l</c>）。broker 判死信只看头
-    ///（<c>SendMessageProcessor#handleRetryAndDLQ:197-210</c>），不抬等于消费者配的阈值
-    /// 形同虚设 —— 退回 retryMaxTimes(16)，毒消息要多耗十几轮才进 %DLQ%。
-    /// </summary>
     [Fact]
     public void RetryTopicPropertiesAreLiftedIntoTheSendHeader()
     {
@@ -407,11 +358,6 @@ public class OrderlyReconsumeTests
         Assert.Contains(MessageConst.PropertyReconsumeTime, request.ExtFields["i"]);
     }
 
-    /// <summary>
-    /// 反向对照：普通 topic 即使带着这两个属性也不许抬（Java 的判据是 topic 前缀，不是
-    /// 「属性存在与否」）。写成按属性抬，业务自发的一条带 RECONSUME_TIME 的普通消息一进
-    /// broker 就被当成重投、甚至直接改投 %DLQ%。
-    /// </summary>
     [Fact]
     public void OrdinaryTopicNeverLiftsReconsumeTimes()
     {

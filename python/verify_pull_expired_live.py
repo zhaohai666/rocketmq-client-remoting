@@ -1,29 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""拉取循环停摆**自愈**（Java isPullExpired / PULL_MAX_IDLE_TIME）真机验证。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_pull_expired_live.py 127.0.0.1:9876
-
-要验的东西：Java ``RebalanceImpl.updateProcessQueueTableInRebalance:438-461`` 在每一趟
-rebalance 里，对**仍归本实例**的队列问一句 ``pq.isPullExpired()``（阈值
-``ProcessQueue.PULL_MAX_IDLE_TIME``=120s，读 ``rocketmq.client.pull.pullMaxIdleTime``）；
-过期就按撤走收尾（setDropped → removeUnnecessaryMessageQueue：持久化位点 + 丢 ProcessQueue
-+ 顺序模式 UNLOCK），紧接着的 add 分支换一具新的 ProcessQueue 重建拉取。
-
-这条路径坏掉的样子是**静默的**：某条队列的循环一旦死了又没有自愈，那个队列从此不再消费，
-但客户端不报任何错、心跳照发、其他队列照常推进——真机上只能从"某个组的位点卡住不动"反推。
-所以必须用真机验证「注入停摆 → 恢复消费」这个闭环，光看客户端不报错说明不了任何事。
-
-场景（故障用注入模拟，Python 没有"杀掉一条线程"的合法手段）：
-  A1 基线：1 队列 topic 投 3 条，位点 3；运行信息里 lastPullTimestamp 是**真时刻**且在前进。
-  A2 线程死掉：把该队列的线程表条目换成一条已退出的线程（等价于循环被异常打穿）→
-     下一趟 rebalance 必须换掉它，之后新发的 3 条**照样被消费**（位点走到 6）。
-  A3 盖章过期：线程还活着，但把 lastPull 时刻倒拨 121s（> 120s 阈值）→ 同样被撤并重建，
-     再发的 3 条照样被消费（位点走到 9）。
-  A4 自愈不回退位点：A2/A3 撤走前必须持久化已消费位点，重建后从 broker 位点续拉 →
-     前 6 条整个窗口各只到一次（没有从头重投）。
-"""
 from __future__ import annotations
 
 import sys
@@ -143,13 +119,7 @@ def parked_thread():
 
 
 def inject_and_rebalance(c: DefaultMQPushConsumer, key: str, mode: str):
-    """注入故障并走**生产路径**触发 rebalance（_rebalance_now 就是 40 通知用的那颗事件）。
-
-    两种模式分别打中 Java isPullExpired 的两个判据：``dead`` = 线程已退出，
-    ``stale`` = 线程活着但 lastPull 时刻超出 PULL_MAX_IDLE_TIME。
-    返回 (原线程, 注入的假线程)——断言"换新"时必须两者都不等于当前条目，
-    否则刚注入还没被撤走也会被判成通过（第一版就栽在这里）。
-    """
+    pass
     old = pull_thread_of(c, key)
     assert old is not None, "队列没分到，注入无意义"
     fake = dead_thread() if mode == "dead" else parked_thread()
@@ -172,11 +142,7 @@ def wait_rebuilt(c: DefaultMQPushConsumer, key: str, old, fake,
 
 
 def pqi_of(info: ConsumerRunningInfo, mq: MessageQueue) -> dict:
-    """取**指定队列**的运行信息，而不是"表里第一条"。
-
-    自营队列和 %RETRY%<group> 会在同一张 mq_table 里（Java processQueueTable 就是
-    按分配队列逐条填的），values()[0] 会随机命中另一条，判据就失效了。
-    """
+    pass
     for k, v in info.mq_table.items():
         if k.topic == mq.topic and k.queue_id == mq.queue_id:
             return v

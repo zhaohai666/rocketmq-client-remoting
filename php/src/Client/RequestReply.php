@@ -104,12 +104,6 @@ class RequestResponseFuture
     }
 }
 
-/**
- * 对应 Java ``RequestFutureHolder``：correlationId → 等待槽 的全局表。
- *
- * Java 里是**跨 producer 共享的单例**（``RequestFutureHolder.getInstance()``），
- * 因为应答由 clientId 级别的 remoting 通道推回，与具体 producer 实例无关。
- */
 class RequestFutureHolder
 {
     /** @var array<string, RequestResponseFuture> */
@@ -142,14 +136,6 @@ class RequestFutureHolder
         return $future;
     }
 
-    /**
-     * 接收侧入口（对齐 Java ``processReplyMessage``）：投递应答。
-     *
-     * Java 做的是 ``getRequestFutureTable().remove(correlationId)`` —— 用「谁摘到谁负责」
-     * 保证「应答到达」与「超时清理」两条路径只会有一个生效。
-     *
-     * 返回被填充的 future；查不到（已超时/已移除）时返回 null。
-     */
     public function putResponse(string $correlationId, ?Message $responseMsg): ?RequestResponseFuture
     {
         $future = $this->removeRequest($correlationId);
@@ -157,21 +143,10 @@ class RequestFutureHolder
             return null;
         }
         $future->putResponseMessage($responseMsg);
-        // 对齐 Java：成功路径也走 executeRequestCallback，让「只回调一次」的守卫生效
         $future->executeRequestCallback();
         return $future;
     }
 
-    /**
-     * TTL 清扫（对应 Java ``RequestFutureHolder.scanExpiredRequest``，由
-     * RequestHouseKeepingService 线程按 1s 周期驱动；PHP 无线程，改由
-     * ``MQClientInstance.tick()`` 按同一节奏调用）。
-     *
-     * 超时的槽位摘除后逐个置 RequestTimeoutException 并触发回调 —— 「摘到才负责」
-     * 与 putResponse 的 remove 语义互斥，同一请求只会走两条路径之一。
-     *
-     * @return int 本轮清扫掉的槽位数
-     */
     public function scanExpiredRequest(): int
     {
         $expired = [];
@@ -197,7 +172,6 @@ class RequestFutureHolder
     }
 }
 
-/** 对应 Java ``CorrelationIdUtil``（随机 UUID 字符串）。 */
 final class CorrelationIdUtil
 {
     public static function createCorrelationId(): string
@@ -209,20 +183,8 @@ final class CorrelationIdUtil
     }
 }
 
-/**
- * 对应 Java ``MessageUtil``：由请求消息派生应答消息 / 判定是否为应答消息。
- */
 final class MessageUtil
 {
-    /**
-     * 对应 Java ``MessageUtil.createReplyMessage``。
-     *
-     * ``CLUSTER`` 属性由 broker 在投递时写入；拿不到就说明这条消息不是经 broker 转发的
-     * （或 topic 配得不对），与 Java 一样直接抛错，而不是造一条投不出去的应答。
-     *
-     * Java 抛 ``MQClientException(CREATE_REPLY_MESSAGE_EXCEPTION, ...)``，应答方通常写在
-     * 业务 listener 里，按 responseCode 分流才能把"这条请求不能回话"和别的本地错误分开。
-     */
     public static function createReplyMessage(?Message $requestMessage, string $body): Message
     {
         if ($requestMessage === null) {
@@ -266,8 +228,6 @@ final class MessageUtil
 
     private static function copyProperty(Message $from, Message $to, string $key): void
     {
-        // Java/Python 原样拷贝（可能为 null）；PHP 属性表为 array<string,string>，
-        // null 无法落地，故缺省时跳过 —— 对 properties2String 的线格式等价（null 本就跳过）。
         $value = $from->getProperty($key);
         if ($value !== null) {
             $to->putProperty($key, $value);

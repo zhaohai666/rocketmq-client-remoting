@@ -6,13 +6,6 @@ declare(strict_types=1);
 //
 //   php examples/live_tls.php <ns> <leg> <caCert> <serverName> [clientCert] [clientKey]
 //
-//   leg = plain_tls | ca_verify | mtls
-//     plain_tls : tlsEnable=true、无证书选项 —— Java tls.test.mode.enable=true 口径
-//                 （信任 broker 自签证书），最小握手/收发全链路。
-//     ca_verify : tlsOptions['caCert'] = CA 证书 —— 真校验 broker 证书链 + 主机名
-//                 （tls.test.mode.enable=false 口径）。
-//     mtls      : 在 ca_verify 基础上带客户端证书 —— broker 端
-//                 tls.client.authServer=true 时要求出示（mTLS 双向认证）。
 //
 // broker 由 scripts/run_php_live.sh tls 分支启动：
 //   leg1+2: -Dtls.enable=true -Dtls.server.certPath=... -Dtls.server.keyPath=...

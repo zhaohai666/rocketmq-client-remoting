@@ -1,41 +1,14 @@
-//! 一致性哈希环（对应 Java `org.apache.rocketmq.common.consistenthash` 包）。
-//!
-//! 移植的正是 `ConsistentHashRouter` / `Node` / `VirtualNode` / `HashFunction` 四个类型
-//! 加 `ConsistentHashRouter.MD5Hash` 这个私有实现，目前唯一的用户是队列分配策略
-//! [`crate::client::allocate_strategy::AllocateMessageQueueConsistentHash`]（Java 侧
-//! `AllocateMessageQueueConsistentHash` 是另一个用户：`MQClientAPIImpl` 的事务回查
-//! 分片在本仓库的四个端口里都没搬）。
-//!
 //! ## 为什么整套照搬而不是"等价改写"
-//!
-//! 环上的落点由三处细节共同决定，任何一处不同都会让**全体**队列换主，与 Java 客户端
-//! 混跑时表现为重复消费 / 漏消费，而不是"分得稍有不均"：
-//!
-//! 1. 哈希函数只取 MD5 摘要的**前 4 个字节**按大端拼成整数（Java
-//!    `for (int i = 0; i < 4; i++) { h <<= 8; h |= digest[i] & 0xFF; }`），不是完整
-//!    128 bit；
-//! 2. 虚拟节点的 key 是 `物理节点key + "-" + 副本序号`，序号从 `existingReplicas` 起算；
-//! 3. 查找用 `TreeMap#tailMap(hashVal)`，它**含端点**，所以等价于 `BTreeMap::range(h..)`
-//!    的第一个 key（相等的 hash 归自己），越过环末尾时回绕到 `firstKey()`。
-//!
-//! ## 与 Java 的有意差异
-//!
-//! 1. Java 的环是 `TreeMap<Long, VirtualNode<T>>` 且泛型参数 `T extends Node`；Rust 用
-//!    `Arc<dyn Node>` 做动态分发，`route_node` 因而交出 `Arc<dyn Node>` 而不是 `T`。
-//! 2. `virtualNodeCnt < 0` 在 Java 抛 `IllegalArgumentException`，这里返回
-//!    [`Err`]（口径同本仓库其它"非法配置"的入口）。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
-/// 对应 Java `HashFunction#hash(String) -> long`：把字符串映射到环上的位置。
 pub trait HashFunction: Send + Sync {
     fn hash(&self, key: &str) -> i64;
 }
 
-/// 对应 Java `ConsistentHashRouter.MD5Hash`（Java 里的默认哈希函数）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Md5Hash;
 
@@ -44,8 +17,6 @@ impl HashFunction for Md5Hash {
     fn hash(&self, key: &str) -> i64 {
         let digest = md5(key.as_bytes());
         let mut value: i64 = 0;
-        // Java 写的是 `h |= ((int) digest[i]) & 0xFF` —— 那个掩码是必须的，因为 Java 的
-        // `byte` 有符号，`0x90` 会先变成 `-112`。Rust 的 `u8` 无符号，升位即同值。
         for byte in digest.iter().take(4) {
             value = (value << 8) | i64::from(*byte);
         }
@@ -53,12 +24,10 @@ impl HashFunction for Md5Hash {
     }
 }
 
-/// 对应 Java `Node#getKey`：能被映到环上的东西，物理节点和虚拟节点都算。
 pub trait Node: Send + Sync {
     fn get_key(&self) -> &str;
 }
 
-/// 对应 Java `AllocateMessageQueueConsistentHash.ClientNode`：key 就是 clientId。
 #[derive(Debug, Clone)]
 pub struct ClientNode {
     client_id: String,
@@ -82,7 +51,6 @@ impl Node for ClientNode {
     }
 }
 
-/// 对应 Java `VirtualNode`：`getKey()` = 物理节点 key + `"-"` + 副本序号。
 #[derive(Clone)]
 struct VirtualNode {
     physical: Arc<dyn Node>,
@@ -99,9 +67,7 @@ impl VirtualNode {
     }
 }
 
-/// 对应 Java `ConsistentHashRouter`：虚拟节点环 + "顺时针找最近物理节点"。
 pub struct ConsistentHashRouter {
-    // Java 是 TreeMap<Long, VirtualNode<T>>；BTreeMap 的 range 就是 tailMap。
     ring: BTreeMap<i64, VirtualNode>,
     hash_function: Arc<dyn HashFunction>,
 }
@@ -122,14 +88,10 @@ impl std::fmt::Debug for ConsistentHashRouter {
 }
 
 impl ConsistentHashRouter {
-    /// 对应 Java `ConsistentHashRouter(Collection<T>, int)`：用默认 MD5Hash。
     pub fn new(p_nodes: &[Arc<dyn Node>], v_node_count: i32) -> Result<ConsistentHashRouter> {
         Self::with_hash_function(p_nodes, v_node_count, Arc::new(Md5Hash))
     }
 
-    /// 对应 Java `ConsistentHashRouter(Collection<T>, int, HashFunction)`。
-    ///
-    /// Java 的 `hashFunction == null` 抛 NPE；Rust 由 `Arc` 保证非空，参数直接不可为空。
     pub fn with_hash_function(
         p_nodes: &[Arc<dyn Node>],
         v_node_count: i32,
@@ -145,11 +107,6 @@ impl ConsistentHashRouter {
         Ok(router)
     }
 
-    /// 对应 Java `ConsistentHashRouter#addNode`。
-    ///
-    /// `i + existingReplicas` 那段不是冗余：同一个物理节点分两次 `addNode` 时，
-    /// Java 靠已有副本数把虚拟节点编号继续往后排；从 0 重编就会让两次注册的虚拟节点
-    /// 撞在同一个 hash 上（Java 是 TreeMap.put，后者覆盖前者 ⇒ 实际少一半节点）。
     pub fn add_node(&mut self, p_node: &dyn Node, v_node_count: i32) -> Result<()> {
         if v_node_count < 0 {
             return Err(Error::client(format!(
@@ -168,7 +125,6 @@ impl ConsistentHashRouter {
         Ok(())
     }
 
-    /// 对应 Java `ConsistentHashRouter#removeNode`：摘掉该物理节点的全部虚拟节点。
     pub fn remove_node(&mut self, p_node: &dyn Node) {
         let dead: Vec<i64> = self
             .ring
@@ -181,8 +137,6 @@ impl ConsistentHashRouter {
         }
     }
 
-    /// 对应 Java `ConsistentHashRouter#routeNode`：环空返回 `None`，否则返回顺时针
-    /// 第一个（含同 hash）虚拟节点所属的物理节点。
     pub fn route_node(&self, object_key: &str) -> Option<Arc<dyn Node>> {
         if self.ring.is_empty() {
             return None;
@@ -190,12 +144,11 @@ impl ConsistentHashRouter {
         let hash = self.hash_function.hash(object_key);
         let (_, v_node) = match self.ring.range(hash..).next() {
             Some(entry) => entry,
-            None => self.ring.iter().next()?, // Java 的 ring.firstKey()：越过末尾回绕
+            None => self.ring.iter().next()?,
         };
         Some(v_node.physical.clone())
     }
 
-    /// 对应 Java `ConsistentHashRouter#getExistingReplicas`。
     pub fn get_existing_replicas(&self, p_node: &dyn Node) -> i32 {
         self.ring
             .values()
@@ -205,19 +158,11 @@ impl ConsistentHashRouter {
 }
 
 /// `add_node` 吃 `&dyn Node`（方便测试与内部复用），环里却要存 `Arc<dyn Node>`。
-///
-/// 这里不做 `Arc::clone` 而是按 key 造一个等价的 `ClientNode`：Java 判"是不是同一个
-/// 物理节点"用的就是 `getKey().equals(...)`（`VirtualNode#isVirtualNodeOf`），
-/// 从不比对象身份，所以存 key 的副本与存原 `Arc` 行为一致。
 fn shared_node_of(p_node: &dyn Node) -> Arc<dyn Node> {
     Arc::new(ClientNode::new(p_node.get_key()))
 }
 
 // ------------------------------------------------------------------ MD5
-//
-// RFC 1321 的标准实现，刻意**不**引入第三方 crate（与 `cpp/src/remoting/rpchook.cpp`
-// 自带 SHA1/HMAC 同一个理由：定长算法几十行，自带反而好与 Java 逐字节对拍）。
-// 只用来算环上的落点，不当密码学原语用。
 
 /// MD5 的 64 轮位移量（RFC 1321 §3.4）。
 const MD5_SHIFTS: [u32; 64] = [
@@ -228,9 +173,6 @@ const MD5_SHIFTS: [u32; 64] = [
 ];
 
 /// `K[i] = floor(abs(sin(i + 1)) * 2^32)`（RFC 1321 §3.4 的表）。
-///
-/// 写成常量而不是运行时用 `sin` 算：`floor(abs(sin(x)) * 2^32)` 落在整数边界附近时
-/// 不同 libm 的最后一位可能差 1，那样 hash 就与 Java 不一致了。
 const MD5_K: [u32; 64] = [
     0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee, //
     0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501, //
@@ -250,7 +192,6 @@ const MD5_K: [u32; 64] = [
     0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391, //
 ];
 
-/// 计算 MD5 摘要（16 字节，按 RFC 1321 的小端字序输出，与 Java `MessageDigest#digest` 同）。
 fn md5(input: &[u8]) -> [u8; 16] {
     let mut state = [
         0x6745_2301u32,
@@ -345,7 +286,6 @@ mod tests {
 
     #[test]
     fn ring_md5_hash_takes_only_the_first_four_bytes() {
-        // Java 的 `h <<= 8; h |= digest[i] & 0xFF`（i<4）= 摘要前 4 字节大端拼接
         assert_eq!(Md5Hash.hash(""), 0xd41d_8cd9);
         assert_eq!(Md5Hash.hash("abc"), 0x9001_5098);
         assert_eq!(Md5Hash.hash("abc") >> 32, 0, "结果必须在 32 位内（Java 是 long）");
@@ -382,8 +322,6 @@ mod tests {
 
     #[test]
     fn negative_virtual_node_count_is_rejected() {
-        // Java `addNode` 抛 IllegalArgumentException("illegal virtual node counts :")。
-        // 注意 Java 的构造器只是遍历 pNodes 调 addNode，空集合时不会抛——这里同口径。
         let nodes: Vec<Arc<dyn Node>> = vec![Arc::new(ClientNode::new("a"))];
         assert!(ConsistentHashRouter::new(&[], -1).is_ok(), "空节点集不触发检查");
         let err = ConsistentHashRouter::new(&nodes, -1).expect_err("必须拒绝");
@@ -395,8 +333,6 @@ mod tests {
 
     #[test]
     fn re_adding_a_node_keeps_virtual_nodes_distinct() {
-        // Java 的 `i + existingReplicas`：同一个物理节点二次 addNode 会得到 2×v 个**不同**
-        // 的虚拟节点位置，而不是全撞在同一个 hash 上。
         let node = ClientNode::new("dup");
         let mut router = ConsistentHashRouter::new(&[], 0).unwrap();
         router.add_node(&node, 3).unwrap();

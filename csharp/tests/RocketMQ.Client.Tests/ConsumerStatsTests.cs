@@ -126,7 +126,6 @@ public class ConsumerStatsTests
         ri.SubscriptionSet = JsonValue.MakeArray();
 
         string json = System.Text.Encoding.UTF8.GetString(ri.Encode());
-        // Python/Java 侧 307 应答总是带这三个字段（空 map 序列化为 {}）
         Assert.Contains("\"statusTable\":{}", json);
         Assert.Contains("\"mqPopTable\":{}", json);
         Assert.Contains("\"userConsumerInfo\":{}", json);

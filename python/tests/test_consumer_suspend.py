@@ -1,22 +1,3 @@
-# 消费者级挂起/恢复（Java DefaultMQPushConsumer#suspend/#resume/#isPause）单测 —— 不需要集群。
-#
-# Java 侧的实现位置：
-#   - DefaultMQPushConsumer#suspend():890 / #resume():898 / #isPause():902
-#     → DefaultMQPushConsumerImpl#suspend():1312-1315（pause=true + info 日志）
-#     → DefaultMQPushConsumerImpl#resume():741-745（pause=false + doRebalance + info 日志）；
-#   - 读这个布尔的只有两处：pullMessage:263-266 与 popMessage:518-521，命中就按
-#     PULL_TIME_DELAY_MILLS_WHEN_SUSPEND（:113，默认 1000ms）退避后重新调度。
-#
-# 为什么必须离线锁死 —— 挂起闸门**放在哪一行**是这里唯一的危险点：
-#   Java 把 pause 判定写在 lastPullTimestamp 盖章（:253，且在流控/锁判定之前）**之后**。
-#   如果反过来（先判 pause 再盖章），一个只是被 suspend() 暂停、并没有真死的消费者，
-#   会因为超过 120s 没发起拉取而被停摆判据（ProcessQueue.isPullExpired）当成死循环，
-#   rebalance 于是把它的分配整个摘掉重建 —— 日志里就是那句
-#   "[BUG]doRebalance ... because pull is pause, so time to wait"，
-#   表现为"运维挂起一个消费者 2 分钟，恢复后位点被重置、消息重投一遍"。
-#   这个后果在挂起本身的那几分钟里是**看不见的**（拉取确实停了），只有配合
-#   "挂起期间时间戳继续推进 + 停摆判据保持沉默"两条断言才锁得住。
-#
 # 与其它语言同构：go/client/consumer_test.go 的
 # TestConsumerSuspendStopsPullsAndResumeRestartsThem、
 # csharp/tests/RocketMQ.Client.Tests/SuspendResumeTests.cs、
@@ -101,11 +82,7 @@ def _wait_pulls(fake, at_least, timeout=3.0):
 
 
 def _settle():
-    """suspend() 之后、取基线之前必须先静置一会儿。
-
-    挂起只管"不再**发起**下一笔"：发起时已在途的那一笔仍会正常落地（Java 也是如此，
-    pause 不会取消已在请求里的拉取）。立刻取基线的话，这一笔会被算成"挂起期间还在拉"。
-    """
+    pass
     time.sleep(0.5)
 
 
@@ -115,14 +92,9 @@ def _stop(c, th):
     th.join(timeout=3)
 
 
-# ---------------- 常量：退避时长与 Java 默认一致 ----------------
 
 def test_suspend_backoff_matches_the_default_interval():
-    """Java PULL_TIME_DELAY_MILLS_WHEN_SUSPEND 默认 1000ms。
-
-    写小 ⇒ 挂起期间循环空转刷屏；写大 ⇒ resume() 后要等好几秒才恢复消费，
-    运维在控制台上看到"恢复无效"。
-    """
+    pass
     assert PULL_TIME_DELAY_WHEN_SUSPEND == 1.0
 
 
@@ -164,11 +136,7 @@ def test_suspend_stops_pulls_and_resume_restarts_them():
 
 
 def test_suspend_leaves_already_fetched_state_alone():
-    """挂起只管"发起下一轮拉取"：本地已拉到的缓冲与游标一律不动。
-
-    Java 的 pause 闸门在 pullMessage 入口，既不落 pending 也不清位点；若在这里顺手
-    丢弃缓冲，挂起一次等于把在途消息重投一遍。
-    """
+    pass
     c, mq, key, fake = _consumer()
     from common.message import MessageExt
     buffered = [MessageExt(topic=TOPIC, body=b"x")]
@@ -187,11 +155,7 @@ def test_suspend_leaves_already_fetched_state_alone():
 
 
 def test_resume_triggers_rebalance():
-    """Java Impl#resume:741-745 在解除挂起后立即 doRebalance()。
-
-    挂起期间可能有队列增减没被处理：不叫醒重平衡的话，恢复后新队列最长要等一个
-    重平衡周期（默认 20s）才开始消费。
-    """
+    pass
     c, mq, key, fake = _consumer()
     try:
         c.suspend()
@@ -205,12 +169,7 @@ def test_resume_triggers_rebalance():
 # ---------------- POP 模式：同一道闸门 ----------------
 
 def test_pop_mode_suspend_stops_pops_and_keeps_stamping():
-    """Java popMessage:518-521 读的是同一个 pause 布尔，且同样在盖章之后。
-
-    POP 路径的"心跳"是 PopProcessQueue.lastPopTimestamp（停摆判据读它）；挂起期间
-    不继续盖章的话，POP 消费者挂起两分钟就会被 rebalance 撤队列、在途批次全交给
-    broker 复活重投。
-    """
+    pass
     c, mq, key, fake = _consumer(pop_mode=True)
     pq = PopProcessQueue()
     c._pop_queues[key] = pq
@@ -242,11 +201,7 @@ def test_pop_mode_suspend_stops_pops_and_keeps_stamping():
 # ---------------- 幂等 / 未启动也安全 ----------------
 
 def test_suspend_and_resume_are_idempotent_and_safe_before_start():
-    """Java 的 suspend()/resume() 不校验服务状态：反复调用、Start 之前调用都不报错。
-
-    运维脚本常在下发暂停指令前重试，若这里抛异常或状态翻转不幂等，就会出现
-    "调用两次 suspend 之后 is_paused 反而是 False" 这类难查的翻转。
-    """
+    pass
     c = DefaultMQPushConsumer("G_suspend_idle")
     assert c.is_paused() is False
     c.suspend()

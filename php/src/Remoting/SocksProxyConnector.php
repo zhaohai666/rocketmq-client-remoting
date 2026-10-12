@@ -4,20 +4,6 @@ declare(strict_types=1);
 
 namespace RocketMQ\Remoting;
 
-/**
- * SOCKS 代理握手（CONNECT 隧道，零依赖手写；对应 Java 侧 Netty
- * ``Socks5ProxyHandler`` 在 pipeline 里承担的角色）。
- *
- * 调用约定：``$conn`` 是**已**与代理服务器建好的 TCP 流（stream_socket_client
- * 刚返回，阻塞模式），握手完成后由调用方再决定是否 TLS 升级（对齐 Java pipeline
- * 的 addFirst 顺序：Socks5ProxyHandler 在 SslHandler 之前 —— SOCKS 先行，TLS 包在
- * 隧道之上）。握手全程保持阻塞读 + 显式 deadline，失败一律抛 RuntimeException，
- * 由 RemotingClient 包成 RemotingConnectException。
- *
- * 支持两条路径：
- *  - SOCKS5（RFC 1928）：无认证(0x00) / 用户名密码子协商(RFC 1929, 0x02)；
- *  - SOCKS4：目标域名解析失败时退 SOCKS4a 域名扩展（0.0.0.x + 尾随域名）。
- */
 final class SocksProxyConnector
 {
     // ---------- SOCKS 常量 ----------

@@ -1,11 +1,4 @@
 // 动态 name server（DefaultTopAddressing）单测 —— 本地 HttpListener mock，不依赖外网。
-//
-// Java 语义锚点与 Python/C++ 侧 test_top_addressing.py 同源：
-//   * WS 地址 / unitName / para 的 URL 拼装规则；
-//   * ClearNewLine（trim 后截断到第一个 \r 或 \n）；
-//   * 200 → 地址串；非 200 / 连接失败 → null；
-//   * FetchAndApply：地址**变化才应用**；
-//   * MQClientInstance：配了静态地址不 fetch；空地址 Start 时 fetch 一次并应用。
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -103,7 +96,6 @@ public class TopAddressingTests : IDisposable
     [Fact]
     public void FetchReturnsNullOnConnectionError()
     {
-        // 没有服务监听的端口 → 连接失败 → null（Java catch IOException）
         var ta = new DefaultTopAddressing(domain: "127.0.0.1:1", timeoutMillis: 300);
         Assert.Null(ta.FetchNsAddr(verbose: false));
     }

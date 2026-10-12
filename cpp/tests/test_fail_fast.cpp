@@ -1,13 +1,3 @@
-// 断连时立刻失败在途请求（对应 Java NettyRemotingAbstract#failFast / #requestFail）。
-//
-// Java 的 NettyRemotingHandler#close 在 closeChannel 之后紧接着调 failFast(channel)
-// （NettyRemotingClient.java:1191）：把这条连接名下的在途请求逐条 requestFail ——
-// setSendRequestOK(false) + putResponse(null) + 恰好投递一次回调。缺了这一步会错两件事：
-//   1. 时机：同步调用等满 invoke 超时、异步回调等 timeout + 1s（超时清理线程的宽限口径），
-//      而对端在第一次 EOF 时就已经确定"再也不会有响应了"。
-//   2. 语义：报成 TIMEOUT，Java 报 SEND_REQUEST。异步发送的重试判据按异常类型分流，
-//      错类型等于错重试决策（见 InvokeError::Kind 的注释）。
-//
 // 全部用真 socket 对端（读完请求就关连接），不用 mock：只有真 EOF 才走读线程退出那条路。
 #include <atomic>
 #include <chrono>

@@ -146,7 +146,6 @@ async function main(): Promise<void> {
     brokerAccepted ? 'broker accepted, consumer running'
       : `start() aborted: ${sqlErrors[0]?.message ?? ''}`);
   if (brokerRefused) {
-    // Java start:1018-1021 — a failure here shuts the consumer down.
     check('failed start leaves no running consumer', sqlConsumer.started === false);
     console.log('SKIP  end-to-end SQL92 delivery (broker refuses SQL92; set enablePropertyFilter=true)');
     await new Promise((r) => setTimeout(r, 500));

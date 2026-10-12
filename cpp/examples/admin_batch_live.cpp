@@ -1,17 +1,6 @@
 // C++ 批量 admin 方法的**真实集群**联调（对标 python/verify_admin_batch_live.py，
 // 与 go/examples/live_admin_batch 同口径）。
 //
-// 这些方法此前只存在于 RequestCode 常量层：body 键名写错、header 字段缺失这类
-// 编码错误 mock 层看不见，必须打真实 broker。覆盖（全部真实 nameServer + broker）：
-//   1. UPDATE_AND_CREATE_TOPIC_LIST(18)：body={"topicConfigList":[...]}，header 为空
-//   2. UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225)：body={"groupConfigList":[...]}
-//   3. UPDATE_AND_GET_GROUP_FORBIDDEN(353)：禁读→仅查询不改动→恢复可读→回包字段
-//   4. RESUME_CHECK_HALF_MESSAGE(323)：非半消息返回 false 而非报错（Java 语义）
-//   5. createOrUpdateOrderConf：nameserver KV 的合并/覆盖语义
-//   6. CLEAN_EXPIRED_CONSUMEQUEUE(306) / DELETE_EXPIRED_COMMITLOG(329) + ByAddr + 死地址
-//   7. CLEAN_UNUSED_TOPIC(316)：broker 接受即可（清理策略是 broker 侧的）
-//   8. QUERY_CONSUME_TIME_SPAN(303)：路由扇出聚合
-//   9. UPDATE/GET_NAMESRV_CONFIG(318/319)：properties 文本 + 写读回环（可逆）
 //
 // 本程序自身不启动集群；用 scripts/with_cluster.sh 包一层跑。用法：
 //   ./rmq_admin_batch_live [namesrv_addr]
@@ -222,9 +211,6 @@ int main(int argc, char** argv) {
         check("消费组读禁配(353) 回包含 group/topic", false, e.what());
     }
 
-    // ---- 4. 恢复半消息(323) ---------------------------------------------
-    // Java（MQClientAPIImpl:3279）对非 SUCCESS 返回 false 而非抛错：对非半消息
-    // （broker 表现为 SYSTEM_ERROR）的良构调用必须得到 false，而不是异常。
     try {
         bool resumed = admin.resumeCheckHalfMessage(
             brokerAddr, topicA, "0A0F0000000000000000000000000000000000");

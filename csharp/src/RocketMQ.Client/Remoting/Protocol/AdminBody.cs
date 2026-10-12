@@ -1,14 +1,3 @@
-// 管理端专用响应体（对应 org.apache.rocketmq.remoting.protocol.admin.* 与
-// body.* 中的管理类）：
-//   TopicStatsTable / TopicOffset / ConsumeStats / OffsetWrapper /
-//   TopicConfigSerializeWrapper / ConsumeQueueData / QueryConsumeQueueResponseBody
-//
-// ⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，fastjson2 会把键直接内联成 JSON 对象，
-// 产出**非法 JSON**，例如：
-//   {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
-// 因此 Json 解析器必须容忍"对象作为键"（保留原始 JSON 文本作键名），
-// 再由 ParseMessageQueueKey() 还原成 MessageQueue。
-// 字段名与结构均由 Java 探针实测确认。
 using System.Globalization;
 using RocketMQ.Common;
 
@@ -79,7 +68,6 @@ public static class MessageQueueKeys
     }
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.admin.TopicOffset。</summary>
 public sealed class TopicOffset
 {
     public long MinOffset { get; set; }
@@ -104,10 +92,6 @@ public sealed class TopicOffset
         };
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.admin.TopicStatsTable。
-/// 探针输出：{"offsetTable":{MessageQueue:{...}},"topicPutTps":0.0}
-/// </summary>
 public sealed class TopicStatsTable
 {
     public SortedDictionary<MessageQueue, TopicOffset> OffsetTable { get; } = new();
@@ -145,7 +129,6 @@ public sealed class TopicStatsTable
     }
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.admin.OffsetWrapper。</summary>
 public sealed class OffsetWrapper
 {
     public long BrokerOffset { get; set; }
@@ -153,7 +136,6 @@ public sealed class OffsetWrapper
     public long LastTimestamp { get; set; }
     public long PullOffset { get; set; }
 
-    /// <summary>与 Java OffsetWrapper.getLag() 一致：brokerOffset - consumerOffset。</summary>
     public long Lag() => BrokerOffset - ConsumerOffset;
 
     public JsonValue ToJson()
@@ -176,10 +158,6 @@ public sealed class OffsetWrapper
         };
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.admin.ConsumeStats。
-/// 探针输出：{"consumeTps":1.5,"offsetTable":{MessageQueue:OffsetWrapper}}
-/// </summary>
 public sealed class ConsumeStats
 {
     public SortedDictionary<MessageQueue, OffsetWrapper> OffsetTable { get; } = new();
@@ -216,10 +194,6 @@ public sealed class ConsumeStats
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.TopicConfigSerializeWrapper。
-/// 探针输出：{"dataVersion":{...},"topicConfigTable":{"Topic":{"attributes":{},...}}}
-/// </summary>
 public sealed class TopicConfigSerializeWrapper
 {
     public SortedDictionary<string, TopicConfig> TopicConfigTable { get; } = new();
@@ -272,10 +246,6 @@ public sealed class TopicConfigSerializeWrapper
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.ConsumeQueueData。
-/// 字段：physicOffset, physicSize, tagsCode, extendDataJson, bitMap, eval, msg
-/// </summary>
 public sealed class ConsumeQueueData
 {
     public long PhysicOffset { get; set; }
@@ -305,7 +275,6 @@ public sealed class ConsumeQueueData
             v.Set("bitMap", JsonValue.MakeNull());
         }
 
-        // 同 Java：null 字段不序列化（这里用 has* 显式表达 null）
         if (HasExtendDataJson)
         {
             v.Set("extendDataJson", JsonValue.MakeString(ExtendDataJson));
@@ -350,11 +319,6 @@ public sealed class ConsumeQueueData
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.body.QueryConsumeQueueResponseBody。
-/// 探针输出：{"filterData":"*","maxQueueIndex":88,"minQueueIndex":1,"subscriptionData":{...}}
-/// （queueData 为 null 时不出现）
-/// </summary>
 public sealed class QueryConsumeQueueResponseBody
 {
     // 透传（null 表示不出现）

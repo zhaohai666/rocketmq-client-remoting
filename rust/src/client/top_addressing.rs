@@ -1,8 +1,3 @@
-//! 动态 name server 取址（对应 `org.apache.rocketmq.common.namesrv.TopAddressing` /
-//! `DefaultTopAddressing` 与 `MixAll.getWSAddr`，逐条对齐 `python/client/top_addressing.py`）。
-//!
-//! Java 语义锚点（5.5.1 源码）：
-//!
 //! 1. `MixAll.getWSAddr()`：`http://<domain>:8080/rocketmq/<subgroup>`；domain 自带端口
 //!    （含 `:`）时不追加 `:8080`。
 //! 2. `fetchNSAddr(true, 3000)`：HTTP GET（超时 3000ms），unitName 非空白则 URL 追加
@@ -12,10 +7,6 @@
 //!    （`updateNameServerAddressList`，按 `;` 切分）；相同则什么都不做。
 //! 4. `MQClientInstance`：**当且仅当**没配静态 namesrvAddr 时，start() 先 fetch 一次，
 //!    并调度 10s / 2min 周期刷新。
-//!
-//! 与本仓库 Python 端一致的**有意差异**：Java 默认 domain 是 `jmenv.tbsite.net`（依赖
-//! /etc/hosts 绑定），照抄会让没配域名的用户白等 3s。所以这里 domain 必须显式给出
-//! （构造参数或环境变量 `ROCKETMQ_NAMESRV_DOMAIN`），未配置 = 动态取址关闭。
 
 use std::time::Duration;
 
@@ -24,16 +15,12 @@ use tokio::net::TcpStream;
 
 use crate::error::{Error, Result};
 
-/// Java `MixAll.DEFAULT_NAMESRV_ADDR_LOOKUP`：仅作展示/文档，不作为默认 domain。
 pub const DEFAULT_NAMESRV_ADDR_LOOKUP: &str = "jmenv.tbsite.net";
-/// Java 默认 subgroup。
 pub const DEFAULT_DOMAIN_SUBGROUP: &str = "nsaddr";
 /// domain 未显式给出时读取的环境变量。
 pub const NAMESRV_DOMAIN_ENV: &str = "ROCKETMQ_NAMESRV_DOMAIN";
-/// Java `DefaultTopAddressing` 的 HTTP 超时。
 pub const DEFAULT_TIMEOUT_MILLIS: u64 = 3000;
 
-/// Java `DefaultTopAddressing.clearNewLine`：trim 后截断到第一个 `\r` 或 `\n`。
 pub fn clear_new_line(content: &str) -> String {
     let s = content.trim();
     if let Some(i) = s.find('\r') {
@@ -45,14 +32,12 @@ pub fn clear_new_line(content: &str) -> String {
     s.to_string()
 }
 
-/// 地址服务器取址器（Java `DefaultTopAddressing` 的等价物，零第三方 HTTP 依赖）。
 #[derive(Clone, Debug)]
 pub struct DefaultTopAddressing {
     ws_addr: String,
     unit_name: String,
     para: Vec<(String, String)>,
     timeout_millis: u64,
-    /// Java 的 `nameSrvAddr` 缓存：上次成功应用到客户端的地址串。
     ns_addr: Option<String>,
 }
 
@@ -155,7 +140,6 @@ impl DefaultTopAddressing {
         self.timeout_millis
     }
 
-    /// 取一次 NS 地址串；不可用 / 非 200 / 网络失败都返回 None（Java 语义）。
     pub async fn fetch_ns_addr(&self, verbose: bool) -> Option<String> {
         if self.ws_addr.is_empty() {
             return None;
@@ -174,7 +158,6 @@ impl DefaultTopAddressing {
         }
     }
 
-    /// Java `MQClientAPIImpl.fetchNameServerAddr`：**地址变化才返回并应用**。
     pub async fn fetch_and_apply(&mut self) -> Option<String> {
         let addrs = self.fetch_ns_addr(true).await?;
         if addrs.trim().is_empty() {
@@ -188,8 +171,6 @@ impl DefaultTopAddressing {
         self.ns_addr.clone()
     }
 
-    /// Java `HttpTinyClient.httpGet` 的零依赖等价物：只支持 `http://`。
-    ///
     /// 返回响应体文本；非 200 / 响应不合法都返回 Err（由 `fetch_ns_addr` 统一按失败处理）。
     async fn http_get(&self, url: &str) -> Result<String> {
         let (host, port, path) = split_http_url(url)?;
@@ -216,7 +197,6 @@ impl DefaultTopAddressing {
         if status != 200 {
             return Err(Error::SendRequest { addr, message: format!("http status {status}") });
         }
-        // Java 用 ISO-8859-1、Python 用 utf-8+replace；地址串是 ASCII，两者等价。
         Ok(String::from_utf8_lossy(body).into_owned())
     }
 }
@@ -340,7 +320,6 @@ mod tests {
             .build_url();
         assert_eq!(url, "http://h:8080/rocketmq/nsaddr?k1=v1&k2=v2");
 
-        // unitName + para → "-unit?nofix=1&k=v"（Java 会留一个尾部 &，Python 去掉；这里去掉）
         assert_eq!(
             base()
                 .with_unit_name("u")
@@ -363,7 +342,6 @@ mod tests {
         assert_eq!(clear_new_line("  1.2.3.4:9876\r\nrest"), "1.2.3.4:9876");
         assert_eq!(clear_new_line("a:9876\nb:9877"), "a:9876");
         assert_eq!(clear_new_line("  a:9876  "), "a:9876");
-        // Java trim() 会先把前导 \r\n 一并去掉
         assert_eq!(clear_new_line("   \r\n x"), "x");
         assert_eq!(clear_new_line("\r\n"), "");
     }
@@ -507,7 +485,6 @@ mod tests {
         server.set_response(500, "boom");
         assert_eq!(server.top().fetch_ns_addr(false).await, None);
 
-        // 没有服务监听的端口 → Connect 失败 → None（Java catch IOException）
         let ta = DefaultTopAddressing::from_domain("127.0.0.1:1").with_timeout_millis(300);
         assert_eq!(ta.fetch_ns_addr(true).await, None);
     }

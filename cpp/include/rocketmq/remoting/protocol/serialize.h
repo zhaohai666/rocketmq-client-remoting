@@ -1,6 +1,5 @@
 // 协议序列化：JSON（RemotingSerializable）与 RocketMQ 私有二进制（RocketMQSerializable）。
 //
-// 对应 org.apache.rocketmq.remoting.protocol.RemotingSerializable / RocketMQSerializable。
 //
 // RocketMQ 二进制 header 线格式：
 //   code(2) | language(1) | version(2) | opaque(4) | flag(4)
@@ -30,7 +29,6 @@ struct ProtocolHeaderFields {
     PropertyMap extFields;
 };
 
-// org.apache.rocketmq.remoting.protocol.RemotingSerializable
 struct RemotingSerializable {
     // JsonValue -> UTF-8 字节串
     static Bytes encode(const JsonValue& v);
@@ -39,7 +37,6 @@ struct RemotingSerializable {
     static bool decode(const Bytes& data, JsonValue& out);
 };
 
-// org.apache.rocketmq.remoting.protocol.RocketMQSerializable
 struct RocketMQSerializable {
     // 十进制 ASCII 写入：先占位 int 长度，写完回补
     static void writeDecimalLong(Bytes& buf, int64_t value);

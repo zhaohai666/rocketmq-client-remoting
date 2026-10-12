@@ -1,22 +1,4 @@
 # -*- coding: utf-8 -*-
-"""异步轨迹分发器（对应 org.apache.rocketmq.client.trace.AsyncTraceDispatcher）。
-
-职责：钩子把 TraceContext 丢进内存队列（``append``），后台线程按
-「攒够 batch_num 条 或 距上次发送超过 5s」两个条件触发刷写，再把编码后的文本
-用**独立的内部生产者**发到轨迹 topic（默认 RMQ_SYS_TRACE_TOPIC）。
-
-与 Java 的对应关系：
-  * ``trace_context_queue``  ← ArrayBlockingQueue<TraceContext>(2048)
-  * ``_flush_trace_context`` ← flushTraceContext（含 force_flush 语义）
-  * ``_send_trace_data``     ← AsyncDataSendTask.sendTraceData（按 topic@traceTopic 分组）
-  * ``_flush_data``          ← flushData（按 maxMessageSize 128K 切块）
-  * ``_send_trace_data_by_mq`` ← sendTraceDataByMQ（带 broker 过滤的选择器）
-  * 内部生产者组名           ← ``_INNER_TRACE_PRODUCER-<group>-<PRODUCE|CONSUME>-<N>``
-
-**防递归**：内部生产者自身的 ``enable_trace`` 必须为 False，且
-SendMessageTraceHook 会跳过 topic 以轨迹 topic 开头的消息 —— 两道保险都要有，
-否则轨迹会自我复制到无限。
-"""
 from __future__ import annotations
 
 import atexit
@@ -39,14 +21,14 @@ logger = get_logger()
 
 
 class TraceDispatcherType(Enum):
-    """对应 org.apache.rocketmq.client.trace.TraceDispatcher.Type。"""
+    pass
 
     PRODUCE = "PRODUCE"
     CONSUME = "CONSUME"
 
 
 class _BrokerSetSelector:
-    """只在指定 broker 集合里轮询选队列（对应 Java 里那个匿名 MessageQueueSelector）。"""
+    pass
 
     def __init__(self, counter: "itertools.count"):
         self._counter = counter
@@ -55,8 +37,6 @@ class _BrokerSetSelector:
         broker_set = arg or set()
         filtered = [q for q in mqs if q.broker_name in broker_set]
         if not filtered:
-            # Java 在这里会 filterMqs.get(pos) 抛越界；退化为全量轮询更安全，
-            # 语义上等价于「没有跨集群过滤需求」。
             filtered = list(mqs)
         pos = next(self._counter) % len(filtered)
         return filtered[pos]
@@ -72,7 +52,7 @@ class AsyncTraceDispatcher:
 
     def __init__(self, group: str, type_: TraceDispatcherType, batch_num: int = 10,
                  trace_topic_name: Optional[str] = None, rpc_hook=None) -> None:
-        self.batch_num = min(batch_num, 20)      # Java 注释明说最大 20
+        self.batch_num = min(batch_num, 20)
         self.max_msg_size = 128000
         self.trace_instance_id = next(self._INSTANCE_NUM)
         self.group = group
@@ -118,11 +98,7 @@ class AsyncTraceDispatcher:
         self.host_consumer = host
 
     def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
-        """对应 Java `AsyncTraceDispatcher#setNamespaceV2`。
-
-        宿主 facade 在 start 分发器**之前**调用（Java DefaultMQProducer:384 /
-        DefaultMQPushConsumer:769），值随内部生产者一起在下一次 start 时落地。
-        """
+        pass
         self.namespace_v2 = namespace_v2 or ""
 
     def get_namespace_v2(self) -> Optional[str]:
@@ -141,8 +117,6 @@ class AsyncTraceDispatcher:
                 self.trace_producer.set_namesrv_addr(name_srv_addr)
                 self.trace_producer.set_instance_name(
                     "%s_%s" % (TraceConstants.TRACE_INSTANCE_NAME, name_srv_addr))
-                # 对应 Java AsyncTraceDispatcher.start():155 `traceProducer.setNamespaceV2(...)`：
-                # 轨迹内部生产者发出去的请求也要带 nsd/ns，否则 broker 认不出实例。
                 self.trace_producer.set_namespace_v2(self.namespace_v2)
                 self.trace_producer.set_enable_trace(False)
                 self.trace_producer.start()
@@ -177,7 +151,7 @@ class AsyncTraceDispatcher:
 
     # ---------------- 入队 / 刷写 ----------------
     def append(self, ctx) -> bool:
-        """把一个 TraceContext 入队。队列满时计数并丢弃（与 Java 一致，不阻塞业务）。"""
+        pass
         try:
             self.trace_context_queue.put_nowait(ctx)
             return True
@@ -187,7 +161,7 @@ class AsyncTraceDispatcher:
             return False
 
     def flush(self) -> None:
-        """强制刷空队列（Java flush()）。"""
+        pass
         while not self.trace_context_queue.empty():
             try:
                 self._flush_trace_context(True)
@@ -215,7 +189,6 @@ class AsyncTraceDispatcher:
                         break
                 self._async_send_trace_message(context_list)
                 return
-        # 防止忙等（Java Thread.sleep(5)）
         time.sleep(0.005)
 
     def _async_send_trace_message(self, context_list: List[TraceContext]) -> None:
@@ -226,7 +199,7 @@ class AsyncTraceDispatcher:
 
     # ---------------- 发送 ----------------
     def _send_trace_data(self, context_list: List[TraceContext]) -> None:
-        """按 (业务 topic, 轨迹 topic) 分组后逐组发送（对应 Java sendTraceData）。"""
+        pass
         bean_map = {}
         for context in context_list:
             access_channel = context.access_channel or self.access_channel
@@ -280,10 +253,7 @@ class AsyncTraceDispatcher:
 
     @staticmethod
     def _try_get_message_queue_broker_set(producer, topic: str) -> set:
-        """取该 topic 涉及的 broker 名集合（对应 Java tryGetMessageQueueBrokerSet）。
-
-        只有跨集群（CLOUD）场景才需要按 broker 过滤；本地场景返回空集即走普通轮询。
-        """
+        pass
         broker_set = set()
         try:
             publish = producer._topic_publish_info(topic)

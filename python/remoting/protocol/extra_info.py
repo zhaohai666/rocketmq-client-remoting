@@ -1,22 +1,8 @@
-"""POP 模式的 extraInfo（俗称 CK 串）编解码。
-
-逐条移植 Java ``org.apache.rocketmq.remoting.protocol.header.ExtraInfoUtil``。
-
-CK 串是 POP 模式的核心凭据：broker 在 POP 响应里**不**给普通 topic 的消息写
-``POP_CK`` 属性（只在 retry topic 重编码路径写），客户端必须自己用响应头的
-``startOffsetInfo`` / ``msgOffsetInfo`` 反构出这个串，再作为 ACK /
-CHANGE_MESSAGE_INVISIBLETIME 的 ``extraInfo`` 回传。格式是 8 段、**空格**分隔：
-
-``ckQueueOffset popTime invisibleTime reviveQid retryFlag brokerName queueId [msgQueueOffset]``
-
-注意分隔符是空格而不是逗号 —— 用错会导致 broker 静默解析失败。
-"""
 
 from typing import Dict, List, Optional
 
 from common.mix_all import MixAll
 
-#: 段内分隔符；**必须**是空格，对应 Java ``MessageConst.KEY_SEPARATOR``
 KEY_SEPARATOR = " "
 #: 队列之间的分隔符
 QUEUE_SEPARATOR = ";"
@@ -28,7 +14,6 @@ RETRY_TOPIC = "1"
 RETRY_TOPIC_V2 = "2"
 QUEUE_OFFSET = "qo"
 
-#: 顺序消费用的固定 revive 队列号，对应 Java ``KeyBuilder.POP_ORDER_REVIVE_QUEUE``
 POP_ORDER_REVIVE_QUEUE = 999
 
 _POP_RETRY_SEPARATOR_V1 = "_"
@@ -36,24 +21,24 @@ _POP_RETRY_SEPARATOR_V2 = "+"
 
 
 def build_pop_retry_topic_v1(topic: str, cid: str) -> str:
-    """``%RETRY%<cid>_<topic>``（Java ``KeyBuilder.buildPopRetryTopicV1``）。"""
+    pass
     return MixAll.RETRY_GROUP_TOPIC_PREFIX + cid + _POP_RETRY_SEPARATOR_V1 + topic
 
 
 def build_pop_retry_topic_v2(topic: str, cid: str) -> str:
-    """``%RETRY%<cid>+<topic>``（Java ``KeyBuilder.buildPopRetryTopicV2``）。"""
+    pass
     return MixAll.RETRY_GROUP_TOPIC_PREFIX + cid + _POP_RETRY_SEPARATOR_V2 + topic
 
 
 def build_pop_retry_topic(topic: str, cid: str, enable_retry_v2: bool = False) -> str:
-    """Java ``buildPopRetryTopic``：``enableRetryTopicV2`` 关（默认）走 V1。"""
+    pass
     if enable_retry_v2:
         return build_pop_retry_topic_v2(topic, cid)
     return build_pop_retry_topic_v1(topic, cid)
 
 
 def is_pop_retry_topic_v2(retry_topic: Optional[str]) -> bool:
-    """Java ``KeyBuilder.isPopRetryTopicV2``：``%RETRY%`` 前缀且含 ``+``。"""
+    pass
     if not retry_topic:
         return False
     return retry_topic.startswith(MixAll.RETRY_GROUP_TOPIC_PREFIX) and (
@@ -62,11 +47,7 @@ def is_pop_retry_topic_v2(retry_topic: Optional[str]) -> bool:
 
 
 def _split_drop_trailing(value: str, sep: str) -> List[str]:
-    """模拟 Java ``String.split``：**丢弃末尾空串**（Python 的 ``split`` 会保留）。
-
-    这个差异是真实的：Java ``"a b ".split(" ")`` 得到 ``["a","b"]``，
-    而 Python ``"a b ".split(" ")`` 得到 ``["a","b",""]``。段数校验依赖它。
-    """
+    pass
     parts = value.split(sep)
     while parts and parts[-1] == "":
         parts.pop()
@@ -74,7 +55,7 @@ def _split_drop_trailing(value: str, sep: str) -> List[str]:
 
 
 def split(extra_info: Optional[str]) -> List[str]:
-    """按空格切分 CK 串（Java ``ExtraInfoUtil.split``）。"""
+    pass
     if extra_info is None:
         raise ValueError("split extraInfo is null")
     return _split_drop_trailing(extra_info, KEY_SEPARATOR)
@@ -128,10 +109,7 @@ def get_queue_offset(segments: Optional[List[str]]) -> int:
 
 
 def retry_of_topic(topic: str) -> str:
-    """由 topic 形状判定 retryFlag（Java ``ExtraInfoUtil.getRetry(topic)``）。
-
-    顺序很重要：先判 V2（含 ``+``），再判 ``%RETRY%`` 前缀（V1）。
-    """
+    pass
     if is_pop_retry_topic_v2(topic):
         return RETRY_TOPIC_V2
     if topic.startswith(MixAll.RETRY_GROUP_TOPIC_PREFIX):
@@ -142,10 +120,7 @@ def retry_of_topic(topic: str) -> str:
 def build_extra_info(ck_queue_offset: int, pop_time: int, invisible_time: int,
                      revive_qid: int, topic: str, broker_name: str, queue_id: int,
                      msg_queue_offset: Optional[int] = None) -> str:
-    """拼 CK 串。传 ``msg_queue_offset`` 得到 8 段，不传得到 7 段。
-
-    对应 Java 的两个 ``buildExtraInfo`` 重载。ACK 场景用 8 段版本。
-    """
+    pass
     parts = [
         str(ck_queue_offset),
         str(pop_time),
@@ -242,12 +217,12 @@ def get_queue_offset_map_key(topic: str, queue_id, queue_offset) -> str:
 
 
 def is_order(segments: List[str]) -> bool:
-    """reviveQid 是 999 表示顺序消费（Java ``ExtraInfoUtil.isOrder``）。"""
+    pass
     return get_revive_qid(segments) == POP_ORDER_REVIVE_QUEUE
 
 
 def get_real_topic(topic: str, cid: str, retry: str) -> str:
-    """由 retryFlag 还原真实 topic（Java ``ExtraInfoUtil.getRealTopic``）。"""
+    pass
     if retry == NORMAL_TOPIC:
         return topic
     if retry == RETRY_TOPIC:

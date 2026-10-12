@@ -1,6 +1,3 @@
-// -*- coding: utf-8 -*-
-// Request / response codes, language codes, serialize types.
-// Mirrors org.apache.rocketmq.remoting.protocol.RequestCode / ResponseCode / LanguageCode.
 
 export class RequestCode {
   static SEND_MESSAGE = 10;

@@ -1,26 +1,4 @@
 # -*- coding: utf-8 -*-
-"""路由刷新 / 位点落盘周期的可配置性（离线，无集群）。
-
-Java 锚点（5.5.1 逐条核对）：
-
-  * ``ClientConfig.java:58`` ``private int pollNameServerInterval = 1000 * 30;``（30s）、
-    ``:62`` ``heartbeatBrokerInterval = 1000 * 30``、``:66``
-    ``persistConsumerOffsetInterval = 1000 * 5;``（5s）；getter/setter 在 ``:311-333``。
-    ``DefaultMQProducer`` / ``DefaultMQPushConsumer`` / ``DefaultMQPullConsumer`` /
-    ``DefaultLitePullConsumer`` / ``DefaultMQAdminExt`` 都 ``extends ClientConfig``，
-    因此这几个开关在 Java 里对每个客户端都可见。
-  * ``MQClientInstance.startScheduledTask``：
-      - ``:400-407`` ``updateTopicRouteInfoFromNameServer``：
-        ``scheduleAtFixedRate(..., 10, clientConfig.getPollNameServerInterval(), MS)``
-        —— initialDelay 10ms，周期默认 30s。
-      - ``:414-424`` ``persistAllConsumerOffset``：
-        ``scheduleAtFixedRate(..., 1000 * 10, clientConfig.getPersistConsumerOffsetInterval(), MS)``
-        —— initialDelay 10s，周期默认 5s。
-  * 两条任务都走 ``scheduledExecutorService.scheduleAtFixedRate``：**启动时把周期排定**，
-    运行期再改字段不影响已排定的节奏；**首个任务在 initialDelay 之后立刻执行**，不是
-    initialDelay + 一个周期之后。本端口的后台循环同样如此（这一条被真机验证脚本
-    ``verify_interval_live.py`` 的 I1/I2 钉住：见 2026-09-24 那轮实测）。
-"""
 from __future__ import annotations
 
 from client.admin import DefaultMQAdminExt
@@ -81,12 +59,7 @@ def test_client_instance_defaults_match_the_client_config():
 
 # ---------------------------------------------------------------- 路由刷新循环
 def test_route_refresh_loop_uses_initial_delay_then_configured_period():
-    """Java initialDelay = 10ms，随后按 pollNameServerInterval 固定周期。
-
-    首轮刷新发生在 initialDelay 之后（``scheduleAtFixedRate`` 语义），不是
-    ``initialDelay + 一个周期`` 之后 —— 真机验证脚本 I1 就是按"1s 周期组 ≤6s 看到
-    新建 topic 的路由"钉住这一点的。
-    """
+    pass
     inst = MQClientInstance("interval_route", ["127.0.0.1:9876"])
     try:
         inst.poll_name_server_interval = 1500
@@ -94,14 +67,14 @@ def test_route_refresh_loop_uses_initial_delay_then_configured_period():
         stop = _RecordingStop([False, False])
         inst._route_refresh_stop = stop  # type: ignore[assignment]
         inst._route_refresh_loop()
-        assert stop.timeouts[0] == 0.01          # Java initialDelay = 10ms
+        assert stop.timeouts[0] == 0.01
         assert stop.timeouts[1:] == [1.5, 1.5]   # 配置值换算成秒
     finally:
         _drop(inst)
 
 
 def test_route_refresh_loop_refreshes_every_topic_in_use():
-    """循环体逐个刷新在用 topic（对应 Java updateTopicRouteInfoFromNameServer()）。"""
+    pass
     inst = MQClientInstance("interval_route_body", ["127.0.0.1:9876"])
     try:
         calls = []
@@ -140,7 +113,7 @@ def test_route_refresh_loop_stops_on_the_wait_before_the_first_tick():
 
 # ---------------------------------------------------------------- 另外两条定时任务
 def test_namesrv_refresh_loop_first_fetch_is_after_ten_seconds():
-    """Java：动态取址 initialDelay 10s、周期 2 分钟（首拉在 10s，不是 130s）。"""
+    pass
     inst = MQClientInstance("interval_namesrv", ["127.0.0.1:9876"])
     try:
         calls = []
@@ -156,7 +129,7 @@ def test_namesrv_refresh_loop_first_fetch_is_after_ten_seconds():
 
 
 def test_adjust_thread_pool_loop_first_run_is_after_one_minute():
-    """Java：adjustThreadPool initialDelay 1 分钟、周期 1 分钟。"""
+    pass
     inst = MQClientInstance("interval_adjust", ["127.0.0.1:9876"])
     try:
         calls = []
@@ -173,7 +146,7 @@ def test_adjust_thread_pool_loop_first_run_is_after_one_minute():
 
 # ---------------------------------------------------------------- 位点落盘循环
 def test_offset_persist_loop_uses_the_default_initial_delay_and_period():
-    """Java：initialDelay 10s、周期 5s；首笔落盘就在 10s（不是 15s）。"""
+    pass
     consumer = DefaultMQPushConsumer("CG_interval_persist_default")
     persisted = []
     consumer._persist_offsets_once = lambda: persisted.append(True)  # type: ignore[method-assign]

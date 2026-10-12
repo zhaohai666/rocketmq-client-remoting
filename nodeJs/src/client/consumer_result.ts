@@ -1,6 +1,3 @@
-// -*- coding: utf-8 -*-
-// Consumer-side result models (org.apache.rocketmq.client.consumer.*).
-// Faithful port of python/client/consumer_result.py.
 import { MessageQueue } from '../common/message.ts';
 import { MessageExt } from '../common/message.ts';
 
@@ -107,7 +104,6 @@ export class ConsumeOrderlyContext {
   setSuspendCurrentQueueTimeMillis(t: number): void { this.suspendCurrentQueueTimeMillis = t; }
 }
 
-// Message selector (org.apache.rocketmq.client.consumer.MessageSelector).
 export class MessageSelector {
   type: string;
   expression: string;
@@ -125,7 +121,6 @@ export class MessageSelector {
   getExpression(): string { return this.expression; }
 }
 
-// MessageQueueListener (org.apache.rocketmq.client.consumer.listener.MessageQueueListener).
 export abstract class MessageQueueListener {
   // Subclasses override.
   messageQueueChanged(topic: string, mqAll: MessageQueue[], mqDivided: MessageQueue[]): void {

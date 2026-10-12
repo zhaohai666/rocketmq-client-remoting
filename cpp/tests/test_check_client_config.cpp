@@ -1,32 +1,4 @@
 // CHECK_CLIENT_CONFIG(46) 离线单测 —— 不需要集群。
-//
-// 为什么必须有这一步：SQL92 表达式写错时 broker **不会**报错 ——
-// ExpressionMessageFilter#isMatched 在 ConsumeQueue 阶段拿不到编译好的过滤数据就直接
-// return true（静默放行全部消息），消费者启动照常成功。Java 因此在
-// DefaultMQPushConsumerImpl.start:1014 主动发一笔 46 号请求，把「写错的表达式」变成
-// 启动期错误。本端口此前只有 RequestCode 常量、没有调用方，所以这里锁死协议形状与
-// 分支语义（真机行为见 examples/sql92_live.cpp）。
-//
-// 对齐基准（Java 5.5.1，逐行读过；与 python/tests/test_check_client_config.py、
-// rust/src/client/mq_client.rs 的同一组断言对拍）：
-//   * MQClientAPIImpl#checkClientInBroker:3256 —— 请求头是 **null**（线上没有 extFields），
-//     body 是 CheckClientRequestBody 的 JSON（clientId / group / subscriptionData）；
-//     响应码非 SUCCESS 时抛 MQClientException(响应码, remark)。
-//   * MQClientInstance#checkClientInBroker:534 —— 只查非 TAG 订阅
-//     （ExpressionType.isTagType：null / "" / TAG 都算 TAG）；broker 地址来自
-//     findBrokerAddrByTopic（**只读缓存**路由、随机一个 broker、优先 master），
-//     取不到就跳过；网络类异常换成固定文案的 MQClientException。
-//   * ClientConfig#mqClientApiTimeout 默认 **3000ms**，这笔请求用的就是它。
-//
-// 覆盖：
-//   1. TAG（含空串）订阅一笔 46 都不发
-//   2. SQL92 请求形状：恰好一笔、无 extFields、body 三个字段与 SubscriptionData 的 7 个键
-//   3. broker 回 SUBSCRIPTION_PARSE_FAILED(23) → MQClientException 带该响应码与 remark
-//   4. broker 未开 enablePropertyFilter 回 SYSTEM_ERROR(1) → 同一条码
-//   5. 查不到路由 → 跳过（一笔不发，也不抛）
-//   6. 连不上 broker → 换成 Java 的固定文案
-//   7. 空订阅集合 → 什么都不发
-//   8. 只有 master 缺席时才随机取从节点（selectBrokerAddr 语义）
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -349,7 +321,6 @@ std::unique_ptr<MQClientInstance> seeded(MockBroker& mock) {
 
 // ---------------------------------------------------------------- 用例
 
-// 1. TAG（含空串）一律不发 46：Java ExpressionType.isTagType 短路
 void testTagOnlySendsNothing(MockBroker& mock) {
     auto instance = seeded(mock);
     mock.scriptChecks({});
@@ -360,7 +331,6 @@ void testTagOnlySendsNothing(MockBroker& mock) {
     expectInt(mock.checkCount(), 0, "TAG / 空 expressionType 都不发 46");
 }
 
-// 2. SQL92 请求形状对齐 Java
 void testSql92RequestShape(MockBroker& mock) {
     auto instance = seeded(mock);
     mock.scriptChecks({});
@@ -384,7 +354,6 @@ void testSql92RequestShape(MockBroker& mock) {
     expect(sd->get("subString").stringValue() == "a > 10", "subscriptionData.subString");
     expect(sd->get("expressionType").stringValue() == std::string(ExpressionType::SQL92),
            "subscriptionData.expressionType");
-    // Java SubscriptionData 的序列化字段名（filterClassSource 是 @JSONField(serialize=false)）
     std::vector<std::string> keys;
     for (const auto& kv : sd->objectItems()) keys.push_back(kv.first);
     std::sort(keys.begin(), keys.end());
@@ -417,7 +386,6 @@ void testBrokerRejectCode(MockBroker& mock, int32_t code, const char* name) {
     expect(msg.find("remark") != std::string::npos, std::string(name) + " 保留 remark", msg);
 }
 
-// 5. 查不到路由 → 跳过（Java findBrokerAddrByTopic 返回 null 即 continue）
 void testNoRouteSkips(MockBroker& mock) {
     netcompat::ensureInitialized();
     auto instance = std::make_unique<MQClientInstance>(
@@ -430,7 +398,6 @@ void testNoRouteSkips(MockBroker& mock) {
     expect(instance->findBrokerAddrByTopic(kTopic).empty(), "findBrokerAddrByTopic 只读缓存");
 }
 
-// 6. 连不上 broker 时 Java 不吞异常，而是换成一段固定文案再抛
 void testTransportErrorWrapped(MockBroker& mock) {
     TopicRouteData route;
     std::map<int64_t, std::string> addrs;
@@ -460,7 +427,6 @@ void testTransportErrorWrapped(MockBroker& mock) {
     expectInt(mock.checkCount(), 0, "传输失败时 broker 没收到 46");
 }
 
-// 7. 空订阅集合什么都不发（Java 的 return 语义在本端口由调用方各自保证）
 void testEmptySubs(MockBroker& mock) {
     auto instance = seeded(mock);
     mock.scriptChecks({});

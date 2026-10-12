@@ -1,6 +1,3 @@
-//! 消息模型（对应 Java `org.apache.rocketmq.common.message.{MessageQueue,Message,
-//! MessageExt,MessageBatch}`，参考实现 `python/common/message.py`）。
-//!
 //! 属性容器一律用 [`StringMap`]（保序）：17 段格式第 17 项是按插入顺序拼出来的
 //! `k\x01v\x02` 字节串，换成 `HashMap` 会直接破坏逐字节对拍。
 
@@ -15,10 +12,6 @@ use crate::common::mix_all::MixAll;
 use crate::error::{Error, Result};
 use crate::remoting::protocol::ext_fields::StringMap;
 
-/// `WAIT` 属性的原始值 → 布尔，对应 Java `Message#isWaitStoreMsgOK()`：
-/// **缺省（`None`）为 `true`**，否则 `Boolean.parseBoolean(value)`
-/// （即只有忽略大小写的 `"true"` 为真，`"1"` / `""` / `"yes"` 都是假）。
-///
 /// 四端共用同一条判据（Python `message.is_wait_store_msg_ok`、C# `Message.WaitStoreMsgOk`、
 /// C++ `Message::isWaitStoreMsgOk`）—— 所有写 `WAIT` 的地方（`MessageBatch::generate_from_list`、
 /// `AggregateKey::of_message`）都必须走它，见 [`Message::is_wait_store_msg_ok`] 的注释。
@@ -29,7 +22,6 @@ pub fn wait_store_msg_ok_of(raw: Option<&str>) -> bool {
     }
 }
 
-/// 对应 Java `MessageQueue`（Python 里也在 `common/message.py`）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct MessageQueue {
     pub topic: String,
@@ -74,12 +66,6 @@ impl MessageQueue {
         self.queue_id.to_string()
     }
 
-    /// 对应 Java `MessageQueue#toString`。
-    ///
-    /// ⚠ 刻意**不**与本模块的 [`fmt::Display`] 合并：Java 的 `toString` 是
-    /// `MessageQueue [topic=.., brokerName=.., queueId=..]`，而一致性哈希策略要哈希的
-    /// 正是这个字符串（差一个空格就与 Java 客户端不是同一个环），`Display` 那种
-    /// 面向日志的紧凑写法不能顶替它。
     pub fn to_java_string(&self) -> String {
         format!(
             "MessageQueue [topic={}, brokerName={}, queueId={}]",
@@ -87,8 +73,6 @@ impl MessageQueue {
         )
     }
 
-    /// Java `MessageQueue#hashCode`：`((31 + brokerHash) * 31 + queueId) * 31 + topicHash`，
-    /// 32 位有符号回绕。消费者 rebalance / 去重按它分桶，必须逐位一致。
     pub fn hashcode(&self) -> i32 {
         let topic_hash = crate::common::util_all::java_string_hash(&self.topic);
         let broker_hash = crate::common::util_all::java_string_hash(&self.broker_name);
@@ -98,7 +82,6 @@ impl MessageQueue {
         r.wrapping_mul(31).wrapping_add(topic_hash)
     }
 
-    /// 对应 Java `Comparable#compareTo`：topic -> brokerName -> queueId 字典序。
     pub fn compare_to(&self, other: &MessageQueue) -> Ordering {
         match self.topic.cmp(&other.topic) {
             Ordering::Equal => {}
@@ -130,12 +113,10 @@ impl fmt::Display for MessageQueue {
     }
 }
 
-/// 对应 Java `Message` / Python `Message`。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Message {
     pub topic: String,
     pub flag: i32,
-    /// `None` 等价 Java 的 `body == null`；`encode` 时按空串处理。
     pub body: Option<Vec<u8>>,
     pub properties: StringMap,
     pub transaction_id: Option<String>,
@@ -239,9 +220,6 @@ impl Message {
         self.properties.get(PROPERTY_KEYS)
     }
 
-    /// Java `Message#isWaitStoreMsgOK()`：属性**缺省即 `true`**，其余走
-    /// `Boolean.parseBoolean` —— 也就是**只有**忽略大小写的 `"true"` 为真。
-    ///
     /// ⚠ 千万别写成 `get_wait_store_msg_ok() == Some("true")`。本端口的 `Message::new`
     /// （与 Python 的 `Message.__init__` 一样）**不**预先写 `WAIT`，所以"属性缺省"是
     /// **常态而不是边角**：按 `== Some("true")` 判会让一条普通消息变成 `WAIT=false`，
@@ -261,7 +239,6 @@ impl Message {
         self.properties.get(PROPERTY_DELAY_TIME_LEVEL)
     }
 
-    /// Java `Message#getDelayTimeLevel()`：缺失或非法一律 0（表示非延时消息）。
     pub fn delay_time_level(&self) -> i32 {
         match self.get_delay_time_level() {
             Some(v) => v.trim().parse::<i32>().unwrap_or(0),
@@ -280,43 +257,30 @@ impl Message {
         self.properties.get(PROPERTY_WAIT_STORE_MSG_OK)
     }
 
-    // ---------------- 定时消息的三个类型化计时器（Java Message.java:238-267） ----------------
-    //
-    // Java 的三个 setter 都是「putProperty(键, String.valueOf(值))」、三个 getter 都是
-    // 「parse 属性，缺失返回 0」：没有正负校验、键之间互不清理（TIMER_DELAY_SEC 与
-    // TIMER_DELIVER_MS 同存时 broker 侧按自身优先级取舍），这里逐字段照搬。
-    // getter 遇到解析不了的值返回 0 —— Java 会抛 NumberFormatException，但属性区是
-    // 不可信输入，按「缺省 0」处理比让拉取路径 panic 合理（与 delay_time_level 同口径）。
 
-    /// Java `Message#setDelayTimeSec(long)`：延迟 `sec` 秒投递。
     pub fn set_delay_time_sec(&mut self, sec: i64) {
         self.properties
             .insert(PROPERTY_TIMER_DELAY_SEC, sec.to_string());
     }
 
-    /// Java `Message#getDelayTimeSec()`：缺属性 / 值非法时 0。
     pub fn get_delay_time_sec(&self) -> i64 {
         self.timer_property(PROPERTY_TIMER_DELAY_SEC)
     }
 
-    /// Java `Message#setDelayTimeMs(long)`：延迟 `time_ms` 毫秒投递。
     pub fn set_delay_time_ms(&mut self, time_ms: i64) {
         self.properties
             .insert(PROPERTY_TIMER_DELAY_MS, time_ms.to_string());
     }
 
-    /// Java `Message#getDelayTimeMs()`：缺属性 / 值非法时 0。
     pub fn get_delay_time_ms(&self) -> i64 {
         self.timer_property(PROPERTY_TIMER_DELAY_MS)
     }
 
-    /// Java `Message#setDeliverTimeMs(long)`：绝对投递时刻（毫秒时间戳）。
     pub fn set_deliver_time_ms(&mut self, time_ms: i64) {
         self.properties
             .insert(PROPERTY_TIMER_DELIVER_MS, time_ms.to_string());
     }
 
-    /// Java `Message#getDeliverTimeMs()`：缺属性 / 值非法时 0。
     pub fn get_deliver_time_ms(&self) -> i64 {
         self.timer_property(PROPERTY_TIMER_DELIVER_MS)
     }
@@ -364,7 +328,6 @@ impl fmt::Display for Message {
     }
 }
 
-/// 对应 Java `MessageExt` / Python `MessageExt`（拉取到的消息）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MessageExt {
     pub topic: String,
@@ -404,7 +367,6 @@ impl MessageExt {
         }
     }
 
-    /// 由待发消息派生（对应 Java `MessageExt` 继承 `Message` 的那部分字段）。
     pub fn from_message(msg: &Message) -> MessageExt {
         MessageExt {
             topic: msg.topic.clone(),
@@ -492,7 +454,6 @@ impl MessageExt {
         self.properties.get(PROPERTY_DELAY_TIME_LEVEL)
     }
 
-    /// Java `MessageExt#getDelayTimeLevel()`：缺失/非法一律 0。
     pub fn delay_time_level(&self) -> i32 {
         match self.get_delay_time_level() {
             Some(v) => v.trim().parse::<i32>().unwrap_or(0),
@@ -687,8 +648,6 @@ impl fmt::Display for MessageExt {
     }
 }
 
-/// 对应 Java `MessageBatch` / Python `MessageBatch`。
-///
 /// 自己没有序列化字段：正文由 [`encode`](Self::encode) 生成，即每条 6 段轻量格式
 /// （见 [`crate::common::message_decoder`]）的拼接结果。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -734,16 +693,10 @@ impl MessageBatch {
         self.message.get_property(name)
     }
 
-    /// 对应 Java `MessageBatch#encode`。
     pub fn encode(&self) -> Vec<u8> {
         crate::common::message_decoder::encode_messages(&self.messages)
     }
 
-    /// 对应 Java `MessageBatch.generateFromList`。
-    ///
-    /// 约束：非空；同一 topic；同一 waitStoreMsgOK；不允许延时消息；不允许重试 topic。
-    /// Java 抛 `UnsupportedOperationException` / `IllegalArgumentException`，
-    /// Python 统一成 `ValueError`，这里统一映射为 [`Error::Client`]。
     pub fn generate_from_list(messages: Vec<Message>) -> Result<MessageBatch> {
         if messages.is_empty() {
             return Err(Error::client("messages must not be null or empty"));
@@ -778,9 +731,6 @@ impl MessageBatch {
         }
 
         let topic = first.get_topic().to_string();
-        // Java `generateFromList:70` 是 `batch.setWaitStoreMsgOK(first.isWaitStoreMsgOK())`：
-        // 缺省即 true。**不能**写成 `== Some("true")`，否则普通消息（没设过 WAIT）组成的
-        // 批量会以 `WAIT=false` 下发，broker 不等刷盘就回 SEND_OK。
         let wait_store_msg_ok = first.is_wait_store_msg_ok();
 
         let mut batch = MessageBatch {
@@ -995,7 +945,6 @@ mod tests {
         assert_eq!(back, msg);
     }
 
-    /// Java Message.java:238-267 的三个定时器 setter/getter：写属性、缺省 0。
     #[test]
     fn timer_setters_write_typed_properties() {
         let mut msg = Message::new("T", Some(b"x"));
@@ -1100,10 +1049,6 @@ mod tests {
     }
 
     /// 回归：**没设过 `WAIT` 的普通消息**组成的批量必须是 `WAIT=true`。
-    ///
-    /// 这里曾经是 `first.get_wait_store_msg_ok() == Some("true")` —— 缺省（`None`）被判成
-    /// `false`，于是 `send_batch` 把 Java 的 `WAIT=true` 发成了 `WAIT=false`：broker 不再
-    /// 等刷盘就回 `SEND_OK`，持久性静默降级。Python 侧同款缺陷一起修掉了。
     #[test]
     fn batch_defaults_wait_store_msg_ok_to_true() {
         let messages = vec![Message::new("T", Some(b"a")), Message::new("T", Some(b"b"))];
@@ -1113,7 +1058,6 @@ mod tests {
         assert_eq!(batch.get_property(PROPERTY_WAIT_STORE_MSG_OK), Some("true"));
     }
 
-    /// 判据本身：Java `Message.isWaitStoreMsgOK()` = 缺省 true + `Boolean.parseBoolean`。
     #[test]
     fn wait_store_msg_ok_follows_server_boolean_parsing() {
         assert!(wait_store_msg_ok_of(None));
@@ -1122,7 +1066,6 @@ mod tests {
         assert!(wait_store_msg_ok_of(Some("True")));
         assert!(!wait_store_msg_ok_of(Some("false")));
         assert!(!wait_store_msg_ok_of(Some("FALSE")));
-        // Java `Boolean.parseBoolean` 对其它任何值都是 false（不是"非 false 即真"）
         assert!(!wait_store_msg_ok_of(Some("1")));
         assert!(!wait_store_msg_ok_of(Some("")));
         assert!(!wait_store_msg_ok_of(Some("yes")));

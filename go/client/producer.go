@@ -541,9 +541,6 @@ func (p *DefaultMQProducer) SetNamespaceV2(ns string) { p.namespaceV2 = ns }
 func (p *DefaultMQProducer) SetTopics(topics []string) { p.topics = append([]string(nil), topics...) }
 func (p *DefaultMQProducer) SetTLSEnable(enable bool)  { p.tlsEnable = &enable }
 
-// SetSocksProxy tunnels the producer's remoting connections through a SOCKS
-// proxy (Java ClientConfig#socksProxyConfig). nil = direct connections. The
-// address-server HTTP fetch (TopAddressing) is not proxied.
 func (p *DefaultMQProducer) SetSocksProxy(proxy *remoting.SocksProxyConfig) {
 	p.socksProxy = proxy
 }
@@ -682,10 +679,6 @@ func (p *DefaultMQProducer) Start() error {
 	// starts an internal producer of its own (a network operation) and registers
 	// its hooks through RegisterSendMessageHook, which takes p.mu.
 	p.startTraceDispatcher()
-	// Java DefaultMQProducerImpl.start():272 starts the fault-avoidance
-	// detector after the impl is up (it needs the client instance to resolve
-	// broker names). Also outside the lock: it installs the Resolver +
-	// ServiceDetector and spawns detectLoop.
 	p.startDetector()
 	return nil
 }
@@ -829,8 +822,6 @@ func (p *DefaultMQProducer) Shutdown() {
 		return
 	}
 	p.heartbeatRunning.Store(false)
-	// Java DefaultMQProducerImpl.shutdown():318 stops the detector executor
-	// alongside the heartbeat loop.
 	p.stopDetector()
 	// Stop the auto-batch guard before the transport goes away so no flush
 	// races an unregistered client.
@@ -1434,10 +1425,6 @@ func (p *DefaultMQProducer) sendDefaultImpl(msg *common.Message, isBatch bool, t
 			return nil, err
 		case common.IsKind(err, common.KindConnect), common.IsKind(err, common.KindTimeout),
 			common.IsKind(err, common.KindSendRequest), common.IsKind(err, common.KindIO):
-			// Connection refused / timeout / write failure: isolate. Java's
-			// RemotingException branch (:821) marks the broker UNREACHABLE when
-			// the background detector is running — the detector probes it back
-			// to health — and merely isolates it otherwise.
 			p.updateFaultItem(selected.BrokerName, began, true, !p.faultStrategy.StartDetectorEnable())
 			lastErr = err
 		default:
@@ -1565,14 +1552,6 @@ func (p *DefaultMQProducer) SendBatchToQueue(messages []*common.Message, mq comm
 	return p.sendBatch(messages, &mq, p.sendMsgTimeout, pinnedTopicMismatchSync)
 }
 
-// joinMemberUniqIDs renders the reply msgId for a CLIENT batch: Java
-// MQClientAPIImpl.processSendResponse:786 builds SendResult.msgId as the
-// comma-joined per-member UNIQ_KEYs whenever the broker echoes no batchUniqId
-// (a client batch on an ordinary topic — the only kind the remoting send
-// kernel produces). The broker's own header msgId (comma-joined per-member
-// offset ids) stays in OffsetMsgID. The ProduceAccumulator splits per-message
-// results from exactly this list, so the join is what makes auto-batch and
-// explicit batches report per-message ids.
 func joinMemberUniqIDs(messages []*common.Message) string {
 	ids := make([]string, 0, len(messages))
 	for _, m := range messages {
@@ -1650,9 +1629,6 @@ func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common
 	if sendErr != nil {
 		return nil, sendErr
 	}
-	// Java processSendResponse:786: a client batch's reply msgId is the
-	// comma-joined member UNIQ_KEYs (built client-side) — see
-	// joinMemberUniqIDs.
 	if len(messages) > 1 {
 		res.MsgID = joinMemberUniqIDs(messages)
 	}
@@ -1730,10 +1706,6 @@ func (p *DefaultMQProducer) sendAccumulatorBatch(messages []*common.Message, tag
 	if err != nil {
 		return nil, err
 	}
-	// Java processSendResponse:786: a client batch's reply msgId is the
-	// comma-joined member UNIQ_KEYs (built client-side) — see
-	// joinMemberUniqIDs. The ProduceAccumulator splits per-message results
-	// from exactly that list.
 	if len(messages) > 1 {
 		res.MsgID = joinMemberUniqIDs(messages)
 	}

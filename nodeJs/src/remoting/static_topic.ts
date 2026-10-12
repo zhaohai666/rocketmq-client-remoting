@@ -1,27 +1,5 @@
 // -*- coding: utf-8 -*-
 // Static topic (unitized topic) mapping support.
-//
-// Faithful port of the Java static-topic client machinery:
-//   - org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingDetail
-//   - org.apache.rocketmq.remoting.protocol.statictopic.LogicQueueMappingItem
-//   - org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingInfo
-//   - org.apache.rocketmq.remoting.rpc.ClientMetadata
-//         .topicRouteData2EndpointsForStaticTopic
-//   - org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingUtils
-//         .getMockBrokerName
-//
-// Wire facts (do NOT "simplify" them):
-//   - The broker decodes bodies with fastjson2 BY EXACT JAVA PROPERTY NAME.
-//     currIdMap / hostedQueues keys are integers in Java but stringified in
-//     JSON — both directions go through String(globalId).
-//   - LogicQueueMappingItem.endOffset/timeOfStart/timeOfEnd default to -1.
-//   - TopicQueueMappingInfo.scope defaults to MixAll.METADATA_SCOPE_GLOBAL
-//     ("__global__"); the mock broker name for the global scope strips the
-//     leading "__" ("__syslo__global__").
-//   - topicRouteData2EndpointsForStaticTopic keeps the Java quirk where
-//     maxTotalNumOfEpoch is read but never updated (stays -1), so the
-//     `epoch >= maxTotalNumOfEpoch` guard is always true and maxTotalNums is
-//     simply the max totalQueues of the scope.
 import { MessageQueue } from '../common/message.ts';
 import { RemotingSerializable } from './serialize.ts';
 // type-only: route.ts imports the runtime helpers below, a value import here
@@ -56,7 +34,6 @@ export function getMockBrokerName(scope: string): string {
 // LogicQueueMappingItem — one generation of a logical queue on one broker.
 // ---------------------------------------------------------------------------
 
-// org.apache.rocketmq.remoting.protocol.statictopic.LogicQueueMappingItem.
 export class LogicQueueMappingItem {
   gen = 0;            // immutable generation
   queueId = 0;        // immutable physical queue id on bname
@@ -119,8 +96,6 @@ export class LogicQueueMappingItem {
 // TopicQueueMappingInfo — the per-broker view carried INSIDE the route.
 // ---------------------------------------------------------------------------
 
-// org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingInfo —
-// what topicQueueMappingByBroker[brokerName] holds.
 export class TopicQueueMappingInfo {
   topic = '';
   scope = METADATA_SCOPE_GLOBAL;
@@ -181,7 +156,6 @@ export class TopicQueueMappingInfo {
 // carries in its body (one broker's shard of it).
 // ---------------------------------------------------------------------------
 
-// org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingDetail.
 export class TopicQueueMappingDetail {
   topic = '';
   scope = METADATA_SCOPE_GLOBAL;
@@ -229,8 +203,6 @@ export class TopicQueueMappingDetail {
     };
   }
 
-  // The body the broker decodes as a TopicQueueMappingDetail (fastjson2 by
-  // exact Java property names).
   encode(): Buffer {
     const data = RemotingSerializable.encode(this.toDict());
     return data != null ? data : Buffer.alloc(0);
@@ -266,12 +238,6 @@ export class TopicQueueMappingDetail {
 // build the LOGICAL queue set — MessageQueue(topic, mockBrokerName(scope),
 // globalId) -> the REAL broker name hosting it ("__syslo__none__" when the
 // logical queue exists in the totals but no broker hosts it yet).
-//
-// Per scope: entries are epoch-desc ordered; a later equal-epoch entry
-// OVERWRITES the earlier one in the endpoint map (Java `oldEpoch <= epoch`);
-// then logical ids 0..maxTotalNums-1 are filled, missing ones mapping to the
-// NOT_EXIST sentinel. The `maxTotalNumOfEpoch` variable Java compares against
-// is never reassigned (stays -1) so the guard is always true — quirk kept.
 export function topicRouteData2EndpointsForStaticTopic(
   topic: string, route: TopicRouteData,
 ): Map<MessageQueue, string> {
@@ -281,7 +247,6 @@ export function topicRouteData2EndpointsForStaticTopic(
     return endpointsOfBroker;
   }
 
-  // group infos by scope (only entries WITH a scope participate, as in Java).
   const infosByScope = new Map<string, Map<string, TopicQueueMappingInfo>>();
   for (const [brokerName, raw] of Object.entries(mappingByBroker)) {
     const info = TopicQueueMappingInfo.fromDict(raw as Record<string, any>);
@@ -301,9 +266,7 @@ export function topicRouteData2EndpointsForStaticTopic(
     const mappingInfos = Array.from(infoMap.entries())
       .sort(([, a], [, b]) => b.epoch - a.epoch);
     let maxTotalNums = 0;
-    const maxTotalNumOfEpoch = -1; // Java never updates this — guard always true
-    // JS Map uses reference identity for objects — Java relies on
-    // MessageQueue.equals/hashCode here, so key by the queue identity string.
+    const maxTotalNumOfEpoch = -1;
     const mqKey = (mq: MessageQueue): string => `${mq.topic}@${mq.brokerName}@${mq.queueId}`;
     const mqEndPoints = new Map<string, TopicQueueMappingInfo>();
     for (const [, info] of mappingInfos) {

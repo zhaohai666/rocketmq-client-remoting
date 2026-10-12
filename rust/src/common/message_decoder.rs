@@ -1,8 +1,3 @@
-//! 消息二进制编解码（对应 Java `org.apache.rocketmq.common.message.MessageDecoder`，
-//! 参考实现 `python/common/message_decoder.py`）。
-//!
-//! 本模块严格对齐 Java 侧的两条编码路径，切勿混用：
-//!
 //! 1) 17 段存储格式 `MessageDecoder#encode(MessageExt, needCompress)` /
 //!    `decode(ByteBuffer)`，用于 broker 写入与 pull/get 返回的消息体：
 //!
@@ -40,29 +35,20 @@ use crate::common::{compression, util_all};
 use crate::error::{Error, Result};
 use crate::remoting::protocol::ext_fields::StringMap;
 
-/// `k` 与 `v` 之间的分隔符（Java `MessageDecoder.NAME_VALUE_SEPARATOR`）。
 pub const NAME_VALUE_SEPARATOR: char = '\u{1}';
-/// 属性项之间的分隔符（Java `MessageDecoder.PROPERTY_SEPARATOR`）。
 pub const PROPERTY_SEPARATOR: char = '\u{2}';
 
-/// v1 魔数（Java `MessageDecoder.MESSAGE_MAGIC_CODE`）。
 pub const MESSAGE_MAGIC_CODE: i32 = -626_843_481;
 /// v2 魔数：topic 长度域从 1 字节变 2 字节。
 pub const MESSAGE_MAGIC_CODE_V2: i32 = -626_843_477;
 /// commitlog 里「空白记录」的魔数，不是合法消息帧。
 pub const BLANK_MAGIC_CODE: i32 = -875_286_124;
 
-/// 对应 Java `MessageDecoder.MESSAGE_MAGIC_CODE_POSITION`。
 pub const MESSAGE_MAGIC_CODE_POSITION: usize = 4;
-/// 对应 Java `MessageDecoder.MESSAGE_FLAG_POSITION`。
 pub const MESSAGE_FLAG_POSITION: usize = 16;
-/// 对应 Java `MessageDecoder.PHY_POS_POSITION`（`4*5 + 8`）。
 pub const PHY_POS_POSITION: usize = 4 + 4 + 4 + 4 + 4 + 8;
-/// 对应 Java `MessageDecoder.QUEUE_OFFSET_POSITION`（`4*5`）。
 pub const QUEUE_OFFSET_POSITION: usize = 4 + 4 + 4 + 4 + 4;
-/// 对应 Java `MessageDecoder.SYSFLAG_POSITION`（`4*5 + 8 + 8`）。
 pub const SYSFLAG_POSITION: usize = 4 + 4 + 4 + 4 + 4 + 8 + 8;
-/// 对应 Java `MessageDecoder.MESSAGE_STORE_TIMESTAMP_POSITION`。
 pub const MESSAGE_STORE_TIMESTAMP_POSITION: usize = 56;
 
 /// v1/v2 帧里 topic 长度域的字节数差异之外的固定头部（含 BODY 长度域）。
@@ -75,13 +61,10 @@ pub fn string2bytes(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
 
-/// 对应 Java `UtilAll.bytes2string` / Python `bytes2string`：逐字节**大写**十六进制
-/// （msgId 依赖大小写）。
 pub fn bytes2string(bytes: &[u8]) -> String {
     util_all::bytes_2_string(bytes)
 }
 
-/// 对应 Java `UtilAll.string2bytes` / Python `string2bytes_hex`：十六进制 -> 字节。
 pub fn string2bytes_hex(hex_string: &str) -> Option<Vec<u8>> {
     util_all::string_2_bytes(hex_string)
 }
@@ -152,8 +135,6 @@ pub fn create_message_id(addr_bytes: &[u8], offset: i64) -> String {
     bytes2string(&raw)
 }
 
-/// 对应 Java `MessageDecoder.decodeMessageId` / Python `decode_message_id`：
-/// `(ip, port, commitLogOffset)`。
 pub fn decode_message_id(msg_id: &str) -> Result<(String, u32, i64)> {
     let raw = string2bytes_hex(msg_id)
         .ok_or_else(|| Error::Decode(format!("illegal msgId: {msg_id}")))?;
@@ -176,10 +157,6 @@ pub fn decode_message_id(msg_id: &str) -> Result<(String, u32, i64)> {
     Ok((ip, port, offset))
 }
 
-/// 对应 Java `MessageDecoder.messageProperties2String`：`k\x01v\x02` 逐项拼接。
-///
-/// 值为 `None` 的项跳过 —— Rust 的 `StringMap` 存的是 `String`，没有 null 值，
-/// 语义上等价于 Java 里 map 中不存在该 key。
 pub fn message_properties_2_string(properties: &StringMap) -> String {
     let mut sb = String::new();
     for (name, value) in properties.iter() {
@@ -191,12 +168,6 @@ pub fn message_properties_2_string(properties: &StringMap) -> String {
     sb
 }
 
-/// 对应 Java `MessageDecoder.string2messageProperties` / Python
-/// `string_2_message_properties`。
-///
-/// 与 Java 一样按 **字符**（不是字节）做下标运算：`newIndex - index >= 3` 且
-/// `index < kvSep < newIndex - 1` 才算合法片段，所以长度 < 3 的片段、没有 kv 分隔符的
-/// 片段、以及**空值**（`k\x01\x02`）都会被丢掉。这里必须照抄，别「顺手修好」。
 pub fn string_2_message_properties(properties_str: &str) -> StringMap {
     let mut result = StringMap::new();
     if properties_str.is_empty() {
@@ -228,7 +199,6 @@ fn find_char(chars: &[char], from: usize, length: usize, target: char) -> Option
 /// `MessageDecoder#decode` 的四个开关（Python `decode_message` 的同名参数）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeOptions {
-    /// false 时跳过 BODY 且 body 保持 `None`（Java `readBody=false` 同语义）。
     pub read_body: bool,
     /// 带 `COMPRESSED_FLAG` 时是否解压。
     pub decompress_body: bool,
@@ -249,11 +219,6 @@ impl Default for DecodeOptions {
     }
 }
 
-/// 一条消息编码后的字节数（对应 Java `MessageDecoder#encode` 里 storeSize 的算式，
-/// 即 Python 的 `computed_size`）。发送前用它可以避免真的编码一次。
-///
-/// ⚠ 名字里的 `messageBytesSize` 在本仓库 Java 快照中没有对应方法，语义取自
-/// Python 的 `computed_size`。
 pub fn message_bytes_size(
     topic: &str,
     body_len: usize,
@@ -273,9 +238,6 @@ pub fn message_bytes_size(
 }
 
 /// 字符串在线上格式里占的字节数：UTF-8 字节数 + 2 字节长度前缀。
-///
-/// ⚠ 同 `message_bytes_size`：Java 快照里没有 `messageStringSize`，按 Python 的
-/// `len(string2bytes(s)) + 2` 口径实现。
 pub fn message_string_size(s: &str) -> usize {
     2 + s.len()
 }
@@ -288,11 +250,6 @@ fn host_length(sys_flag: i32, v6_flag: i32) -> usize {
     }
 }
 
-/// 对应 Java `MessageDecoder#encode(MessageExt, boolean needCompress)` /
-/// Python `encode_message_ext`。
-///
-/// Java 侧 topic 长度固定写 1 字节、魔数固定写 v1（`MESSAGE_MAGIC_CODE`），
-/// `storeSize > 0` 时直接按其分配缓冲（尾部不足会按需补齐）。
 pub fn encode_message_ext(message_ext: &MessageExt, need_compress: bool) -> Result<Vec<u8>> {
     let mut body: Vec<u8> = message_ext.body.clone().unwrap_or_default();
     let sys_flag = message_ext.sys_flag;
@@ -306,7 +263,6 @@ pub fn encode_message_ext(message_ext: &MessageExt, need_compress: bool) -> Resu
     let topic_bytes = string2bytes(&message_ext.topic);
     let topic_len = topic_bytes.len();
     if topic_len > u8::MAX as usize {
-        // Java 会静默截断成 (byte) len，Python 直接抛 struct.error；这里按「报错」处理
         return Err(Error::Encode(format!(
             "topic length {topic_len} exceeds 1-byte field, needs magic code v2"
         )));
@@ -370,22 +326,16 @@ pub fn encode_message_ext(message_ext: &MessageExt, need_compress: bool) -> Resu
     Ok(writer.into_inner())
 }
 
-/// 对应 Java `MessageDecoder#decode(ByteBuffer)`（默认参数）。
 pub fn decode_message(raw: &[u8]) -> Result<MessageExt> {
     decode_message_with(raw, &DecodeOptions::default())
 }
 
-/// 对应 Java `MessageDecoder#decode(bb, readBody, deCompressBody, isClient, checkCRC)`
-/// / Python `decode_message`。
-///
-/// Java 里整段被 `try/catch` 包住、失败返回 null；Rust 用 `Error::Decode` 表达同一语义。
 pub fn decode_message_with(raw: &[u8], options: &DecodeOptions) -> Result<MessageExt> {
     let mut reader = Reader::new(raw);
     let mut msg_ext = MessageExt::new();
 
     let store_size = reader.i32()?;
     let magic_code = reader.i32()?;
-    // Java MessageVersion.valueOfMagicCode 对未知魔数抛异常 -> decode 返回 null
     let use_v2 = match magic_code {
         MESSAGE_MAGIC_CODE => false,
         MESSAGE_MAGIC_CODE_V2 => true,
@@ -442,7 +392,6 @@ pub fn decode_message_with(raw: &[u8], options: &DecodeOptions) -> Result<Messag
             }
             msg_ext.body = Some(body);
         } else {
-            // Java/Python readBody=false：跳过字节且不赋值，body 保持 null
             msg_ext.body = None;
         }
     } else {
@@ -475,8 +424,6 @@ pub fn decode_message_with(raw: &[u8], options: &DecodeOptions) -> Result<Messag
     Ok(msg_ext)
 }
 
-/// 对应 Java `MessageDecoder.decodes` / Python `decode_messages`：pull 结果里的
-/// 17 段消息流 -> 列表。**逐条切分，遇到解不开的就停**（Java 的 `break` 同语义）。
 pub fn decode_messages(raw: &[u8]) -> Vec<MessageExt> {
     decode_messages_with(raw, &DecodeOptions::default())
 }
@@ -509,8 +456,6 @@ pub fn decode_messages_with(raw: &[u8], options: &DecodeOptions) -> Vec<MessageE
     result
 }
 
-/// 对应 Java `MessageDecoder#encodeMessage(Message)`：批量消息的单条编码。
-///
 /// 只写 TOTALSIZE / MAGICCODE(0) / BODYCRC(0) / FLAG / BODY / PROPERTIES。
 pub fn encode_message(message: &Message) -> Vec<u8> {
     let body: &[u8] = message.body.as_deref().unwrap_or(&[]);
@@ -530,7 +475,6 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
     writer.into_inner()
 }
 
-/// 对应 Java `MessageDecoder.encodeMessages(List<Message>)`：拼成批量消息 body。
 pub fn encode_messages(messages: &[Message]) -> Vec<u8> {
     let mut out = Writer::new();
     for msg in messages {
@@ -539,7 +483,6 @@ pub fn encode_messages(messages: &[Message]) -> Vec<u8> {
     out.into_inner()
 }
 
-/// 对应 Java `MessageDecoder.decodeMessage(ByteBuffer)`：单条批量单元 -> `Message`。
 pub fn decode_batch_message(raw: &[u8]) -> Result<Message> {
     let mut reader = Reader::new(raw);
     let _store_size = reader.i32()?; // TOTALSIZE
@@ -557,7 +500,6 @@ pub fn decode_batch_message(raw: &[u8]) -> Result<Message> {
     Ok(msg)
 }
 
-/// 对应 Java `MessageDecoder.decodeMessages(ByteBuffer)`：批量 body -> `Vec<Message>`。
 pub fn decode_batch_messages(raw: &[u8]) -> Vec<Message> {
     let mut result = Vec::new();
     let mut pos = 0usize;
@@ -580,7 +522,6 @@ pub fn decode_batch_messages(raw: &[u8]) -> Vec<Message> {
     result
 }
 
-/// 对应 Java `MessageDecoder.countInnerMsgNum`。
 pub fn count_inner_msg_num(raw: &[u8]) -> i32 {
     let mut count = 0i32;
     let mut pos = 0usize;
@@ -599,11 +540,6 @@ pub fn count_inner_msg_num(raw: &[u8]) -> i32 {
     count
 }
 
-/// 把 admin `ConsumeQueueData.bitMap`（Java `BitsArray#toString` 输出的二进制字符串，
-/// 高位在前）解成按位可读的向量。
-///
-/// ⚠ Python 参考实现里 bitMap 只是原样透传的字符串，Java 快照的 `MessageDecoder` 也没有
-/// 这个方法（位图属于 broker 的 ConsumeQueueExt 过滤位图）；这里补齐，上层不必再手写位运算。
 pub fn parse_topic_filter_bitmap(bitmap: &str) -> Result<Vec<bool>> {
     let mut out = Vec::with_capacity(bitmap.len());
     for ch in bitmap.chars() {
@@ -688,7 +624,6 @@ mod tests {
     fn properties_empty_and_garbage() {
         assert!(string_2_message_properties("").is_empty());
         assert_eq!(message_string_size(""), 2);
-        // Java：长度 < 3 或没有 kv 分隔符的片段会被跳过
         assert!(string_2_message_properties("a\u{2}").is_empty());
         assert!(string_2_message_properties("ab\u{2}").is_empty());
         assert!(string_2_message_properties("no-separator\u{2}").is_empty());
@@ -777,7 +712,6 @@ mod tests {
         let mut raw = encode_message_ext(&build_ext(&[("store_size", "1")]), false).unwrap();
         let declared = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
         assert_eq!(declared as usize, raw.len(), "storeSize=1 应被 max 兜底");
-        // storeSize 比实际大时按 storeSize 分配（尾部补 0，Java ByteBuffer.allocate 同语义）
         raw = encode_message_ext(&build_ext(&[("store_size", "200")]), false).unwrap();
         assert_eq!(raw.len(), 200);
         assert!(raw[139..].iter().all(|b| *b == 0));
@@ -1159,7 +1093,6 @@ mod tests {
         assert!(raw.len() < plain.len());
         let got = decode_message(&raw).unwrap();
         assert_eq!(got.get_body(), plain);
-        // Java: sysFlag &= ~COMPRESSED_FLAG，只清标志位，压缩类型位（bit8~10）保留
         assert_eq!(got.sys_flag, MessageSysFlag::clear_compressed_flag(sys_flag));
         assert_eq!(
             got.sys_flag,
@@ -1203,7 +1136,6 @@ mod tests {
         ext.sys_flag = sys_flag;
         ext.set_body(Some(&compression::compress(&plain, 3, 5).unwrap()));
         let raw = encode_message_ext(&ext, false).unwrap();
-        // 消息被丢弃（Java decode 的 catch -> null），而不是交回压缩流
         assert!(matches!(decode_message(&raw), Err(Error::Decode(_))));
         // 反向确认：同一帧只把类型位改成 ZLIB 就能正常解
         let mut ok = raw.clone();

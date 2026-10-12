@@ -1,4 +1,3 @@
-// RocketMQ 二进制读写工具：全部大端（network byte order），与 Java ByteBuffer 默认序一致。
 #ifndef ROCKETMQ_COMMON_BYTE_BUFFER_H
 #define ROCKETMQ_COMMON_BYTE_BUFFER_H
 
@@ -13,7 +12,6 @@ namespace rocketmq {
 // 二进制字节串。std::string 二进制安全，且便于与 body/属性串互操作。
 using Bytes = std::string;
 
-// 行 format：与 Java DataOutputStream.writeInt/Long/Short/Byte 一致
 inline void putInt8(Bytes& buf, uint8_t v) {
     buf.push_back(static_cast<char>(v));
 }
@@ -50,14 +48,11 @@ inline void putInt64(Bytes& buf, int64_t v) {
     buf.push_back(static_cast<char>(v & 0xFF));
 }
 
-// Java 的 int/long 溢出语义：结果按 32/64 位有符号回绕
 inline int32_t toInt32(int64_t v) {
     return static_cast<int32_t>(static_cast<uint32_t>(v & 0xFFFFFFFFL));
 }
 
 inline int32_t javaStringHash(const std::string& s) {
-    // Java String.hashCode：逐 char（UTF-16 单元）累加，32 位有符号溢出。
-    // 对 ASCII 而言即逐字节；非 ASCII 走 UTF-16 单元换算，避免与 Java 结果不一致。
     int64_t h = 0;
     for (size_t i = 0; i < s.size();) {
         uint32_t cp = 0;
@@ -111,7 +106,6 @@ public:
         }
     }
 
-    // 不移动游标的读取（对应 Java ByteBuffer.get(index) 系列）
     int32_t peekInt32(size_t index) const { return getInt32At(data_, index); }
     int64_t peekInt64(size_t index) const { return getInt64At(data_, index); }
 

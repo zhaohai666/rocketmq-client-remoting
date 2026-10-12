@@ -1,5 +1,3 @@
-//! 发送重试内核（Java `sendDefaultImpl`）的离线对拍。
-//!
 //! 真集群造不出 `SYSTEM_BUSY`，也造不出「慢 broker 把总预算吃光」，而这两条
 //! 恰好是这段内核的全部难点，所以这里在进程内起一个**假集群**（1 个 namesrv +
 //! N 个 broker，只说 remoting 协议），把每个 broker 的应答码和应答延迟脚本化。
@@ -33,10 +31,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // ---------------------------------------------------------------- 假集群
 
 /// 脚本里表示「读到请求、快照下来，然后**关掉连接不回答**」的应答码。
-///
-/// 对端关闭会让客户端拿到 [`Error::SendRequest`]（`connection closed`），也就是 Java
-/// 的 `RemotingSendRequestException` —— 异步链要按「换一台 broker 再试」处理它。
-/// 真集群造不出这种失败，脚本化的应答码又都代表「收到了响应」，所以单独开一个哨兵值。
 const CLOSE_WITHOUT_ANSWER: i32 = -1;
 
 /// 单个 broker 的脚本：按顺序弹出 `(应答码, 应答前 sleep 毫秒)`，耗尽后一直用 `tail`。
@@ -356,7 +350,6 @@ fn expect_client_code(err: Error) -> (Option<i32>, String) {
 
 // ---------------------------------------------------------------- 用例
 
-/// 默认集合与 Java `DefaultMQProducer#retryResponseCodes` 完全一致。
 #[test]
 fn default_retry_response_codes_match_protocol() {
     let cfg = ProducerConfig::default();
@@ -535,9 +528,6 @@ async fn connect_failure_is_qualified_with_10001() {
 
 // ---------------- 6b. 寻址故障（10004）不能被说成「这个 topic 没路由」（10005）
 
-/// Java `DefaultMQProducerImpl#validateNameServerSetting`（:729）读的是**配置**，
-/// 一个地址都没有时报 10004 + 原文案。
-///
 /// 少了这一步，把地址服务器配错（或它返回空列表）的人看到的会是「这个 topic 没路由」，
 /// 于是去查建 topic / 查权限，而真正坏的是寻址 —— 错方向的排障能耗掉半小时。
 #[tokio::test]
@@ -555,16 +545,12 @@ async fn no_name_server_address_reports_10004_not_missing_route() {
 }
 
 /// 对照腿：地址配了、只是连不上（没人监听的端口）⇒ 10004 那道闸必须闭嘴。
-///
-/// Java 判的是「配置里有没有地址」，不是「地址能不能连通」：把连不上说成「没配地址」
-/// 会把排障带向反方向（去翻配置文件，而其实是对端没起来 / 端口写错）。
 #[tokio::test]
 async fn unreachable_name_server_is_never_reported_as_10004() {
     let addr = dead_addr().await;
     let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
     producer.set_instance_name("retry_dead_namesrv");
     producer.set_namesrv_addr(&addr);
-    // start() 不查 namesrv 可达性（Java 同：地址非空就放行）
     producer.start().await.expect("配置非空即应放行");
 
     let mut msg = Message::new("T1", Some(b"body"));
@@ -580,14 +566,12 @@ async fn unreachable_name_server_is_never_reported_as_10004() {
     producer.shutdown();
 }
 
-/// 生产者 `start()`：完全没有寻址时也在本地就拦下来（本端口比 Java 严格，
-/// Java 要等第一次发送才由漏斗报 10004），码值同样是 10004 —— 同一个故障只有一种码。
 #[tokio::test]
 async fn producer_start_reports_10004_when_addressing_is_missing() {
     let producer = DefaultMQProducer::new("GID_send_retry").expect("组名合法");
     producer.set_instance_name("retry_start_noaddr");
     if DefaultTopAddressing::is_configured() {
-        return; // 配了动态取址时 start() 允许静态地址为空（与 Java 一致）
+        return;
     }
     let err = producer.start().await.expect_err("没有寻址必须起不来");
     assert_eq!(err.response_code(), Some(client_error_code::NO_NAME_SERVER_EXCEPTION), "{err}");
@@ -705,8 +689,6 @@ fn ext_value<'a>(ext: &'a [(String, String)], key: &str) -> Option<&'a str> {
     ext.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
-/// Java `sendKernelImpl:1004` 把 `tc.isUnitMode()` 写进发送头，
-/// V2 头再映射成单字母键 `k`（`SendMessageRequestHeaderV2`）。
 #[tokio::test]
 async fn unit_mode_is_carried_in_the_send_header() {
     let cluster = MockCluster::start(1, true).await;
@@ -734,12 +716,6 @@ async fn unit_mode_is_carried_in_the_send_header() {
     off.shutdown();
 }
 
-/// Java `sendKernelImpl` 在同一个发送头上还写了三个值，本端口此前全部漏掉：
-///   - `:996 setDefaultTopic(producer.getCreateTopicKey())` → V2 键 `c`
-///   - `:997 setDefaultTopicQueueNums(producer.getDefaultTopicQueueNums())` → V2 键 `d`
-///   - `:1007 setBrokerName(brokerName)` → V2 键 `n`（`SendMessageRequestHeaderV2:69`，
-///     `@CFNullable`，所以空串不该上线）
-///
 /// `c`/`d` 是功能 bug：broker 侧自动建 topic 时用这两个值决定队列数
 /// （`AbstractSendMessageProcessor` 的 `createTopicInSendMessageMethod`），写死
 /// `TBW102`/4 等于把 `set_create_topic_key` / `set_default_topic_queue_nums` 变成假
@@ -753,7 +729,6 @@ async fn send_header_carries_broker_name_and_topic_keys() {
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let producer = started("send_header_fields", &cluster).await;
 
-    // ① 不配置时就是 Java 的那两个常量
     let mut msg = Message::new("T1", Some(b"single"));
     producer.send(&mut msg, None, None).await.expect("发送应当成功");
     let ext = cluster.send_ext(0, 0);
@@ -822,8 +797,6 @@ async fn send_header_carries_broker_name_and_topic_keys() {
     producer.shutdown();
 }
 
-/// `n` 取的是**这一笔选中的**那个 broker 名（Java `:1007` 用 `mqSel.getBrokerName()`），
-/// 不是路由里的第一个；broker 名为空时 `@CFNullable` 让它整条不上线。
 #[tokio::test]
 async fn broker_name_header_follows_the_selected_queue() {
     let cluster = MockCluster::start(2, true).await;
@@ -865,9 +838,6 @@ async fn broker_name_header_follows_the_selected_queue() {
     producer.shutdown();
 }
 
-/// Java `DefaultMQProducerImpl#sendKernelImpl:1004-1018`：发往 `%RETRY%` 时把
-/// `RECONSUME_TIME` / `MAX_RECONSUME_TIMES` 两个属性**抬进请求头**（V2 头的 `j` / `l`）。
-///
 /// 为什么必须在**线上报文**这一层锁死：broker 判死信读的是
 /// `SendMessageProcessor#handleRetryAndDLQ:197-210` 里的 `requestHeader.reconsumeTimes`
 /// 与 `maxReconsumeTimes`，**不看报文属性**。抬错等于把消费者配的
@@ -899,8 +869,6 @@ fn retry_topic_properties_are_lifted_into_the_send_header() {
     let ext = request.ext_fields();
     assert_eq!(ext.get("j"), Some("4"), "reconsumeTimes 抬进 j");
     assert_eq!(ext.get("l"), Some("6"), "maxReconsumeTimes 抬进 l");
-    // ⚠ 属性本身**不能丢**：消费端还要靠 `RECONSUME_TIME` 还原重试次数
-    //（Java 也是先 setProperties 再 clearProperty，线上两份都在）。
     let props = ext.get("i").unwrap_or_default();
     assert!(
         props.contains(crate::common::message_const::PROPERTY_RECONSUME_TIME),
@@ -909,11 +877,6 @@ fn retry_topic_properties_are_lifted_into_the_send_header() {
 }
 
 /// 反向对照：普通 topic 即使带着这两个属性也**不许**抬。
-///
-/// Java 的判据是 `MixAll.isRetryTopic(topic)`，不是「属性存在与否」。写成按属性存在
-/// 就抬，会让业务自发的一条带 `RECONSUME_TIME` 的普通消息一进 broker 就被当成重投，
-/// 甚至直接改投 `%DLQ%`。`j` 在这里是 Java 的默认值 0，`l` 整个不上线
-///（`@CFNullable` + `writeIfNotNull`）。
 #[test]
 fn ordinary_topic_never_lifts_reconsume_times() {
     let mut msg = Message::new("T1", Some(b"normal"));
@@ -957,14 +920,10 @@ async fn unit_name_only_changes_the_client_id() {
     );
     let mut msg = Message::new("T1", Some(b"body"));
     producer.send(&mut msg, None, None).await.expect("发送应当成功");
-    // unitName 不进发送头：Java 只有 unitMode 上线，unitName 只影响 clientId/地址服务器
     assert!(cluster.send_ext(0, 0).iter().all(|(k, _)| k != "unitName"));
     producer.shutdown();
 }
 
-/// Java `MQClientAPIImpl#sendMessage:550-563` 的三级判据，逐条抓线取证：
-/// 先 `isReply` → 325，再 `msg instanceof MessageBatch` → 320，否则 310。
-///
 /// ⚠ 请求码与 V2 头的 `m`（batch）是**两件不同的事**：broker 真正按 `m` 选
 /// `sendBatchMessage` 还是单条写入（`SendMessageProcessor:117` 读
 /// `requestHeader.isBatch()`），码只影响服务端按码归类（proxy/auth 把 310/320 列在
@@ -996,7 +955,6 @@ async fn send_request_code_follows_protocol_three_way_branch() {
     assert_eq!(cluster.send_code(0, 1), request_code::SEND_BATCH_MESSAGE);
     assert_eq!(ext_value(&cluster.send_ext(0, 1), "m"), Some("true"));
 
-    // reply 优先于 batch：Java 先判 isReply，所以「带 reply 属性的批量」仍走 325。
     let mut reply_batch = MessageBatch::generate_from_list(vec![
         Message::new("T1", Some(b"r-0")),
         Message::new("T1", Some(b"r-1")),
@@ -1027,15 +985,6 @@ async fn send_request_code_follows_protocol_three_way_branch() {
     producer.shutdown();
 }
 
-/// 批量发送的客户端 ID 口径（Java `DefaultMQProducer.batch():1176-1182` 的**顺序** +
-/// `MQClientAPIImpl.processSendResponse:785`）：
-///   ① 每条**子消息**的 UNIQ_KEY 必须在**编码之前**写好 —— 写晚一步 body 里就是三条没有 ID
-///     的消息，落进 commitLog 后消费端轨迹、按 uniqKey 反查全断，而发送侧看起来一切正常；
-///   ② `SendResult.msg_id` 取**批量自身**那条消息写在报文属性（`i`）里的 UNIQ_KEY，
-///     不是 broker 回的 `offsetMsgId`。
-///
-/// ⚠ 有意不跟 Java 的「broker 没回 batchUniqId 时把 msg_id 换成逐条逗号串」：本端口的应答解析
-/// 只拿到批量外壳（`&Message`），子消息列表不在里面；四种语言统一取批量自身的 ID 才能互相比对。
 #[tokio::test]
 async fn send_batch_writes_client_ids_before_encoding_the_body() {
     let cluster = MockCluster::start(1, true).await;
@@ -1081,9 +1030,6 @@ async fn send_batch_writes_client_ids_before_encoding_the_body() {
     producer.shutdown();
 }
 
-/// `ReqT` 必须由 stream 钩子**在用户钩子之前**写入：Java 的注释
-/// "Inject stream rpc hook first to make reserve field signature" 说明它得进 ACL 签名，
-/// 而签名由用户钩子（AclClientRPCHook）算 —— 顺序反了签名内容就不含 ReqT。
 #[tokio::test]
 async fn stream_request_type_tags_requests_before_user_hooks_run() {
     #[derive(Default)]
@@ -1148,16 +1094,6 @@ async fn stream_request_type_is_off_by_default_for_producers() {
 }
 
 // ---------------------------------------------------------------- 异步发送背压
-//
-// 对端是 Java `DefaultMQProducerImpl:635-682`（两道闸、共享一份预算）与 `:577-633`
-// （`BackpressureSendCallBack` 的归还），与 `python/tests/test_producer_async.py`、
-// `cpp/tests/test_producer_async.cpp` 及 C# 的同题用例一一对应。
-//
-// 字节闸的地板值是 1M（Java `:148-153`），所以只能拿「1M 少掉多少」来断言在途字节，
-// 不能把上限配成几百字节 —— 那会被夹回 1M。
-//
-// 「发送队列满了怎么办」（Java `:675-681`）在下一节「异步发送内核」里：那道分支要有界
-// 队列才谈得上，本端口 #50 之后才有。
 
 use std::sync::atomic::AtomicUsize;
 
@@ -1247,7 +1183,6 @@ impl CheckForbiddenHook for SleepingForbiddenHook {
     }
 
     fn check_forbidden(&self, _context: &mut CheckForbiddenContext) -> Result<()> {
-        // 钩子接口是同步的（Java 也是），所以只能睡挂钟；挂钟正是预算用的时钟。
         std::thread::sleep(Duration::from_millis(self.millis));
         Ok(())
     }
@@ -1444,7 +1379,6 @@ async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
     cond()
 }
 
-/// Java `DefaultMQProducer:169/175/181` —— 默认关，1024 条 / 100M 字节。
 #[test]
 fn backpressure_defaults_match_contract() {
     let producer = DefaultMQProducer::new("GID_bp_default").expect("组名合法");
@@ -1461,7 +1395,6 @@ fn backpressure_defaults_match_contract() {
     );
 }
 
-/// 配置越界时**构造**就夹到地板值（Java 建 impl 时的 `:141-153` 分支）。
 #[test]
 fn constructor_floors_undersized_capacities() {
     let cfg = ProducerConfig {
@@ -1487,7 +1420,6 @@ fn constructor_floors_undersized_capacities() {
     );
 }
 
-/// Java `DefaultMQProducer:1385/1402` —— setter 也夹地板值，且配置跟着走。
 #[test]
 fn setter_floors_both_gates() {
     let producer = DefaultMQProducer::new("GID_bp_setter").expect("组名合法");
@@ -1536,7 +1468,6 @@ async fn disabled_gate_stays_out_of_the_way() {
     producer.shutdown();
 }
 
-/// Java `:654-658` —— 条数拿不到就回调，一次请求都不发（预算被闸自己花光）。
 #[tokio::test]
 async fn num_gate_rejects_with_contract_message_and_sends_nothing() {
     let cluster = MockCluster::start(1, true).await;
@@ -1579,7 +1510,6 @@ async fn num_gate_rejects_with_contract_message_and_sends_nothing() {
     producer.shutdown();
 }
 
-/// Java `:667-671` —— 字节闸没过时，**已经拿到**的条数许可必须归还。
 #[tokio::test]
 async fn size_gate_rejects_and_gives_the_num_permit_back() {
     let cluster = MockCluster::start(1, true).await;
@@ -1642,7 +1572,6 @@ async fn permits_are_borrowed_per_in_flight_send_and_given_back() {
     producer.shutdown();
 }
 
-/// 归还挂在失败回调上（Java `semaphoreProcessor` 在两个回调里都跑），失败不能漏。
 #[tokio::test]
 async fn failure_also_gives_the_permits_back() {
     let cluster = MockCluster::start(1, true).await;
@@ -1701,7 +1630,6 @@ async fn retry_chain_holds_one_pair_not_one_per_attempt() {
     producer.shutdown();
 }
 
-/// Java `:636-664` —— 闸是**等**到超时为止，不是看一眼不够就报错，这才是限流。
 #[tokio::test]
 async fn gate_waits_for_a_permit_instead_of_failing_early() {
     let cluster = MockCluster::start(1, true).await;
@@ -1746,7 +1674,6 @@ async fn gate_waits_for_a_permit_instead_of_failing_early() {
     producer.shutdown();
 }
 
-/// Java `DefaultMQProducerTest:593-595` 的那条断言：空闲许可 + 在途份数 == 新配置。
 #[tokio::test]
 async fn runtime_resize_keeps_the_in_flight_share() {
     let cluster = MockCluster::start(1, true).await;
@@ -1771,7 +1698,6 @@ async fn runtime_resize_keeps_the_in_flight_share() {
     producer.shutdown();
 }
 
-/// 本端口改容量不丢等待者（Java 换对象会把等待者留在旧信号量上等自己的超时）。
 #[tokio::test]
 async fn growing_capacity_wakes_a_blocked_sender() {
     let cluster = MockCluster::start(1, true).await;
@@ -1800,7 +1726,6 @@ async fn growing_capacity_wakes_a_blocked_sender() {
     producer.shutdown();
 }
 
-/// Java `:642` —— `getBody() == null ? 1 : getBody().length`，空 body 也要扣 1。
 #[test]
 fn empty_body_still_costs_one_size_permit() {
     assert_eq!(back_pressure_msg_len(&body_of(5)), 5);
@@ -1809,8 +1734,6 @@ fn empty_body_still_costs_one_size_permit() {
     assert_eq!(back_pressure_msg_len(&no_body), 1);
 }
 
-/// Python `_run` / Java `:555` —— 排队吃掉整个预算就直接回调，不发请求。
-///
 /// 「排队」在这里是任务从入队到被池内消费者跑起来之间的间隔，真集群造不出稳定时长，
 /// 所以直接把 `began` 摆在过去，等价于那段等待已经花光了预算。
 #[tokio::test]
@@ -1841,9 +1764,6 @@ async fn queue_wait_beyond_budget_reports_async_send_call_timeout() {
 // 队列有界、地址解析、复用请求换 opaque、`retryTimesWhenSendAsyncFailed`、异步不看
 // `retryResponseCodes` —— 这些只有真异步内核才谈得上，全部在假集群上对拍。
 
-/// Java `:674-681`（Python `submit` 抛 `RejectedExecutionException`）—— 队列满了
-/// 就地报错给**调用方**，不排队、不走回调。
-///
 /// 这里能确定性地造出队满：`#[tokio::test]` 用的是**单线程**运行时，两次 `send_async`
 /// 之间没有 `await`，池内消费者没机会被调度，所以容量 1 的队列在第二笔时必然是满的。
 /// 容量是**建池时**（`start()`）读的，所以要配在 `ProducerConfig` 里。
@@ -1882,8 +1802,6 @@ async fn queue_full_rejects_the_caller_without_sending() {
     producer.shutdown();
 }
 
-/// 队列满 + **开了背压**：Java `:675-681` 就地跑完（许可已扣），本端口扣许可发生在出队
-/// 之后，所以改成派发到队列之外 —— 两笔都要发出去，且各只扣一份许可。
 #[tokio::test]
 async fn queue_full_with_backpressure_dispatches_off_the_queue() {
     let cluster = MockCluster::start(1, true).await;
@@ -1938,8 +1856,6 @@ async fn send_async_after_shutdown_is_rejected() {
     assert_eq!(cb.done.load(Ordering::SeqCst), 1, "被拒的一笔不该有回调");
 }
 
-/// Java `:1043-1046`（Python `_send_kernel_async`）—— 准备工作（这里用拦截钩子的耗时
-/// 代表）把预算花光时，**不建请求**，但仍然跑一次 after 钩子并归还许可。
 #[tokio::test]
 async fn prep_stage_beyond_budget_reports_send_kernel_timeout() {
     let cluster = MockCluster::start(1, true).await;
@@ -1974,8 +1890,6 @@ async fn prep_stage_beyond_budget_reports_send_kernel_timeout() {
     producer.shutdown();
 }
 
-/// Java `onExceptionImpl` —— 连不上（`RemotingConnectException`）算「没收到响应」，
-/// 要换一台 broker 重试；重试复用**同一个请求**但换新 `opaque`。
 #[tokio::test]
 async fn connect_failure_retries_on_another_broker_with_a_fresh_opaque() {
     let live = MockCluster::start(1, true).await;
@@ -1996,8 +1910,6 @@ async fn connect_failure_retries_on_another_broker_with_a_fresh_opaque() {
     producer.shutdown();
 }
 
-/// 同上，但第二台 broker 也是坏的：重试上限是 `retryTimesWhenSendAsyncFailed`，
-/// 一共 3 笔尝试，最后把**包装过**的失败交给回调（Java `"unknown reason"` 分支）。
 #[tokio::test]
 async fn async_retry_honours_retry_times_when_send_async_failed() {
     let cluster = MockCluster::start(2, true).await;
@@ -2027,7 +1939,6 @@ async fn async_retry_honours_retry_times_when_send_async_failed() {
     producer.shutdown();
 }
 
-/// 配成 0 就一笔都不重试（Java 的 `times <= timesTotal` 判据）。
 #[tokio::test]
 async fn retry_times_when_send_async_failed_zero_means_one_attempt() {
     let cluster = MockCluster::start(2, true).await;
@@ -2076,8 +1987,6 @@ async fn broker_rejected_response_ends_the_chain_after_one_attempt() {
     producer.shutdown();
 }
 
-/// 一笔异步发送只跑**一次** before/after 钩子（Java 的 `sendKernelImpl` 末尾对 ASYNC
-/// 还会再跑一次 after，本端口跟 Python：只在链的终点跑一次）。
 #[tokio::test]
 async fn send_hooks_run_once_per_async_send() {
     let cluster = MockCluster::start(1, true).await;
@@ -2127,8 +2036,6 @@ async fn after_hook_sees_the_async_outcome() {
     producer.shutdown();
 }
 
-/// 定点发送（调用方给了 `mq`）不换 broker：Java 传下去的 topicPublishInfo 是 null，
-/// 重试只能在**同一台**上换 opaque —— 那里连接是好的，所以三次尝试都打到同一台 broker。
 #[tokio::test]
 async fn pinned_mq_retries_on_the_same_broker_with_new_opaques() {
     let cluster = MockCluster::start(1, true).await;
@@ -2160,7 +2067,6 @@ async fn pinned_mq_retries_on_the_same_broker_with_new_opaques() {
     producer.shutdown();
 }
 
-/// 未 start 的异步发送**同步抛**（Java 走回调，Python 与这里一致），回调一次都不跑。
 #[test]
 fn send_async_before_start_raises_without_calling_back() {
     let producer = DefaultMQProducer::new("GID_async_unstarted").expect("组名合法");
@@ -2176,10 +2082,6 @@ fn send_async_before_start_raises_without_calling_back() {
 }
 
 // ------------------------------------------------- 定点发送的 topic 一致性守卫
-//
-// Java 全客户端树只有两处守卫（同步 `DefaultMQProducerImpl:1234-1236`、异步 `:1277-1278`），
-// 两处文案不同。假集群在这里的价值是 `requests(0) == 0`：守卫必须在**任何请求上线之前**
-// 拒绝，真集群只能看到「结果不对」，看不到「一个字节都没出去」。
 
 /// 定点同步发送在 `sendKernelImpl` **之前**比 topic，不符就拒 —— 假 broker 一笔请求都收不到。
 #[tokio::test]
@@ -2222,10 +2124,6 @@ async fn pinned_sync_send_with_a_matching_topic_reaches_the_broker() {
     producer.shutdown();
 }
 
-/// 命名空间下比的是**各自包装之后**的资源名（Java 公开入口先 `withNamespace(msg topic)`、
-/// 队列再过 `queueWithNamespace`，`wrapNamespace` 幂等）——已带前缀的队列 topic 不能被误拒，
-/// 跨命名空间的同名 topic 仍然是不同资源。三条与 Python
-/// `test_pinned_send_topic_guard.py` 的命名空间用例同题。
 #[tokio::test]
 async fn pinned_sync_send_compares_topics_after_namespace_wrapping() {
     let cluster = MockCluster::start(1, true).await;
@@ -2267,8 +2165,6 @@ async fn pinned_sync_send_compares_topics_after_namespace_wrapping() {
     producer.shutdown();
 }
 
-/// 批量是 `MessageBatch extends Message`，落在**同一处同步守卫**上（Java
-/// `send(Collection, MessageQueue, timeout)` → `impl.send(batch, mq, timeout)`）。
 #[tokio::test]
 async fn pinned_batch_send_shares_the_sync_guard() {
     let cluster = MockCluster::start(1, true).await;
@@ -2294,8 +2190,6 @@ async fn pinned_batch_send_shares_the_sync_guard() {
     producer.shutdown();
 }
 
-/// 异步入口用**另一句**文案（Java `:1277-1278`），并且只从回调交一次出去 ——
-/// 守卫被放在 `run_async_send` 里，回调侧的 `onException` 由 `fail_async` 交付。
 #[tokio::test]
 async fn pinned_async_send_refuses_with_the_async_wording_via_the_callback() {
     let cluster = MockCluster::start(1, true).await;
@@ -2319,9 +2213,6 @@ async fn pinned_async_send_refuses_with_the_async_wording_via_the_callback() {
     producer.shutdown();
 }
 
-/// Java 刻意**没有**给 `sendOneway(msg, mq)` 加守卫（`:1303-1310` 直接进 `sendKernelImpl`），
-/// 本端口照抄 —— 守卫的位置若被改动（挪进 `send_pinned` 之类），这一条会红。
-///
 /// 先来一笔普通发送把 broker 地址表喂上：单向定点发送自己不做路由查询
 /// （`need_addr` 只读缓存），这一步与守卫无关。
 #[tokio::test]
@@ -2355,8 +2246,6 @@ async fn oneway_pinned_send_has_no_topic_guard() {
     producer.shutdown();
 }
 
-/// 顺序与 Java 一致：`makeSureStateOK()` 在最前，未启动的生产者先报「没启动」，
-/// 守卫根本轮不到（同步路径）。
 #[tokio::test]
 async fn state_check_precedes_the_pinned_guard() {
     let producer = DefaultMQProducer::new("GID_pinned_unstarted").expect("组名合法");

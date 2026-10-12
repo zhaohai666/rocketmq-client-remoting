@@ -1,37 +1,10 @@
 # -*- coding: utf-8 -*-
-"""SOCKS 代理支持（对应 Java ``org.apache.rocketmq.remoting.proxy.SocksProxyConfig`` 与
-``NettyRemotingClient`` 里 ``Socks5ProxyHandler`` 的接入位置）。
-
-职责只有两块：
-
-1. ``SocksProxyConfig``：代理配置载体，字段对齐 Java 的 SocksProxyConfig
-   （addr / username / password），并按本端口七端约定补齐三样 Java 里由
-   Netty ``Socks5ProxyHandler`` 隐含的东西：代理类型（SOCKS4/SOCKS5）、
-   独立端口字段、enable 开关。只放纯数据与校验，不做任何 I/O。
-2. ``socks_handshake``：在**已连上代理服务器**的套接字上，对目标 host:port
-   做 SOCKS CONNECT 握手（RFC 1928 SOCKS5 / RFC 1929 用户名密码子协商 /
-   SOCKS4 与 4a 域名扩展），握手完成后的套接字即视为直连目标。
-
-只在纯标准库 ``socket`` 上手写协议字节，不引第三方依赖（Java 侧用的
-netty-handler-proxy 在 Python 侧没有等价物，而 PySocks 不是标准库）。
-
-与 Java 的口径差异（刻意如此）：
-- Java 的 ``NettyClientConfig.socksProxyConfig`` 是一段按 CIDR 分流的 JSON
-  （``{"10.10.0.0/16": {"addr": ...}}``），按目标地址匹配走不走代理；本端口的
-  客户端是单实例单配置（``remoting_client.socks_proxy_config``），配置了就
-  **全部** remoting 连接（NameServer + Broker）都走代理。这对应 Java 里
-  CIDR 写 ``0.0.0.0/0``（RemotingHelper.DEFAULT_CIDR_ALL）的形状。
-- Java 只代理 remoting 连接，NameServer HTTP 动态取址（地址服务器的那次
- 普通 HTTP GET）不走代理；本端口 ``client/top_addressing.py`` 的 urllib 请求
-  同样不被触碰，口径一致。
-"""
 from __future__ import annotations
 
 import socket
 import struct
 from typing import Optional
 
-# 代理类型（Java 的 Socks5ProxyHandler 只支持 5；本端口按任务口径同时给 4/4a）
 SOCKS4 = "SOCKS4"
 SOCKS5 = "SOCKS5"
 SUPPORTED_PROXY_TYPES = (SOCKS4, SOCKS5)
@@ -82,24 +55,12 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 class SocksProxyConfig:
-    """代理配置（字段对齐 Java SocksProxyConfig + 本端口的类型/端口/enable 三项）。
-
-    ``addr``     代理主机名或 IP；也接受 Java 风格的 ``host:port`` 写法（此时
-                 ``port`` 参数可省，两者都给时以显式 ``port`` 为准）。
-    ``port``     代理端口；``addr`` 里带了端口且这里为 None 时从 addr 解析。
-    ``proxy_type`` ``SOCKS5``（默认）或 ``SOCKS4``（域名目标自动走 4a 扩展）。
-    ``username`` / ``password``：可选认证。SOCKS5 用 RFC 1929 子协商；
-                 SOCKS4 复用 userid 字段（4 协议本身没有密码）。
-    ``enable``   None（默认）= 自动：addr 非空即启用；显式 True/False 强制开/关
-                 （False 等于"留着配置但不走代理"，Java 没有这一项，是本端口
-                 门面 setter 的便利语义）。
-    """
+    pass
 
     def __init__(self, addr: str = "", port: Optional[int] = None,
                  proxy_type: str = SOCKS5, username: str = "", password: str = "",
                  enable: Optional[bool] = None):
         addr = str(addr or "").strip()
-        # Java SocksProxyConfig 的 addr 就是 "host:port" 一个串：这里兼容同一种写法。
         if addr.startswith("["):  # IPv6 字面量 [::1]:1080
             host, _, rest = addr[1:].partition("]")
             tail = rest.lstrip(":")
@@ -142,7 +103,6 @@ class SocksProxyConfig:
         return self.addr, self.port
 
     def __repr__(self) -> str:
-        # 与 Java toString() 同位：不打密码明文
         return ("SocksProxyConfig{type=%s, addr=%s, port=%d, username=%s, "
                 "password=****, enable=%s}" % (self.proxy_type, self.addr, self.port,
                                                self.username or "-", self.enable))
@@ -174,8 +134,6 @@ def _encode_socks5_target(host: str, port: int) -> bytes:
 
 def _socks5_handshake(sock: socket.socket, host: str, port: int,
                       config: SocksProxyConfig) -> None:
-    # 1) 方法协商：配了用户名或密码就同时声明"无认证"与"用户名密码"两种
-    #    （Java Socks5ProxyHandler 的行为：代理选了哪个就用哪个）。
     has_auth = bool(config.username or config.password)
     methods = (_S5_METHOD_NO_AUTH, _S5_METHOD_USERNAME_PASSWORD) if has_auth \
         else (_S5_METHOD_NO_AUTH,)

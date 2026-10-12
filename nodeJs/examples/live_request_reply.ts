@@ -4,11 +4,6 @@
 // as a broker-pushed PUSH_REPLY_MESSAGE_TO_CLIENT(326).
 //
 //   node --experimental-strip-types examples/live_request_reply.ts --ns 127.0.0.1:9876
-//
-// Java shape honoured here: the reply's TOPIC is `<cluster>_REPLY_TOPIC`
-// (cluster from the request's CLUSTER property, stamped by the broker), the
-// requester's clientId rides as REPLY_TO_CLIENT, and the broker finds the
-// requestor's channel via ProducerManager.findChannel to push 326.
 import { DefaultMQProducer } from '../src/client/producer.ts';
 import { DefaultMQPushConsumer } from '../src/client/consumer.ts';
 import { Message } from '../src/common/message.ts';

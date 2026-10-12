@@ -331,8 +331,6 @@ func TestPopKeepsBrokerCheckpointOnRewrittenRetryTopic(t *testing.T) {
 	if got := common.GetRealTopic(parts, "TopicA", group); got != physical {
 		t.Fatalf("ACK topic = %q, want %q", got, physical)
 	}
-	// 1ST_POP_TIME is computeIfAbsent in Java (MQClientAPIImpl:1224): absent
-	// here, so it is stamped; and the listener still sees the request topic.
 	if v := propertyOf(result.MsgFoundList[0], common.PropertyFirstPopTime); v != i64Text(popTime) {
 		t.Fatalf("1ST_POP_TIME = %q", v)
 	}
@@ -453,8 +451,6 @@ func TestPopConsumerFailureExtendsInvisibility(t *testing.T) {
 	}
 }
 
-// Retry budget exhausted and the message younger than twice the longest delay:
-// Java extends by the next notch above the elapsed time.
 func TestPopConsumerCheckNeedAckOrDelayExtends(t *testing.T) {
 	f, c := popFixtureWithConsumer(t, &countingConcurrentlyListener{
 		fn: func(_ []*common.MessageExt, _ *ConsumeConcurrentlyContext) ConsumeConcurrentlyStatus {
@@ -557,9 +553,6 @@ func TestPopConsumerSendsSetMessageRequestMode(t *testing.T) {
 	}
 }
 
-// The POP request must carry the Java defaults and never suspend on a client
-// offset: bornTime is "now", pollTime is 15s, invisibleTime is the configured
-// 60s, and maxMsgNums is the configured batch size.
 func TestPopRequestHeaderShape(t *testing.T) {
 	f, c := popFixtureWithConsumer(t, &countingConcurrentlyListener{
 		fn: func(_ []*common.MessageExt, _ *ConsumeConcurrentlyContext) ConsumeConcurrentlyStatus {
@@ -641,15 +634,12 @@ func TestPopProcessQueueSemantics(t *testing.T) {
 	if q.WaitAckMsgCount() != 3 {
 		t.Fatalf("after incFoundMsg(3) = %d", q.WaitAckMsgCount())
 	}
-	// ack() returns the value BEFORE the decrement (Java AtomicInteger
-	// .getAndDecrement), which the live verifiers read.
 	if prev := q.Ack(); prev != 3 {
 		t.Fatalf("ack() returned %d, want the pre-decrement 3", prev)
 	}
 	if q.WaitAckMsgCount() != 2 {
 		t.Fatalf("after ack() = %d", q.WaitAckMsgCount())
 	}
-	// decFoundMsg ADDS — Java calls it with a negative count to hand debt back.
 	q.DecFoundMsg(-2)
 	if q.WaitAckMsgCount() != 0 {
 		t.Fatalf("after decFoundMsg(-2) = %d", q.WaitAckMsgCount())
@@ -672,7 +662,6 @@ func TestPopDelayLevelTable(t *testing.T) {
 	if popDelayLevel[0] != 10 || popDelayLevel[1] != 30 || popDelayLevel[15] != 7200 {
 		t.Fatalf("table = %v", popDelayLevel)
 	}
-	// Clamping, not erroring (Java: `delayLevel >= length ? last : table[level]`).
 	if got := popDelayLevelSeconds(99); got != 7200 {
 		t.Fatalf("clamped = %d", got)
 	}
@@ -689,9 +678,6 @@ func TestPopDelayLevelTable(t *testing.T) {
 	if got := popDelayLevelForElapsed(10_000); got != 1 {
 		t.Fatalf("10s -> %d, want 1", got)
 	}
-	// Below the shortest notch Java's loop falls off the end with -1 and then
-	// indexes the table with -1 (AIOOBE). -1 is the faithful return; the clamp
-	// lives in popDelayLevelSeconds / checkNeedAckOrDelay.
 	if got := popDelayLevelForElapsed(5_000); got != -1 {
 		t.Fatalf("5s -> %d, want -1 (Java's loop then AIOOBEs)", got)
 	}
@@ -736,7 +722,6 @@ func TestPopConfigBounds(t *testing.T) {
 			t.Fatalf("%s: expected a config error", tc.name)
 		}
 	}
-	// The Java defaults must pass.
 	c := MustNewDefaultMQPushConsumer("PopBoundsOK")
 	c.SetPopMode(true)
 	if err := c.checkConfigRanges(); err != nil {

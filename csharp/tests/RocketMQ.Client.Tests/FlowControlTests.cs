@@ -1,18 +1,4 @@
 // 拉取前流控判定的单测 —— 不需要集群。
-//
-// 为什么必须离线锁死：Java ProcessQueue 的五个阈值里只有**条数**那一条会在"消息小、拉得快"
-// 的场景里先命中，其余四条要等真出问题才看得见（队列级字节阈值失效 ⇒ 大消息把堆撑爆；
-// 位点跨度失效 ⇒ 队首一条卡住、后面无限堆；topic 级阈值失效 ⇒ 同 topic 多队列各自为政）。
-// 判据与 Python `_flow_control_hit` / Rust `flow_control_hit` / C++ `flowControlHit` 逐条同构：
-//   1) 条数   >= PullThresholdForQueue（Java 的 Math.Max(1, n) 守卫：配 0 也按 1 条算）
-//   2) 字节   >= PullThresholdSizeForQueue，单位 **MiB**（<=0 关闭）
-//   3) 跨度   **严格大于** ConsumeConcurrentlyMaxSpan（pending 里 queueOffset 的 max-min；<=0 关闭）
-//   4) topic 累计条数 >= PullThresholdForTopic（本实例该 topic **所有**队列合起来；-1 关闭）
-//   5) topic 累计字节 >= PullThresholdSizeForTopic，单位 MiB（-1 关闭，且不复用第 2 条的开关）
-// 命中一次只记一格 FlowControlTriggered。
-//
-// 注意 topic 级两条的语义偏差：Java RebalancePushImpl:67-81 会把 topic 阈值**除以队列数**
-// 折算进队列级闸门，本移植（四语言一致）直接拿累计值比对，见各属性文档注释。
 using System.Globalization;
 
 using RocketMQ.Client;
@@ -91,7 +77,6 @@ public class FlowControlTests
         Stage(c, mq, NSized(Topic, 100, 3));
         Assert.True(Hit(c, mq));
         Assert.Equal(1L, c.FlowControlTriggered);
-        // Java 的 Math.Max(1, n) 守卫：配 0 不是"全放行"，而是"1 条就停"
         c.PullThresholdForQueue = 0;
         Stage(c, mq, NSized(Topic, 100, 1));
         Assert.True(Hit(c, mq), "PullThresholdForQueue=0 要按 1 条算（Java 的 max(1,n) 守卫）");
@@ -125,7 +110,6 @@ public class FlowControlTests
         c.ConsumeConcurrentlyMaxSpan = 10;
         Stage(c, mq, new List<MessageExt> { Sized(Topic, 1, 0), Sized(Topic, 1, 100) });
         Assert.True(Hit(c, mq));
-        // **严格大于**：跨度正好等于阈值不算（Java 同）
         c.ConsumeConcurrentlyMaxSpan = 100;
         Assert.False(Hit(c, mq), "跨度 100 不严格大于 100，不该命中");
         // 乱序缓冲也要量出真实跨度（min/max 而不是首尾差）

@@ -1,13 +1,5 @@
 // 定时消息撤回（RECALL_MESSAGE 370）离线单测 —— 不需要集群。
 //
-// 对齐基准是 Java 5.5.1 的 RecallMessageHandle / RecallMessageRequestHeader /
-// DefaultMQProducerImpl#recallMessage(:1570-1601)。盯的是三类错得很安静的东西：
-//   * 句柄编解码：分隔符是**空格**、版本段是 "v1"、编码是 base64url **带 '=' 填充**；
-//     Java 解码器不吃无填充串，本端口两种都吃（见头文件差异说明），所以两种都要测。
-//   * 报文键名：RecallMessageRequestHeader 在 Java 里继承 RpcRequestHeader，
-//     brokerName 的**反射名是 bname**，写成 brokerName 会被 broker 静默丢掉。
-//   * 客户端校验顺序：状态 → checkTopic → 禁 retry/DLQ → 解句柄 → 定位 broker，
-//     前三步都不该打网络（一个手滑的句柄不该耗掉一次 RPC 超时）。
 //
 // 语义（撤回后消息到底还不投递）只有真机能证，见 examples/recall_live.cpp。
 #include <chrono>
@@ -39,7 +31,6 @@ void expect(bool ok, const std::string& name, const std::string& detail = "") {
 const char* kTopic = "TopicRecallUnit";
 const char* kBroker = "broker-a";
 const char* kUniqKey = "0123456789ABCDEF0123456789abcdef";
-// Java 的 RecallMessageHandle 在所有解码失败分支上给的都是这一句文案。
 const char* kInvalid = "recall handle is invalid";
 
 std::string catchMessage(const std::function<void()>& fn) {
@@ -55,7 +46,6 @@ std::string catchMessage(const std::function<void()>& fn) {
 
 // ---------------------------------------------------------------- 句柄编解码
 void testCodec() {
-    // 向量是用 Java 的 Base64.getUrlEncoder() 实算出来的，改动即失配。
     const std::string handle = buildRecallHandle(kTopic, kBroker, "1700000000000", kUniqKey);
     expect(handle == "djEgVG9waWNSZWNhbGxVbml0IGJyb2tlci1hIDE3MDAwMDAwMDAwMDAg"
                      "MDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlhYmNkZWY=",
@@ -66,13 +56,10 @@ void testCodec() {
     expect(parsed.topic == kTopic && parsed.brokerName == kBroker &&
                parsed.timestampStr == "1700000000000" && parsed.messageId == kUniqKey,
            "句柄往返一致", parsed.topic + "/" + parsed.brokerName);
-    // Java 的 getUrlDecoder 会拒无填充串；本端口必须两种都吃（另外三个移植用无填充编码器）。
     std::string unpadded = handle;
     while (!unpadded.empty() && unpadded.back() == '=') unpadded.pop_back();
     expect(decodeRecallHandle(unpadded) == parsed, "无填充句柄同样能解");
 
-    // Java split(" ") 后只取 items[1..4]，多余分段直接忽略。
-    // 下面是 base64url("v1 TopicA broker-a 1700000000000 abc junk")。
     const HandleV1 truncated =
         decodeRecallHandle("djEgVG9waWNBIGJyb2tlci1hIDE3MDAwMDAwMDAwMDAgYWJjIGp1bms=");
     expect(truncated.topic == "TopicA" && truncated.messageId == "abc",
@@ -164,9 +151,6 @@ void testProducerValidation() {
     expect(corrupt == kInvalid, "非法句柄本地即拒", corrupt);
     expect(cost < 200, "非法句柄是秒回的（没打网络）", std::to_string(cost) + "ms");
 
-    // 句柄合法但拿不到路由：Java 的 tryToFindTopicPublishInfo **异常照抛**
-    // （DefaultMQProducerImpl:1586），所以这里 surfacing 的是路由错误而不是
-    // "The broker service address not found"（后者要有路由、只是没有可用 broker 才会走到）。
     const std::string handle = buildRecallHandle(kTopic, kBroker, "1700000000000", kUniqKey);
     const std::string noRoute = catchMessage([&] { (void)p.recallMessage(kTopic, handle); });
     // 只断言前缀：路由拉取真的失败时，后面还会带上 "(route fetch failed: ...)" 明细。

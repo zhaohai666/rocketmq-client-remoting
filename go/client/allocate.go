@@ -1,11 +1,3 @@
-// Queue allocation strategies (Java
-// org.apache.rocketmq.client.consumer.rebalance.AllocateMessageQueue*).
-//
-// Deliberate deviation from Java, shared by all four ports: Java's
-// AbstractAllocateMessageQueueStrategy#check throws IllegalArgumentException
-// on bad input; here every strategy returns an empty list instead. Rebalance is
-// a background timer — one dirty input must not kill the consumer.
-//
 // Determinism is the whole point: every instance in a group sorts mqAll and
 // cidAll the same way and runs the same index math, otherwise two instances
 // compute overlapping assignments and duplicate every message.
@@ -28,18 +20,9 @@ type AllocateMessageQueueStrategy interface {
 	// Allocate returns the queues this instance owns. Must not return nil for
 	// a valid input with no queues — an empty slice is fine.
 	Allocate(consumerGroup, currentCID string, mqAll []common.MessageQueue, cidAll []string) []common.MessageQueue
-	// Name is Java getName ("AVG", "CONSISTENT_HASH", ...).
 	Name() string
 }
 
-// AllocateErrReporter is implemented by strategies that can fail hard —
-// Java's AllocateMachineRoomNearBy throws IllegalArgumentException when the
-// resolver hands out an empty machine room, the rebalance thread lets the
-// exception abort the round and processQueueTable stays untouched. The Go
-// interface has no error channel, so such a strategy records the failure and
-// the rebalance call sites ask for it via this interface: a non-nil error
-// KEEPS the previous assignment instead of revoking every queue (silently
-// returning empty would take the whole topic away from the group).
 type AllocateErrReporter interface {
 	AllocateErr() error
 }
@@ -51,8 +34,6 @@ func strategyName(s AllocateMessageQueueStrategy) string {
 	return s.Name()
 }
 
-// checkCid reproduces Java AbstractAllocateMessageQueueStrategy#check: the
-// currentCID must be IN cidAll, and Java logs the [BUG] line when it is not.
 func checkCid(consumerGroup, currentCID string, mqAll []common.MessageQueue, cidAll []string) (int, bool) {
 	if currentCID == "" || len(mqAll) == 0 || len(cidAll) == 0 {
 		return 0, false
@@ -73,7 +54,6 @@ func checkCid(consumerGroup, currentCID string, mqAll []common.MessageQueue, cid
 
 // ------------------------------------------------------------- AVG
 
-// AllocateMessageQueueAveragely is Java AllocateMessageQueueAveragely.
 type AllocateMessageQueueAveragely struct{}
 
 func (AllocateMessageQueueAveragely) Name() string { return "AVG" }
@@ -104,8 +84,6 @@ func (AllocateMessageQueueAveragely) Allocate(consumerGroup, currentCID string, 
 
 // ------------------------------------------------ AVG_BY_CIRCLE
 
-// AllocateMessageQueueAveragelyByCircle is Java
-// AllocateMessageQueueAveragelyByCircle.
 type AllocateMessageQueueAveragelyByCircle struct{}
 
 func (AllocateMessageQueueAveragelyByCircle) Name() string { return "AVG_BY_CIRCLE" }
@@ -124,9 +102,6 @@ func (AllocateMessageQueueAveragelyByCircle) Allocate(consumerGroup, currentCID 
 
 // ------------------------------------------------------------- CONFIG
 
-// AllocateMessageQueueByConfig is Java AllocateMessageQueueByConfig: whatever
-// the caller configured. Note Java does NO check here — an empty group or
-// cidAll still returns the configured list.
 type AllocateMessageQueueByConfig struct {
 	MessageQueueList []common.MessageQueue
 }
@@ -138,21 +113,16 @@ func NewAllocateMessageQueueByConfig(mqs []common.MessageQueue) *AllocateMessage
 
 func (*AllocateMessageQueueByConfig) Name() string { return "CONFIG" }
 
-// Allocate ignores every argument (Java does too — no check runs here).
 func (s *AllocateMessageQueueByConfig) Allocate(_, _ string, _ []common.MessageQueue, _ []string) []common.MessageQueue {
 	return append([]common.MessageQueue(nil), s.MessageQueueList...)
 }
 
 // ------------------------------------------------- consistent hash ring
 
-// hashFunction is Java HashFunction.
 type hashFunction interface {
 	Hash(key string) uint32
 }
 
-// md5Hash is Java ConsistentHashRouter.MD5Hash: the FIRST FOUR BYTES of the MD5
-// digest, big endian. Taking the full 128 bits (or a different slice) puts you
-// on a different ring than every Java client.
 type md5Hash struct{}
 
 func (md5Hash) Hash(key string) uint32 {
@@ -190,7 +160,6 @@ func (r *consistentHashRouter) addNode(pNode string, vNodeCount int) {
 		if _, ok := r.ring[key]; !ok {
 			r.keys = insertU32(r.keys, key)
 		}
-		// Java TreeMap.put: a duplicate hash is overwritten in place.
 		r.ring[key] = v
 	}
 }
@@ -207,9 +176,6 @@ func (r *consistentHashRouter) removeNode(pNode string) {
 	r.keys = kept
 }
 
-// routeNode is Java ConsistentHashRouter#routeNode: tailMap(hash).firstKey(),
-// and TreeMap's tailMap is INCLUSIVE of the endpoint, so the lookup is a
-// "first key >= hash" search. Wrapping past the end returns the first key.
 func (r *consistentHashRouter) routeNode(objectKey string) (string, bool) {
 	if len(r.keys) == 0 {
 		return "", false
@@ -265,23 +231,15 @@ func itoa(v int) string {
 	return string(buf[i:])
 }
 
-// queueWireString is Java MessageQueue#toString — the string the ring
-// hashes. Must match character for character.
 func queueWireString(mq common.MessageQueue) string { return mq.WireString() }
 
 // ------------------------------------------- CONSISTENT_HASH
 
-// AllocateMessageQueueConsistentHash is Java
-// AllocateMessageQueueConsistentHash. Its point is not evenness but STABILITY:
-// when the queue or consumer count changes, only the queues on the affected arc
-// switch owner, while AVG moves everybody's boundary.
 type AllocateMessageQueueConsistentHash struct {
 	VirtualNodeCnt     int
 	CustomHashFunction hashFunction
 }
 
-// NewAllocateMessageQueueConsistentHash mirrors the Java default: 10 virtual
-// nodes, MD5Hash.
 func NewAllocateMessageQueueConsistentHash(virtualNodeCnt int) *AllocateMessageQueueConsistentHash {
 	return &AllocateMessageQueueConsistentHash{VirtualNodeCnt: virtualNodeCnt}
 }
@@ -305,10 +263,6 @@ func (s *AllocateMessageQueueConsistentHash) Allocate(consumerGroup, currentCID 
 
 // ------------------------------------------------- MACHINE_ROOM
 
-// splitWithoutTrailingEmpty mirrors Java String#split(sep) with limit 0: trailing empty
-// segments are DROPPED, but a string with no separator is returned whole
-// (Java's "if no match was found, return this" early return) — so "" stays [""]
-// and does not become empty.
 func splitWithoutTrailingEmpty(text, sep string) []string {
 	parts := strings.Split(text, sep)
 	if len(parts) == 1 {
@@ -320,11 +274,6 @@ func splitWithoutTrailingEmpty(text, sep string) []string {
 	return parts
 }
 
-// AllocateMessageQueueByMachineRoom is Java
-// AllocateMessageQueueByMachineRoom. Broker names are expected to look like
-// `<idc>@<brokerName>`; only queues whose idc prefix is in ConsumerIDCs take
-// part, and those are then split by an AVG-like rule whose remainder goes to
-// the FIRST `mod` consumers (java uses `rem > currentIndex`, not `>=`).
 type AllocateMessageQueueByMachineRoom struct {
 	ConsumerIDCs map[string]struct{}
 }
@@ -345,8 +294,6 @@ func (s *AllocateMessageQueueByMachineRoom) Allocate(consumerGroup, currentCID s
 	if !ok {
 		return nil
 	}
-	// Java's consumeridcs has no default (a nil field NPEs on contains); this
-	// port defaults to an empty set, i.e. "nothing is allocated".
 	var candidates []common.MessageQueue
 	for _, mq := range mqAll {
 		parts := splitWithoutTrailingEmpty(mq.BrokerName, "@")
@@ -382,32 +329,16 @@ func (s *AllocateMessageQueueByMachineRoom) Allocate(consumerGroup, currentCID s
 
 // ------------------------------------------------ MACHINE_ROOM_NEARBY
 
-// MachineRoomResolver is Java AllocateMachineRoomNearBy.MachineRoomResolver:
-// it tells the strategy which machine room a queue or a consumer lives in.
-// Java's javadoc is explicit that neither method may return null/empty — an
-// empty room aborts the allocation with an error (see AllocateErrReporter).
 type MachineRoomResolver interface {
 	BrokerDeployIn(mq common.MessageQueue) string
 	ConsumerDeployIn(clientID string) string
 }
 
-// AllocateMachineRoomNearby is Java AllocateMachineRoomNearBy: a proxy around
-// another strategy. Queues and consumers are grouped by machine room, then
-//
 //  1. the queues in THIS consumer's room are split among the consumers of that
 //     room only (through the inner strategy);
 //  2. queues in a room with NO alive consumer at all are shared among ALL
 //     consumers (again through the inner strategy) — otherwise nobody would
 //     consume them.
-//
-// getName() is "MACHINE_ROOM_NEARBY" + "-" + <inner name> (Java likewise), so
-// logs can tell which algorithm actually did the splitting.
-//
-// Java throws NullPointerException when either constructor argument is null
-// and IllegalArgumentException when the resolver returns an empty room; the
-// constructor mirrors that as an error, and the per-allocate failure is
-// reported through AllocateErrReporter so the rebalance round keeps the
-// current assignment instead of revoking everything.
 type AllocateMachineRoomNearby struct {
 	Inner    AllocateMessageQueueStrategy
 	Resolver MachineRoomResolver
@@ -416,7 +347,6 @@ type AllocateMachineRoomNearby struct {
 	err error
 }
 
-// NewAllocateMachineRoomNearby mirrors Java's constructor null checks.
 func NewAllocateMachineRoomNearby(inner AllocateMessageQueueStrategy, resolver MachineRoomResolver) (*AllocateMachineRoomNearby, error) {
 	if inner == nil {
 		return nil, errors.New("allocateMessageQueueStrategy is null")
@@ -453,8 +383,6 @@ func (s *AllocateMachineRoomNearby) Allocate(consumerGroup, currentCID string, m
 	if _, ok := checkCid(consumerGroup, currentCID, mqAll, cidAll); !ok {
 		return nil
 	}
-	// Group queues by machine room. Java uses TreeMap, i.e. lexicographic room
-	// order — keep it so the inner allocations are deterministic.
 	mr2mq := map[string][]common.MessageQueue{}
 	rooms := make([]string, 0, len(mqAll))
 	for _, mq := range mqAll {

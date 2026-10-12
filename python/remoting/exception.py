@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Remoting 异常（对应 org.apache.rocketmq.remoting.exception）。"""
 from __future__ import annotations
 
 

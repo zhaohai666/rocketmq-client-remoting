@@ -1,7 +1,3 @@
-// 消息二进制编解码（对应 org.apache.rocketmq.common.message.MessageDecoder）。
-//
-// 与 Java 一致，存在**两条互不可混用**的编码路径：
-//
 // 1) 17 段存储格式 MessageDecoder.encode(MessageExt, needCompress) / decode(ByteBuffer)
 //    broker 写入与 pull/get 返回的消息体：
 //
@@ -36,7 +32,6 @@ constexpr int32_t MESSAGE_MAGIC_CODE = -626843481;
 constexpr int32_t MESSAGE_MAGIC_CODE_V2 = -626843477;
 constexpr int32_t BLANK_MAGIC_CODE = -875286124;
 
-// 字段固定偏移，与 Java MessageDecoder 常量一致
 constexpr size_t MESSAGE_MAGIC_CODE_POSITION = 4;
 constexpr size_t MESSAGE_FLAG_POSITION = 16;
 constexpr size_t MESSAGE_PHYSIC_OFFSET_POSITION = 28;
@@ -59,10 +54,8 @@ std::string bytes2String(const Bytes& bs);
 
 // ------------------------------------------------------- 属性串 <-> Map
 
-// Java MessageDecoder.messageProperties2String：k\x01v\x02 逐项拼接
 std::string messagePropertiesToString(const PropertyMap& properties);
 
-// Java MessageDecoder.string2messageProperties
 PropertyMap stringToMessageProperties(const std::string& propertiesStr);
 
 // ---------------------------------------------------------------- msgId
@@ -70,14 +63,12 @@ PropertyMap stringToMessageProperties(const std::string& propertiesStr);
 // ip+port(8 或 20B) + 8B commitLogOffset -> 大写十六进制 msgId
 std::string createMessageId(const Bytes& addrBytes, int64_t offset);
 
-// Java MessageDecoder.decodeMessageId -> (ip, port, offset)
 bool decodeMessageId(const std::string& msgId, std::string& ip, int32_t& port, int64_t& offset);
 
 // ------------------------------------------- 1) 17 段存储格式：MessageExt
 
 Bytes encodeMessageExt(const MessageExt& messageExt, bool needCompress = false);
 
-// 解码失败返回 false（对应 Java decode 返回 null）
 bool decodeMessage(const Bytes& raw, MessageExt& out, bool readBody = true,
                    bool decompressBody = true, bool isClient = true, bool checkCrc = false);
 
@@ -86,19 +77,14 @@ std::vector<MessageExt> decodeMessages(const Bytes& raw, bool readBody = true);
 
 // --------------------------------------- 2) 6 段轻量格式：批量消息 body
 
-// Java MessageDecoder.encodeMessage(Message)
 Bytes encodeMessage(const Message& message);
 
-// Java MessageDecoder.encodeMessages(List<Message>)
 Bytes encodeMessages(const std::vector<Message>& messages);
 
-// Java MessageDecoder.decodeMessage(ByteBuffer)：单条批量单元 -> Message
 bool decodeBatchMessage(const Bytes& raw, Message& out);
 
-// Java MessageDecoder.decodeMessages(ByteBuffer)：批量 body -> Message 列表
 std::vector<Message> decodeBatchMessages(const Bytes& raw);
 
-// Java MessageDecoder.countInnerMsgNum
 int32_t countInnerMsgNum(const Bytes& raw);
 
 }  // namespace rocketmq

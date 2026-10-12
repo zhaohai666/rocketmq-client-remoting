@@ -13,46 +13,6 @@
 //!
 //! Python 用 `threading.Thread` + `Condition` 跑 lite 的心跳与拉取循环；这里换成
 //! tokio 任务 + [`tokio::sync::Notify`]，行为口径不变。两条刻意差别：
-//!
-//! 1. **RPC 全部 `async`**：Python 的 `pull`/`commit`/`seek` 是同步阻塞调用，这里
-//!    是 `async fn`（与 [`crate::client::consumer`] 模块头差异 5 同因）。
-//!    [`DefaultLitePullConsumer::shutdown`] 仍是同步的（与生产者/推送消费者一致），
-//!    退出时的最后一次提交被派发到运行时上执行。
-//! 2. **队列顺序确定化**：Python 的 `_assigned` 是 `set`（遍历序不稳定），这里用
-//!    `BTreeMap<key, MessageQueue>`，后台拉取按「topic+brokerName+queueId」轮转；
-//!    同时重平衡前对 `mqAll`/`cidAll` 排序（与 Java
-//!    `RebalanceImpl#rebalanceByTopic` 和本项目推送消费者一致，Python 的 lite 路径
-//!    漏了这一步 —— 单实例看不出来，多实例会因顺序不同算出不同分配）。
-//!
-//! # 与 Java 5.5.1 的有意偏离
-//!
-//! 1. **`pull()` 不做客户端二次 tag 过滤**。Java
-//!    `DefaultMQPullConsumerImpl#pullSyncImpl` 会把 `FilterAPI.buildSubscriptionData`
-//!    造出的 `subscriptionData` 交给 `PullAPIWrapper#processPullResult`，后者在
-//!    `!tagsSet.isEmpty()` 时按字符串再筛一遍（:112-121）。Python/cpp/csharp 三版
-//!    都只跑过滤钩子（`consumer.py:2095-2106` 的注释把这件事说成 Java 行为，其实
-//!    不成立）。差别只在 broker 侧 tag **哈希**碰撞时才会显现（碰撞消息 Java 丢、
-//!    本版留），这里保持与四门语言一致的口径，不改行为、只在此处记账。
-//! 2. **不做 Java 的 `subscriptionAutomatically`**。Java 的拉取消费者会
-//!    `registerConsumer` 进 `MQClientInstance`（`DefaultMQPullConsumerImpl:746`），
-//!    由实例的心跳周期任务发出消费组心跳；本移植的实例心跳任务只遍历
-//!    `consumer_table`（推送消费者专属，拉模式消费者接不了 broker 的 220/221/307/309
-//!    反向请求），所以**改由消费者自己起心跳循环**（与 Python/C++/C# 四版同构，
-//!    #98 补的缺口）：`start()` 刷一遍 registerTopics 的路由，
-//!    同步发一轮 `consumeType=CONSUME_ACTIVELY` 的 ConsumerData，之后按
-//!    `heartbeat_broker_interval_millis` 周期重发；`shutdown()` 发 35 注销。
-//!    [`DefaultMQPullConsumer::register_topics`] 就是这份心跳的订阅集来源
-//!    （Java `subscriptions():357-385`）。
-//! 3. **`message_queue_lists` 字段不移植**：Python/cpp/csharp 里都是纯声明、零读写的
-//!    死字段（Java 也只有配合 `AllocateMessageQueueByConfig` 才用），不搬进 Rust。
-//! 4. **消息回投失败会抛**：Java `DefaultMQPullConsumerImpl:666` 在回投失败时吞掉异常、
-//!    改用内部生产者把消息直接发进 `%RETRY%group`；本实现按 Python 同口径直接返回错误
-//!    （见 [`DefaultMQPullConsumer::send_message_back`]）。
-//! 5. **`MessageQueueListener` 按 Java 签名回调**：Python 的重平衡用两个实参调
-//!    三参方法（`consumer.py:2705`），异常被外层 `except Exception: pass` 吞掉 ⇒
-//!    监听器在 Python 里**从未真正触发过**；cpp 传的是「全部订阅队列 + 新分配」两参。
-//!    这里回调 `(topic, mqAll, mqDivided)`（Java `RebalanceImpl#messageQueueChanged`），
-//!    与本项目已有的 trait 形状一致。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
@@ -112,12 +72,8 @@ const LITE_REBALANCE_INTERVAL_MILLIS: i64 = 1_000;
 pub const MAX_POLL_BATCH_SIZE: usize = 1024;
 /// Python lite 心跳的 RPC 超时同上，此处仅为可读性命名。
 const LITE_PULL_RPC_TIMEOUT_MILLIS: i64 = 5_000;
-/// Java `startScheduleTask` 的首查延迟（`scheduleAtFixedRate(.., 1000 * 10, period)`）。
 const LITE_METADATA_FIRST_DELAY_MILLIS: u64 = 10_000;
 
-/// Python 经典拉模式消费者的心跳循环间隔（`consumer.heartbeat_interval_millis`，
-/// `consumer.py:870`，默认 30000ms；与 Java 实例级 `sendHeartbeatToAllBrokerWithLock`
-/// 的 30s 同量级）。
 pub const DEFAULT_HEARTBEAT_BROKER_INTERVAL_MILLIS: u64 = 30_000;
 /// 经典拉模式消费者的心跳 RPC 超时（与 lite 的 5000ms、C++/C# 同口径）。
 const PULL_HEARTBEAT_TIMEOUT_MILLIS: i64 = 5_000;
@@ -142,8 +98,6 @@ async fn wait_or_stop(rx: &mut watch::Receiver<bool>, millis: u64) -> bool {
     }
 }
 
-/// Python `_with_namespace`：lite 版用裸 `ns + "%" + topic`，这里统一走
-/// [`NamespaceUtil::wrap_namespace`]（Java 口径：system topic 与已带前缀的不重复拼）。
 fn with_namespace(namespace: &str, topic: &str) -> String {
     if namespace.is_empty() {
         topic.to_string()
@@ -152,9 +106,6 @@ fn with_namespace(namespace: &str, topic: &str) -> String {
     }
 }
 
-/// 队列集合相等判定，对应 Java
-/// `DefaultLitePullConsumerImpl#isSetEqual:1246-1260`：先比数量，再逐个元素查旧集。
-/// 队列身份用 [`mq_key`]（`topic+brokerName+queueId`），与本文件其余表同口径。
 fn same_queue_set(old: &[MessageQueue], new: &[MessageQueue]) -> bool {
     if old.len() != new.len() {
         return false;
@@ -173,12 +124,6 @@ fn pull_sys_flag(block: bool) -> i32 {
     PullSysFlag::build_sys_flag_basic(false, block, true, false)
 }
 
-/// lite pull 的 sysFlag：Java `DefaultLitePullConsumerImpl#pullSyncImpl:1058` 的
-/// `buildSysFlag(false, block, true, false, /*litePull=*/true)` —— 比经典拉取多一个
-/// `FLAG_LITE_PULL_MESSAGE(0x10)`，客户端 API 层（`MQClientAPIImpl#pullMessage:816-820`）
-/// 据此把请求码切成 `LITE_PULL_MESSAGE(361)`，broker 侧只对 361 施加
-/// `litePullMessageEnable` 开关（`PullMessageProcessor:325`）。
-///
 /// ⚠ 不要并进 [`pull_sys_flag`]：那条是经典拉取的（:795/:842），多这一位会让普通消费者
 /// 也撞上 lite 开关。
 fn lite_pull_sys_flag() -> i32 {
@@ -199,32 +144,16 @@ pub struct PullConsumerConfig {
     pub instance_name: String,
     /// Python `client_id`；`None` 时 `start()` 现造。
     pub client_id: Option<String>,
-    /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
-    /// 并作为地址服务器 URL 的 `-<unitName>` 段。
     pub unit_name: Option<String>,
-    /// Java `ClientConfig#namespaceV2`（默认 null）：5.x **服务端**命名空间，
-    /// 非空时每个请求带 `nsd=true` / `ns=<namespaceV2>` 扩展头（`NamespaceRpcHook`），
-    /// 与 v1 `namespace` 的客户端 `%` 前缀机制是两套东西。
     pub namespace_v2: Option<String>,
-    /// Java `ClientConfig#unitMode`（默认 false）：随回投/鉴权/消息过滤上线。
     pub unit_mode: bool,
-    /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
-    /// clientId 末尾多一段 `@STREAM`。
-    ///
-    /// ⚠ 拉模式默认 **true**：Java `DefaultMQPullConsumer` / `DefaultLitePullConsumer`
-    /// 的每个构造函数都置 `enableStreamRequestType = true`（:113/:126 与 :213/:228），
-    /// 只有推送消费者和生产者默认 false。
     pub enable_stream_request_type: bool,
-    /// Java `ClientConfig#pollNameServerInterval`（默认 30000ms）：在用 topic 的
-    /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`。
     pub poll_name_server_interval_millis: u64,
     /// Python `name_server_addrs`。
     pub name_server_addrs: Vec<String>,
     /// Python `tls_enable`：`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`
     /// （Python 的拉取消费者没这个属性，这里与推送消费者统一）。
     pub tls_enable: Option<bool>,
-    /// SOCKS 代理（对齐 Java `ClientConfig#socksProxyConfig`：addr / username /
-    /// password 三字段，见 [`SocksProxyConfig`]）。`None` = 直连（默认）。
     pub socks_proxy: Option<SocksProxyConfig>,
     /// Python `message_model`；拉模式只影响 `subscriptionAutomatically`
     /// （本移植版不做注册，见模块头偏离 2），其余行为与它无关。
@@ -252,7 +181,6 @@ impl Default for PullConsumerConfig {
             namespace_v2: None,
             unit_mode: false,
             enable_stream_request_type: true,
-            // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
             poll_name_server_interval_millis: 30_000,
             client_id: None,
             name_server_addrs: Vec::new(),
@@ -283,13 +211,8 @@ struct PullInner {
     filter_hooks: FilterMessageHookList,
     register_topics: Mutex<BTreeSet<String>>,
     listener: Mutex<Option<Arc<dyn MessageQueueListener>>>,
-    /// 对应 Java `DefaultMQPullConsumer.allocateMessageQueueStrategy` 的字段初值
-    /// （`new AllocateMessageQueueAveragely()`:89）。本端口拉模式不做 rebalance
-    /// （见模块头偏离 2），所以它只是配置形状，与 Python/C++/C# 同口径。
     strategy: RwLock<Arc<dyn AllocateMessageQueueStrategy>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
-    /// Java `PullAPIWrapper.pullFromWhichNodeTable`：每次拉取回写响应头里的
-    /// `suggestWhichBrokerId`，下次拉取按它选主/从。
     pull_from_which_node: Mutex<HashMap<MessageQueue, i64>>,
 }
 
@@ -325,9 +248,6 @@ impl Drop for PullInner {
     }
 }
 
-/// 拉模式消费者（对应 Java `DefaultMQPullConsumer` + `DefaultMQPullConsumerImpl`，
-/// 移植自 Python `consumer.DefaultMQPullConsumer`）。
-///
 /// 用法：`start()` → `fetch_subscribe_message_queues(topic)` 拿队列 → 逐队列
 /// `pull(mq, expr, offset, maxNums)` → 自己 `update_consume_offset` 提交 →
 /// `shutdown()`。克隆出的副本共享同一份状态。
@@ -412,7 +332,6 @@ impl DefaultMQPullConsumer {
             .unwrap_or_default()
     }
 
-    /// Java `ClientConfig#isUnitMode()`（回投/过滤等请求都取这一个值）。
     pub fn unit_mode(&self) -> bool {
         read_cfg(&self.inner.cfg).unit_mode
     }
@@ -441,49 +360,36 @@ impl DefaultMQPullConsumer {
         self.update_config(|c| c.instance_name = name);
     }
 
-    /// Java `ClientConfig#setUnitName`：`None`/空白等价于不设（拼 clientId 时按 isBlank 判）。
     pub fn set_unit_name(&self, unit_name: Option<&str>) {
         let unit_name = unit_name.map(str::to_string);
         self.update_config(|c| c.unit_name = unit_name);
     }
 
-    /// Java `ClientConfig#setNamespaceV2`：5.x **服务端**命名空间（`ns`/`nsd`
-    /// 扩展头，见 `NamespaceRpcHook`）。`None`/空串 = 不设，钩子退化为 no-op。
-    /// `start()` 时透传给 `MQClientInstance`，晚于 start 修改不影响已建实例。
     pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
         let namespace_v2 = namespace_v2.map(str::to_string);
         self.update_config(|c| c.namespace_v2 = namespace_v2);
     }
 
-    /// Java `ClientConfig#getNamespaceV2`。
     pub fn get_namespace_v2(&self) -> Option<String> {
         self.config().namespace_v2
     }
 
-    /// Java `ClientConfig#setSocksProxyConfig`：SOCKS 代理（addr / username /
-    /// password，见 [`SocksProxyConfig`]）。`None` = 直连。`start()` 时透传给
-    /// `MQClientInstance` → 传输层，晚于 start 修改不影响已建实例。
-    /// 代理地址可带 `socks5://`（缺省）/ `socks4://` 前缀选协议版本。
     pub fn set_socks_proxy(&self, socks_proxy: Option<SocksProxyConfig>) {
         self.update_config(|c| c.socks_proxy = socks_proxy);
     }
 
-    /// Java `ClientConfig#getSocksProxyConfig`。
     pub fn get_socks_proxy(&self) -> Option<SocksProxyConfig> {
         self.config().socks_proxy
     }
 
-    /// Java `ClientConfig#setUnitMode`。
     pub fn set_unit_mode(&self, unit_mode: bool) {
         self.update_config(|c| c.unit_mode = unit_mode);
     }
 
-    /// Java `ClientConfig#setEnableStreamRequestType`。
     pub fn set_enable_stream_request_type(&self, enable: bool) {
         self.update_config(|c| c.enable_stream_request_type = enable);
     }
 
-    /// Java `ClientConfig#setPollNameServerInterval`。
     pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
         self.update_config(|c| c.poll_name_server_interval_millis = millis);
     }
@@ -513,11 +419,6 @@ impl DefaultMQPullConsumer {
         *lock(&self.inner.listener) = Some(listener);
     }
 
-    /// 队列分配策略，对应 Java `DefaultMQPullConsumer` 的 getter/setter(:196-202)。
-    ///
-    /// ⚠ Java 的 checkConfig(:803) 会拒绝 null 策略；Rust 用 `Arc<dyn ...>` 表达
-    /// 「一定有策略」，那个分支类型上不可表示，故无对应校验。本端口拉模式不做
-    /// rebalance（见模块头偏离 2），策略只作为配置形状保留。
     pub fn set_allocate_message_queue_strategy(
         &self,
         strategy: Arc<dyn AllocateMessageQueueStrategy>,
@@ -529,7 +430,6 @@ impl DefaultMQPullConsumer {
             .unwrap_or_else(|e| e.into_inner()) = strategy;
     }
 
-    /// 当前队列分配策略（对应 Java `getAllocateMessageQueueStrategy`）。
     pub fn allocate_message_queue_strategy(&self) -> Arc<dyn AllocateMessageQueueStrategy> {
         self.inner
             .strategy
@@ -538,13 +438,10 @@ impl DefaultMQPullConsumer {
             .clone()
     }
 
-    /// Java `DefaultMQPullConsumer#registerTopic`：拼命名空间后登记
-    /// （也是心跳订阅集的来源，见模块头偏离 2）。
     pub fn register_topics(&self) -> Vec<String> {
         lock(&self.inner.register_topics).iter().cloned().collect()
     }
 
-    /// Java `DefaultMQPullConsumer#registerTopic`：拼命名空间后登记。
     pub fn register_topic(&self, topic: &str) {
         let topic = with_namespace(&self.config().namespace, topic);
         lock(&self.inner.register_topics).insert(topic);
@@ -562,8 +459,6 @@ impl DefaultMQPullConsumer {
         self.inner.filter_hooks.has_hooks()
     }
 
-    /// Python `_filter_messages_for_delivery`：拉模式只跑钩子，不做客户端 tag
-    /// 过滤（Java 会，见模块头偏离 1）。
     fn filter_messages_for_delivery(
         &self,
         mq: &MessageQueue,
@@ -583,11 +478,6 @@ impl DefaultMQPullConsumer {
     // ---------------- 生命周期 ----------------
 
     /// Python `start()`：幂等、必须有 name server，`client_id` 缺省时现造。
-    ///
-    /// ⚠ `client_id` 的时间戳是**秒级** `instanceName@yyyyMMddHHmmss`
-    /// （`consumer.py:2134`），与推送消费者同格式；同一秒内起两个实例会撞 clientId，
-    /// 那时 [`MQClientInstance::create_mq_client_instance`] 会复用同一实例 —— 与
-    /// Python/Java 同语义（Java 靠 `changeInstanceNameToPID` 规避，本项目四版都没做）。
     pub async fn start(&self) -> Result<()> {
         if self
             .inner
@@ -598,9 +488,6 @@ impl DefaultMQPullConsumer {
             return Ok(());
         }
         let cfg = self.config();
-        // 对应 Java DefaultMQPullConsumerImpl.checkConfig(:772)：组名合法性（blank / 120
-        // 长度 / 字符表）+ 挡掉 DEFAULT_CONSUMER（共用默认组会混掉订阅关系与位点）。
-        // 纯本地校验，排在地址检查之前，失败不碰网络。
         if let Err(e) = validators::check_group(&cfg.consumer_group) {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
@@ -615,9 +502,6 @@ impl DefaultMQPullConsumer {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
         }
-        // Java `DefaultMQPullConsumerImpl#start`:712 / `DefaultLitePullConsumerImpl#start`:288：
-        // CLUSTERING 才改写 instanceName，clientId 口径是 `ClientConfig#buildMQClientId`
-        // 的 `<本机 IP>@<instanceName>`。
         let instance_name = MixAll::instance_name_for_model(
             &cfg.instance_name,
             cfg.message_model == MessageModel::CLUSTERING,
@@ -668,16 +552,8 @@ impl DefaultMQPullConsumer {
                 self.update_config(|c| c.name_server_addrs = addrs);
             }
         }
-        // Java `DefaultMQPullConsumerImpl#start`:746 `registerConsumer`：拉模式消费者
-        // 接不了 broker 的反向请求（220/221/307/309），所以只登记组名给实例的关闭
-        // 守卫用，不进 `consumer_table`（实例心跳任务因此看不见本组，心跳由本消费者
-        // 自己的循环发，见模块头偏离 2）。
         client.register_consumer_group(&cfg.consumer_group);
         *lock(&self.inner.client) = Some(client);
-        // 心跳：先刷 registerTopics 的路由（心跳只发给路由表里已知的 broker，没有
-        // 地址就发 0 份），再同步发一轮让 broker 立刻认识本组，最后交给后台循环 ——
-        // 顺序对齐 Python/C++/C# 的拉模式消费者（也贴合 Java 的
-        // registerConsumer:746 → mQClientFactory.start():755 首个心跳周期在 1s 内）。
         self.refresh_route_for_heartbeat().await;
         self.inner.running.store(true, Ordering::Release);
         let _ = self.inner.stop.send(false);
@@ -689,15 +565,6 @@ impl DefaultMQPullConsumer {
     }
 
     /// Python `shutdown()`；未启动时是 no-op。
-    ///
-    /// 收尾三步（对齐 Java `DefaultMQPullConsumerImpl.shutdown:689-692`：
-    /// `unregisterConsumer` → `mQClientFactory.shutdown()`，中间补 Python/C++/C#
-    /// 都有的 35 号注销）：停心跳 → 逐台 broker 发 UNREGISTER_CLIENT(35) → 摘组 → 关实例。
-    /// 35 让 broker 的 ConsumerManager 立刻摘掉本组，不必等 ~120s 通道扫描
-    /// （Java `MQClientInstance#unregisterClient`，`DefaultMQPullConsumerImpl:691` 走同一入口）。
-    /// 35 与关实例挂在运行时上跑，但本方法**阻塞等它落地**（上限
-    /// [`SHUTDOWN_FINALIZE_BUDGET`]）；current_thread 运行时里退化为游离任务并告警
-    /// （见 [`run_finalize_blocking`] 的情形 2/3）。
     pub fn shutdown(&self) {
         if self
             .inner
@@ -775,11 +642,6 @@ impl DefaultMQPullConsumer {
     /// Python `_refresh_route_for_heartbeat`（同 lite 版）：心跳只发给「路由表里已知的
     /// broker」，自建实例刚 start 时路由表是空的。先把 registerTopics 的路由拉一遍并
     /// 登记为在用，start() 里那次同步心跳才真正到达 broker。
-    ///
-    /// Java 侧这条链路是间接的：`DefaultMQPullConsumerImpl.subscriptions()` 返回
-    /// registerTopics 构的订阅集 → 实例的 `updateTopicRouteInfoFromNameServer` 周期任务
-    /// 据此刷路由 → `brokerAddrTable` 有地址 → 心跳发得出去。本移植的实例心跳任务
-    /// 不看拉模式组（见模块头偏离 2），所以这里显式刷一遍。
     async fn refresh_route_for_heartbeat(&self) {
         let Ok(client) = self.require_client() else {
             return;
@@ -828,8 +690,6 @@ impl DefaultMQPullConsumer {
 
     /// Python `fetch_subscribe_message_queues`：按**订阅信息**列队列。
     ///
-    /// Java `DefaultMQPullConsumerImpl:142` 与 push 同源，读的是订阅信息
-    /// （读位 + readQueueNums、不筛 master），不是发布信息。
     ///
     /// ⚠ 与 lite 版不同，这里**不拼命名空间**（`consumer.py` 直接把入参
     /// topic 传给路由查询），与 Python 保持逐字一致。
@@ -839,24 +699,8 @@ impl DefaultMQPullConsumer {
         Ok(client.get_topic_subscribe_info(topic).await)
     }
 
-    /// Python `fetch_message_queues_in_balance`：本实例「平衡后」应负责的队列
-    /// （Java `MQPullConsumer:187`，官方 `example/simple/PullConsumer.java:62` 就靠它
-    /// 决定去拉哪些队列）。
-    ///
-    /// Java（`DefaultMQPullConsumerImpl:120-135`）读的是后台 rebalance 填出来的
-    /// `processQueueTable`；本端口拉模式没有那条后台线程（见模块头偏离说明），所以按
-    /// `RebalanceImpl.rebalanceByTopic` 的**同一条公式**当场算：BROADCASTING 全量；
-    /// CLUSTERING 用订阅信息（读位口径，与 [`Self::fetch_subscribe_message_queues`] 同源）
-    /// 作 mqAll、GET_CONSUMER_LIST_BY_GROUP(38) 作 cidAll，再交给本实例配置的分配策略取
-    /// 自己那一份。公式与 push 消费者的 rebalance 共用一份口径，两处一旦分叉，同一队列
-    /// 会被两个实例同时认领。
-    ///
-    /// 查不到路由/消费者列表时**保留现有分配**：退回本地 `pull_from_which_node`
-    /// （Java 同名表 `pullFromWhichNodeTable`）的键集。绝不回退成「独占全部队列」——
-    /// 那会让同组多实例互相重复消费。注意「算出来确实是空」（队列全分给了同组别人）
-    /// 与「算不动」是两回事，前者如实返回空集（Java 的表里那时就是空的）。
     pub async fn fetch_message_queues_in_balance(&self, topic: &str) -> Result<Vec<MessageQueue>> {
-        let client = self.require_client()?; // Java isRunning()：未启动直接报错
+        let client = self.require_client()?;
         let cfg = self.config();
         let mut pulled: Vec<MessageQueue> = lock(&self.inner.pull_from_which_node)
             .keys()
@@ -866,7 +710,6 @@ impl DefaultMQPullConsumer {
         sort_mqs(&mut pulled);
 
         if cfg.message_model == MessageModel::BROADCASTING {
-            // Java rebalanceByTopic 对 BROADCASTING 不查消费者列表、全量分配。
             let mut all = client.get_topic_subscribe_info(topic).await;
             if all.is_empty() {
                 return Ok(pulled);
@@ -876,8 +719,6 @@ impl DefaultMQPullConsumer {
         }
 
         let mut mq_all = client.get_topic_subscribe_info(topic).await;
-        // Java :128-131 逐个比对表键的 topic；别让策略的意外返回值把别的 topic
-        // 混进调用方的拉取循环。
         mq_all.retain(|mq| mq.topic == topic);
         sort_mqs(&mut mq_all);
         let cid_all = client
@@ -889,8 +730,6 @@ impl DefaultMQPullConsumer {
             if let Some(cids) = cid_all.filter(|c| !c.is_empty()) {
                 let mut sorted_cids = cids;
                 sorted_cids.sort();
-                // 对应 Java RebalanceImpl.rebalanceByTopic 的 catch (Throwable)：策略异常
-                // 只记日志、本轮保持现有分配，绝不能把队列撤走。
                 match self.allocate_message_queue_strategy().allocate(
                     &cfg.consumer_group,
                     cfg.client_id.as_deref().unwrap_or(""),
@@ -945,7 +784,6 @@ impl DefaultMQPullConsumer {
                 pull_sys_flag(false),
                 0,
                 sub_expression_of(&sub),
-                // Java：TAG 类型时 subVersion 传 0（`isTagType ? 0L : subVersion`）
                 0,
                 ExpressionType::TAG,
                 timeout,
@@ -1024,8 +862,6 @@ impl DefaultMQPullConsumer {
 
     // ---------------- 位点管理 ----------------
 
-    /// Python `fetch_consume_offset`：broker 无记录 ⇒ `None`
-    /// （`set_zero_if_not_found=false`，与 Java `queryConsumerOffset` 的默认一致）。
     pub async fn fetch_consume_offset(&self, mq: &MessageQueue) -> Result<Option<i64>> {
         let client = self.require_client()?;
         let group = self.consumer_group();
@@ -1068,10 +904,6 @@ impl DefaultMQPullConsumer {
     }
 
     /// Python `earliest_msg_store_time`（GET_EARLIEST_MSG_STORETIME=32）。
-    ///
-    /// Python 把这条 RPC 内联在消费者里，这里走
-    /// [`MQClientInstance::get_earliest_msg_store_time`]（Java 放在
-    /// `MQClientAPIImpl`，与其它 offset RPC 同一层）。
     pub async fn earliest_msg_store_time(&self, mq: &MessageQueue) -> Result<i64> {
         let client = self.require_client()?;
         client
@@ -1079,19 +911,6 @@ impl DefaultMQPullConsumer {
             .await
     }
 
-    /// 消息回投（Python `send_message_back`，Java `sendMessageBack`）。
-    ///
-    /// 两个真机踩过的点，照 Python 的注释：
-    /// 1. 地址靠 `find_broker_address_in_publish(msg.broker_name)` 反查**发布地址表**
-    ///    （只认 master），所以调用方必须先用本 consumer 访问过该 topic
-    ///    （Java DefaultMQPullConsumerImpl:654 走的也是 findBrokerAddressInPublish）。
-    /// 2. 与 Java 的有意差异：Java 失败时吞异常、改由内部生产者把消息直接发进
-    ///    `%RETRY%group`；这里直接返回错误，不换路径静默重发（模块头偏离 4）。
-    ///
-    /// `max_reconsume_times` 不下发（`None`）：让 broker 按订阅组的 `retryMaxTimes`
-    /// 判定重试上限，超限才转 `%DLQ%`。Python 在这里传 `-1`，但它自己的注释说的是
-    /// 「交给 broker 决定」——真按 Java 拉模式把 -1 带上，broker 会无条件采纳并让消息
-    /// 直接进 `%DLQ%`（详见 [`MQClientInstance::consumer_send_msg_back`]）。
     pub async fn send_message_back(&self, msg: &MessageExt, delay_level: i32) -> Result<()> {
         let client = self.require_client()?;
         let group = self.consumer_group();
@@ -1113,10 +932,6 @@ impl DefaultMQPullConsumer {
             .await
     }
 
-    /// Python `create_topic`（Java `MQAdminImpl.createTopic`）。
-    ///
-    /// Java 的第 1 个参数 `key`（clusterName / brokerAddr）Python 收了不用；本移植版
-    /// 干脆不收，语义 = 对默认路由里的**所有 master** 建 topic（与 Python 一致）。
     pub async fn create_topic(
         &self,
         new_topic: &str,
@@ -1158,17 +973,6 @@ fn split_addrs(addr: &str) -> Vec<String> {
 
 /// Python `DefaultMQPullConsumer._build_heartbeat`（`consumer.py:1649-1676`）：
 /// 拉模式消费者组的一份 ConsumerData。
-///
-/// Java 依据（`MQClientInstance#prepareHeartbeatData:1031-1045` 为拉模式组出来的那一份）：
-/// * `consumeType()` 恒为 `CONSUME_ACTIVELY`（`DefaultMQPullConsumerImpl:348`）、
-///   `consumeFromWhere()` 恒为 `CONSUME_FROM_LAST_OFFSET`（:353）—— 与推送消费者
-///   的 PASSIVELY 是两个口径，broker 侧两项都不是摆设：`consumerConnection`
-///   （`AdminBrokerProcessor:1971`）按 consumeType 显示消费类型；开了
-///   `rejectPullConsumerEnabled` 的 broker 会跳过非 ACTIVELY 的拉模式组
-///   （`PullMessageProcessor:493-505` 回 `SUBSCRIPTION_NOT_EXIST`）。
-/// * 订阅集取 `subscriptions():357-385`：逐条 `buildSubscriptionData(topic, "*")`，
-///   并显式把 **subVersion 置 0**（Java `ms.setSubVersion(0L)`）—— 拉模式没有
-///   "订阅版本"语义，带上当前时间戳会让 broker 每次心跳都认为订阅变了。
 fn build_pull_heartbeat(inner: &PullInner) -> HeartbeatData {
     let cfg = read_cfg(&inner.cfg);
     let mut hb = HeartbeatData::new(cfg.client_id.clone().unwrap_or_default());
@@ -1181,8 +985,6 @@ fn build_pull_heartbeat(inner: &PullInner) -> HeartbeatData {
     cd.unit_mode = cfg.unit_mode;
     for topic in lock(&inner.register_topics).iter() {
         if let Ok(mut sub) = FilterAPI::build_subscription_data(topic, Some(FilterAPI::SUB_ALL)) {
-            // ⚠ SubscriptionData::new 的 sub_version 是 now_millis()（推送/lite 口径），
-            // 拉模式这里必须显式清零，见上面 Java `ms.setSubVersion(0L)`。
             sub.sub_version = 0;
             cd.add_subscription_data(sub);
         }
@@ -1193,10 +995,6 @@ fn build_pull_heartbeat(inner: &PullInner) -> HeartbeatData {
 
 /// Python `_send_heartbeat_to_all_broker`：向所有已知 broker（含从节点）发一次本组
 /// 心跳，返回成功台数。
-///
-/// 收件人取 `get_all_broker_addrs`，理由与 lite 版一致（Java
-/// `sendHeartbeatToAllBroker`:732-750 只对 `consumerEmpty` 跳从节点；本心跳带
-/// ConsumerData，故不跳）。
 async fn send_pull_heartbeat(inner: &PullInner) -> usize {
     let Some(client) = lock(&inner.client).clone() else {
         return 0;
@@ -1250,24 +1048,10 @@ pub struct LitePullConsumerConfig {
     pub instance_name: String,
     /// Python `client_id`；`None` 时 `start()` 现造。
     pub client_id: Option<String>,
-    /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
-    /// 并作为地址服务器 URL 的 `-<unitName>` 段。
     pub unit_name: Option<String>,
-    /// Java `ClientConfig#namespaceV2`（默认 null）：5.x **服务端**命名空间，
-    /// 非空时每个请求带 `nsd=true` / `ns=<namespaceV2>` 扩展头（`NamespaceRpcHook`），
-    /// 与 v1 `namespace` 的客户端 `%` 前缀机制是两套东西。
     pub namespace_v2: Option<String>,
-    /// Java `ClientConfig#unitMode`（默认 false）：随回投/鉴权/消息过滤上线。
     pub unit_mode: bool,
-    /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
-    /// clientId 末尾多一段 `@STREAM`。
-    ///
-    /// ⚠ 拉模式默认 **true**：Java `DefaultMQPullConsumer` / `DefaultLitePullConsumer`
-    /// 的每个构造函数都置 `enableStreamRequestType = true`（:113/:126 与 :213/:228），
-    /// 只有推送消费者和生产者默认 false。
     pub enable_stream_request_type: bool,
-    /// Java `ClientConfig#pollNameServerInterval`（默认 30000ms）：在用 topic 的
-    /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`。
     pub poll_name_server_interval_millis: u64,
     /// Python `name_server_addrs`。
     pub name_server_addrs: Vec<String>,
@@ -1279,9 +1063,6 @@ pub struct LitePullConsumerConfig {
     pub message_model: String,
     /// Python `consume_from_where`：仅影响**首次**位点解析。
     pub consume_from_where: String,
-    /// Python `consume_timestamp`：14 位**本地墙钟** `yyyyMMddHHmmss`，
-    /// 默认 now-30min（Java `DefaultLitePullConsumer:168`）。只有
-    /// `CONSUME_FROM_TIMESTAMP` 会读它，但 start 时无条件校验格式。
     pub consume_timestamp: String,
     /// Python `pull_batch_size` = 32（ setter 里 `max(1, n)`）。
     pub pull_batch_size: i32,
@@ -1301,9 +1082,6 @@ pub struct LitePullConsumerConfig {
     /// Python `pull_thread_nums` = 1：**本实现恒为单拉取循环**（与四门语言一致），
     /// 字段只为配置形状保留。
     pub pull_thread_nums: i32,
-    /// Java `DefaultLitePullConsumer.topicMetadataCheckIntervalMillis`（:160，默认 30s）：
-    /// 后台比对 [`register_topic_message_queue_change_listener`] 注册 topic 的队列集合的周期。
-    ///
     /// [`register_topic_message_queue_change_listener`]: DefaultLitePullConsumer::register_topic_message_queue_change_listener
     pub topic_metadata_check_interval_millis: i64,
 }
@@ -1318,7 +1096,6 @@ impl Default for LitePullConsumerConfig {
             namespace_v2: None,
             unit_mode: false,
             enable_stream_request_type: true,
-            // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
             poll_name_server_interval_millis: 30_000,
             client_id: None,
             name_server_addrs: Vec::new(),
@@ -1340,9 +1117,6 @@ impl Default for LitePullConsumerConfig {
     }
 }
 
-/// Python 里由 `_lock` 保护的那几张表（键统一是 [`mq_key`] 那串
-/// `topic+brokerName+queueId`，与推送消费者同口径）。
-/// `Default` 手写：截止时刻的初值必须是 -1（Java 同值），不能是 0。
 struct LiteState {
     /// Python `subscription: Dict[topic, sub_expression]`（subscribe 模式）。
     subscription: BTreeMap<String, String>,
@@ -1354,19 +1128,11 @@ struct LiteState {
     assign_mode: bool,
     /// Python `_assigned`：当前分配（有序，见模块头差异 2）。
     assigned: BTreeMap<String, MessageQueue>,
-    /// Python `_next_offset`：**拉取游标**（Java `MessageQueueState.pullOffset`）。
-    /// 只回答"下一次从哪拉"，**绝不**是提交内容。
     next_offset: BTreeMap<String, i64>,
-    /// Python `_consume_offset`：**已消费游标**（Java `MessageQueueState.consumeOffset`）。
-    /// 只有 `poll()` 把消息交到调用方手上才前进，本地缓冲里压着的部分不算已消费。
     consume_offset: BTreeMap<String, i64>,
-    /// Python `_offset_table`：提交落点，对位 Java
-    /// `RemoteBrokerOffsetStore.offsetTable`（内存位点表；`persist=False` 的值就在这张表里）。
     offset_table: BTreeMap<String, i64>,
     /// Python `_seek_offset`：`seek()` 钉住的位点，优先于 `consume_from_where`。
     seek_offset: BTreeMap<String, i64>,
-    /// Python `_next_auto_commit_deadline`：全局自动提交截止时刻，初值 -1 ⇒ 第一次检查就提交
-    /// （Java `DefaultLitePullConsumerImpl.nextAutoCommitDeadline`）。
     next_auto_commit_deadline: i64,
     /// Python `_paused`。
     paused: BTreeSet<String>,
@@ -1386,7 +1152,6 @@ impl Default for LiteState {
             consume_offset: BTreeMap::new(),
             offset_table: BTreeMap::new(),
             seek_offset: BTreeMap::new(),
-            // Java 的初值是 -1 而不是 0：0 是 epoch 起点，等价于"永远不到点"。
             next_auto_commit_deadline: -1,
             paused: BTreeSet::new(),
             last_rebalance_ts: 0,
@@ -1409,9 +1174,6 @@ struct LiteInner {
     /// Python `_local_buffer` + `_buffer_cond`。
     buffer: Mutex<VecDeque<MessageExt>>,
     buffer_signal: Notify,
-    /// Java `DefaultLitePullConsumerImpl:144` topicMessageQueueChangeListenerMap +
-    /// `:146` messageQueuesForTopic：监听器按 topic 键存放，快照表记录上一轮报出去的
-    /// 队列集合（键集变化才回调）。
     topic_listeners: Mutex<BTreeMap<String, Arc<dyn TopicMessageQueueChangeListener>>>,
     queues_for_topic: Mutex<BTreeMap<String, Vec<MessageQueue>>>,
 }
@@ -1450,19 +1212,10 @@ impl Drop for LiteInner {
     }
 }
 
-/// 对应 Java `consumer.TopicMessageQueueChangeListener`：topic 的队列**集合**相对
-/// 上一次快照有变化时才回调（扩/缩容场景）。Java 的
-/// `DefaultLitePullConsumerImpl#fetchTopicMessageQueuesAndCompare:1230` 每
-/// `topicMetadataCheckIntervalMillis` 比对一次，本端口同款。
 pub trait TopicMessageQueueChangeListener: Send + Sync {
-    /// Java `onChanged(String topic, Set<MessageQueue>)`。`topic` 就是注册监听器时
-    /// 用的那个键（Java `DefaultLitePullConsumer:327` 在入口就 `withNamespace`）。
     fn on_changed(&self, topic: &str, message_queues: &[MessageQueue]);
 }
 
-/// 轻量拉取消费者（对应 Java `DefaultLitePullConsumer`，移植自 Python
-/// `consumer.DefaultLitePullConsumer`）。
-///
 /// 两种模式：
 /// * **subscribe**：`subscribe(topic, expr)` → 后台按 [`AllocateMessageQueueStrategy`]
 ///   重平衡 → 后台拉取；
@@ -1605,49 +1358,36 @@ impl DefaultLitePullConsumer {
         self.update_config(|c| c.instance_name = name);
     }
 
-    /// Java `ClientConfig#setUnitName`：`None`/空白等价于不设（拼 clientId 时按 isBlank 判）。
     pub fn set_unit_name(&self, unit_name: Option<&str>) {
         let unit_name = unit_name.map(str::to_string);
         self.update_config(|c| c.unit_name = unit_name);
     }
 
-    /// Java `ClientConfig#setNamespaceV2`：5.x **服务端**命名空间（`ns`/`nsd`
-    /// 扩展头，见 `NamespaceRpcHook`）。`None`/空串 = 不设，钩子退化为 no-op。
-    /// `start()` 时透传给 `MQClientInstance`，晚于 start 修改不影响已建实例。
     pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
         let namespace_v2 = namespace_v2.map(str::to_string);
         self.update_config(|c| c.namespace_v2 = namespace_v2);
     }
 
-    /// Java `ClientConfig#getNamespaceV2`。
     pub fn get_namespace_v2(&self) -> Option<String> {
         self.config().namespace_v2
     }
 
-    /// Java `ClientConfig#setSocksProxyConfig`：SOCKS 代理（addr / username /
-    /// password，见 [`SocksProxyConfig`]）。`None` = 直连。`start()` 时透传给
-    /// `MQClientInstance` → 传输层，晚于 start 修改不影响已建实例。
-    /// 代理地址可带 `socks5://`（缺省）/ `socks4://` 前缀选协议版本。
     pub fn set_socks_proxy(&self, socks_proxy: Option<SocksProxyConfig>) {
         self.update_config(|c| c.socks_proxy = socks_proxy);
     }
 
-    /// Java `ClientConfig#getSocksProxyConfig`。
     pub fn get_socks_proxy(&self) -> Option<SocksProxyConfig> {
         self.config().socks_proxy
     }
 
-    /// Java `ClientConfig#setUnitMode`。
     pub fn set_unit_mode(&self, unit_mode: bool) {
         self.update_config(|c| c.unit_mode = unit_mode);
     }
 
-    /// Java `ClientConfig#setEnableStreamRequestType`。
     pub fn set_enable_stream_request_type(&self, enable: bool) {
         self.update_config(|c| c.enable_stream_request_type = enable);
     }
 
-    /// Java `ClientConfig#setPollNameServerInterval`。
     pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
         self.update_config(|c| c.poll_name_server_interval_millis = millis);
     }
@@ -1674,9 +1414,6 @@ impl DefaultLitePullConsumer {
     }
 
     /// Python `set_allocate_message_queue_strategy`。
-    ///
-    /// ⚠ Rust 用 `Arc<dyn ...>` 表达「一定有策略」，Java/Python 那个「置 null/None
-    /// 再由 checkConfig 拒绝」的分支在这里类型不可表示，故无对应校验。
     pub fn set_allocate_message_queue_strategy(
         &self,
         strategy: Arc<dyn AllocateMessageQueueStrategy>,
@@ -1688,8 +1425,6 @@ impl DefaultLitePullConsumer {
             .unwrap_or_else(|e| e.into_inner()) = strategy;
     }
 
-    /// 当前队列分配策略（对应 Java `getAllocateMessageQueueStrategy`，
-    /// `DefaultLitePullConsumer:196` 同款）。
     pub fn allocate_message_queue_strategy(&self) -> Arc<dyn AllocateMessageQueueStrategy> {
         self.inner
             .strategy
@@ -1698,7 +1433,6 @@ impl DefaultLitePullConsumer {
             .clone()
     }
 
-    /// Python `set_message_queue_listener`（Java 签名回调，见模块头偏离 5）。
     pub fn set_message_queue_listener(&self, listener: Arc<dyn MessageQueueListener>) {
         *lock(&self.inner.listener) = Some(listener);
     }
@@ -1714,7 +1448,6 @@ impl DefaultLitePullConsumer {
             .unwrap_or_default()
     }
 
-    /// Java `ClientConfig#isUnitMode()`（回投/过滤等请求都取这一个值）。
     pub fn unit_mode(&self) -> bool {
         read_cfg(&self.inner.cfg).unit_mode
     }
@@ -1797,9 +1530,6 @@ impl DefaultLitePullConsumer {
         let mut state = lock(&self.inner.state);
         state.assign_mode = true;
         let keep: BTreeSet<String> = message_queues.iter().map(mq_key).collect();
-        // Java `assignedMessageQueue.updateAssignedMessageQueue`：撤掉的队列连着整份
-        // MessageQueueState 丢掉 ⇒ 两条游标一起消失。**不**动内存位点表，也**不** persist：
-        // 那份清理挂在 subscribe 模式的 rebalance 上，assign 模式不走 rebalance。
         for key in state
             .assigned
             .keys()
@@ -1858,8 +1588,6 @@ impl DefaultLitePullConsumer {
             return Ok(());
         }
         let cfg = self.config();
-        // 对应 Java DefaultLitePullConsumerImpl.checkConfig(:413)：组名合法性 + 挡掉
-        // DEFAULT_CONSUMER，都排在地址/订阅校验之前（纯本地判定，失败不碰网络）。
         if let Err(e) = validators::check_group(&cfg.consumer_group) {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
@@ -1881,15 +1609,10 @@ impl DefaultLitePullConsumer {
                 bail!("subscription is not set, call subscribe() or assign() first");
             }
         }
-        // 对应 Java DefaultMQPushConsumerImpl.checkConfig：启动即无条件校验 consumeTimestamp。
-        // 下面解析初始位点的路径会吞异常，晚抛等于静默退化成「从 max offset 消费」。
         if let Err(e) = consume_timestamp_millis(&cfg.consume_timestamp) {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
         }
-        // Java `DefaultMQPullConsumerImpl#start`:712 / `DefaultLitePullConsumerImpl#start`:288：
-        // CLUSTERING 才改写 instanceName，clientId 口径是 `ClientConfig#buildMQClientId`
-        // 的 `<本机 IP>@<instanceName>`。
         let instance_name = MixAll::instance_name_for_model(
             &cfg.instance_name,
             cfg.message_model == MessageModel::CLUSTERING,
@@ -1939,10 +1662,6 @@ impl DefaultLitePullConsumer {
                 self.update_config(|c| c.name_server_addrs = addrs);
             }
         }
-        // 本消费者不进 `consumer_table`（接不了 broker 的反向请求），但要在实例上
-        // 登记组名：Java `DefaultLitePullConsumerImpl#start`:339 也是 registerConsumer
-        // 之后才由实例的关闭守卫判断「还有谁在用这份实例」。心跳报文仍由自己拼
-        // （Python 同），这里只取 client 引用备用。
         client.register_consumer_group(&cfg.consumer_group);
         *lock(&self.inner.client) = Some(client);
 
@@ -1995,15 +1714,10 @@ impl DefaultLitePullConsumer {
         self.inner.buffer_signal.notify_waiters();
 
         let auto_commit = self.config().auto_commit;
-        // Java 的 shutdown 走 `persistConsumerOffset()`：把内存位点表按**当下持有的队列**
-        // 刷一遍，与 auto_commit 无关（手动模式 `persist=false` 攒下的值同样要落盘）。
-        // 自动提交模式再多走一步 commitAll：本端口没有 Java 那份 5s 定时器，
-        // "poll 交出去但还没到截止时刻"的位点得在这里补上，否则重启后从上一格重投。
         if auto_commit {
             let mut state = lock(&self.inner.state);
             let scope: Vec<String> = state.assigned.keys().cloned().collect();
             for key in &scope {
-                // -1 守卫：没交付过的队列绝不写表（Java 的 consumerOffset is -1 那条 error）
                 if let Some(offset) = state.consume_offset.get(key).copied() {
                     if offset != -1 {
                         state.offset_table.insert(key.clone(), offset);
@@ -2016,7 +1730,6 @@ impl DefaultLitePullConsumer {
         match self.runtime_handle() {
             Some(handle) => {
                 let finalize = async move {
-                    // 里面含 Java persistAll 的"remove unused mq"清理
                     let _ = this.persist_offset_table(&scope).await;
                     this.close_client();
                 };
@@ -2036,8 +1749,6 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// 摘掉本组登记并关掉这条连接。末次提交还要用它，所以只能排在提交之后
-    /// （Java `unregisterConsumer`:265 → `shutdown()`:269）。
     fn close_client(&self) {
         if let Some(client) = lock(&self.inner.client).take() {
             let group = self.consumer_group();
@@ -2070,10 +1781,6 @@ impl DefaultLitePullConsumer {
     /// 而自建实例刚 start 时路由表还是空的，那一轮会发 0 份 —— 订阅要等到 5s 心跳
     /// 循环的第一轮才注册上 broker。所以这里先把本实例关注的 topic（订阅的 + assign
     /// 到的）路由拉一遍并登记为在用，让 start() 里那次同步心跳真正到达 broker。
-    ///
-    /// 对应 Java：`MQClientInstance#sendHeartbeatToAllBrokerWithLock` 依赖
-    /// `topicRouteTable`，而 `DefaultLitePullConsumerImpl#start` 在注册心跳前先
-    /// `updateTopicRouteInfoFromNameServer`。
     async fn refresh_route_for_heartbeat(&self) {
         let Ok(client) = Self::require_client(&self.inner) else {
             return;
@@ -2143,8 +1850,6 @@ impl DefaultLitePullConsumer {
     /// Python `poll(timeout=None)`：等缓冲非空（最多 `poll_timeout_millis`），
     /// 一次最多取 [`MAX_POLL_BATCH_SIZE`] 条。
     pub async fn poll(&self, timeout_millis: Option<i64>) -> Vec<MessageExt> {
-        // Java poll() 进来先按全局截止时刻试一次自动提交：在拿缓冲锁之前做，
-        // 提交要发 RPC，抱着缓冲锁等网络会把 enqueue 一起卡住。
         if self.config().auto_commit {
             self.maybe_auto_commit().await;
         }
@@ -2157,8 +1862,6 @@ impl DefaultLitePullConsumer {
             let mut notified = std::pin::pin!(self.inner.buffer_signal.notified());
             notified.as_mut().enable();
             if let Some(drained) = self.try_drain() {
-                // 对位 Java `poll()`：消息交到调用方手上才推进"已消费游标"
-                // （`updateConsumeOffset(mq, processQueue.removeMessage(msgs))`）。
                 self.advance_consume_offset(&drained);
                 return drained;
             }
@@ -2184,9 +1887,6 @@ impl DefaultLitePullConsumer {
     }
 
     /// 交付出去的这批消息推进**已消费游标**（拉取游标一格都不动）。
-    ///
-    /// 只认当下持有且已有拉取记录的队列：Java 的 `updateConsumeOffset` 在
-    /// `MessageQueueState` 不存在时直接什么都不做。
     fn advance_consume_offset(&self, msgs: &[MessageExt]) {
         let mut state = lock(&self.inner.state);
         // Python 同款做法：先把"有拉取记录的队列"按 (topic, brokerName, queueId) 建索引，
@@ -2224,9 +1924,6 @@ impl DefaultLitePullConsumer {
             let mut state = lock(&self.inner.state);
             state.seek_offset.insert(key.clone(), offset);
             state.next_offset.insert(key.clone(), offset);
-            // Java 的 seek 只置 seekOffset，下一次拉取时 `nextPullOffset()` 才把它同时
-            // 写进 consumeOffset：跳回去意味着"那里之前都还没消费"，否则重放的消息会被
-            // 已提交位点直接跳过。这里一次性写全，效果相同。
             state.consume_offset.insert(key, offset);
         }
         let mut buffer = lock(&self.inner.buffer);
@@ -2263,9 +1960,6 @@ impl DefaultLitePullConsumer {
         Ok(())
     }
 
-    /// Python `committed`：Java `readOffset(MEMORY_FIRST_THEN_STORE)` —— 先看内存位点表
-    /// （`persist=false` 刚提交、还没发给 broker 的值也算数），再问 broker 并回填进表里。
-    /// broker 无记录 ⇒ `None`（对位 Java 的 -1）。
     pub async fn committed(&self, mq: &MessageQueue) -> Result<Option<i64>> {
         let key = mq_key(mq);
         if let Some(cached) = lock(&self.inner.state).offset_table.get(&key).copied() {
@@ -2282,13 +1976,6 @@ impl DefaultLitePullConsumer {
         Ok(broker_offset)
     }
 
-    /// 到点提交：只有一道全局截止时刻（Java `maybeAutoCommit`），到点走一次
-    /// [`commit`](Self::commit) 并把截止时刻推到 `now + auto_commit_interval_millis`。
-    ///
-    /// 调用点和 Java 一致，只有 [`poll`](Self::poll) 开头一处（外加 `shutdown` 的兜底提交）。
-    /// Java 里空闲消费者靠 MQClientInstance 每 5s 的 `persistConsumerOffset` 定时器刷的是
-    /// **内存位点表**，而那张表也只有 commit 路径会写，所以停掉 poll 之后 Java 同样不会
-    /// 往前推进 broker 位点；这里把它塞进拉取循环就会变成"没人 poll 也提交"，比 Java 激进。
     async fn maybe_auto_commit(&self) {
         let interval_millis = self.config().auto_commit_interval_millis;
         let now = current_time_millis();
@@ -2304,8 +1991,6 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Python `commit(None)`：对位 Java `commitAll()` —— 按**已消费游标**提交全部已分配队列。
-    ///
     /// 提交源绝不能是拉取游标：本地缓冲里压着没交出去的消息不算已消费，
     /// 提前提交会让那段消息在重启后永远不再投递（静默丢消息）。
     pub async fn commit(&self) -> Result<()> {
@@ -2325,9 +2010,6 @@ impl DefaultLitePullConsumer {
         self.commit_targets(targets, &scope, true).await
     }
 
-    /// Python `commit({MessageQueue: offset}, persist)`：调用方指定位点。
-    /// **只改提交落点，两条游标都不动**。空 map 对位 Java：记一条 warn 就 return，
-    /// 连表都不碰（上一轮 `persist=false` 攒下的内存值原样保留）。
     pub async fn commit_offsets(
         &self,
         offsets: &BTreeMap<String, i64>,
@@ -2341,8 +2023,6 @@ impl DefaultLitePullConsumer {
         self.commit_targets(offsets.clone(), &scope, persist).await
     }
 
-    /// Python `commit([MessageQueue, ...], persist)`：只提交点名这几条队列，
-    /// 取的是它们当下的**已消费游标**。空集合对位 Java：静默 return。
     pub async fn commit_queues(
         &self,
         message_queues: &[MessageQueue],
@@ -2368,12 +2048,6 @@ impl DefaultLitePullConsumer {
     }
 
     /// 三个入口的共同部分：写内存位点表（两道守卫），`persist` 再把这一批刷给 broker。
-    ///
-    /// 两处已知的偏离，与 Python 逐字对应（见 `consumer.py` 的 `commit`）：
-    /// ① Java 的 `commitAll()` 只写内存表，真正发给 broker 靠 MQClientInstance 每
-    ///    `persistConsumerOffsetInterval`（5s）一次的定时器；本端口的 lite 消费者没挂那个
-    ///    定时器，所以 `persist=true`（默认）就地发出去。
-    /// ② Java 的 `persistAll` 用 oneway、异常只记日志；这里发同步带应答，坏位点当场可见。
     async fn commit_targets(
         &self,
         targets: BTreeMap<String, i64>,
@@ -2384,14 +2058,10 @@ impl DefaultLitePullConsumer {
             let mut state = lock(&self.inner.state);
             for (key, offset) in &targets {
                 if *offset == -1 {
-                    // Java 原文：这条队列还没消费过，记 error 并跳过。绝不能把 -1 写给
-                    // broker —— 位点 -1 会让下次消费从队首重投全量。
                     rmq_error!("consumerOffset is -1 in messageQueue [{key}].");
                     continue;
                 }
                 if !state.assigned.contains_key(key) {
-                    // Java 的 `processQueue != null && !isDropped()` 守卫：不是本实例持有的
-                    // 队列一律不替它提交，静默跳过（Java 原文这里连日志都没有）。
                     continue;
                 }
                 state.offset_table.insert(key.clone(), *offset);
@@ -2403,8 +2073,6 @@ impl DefaultLitePullConsumer {
         self.persist_offset_table(scope).await
     }
 
-    /// Python `_persist_offset`：Java `OffsetStore#persist(mq)`，只把这一条队列的内存位点
-    /// 发给 broker，不做清理。
     async fn persist_offset(&self, mq: &MessageQueue) {
         let key = mq_key(mq);
         let Some(offset) = lock(&self.inner.state).offset_table.get(&key).copied() else {
@@ -2422,13 +2090,6 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Python `_persist_offset_table`：Java `RemoteBrokerOffsetStore#persistAll(Set)` ——
-    /// 内存位点表里落在 `mqs` 上的那部分写给 broker，**不在**其中的条目顺手从表里删掉
-    /// （Java 日志里那句 `remove unused mq`）。
-    ///
-    /// 后半句是 Java 的真实行为：这张表只服务于当下持有的队列。代价是
-    /// `commit(部分队列, persist=true)` 会把其余队列**尚未落盘**的内存值一起丢掉 ——
-    /// 要提交谁就一次给全。
     async fn persist_offset_table(&self, mqs: &[String]) -> Result<()> {
         if mqs.is_empty() {
             return Ok(());
@@ -2451,10 +2112,6 @@ impl DefaultLitePullConsumer {
             }
             out
         };
-        // 未启动时表照样写得进去、只是发不出去（Python/C++ 同）：Java 在这里会先
-        // checkServiceState 抛错，本端口放宽这一步，好让表逻辑能离线单测。
-        // 这里直接读连接槽而不是 require_client()：shutdown 已经翻掉 started 标记，
-        // 但末次提交仍要用这条还没关掉的连接。
         let Some(client) = lock(&self.inner.client).clone() else {
             return Ok(());
         };
@@ -2562,9 +2219,6 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Java `DefaultLitePullConsumer.setTopicMetadataCheckIntervalMillis:563`。
-    /// Java 没有下限，但 0 会让 `scheduleAtFixedRate` 抛，本端口与 cpp/python 同款
-    /// 夹到 1s。
     pub fn set_topic_metadata_check_interval_millis(&self, millis: i64) {
         self.update_config(|c| c.topic_metadata_check_interval_millis = millis.max(1000));
     }
@@ -2574,16 +2228,6 @@ impl DefaultLitePullConsumer {
         self.config().topic_metadata_check_interval_millis
     }
 
-    /// 对应 Java `registerTopicMessageQueueChangeListener`（`DefaultLitePullConsumer:325` →
-    /// `DefaultLitePullConsumerImpl:1267-1279`）：登记一个 topic 的队列集合变更监听器，
-    /// 后台循环（启动后 10s 首查、此后每 `topic_metadata_check_interval_millis` 一趟）
-    /// 比对队列**集合**，有变化才回调 [`TopicMessageQueueChangeListener::on_changed`]。
-    ///
-    /// 与 Java 逐条对齐：
-    /// * topic 为空或监听器为空 → 报错（Java 抛 `MQClientException("Topic or listener is null")`）；
-    /// * 重复注册同一 topic → 覆盖旧监听器并 warn 一条（`:1272`）；
-    /// * 键取套好命名空间的 topic（Java `:327` 在入口就 `withNamespace`），回调收到的也是它；
-    /// * 已启动时立刻记一版快照（`:1275-1277`），否则首轮会把"当前集合"误报成变化。
     pub async fn register_topic_message_queue_change_listener(
         &self,
         topic: &str,
@@ -2646,8 +2290,6 @@ impl DefaultLitePullConsumer {
             let changed = {
                 let mut snapshots = lock(&self.inner.queues_for_topic);
                 let changed = match snapshots.get(&key) {
-                    // 没有快照 = Java 的 `oldSet == null`：`fetchMessageQueues` 永远回
-                    // 一个非 null 集合，所以 isSetEqual 必判不等 ⇒ 首轮一定回调一次。
                     None => true,
                     Some(old) => !same_queue_set(old, &queues),
                 };
@@ -2726,16 +2368,11 @@ impl DefaultLitePullConsumer {
             .clone();
 
         let mut new_assigned: BTreeMap<String, MessageQueue> = BTreeMap::new();
-        // 本轮的分配起点：本 topic 当前的分配。策略抛错时以它兜底——
-        // Java `RebalanceImpl#rebalanceByTopic` 在 `catch (Throwable)` 里直接 `return false`，
-        // 位置在 `updateProcessQueueTableInRebalance` **之前**，所以一次分配异常不会把队列撤走。
         let baseline: Vec<MessageQueue> =
             lock(&self.inner.state).assigned.values().cloned().collect();
         // topic -> (全部队列, 分到的队列)，用于 MessageQueueListener 回调
         let mut per_topic: Vec<(String, Vec<MessageQueue>, Vec<MessageQueue>)> = Vec::new();
         for topic in topics {
-            // 与 push 的 rebalance 同源：Java DefaultLitePullConsumerImpl 走的是同一个
-            // RebalanceImpl，mqAll 来自订阅信息（读位、不筛 master），不是发布信息。
             let mut mq_all: Vec<MessageQueue> = client.get_topic_subscribe_info(&topic).await;
             if mq_all.is_empty() {
                 rmq_debug!("lite rebalance: no subscribe info for topic {topic}");
@@ -2783,9 +2420,6 @@ impl DefaultLitePullConsumer {
                 .cloned()
                 .collect();
             let changed = !added.is_empty() || !removed.is_empty();
-            // 撤销的队列要连着整份 MessageQueueState 一起丢（Java removeUnnecessaryMessageQueue
-            // = persist(mq) 再 removeOffset(mq)）。persist 是 RPC，抱着锁做网络会把整条
-            // poll/commit 路径卡住，所以这里只把**该补发的队列**记下来，锁外再发。
             let revoked: Vec<MessageQueue> = removed
                 .iter()
                 .filter(|k| state.offset_table.contains_key(*k))
@@ -2798,8 +2432,6 @@ impl DefaultLitePullConsumer {
                     state.next_offset.remove(key);
                     state.consume_offset.remove(key);
                     state.seek_offset.remove(key);
-                    // ⚠ `offset_table` 那一格**留到 persist 发出去之后再清**：
-                    // Java 的顺序就是 removeUnnecessaryMessageQueue = persist(mq) → removeOffset(mq)。
                 }
             }
             let changed_topics: Vec<(String, Vec<MessageQueue>, Vec<MessageQueue>)> = if changed {
@@ -2815,8 +2447,6 @@ impl DefaultLitePullConsumer {
             (added, changed_topics, revoked)
         };
 
-        // 撤手之后补发最后那次提交（Java 的 persist 在 removeOffset **之前**：上面刻意把
-        // offset_table 那一格留着就是为了这一步还能读到值）。
         for mq in &revoked {
             self.persist_offset(mq).await;
         }
@@ -2830,7 +2460,6 @@ impl DefaultLitePullConsumer {
         if !added.is_empty() {
             self.resolve_offsets_for(&added).await;
         }
-        // 回调按 topic 逐个发（Java 签名；Python 的调用是死代码，见模块头偏离 5）
         if !changed_topics.is_empty() {
             let listener = lock(&self.inner.listener).clone();
             if let Some(listener) = listener {
@@ -2896,15 +2525,6 @@ impl DefaultLitePullConsumer {
                 return false;
             }
         };
-        // Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：一轮拉取回来之后
-        // 无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都把拉取游标推进到
-        // broker 给的 nextBeginOffset —— NO_MATCHED_MSG 的已越过本轮扫过的整段不匹配区间
-        // （不跟就会每轮把同一段重扫一遍），OFFSET_ILLEGAL 的是 broker 的纠正位点
-        // （越界自愈也靠这一步）。
-        // 刹车只有一只：**在途请求的结果不许盖掉这轮里刚 seek / 刚被撤走的位点**
-        // （Java :808 的 seekOffset == -1 检查 + :979 的 isDropped 检查；本端 seek() 直接
-        // 改写 next_offset、撤队列直接 remove 掉条目，用「游标还是不是我发请求时的那个值」
-        // 做同一件事）。同一条刹车也管着 FOUND 分支的入缓冲（Java :986）。
         let intact = {
             let mut state = lock(&self.inner.state);
             if state.next_offset.get(&key).copied() == Some(offset) {
@@ -2927,8 +2547,6 @@ impl DefaultLitePullConsumer {
             // 只是没有可交付的——不能像旧实现那样原地重拉同一窗口。
             return false;
         }
-        // 只推进**拉取游标**。「已消费游标」是 poll() 交付时才写的，两条线不是一条：
-        // 缓冲里压着没交出去的消息不能算已消费（Java `processQueue.removeMessage` 同口径）。
         self.enqueue(msgs);
         true
     }
@@ -2971,10 +2589,6 @@ async fn resolve_initial_offset(
         Err(e) => rmq_debug!("lite query offset failed for {mq:?}: {e}"),
     }
     if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET {
-        // Java RebalanceLitePullImpl:FIRST_OFFSET 分支与 push 同形（`result = 0L`），
-        // 不发 minOffset 查询 —— minOffset 属于 MQAdminImpl 口径（只认 master），
-        // 主掉线期间会让新起的 lite-pull 一条都拉不到；越界由 broker 的
-        // PULL_OFFSET_MOVED 纠正（见 `handle_offset_illegal`）。
         return Ok(0);
     }
     if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP {
@@ -2991,14 +2605,6 @@ async fn resolve_initial_offset(
 
 /// Python `_heartbeat_loop` 里那份报文：只带**本消费者自己**的 ConsumerData
 /// （lite 不进实例注册表，报文由自己拼）。
-///
-/// ⚠ `consumeType` 用 **CONSUME_ACTIVELY**：Java
-/// `DefaultLitePullConsumerImpl.consumeType():1111-1112` 恒返回它（5.4.0 起；此前与
-/// 推送同用 PASSIVELY 是错的口径）。broker 侧有三个读者：
-/// `ClientManageProcessor:87-92` 对 ACTIVELY 的心跳跳过订阅注册（拉取靠自己带
-/// subscription 标志走补偿分支）、`PullMessageProcessor:493-505` 对开了
-/// `rejectPullConsumerEnabled` 的 broker 按它放行/拒绝拉取、`AdminBrokerProcessor:1971`
-/// 按它显示消费类型（mqadmin consumerConnection）。Python/C++/C# 三版同值。
 fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
     let cfg = read_cfg(&inner.cfg);
     let mut hb = HeartbeatData::new(cfg.client_id.clone().unwrap_or_default());
@@ -3013,7 +2619,6 @@ fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
         .values()
         .cloned()
         .collect();
-    // Java `MQClientInstance:1039`：心跳里的 unitMode 来自消费者自己的 ClientConfig
     cd.unit_mode = cfg.unit_mode;
     hb.consumer_data_set.push(cd);
     hb
@@ -3021,11 +2626,6 @@ fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
 
 /// Python `_send_heartbeat_to_all_broker`：路由里的每个 broker（**含从节点**）发一份。
 /// 没有 client（未 start / 已 shutdown）就发 0 份而不是退出循环 —— Python 同。
-///
-/// 从节点也要发：Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750 遍历
-/// `brokerAddrTable` 的每个 brokerId，仅在 `consumerEmpty && id != MASTER_ID` 时跳过；
-/// 本心跳带 ConsumerData，故不跳。broker 的 ConsumerManager 每台各自一份，从节点收不到
-/// 心跳就会对指向自己的拉取回 `SUBSCRIPTION_NOT_EXIST`（`PullMessageProcessor`:420-427）。
 async fn send_lite_heartbeat(inner: &LiteInner) -> usize {
     let Some(client) = lock(&inner.client).clone() else {
         return 0;
@@ -3184,9 +2784,6 @@ mod tests {
         assert!(DefaultLitePullConsumer::new("PG").is_ok());
     }
 
-    /// Java 的 `checkConfig` 是 start() 第一步，所以组名校验排在地址/订阅/时间戳之前：
-    /// 地址配好、订阅齐了，也照样因为组名本地失败（`127.0.0.1:1` 兜底，跑偏了也不会
-    /// 打到真集群）。
     #[tokio::test]
     async fn both_pull_consumers_reject_bad_group_before_the_other_gates() {
         let long_group = std::iter::repeat_n('g', 121).collect::<String>();
@@ -3312,7 +2909,6 @@ mod tests {
             l.consume_from_where,
             ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET
         );
-        // Java DefaultLitePullConsumer.java:168：默认 now-30min 的 14 位 yyyyMMddHHmmss
         assert_eq!(l.consume_timestamp.len(), 14);
         assert!(l.consume_timestamp.bytes().all(|b| b.is_ascii_digit()));
         assert_eq!(l.broker_suspend_max_time_millis, 20_000);
@@ -3451,7 +3047,6 @@ mod tests {
     #[tokio::test]
     async fn poll_ignores_queues_this_instance_does_not_hold() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
-        // 没有拉取记录（未分配）的队列：交付了也不写游标（Java 的 MessageQueueState==null）
         c.enqueue(vec![msg("T", "broker-a", 9, 0, "m")]);
         assert_eq!(c.poll(Some(10)).await.len(), 1);
         assert_eq!(c.consume_cursor_of(&queue("T", "broker-a", 9)), -1);
@@ -3481,7 +3076,6 @@ mod tests {
         assert_eq!(c.pull_cursor_of(&q0), -1, "提交位点不改拉取游标");
         assert_eq!(c.consume_cursor_of(&q0), -1, "提交位点不改已消费游标");
 
-        // -1 与「不是本实例持有的队列」两道守卫（Java 的 log.error + processQueue 守卫）
         let mut guarded = BTreeMap::new();
         guarded.insert(mq_key(&q0), -1);
         guarded.insert(mq_key(&queue("T", "broker-a", 7)), 3);
@@ -3497,7 +3091,6 @@ mod tests {
             "没分配到的队列不替它提交"
         );
 
-        // 空 map / 空集合：Java 都是直接 return，连表都不碰
         c.commit_offsets(&BTreeMap::new(), false).await.unwrap();
         assert_eq!(c.pending_commit_of(&q0), 5, "空 map 忽略这次提交");
         c.commit_queues(&[], false).await.unwrap();
@@ -3513,8 +3106,6 @@ mod tests {
             "commit(Set) 在没有交付记录时不写 -1"
         );
 
-        // assign 缩范围：撤掉的队列连着两条游标一起丢（Java updateAssignedMessageQueue），
-        // 但内存位点表**不**清 —— 那份清理挂在 subscribe 模式的 rebalance 上（Java 同）。
         c.assign(std::slice::from_ref(&q0));
         assert_eq!(c.pull_cursor_of(&q1), -1, "assign 撤队列后拉取游标消失");
         assert_eq!(
@@ -3528,9 +3119,6 @@ mod tests {
         c.commit_offsets(&late, false).await.unwrap();
         assert_eq!(c.pending_commit_of(&q1), 8, "撤掉的队列不替它改位点");
 
-        // Java RemoteBrokerOffsetStore#persistAll 的 "remove unused mq"：点名提交只发被点名的
-        // 队列，内存表里**其余**条目顺手删掉 —— 上一轮 persist=false 攒下、还没落盘的值就此
-        // 丢掉。（这里没 start()，网络那半段自然跳过，验的是清理这半段。）
         c.commit_queues(std::slice::from_ref(&q0), true)
             .await
             .unwrap();
@@ -3547,8 +3135,6 @@ mod tests {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         let q = queue("T", "broker-a", 0);
         c.assign(std::slice::from_ref(&q));
-        // Java 的 nextPullOffset() 吃掉 seekOffset 时连 consumeOffset 一起改：
-        // "跳回去"意味着"那里之前都还没消费"，否则重放的段会被旧位点跳过。
         c.seek(&q, 2);
         assert_eq!(c.pull_cursor_of(&q), 2, "seek 改拉取游标");
         assert_eq!(c.consume_cursor_of(&q), 2, "seek 也要改已消费游标");
@@ -3557,7 +3143,6 @@ mod tests {
     #[tokio::test]
     async fn auto_commit_deadline_starts_at_minus_one() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
-        // Java DefaultLitePullConsumerImpl:154：初值 -1 ⇒ 第一次检查就会提交一次
         assert_eq!(lock(&c.inner.state).next_auto_commit_deadline, -1);
         // 没交付过：这次"到点提交"发不出任何东西，只把截止时刻推到下一个周期
         c.maybe_auto_commit().await;
@@ -3696,8 +3281,6 @@ mod tests {
         }
     }
 
-    /// Java `DefaultLitePullConsumer:168`：默认值是 now-30min 的 14 位墙钟串，
-    /// 所以「没设过 consumeTimestamp」在 start 守卫下必然通过（Python 同）。
     #[test]
     fn default_consume_timestamp_is_valid_wall_clock() {
         let cfg = LitePullConsumerConfig::default();
@@ -3726,8 +3309,6 @@ mod tests {
 
     #[test]
     fn namespace_v2_setter_getter_round_trip_on_both_pull_facades() {
-        // Java `ClientConfig#setNamespaceV2/getNamespaceV2`：服务端命名空间
-        //（`NamespaceRpcHook` 的 `nsd`/`ns` 头），与 v1 `namespace` 互不影响。
         let pull = DefaultMQPullConsumer::new("PullPG").expect("合法组名不该构造失败");
         assert_eq!(pull.get_namespace_v2(), None, "默认不设");
         pull.set_namespace_v2(Some("NS_V2"));
@@ -3820,7 +3401,6 @@ mod tests {
         assert_eq!(hb.consumer_data_set.len(), 1);
         let cd = &hb.consumer_data_set[0];
         assert_eq!(cd.group_name, "LitePG");
-        // Java DefaultLitePullConsumerImpl.consumeType():1111-1112 恒为 ACTIVELY
         assert_eq!(cd.consume_type, ConsumeType::CONSUME_ACTIVELY);
         assert_eq!(cd.message_model, MessageModel::CLUSTERING);
         assert_eq!(
@@ -4123,11 +3703,6 @@ mod tests {
         }
     }
 
-    /// PULL_MESSAGE 的应答：排了脚本就按脚本回（有闸先等闸），否则按**空 broker**
-    /// 的忠实形态回 `PULL_NOT_FOUND` + `nextBeginOffset = 请求 queueOffset`
-    /// （Java `PullMessageProcessor#composeResponseHeader` 对 NO_NEW_MSG 同样回填
-    /// nextBeginOffset；min/max 为 0）。客户端从 #105 起每轮都信 nextBeginOffset，
-    /// 这里不忠实（如裸 SUCCESS 缺 ext）就会把拉取游标推到 0。
     async fn answer_pull(request: &RemotingCommand, broker: &FakeBroker) -> RemotingCommand {
         let script = lock(&broker.pull_scripts).pop_front();
         if let Some(script) = script {
@@ -4155,9 +3730,6 @@ mod tests {
         response
     }
 
-    /// GET_CONSUMER_LIST_BY_GROUP(38) 的应答：把 [`FakeBroker::cid_list`] 原样包成
-    /// Java 的 `GetConsumerListByGroupResponseBody`。空列表就是「broker 不认识这个组」——
-    /// 真实 broker 对没注册过的组也是这么回（不是报错），平衡视图据此走兜底分支。
     fn answer_consumer_list(request: &RemotingCommand, broker: &FakeBroker) -> RemotingCommand {
         let cids = lock(&broker.cid_list).clone();
         let body = GetConsumerListByGroupResponseBody {
@@ -4271,10 +3843,6 @@ mod tests {
         panic!("等待超时：{what}");
     }
 
-    /// Java `MQClientInstance#prepareHeartbeatData:1031-1045` 为拉模式组出的那份
-    /// ConsumerData 的形状：`consumeType()` 恒 `CONSUME_ACTIVELY`（`DefaultMQPullConsumerImpl:348`）、
-    /// `consumeFromWhere()` 恒 `CONSUME_FROM_LAST_OFFSET`（:353），订阅集来自
-    /// `subscriptions():357-385` 的 registerTopics，每条 **subVersion 显式置 0**。
     #[test]
     fn pull_heartbeat_matches_the_wire_shape() {
         let c = DefaultMQPullConsumer::new("PG_PullHb").unwrap();
@@ -4377,8 +3945,6 @@ mod tests {
         c.shutdown();
     }
 
-    /// shutdown 的收尾（Java `DefaultMQPullConsumerImpl:689-692` 的 unregisterConsumer）
-    /// 要给**每一台**发 35：`consumerGroup` 有值、`producerGroup` 字段不上线（Java 传 null）。
     #[tokio::test]
     async fn pull_shutdown_unregisters_group_on_every_broker() {
         let cluster = FakePullCluster::start().await;
@@ -4525,12 +4091,6 @@ mod tests {
         assert!(_key_order_proof(&low) < _key_order_proof(&high));
     }
 
-    /// 两个拉消费者的策略面（Java `DefaultMQPullConsumer:89` 字段默认 + `:196-202`
-    /// getter/setter；`DefaultLitePullConsumer` 同款）。
-    ///
-    /// ⚠ Python/C++/C# 都有「置 null/None 后 `start()` 抛
-    /// `allocateMessageQueueStrategy is null`」（Java checkConfig:803）；Rust 用
-    /// `Arc<dyn ...>` 把它压成「类型上不可表示」，所以这里只测默认值与替换。
     #[test]
     fn both_pull_consumers_expose_the_allocate_strategy() {
         use crate::client::allocate_strategy::{
@@ -4586,9 +4146,6 @@ mod tests {
 
     // --------------------------------- FIRST_OFFSET 的起点是字面量 0（#100 附带）
 
-    /// Java `RebalanceLitePullImpl` 的 FIRST_OFFSET 分支（与 `RebalancePushImpl:197-208`
-    /// 同形）：起点是字面量 0，**不**发 minOffset 查询。
-    ///
     /// minOffset 属 MQAdminImpl 口径（只认 master），主掉线期间会让新起的 lite-pull
     /// 一条都拉不到；起点 0 越界时由 broker 用 `PULL_OFFSET_MOVED` 纠正
     /// （`handle_offset_illegal`）。
@@ -4641,14 +4198,6 @@ mod tests {
 
     // --------------------------------- 请求码 / lite 位（#107）
 
-    /// lite pull 必须带 `FLAG_LITE_PULL_MESSAGE(0x10)` 且线上请求码为
-    /// `LITE_PULL_MESSAGE(361)`。Java 把这两件事拆在两处：消费者侧
-    /// `DefaultLitePullConsumerImpl#pullSyncImpl:1058` 置位，客户端 API 侧
-    /// `MQClientAPIImpl#pullMessage:816-820` 按位选码。少了任一步，报文仍是一个合法的
-    /// pull（假 broker 照常回消息），但走普通 pull 线程池、且**不受
-    /// `litePullMessageEnable` 开关管辖**（`PullMessageProcessor:325` 只拦 361）——
-    /// 假 broker 不看请求码也能测，所以必须对线形状单独设卡；真机判别器见
-    /// examples/live_lite_pull_code.rs。
     #[tokio::test]
     async fn lite_pull_uses_code_361_and_sets_the_lite_bit() {
         let cluster = FakePullCluster::start().await;
@@ -4669,7 +4218,6 @@ mod tests {
         let flags = cluster.master.pull_sys_flags();
         assert!(!flags.is_empty(), "至少一笔带 sysFlag 的拉取");
         for f in &flags {
-            // 与 Java pullSyncImpl:1058 的 (false, block, true, false, true) 逐位对齐
             assert!(
                 PullSysFlag::has_lite_pull_flag(*f),
                 "lite 位必须置上：{f:#x}"
@@ -4720,10 +4268,6 @@ mod tests {
         c
     }
 
-    /// Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：NO_MATCHED_MSG 的
-    /// nextBeginOffset 已越过本轮扫过的整段不匹配区间，拉取游标必须跟过去 ——
-    /// 旧实现只在 FOUND 时用 `last.queue_offset + 1` 推进，游标会永远卡在 0，
-    /// 每轮把同一段不匹配区间重扫一遍。
     #[tokio::test]
     async fn lite_cursor_follows_next_begin_offset_on_no_matched_msg() {
         let cluster = FakePullCluster::start().await;
@@ -4790,11 +4334,6 @@ mod tests {
         c.shutdown();
     }
 
-    /// 唯一一只刹车（Java :808 的 seekOffset == -1 + :979 的 isDropped）：在途应答
-    /// 回来时，这轮里刚 seek 过的位点不许被盖掉，也不许把应答里的消息塞进缓冲
-    /// （seek 的语义就是「游标钉在这里、旧位点的消息全丢」）。
-    /// 发车闸把在途窗口拉成确定性的：请求已到 broker → seek → 放闸。
-    /// 旧实现没有刹车：FOUND + 一条 offset=2 的消息会把游标改成 3 并把消息入缓冲。
     #[tokio::test]
     async fn lite_in_flight_seek_wins_over_the_pull_result() {
         let cluster = FakePullCluster::start().await;
@@ -4832,11 +4371,6 @@ mod tests {
     }
 
     // ------------------------------------------------------------ 平衡视图
-    //
-    // Java `MQPullConsumer:187` → `DefaultMQPullConsumerImpl:120-135`，官方
-    // `example/simple/PullConsumer.java:62` 就靠它决定这一轮去拉哪些队列。
-    // 本端口拉模式没有后台 rebalance 线程，视图按 `RebalanceImpl.rebalanceByTopic`
-    // 的同一条公式当场算，所以用例锁的是「算得对不对」而不是「表填没填上」。
 
     /// 同组只有本实例：整份订阅信息都是自己的，且按 house 口径排好序。
     #[tokio::test]
@@ -4868,8 +4402,6 @@ mod tests {
         let a = started_pull("bal_pair_a", "PG_BalPair", &cluster, "T").await;
         let b = started_pull("bal_pair_b", "PG_BalPair", &cluster, "T").await;
 
-        // 分配前 cidAll 必排序（Java `Collections.sort(cidAll)`）；真实 broker 的返回顺序
-        // 不定，用例先把两个 clientId 排好再登记，两边看到的才是同一份列表。
         let mut ids = [a.client_id(), b.client_id()];
         ids.sort();
         cluster.set_cid_list(
@@ -4941,8 +4473,6 @@ mod tests {
         c.shutdown();
     }
 
-    /// BROADCASTING：Java `rebalanceByTopic` 对广播不查消费者列表、直接全量，
-    /// 所以列表里没有本实例也照样拿到全部队列。
     #[tokio::test]
     async fn balance_view_broadcasting_takes_all_without_the_consumer_list() {
         let cluster = FakePullCluster::start_queues(3).await;
@@ -4962,8 +4492,6 @@ mod tests {
         c.shutdown();
     }
 
-    /// 未 start：Java `isRunning()` 守卫直接报错，而不是静默返回空表
-    /// （空表会让调用方以为「没有我的队列」而停止拉取）。
     #[tokio::test]
     async fn balance_view_requires_a_started_consumer() {
         let c = DefaultMQPullConsumer::new("PG_BalNotStarted").expect("组名合法");
@@ -4978,11 +4506,6 @@ mod tests {
     }
 
     // ---------------------- lite 的 topic 队列集合变更监听器
-    //
-    // Java `registerTopicMessageQueueChangeListener`（`DefaultLitePullConsumer:325` →
-    // `DefaultLitePullConsumerImpl:1267`）此前整个端口都没有。用例钉的是它的契约：
-    // 入参守卫、注册即快照（只在 RUNNING）、集合相等才判"没变"、重复注册覆盖、
-    // 后台循环真的在比对。
 
     /// 监听器事件的收纳形态：`(topic, 排序后的 queueId 列表)` 序列。
     type QueueChangeEvents = Arc<Mutex<Vec<(String, Vec<i32>)>>>;
@@ -5049,7 +4572,6 @@ mod tests {
             err.to_string().contains("Topic or listener is null"),
             "报的是 Java 那句：{err}"
         );
-        // Java DefaultLitePullConsumer:160 默认 30s
         assert_eq!(c.topic_metadata_check_interval_millis(), 30_000);
         c.set_topic_metadata_check_interval_millis(0);
         assert_eq!(c.topic_metadata_check_interval_millis(), 1_000, "夹到 1s 下限");

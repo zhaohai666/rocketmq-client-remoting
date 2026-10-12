@@ -49,7 +49,7 @@ def decode_message_queue_map(raw: Optional[dict]) -> Dict[MessageQueue, Any]:
 
 # ---------------------------------------------------------------- TopicStatsTable
 class TopicOffset:
-    """对应 org.apache.rocketmq.remoting.protocol.admin.TopicOffset。"""
+    pass
 
     def __init__(self, min_offset: int = 0, max_offset: int = 0,
                  last_update_timestamp: int = 0):
@@ -78,10 +78,7 @@ class TopicOffset:
 
 
 class TopicStatsTable:
-    """对应 org.apache.rocketmq.remoting.protocol.admin.TopicStatsTable。
-
-    探针输出：{"offsetTable":{<MessageQueue>:{...}},"topicPutTps":0.0}
-    """
+    pass
 
     def __init__(self):
         self.offset_table: Dict[MessageQueue, TopicOffset] = {}
@@ -111,7 +108,7 @@ class TopicStatsTable:
 
 # ---------------------------------------------------------------- ConsumeStats
 class OffsetWrapper:
-    """对应 org.apache.rocketmq.remoting.protocol.admin.OffsetWrapper。"""
+    pass
 
     def __init__(self, broker_offset: int = 0, consumer_offset: int = 0,
                  last_timestamp: int = 0, pull_offset: int = 0):
@@ -148,10 +145,7 @@ class OffsetWrapper:
 
 
 class ConsumeStats:
-    """对应 org.apache.rocketmq.remoting.protocol.admin.ConsumeStats。
-
-    探针输出：{"consumeTps":1.5,"offsetTable":{<MessageQueue>:<OffsetWrapper>}}
-    """
+    pass
 
     def __init__(self):
         self.offset_table: Dict[MessageQueue, OffsetWrapper] = {}
@@ -185,10 +179,7 @@ class ConsumeStats:
 
 # ---------------------------------------------------------------- TopicConfigSerializeWrapper
 class TopicConfigSerializeWrapper:
-    """对应 org.apache.rocketmq.remoting.protocol.body.TopicConfigSerializeWrapper。
-
-    探针输出：{"dataVersion":{...},"topicConfigTable":{"Topic":{"attributes":{},...}}}
-    """
+    pass
 
     def __init__(self):
         self.topic_config_table: Dict[str, TopicConfig] = {}
@@ -219,10 +210,7 @@ class TopicConfigSerializeWrapper:
 
 # ---------------------------------------------------------------- QueryConsumeQueue
 class ConsumeQueueData:
-    """对应 org.apache.rocketmq.remoting.protocol.body.ConsumeQueueData。
-
-    探针/源码字段：physicOffset, physicSize, tagsCode, extendDataJson, bitMap, eval, msg
-    """
+    pass
 
     def __init__(self, physic_offset: int = 0, physic_size: int = 0, tags_code: int = 0,
                  extend_data_json: Optional[str] = None, bit_map: Optional[str] = None,
@@ -264,11 +252,7 @@ class ConsumeQueueData:
 
 
 class QueryConsumeQueueResponseBody:
-    """对应 org.apache.rocketmq.remoting.protocol.body.QueryConsumeQueueResponseBody。
-
-    探针输出：{"filterData":"*","maxQueueIndex":88,"minQueueIndex":1,"subscriptionData":{...}}
-    （queueData 为 null 时不出现）
-    """
+    pass
 
     def __init__(self):
         self.subscription_data: Optional[dict] = None

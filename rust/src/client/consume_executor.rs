@@ -1,55 +1,10 @@
-//! 消费执行器：Java `ThreadPoolExecutor` 的最小等价物
-//! （逐条对齐 `python/client/consume_executor.py`）。
-//!
-//! 为什么不用「固定 N 个 worker 各领一份队列」：Java 的线程弹性语义全部挂在 **core** 上，
-//! 而只有 max 一个上限的池子（Python 标准库 `concurrent.futures.ThreadPoolExecutor` 就是）
-//! 恰好把这份弹性做没了。对齐点（构造参数照抄 Java
-//! `AbstractConsumeMessageService#<init>`：
-//! `new ThreadPoolExecutor(consumeThreadMin, consumeThreadMax, 1000 * 60, MILLISECONDS, new LinkedBlockingQueue<>(), threadFactory)`）：
-//!
 //! * 队列**无界**，于是 `execute` 里「线程数超过 core」这条路径永远不会走
 //!   （只有 `poolSize < corePoolSize` 才新建线程，否则入队），**真实并发度 == corePoolSize**；
 //! * `AbstractConsumeMessageService#updateCorePoolSize` → `ThreadPoolExecutor#setCorePoolSize`
 //!   —— 运行时改的就是这个并发度，`getCorePoolSize()` 能读回来，所以
 //!   `update_core_pool_size` / `get_core_pool_size`（在 `consumer.rs` 一侧）有真实语义。
 //!
-//! 于是本模块实现 core/max 两档：
-//! 1. 任务到来时，仅当 `workers < core` 才新建 worker，否则入队（Java 无界队列行为）；
-//! 2. `> core` 的 worker 空闲超过 keep_alive 后退出；`<= core` 的 worker **永不**退出
-//!    （Java `allowCoreThreadTimeOut` 默认 false）；
-//! 3. `set_core_pool_size(n)`：core 变大且队列非空时按 `min(delta, 队列长度)` 补足 worker
-//!    （Java `setCorePoolSize` 里的 `addWorker(null, true)` 循环）；core 变小时只让超编的
-//!    空闲 worker 自行退出（Java 是 `interruptIdleWorkers()`，Python/这里都不打断在跑的任务）；
-//! 4. 任务出错**不杀 worker**（Java `ThreadPoolExecutor` 是杀掉再补一个 worker；Python 在
-//!    循环里 try/except，效果等价且没有补线程的竞态）。
 //!
-//! # 与 Python 的有意差异（行为口径不变）
-//! 1. **Python 线程 → tokio 任务**：worker 是 `Handle::spawn` 出来的任务。「并发度 ==
-//!    worker 数」依然成立（每个 worker 一次只跑一个任务、跑完才领下一个），但**真实 OS
-//!    线程并行度**取决于宿主运行时（current-thread 运行时下是协作式交错）。因此
-//!    [`ConsumeExecutor::submit`] / [`ConsumeExecutor::set_core_pool_size`] 需要在 tokio
-//!    运行时上下文里调用（或用 [`ConsumeExecutor::with_handle`] 注入 `MQClientInstance`
-//!    的句柄），否则返回 `Err`；Python 的 daemon 线程无此约束。
-//! 2. **异常 → panic**：Rust 任务不会「抛出」，所以每个任务再经 `Handle::spawn` 隔离一层，
-//!    worker 只等它的 `JoinHandle`；`JoinError::is_panic` 计入
-//!    [`ConsumeExecutor::handler_exception_count`]，与 Python 的 `except BaseException` 同义，
-//!    且 worker 数不变（正是上面第 4 条要的观测效果）。
-//! 3. `shutdown(wait=True)` 的「等」是异步的：拆成 [`ConsumeExecutor::shutdown`]（同步，
-//!    对应 Java `shutdown()`）+ [`ConsumeExecutor::await_termination`]（等所有 worker 把
-//!    手上队列跑完并退出），组合即 [`ConsumeExecutor::shutdown_gracefully`]
-//!    （对应 Java `AbstractConsumeMessageService#shutdownConsumeExecutor` →
-//!    `ThreadUtils.shutdownGracefully`）。同步上下文里 `wait=True` 会阻塞调用线程，
-//!    而 Rust 不能阻塞运行时线程，故不做 `shutdown(bool)`。
-//! 4. **`Condition.notify()` 单次唤醒 → `Notify::notify_waiters()` 全员唤醒**：被抢空的
-//!    worker 重看队列后自行 park，不会有任务留在队列里没人领（等待凭据先登记、后看队列），
-//!    只是多几次无用唤醒。
-//! 5. Python 的 `RuntimeError("ConsumeExecutor has been shut down")` /
-//!    `ValueError("core pool size must be >= 0")` 统一用 [`Error::Client`]
-//!    （`MQClientException`）承载，**消息文本逐字一致**；Java 侧两者分别对应
-//!    `RejectedExecutionException` / `IllegalArgumentException`。
-//! 6. Python 私有的 `_idle`（空闲 worker 数）**没有任何读取点**，`_threads` 名册只为
-//!    `Thread.join()` 存在：两者都未移植，worker 存活性由 `workers` 计数 + `retired`
-//!    `Notify` 表达（见 [`ConsumeExecutor::await_termination`]）。
 //!
 //! # 给后续 `consumer.rs` 留的接缝（seam）
 //! 本模块**不认识**消息、listener、`MQClientInstance`，也就无需任何消费者侧 trait：
@@ -65,10 +20,6 @@
 //! ```text
 //! executor.submit(Box::pin(async move { consume_pop_batch(listener, client, batch, pq, mq).await }))
 //! ```
-//!
-//! Python 的 worker 跑的是**阻塞**回调；Rust 侧若回调确实是同步阻塞的（Java
-//! `MessageListener#consumeMessage` 就是），应在任务体内 `spawn_blocking`，别把阻塞留在
-//! worker 本身上 —— 否则并发度会被宿主运行时的线程数卡住，而不是被 core 卡住。
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -84,16 +35,10 @@ use tokio::sync::Notify;
 use crate::error::{Error, Result};
 use crate::{bail, rmq_debug, rmq_error, rmq_warn};
 
-/// Java `AbstractConsumeMessageService` 建池用的 `1000 * 60` 毫秒，也是 Python
-/// `ConsumeExecutor.__init__` 的 `keep_alive_seconds=60.0`。
 pub const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(60);
 
-/// Python `ConsumeExecutor.__init__` 的 `thread_name_prefix="rmq-consume"`；
-/// Java 侧对应 `ThreadFactory` 给的线程名（如 `ConsumeMessageThread_`）。
 pub const DEFAULT_THREAD_NAME_PREFIX: &str = "rmq-consume";
 
-/// Java `Short.MAX_VALUE`：`AbstractConsumeMessageService#updateCorePoolSize` 的第二道守卫
-/// （`corePoolSize <= Short.MAX_VALUE`）。守卫本身在 `consumer.rs` 一侧，这里只共享常量。
 pub const SHORT_MAX_VALUE: i32 = 32767;
 
 /// 投递给执行器的一个任务，等价 Python `submit(fn, *args, **kwargs)` 的 `(fn, args, kwargs)`。
@@ -112,13 +57,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// 池子状态（对应 Python `ConsumeExecutor.__init__` 里那批 `self._xxx` 字段）。
 struct State {
-    /// Java `corePoolSize`（`self._core`）
     core: i32,
-    /// Java `maximumPoolSize`（`self._max`）
     max: i32,
-    /// 无界工作队列（Java `LinkedBlockingQueue`，`self._queue`）
     queue: VecDeque<ConsumeTask>,
-    /// 当前存活 worker 数（Java `poolSize`，`self._workers`）
     workers: i32,
     /// 线程名序号（`self._seq`），名字格式 `<prefix>-<seq>` 与 Python `%s-%d` 一致
     seq: u64,
@@ -127,9 +68,6 @@ struct State {
 }
 
 impl State {
-    /// 对应 Python `_spawn_locked` 的**记账**部分（调用方必须已持锁）：先把 `workers`
-    /// 抬上去、分配名字，再在锁外真正起任务 —— 与 Java `addWorker` 先 CAS 抬 `ctl`
-    /// 再起线程同理，避免并发提交时超建。
     fn plan_spawn_locked(&mut self, prefix: &str) -> String {
         self.workers += 1;
         let name = format!("{prefix}-{}", self.seq);
@@ -179,12 +117,6 @@ struct Inner {
     pinned: Mutex<Option<Handle>>,
 }
 
-/// core/max 两档消费线程池（对应 Java `ThreadPoolExecutor` + `LinkedBlockingQueue`，
-/// 即 Python `ConsumeExecutor`）。
-///
-/// 默认参数就是 Java `AbstractConsumeMessageService` 的构造参数：
-/// `core=consumeThreadMin`、`max=consumeThreadMax`、`keepAlive=60s`。
-///
 /// `Clone` 共享同一个池（内部 `Arc`）：Python 里 consumer 持有的是引用，Rust 侧
 /// `consumer.rs` 直接 clone 给各 POP 循环即可，不要再套一层 `Arc<ConsumeExecutor>`。
 #[derive(Clone)]
@@ -220,10 +152,6 @@ impl ConsumeExecutor {
 
     /// 对应 Python `ConsumeExecutor(core, max, keep_alive_seconds=..., thread_name_prefix=...)`
     /// （POP 路径实际用的形态，见 Python `consumer.py:789`）。
-    ///
-    /// 入参照抄 Python 的夹取：`core = max(0, core)`、`max = max(core, max)`，
-    /// 所以负数不会报错、只会退化成 0。`keep_alive == 0` 表示超编 worker 一空闲就退出
-    /// （Java `keepAliveTime=0` 同义）。
     pub fn with_params(
         core_pool_size: i32,
         maximum_pool_size: i32,
@@ -263,8 +191,6 @@ impl ConsumeExecutor {
 
     // ---------------- 对外 API ----------------
 
-    /// 投递任务（Java `ThreadPoolExecutor#execute`，Python `submit`）。
-    ///
     /// 失败只有两种：池已关闭（Python 的 `RuntimeError`，文案一致）、拿不到 tokio
     /// 运行时（差异 #1，Python 无此约束）。任务本身没有结果，所以 `Ok(())` 只表示「入队了」。
     pub fn submit(&self, task: ConsumeTask) -> Result<()> {
@@ -281,10 +207,7 @@ impl ConsumeExecutor {
                 bail!("ConsumeExecutor has been shut down");
             }
             state.queue.push_back(task);
-            // Java 无界队列语义：只有 poolSize < corePoolSize 才新建 worker
             if state.workers < state.core || state.workers == 0 {
-                // 后半句是 Java `ThreadPoolExecutor#execute` 的兜底分支：入队成功后若
-                // workerCount == 0（core=0 的配置）仍要补一个 worker，否则任务永远没人跑。
                 Some(state.plan_spawn_locked(&self.inner.prefix))
             } else {
                 None
@@ -298,10 +221,6 @@ impl ConsumeExecutor {
         Ok(())
     }
 
-    /// 对应 Java `ThreadPoolExecutor#setCorePoolSize`（Python `set_core_pool_size`）。
-    ///
-    /// Java 的实现（JDK 8+）：
-    ///
     /// ```text
     /// int delta = corePoolSize - this.corePoolSize;
     /// this.corePoolSize = corePoolSize;
@@ -332,7 +251,6 @@ impl ConsumeExecutor {
             let mut state = lock(&self.inner.state);
             let delta = n - state.core;
             state.core = n;
-            // Java 允许 core > max（会把 max 抬到 core）；这里显式对齐
             if n > state.max {
                 state.max = n;
             }
@@ -358,24 +276,19 @@ impl ConsumeExecutor {
         Ok(())
     }
 
-    /// Java `getCorePoolSize`（Python `get_core_pool_size`）：真实并发度。
     pub fn get_core_pool_size(&self) -> i32 {
         lock(&self.inner.state).core
     }
 
-    /// Java `getMaximumPoolSize`（Python `get_max_pool_size`）。
-    ///
     /// 无界队列下它只是「补线程」路径的上界，正常情况下够不到。
     pub fn get_max_pool_size(&self) -> i32 {
         lock(&self.inner.state).max
     }
 
-    /// 当前存活 worker 数（Java `getPoolSize`，Python `worker_count`）。仅供观测/单测。
     pub fn worker_count(&self) -> i32 {
         lock(&self.inner.state).workers
     }
 
-    /// 队列中待执行任务数（Java `getQueue().size()`，Python `queued_count`）。仅供观测/单测。
     pub fn queued_count(&self) -> usize {
         lock(&self.inner.state).queue.len()
     }
@@ -385,13 +298,6 @@ impl ConsumeExecutor {
         self.inner.handler_exceptions.load(Ordering::Acquire)
     }
 
-    /// 对应 Java `shutdown()`（Python `shutdown(wait=False)`）：停止接收新任务，
-    /// 但把手上的队列跑完。
-    ///
-    /// Java 的 `shutdown` **不中断**已提交任务；consumer 停止时走 `shutdownGracefully`
-    /// （先 shutdown、超时后 shutdownNow）。本方法不等价于 `shutdownNow`（不打断在跑的任务）。
-    /// 要「等跑完」就接着 [`ConsumeExecutor::await_termination`]，或直接用
-    /// [`ConsumeExecutor::shutdown_gracefully`]。重复调用是 no-op。
     pub fn shutdown(&self) {
         let first_time = {
             let mut state = lock(&self.inner.state);
@@ -407,9 +313,6 @@ impl ConsumeExecutor {
     }
 
     /// 等所有 worker 退出（Python `shutdown(wait=True)` 里那段 `Thread.join()`）。
-    ///
-    /// 得先 [`ConsumeExecutor::shutdown`]，否则本方法可能永不返回：core 内的空闲 worker
-    /// 按 Java 语义永不退出（只有超编的会在 keep_alive 后走掉）。
     pub async fn await_termination(&self) {
         loop {
             // 先登记唤醒凭据再看计数：「最后一个 worker 刚好在此刻退出」不会丢通知
@@ -423,8 +326,6 @@ impl ConsumeExecutor {
         }
     }
 
-    /// `shutdown` + `await_termination`：对应 Python `shutdown(wait=True)` 与
-    /// Java `AbstractConsumeMessageService#shutdownConsumeExecutor`。
     pub async fn shutdown_gracefully(&self) {
         self.shutdown();
         self.await_termination().await;
@@ -512,7 +413,6 @@ async fn take_task(inner: &Arc<Inner>, name: &str) -> Option<ConsumeTask> {
             );
             return None;
         }
-        // core 内的 worker 永不退出（Java `allowCoreThreadTimeOut=false`）：继续等
         drop(state);
     }
 }
@@ -604,7 +504,6 @@ mod tests {
 
     #[tokio::test]
     async fn raising_core_spawns_for_queued_tasks() {
-        // set_core_pool_size 变大且队列非空 → 立刻补足 worker（Java setCorePoolSize）
         let ex = ConsumeExecutor::with_params(1, 8, Duration::from_secs(30), "rmq-test");
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let _hold = gate.lock().await;
@@ -631,7 +530,6 @@ mod tests {
 
     #[tokio::test]
     async fn raising_core_on_empty_queue_does_not_spawn() {
-        // Java: k = min(delta, workQueue.size())，队列空 → 一个都不补
         let ex = ConsumeExecutor::with_params(1, 8, Duration::from_secs(30), "rmq-test");
         ex.set_core_pool_size(6).expect("valid core");
         assert_eq!(ex.get_core_pool_size(), 6);
@@ -650,8 +548,6 @@ mod tests {
         let ex = ConsumeExecutor::with_params(1, 4, Duration::from_millis(200), "rmq-test");
 
         ex.submit(task(async {})).expect("submit 1");
-        // 先让唯一的 worker 真把任务领走：任务还躺在队列里时 set_core_pool_size 会照 Java
-        // 的 min(delta, 队列长度) 补线程，那就不是「队列空 → 不补」这条要验证的分支了
         until("task 1 drained", || ex.queued_count() == 0).await;
         ex.set_core_pool_size(2).expect("raise core"); // 队列空 → 不补 worker，core 现在是 2
         assert_eq!(ex.get_core_pool_size(), 2);
@@ -674,7 +570,6 @@ mod tests {
         }
         assert_eq!(ex.worker_count(), 1, "超编 worker 应在 keep_alive 后退出");
 
-        // core 内的 worker 永不退出（Java allowCoreThreadTimeOut=false）
         for _ in 0..10 {
             tokio::time::advance(Duration::from_millis(300)).await;
             tokio::task::yield_now().await;
@@ -736,7 +631,6 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_waits_for_queued_tasks_to_drain() {
-        // Java shutdown() 不丢已提交任务：wait=True 要等队列跑完
         let ex = ConsumeExecutor::with_params(1, 2, Duration::from_secs(30), "rmq-test");
         let counter = Arc::new(AtomicI32::new(0));
         for _ in 0..5 {
@@ -882,7 +776,6 @@ mod tests {
 
     #[tokio::test]
     async fn tasks_run_in_fifo_order_per_worker() {
-        // 无界队列 + core=1 → 严格串行 FIFO（Java LinkedBlockingQueue 的行为）
         let ex = ConsumeExecutor::with_params(1, 4, Duration::from_secs(30), "rmq-test");
         let order = Arc::new(std::sync::Mutex::new(Vec::new()));
         for i in 0..6 {

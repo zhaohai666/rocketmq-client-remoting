@@ -9,17 +9,6 @@
 //                                                         → topic=<CLUSTER>_REPLY_TOPIC
 //                                                         → MSG_TYPE="reply"
 //     ◄── PUSH_REPLY_MESSAGE_TO_CLIENT(326) ◄─────      producer.send(reply) → 325
-//
-// 错误码两条硬断言（Java 同款，缺了就是两类故障糊成一条）：
-//   S5 无应答方 → RequestTimeoutException 带 10006 REQUEST_TIMEOUT_EXCEPTION；
-//   S8 拿客户端手里那份（没有 broker 写的 CLUSTER）造应答 → MQClientException 带
-//      10007 CREATE_REPLY_MESSAGE_EXCEPTION，文案点到缺失的 CLUSTER。
-//
-// ⚠ 两个真机必踩点：
-//   1) <cluster>_REPLY_TOPIC 是 broker 启动时注册的**系统 topic**，客户端 createTopic 它
-//      会被 INVALID_PARAMETER(29)「conflict with system topic」拒绝 —— 不要去"预建"它。
-//   2) 请求方必须先在 broker 上登记（心跳），否则 broker 按 REPLY_TO_CLIENT 找不到 channel。
-//      request() 内部已补一次心跳（对齐 Java prepareSendRequest）。
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -81,7 +70,6 @@ struct RequestRecord {
     std::string cluster;
 };
 
-// 应答方：普通 push 消费者 + 用来发应答的生产者（Java 文档里 Request-Reply 的标准写法）
 class Replier {
 public:
     Replier(const std::string& nsAddr, const std::string& group, const std::string& topic)
@@ -305,8 +293,6 @@ int main(int argc, char* argv[]) {
         }
         const int64_t s5Elapsed = nowMs() - s5Begin;
         check("S5 抛的是 RequestTimeoutException", raisedTimeout, raisedWhat);
-        // Java 抛的是 RequestTimeoutException(ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, msg)：
-        // 光有类型不够，10006 也要带上 —— 调用方按码分流时才知道"请求已投出去、只是没等到应答"。
         check("S5 异常带 10006 REQUEST_TIMEOUT_EXCEPTION",
               raisedCode == ClientErrorCode::REQUEST_TIMEOUT_EXCEPTION,
               "code=" + std::to_string(raisedCode));
@@ -351,11 +337,6 @@ int main(int argc, char* argv[]) {
             15000);
         check("S7 后续普通消息仍被消费", plain, "");
 
-        // ---------------- S8 CLUSTER 由 broker 写入；造不出应答时报 10007 ----------------
-        // Java MessageUtil.createReplyMessage（:46/49）抛的是
-        // MQClientException(CREATE_REPLY_MESSAGE_EXCEPTION=10007, ...)。这条既验"错误码带上了"，
-        // 也验它**为什么**存在：CLUSTER 是 broker 存储时补的（SendMessageProcessor:318/614），
-        // 客户端手里那份永远没有 ⇒ 应答必须建立在**投递到的**那条消息上，用错对象就撞上 10007。
         std::printf("\nS8 CLUSTER 由 broker 写入；造不出应答时报 10007 而不是别的错\n");
         RequestRecord pingRec;
         {

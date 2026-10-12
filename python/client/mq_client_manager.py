@@ -1,29 +1,4 @@
 # -*- coding: utf-8 -*-
-"""MQClientManager：同进程内按 clientId 复用 MQClientInstance。
-
-对应 Java ``org.apache.rocketmq.client.impl.MQClientManager``（``factoryTable``：
-clientId → MQClientInstance）+ ``MQClientInstance`` 的引用计数关闭语义。
-
-Java 的经典设计：同进程内同 clientId（``IP@instanceName[@unitName][@STREAM]``）的
-producer / consumer / admin 共享**同一个** MQClientInstance——路由缓存、broker 地址表、
-心跳、与 broker 的长连接、client 级处理器（326/40/220/221/307/309）都只有一份；
-引用计数归零时才真正 ``shutdown()``（停后台线程、断连接），并把条目从表里摘掉。
-
-生命周期契约（与 Java ``getOrCreateMQClientInstance`` / ``MQClientInstance.shutdown`` 一致）：
-
-* 门面 ``start()``：``get_or_create_mq_client_instance`` 拿实例（没有就建）→
-  ``register_client`` 计数 +1 → ``instance.start()``（幂等，复用时不会重复拉起
-  路由刷新 / name server 刷新 / 弹性巡检这些**实例级**后台线程）。
-* 门面 ``shutdown()``：``unregister_client`` 计数 -1；**归零**时把实例摘出缓存并
-  在锁外真正 ``shutdown()``；仍有其他门面持有（计数 > 0）时实例继续存活，
-  其后台线程与连接不受影响。
-* 配置以**第一次创建**时的快照为准（Java ``cloneClientConfig`` 同口径）：复用方后设的
-  tls / 代理 / 超时等不会改写已存在的实例。Java 还会因 rpcHook 不同的场景天然只用
-  第一份，这里一致：rpcHook 只在 ``created=True``（本门面是创建者）时才注册。
-
-线程安全：所有表操作都在单把锁内完成；真正的 ``shutdown()``（网络 I/O）在锁外执行，
-避免长时间持锁阻塞其他门面的 start/unregister。
-"""
 from __future__ import annotations
 
 import threading
@@ -48,7 +23,7 @@ class _FactoryEntry:
 
 
 class MQClientManager:
-    """进程级单例（对应 Java ``MQClientManager.getInstance()``）。"""
+    pass
 
     _INSTANCE: Optional["MQClientManager"] = None
     _SINGLETON_LOCK = threading.Lock()
@@ -63,21 +38,13 @@ class MQClientManager:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # 对应 Java ``factoryTable``：clientId → 条目。
         self._factory_table: Dict[str, _FactoryEntry] = {}
 
     # ---------------- 查询 / 创建 ----------------
     def get_or_create_mq_client_instance(
             self, client_id: str,
             factory: Callable[[], "MQClientInstance"]) -> Tuple["MQClientInstance", bool]:
-        """按 clientId 取缓存实例；没有就用 ``factory()`` 建一个并落表。
-
-        返回 ``(instance, created)``：``created=True`` 表示本调用方是创建者，
-        门面据此决定要不要注册自己的 rpcHook（复用方不注册，与 Java 只认
-        创建时那份 rpcHook 同口径）。``factory()`` 在锁外执行：构造期间若另一
-        线程已抢先落表，则**放弃自己的新实例**、返回已缓存的那份（Java
-        ``computeIfAbsent`` 的「只有赢家生效」语义）。
-        """
+        pass
         with self._lock:
             entry = self._factory_table.get(client_id)
             if entry is not None:
@@ -133,12 +100,7 @@ class MQClientManager:
 
     def remove_client_factory(self, client_id: str,
                               instance: Optional["MQClientInstance"] = None) -> None:
-        """把实例从缓存摘掉但**不** shutdown（对应 Java ``removeClientFactory``）。
-
-        ``MQClientInstance.start()`` 失败时由实例自己调用：半启动的实例不能留在
-        表里毒化后续的 ``get_or_create``；传 ``instance`` 时只摘自己的条目，
-        防止误删一个已顶替上来的新实例。
-        """
+        pass
         with self._lock:
             entry = self._factory_table.get(client_id)
             if entry is None:

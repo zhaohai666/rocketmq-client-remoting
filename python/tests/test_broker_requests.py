@@ -1,20 +1,4 @@
 # -*- coding: utf-8 -*-
-"""broker 主动请求（40/220/221/307/309）离线单测，不需要集群。
-
-为什么单独一个文件：这组请求是 broker（或 mqadmin）反向打给客户端的，对应 Java
-``ClientRemotingProcessor``。它们不在正常消费路径上，但错得同样安静 —— 比如
-ConsumerRunningInfo 的 mqTable 键是 ``MessageQueue``（fastjson2 内联成对象），一旦
-当成普通字符串键编码，broker 的 mqadmin getConsumerRunningInfo 就解析不出队列；
-又比如 220 的 resetOffset 会触发 rebalance（内部 invokeSync），若在读线程上同步跑就会
-卡死该连接上所有响应（静默自死锁）。所以离线把协议 + 分派逻辑锁死。
-
-覆盖：
-  - 四个 body 的 encode→decode 往返（重点：MessageQueue 内联键）
-  - 消费者四个处理方法（get_consumer_status / consumer_running_info /
-    consume_message_directly 的四种状态映射 / reset_offset 落位）
-  - MQClientInstance 按 consumerGroup 分派 + 读线程安全的 oneway 处理（220 丢后台线程）
-  - 40 NOTIFY_CONSUMER_IDS_CHANGED 的**实例级**注册与整组唤醒
-"""
 from __future__ import annotations
 
 import time
@@ -97,7 +81,7 @@ class TestBodyRoundTrip:
         assert m.topic == TOPIC and m.queue_id == 0 and d.offset_table[m] == 7
 
     def test_reset_offset_body_for_c_round_trip(self):
-        """数组形状（ResetOffsetBodyForC）：Java 侧只有发起方 language=CPP 才会收到。"""
+        pass
         b = ResetOffsetBodyForC()
         b.offset_table = [MessageQueueForC(topic=TOPIC, broker_name=BROKER,
                                            queue_id=1, offset=9)]
@@ -194,12 +178,7 @@ class TestConsumerHandlers:
         assert "boom" in (r.remark or "")
 
     def test_consume_message_directly_orderly_maps_commit_rollback(self):
-        """顺序侧比并发侧多 CR_COMMIT/CR_ROLLBACK 两档，且 order=True、autoCommit 回传。
-
-        映射写错是静默的：Java 顺序 consumeMessageDirectly:125-140 的这两个成员
-        broker 侧按 binlog 口径用（COMMIT = 已提交、ROLLBACK = 回滚重投），落成
-        CR_SUCCESS 只会让 mqadmin 的返回少一档语义，消费侧毫无异常。
-        """
+        pass
         for status, expect in (
             (ConsumeOrderlyStatus.SUCCESS, CMResult.CR_SUCCESS),
             (ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT, CMResult.CR_LATER),
@@ -218,26 +197,14 @@ class TestConsumerHandlers:
             assert r.auto_commit is False, status
 
     def test_consume_message_directly_orderly_none_is_return_null(self):
-        """顺序 + 无 listener：Java 顺序 :150-156 的 `status == null` → CR_RETURN_NULL。
-
-        并发侧同一分支在 :128-133；两侧都要有，漏掉就不是 CR_RETURN_NULL 而是
-        consume_result 留下初值（None），broker 解析出空串。
-        """
+        pass
         c = consumer_with_state()
         c.set_message_listener(None)
         r = c.consume_message_directly(MessageExt(topic=TOPIC, body=b"x"), BROKER)
         assert r.consume_result == CMResult.CR_RETURN_NULL
 
     def test_reset_offset_writes_position(self):
-        """220 的处理逻辑：新位点进撤销尾部落盘（不是留在内存表里）并触发 rebalance。
-
-        Java ``MQClientInstance.resetOffset:1414-1442``：``pq.setDropped(true); pq.clear()``
-        后在途批次全部作废，随后 ``updateConsumeOffset`` ＋
-        ``removeUnnecessaryMessageQueue``（**先 persist 再 removeOffset**）。所以重置后
-        ``_consume_offsets`` 里不能再有这条 —— 位点若留在表里，旧批次迟到的 ack 会把它
-        推回原处、盖掉 broker 上的新位点（这正是旧实现静默失效的地方）。新位点只经
-        ``_on_queues_revoked`` 的持久化参数出去，重建后按它重新解析。
-        """
+        pass
         c = consumer_with_state()
         events = []
         key = "%s@%s@%d" % (TOPIC, BROKER, 0)
@@ -245,9 +212,9 @@ class TestConsumerHandlers:
         c._do_rebalance = lambda: events.append("rebalance")  # type: ignore[method-assign]
         c._on_queues_revoked = lambda qs: events.append(("revoked", qs))  # type: ignore[method-assign]
         c.reset_offset(TOPIC, {mq(): 100})
-        assert key not in c._consume_offsets          # Java 的 removeOffset
+        assert key not in c._consume_offsets
         assert key not in c._mq_map
-        assert c._queue_epoch[key] == 1               # Java setDropped(true)
+        assert c._queue_epoch[key] == 1
         assert ("revoked", [(mq(), 100)]) in events   # persist 带上的是新位点
         assert "rebalance" in events
 
@@ -325,12 +292,7 @@ class TestMqClientDispatch:
         assert recorded["called"] is True
 
     def test_220_array_body_for_c_is_not_dropped(self):
-        """发起方 language=CPP 时 broker 推**数组**形状（ResetOffsetBodyForC）：必须解析出来。
-
-        Java 处理器（``ClientRemotingProcessor.resetOffset:153``）只认 map 形状 ——
-        Java 管理端恒发 JAVA，故 Java 侧碰不到该形状；本端口兜底是为了与 language=CPP 的
-        旧 C++ SDK 管理端互通，不兜底等于整笔重置**静默**丢弃（map 解析器对数组只得空表）。
-        """
+        pass
         seen = {}
         done = threading.Event()
         c = consumer_with_state()
@@ -373,8 +335,7 @@ class TestMqClientDispatch:
         assert seen["table"] == {mq(queue_id=2): 4}
 
     def test_220_garbage_body_is_still_an_empty_noop(self):
-        """负向对照：合法 JSON 但两种形状都不是 → 空表继续走下（Java 也是解出空表后照常调用，
-        由 reset_offset 内部判空），不能抛异常把读线程带崩。"""
+        pass
         seen = {}
         done = threading.Event()
         c = consumer_with_state()
@@ -392,8 +353,7 @@ class TestMqClientDispatch:
         assert seen["table"] == {}
 
     def test_220_undecodable_body_never_reaches_reset_offset(self):
-        """负向对照：连 JSON 都不是 → 与 Java 一致地整笔丢弃（Java 的解码异常从处理器里
-        抛出、由 netty 侧吞掉），本地位点一根手指都不许碰。"""
+        pass
         called = []
         c = consumer_with_state()
         c.reset_offset = lambda topic, table: called.append((topic, table))  # type: ignore[method-assign]
@@ -404,12 +364,7 @@ class TestMqClientDispatch:
         assert called == []
 
     def test_40_is_instance_level_and_wakes_every_consumer(self):
-        """40 注册在 **实例**上（Java MQClientAPIImpl 构造函数），扇给全组消费者。
-
-        曾经的 bug：每个 push 消费者各自 `register_processor(40, self._on_...)`，
-        而处理器按 code 建表 ⇒ 后启动的消费者把前一个的处理器覆盖掉，
-        组里只剩最后一个实例能被叫醒。
-        """
+        pass
         c1 = consumer_with_state()
         c2 = consumer_with_state()
         mqc = MQClientInstance("client@40", ["127.0.0.1:9876"])

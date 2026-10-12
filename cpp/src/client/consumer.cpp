@@ -431,8 +431,6 @@ void DefaultMQPushConsumer::start() {
         if (tlsOptionsSet_) {
             mqClient_->setTlsOptions(tlsOptions_);
         }
-        // SOCKS 代理（对齐 Java NettyRemotingClient#createBootstrap(SocksProxyConfig)）：
-        // 透传给传输层，首条连接建立时生效
         if (socksProxySet_) {
             mqClient_->setSocksProxy(socksProxy_);
         }

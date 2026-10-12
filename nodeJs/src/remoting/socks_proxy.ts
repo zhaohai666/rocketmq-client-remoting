@@ -1,35 +1,13 @@
 // -*- coding: utf-8 -*-
 // SOCKS proxy support for the remoting transport layer.
-//
-// Java baseline: ClientConfig#socksProxyConfig (system property
-// `com.rocketmq.socks.proxy.config`, a JSON map cidr -> SocksProxyConfig) is
-// loaded by NettyRemotingClient; the matching entry's SocksProxyConfig
-// (org.apache.rocketmq.remoting.proxy.SocksProxyConfig: addr / username /
-// password) drives a Netty Socks5ProxyHandler prepended BEFORE the SSL handler
-// — i.e. the wire order is TCP connect → SOCKS CONNECT → (optional) TLS.
-// This port reimplements the handshake by hand on the raw node:net socket
-// (zero npm deps): SOCKS5 (RFC 1928 — no-auth and RFC 1929 user/pass) plus
-// SOCKS4/4a (Java only ships SOCKS5; SOCKS4 is a port extra, hence the
-// `version` field).
-//
-// Scope vs Java: Java picks a proxy per destination CIDR out of the JSON map.
-// This port applies the single configured proxy to ALL remoting connections —
-// the `0.0.0.0/0` behaviour. TopAddressing's HTTP route fetch goes through the
-// global fetch() and never enters this layer, so it intentionally does NOT go
-// through the proxy (same as Java, where HTTP addressing runs outside
-// NettyRemotingClient).
 import net from 'node:net';
 import { Buffer } from 'node:buffer';
 
-// SocksProxyConfig fields aligned 1:1 with Java SocksProxyConfig getters/setters
-// (addr / username / password), plus `version` for the SOCKS4/5 choice.
 export interface SocksProxyConfig {
-  // 'host:port' of the SOCKS proxy server (Java getAddr/setAddr).
   addr: string;
   // Optional RFC 1929 username (SOCKS5) / userid (SOCKS4). Empty/absent = no auth.
   username?: string | null;
   password?: string | null;
-  // 4 | 5 or 'SOCKS4'/'SOCKS4a'/'SOCKS5'. Default 5 (Java Socks5ProxyHandler).
   version?: number | string | null;
 }
 
@@ -40,8 +18,6 @@ export const SOCKS5_METHOD_NO_ACCEPTABLE = 0xff;
 
 export const SOCKS4_GRANTED = 0x5a; // 90
 
-// RFC 1963... rather RFC 1928 reply codes -> human names (Java Netty
-// Socks5ProxyHandler surfaces the same codes).
 export const SOCKS5_REPLY_NAMES: Record<number, string> = {
   0x01: 'general SOCKS server failure',
   0x02: 'connection not allowed by ruleset',
@@ -225,9 +201,6 @@ export function parseSocks4ConnectReply(buf: Buffer): void {
 
 // ---------------- config parsing (env surface) ----------------
 
-// Java passes ClientConfig#socksProxyConfig around as a JSON STRING shaped
-// {cidr: SocksProxyConfig}. Accept both that shape (first entry wins — the
-// 0.0.0.0/0 behaviour) and a bare SocksProxyConfig object. null when unset.
 export function parseSocksProxyConfig(json: string | null | undefined): SocksProxyConfig | null {
   if (json == null) return null;
   const s = String(json).trim();
@@ -387,10 +360,6 @@ async function _socks4Handshake(reader: _SocksStreamReader, proxy: SocksProxyCon
   parseSocks4ConnectReply(await reader.read(8, left()));
 }
 
-// Run the SOCKS CONNECT handshake over an ALREADY TCP-connected socket to the
-// proxy, tunnelling to targetHost:targetPort. On success the socket is a raw
-// tunnel to the target (TLS, when enabled, is layered on top by the caller —
-// the Java pipeline order: Socks5ProxyHandler before the SSL handler).
 export async function socksHandshake(socket: any, proxy: SocksProxyConfig,
   targetHost: string, targetPort: number, timeoutMillis = 10000): Promise<void> {
   const version = proxyVersion(proxy); // validates addr too

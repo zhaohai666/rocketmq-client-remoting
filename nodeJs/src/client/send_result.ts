@@ -1,6 +1,3 @@
-// -*- coding: utf-8 -*-
-// Send result model + SendStatus enum (org.apache.rocketmq.client.producer.SendResult).
-// Faithful port of python/client/send_result.py.
 import { MessageQueue } from '../common/message.ts';
 
 export const SendStatus = {
@@ -78,7 +75,6 @@ export class SendResult {
   }
 }
 
-// Transaction send result (org.apache.rocketmq.client.producer.SendResult + transaction fields).
 export class TransactionSendResult extends SendResult {
   localTransactionState: number;
   constructor(

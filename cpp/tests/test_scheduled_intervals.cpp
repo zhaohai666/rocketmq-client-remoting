@@ -1,22 +1,6 @@
-// 定时任务的 initialDelay / 周期语义单测（Java MQClientInstance#startScheduledTask:389-432）。
-//
-// 为什么必须离线锁死：Java 一律用
-//   scheduleAtFixedRate(work, initialDelay, period)
-// ——**首跳落在 initialDelay 这一刻**，不是 initialDelay + period；周期在调度时定型，
-// 之后改配置不重排。旧实现写的是「先睡 initialDelay，再在循环头睡一个整周期」，
-// 于是首跳晚了整整一个周期（路由刷新默认 30s 才刷第一次），周期还写死 30s，
-// ClientConfig#pollNameServerInterval（:58）形同虚设。
-//
 // 这两个偏差在真机上都只表现为「慢」，不表现为「错」：没有报文缺字段、没有异常，
 // 只有「新 topic 的路由要等 30s 才刷新」这种没人会去计时的现象。所以这里起一个
 // 本机假 name server，记录 GET_ROUTEINFO_BY_TOPIC 的**到达时刻**，把节奏钉死。
-//
-// 覆盖：
-//   1. 五个门面的 Java 默认值：pollNameServerInterval=30000（:58）、
-//      推送消费者 persistConsumerOffsetInterval=5000（:66），且 setter 生效；
-//   2. 门面 → MQClientInstance 的透传（start() 时定型的那一份）；
-//   3. 路由刷新的**首跳落在 10ms initialDelay**（旧写法要等 30s，必然失败）；
-//   4. 周期真按构造时传入的 pollNameServerInterval 走（600ms 档：连收 3 跳）。
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -281,7 +265,6 @@ public:
 
 // ---------------------------------------------------------------- 用例
 
-// 1. Java ClientConfig:58/:66 的默认值落在**门面**上（不只是实例上）。
 void testFacadeDefaults() {
     DefaultMQProducer producer("PG_intervals_default");
     expectInt(producer.pollNameServerIntervalMillis(), 30000, "producer.pollNameServerInterval default");
@@ -310,7 +293,6 @@ void testFacadeDefaults() {
     expectInt(admin.pollNameServerIntervalMillis(), 1100, "admin setter");
 }
 
-// 2. 门面透传：start() 时把门面上的值交给 MQClientInstance（Java 的实例级副本）。
 void testForwardingToInstance(FakeNamesrv& ns) {
     const std::string topic = "SchedIntervalForward";
     ns.addRoute(topic, makeRoute(ns.address()));
@@ -385,7 +367,6 @@ void testRouteRefreshTiming(FakeNamesrv& ns) {
     }
     std::printf("\n");
 
-    // Java scheduleAtFixedRate：首跳就是 initialDelay 那一刻（10ms），绝不是 initialDelay+周期
     expect(arrivals[0] < periodMillis / 2,
            "first tick lands at the initialDelay, not one period later",
            "first=" + std::to_string(arrivals[0]) + "ms");
@@ -398,7 +379,6 @@ void testRouteRefreshTiming(FakeNamesrv& ns) {
            "gap=" + std::to_string(gap2) + "ms");
 }
 
-// 周期非法值（0 / 负）回落到 Java 默认 30000，而不是变成「每 100ms 刷一次」的忙转。
 void testBadPeriodFallsBackToDefault() {
     MQClientInstance instance("sched_bad_period_instance", {"127.0.0.1:1"}, 3000, 15000, false,
                               std::string(), 0);

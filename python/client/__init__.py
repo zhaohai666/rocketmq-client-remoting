@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""rocketmq.client - 客户端层（对应 org.apache.rocketmq.client）。"""
 from .producer import (DefaultMQProducer, TransactionMQProducer, LocalTransactionState,
                        MessageQueueSelector, SendCallback, TransactionListener)
 from .consumer import (DefaultMQPushConsumer, DefaultMQPullConsumer,

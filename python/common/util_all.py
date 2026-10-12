@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""通用工具函数（对应 org.apache.rocketmq.common.UtilAll）。"""
 from __future__ import annotations
 
 import datetime
@@ -12,14 +11,7 @@ from typing import Optional
 
 
 def utf16_int32_hash(s: str) -> int:
-    """Java `String.hashCode()`：h = 31*h + ch，按 32 位有符号回绕。
-
-    必须显式实现：Python 的 `hash(str)` 带进程级随机盐（PYTHONHASHSEED），
-    且算法与 Java 完全不同。用途之一：`SubscriptionData.codeSet`
-    （Java `FilterAPI.buildSubscriptionData` 写入 `tag.hashCode()`，
-    broker 侧 `ExpressionMessageFilter.isMatchedByConsumeQueue` 按它过滤）。
-    对拍向量：TagA=2598919、TagB=2598920、P=80、PA=2545、"*"=42。
-    """
+    pass
     h = 0
     for ch in s:
         h = (31 * h + ord(ch)) & 0xFFFFFFFF
@@ -27,7 +19,6 @@ def utf16_int32_hash(s: str) -> int:
 
 
 class UtilAll:
-    # Java 相同的日期格式化
     YYYY_MM_DD_HH_MM_SS = "%Y-%m-%d %H:%M:%S"
     YYYY_MM_DD_HH_MM_SS_SSS = "%Y-%m-%d %H:%M:%S.%f"
 
@@ -77,7 +68,6 @@ class UtilAll:
 
     @staticmethod
     def string_2_unicode_shift(index: str, offset: int) -> str:
-        # 对应 Java：取字符串与整数的异或混淆（保持接口兼容）
         if index is None:
             return index
         if offset < 0:
@@ -92,12 +82,12 @@ class UtilAll:
 
     @staticmethod
     def bytes_2_string(bs: bytes) -> str:
-        """Java UtilAll.bytes2string：逐字节转大写十六进制。"""
+        pass
         return "".join(UtilAll.HEX_ARRAY[(b >> 4) & 0x0F] + UtilAll.HEX_ARRAY[b & 0x0F] for b in bs)
 
     @staticmethod
     def string_2_bytes(hex_string: str) -> Optional[bytes]:
-        """Java UtilAll.string2bytes：十六进制字符串 -> 字节（非 UTF-8 编码）。"""
+        pass
         if hex_string is None or hex_string == "":
             return None
         hex_string = hex_string.upper()

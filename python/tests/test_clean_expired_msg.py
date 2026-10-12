@@ -1,33 +1,4 @@
 # -*- coding: utf-8 -*-
-"""cleanExpiredMsg 挂起逃生口（离线，无集群）。
-
-Java 锚点（5.5.1 逐条核对）：
-
-  * ``ConsumeMessageConcurrentlyService.java:68-88``：并发服务的构造器建
-    ``CleanExpireMsgScheduledThread_<group>`` 单线程调度，``start()`` 里
-    ``scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)``
-    —— **initialDelay 与 period 同值**（都是 ``DefaultMQPushConsumer.getConsumeTimeout()``
-    分钟，默认 15，见 ``DefaultMQPushConsumer.java:267``）；``shutdown`` 关掉它。
-  * ``:192-200``：``cleanExpireMsg()`` 遍历 rebalance 的 processQueueTable，逐个
-    ``pq.cleanExpiredMsg(pushConsumer)``。只有并发服务有这条调度（POP 的
-    ConsumeMessagePopConcurrentlyService 没有）。
-  * ``ProcessQueue.java:75-127``：顺序消费直接返回；``loop = min(size, 16)``；只看
-    ``msgTreeMap.firstEntry()``（最小位点）；没盖过 ``CONSUME_START_TIME`` 就停；
-    过期判据是**严格大于** ``consumeTimeout * 60 * 1000``；过期就
-    ``sendMessageBack(msg, 3)``，成功后再看它**仍是**队首才 ``removeMessage``。
-  * ``:366-370``：时间戳在 ConsumeRequest.run 里、正是调 listener **之前**逐条盖
-    （每次投递重盖）；POP 并发在 ``ConsumeMessagePopConcurrentlyService.java:379-385``
-    同样盖（但 POP 没有清扫）。
-  * ``:243-248``：listener 返回后回投未认可消息前先 ``containsMessage`` —— 已被清扫掉
-    的条目跳过回投，否则会重复投递。
-
-为什么必须离线锁死：这条清扫是"listener 卡死不返回"时唯一的回收路径。少了它，
-一条卡住的消息会让该队列位点永久停在原地，且没有任何异常、日志或超时可见 ——
-真机上只能靠"消息发了却永远不来第二次"这种间接现象暴露。清扫本身的窗口（分钟级）
-与 16 条上限也只有在离线用假时钟才能在秒级验证。
-
-与 C++/Rust/C# 的同名用例一一对应；真机验证见 ../verify_clean_expired_msg_live.py。
-"""
 from __future__ import annotations
 
 import threading
@@ -139,8 +110,7 @@ class Harness:
 
 # ---------------------------------------------------------------- 调度节奏
 def test_sweep_schedule_initial_delay_equals_period(monkeypatch):
-    """Java scheduleAtFixedRate(..., consumeTimeout, consumeTimeout, MINUTES)：
-    initialDelay == period == consumeTimeout 分钟（默认 15 → 900s）。"""
+    pass
     c = DefaultMQPushConsumer(GROUP)
     c._started = True
     swept = []
@@ -177,7 +147,7 @@ def test_sweep_loop_exits_when_stopped_before_first_tick():
 
 
 def test_sweep_loop_survives_a_failing_pass():
-    """Java 的调度壳子 catch (Throwable)：单轮出错不能打死调度（:77-81）。"""
+    pass
     c = DefaultMQPushConsumer(GROUP + "_resilient")
     c._started = True
     calls = []
@@ -223,7 +193,7 @@ def test_expired_first_entry_is_sent_back_at_delay_3_then_removed(monkeypatch):
 
 
 def test_unstamped_first_entry_blocks_the_whole_pass(monkeypatch):
-    """只看队首：队首没盖过章（还没进过 listener）就停，后面过期也轮不到（Java:87-90）。"""
+    pass
     h = Harness()
     clock = Clock()
     monkeypatch.setattr("client.consumer.time", clock)
@@ -238,7 +208,7 @@ def test_unstamped_first_entry_blocks_the_whole_pass(monkeypatch):
 
 
 def test_expiry_is_strictly_greater_than_timeout(monkeypatch):
-    """等于阈值不算过期，多 1ms 才算（Java:89 的 ``>``）。"""
+    pass
     h = Harness()
     clock = Clock()
     monkeypatch.setattr("client.consumer.time", clock)
@@ -254,7 +224,7 @@ def test_expiry_is_strictly_greater_than_timeout(monkeypatch):
 
 
 def test_orderly_consumer_is_never_swept():
-    """Java ProcessQueue.cleanExpiredMsg:76-78：顺序消费直接返回（回投会乱序）。"""
+    pass
     h = Harness(orderly=True)
     m = stamp(msg(0), int(time.time() * 1000) - 3600_000)
     h.inflight([m])
@@ -266,7 +236,7 @@ def test_orderly_consumer_is_never_swept():
 
 
 def test_at_most_sixteen_messages_per_pass():
-    """Java:80 的 ``min(size, 16)``：一轮最多 16 条，剩下的下一轮继续。"""
+    pass
     h = Harness()
     old = int(time.time() * 1000) - h.timeout_ms - 1
     h.inflight([stamp(msg(i), old) for i in range(20)])
@@ -281,7 +251,7 @@ def test_at_most_sixteen_messages_per_pass():
 
 
 def test_failed_send_back_keeps_the_message_for_the_next_pass():
-    """Java:122-125：回投失败只记日志、绝不摘除（摘了就真丢了）。"""
+    pass
     h = Harness()
     old = int(time.time() * 1000) - h.timeout_ms - 1
     m = stamp(msg(0), old)
@@ -299,7 +269,7 @@ def test_failed_send_back_keeps_the_message_for_the_next_pass():
 
 
 def test_sweep_only_looks_at_messages_registered_for_held_queues(monkeypatch):
-    """清扫范围 = 当前持有的队列（Java 遍历 processQueueTable）：撤销过的队列不再被扫。"""
+    pass
     h = Harness()
     clock = Clock()
     monkeypatch.setattr("client.consumer.time", clock)
@@ -332,8 +302,7 @@ def test_concurrent_batch_registers_inflight_and_send_back_proceeds(monkeypatch)
 
 
 def test_send_back_skips_a_message_the_sweep_already_reclaimed(monkeypatch):
-    """Java:243-248 的 containsMessage 闸门：listener 挂着期间被清扫回投的消息，
-    listener 事后返回 RECONSUME_LATER 时**不能再回投一次**。"""
+    pass
     h = Harness()
     clock = Clock()
     monkeypatch.setattr("client.consumer.time", clock)
@@ -352,14 +321,12 @@ def test_send_back_skips_a_message_the_sweep_already_reclaimed(monkeypatch):
     assert h.c._consume_batch(h.key, h.mq, [m]) is True
     assert swept == [[0]], "listener 期间清扫必须已把它回投"
     assert h.backed == [(m, 3)], "整条链路上只允许一次回投"
-    # Java removeMessage(msgs) 里含这条已摘除的消息：位点照样推到它后面
     assert h.c._consume_offsets[h.key] == 1
     assert h.c._inflight_msgs.get(h.key) is None
 
 
 def test_sweep_can_reclaim_a_requeued_buffered_message(monkeypatch):
-    """回塞到本地缓冲的批次保留旧时间戳（Java makeMessageToConsumeAgain 同理），
-    队首又是它时清扫照样能回收，摘除要落到缓冲上。"""
+    pass
     h = Harness()
     clock = Clock()
     monkeypatch.setattr("client.consumer.time", clock)

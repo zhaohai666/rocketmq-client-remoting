@@ -1,29 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消费侧统计（对应 org.apache.rocketmq.client.stat.ConsumerStatsManager 与
-org.apache.rocketmq.common.stats.{StatsItem,StatsItemSet,StatsSnapshot}）。
-
-Java 真实模型（5.5.1 源码逐条核对，**不是**按名字想象的"每分钟一个桶"）：
-
-* ``StatsItem`` 持有**累计值** value / times（只增不减），以及两个采样快照链：
-  ``csListMinute``（每 10s 采一个累计点）与 ``csListHour``（每 10 分钟采一个累计点）；
-* 快照计算 ``computeStatsData``（StatsItem.java:53-79）::
-
-      sum      = last.value - first.value          # 窗口内的增量
-      tps      = sum * 1000.0 / (last.ts - first.ts)  # 每秒（注意不是每分钟！）
-      timesDiff= last.times - first.times
-      avgpt    = timesDiff > 0 ? sum / timesDiff : 0  # "每次调用的平均量"——RT 项即平均耗时
-
-* TPS 类计数（PULL_TPS 等）调用 ``addValue(key, msgs, 1)``：value 累加**消息数**、
-  times 累加**调用次数** → tps = 调用次数/秒；
-* RT 类计数（PULL_RT 等）调用 ``addRTValue(key, rt, 1)``：value 累加耗时、times 累加次数
-  → avgpt = 平均耗时（毫秒）；
-* ``consumeStatus(group, topic)`` 全部取 **minute** 快照：pullRT/consumeRT 用 avgpt，
-  pullTPS/consumeOKTPS/consumeFailedTPS 用 tps，consumeFailedMsgs 用 failed 的 **hour**
-  窗口 sum（Java 特意跨窗口取数，照抄）。
-
-与 Java 的**实现差异**（语义不变）：Java 给每个 StatsItem 单独排 10s/10min 的采样任务，
-这里由 ConsumerStatsManager 的**一个**采样线程统一巡采 —— 采样精度相同（10s），线程省。
-"""
 
 from __future__ import annotations
 
@@ -37,16 +12,14 @@ from remoting.protocol.body import ConsumeStatus
 
 logger = get_logger(__name__)
 
-# 采样参数（Java StatsItem.init 的 scheduleAtFixedRate 参数）
 SAMPLING_INTERVAL_SECONDS = 10.0
 HOUR_SAMPLING_INTERVAL_SECONDS = 600.0
-# 快照链长度（Java csListMinute 最多约 60 个点 ≈ 10 分钟窗口）
 MINUTE_LIST_MAX = 60
 HOUR_LIST_MAX = 60
 
 
 class StatsSnapshot:
-    """对应 Java StatsSnapshot：sum / tps / avgpt / times。"""
+    pass
 
     __slots__ = ("sum", "tps", "avgpt", "times")
 
@@ -62,7 +35,7 @@ class StatsSnapshot:
 
 
 def compute_stats_data(cs_list) -> StatsSnapshot:
-    """Java ``StatsItem.computeStatsData`` 逐条照抄（StatsItem.java:53-79）。"""
+    pass
     ss = StatsSnapshot()
     if not cs_list:
         return ss
@@ -134,7 +107,7 @@ class StatsItem:
 
 
 class StatsItemSet:
-    """key -> StatsItem（对应 Java StatsItemSet；key = topic@group）。"""
+    pass
 
     def __init__(self, stats_name: str) -> None:
         self.stats_name = stats_name
@@ -170,12 +143,7 @@ class StatsItemSet:
 
 
 class ConsumerStatsManager:
-    """消费统计管理器（Java ConsumerStatsManager）。
-
-    五个 StatsItemSet，key 一律是 ``topic@group``：
-    PULL_RT / PULL_TPS / CONSUME_RT / CONSUME_OK_TPS / CONSUME_FAILED_TPS。
-    ``start()`` 起一个统一采样线程（10s 分钟级 + 每 60 轮即 10 分钟做小时级）。
-    """
+    pass
 
     def __init__(self) -> None:
         self.topic_and_group_pull_rt = StatsItemSet("PULL_RT")
@@ -195,8 +163,6 @@ class ConsumerStatsManager:
 
     # ---------------- 生命周期 ----------------
     def start(self) -> None:
-        # Java 的 start() 是空实现（采样挂在每个 StatsItem 的调度器上）；
-        # 这里收敛为一个统一采样线程，精度不变（10s）。
         if self._thread is not None:
             return
         self._stop.clear()
@@ -220,7 +186,6 @@ class ConsumerStatsManager:
                 for s in self._sets:
                     s.sample_hour_all()
 
-    # ---------------- 记数（Java ConsumerStatsManager 同名方法）----------------
     @staticmethod
     def _key(topic: str, group: str) -> str:
         return "%s@%s" % (topic, group)
@@ -242,8 +207,7 @@ class ConsumerStatsManager:
 
     # ---------------- 查询 ----------------
     def consume_status(self, group: str, topic: str) -> ConsumeStatus:
-        """Java ``ConsumerStatsManager.consumeStatus``：全部取 minute 快照；
-        consumeFailedMsgs 取 failed 的 **hour** 窗口 sum（Java 特意跨窗口，照抄）。"""
+        pass
         cs = ConsumeStatus()
         key = self._key(topic, group)
         ss = self.topic_and_group_pull_rt.find(key)

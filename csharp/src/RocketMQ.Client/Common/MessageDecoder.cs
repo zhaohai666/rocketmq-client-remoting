@@ -1,14 +1,8 @@
-// 消息二进制编解码（对应 org.apache.rocketmq.common.message.MessageDecoder）。
-//
 // 严格对齐 cpp/include/rocketmq/common/message_decoder.h 与 message_decoder.cpp
 // （已对真实 5.5.1 集群验证），两条**互不可混用**的路径：
 //   1) 17 段存储格式：EncodeMessageExt / DecodeMessage / DecodeMessages（broker 写入与 pull 返回）；
 //   2) 6 段轻量格式：EncodeMessage / EncodeMessages / DecodeBatchMessage / DecodeBatchMessages（批量 body）。
 //
-// 压缩说明：与 Java/Python 对齐——消息体压缩用 **zlib 流格式**（RFC1950），
-// 压缩类型取自 sysFlag 的 bit8~10；类型位为 0 的老版本消息按 ZLIB 解。
-// 编解码统一走 CompressorFactory（见 Common/Compression.cs），
-// 失败或不支持的类型会抛异常，而不是静默透传压缩字节。
 //
 // 17 段存储格式字段顺序与偏移（大端，单位字节）：
 //   0  TOTALSIZE(4)
@@ -44,7 +38,6 @@ public static class MessageDecoder
     public const int MessageMagicCodeV2 = -626843477;
     public const int BlankMagicCode = -875286124;
 
-    // 字段固定偏移，与 Java MessageDecoder 常量一致。
     public const int MessageMagicCodePosition = 4;
     public const int MessageFlagPosition = 16;
     public const int MessagePhysicOffsetPosition = 28;
@@ -111,7 +104,6 @@ public static class MessageDecoder
 
     // ------------------------------------------------------- 属性串 <-> Map
 
-    // Java MessageDecoder.messageProperties2String：k\x01v\x02 逐项拼接。
     public static string MessagePropertiesToString(PropertyMap properties)
     {
         var outStr = new StringBuilder();
@@ -126,7 +118,6 @@ public static class MessageDecoder
         return outStr.ToString();
     }
 
-    // Java MessageDecoder.string2messageProperties。
     public static PropertyMap StringToMessageProperties(string propertiesStr)
     {
         var result = new PropertyMap();
@@ -172,7 +163,6 @@ public static class MessageDecoder
         return UtilAll.Bytes2String(raw.ToArray());
     }
 
-    // Java MessageDecoder.decodeMessageId -> (ip, port, offset)。
     public static bool DecodeMessageId(string msgId, out string ip, out int port, out long offset)
     {
         ip = string.Empty;
@@ -199,8 +189,6 @@ public static class MessageDecoder
 
     public static byte[] EncodeMessageExt(MessageExt messageExt, bool needCompress = false)
     {
-        // 压缩：仅在 needCompress 且 sysFlag 已置 COMPRESSED_FLAG 时执行。
-        // 与 Java MessageDecoder.encode 一致，压缩类型取自 sysFlag 的 bit8~10。
         byte[] body = MaybeCompress(messageExt.Body, needCompress, messageExt.SysFlag);
         int bodyLength = body.Length;
 
@@ -255,7 +243,6 @@ public static class MessageDecoder
         return buf.ToArray();
     }
 
-    // 解码失败返回 false（对应 Java decode 返回 null）。
     public static bool DecodeMessage(byte[] raw, out MessageExt outMsg, bool readBody = true,
         bool decompressBody = true, bool isClient = true, bool checkCrc = false)
     {
@@ -267,7 +254,7 @@ public static class MessageDecoder
             int magicCode = r.ReadInt32();
             if (magicCode != MessageMagicCode && magicCode != MessageMagicCodeV2)
             {
-                return false; // 未知魔数 -> 解码失败（对应 Java 返回 null）
+                return false;
             }
 
             bool useV2 = magicCode == MessageMagicCodeV2;
@@ -328,15 +315,9 @@ public static class MessageDecoder
                         return false;
                     }
 
-                    // 解压：与 Java MessageDecoder.decode 一致，压缩类型取自 sysFlag 的 bit8~10。
-                    // 类型位为 0 的老版本压缩消息由 CompressionType.findByValue 映射到 ZLIB。
-                    // **失败或不支持的类型会抛异常**，绝不返回压缩字节——否则上层会把压缩流当正文，
-                    // 属静默数据损坏（Java 同样是抛 IOException / RuntimeException）。
                     body = MaybeDecompress(body, decompressBody, sysFlag);
                     outMsg.Body = body;
                     outMsg.HasBody = true;
-                    // 对齐 Java：解压成功后清掉 COMPRESSED_FLAG（保留 bit8~10 的类型位）。
-                    // 条件与 Java `if (deCompressBody && isCompressed(sysFlag))` 完全相同。
                     if (decompressBody && MessageSysFlag.IsCompressed(sysFlag))
                     {
                         outMsg.SysFlag = MessageSysFlag.ClearCompressedFlag(sysFlag);
@@ -420,7 +401,6 @@ public static class MessageDecoder
 
     // --------------------------------------- 2) 6 段轻量格式：批量消息 body
 
-    // Java MessageDecoder.encodeMessage(Message)。
     public static byte[] EncodeMessage(Message message)
     {
         byte[] body = message.Body;
@@ -441,7 +421,6 @@ public static class MessageDecoder
         return buf.ToArray();
     }
 
-    // Java MessageDecoder.encodeMessages(List<Message>)。
     public static byte[] EncodeMessages(List<Message> messages)
     {
         var outBuf = new ByteWriter();
@@ -453,7 +432,6 @@ public static class MessageDecoder
         return outBuf.ToArray();
     }
 
-    // Java MessageDecoder.decodeMessage(ByteBuffer)：单条批量单元 -> Message。
     public static bool DecodeBatchMessage(byte[] raw, out Message outMsg)
     {
         outMsg = new Message();
@@ -486,7 +464,6 @@ public static class MessageDecoder
         }
     }
 
-    // Java MessageDecoder.decodeMessages(ByteBuffer)：批量 body -> Message 列表。
     public static List<Message> DecodeBatchMessages(byte[] raw)
     {
         var result = new List<Message>();
@@ -517,7 +494,6 @@ public static class MessageDecoder
         return result;
     }
 
-    // Java MessageDecoder.countInnerMsgNum。
     public static int CountInnerMsgNum(byte[] raw)
     {
         int count = 0;
@@ -562,10 +538,6 @@ public static class MessageDecoder
         return CompressorFactory.Compress(body, type, GetCompressLevel());
     }
 
-    // 解压：与 Java MessageDecoder.decode 一致，压缩类型取自 sysFlag 的 bit8~10。
-    // 类型位为 0 的老版本压缩消息由 CompressionType.findByValue 映射到 ZLIB。
-    // **失败或不支持的类型会抛异常**，绝不返回压缩字节——否则上层会把压缩流当正文，
-    // 属静默数据损坏（Java 同样是抛 IOException / RuntimeException）。
     private static byte[] MaybeDecompress(byte[] body, bool decompressBody, int sysFlag)
     {
         if (!decompressBody)
@@ -582,7 +554,6 @@ public static class MessageDecoder
         return CompressorFactory.Decompress(body, type);
     }
 
-    // 压缩级别从环境变量 rocketmq.message.compressLevel 取（默认 5，与 Java 一致）。
     private static int GetCompressLevel()
     {
         string? v = Environment.GetEnvironmentVariable(MixAll.MessageCompressLevel);

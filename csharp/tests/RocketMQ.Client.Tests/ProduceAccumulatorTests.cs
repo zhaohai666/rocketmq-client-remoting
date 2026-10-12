@@ -1,19 +1,4 @@
 // ProduceAccumulator（自动攒批）的离线单测 —— 与 python/tests/test_produce_accumulator.py 同题。
-//
-// 对齐基准（Java 5.5.0，逐行读过 client/src/main/java/org/apache/rocketmq/client/producer/
-// ProduceAccumulator.java 与 DefaultMQProducer.java:434-452 / 759-793 / 1186-1241 / 1475-1490）：
-//   * 归并键 = AggregateKey(topic, mq, waitStoreMsgOK, tag)，四维任一不同就分成两批；
-//   * TryAddMessage 是全局字节闸门（放行即记账、批次**发完**才归还），而"不能攒批"的四条
-//     排除项**不归还**已记账的字节（上游遗漏，照抄）；
-//   * 批量应答按逗号拆条；不含逗号时所有下标**共享同一个** SendResult 实例；
-//   * 同步 Add 收集 KEYS、异步 Add 不收集（上游的不对称行为），批级 KEYS 无条件写出；
-//   * 守卫线程每 max(1, holdMs/2) ms 一轮：同步版叫醒等待者，异步版直接发；只摘
-//     MessagesSize == 0 的空批次，已发完的批次会**留在表里**直到下一次同键 Send 拿到它；
-//   * MessageBatch（Message.IsBatch）不再进累加器，否则无限递归（它正是累加器发出去的东西）。
-//
-// ⚠ 本端的 MessageBatch.GenerateFromList 会逐条给子消息补 UNIQ_KEY（对齐 Java
-// DefaultMQProducer.batch()），所以造参考批量体时两边必须拿**同一批已打过 ID**的消息：
-// MakeMessages 里先打一遍即可（真实调用链里 sendByAccumulator 也是先打 ID 再进累加器）。
 using System.Globalization;
 using System.Text;
 using RocketMQ.Client;
@@ -27,8 +12,6 @@ public class ProduceAccumulatorTests
 
     // ---------------------------------------------------------------- 夹具
 
-    /// <summary>只覆写 <see cref="DefaultMQProducer.SendDirect" /> 的假生产者
-    /// （Java 单测里的 MockMQProducer 同款）：记下每一次发送，回一个可脚本化的 SendResult。</summary>
     private sealed class FakeProducer : DefaultMQProducer
     {
         private readonly object _gate = new();
@@ -57,7 +40,6 @@ public class ProduceAccumulatorTests
         }
     }
 
-    /// <summary>把回调收集起来的 SendCallback（Java 单测里 CollectingSendCallback 同款）。</summary>
     private sealed class CollectingCallback : ISendCallback
     {
         private readonly object _gate = new();
@@ -114,8 +96,6 @@ public class ProduceAccumulatorTests
         }
     }
 
-    /// <summary>与 Java 单测同款 body（1/22/333/4444/55555 字节）。
-    /// 先打 UNIQ_KEY：见文件头最后一段。</summary>
     private static List<Message> MakeMessages(int n = 5)
     {
         var messages = new List<Message>();
@@ -167,7 +147,6 @@ public class ProduceAccumulatorTests
         Assert.Equal(10, acc.HoldMs);
         Assert.Equal(32 * 1024, acc.HoldSize);
         Assert.Equal(32L * 1024 * 1024, acc.TotalHoldSize);
-        // Java 的 getTotalBatchMaxBytes 实际返回 holdSize（上游笔误，照抄）
         Assert.Equal(32 * 1024, acc.GetTotalBatchMaxBytes());
         Assert.Equal(0, acc.CurrentlyHoldSize);
     }
@@ -193,14 +172,12 @@ public class ProduceAccumulatorTests
     [Fact]
     public void ProducerGetters_ReturnZeroBeforeAccumulatorExists()
     {
-        // Java：累加器为 null 时三个 getter 返回 0，getAutoBatch() 返回 false。
         var producer = new DefaultMQProducer("PG_AccumGetter");
         Assert.Equal(0, producer.BatchMaxDelayMs);
         Assert.Equal(0, producer.BatchMaxBytes);
         Assert.Equal(0, producer.TotalBatchMaxBytes);
         Assert.False(producer.AutoBatch);
         producer.AutoBatch = true;
-        // 仍然没有累加器 → 依然 false（Java 的 getAutoBatch 有 null 短路）
         Assert.False(producer.AutoBatch);
     }
 
@@ -219,7 +196,6 @@ public class ProduceAccumulatorTests
         Assert.Equal(50, acc.GetBatchMaxDelayMs());
         Assert.Equal(1024, acc.GetBatchMaxBytes());
         Assert.Equal(4096, acc.TotalHoldSize);
-        // 累加器建好之后 setter 立刻生效（Java 同）
         producer.BatchMaxDelayMs = 80;
         Assert.Equal(80, acc.GetBatchMaxDelayMs());
         // 再来一个同 clientId 的 producer → 复用同一个累加器
@@ -236,7 +212,6 @@ public class ProduceAccumulatorTests
         var ten = new Message(Topic, Encoding.ASCII.GetBytes("1234567890"));
         Assert.True(acc.TryAddMessage(ten));
         Assert.Equal(10, acc.CurrentlyHoldSize);
-        // 额度已满（Java：`currentlyHoldSize < totalHoldSize` 才放行）
         Assert.False(acc.TryAddMessage(new Message(Topic, Encoding.ASCII.GetBytes("x"))));
         Assert.Equal(10, acc.CurrentlyHoldSize);
         acc.ReleaseHold(10);
@@ -307,14 +282,8 @@ public class ProduceAccumulatorTests
         Assert.IsType<MessageBatch>(sentMsg);
         Assert.Null(sentMq);        // 没指定 mq → 由 producer 轮询选
         Assert.Null(sentCallback);  // 同步路径没有回调
-        // 子消息集合与参考批量体一致。⚠ 只比长度不比字节：5 条是**不同线程**并发 add 的，
-        // 批内顺序不确定（Java 的同步用例也因此只断言长度，只有单线程的异步用例才全等比较）。
         Assert.Equal(ReferenceBatchBody(messages).Length, sentMsg.Body.Length);
 
-        // 拆条结果是**按批内位置**下发的，而位置由 Add 的先后决定 —— 5 条消息是并发 add 的，
-        // 「哪条消息拿哪个下标」不确定（Java 的单测同样只能断言"成套"关系）。所以这里验两件事：
-        // ① 五条 MsgId 一个不少；② 同一条结果里 id-N ↔ off-N ↔ 100+N 必须成套（串了就说明
-        //    SplitSendResults 的下标算错了）。
         Assert.Equal(new[] { "id-0", "id-1", "id-2", "id-3", "id-4" },
             collected.Select(r => r!.MsgId).OrderBy(x => x, StringComparer.Ordinal).ToArray());
         foreach (SendResult? result in collected)
@@ -383,7 +352,6 @@ public class ProduceAccumulatorTests
         Assert.NotNull(sentCallback);   // 异步路径回调不为 null
         // 单线程依次 add → 批内顺序确定，可以逐字节比
         Assert.Equal(ReferenceBatchBody(messages), sentMsg.Body);
-        // 异步批次**不**收集 keys（Java 的不对称行为），但批级 KEYS 仍被无条件写出（空串）
         Assert.Equal(string.Empty, sentBatch.Keys);
         Assert.True(sentBatch.Properties.ContainsKey(MessageConst.PropertyKeys));
     }
@@ -431,7 +399,6 @@ public class ProduceAccumulatorTests
     [Fact]
     public void SendWithMessageQueue_PinsTheBatch()
     {
-        // 指定 mq（Java 的 send(msg, mq, producer)）：mq 原样透传给 SendDirect。
         var mq = new MessageQueue(Topic, "broker-pinned", 2);
         var producer = new FakeProducer();
         var acc = new ProduceAccumulator("pinned");
@@ -574,11 +541,6 @@ public class ProduceAccumulatorTests
     [Fact]
     public void Guard_KeepsClosedBatchUntilNextSend()
     {
-        // 守卫线程的清理口径（Java GuardForSyncSendService.doWork）：**只**清理
-        // MessagesSize == 0 的批次。
-        // ⚠ 发完的批次 MessagesSize 仍 > 0（send() 只置 closed，不重置 messagesSize）——
-        // 所以它会**留在表里**，直到下一次同键 Send 拿到它、Add 返回 -1 才被摘掉重取。
-        // 别把"发完即摘表"当成 Java 行为。
         var producer = new FakeProducer();
         var acc = new ProduceAccumulator("guard-keep");
         acc.Start();
@@ -650,14 +612,12 @@ public class ProduceAccumulatorTests
         grouped.PutProperty("PGROUP", "PG_x");
         Assert.False(producer.CanBatch(grouped));
 
-        // ⚠ 被拒的几条**不归还**已经在闸门里记下的字节数（Java 遗漏，照抄）
         Assert.True(acc.CurrentlyHoldSize > 0);
     }
 
     [Fact]
     public void SendByAccumulator_StampsUniqIdThenAccumulates()
     {
-        // sendByAccumulator 先过本地校验、补 UNIQ_KEY，再交给累加器（Java :778-793）。
         var acc = new ProduceAccumulator("send-by-accum");
         acc.BatchMaxDelayMs(3000);
         var stub = new FakeProducer { ProduceAccumulator = acc };
@@ -685,7 +645,6 @@ public class ProduceAccumulatorTests
     [Fact]
     public void MessageBatch_NeverEntersAccumulator()
     {
-        // batch 消息不再攒批（Java `!(msg instanceof MessageBatch)`）→ 直接进直发路径。
         var producer = new DefaultMQProducer("PG_NoRecurse")
         {
             ClientId = "accum-norecurse-" + Guid.NewGuid().ToString("N"),

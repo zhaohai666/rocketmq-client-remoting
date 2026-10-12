@@ -1,42 +1,3 @@
-// 消费侧补齐真机验证（对齐 Java：回投 / 位点持久化 / 顺序锁 / 广播 / 流控 / rebalance / 注销）。
-// 用法：rmq redelivery [namesrv]
-//
-// S1 回投 / S2 位点持久化 / S3 顺序消费+broker 锁 / S4 广播 / S5 流控
-// S6 集群多实例 rebalance（均分队列、不重不漏、无重复消费，且两侧都收到 broker 反推的 40）
-// S7 优雅注销（shutdown 发 UNREGISTER_CLIENT，broker 端立刻摘除）
-// S9 死信终态：maxReconsumeTimes=2 ⇒ 恰好投递 3 次（reconsumeTimes 0/1/2），第 3 次回投后
-//    broker 改投 %DLQ%<group>（自动建 topic 并注册路由），死信里 reconsumeTimes=3、
-//    RETRY_TOPIC 保留业务 topic，且原组不再有第 4 次投递
-// S10 部分 ack（ackIndex）：一批 3 条只认可第 1 条 ⇒ 尾巴 2 条经 %RETRY% 重投
-//    （reconsumeTimes>=1、listener 看到业务 topic）、已认可的那条整个窗口只投一次、
-//    3 条最终全部消费完、业务队列位点仍整批提交到 3；对照组（不碰 ackIndex）一条都不回投
-// S11 拉取停摆自愈（Java isPullExpired，阈值 120s）：1 队列 topic 先消费 3 条并把位点提交到 3，
-//    再把该队列登记的循环线程换成一条永远起不来的占位线程（= 循环被异常打穿）⇒ 立刻判停摆 ⇒
-//    叫醒生产 rebalance ⇒ 断言它被撤掉重建（新线程接管并重新盖章），之后 3 条照样消费、
-//    位点前进到 6；另有一轮"盖章倒拨 125s"验证阈值那一支与运行信息的 lastPullTimestamp；
-//    最终 9 条各只投一次、reconsumeTimes 全 0（撤走前持久化了位点，重建后从 broker 续拉）
-// S12 顺序消费毒消息：listener 一直 SUSPEND + maxReconsumeTimes=2 ⇒ 本地恰好投 3 次
-//    （reconsumeTimes 0/1/2，每次自己 +1），第 3 次交 broker 后业务队列继续前进，消息因
-//    rebalance 锁未过期被 broker 立刻改投 %DLQ%<group>（reconsumeTimes=3、RETRY_TOPIC 保留业务 topic）
-// S12b 顺序侧的 -1 是**不设上限**（投过 >=18 次、%DLQ% 空），不是并发侧的 16
-// S12c context.SuspendCurrentQueueTimeMillis 优先于消费者配置（配置 900/context 70 ⇒ 相邻投递
-//    中位间隔贴着 70ms+50ms 节拍；context -1 ⇒ 回落配置 400ms；1ms/0 两个非法值钳到下限不忙等）
-// S13 顺序侧显式批量 ack（COMMIT，autoCommit=false）/ 显式回滚（ROLLBACK 当场重投）：
-//    Java ConsumeMessageOrderlyService#processConsumeResult:270-300 —— a) COMMIT 一批 3 条一次
-//    认可（位点直接到 3）；b) ROLLBACK 把这条退回**本地**重投（间隔贴着 200ms 挂起，reconsumeTimes
-//    不动、topic 不变、后面的消息不越位；回滚 6 次后提交，位点到 2）；c) autoCommit=true 时
-//    ROLLBACK 是非法用法，只 warn 并按成功 ack（head 只投一次、next 立刻被消费、位点到 2）
-// S14 correctTagsOffset（Java DefaultMQPushConsumerImpl:713-717，调用点 :394-401）：空应答
-//    （NO_NEW_MSG / NO_MATCHED_MSG）时把"已消费位点"抬到拉取游标（只前进不回退，且闸门要求
-//    ProcessQueue 里既没有待消费也没有在途批次）。三腿：a) 对照组 TagA 正常收齐 5 条且
-//    committed == 各队列 maxOffset（数值口径）；b) TagB 永不匹配 ⇒ listener 零投递但每条队列的
-//    committed 仍 == maxOffset（不修正就永远查无记录）；c) %RETRY%<group> 空队列出现 0 位点记录
-//
-// ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 PrepareTopic）。消费者不做默认 topic 兜底
-//   （对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），topic 不存在时消费者拿不到
-//   路由 → 不分配队列 → 不消费；等它自己发现路由时，CONSUME_FROM_LAST_OFFSET 已把位点解析到
-//   "发现时刻的最新"，期间生产的消息会被正常跳过（Java 同样）。那是语义正确但测不出东西的
-//   假失败，不是客户端 bug。
 using System.Text;
 
 using RocketMQ.Client;
@@ -636,16 +597,6 @@ public static class LiveRedelivery
         }
     }
 
-    /// <summary>
-    /// 死信终态。为什么只能真机验：「重试到第几次算用尽」两端各写一半——客户端只把
-    /// maxReconsumeTimes 塞进 CONSUMER_SEND_MSG_BACK 请求头（Java
-    /// DefaultMQPushConsumerImpl#sendMessageBack:773，-1 时按 16 传，见 #getMaxReconsumeTimes:890），
-    /// 判定与改投 %DLQ%&lt;group&gt; 全在 broker（AbstractSendMessageProcessor#consumerSendMsgBack:183
-    /// 用 `msgExt.getReconsumeTimes() &gt;= maxReconsumeTimes`，注意是 &gt;= 不是 &gt;；转死信时
-    /// topic 换成 MixAll.GetDlqTopic(group)、顺手建 topic 并注册路由，:226 又给 reconsumeTimes +1）。
-    /// 两种写反都表现为「看起来正常」：漏传 header ⇒ broker 用订阅组默认 16 次，测试等到天荒地老；
-    /// &gt;= 写成 &gt; ⇒ 多投一次才进死信。离线单测锁不住任何一边。
-    /// </summary>
     private static void ScenarioDlq(DefaultMQProducer producer)
     {
         const int maxReconsume = 2;
@@ -715,7 +666,6 @@ public static class LiveRedelivery
         private readonly List<(string Body, string Topic, int ReconsumeTimes)> _seen = new();
         private readonly List<int> _batchSizes = new();
 
-        /// <summary>&lt; 0 = 完全不碰 ackIndex（对照组，走 Java 默认的整批认可）。</summary>
         private readonly int _ackFirst;
 
         public PartialAckListener(int ackFirst) => _ackFirst = ackFirst;
@@ -752,16 +702,6 @@ public static class LiveRedelivery
         }
     }
 
-    /// <summary>
-    /// 部分 ack（ackIndex）。为什么只能真机验：Java
-    /// ConsumeMessageConcurrentlyService#processConsumeResult:207-269 在 CONSUME_SUCCESS 时
-    /// 把 listener 写的 ackIndex 当切点——前缀提交位点、尾巴逐条 sendMessageBack；
-    /// 默认 Integer.MAX_VALUE 就是整批认可。离线单测（tests/.../ConsumeAckIndexTests.cs）
-    /// 只能锁「回投**失败**时位点不越过它」——未 start 的消费者回投必败；
-    /// 「回投成功时尾巴真被 broker 收下重投、已 ack 的那条整个窗口只投一次、业务队列位点仍整批
-    /// 前进」只有真 broker 说了算。两种写错在离线看不出差别：忘记回投（尾巴静默丢失，
-    /// 收到的条数照样对）、把已 ack 的前缀也回投（看起来"没丢"，其实是重复投递）。
-    /// </summary>
     private static void ScenarioPartialAck(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_AckIndex";
@@ -879,26 +819,7 @@ public static class LiveRedelivery
         cc.Shutdown();
     }
 
-    // ---------------- S11 拉取停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME=120s）----------------
 
-    /// <summary>
-    /// 一路拉取循环死了之后，下一趟 rebalance 必须把它**撤掉重建**，而且撤走前要把已消费位点
-    /// 持久化（Java RebalanceImpl#updateProcessQueueTableInRebalance:438-461 的 [BUG] 分支 +
-    /// removeUnnecessaryMessageQueue）。
-    /// </summary>
-    /// <remarks>
-    /// 为什么必须真机：判据本身（120s 阈值、严格 <c>&gt;</c>、撤走清哪些痕迹、撤/建顺序）
-    /// 已经由 tests/RocketMQ.Client.Tests/PullExpiredTests.cs 离线锁死，但"重建出来的那一路
-    /// 真的从 broker 位点接着往下消费、一条不重不丢"只有真 broker 能证明 —— 少持久化那一步
-    /// 在离线测试里看着照样能消费，真机才会暴露成"整把队列从旧位点重投"。
-    ///
-    /// 注入方式与 C++/Rust 那两版不同，是有意的：C# 的存活判据就是登记线程本身
-    /// （<c>Thread.IsAlive</c>，Java per-queue ProcessQueue 的等价物），所以这里把登记表里那一路
-    /// 换成一条**永远起不来**的占位线程。好处是判据没有时钟竞态 —— 自愈之前
-    /// <c>PullStalled</c> 恒为 true（占位线程不可能变 alive），只有被换成真的新循环才会 false；
-    /// 用"倒拨盖章"注入反而会撞上旧循环自己刷新的那一次，判不出到底自愈没有。
-    /// 阈值那一支（H3）仍然照拨，但只断言"拨了会判停摆、运行信息如实报出、之后照常消费"。
-    /// </remarks>
     private static void ScenarioPullStallSelfHeal(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_Heal";
@@ -961,7 +882,6 @@ public static class LiveRedelivery
                 WaitUntil(() => Committed() == 3, 30000),
                 "committed=" + Committed().ToString(CultureInfo.InvariantCulture));
 
-            // 运行信息里的 lastPullTimestamp 必须是真时刻（Java ProcessQueue#fillOutRunningInfo:456）
             long stamp = c.LastPullAt(key);
             Check("S11-H1 循环在发起拉取时盖章", stamp > 0 && NowMs() - stamp < 60000,
                 "lastPullAt=" + stamp.ToString(CultureInfo.InvariantCulture));
@@ -1088,20 +1008,6 @@ public static class LiveRedelivery
         }
     }
 
-    /// <summary>
-    /// 顺序消费的毒消息终态。为什么只能真机验：
-    /// Java ConsumeMessageOrderlyService#processConsumeResult:236-307 的 SUSPEND 分支先过
-    /// checkReconsumeTimes:322-339 —— 次数没用尽就**本地** reconsumeTimes +1 并原地挂起
-    /// （broker 那边压根没记这次失败），用尽了才 sendMessageBack:341-362 把整条投给
-    /// %RETRY%&lt;group&gt;，**投成功就不再挂起**、commit 位点让路（所以下一条必须被消费）。
-    /// 而「投给 %RETRY% 之后进不进 %DLQ%」全在 broker：SendMessageProcessor#handleRetryAndDLQ:185-234
-    /// 读 SEND_MESSAGE_V2 的 j/l（AbstractSendMessageProcessor:427 把 j 直接写成存储消息的
-    /// reconsumeTimes），且只有本组 rebalance 锁还没过期（:202-207，即这个实例真的握着
-    /// LOCK_BATCH_MQ）才「立刻改投死信」。三种写错在客户端本地都表现为「看起来正常」：
-    /// 少 +1 ⇒ 毒消息原地转到天荒地老且永远不进死信；-1 读成并发侧的 16 ⇒ 顺序消费凭空多出死信；
-    /// 回投成功后仍挂起 ⇒ 队列永久卡死，跟消费者进程死掉一模一样。
-    /// 离线单测（OrderlyReconsumeTests.cs）只能锁「回投失败」那一半——未 Start 的内部生产者必败。
-    /// </summary>
     private static void ScenarioOrderlyDlq(DefaultMQProducer producer)
     {
         const int maxReconsume = 2;
@@ -1127,8 +1033,6 @@ public static class LiveRedelivery
             WaitUntil(() => listener.CountOf(poison) >= 3, 60000)
             && LadderOf(listener, poison),
             "times=[" + TimesOf(listener, poison) + "]");
-        // 交棒判据：回投成功后 Java commit 位点，队列必须往前走。少了这一步就是「毒消息把
-        // 整个队列钉住」，与消费者死掉无法区分；多了（回投还没成功就前进）则是静默丢消息。
         Check("S12-交给 broker 后业务队列继续前进（后一条被消费）",
             WaitUntil(() => listener.CountOf("ord-after") >= 1, 60000),
             "after=" + listener.CountOf("ord-after").ToString(CultureInfo.InvariantCulture));
@@ -1163,15 +1067,6 @@ public static class LiveRedelivery
         }
     }
 
-    /// <summary>
-    /// 顺序侧的 -1 是**不设上限**，不是并发侧的 16。Java 两处 getMaxReconsumeTimes 故意不同：
-    /// ConsumeMessageOrderlyService:313-320 把 -1 读成 Integer.MAX_VALUE（顺序消费一直在本地
-    /// 原地重试，broker 侧没有计数，默认就该重试到成功为止）；DefaultMQPushConsumerImpl:890 把
-    /// -1 读成 16（那边每轮都过一遍 broker，16 是 broker 默认的 retryMaxTimes）。合成一个常量
-    /// 的两种坏法都得分别挡住：顺序侧读成 16 ⇒ 第 17 次投给 broker，而锁还没过期 ⇒ 直接造出
-    /// 一条死信；并发侧读成 MAX ⇒ 毒消息永远不进 %DLQ%（S9 覆盖了「阈值生效」，这条覆盖
-    /// 「默认值绝不生效」）。
-    /// </summary>
     private static void ScenarioOrderlyNoCap(DefaultMQProducer producer)
     {
         const string poison = "ord-forever";
@@ -1262,14 +1157,6 @@ public static class LiveRedelivery
         return n % 2 == 1 ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2.0;
     }
 
-    /// <summary>
-    /// #74：Java ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234 —— `-1`（context
-    /// 默认）才回落到消费者配置，解析出的值再钳到 [10, 30000]。真机这三条探针分别证：
-    /// context 70ms 压过配置 900ms（中位间隔贴着 70ms）、context 保持 -1 时回落配置 400ms、
-    /// 两个非法值（context 1ms / 配置 0）钳到下限不忙等。
-    /// 钳位端点只能兜「不忙等」（>= 10ms）：分发循环本身有 50ms 固定节拍，间隔法分不出 10ms
-    /// 与 1ms —— 精确值由离线矩阵锁死（OrderlyReconsumeTests.OrderlySuspendMillisResolvesThenClampsLikeLegacy）。
-    /// </summary>
     private static void ScenarioOrderlySuspendMillis(DefaultMQProducer producer)
     {
         SuspendProbe(producer, "OrdSusp", "g12c", configMs: 900, askedMs: 70, poison: "ord-susp-poison",
@@ -1417,12 +1304,6 @@ public static class LiveRedelivery
         }
     }
 
-    /// <summary>
-    /// S13：Java 顺序消费 processConsumeResult 的显式分支（ConsumeMessageOrderlyService:270-300）。
-    /// 三条探针的判别力都在"本地 vs broker"上：真回滚是 ProcessQueue 本地重投（间隔贴着挂起
-    /// 时长、reconsumeTimes 不动），任何"交给 broker 走 %RETRY%"的实现最快也是 delayLevel=3
-    /// 的 10s 档 —— 间隔量级差 40 倍以上，真机完全可分。
-    /// </summary>
     private static void ScenarioOrderlyAckRollback(DefaultMQProducer producer)
     {
         ManualAckCommitProbe(producer);
@@ -1442,7 +1323,6 @@ public static class LiveRedelivery
         }
     }
 
-    /// <summary>S13a autoCommit=false + COMMIT：整批 3 条一次认可（Java:275-277）。</summary>
     private static void ManualAckCommitProbe(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_OrdCommit";
@@ -1507,7 +1387,6 @@ public static class LiveRedelivery
         admin.Shutdown();
     }
 
-    /// <summary>S13b autoCommit=false + ROLLBACK：显式回滚、本地立即重投（Java:278-285）。</summary>
     private static void ManualRollbackProbe(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_OrdRollback";
@@ -1598,10 +1477,6 @@ public static class LiveRedelivery
         admin.Shutdown();
     }
 
-    /// <summary>
-    /// S13c autoCommit=true + ROLLBACK = 非法用法（Java:246-250 只 warn）⇒ 顺势落进 SUCCESS 分支
-    /// 按 ack 处理。真按回滚办的话 head 会被挂起节奏反复投递、next 永远不放行 —— 两种行为完全可分。
-    /// </summary>
     private static void ManualIllegalRollbackProbe(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_OrdIllegal";
@@ -1660,14 +1535,6 @@ public static class LiveRedelivery
 
     // ---------------- S14 correctTagsOffset（空应答修正已消费位点）----------------
 
-    /// <summary>
-    /// Java <c>DefaultMQPushConsumerImpl#correctTagsOffset:713-717</c>（调用点 <c>:394-401</c>）：
-    /// 拉取应答是 NO_NEW_MSG / NO_MATCHED_MSG 时，这条队列的"已消费位点"必须跟着拉取游标走，
-    /// 否则没人 ack 的消息（broker 过滤掉的不在应答里、客户端二次过滤摘掉的明确不 ack）
-    /// 会让位点永久卡死。离线单测锁得住「哪些状态要修正 + 闸门何时放行」，锁不住
-    /// 「这条修正真的走到了 broker」—— 位点最终由 UPDATE_CONSUMER_OFFSET 落盘，只有真集群
-    /// 能证明 broker 上的已提交位点前移了、而且是在**一条消息都没投递**的前提下前移的。
-    /// </summary>
     private static void ScenarioCorrectTagsOffset(DefaultMQProducer producer)
     {
         string topic = _gPrefix + "_Cto";

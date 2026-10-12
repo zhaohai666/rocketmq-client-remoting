@@ -1,7 +1,3 @@
-// ACL 鉴权真机验证（对齐 Java AclClientRPCHook；与 cpp/examples/live_acl.cpp、
-// python/verify_acl_live.py 同场景）。
-// 用法：rmq acl [namesrv] [accessKey] [secretKey]
-//
 // 前置：broker 开了 `authenticationEnabled=true`，并用 `initAuthenticationUser`
 //       建了 accessKey/secretKey 对应的 SUPER 用户（见 /tmp/run_acl_live.sh 的
 //       broker_acl.conf）。此时**所有** broker RPC 都要求合法签名：
@@ -194,13 +190,6 @@ public static class LiveAcl
             Check("S3 错误 secretKey 被 broker 拒绝(NO_PERMISSION=16)", rejected, detail);
         }
 
-        // ---------------- S4 正向：带凭据生产者发送 ----------------
-        // ---------------- S4/S5 正向：**先起消费者再发送** ----------------
-        // 顺序不能反：Java 默认 CONSUME_FROM_LAST_OFFSET 把新消费组的初始位点解析成该队列
-        // **当时的** maxOffset（RebalancePushImpl.java:174-190），所以"先发、后起消费者"
-        // 会（正确地）一条都收不到；而 broker 的 consumequeue 是异步分发/刷盘的，
-        // "刚发完立刻查 maxOffset"还可能读到 0 —— 同一时序在三种语言间结果不一致
-        // （实测 Python 收 0 条、C++/C# 收 3 条）。先起消费者才是确定性的、只测 ACL 的顺序。
         int sent = 0;
         Console.WriteLine();
         Console.WriteLine("S4/S5 带正确凭据的生产者/消费者（先起消费者再发送）");

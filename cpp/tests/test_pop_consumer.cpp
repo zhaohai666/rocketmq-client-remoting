@@ -4,13 +4,6 @@
 // 容易错的语义，而且错得**很安静** —— 比如 ackIndex 默认值不对，CONSUME_SUCCESS 会
 // 一条都不 ack，消息在 invisibleTime 到期后被 broker 复活重投；如果观测窗口比
 // invisibleTime 短，真机看起来还是"全过"。所以能离线锁的必须先锁死。
-//
-// 覆盖：
-//   - PopProcessQueue 计数与 dropped 语义
-//   - POP_CK → (topic, brokerName, queueId, offset) 的还原，含 retry topic 反解
-//   - isPopTimeout 判定
-//   - 默认值与 Java 对齐（关掉时走原路径、poll < timeout、batchNums ≤ 32）
-//   - 延迟档位表（单位秒）
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -72,7 +65,6 @@ void testProcessQueue() {
     pq.ack();
     pq.ack();
     expect(pq.waitAckCount() == 1, "pq.ack");
-    // Java 传负数（decFoundMsg(-size)），这里按"减多少"理解
     pq.decFoundMsg(-1);
     expect(pq.waitAckCount() == 0, "pq.dec");
     expect(!pq.isDropped(), "pq.notDropped");
@@ -84,7 +76,6 @@ void testDefaults() {
     DefaultMQPushConsumer c(kGroup);
     // 关掉时必须完全走原来的 pull 路径
     expect(!c.popMode(), "defaults.popModeOff");
-    // Java popInvisibleTime=60000 / popBatchNums=32 / popThresholdForQueue=96
     expect(c.popInvisibleTime() == 60000, "defaults.invisible",
            std::to_string(c.popInvisibleTime()));
     expect(c.popBatchNums() == 32, "defaults.batchNums", std::to_string(c.popBatchNums()));
@@ -152,7 +143,6 @@ void testPopCkTarget() {
 }
 
 void testIsPopTimeout() {
-    // 解析不出 popTime/invisibleTime 时按超时处理（Java isPopTimeout）
     expect(DefaultMQPushConsumer::isPopTimeout(0, 0), "timeout.bothZero");
     expect(DefaultMQPushConsumer::isPopTimeout(0, 60000), "timeout.popTimeZero");
     expect(DefaultMQPushConsumer::isPopTimeout(1000, 0), "timeout.invisibleZero");
@@ -162,11 +152,6 @@ void testIsPopTimeout() {
     expect(DefaultMQPushConsumer::isPopTimeout(now - 60001, 60000), "timeout.past");
 }
 
-// POP 循环的拉取统计（Java `popMessage` 的 PopCallback.onSuccess:556-563）。
-// 漏记是**静默**的：消息照弹照 ack、消费完全正常，只有 307 应答的 statusTable 里
-// pullRT/pullTPS 永远 0 —— 看板上"这个消费者没在拉取"和"压根没起来"分不开。真机要
-// 跨两个 10s 采样点才看得出来，所以判定必须离线锁死，而且锁的是那个**不对称**：
-// RT 每个 FOUND 轮次都记（Java 在判空之前记），TPS 只在真弹到消息时记。
 void testPopPullStats() {
     DefaultMQPushConsumer c(kGroup);
     ConsumerStatsManager stats;

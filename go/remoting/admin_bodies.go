@@ -93,8 +93,6 @@ func jsonStringListOr(value any, key string) []string {
 
 // ---------------- TopicConfig ----------------
 
-// TopicConfig mirrors org.apache.rocketmq.common.TopicConfig.
-//
 // `new TopicConfig("t")` serialises as
 //
 //	{"attributes":{},"order":false,"perm":6,"readQueueNums":16,
@@ -197,9 +195,6 @@ func (t *TopicConfig) String() string {
 		t.TopicName, t.ReadQueueNums, t.WriteQueueNums, common.Perm2String(t.Perm))
 }
 
-// TopicConfigSerializeWrapper mirrors
-// org.apache.rocketmq.remoting.protocol.body.TopicConfigSerializeWrapper.
-//
 // Probe output: {"dataVersion":{...},"topicConfigTable":{"Topic":{"attributes":{},...}}}
 type TopicConfigSerializeWrapper struct {
 	TopicConfigTable map[string]*TopicConfig
@@ -264,7 +259,6 @@ func DecodeTopicConfigSerializeWrapper(data []byte) (*TopicConfigSerializeWrappe
 
 // ---------------- TopicStatsTable / TopicOffset ----------------
 
-// TopicOffset mirrors org.apache.rocketmq.remoting.protocol.admin.TopicOffset.
 type TopicOffset struct {
 	MinOffset           int64
 	MaxOffset           int64
@@ -472,9 +466,6 @@ func DecodeConsumeStats(data []byte) (*ConsumeStats, error) {
 	return c, nil
 }
 
-// ConsumeStatus mirrors org.apache.rocketmq.remoting.protocol.body.ConsumeStatus
-// (the per-group consume snapshot the admin tools render).
-//
 // The five rate fields are broker-side `double`s and go through JSONDouble so the body
 // reads `0.0` (not `0`) and a zero-span window reads `null` (not an empty
 // body) — this struct feeds the 307 answer's statusTable, so the broker's

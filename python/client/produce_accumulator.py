@@ -1,39 +1,4 @@
 # -*- coding: utf-8 -*-
-"""对应 ``org.apache.rocketmq.client.producer.ProduceAccumulator``（Java 5.5.0）。
-
-生产者打开 ``autoBatch`` 之后，``send(Message)`` 不再一条一条直发，而是先按
-``AggregateKey(topic, mq, waitStoreMsgOK, tag)`` 归并进 ``MessageAccumulation``，
-攒够 ``holdMs``/``holdSize``（或被守卫线程唤醒）再合成**一个** ``MessageBatch``
-发出去，最后把 broker 回的**批量** ``SendResult`` 拆回每条消息各自的 SendResult ——
-调用方拿到的东西与直发完全一致（msgId / offsetMsgId / queueOffset 都是这一条自己的）。
-
-契约细节（逐条对齐 Java，别"顺手优化"）：
-
-1. ``AggregateKey`` 是 topic + mq + waitStoreMsgOK + **tag** 四元组：tag 不同不合并
-   （一个 MessageBatch 只有一个 TAGS 属性）；指定 mq 与不指定 mq 也不合并。
-2. ``try_add_message`` 是全局字节闸门：``currently_hold_size < total_hold_size`` 才放行，
-   放行时把本条 body 长度记进 ``currently_hold_size``；**批次真的发完**（同步版在
-   ``finally``、异步版在回调里）才扣回。⚠ 上游的真实口径是「先记账，再判延时/重试」——
-   也就是说 ``can_batch`` 里因延时消息退回直发的那条消息，它的字节数**已被记进
-   currently_hold_size 且永不归还**（Java 遗漏，照抄；如果"修"成归还，就与 Java 对不上了）。
-3. 批量应答拆条（``_split_send_results``）：broker 对批量消息回的 msgId/offsetMsgId 是
-   **逗号分隔**的逐条 ID；含逗号才拆，条数对不上直接 ``ValueError``（Java
-   ``IllegalArgumentException("sendResult is illegal")``）；不含逗号（老 broker /
-   单条）时**所有**下标指向同一个 SendResult 对象（就地共享，不复制）。
-4. **同步 add 收集 keys，异步 add 不收集**（Java 的不对称行为，照抄）：同步批次会把
-   所有子消息的 KEYS 并集挂到 MessageBatch 上，异步批次恒为 ``keys=[]`` →
-   ``batch.setKeys("")``。跨语言/跨进程的 KEYS 顺序不保证（Java 是 HashSet 迭代序），
-   断言只能用「具体某条 key 在不在」，别比整串。
-5. ``Message.setKeys(Collection)`` 是 ``String.join(" ", keys)``：分隔符是**空格**
-   （``MessageConst.KEY_SEPARATOR``），且**无条件**写属性 —— 空集合写出 ``KEYS=""``
-   （空串不是 null，``messageProperties2String`` 不会跳过它）。同理 tag 为 None 时不写
-   TAGS（Java 的 null 值属性会被 ``messageProperties2String`` 跳过，等价）。
-6. 守卫线程（sync/async 各一个）每轮 ``max(1, holdMs/2)`` 毫秒：sync 版对每个批次
-   ``wakeup()``（叫醒正在 ``add`` 里阻塞的调用方去自查 ``ready_to_send``），再把
-   ``messages_size == 0`` 的空批次置 ``closed`` 并摘表；async 版先 ``ready_to_send``
-   就 ``send``，再做同样的摘表。**表项的移除只发生在守卫线程 / add 返回 -1 的调用方**，
-   别在 send 里顺手 remove。
-"""
 from __future__ import annotations
 
 import threading
@@ -53,12 +18,7 @@ def _now_ms() -> int:
 
 
 def _split_keys(msg_keys: str) -> List[str]:
-    """``msg.getKeys().split(MessageConst.KEY_SEPARATOR)`` 的 Java 等价物。
-
-    Java 的 ``String.split``（limit=0）**丢弃所有尾部空串**，Python 的 ``str.split``
-    会保留 —— 所以这里显式剥掉尾部空段（``"a ".split(" ")`` 在 Java 是 ``["a"]``，
-    在 Python 是 ``["a", ""]``；中间的空段两边都保留）。
-    """
+    pass
     parts = msg_keys.split(" ")
     while parts and parts[-1] == "":
         parts.pop()
@@ -66,7 +26,7 @@ def _split_keys(msg_keys: str) -> List[str]:
 
 
 class AggregateKey:
-    """归并键：``topic + mq + waitStoreMsgOK + tag``（Java ``ProduceAccumulator.AggregateKey``）。"""
+    pass
 
     __slots__ = ("topic", "mq", "wait_store_msg_ok", "tag")
 
@@ -79,7 +39,6 @@ class AggregateKey:
 
     @classmethod
     def of_message(cls, msg: Message) -> "AggregateKey":
-        # Java ``AggregateKey(message)`` 用 ``message.isWaitStoreMsgOK()``：**缺省即 true**。
         return cls(msg.get_topic(), None, is_wait_store_msg_ok(msg), msg.get_tags())
 
     @classmethod
@@ -95,8 +54,6 @@ class AggregateKey:
                 and self.tag == other.tag)
 
     def __hash__(self) -> int:
-        # Java 用的是 Objects.hash(topic, mq, waitStoreMsgOK, tag) —— 只要「相等的键
-        # 哈希相同」即可，具体数值不必与 Java 对齐（键只在本进程内用）。
         return hash((self.topic, self.mq, self.wait_store_msg_ok, self.tag))
 
     def __repr__(self) -> str:
@@ -105,11 +62,7 @@ class AggregateKey:
 
 
 class MessageAccumulation:
-    """一批待归并的消息（Java ``ProduceAccumulator.MessageAccumulation``）。
-
-    两类调用方：同步 ``add()`` 会在批次达到阈值前**阻塞**自己（等到本批真的发出去，
-    自己的那条消息才有 SendResult 可返回）；异步 ``add_async()`` 立刻返回，结果走回调。
-    """
+    pass
 
     def __init__(self, aggregate_key: AggregateKey, producer: "DefaultMQProducer",
                  owner: "ProduceAccumulator"):
@@ -121,9 +74,7 @@ class MessageAccumulation:
         # 同步 add 收集、异步 add 不收集（见模块头第 4 条）
         self.keys: Set[str] = set()
         self.closed = False
-        # 对应 Java 的 `synchronized (this.closed)`：closed 既是锁对象又是状态位
         self.closed_lock = threading.Lock()
-        # 对应 Java 的 `synchronized (this)`：add 在这里 wait、守卫线程在这里 notify
         self.cond = threading.Condition()
         self.send_results: List[Optional[SendResult]] = []
         self.messages_size = 0
@@ -132,7 +83,7 @@ class MessageAccumulation:
 
     # ---------------- 阈值 ----------------
     def ready_to_send(self) -> bool:
-        """Java ``readyToSend()``：按**本批**字节数或本批存活时间（不是全局限额）。"""
+        pass
         if self.messages_size > self._owner.hold_size:
             return True
         return _now_ms() >= self.create_time + self._owner.hold_ms
@@ -156,8 +107,6 @@ class MessageAccumulation:
             if msg_keys is not None:
                 self.keys.update(_split_keys(msg_keys))
 
-        # Java 这里只有一个 `while (!closed)` 循环，靠守卫线程的 notify 与自己的 send
-        # 两条路跳出；closed 已经为真时直接返回（不管有没有发成功）。
         with self.cond:
             while not self.closed:
                 if self.ready_to_send():
@@ -182,7 +131,7 @@ class MessageAccumulation:
         return True
 
     def wakeup(self) -> None:
-        """Java ``wakeup()``：叫醒一个正在 ``add`` 里等阈值的调用方，让它自查 ``ready_to_send``。"""
+        pass
         with self.cond:
             if self.closed:
                 return
@@ -190,7 +139,7 @@ class MessageAccumulation:
 
     # ---------------- 组装 / 拆分 ----------------
     def _batch(self) -> MessageBatch:
-        """Java ``batch()``：把本批组装成一个 MessageBatch。"""
+        pass
         batch = MessageBatch(list(self.messages))
         batch.set_topic(self.aggregate_key.topic)
         batch.set_wait_store_msg_ok(self.aggregate_key.wait_store_msg_ok)
@@ -203,7 +152,7 @@ class MessageAccumulation:
         return batch
 
     def _split_send_results(self, send_result: Optional[SendResult]) -> None:
-        """Java ``splitSendResults``：批量应答拆成逐条 SendResult。"""
+        pass
         if send_result is None:
             raise ValueError("sendResult is null")
         msg_id = send_result.msg_id or ""
@@ -219,17 +168,12 @@ class MessageAccumulation:
                     send_result.queue_offset + i, send_result.transaction_id,
                     offset_msg_ids[i], send_result.region_id)
         else:
-            # 不含逗号：老 broker / 单条应答，所有下标共享同一个 result 对象（Java 同）
             for i in range(self.count):
                 self.send_results[i] = send_result
 
     # ---------------- 发送 ----------------
     def _send_sync(self) -> None:
-        """Java ``MessageAccumulation.send()``（同步）。
-
-        ⚠ 只能在**持有 ``self.cond``** 时调用：Java 的 ``notifyAll()`` 靠调用方
-        （``add`` 里的 ``synchronized (this)``）提供的监视器，可重入所以合法。
-        """
+        pass
         with self.closed_lock:
             if self.closed:
                 return
@@ -239,16 +183,11 @@ class MessageAccumulation:
             result = self._producer.send_direct(batch, self.aggregate_key.mq, None)
             self._split_send_results(result)
         finally:
-            # 无论成败都归还全局字节额度（Java：finally 里 currentlyHoldSize -= messagesSize）
             self._owner.release_hold(self.messages_size)
             self.cond.notify_all()
 
     def _send_async(self, send_callback: "SendCallback") -> None:
-        """Java ``MessageAccumulation.send(SendCallback)``（异步）。
-
-        参数 ``send_callback`` 与 Java 一样**不参与**逻辑（Java 收了但没用），回调来自
-        ``self.send_callbacks`` 列表。批量应答回来后逐条分发给各自的回调。
-        """
+        pass
         with self.closed_lock:
             if self.closed:
                 return
@@ -266,7 +205,7 @@ class MessageAccumulation:
                 if i != self.count:
                     raise ValueError("sendResult is illegal")
                 self._owner.release_hold(size)
-            except Exception as e:  # noqa: BLE001 - 与 Java 一样把内部异常转给全体回调
+            except Exception as e:
                 _on_exception(e)
 
         def _on_exception(e: BaseException) -> None:
@@ -278,14 +217,12 @@ class MessageAccumulation:
             self._producer.send_direct(batch, self.aggregate_key.mq,
                                        _InternalSendCallback(_on_success, _on_exception))
         except Exception as e:  # noqa: BLE001
-            # ⚠ Java 在这里**没有**归还 currentlyHoldSize（只有回调路径会还）——
-            # 即"异步发送在发起阶段就抛异常"会漏掉一份字节额度。照抄，别修。
             for cb in self.send_callbacks:
                 cb.on_exception(e)
 
 
 class _InternalSendCallback:
-    """把两个函数包成 ``SendCallback``（对应 Java 的匿名内部类）。"""
+    pass
 
     def __init__(self, on_success, on_exception):
         self._on_success = on_success
@@ -299,13 +236,7 @@ class _InternalSendCallback:
 
 
 class _GuardService:
-    """守卫线程基类（对应 Java 的 ``ServiceThread`` 子类）。
-
-    ⚠ **不能**继承 ``threading.Thread``：累加器是按 clientId 复用的，同一个实例会经历
-    ``start → shutdown → start``（生产者重启；Java 的 ``ServiceThread`` 同样可重复 start），
-    而 ``Thread`` 对象只能 ``start()`` 一次 —— 第二次会抛
-    ``RuntimeError: threads can only be started once``。这里改成「持有一根可重建的 Thread」。
-    """
+    pass
 
     def __init__(self, owner: "ProduceAccumulator", instance_name: str, suffix: str):
         self._owner = owner
@@ -330,19 +261,18 @@ class _GuardService:
         while not self._stopped.is_set():
             try:
                 self.do_work()
-            except Exception:  # noqa: BLE001 - Java：日志告警后继续跑
+            except Exception:
                 pass
 
     def do_work(self) -> None:
         raise NotImplementedError
 
     def _sleep(self) -> None:
-        # Java：Math.max(1, holdMs / 2)
         time.sleep(max(1, self._owner.hold_ms / 2) / 1000.0)
 
 
 class _GuardForSyncSend(_GuardService):
-    """同步发送的守卫线程（Java ``GuardForSyncSendService``）。"""
+    pass
 
     def __init__(self, owner: "ProduceAccumulator"):
         super().__init__(owner, owner.instance_name, "GuardForSyncSend")
@@ -361,7 +291,7 @@ class _GuardForSyncSend(_GuardService):
 
 
 class _GuardForAsyncSend(_GuardService):
-    """异步发送的守卫线程（Java ``GuardForAsyncSendService``）。"""
+    pass
 
     def __init__(self, owner: "ProduceAccumulator"):
         super().__init__(owner, owner.instance_name, "GuardForAsyncSend")
@@ -378,9 +308,8 @@ class _GuardForAsyncSend(_GuardService):
 
 
 class ProduceAccumulator:
-    """对应 Java ``ProduceAccumulator``：按 clientId 复用的自动攒批器。"""
+    pass
 
-    # Java 的三个默认值（totalHoldSize / holdSize / holdMs）
     DEFAULT_TOTAL_HOLD_SIZE = 32 * 1024 * 1024
     DEFAULT_HOLD_SIZE = 32 * 1024
     DEFAULT_HOLD_MS = 10
@@ -392,8 +321,6 @@ class ProduceAccumulator:
         self.hold_ms = self.DEFAULT_HOLD_MS
         self._sync_send_batches: Dict[AggregateKey, MessageAccumulation] = {}
         self._async_send_batches: Dict[AggregateKey, MessageAccumulation] = {}
-        # 保护两张表的所有读改写（Java 用 ConcurrentHashMap；这里用一把表锁给出更强的
-        # 一致性，锁序恒为 表锁 → 批次的 cond/closed_lock，不会成环）
         self._table_lock = threading.Lock()
         self._hold_lock = threading.Lock()
         self._currently_hold_size = 0
@@ -416,7 +343,6 @@ class ProduceAccumulator:
         with self._hold_lock:
             return self._currently_hold_size
 
-    # ---------------- 参数（Java 的校验口径逐字照抄）----------------
     def get_batch_max_delay_ms(self) -> int:
         return self.hold_ms
 
@@ -436,7 +362,6 @@ class ProduceAccumulator:
         self.hold_size = hold_size
 
     def get_total_batch_max_bytes(self) -> int:
-        # Java 这里也返回 holdSize（不是 totalHoldSize）—— 上游笔误，照抄
         return self.hold_size
 
     def total_batch_max_bytes(self, total_hold_size: int) -> None:
@@ -447,7 +372,7 @@ class ProduceAccumulator:
 
     # ---------------- 全局字节闸门 ----------------
     def try_add_message(self, message: Message) -> bool:
-        """Java ``tryAddMessage``：还有额度就记账放行，否则拒绝（调用方退回直发）。"""
+        pass
         with self._hold_lock:
             if self._currently_hold_size < self.total_hold_size:
                 body = message.body
@@ -458,7 +383,7 @@ class ProduceAccumulator:
             return False
 
     def release_hold(self, size: int) -> None:
-        """批次发送完成后的归还（Java 直接 ``currentlyHoldSize.addAndGet(-size)``）。"""
+        pass
         with self._hold_lock:
             self._currently_hold_size -= size
 
@@ -472,7 +397,7 @@ class ProduceAccumulator:
             return list(self._async_send_batches.values())
 
     def remove_sync_batch(self, batch: MessageAccumulation) -> None:
-        """Java ``syncSendBatchs.remove(key, batch)``：只在值仍是它时才摘。"""
+        pass
         with self._table_lock:
             if self._sync_send_batches.get(batch.aggregate_key) is batch:
                 self._sync_send_batches.pop(batch.aggregate_key, None)
@@ -502,7 +427,7 @@ class ProduceAccumulator:
 
     # ---------------- 对外发送入口 ----------------
     def send(self, msg: Message, producer: "DefaultMQProducer") -> SendResult:
-        """Java ``send(Message, DefaultMQProducer)``：只返回本条消息自己的 SendResult。"""
+        pass
         key = AggregateKey.of_message(msg)
         while True:
             batch = self._get_or_create_sync_batch(key, producer)
@@ -546,11 +471,6 @@ class ProduceAccumulator:
             return
 
 
-# ---------------------------------------------------------------- 进程级复用
-# 对应 Java ``MQClientManager.getOrCreateProduceAccumulator``：**按 clientId 缓存**，
-# 所以同进程里两个 clientId 相同的 producer（比如同一 group 反复 new）共享同一个累加器
-# 与同一对守卫线程 —— 这也是「累加器参数要先记在 producer 上、start() 时再同步下去」的
-# 原因：第二个 producer 拿到的是别人已经建好的累加器，构造期无从设置阈值。
 _ACCUMULATOR_TABLE: Dict[str, ProduceAccumulator] = {}
 _ACCUMULATOR_LOCK = threading.Lock()
 

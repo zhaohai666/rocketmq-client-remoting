@@ -297,9 +297,6 @@ func main() {
 		}
 	}
 
-	// ---- 8. KEYS index query + viewMessage -------------------------------------
-	// The broker builds the index asynchronously (~700ms in Java's own admin
-	// tool), so a query issued immediately after the sends can legitimately miss.
 	time.Sleep(1500 * time.Millisecond)
 	msgs, err := admin.QueryMessageByKey(*topic, key, 32)
 	if err != nil {

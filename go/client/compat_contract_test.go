@@ -9,8 +9,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// The VIP channel rewrites the broker port to port-2 (common.BrokerVIPChannel,
-// Java MixAll.brokerVIPChannel) only when the producer flag is on. Default off.
 func TestProducerSendAddrAppliesVIPChannel(t *testing.T) {
 	p, err := NewDefaultMQProducer("PID_VIP")
 	if err != nil {
@@ -32,7 +30,6 @@ func TestProducerSendAddrAppliesVIPChannel(t *testing.T) {
 	}
 }
 
-// The three 5.x timer aliases write the exact Java property keys.
 func TestMessageTimerDelaySettersUseWirePropertyKeys(t *testing.T) {
 	msg := common.NewMessage("T", []byte("x"))
 

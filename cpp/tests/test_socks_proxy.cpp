@@ -671,7 +671,6 @@ int main() {
         RemotingClient client;
         SocksProxyConfig proxyCfg;
         proxyCfg.type = SocksProxyConfig::Type::SOCKS4;
-        // 走 Java 口径的 "host:port" 整串形式，顺带覆盖 resolveHostPort 在真实链路上的分支
         proxyCfg.addr = "127.0.0.1:" + std::to_string(proxy.port());
         client.setSocksProxy(proxyCfg);
 

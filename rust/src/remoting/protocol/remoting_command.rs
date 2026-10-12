@@ -24,8 +24,6 @@ pub const RPC_ONEWAY: i32 = 1;
 
 pub const REMOTING_VERSION_KEY: &str = "rocketmq.remoting.version";
 
-/// Java `MQVersion.CURRENT_VERSION`（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
-///
 /// 这个值不只是好看：broker 用它决定能不能把管理请求转发回客户端——
 /// `AdminBrokerProcessor#callConsumer` 要求 ≥ `V3_1_8_SNAPSHOT`（ordinal 62），
 /// `Broker2Client#getConsumeStatus` 要求 ≥ `V3_0_7_SNAPSHOT`（ordinal 28）。
@@ -111,7 +109,6 @@ impl RemotingCommand {
         cmd
     }
 
-    /// 对应 Java `createResponseCommand(int code, String remark, Class classHeader)`。
     pub fn create_response(code: i32, remark: Option<String>) -> RemotingCommand {
         let mut cmd = RemotingCommand::new();
         cmd.code = code;
@@ -197,7 +194,6 @@ impl RemotingCommand {
         self.custom_header.take()
     }
 
-    /// 把 custom_header 的非 None 字段并入 extFields（对应 Java 的反射写入）。
     pub fn make_custom_header_to_net(&mut self) {
         if let Some(header) = self.custom_header.as_ref() {
             let mut out = ExtFields::new();
@@ -257,7 +253,6 @@ impl RemotingCommand {
         out
     }
 
-    /// 只编码 header（body 由调用方另行写出），对应 Java `encodeHeader(int bodyLength)`。
     pub fn encode_header(&mut self, body_length: usize) -> Vec<u8> {
         let header_data = self.header_encode();
         let header_len = header_data.len();
@@ -415,8 +410,6 @@ impl std::fmt::Display for RemotingCommand {
 mod tests {
     use super::*;
 
-    /// 出站请求必须带上 Java 口径的协议版本，否则 broker 的管理转发（307/221）会
-    /// 直接以 "too low to finish" 拒掉；`new()` 是解码用的裸对象，仍保持 0。
     #[test]
     fn outgoing_commands_carry_the_protocol_version() {
         assert_eq!(RemotingCommand::new().version, 0);

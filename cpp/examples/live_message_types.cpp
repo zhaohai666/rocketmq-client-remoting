@@ -310,11 +310,6 @@ int main(int argc, char** argv) {
     }
 
     // ---------- 1b. 定点异步发送：sendAsync(msg, mq, cb) ----------
-    //
-    // 用一个**全新的生产者实例**打定点异步发送：它的 topicRouteTable 是空的，
-    // 而 Java sendKernelImpl:919-924 只在发布地址表查不到时按 topic 刷一次路由再解析
-    // （定点发送不会在 sendDefaultImpl 里取发布信息）。少了那一步，第一次定点异步
-    // 发送会带着空地址去连 broker。
     {
         const std::string topic = gPrefix + "_AsyncPinned";
         SendResult probe;
@@ -504,8 +499,6 @@ int main(int argc, char** argv) {
               "returned=" + std::to_string(found.size()));
     }
 
-    // ---------- 7. 事务消息（对齐 Java 的两阶段：半消息 + END_TRANSACTION + 回查）----------
-    // ---------- 7.1 COMMIT ----------
     {
         const std::string topic = gPrefix + "_Tx";
         CommitTxListener listener;

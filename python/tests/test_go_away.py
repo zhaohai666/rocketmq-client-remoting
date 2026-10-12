@@ -1,14 +1,4 @@
 # -*- coding: utf-8 -*-
-"""GO_AWAY(1500) 的传输层处理（镜像 Rust `remoting::client` 的三个 go_away 用例）。
-
-对应 Java `NettyRemotingClient#invokeImpl:828-873`：broker / proxy 优雅下线时会给
-在途请求回 GO_AWAY，语义是"这条连接别再用了"。客户端必须换连接重发一次，且**只**
-重发一次；第二次还是 GO_AWAY 就抛 `RemotingSendRequestException`，不在下线中的集群
-上无限打转。开关 `enableReconnectForGoAway` 关掉时直接报错、不重连。
-
-修复前这条码在四个端口里都被当成普通业务响应交给上层：同步调用拿到 GO_AWAY 就当作
-"发送成功"继续往下走，消息实际并没有落到 broker。
-"""
 from __future__ import annotations
 
 import socket
@@ -145,7 +135,6 @@ def test_second_go_away_fails_instead_of_looping():
         req = rc_mod.RemotingCommand.create_request_command(RequestCode.SEND_MESSAGE_V2)
         with pytest.raises(RemotingSendRequestException) as caught:
             client.invoke_sync(server.addr, req, 5000)
-        # 文案对齐 Java：RemotingSendRequestException("Receive GO_AWAY twice ...")
         assert "GO_AWAY twice" in str(caught.value)
         assert server.conns == 2, "只重发一次，不能无限重连"
         assert not client._response_table
@@ -170,7 +159,7 @@ def test_go_away_without_reconnect_flag_surfaces_error():
 
 
 def test_async_go_away_retries_via_callback():
-    """异步路径与同步共用同一套 GO_AWAY 语义（Java 里同一段逻辑在 invokeImpl）。"""
+    pass
     server = GoAwayServer(1)
     client = RemotingClient()
     try:

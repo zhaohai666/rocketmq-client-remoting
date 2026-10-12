@@ -1,7 +1,3 @@
-// OFFSET_ILLEGAL 纠错分支（Java DefaultMQPushConsumerImpl:402-427）真机联调
-//（对应 python/verify_offset_illegal_live.py、cpp/examples/live_offset_illegal.cpp、
-//  rust/examples/live_offset_illegal.rs 的 S1/S2）。
-//
 // 离线单测（tests/RocketMQ.Client.Tests/OffsetIllegalRecoverTests.cs，13 项）只能锁住本地状态
 // 怎么清、哪个 ack 被作废、冻结什么时候解；下面两件事只有真集群能证明：
 //
@@ -20,10 +16,6 @@
 //       的新消费者从 103 起拉。窗口内唯一能把 103 写回 3（maxOffset）的路径就是纠错分支自带
 //       的那次 persist，且全程零投递。
 //
-// ⚠ 发现延迟是 Java 同构的长轮询语义：客户端下发 suspendTimeoutMillis=20000（Java
-//   PullAPIWrapper.brokerSuspendMaxTimeMillis 默认值），broker 的 PullRequestHoldService 每 5s
-//   巡检一次到期请求，命中前那笔 pull 不会重读 resetOffsetTable（实测 ~24s）。不是缺陷，
-//   所以 S1 的等待窗口给到 45s。
 //
 // 用法：rmq offset-illegal [namesrv]（需本地 5.5.1 集群，autoCreateTopicEnable=true）
 using System.Globalization;

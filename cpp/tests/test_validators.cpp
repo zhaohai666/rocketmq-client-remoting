@@ -102,7 +102,6 @@ void testCharTable() {
     CHECK(TopicValidator::isTopicOrGroupIllegal("a\\b"), "反斜杠非法");
     CHECK(TopicValidator::isTopicOrGroupIllegal("a b"), "空格非法");
     CHECK(TopicValidator::isTopicOrGroupIllegal("a:b"), "冒号非法");
-    // UTF-8 中文字符的每一字节都 >= 0x80（Java 按 char >= 128 拒绝，等价）
     CHECK(TopicValidator::isTopicOrGroupIllegal("主题"), "非 ASCII 非法");
     // 边界：0x7F (DEL) 不在表内
     CHECK(TopicValidator::isTopicOrGroupIllegal(std::string("a\x7f" "b")), "DEL 控制符非法");
@@ -120,7 +119,6 @@ void testTopicClassification() {
     CHECK(!TopicValidator::isSystemTopic("NormalTopic"), "普通 topic 不是系统 topic");
     CHECK(!TopicValidator::isSystemTopic("%RETRY%grp"), "%RETRY% 不是系统 topic 名单成员");
 
-    // 禁发名单：Java/Python 的 8 个成员一个不多一个不少
     const char* forbidden[] = {"SCHEDULE_TOPIC_XXXX", "RMQ_SYS_TRANS_HALF_TOPIC",
                                "RMQ_SYS_TRANS_OP_HALF_TOPIC", "TRANS_CHECK_MAX_TIME_TOPIC",
                                "SELF_TEST_TOPIC", "OFFSET_MOVED_EVENT",

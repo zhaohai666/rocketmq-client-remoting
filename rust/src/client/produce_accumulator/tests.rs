@@ -2,7 +2,6 @@
 //! `python/tests/test_produce_accumulator.py`（18 例）、
 //! `csharp/tests/RocketMQ.Client.Tests/ProduceAccumulatorTests.cs`（17 例）同题。
 //!
-//! 覆盖 Java `ProduceAccumulatorTest` 的三个场景（sync / async / 指定 MessageQueue），另补：
 //!
 //! * 参数三档校验，与「累加器未建时 producer 的 getter 返回 0」的语义；
 //! * `try_add_message` 全局字节闸门（放行即记账、归还、拒绝后调用方直发）；
@@ -11,16 +10,6 @@
 //! * 守卫线程把「已发完的空批次」置 closed 并摘表；
 //! * 同步 / 异步失败路径（异常上抛 + 额度归还；回调各拿到一份）；
 //! * `start → shutdown → start`（累加器按 clientId 复用，生产者重启会再 start 一次）。
-//!
-//! ⚠ 与 Java 单测一样，这里是**直接调累加器**的 `send` / `send_async`，绕过了
-//! `DefaultMQProducer.send_by_accumulator` 里的 `set_uniq_id` —— 所以子消息都没有
-//! UNIQ_KEY，`MessageBatch::encode()` 出来的 body 才与 `reference_batch_body` 可比
-//! （`generate_from_list` 本身**不**打 ID）。批级 `KEYS` / `TAGS` 不进 body，所以
-//! 累加器的 `build_batch` 多写这两个属性不影响 body 相等。
-//!
-//! ⚠ 和 Java 一样，`send_sync` 会把 `currently_hold_size` 扣掉，而真实调用链里是
-//! `can_batch` → `try_add_message` 先记的账。这里直接调累加器，所以每条消息都得先
-//! 自己补一次 `try_add_message`，否则归还后额度会变成负数。
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,10 +38,6 @@ struct SentBatch {
     has_callback: bool,
 }
 
-/// 假的生产者（Java 单测里的 `MockMQProducer` 同款）：只记账 + 按剧本回结果。
-///
-/// `auto_complete = true`（默认）时同步交付回调，对应 Java mock 里 `callback.onSuccess`
-/// 就地调用；置 `false` 可以让用例自己挑时机交付，用来验证「回调恰好一次」。
 struct FakeSender {
     sent: Mutex<Vec<SentBatch>>,
     result: Mutex<Option<SendResult>>,
@@ -231,7 +216,6 @@ fn as_callback(cb: &Arc<CollectingCallback>) -> Arc<dyn SendCallback> {
     Arc::clone(cb) as Arc<dyn SendCallback>
 }
 
-/// 与 Java / Python 单测同款 body（1 / 22 / 333 / 4444 / 55555 字节）。
 fn make_messages(n: usize) -> Vec<Message> {
     (0..n)
         .map(|i| Message::new(TOPIC, Some(&vec![b'1'; i + 1])))
@@ -304,7 +288,6 @@ fn default_params_match_contract() {
     assert_eq!(acc.get_batch_max_delay_ms(), DEFAULT_HOLD_MS);
     assert_eq!(acc.get_batch_max_bytes(), DEFAULT_HOLD_SIZE);
     assert_eq!(acc.total_hold_size(), DEFAULT_TOTAL_HOLD_SIZE);
-    // Java 的 getTotalBatchMaxBytes 实际返回 holdSize（上游笔误，照抄）
     assert_eq!(acc.get_total_batch_max_bytes(), DEFAULT_HOLD_SIZE);
     assert_eq!(acc.currently_hold_size(), 0);
     assert_eq!(acc.get_batch_max_delay_ms(), 10);
@@ -328,7 +311,6 @@ fn param_guards_enforce_contract_ranges() {
     assert!(acc.total_batch_max_bytes(1).is_ok());
     assert!(acc.total_batch_max_bytes(0).is_err());
 
-    // 文案逐字对齐 Java（Python / C# 两侧的断言同样比文案）
     let err = acc.batch_max_delay_ms(0).unwrap_err().to_string();
     assert!(err.contains("batchMaxDelayMs expect between 1ms and 30s, but get 0!"), "{err}");
     let err = acc.batch_max_bytes(0).unwrap_err().to_string();
@@ -339,8 +321,6 @@ fn param_guards_enforce_contract_ranges() {
 
 #[test]
 fn registry_reuses_accumulator_by_client_id() {
-    // Java `MQClientManager.getOrCreateProduceAccumulator`：按 clientId 复用 ——
-    // 第二个 sender 被忽略，两边共享同一份阈值 / 守卫线程。
     let a = get_or_create_produce_accumulator(
         "rust-accum-test-shared",
         FakeSender::new() as Arc<dyn AccumulatorSender>,
@@ -364,7 +344,6 @@ fn try_add_message_gate_and_release() {
     let msg = Message::new(TOPIC, Some(b"1234567890")); // 10 字节
     assert!(acc.try_add_message(&msg));
     assert_eq!(acc.currently_hold_size(), 10);
-    // 额度已满（Java：`currentlyHoldSize < totalHoldSize` 才放行）
     assert!(!acc.try_add_message(&Message::new(TOPIC, Some(b"x"))));
     assert_eq!(acc.currently_hold_size(), 10);
     acc.release_hold(10);
@@ -425,8 +404,6 @@ fn sync_batch_merges_messages_and_returns_per_message_results() {
     assert_eq!(sender.sent_count(), 1);
     assert!(sender.mq_at(0).is_none()); // 没指定 mq → 由生产者轮询选
     assert!(!sender.callback_at(0)); // 同步路径没有回调
-    // 子消息集合与 reference 一致。⚠ 只比长度不比字节：5 条是**不同线程**并发 add 的，
-    // 批内顺序不确定（Java 的同步用例也因此只断言长度，只有单线程的异步用例才全等比较）。
     assert_eq!(
         sender.batch_at(0).body().len(),
         reference_batch_body(&make_messages(5)).len()
@@ -434,9 +411,6 @@ fn sync_batch_merges_messages_and_returns_per_message_results() {
 
     let collected = collected.lock().unwrap();
     assert_eq!(collected.len(), 5);
-    // 拆条结果按**批内位置**下发，而位置由 add 的先后决定 —— 并发 add 下「哪条消息拿哪个
-    // 下标」不确定（Java 单测同样只能断言"成套"）。所以验两件事：① 五个 MsgId 一个不少；
-    // ② 同一条结果里 id-N ↔ off-N ↔ 100+N 必须成套（串了就说明拆条下标算错了）。
     let mut ids: Vec<String> = collected.iter().filter_map(|r| r.msg_id.clone()).collect();
     ids.sort();
     assert_eq!(ids, vec!["id-0", "id-1", "id-2", "id-3", "id-4"]);
@@ -501,7 +475,6 @@ fn async_batch_merges_and_fires_every_callback() {
         sender.batch_at(0).encode(),
         reference_batch_body(&make_messages(5))
     );
-    // 异步批次**不**收集 keys（Java 的不对称行为），所以 batch 级 KEYS 为空串
     assert_eq!(sender.batch_at(0).get_property(PROPERTY_KEYS), Some(""));
     assert_eq!(acc.currently_hold_size(), 0);
 }
@@ -539,8 +512,6 @@ fn split_results_are_shared_when_msg_id_has_no_comma() {
 
     let collected = collected.lock().unwrap();
     assert_eq!(collected.len(), 3);
-    // Java 是同一个 `SendResult` 实例；本端口按 `Clone` 复制（见模块头「语言级差异」），
-    // 所以断言"每一份内容都等于应答本身"而不是指针相等。
     for result in collected.iter() {
         assert_eq!(result.msg_id.as_deref(), Some("single-id"));
         assert_eq!(result.offset_msg_id, None);
@@ -555,7 +526,6 @@ fn split_results_are_shared_when_msg_id_has_no_comma() {
 
 #[test]
 fn send_with_message_queue_pins_the_batch() {
-    // 指定 mq（Java 的 send(msg, mq, producer)）：mq 原样透传给 sendDirect
     let mq = MessageQueue::new(TOPIC, "broker-pinned", 2);
     let sender = FakeSender::new();
     let acc = accumulator("pinned", &sender);
@@ -615,9 +585,6 @@ fn batch_merges_keys_with_space_separator() {
         .to_string();
     let set: HashSet<&str> = raw.split(' ').collect();
     assert_eq!(set, HashSet::from(["k1", "k2", "k3"]));
-    // ⚠ 与 Java 有一处**可见**差异：Java 的 keys 是 `HashSet`，`String.join` 的顺序由哈希
-    // 决定（未定义）；Rust 侧在 `build_batch` 里排了序，所以顺序确定。属性语义是"空格分隔的
-    // 集合"，顺序无关（broker 只拿它做索引），这里断言排序后的结果。
     assert_eq!(raw, "k1 k2 k3");
 }
 
@@ -694,8 +661,6 @@ fn different_tags_do_not_merge() {
 
 #[test]
 fn guard_keeps_closed_batch_until_next_send() {
-    // 发完的批次 messages_size 仍 > 0，所以会**留在表里**；
-    // 下一次同键 send 拿到它、`add` 返回 -1 才被摘掉重取（Java 的真实行为）
     let sender = FakeSender::new();
     let acc = accumulator("closed-batch", &sender);
     acc.batch_max_delay_ms(3000).unwrap();
@@ -745,8 +710,6 @@ fn guard_removes_empty_batch_without_sending() {
 
 #[test]
 fn accumulator_can_restart_after_shutdown() {
-    // 累加器是**按 clientId 复用**的，生产者 stop → start 会再调一次 start()：
-    // 守卫线程必须能重建（Java ServiceThread 同样可重复 start）
     let sender = FakeSender::new();
     let acc = accumulator("restart", &sender);
     acc.start();
@@ -768,10 +731,6 @@ fn accumulator_can_restart_after_shutdown() {
 
 #[test]
 fn sync_send_failure_surfaces_and_returns_hold_size() {
-    // 发送失败：异常抛给**触发发送的那个调用方**，全局额度照还（Java 的 finally）。
-    // ⚠ 同一批里还在等的其他调用方拿不到 `sendResult`（本批没有结果可拆）——
-    // Java 那边是在 `batch.getSendResults()[index]` 上抛 NPE，这里收敛成
-    // `sendResult is illegal`。
     let sender = FakeSender::fail_with("boom");
     let acc = accumulator("sync-fail", &sender);
     acc.batch_max_delay_ms(3000).unwrap();
@@ -788,7 +747,6 @@ fn sync_send_failure_surfaces_and_returns_hold_size() {
 
 #[test]
 fn async_send_failure_reaches_every_callback() {
-    // 一批 3 条 → 每个回调恰好收到**一次**异常（Java 的 `onException` 逐个回调一次）。
     let sender = FakeSender::fail_with("async boom");
     let acc = accumulator("async-fail", &sender);
     acc.start();

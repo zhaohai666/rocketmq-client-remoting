@@ -1,19 +1,4 @@
 # -*- coding: utf-8 -*-
-"""订阅后置 + 立即心跳（#73）离线单测，不需要集群。
-
-对齐基准（Java 5.5.1 ``DefaultMQPushConsumerImpl``）：
-  * ``subscribe(topic, subExpression):1265-1275``、class-filter 变体 ``:1277-1287``、
-    MessageSelector 变体 —— 三者都是 put 进 ``subscriptionInner`` 之后
-    ``if (this.mQClientFactory != null) this.mQClientFactory.sendHeartbeatToAllBrokerWithLock();``
-    **没有**「started 之后禁止订阅」这道闸门，且心跳是**同步立即**发的。
-  * ``unsubscribe(topic):1317-1319`` 只 remove，**不**发心跳。
-  * 心跳体 ``subscriptions():1385-1387`` = ``subscriptionInner.values()``，即**当前**订阅表。
-
-为什么必须离线锁死：真机上「新订阅没推给 broker」是静默的 —— 只表现为
-``QUERY_TOPIC_CONSUME_BY_WHO(300)`` 查不到本组、新 topic 分不到队列，客户端一声不响。
-这里用替身 client 把**真实**心跳报文体（``_build_heartbeat`` 造的）截下来，
-断言里面的订阅集就是刚写进去的那一份，以及 ``unsubscribe`` 一轮都不多发。
-"""
 from __future__ import annotations
 
 from typing import List
@@ -64,7 +49,7 @@ def subs_of(hb: HeartbeatData):
 
 
 def test_subscribe_after_start_reaches_the_live_table_and_pushes_one_heartbeat():
-    """Java :1265-1275：start() 之后 put 完立即发一轮心跳，报文里带上新订阅。"""
+    pass
     c, fake = started()
 
     c.subscribe(TOPIC, "TagA||TagB")
@@ -74,13 +59,12 @@ def test_subscribe_after_start_reaches_the_live_table_and_pushes_one_heartbeat()
     assert TOPIC in body, "心跳报文必须带新订阅（否则 broker 记不到 topicGroupTable）"
     assert body[TOPIC].sub_string == "TagA||TagB"
     assert body[TOPIC].tags_set == {"TagA", "TagB"}
-    # 路由刷新任务要覆盖新 topic（对应 Java 周期任务遍历 live 订阅表收集 topic）
     assert fake.topics_in_use == [TOPIC]
     assert [s.topic for s in c.subscriptions()] == [TOPIC]
 
 
 def test_selector_subscribe_after_start_keeps_expression_type_in_the_body():
-    """Java :1289-1303：MessageSelector 变体同样立即发心跳，且 expressionType 照原样。"""
+    pass
     c, fake = started()
     c.subscribe_with_selector(TOPIC, MessageSelector.by_sql("a > 1"))
 
@@ -99,13 +83,11 @@ def test_selector_subscribe_after_start_keeps_expression_type_in_the_body():
 
 
 def test_subscribe_before_start_only_records():
-    """Java 的 ``mQClientFactory == null`` 分支：没启动就只落订阅表，不碰网络。"""
+    pass
     c = DefaultMQPushConsumer("GID_SubBeforeStart")
     c.subscribe(TOPIC, "*")
     assert [s.topic for s in c.subscriptions()] == [TOPIC]
 
-    # 就算 client 已经建好、只是还没 start()，也不发（Java 的门是 mQClientFactory != null，
-    # 本端口的门是 _started and _mq_client —— start() 末尾才会同时成立）。
     fake = FakeClient()
     c._mq_client = fake
     c._started = False
@@ -115,7 +97,7 @@ def test_subscribe_before_start_only_records():
 
 
 def test_unsubscribe_does_not_push_a_heartbeat():
-    """Java :1317-1319：只删表项。多发一轮心跳会掩盖「订阅已撤但 broker 仍记着」的差异。"""
+    pass
     c, fake = started()
     c.subscribe(TOPIC, "*")
     assert len(fake.heartbeats) == 1
@@ -127,7 +109,7 @@ def test_unsubscribe_does_not_push_a_heartbeat():
 
 
 def test_every_heartbeat_is_rebuilt_from_the_live_table():
-    """心跳体是「发出时刻」的订阅表快照，不是启动时的固定集合（Java subscriptions():1385）。"""
+    pass
     c, fake = started()
     c.subscribe("T_A", "*")
     c.subscribe("T_B", "*")
@@ -141,7 +123,7 @@ def test_every_heartbeat_is_rebuilt_from_the_live_table():
 
 
 def test_resubscribe_same_topic_replaces_and_heartbeats_again():
-    """Java 每次 subscribe 都是 put + 发心跳（覆盖写也算一次订阅变更）。"""
+    pass
     c, fake = started()
     c.subscribe(TOPIC, "A")
     c.subscribe(TOPIC, "B")

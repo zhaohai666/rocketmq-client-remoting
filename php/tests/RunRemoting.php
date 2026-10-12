@@ -1027,7 +1027,6 @@ final class RunRemoting
 
     private function testSocksProxy(): void
     {
-        // ---- 1. SocksProxyConfig 配置面（字段对齐 Java SocksProxyConfig）----
         $cfg = new SocksProxyConfig();
         $this->check(!$cfg->isConfigured(), '缺省 SocksProxyConfig 未配置（addr=null）');
         $cfg = new SocksProxyConfig('127.0.0.1:1080', 'u', 'p');

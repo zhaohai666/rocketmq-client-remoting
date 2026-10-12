@@ -1,16 +1,5 @@
 // 拉模式消费者的**平衡视图**（fetchMessageQueuesInBalance）离线单测 —— 不需要集群。
 //
-// 对齐基准（Java 5.5.1，逐行读过；与 python/tests/test_pull_consumer.py、
-// php/tests/RunClientConsumer.php、csharp PullBalanceViewTests、rust 同名用例对拍）：
-//   * Java `MQPullConsumer#fetchMessageQueuesInBalance:187` →
-//     `DefaultMQPullConsumerImpl:120-135`：isRunning() 守卫 → topic==null 抛
-//     IllegalArgumentException → 过滤 `rebalanceImpl.getProcessQueueTable()` 的键 →
-//     `parseSubscribeMessageQueues:153-161` **剥掉命名空间**。
-//     官方用法见 `example/simple/PullConsumer.java:62`（去拉「自己那一份」而不是全部）。
-//   * 本端口拉模式没有后台 rebalance 线程（见 pull_consumer.h 头文件的偏离说明），
-//     视图按 `RebalanceImpl#rebalanceByTopic` 的同一条公式当场算，所以这里锁的是
-//     「算得对不对」：BROADCASTING 全量；CLUSTERING 只拿自己那一份；算不动时保持
-//     现有分配（拉过的队列），**绝不回退成独占全部队列**。
 //
 // 判据取自**线上报文**：假端点记下 38（GET_CONSUMER_LIST_BY_GROUP）的应答内容与
 // 11（PULL_MESSAGE）的到达，不靠调用方自说自话。
@@ -280,8 +269,6 @@ const char* kTopic = "BalViewTopic";
 const char* kBrokerKey = "broker-a";
 const int32_t kQueues = 4;
 
-/// Java registerMessageQueueListener(topic, listener) 兼作「登记 topic」入口，
-/// 本端口同款；平衡视图不关心回调，给一个空监听器。
 class NoopListener : public MessageQueueListener {
 public:
     void messageQueueChanged(const std::string&, const std::vector<MessageQueue>&,
@@ -334,8 +321,6 @@ std::vector<std::string> sortedCids(const std::vector<std::string>& in) {
 
 // ---------------------------------------------------------------- 1. 单实例认领全部
 
-// Java 表里那一刻装的就是「全部」：同组只有自己时分配结果必然是整份订阅信息，
-// 而且按 house 口径（topic → brokerName → queueId）排好序。
 void testSoleInstanceTakesEveryQueue() {
     MockEndpoint ep;
     ep.addRoute(kTopic, routeN(kQueues, kBrokerKey, ep.address()));
@@ -365,8 +350,6 @@ void testTwoInstancesSplitTheQueuesWithoutOverlap() {
     ep.addRoute(kTopic, routeN(kQueues, kBrokerKey, ep.address()));
     auto a = started("bal_pair_a", kGroup, ep, kTopic);
     auto b = started("bal_pair_b", kGroup, ep, kTopic);
-    // 分配前 cidAll 必排序（Java `Collections.sort(cidAll)`）；真实 broker 的返回顺序不定，
-    // 用例先排好，两边看到的才是同一份列表。
     ep.setCidList(sortedCids({a->clientId(), b->clientId()}));
 
     const std::vector<MessageQueue> va = a->fetchMessageQueuesInBalance(kTopic);
@@ -420,7 +403,6 @@ void testUnknownGroupKeepsCurrentAssignmentInsteadOfTakingAll() {
 
 // ---------------------------------------------------------------- 4. 广播不看消费者列表
 
-// Java `rebalanceByTopic` 对 BROADCASTING 不查 cidAll、全量认领：列表里没有本实例也照样。
 void testBroadcastingTakesAllWithoutTheConsumerList() {
     MockEndpoint ep;
     ep.addRoute(kTopic, routeN(kQueues, kBrokerKey, ep.address()));
@@ -435,8 +417,6 @@ void testBroadcastingTakesAllWithoutTheConsumerList() {
 
 // ---------------------------------------------------------------- 5. 未启动直接抛
 
-// Java `isRunning()`：未 start 抛 MQClientException，而不是静默返回空表
-// （空表会让调用方以为「没我的队列」而停拉）。
 void testRequiresAStartedConsumer() {
     DefaultMQPullConsumer c("PG_BalNotStarted");
     bool threw = false;
@@ -450,8 +430,6 @@ void testRequiresAStartedConsumer() {
 
 // ---------------------------------------------------------------- 6. 命名空间：返回裸 topic
 
-// Java `parseSubscribeMessageQueues:153-161` 把结果剥回裸 topic：查询用 "ns%topic"，
-// 返回给调用方的队列 topic 是 "topic"，于是可以直接喂给 pull()（pull 自己会再拼上 ns）。
 void testNamespacedInstanceReturnsBareTopics() {
     const std::string ns = "MQ_INST_bal";
     const std::string plain = "NsBalTopic";

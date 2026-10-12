@@ -1,28 +1,4 @@
 # -*- coding: utf-8 -*-
-"""发布侧「只要 master」的两条口径，订阅信息不受这条约束（Java MQClientInstance:294-332）。
-
-Java 把「上游路由 → 客户端队列集」分成两条口径，同一个 topic 会得到两份不同的答案：
-
-* **发布信息** ``topicRouteData2TopicPublishInfo:294-303``：只看**写**位与 writeQueueNums，
-  **并且**要求该 broker 的 ``brokerAddrs`` 里有 ``MASTER_ID(0)``；
-* **订阅信息** ``topicRouteData2TopicSubscribeInfo:318-332``：只看**读**位与 readQueueNums，
-  **不**要求 master。
-
-master 那一条不是冗余判断：从节点自己也会注册进 namesrv，而且默认配置下它的写位不会被抹掉
-（``RouteInfoManager:344-346`` 只在「prime slave 且 enableActingMaster」时才清 WRITE），
-所以 master 一掉线，路由里同一个 brokerName 就只剩 brokerId=1、``perm`` 依然是 6。生产者若
-把它当可写队列，消息就会发到从节点上，而从节点对发送请求一律 reject
-（``SendMessageProcessor:131`` ⇒ ``SYSTEM_BUSY``，还是个可重试码），白烧一轮超时。
-
-反过来，消费侧**必须**保留这些队列（主挂后仍要从从节点拉取），所以两条口径不能合成一条 ——
-本文件最后两个用例就是这条边界的守卫。
-
-文件的第二半是**地址**侧的同一条分界线：``topicRouteData2TopicPublishInfo`` 挑出了队列，发送时
-还要把 brokerName 解析成地址，Java 那边是 ``findBrokerAddressInPublish:1295-1305``
-（``brokerAddrTable.get(brokerName).get(MASTER_ID)``，**只认主**、拿不到返回 null），
-而不是 ``findBrokerAddressInAdmin``（主优先、没主退一台从节点）。从「队列集」到「地址」
-两处都用发布口径，主从切换期间才会是本端立刻报错，而不是把请求打到从节点上再被拒。
-"""
 from __future__ import annotations
 
 import pytest
@@ -78,7 +54,7 @@ def test_publish_queues_keep_the_healthy_broker_only():
 
 
 def test_subscribe_info_keeps_the_masterless_broker():
-    """消费侧反过来：从节点也能服务拉取，Java 的订阅信息不筛 master。"""
+    pass
     route = _route(
         [QueueData("broker-a", 2, 2, 6, 0)],
         [BrokerData("c", "broker-a", {SLAVE: "127.0.0.1:10931"})],
@@ -88,7 +64,7 @@ def test_subscribe_info_keeps_the_masterless_broker():
 
 
 def test_subscribe_info_uses_read_perm_and_read_queue_nums():
-    """只读 topic（perm=4）在 Java 里照样能被消费；条数按 readQueueNums 而不是 writeQueueNums。"""
+    pass
     route = _route(
         [QueueData("broker-a", 3, 1, 4, 0)],
         [BrokerData("c", "broker-a", {MASTER: "a:10911"})],
@@ -155,7 +131,7 @@ def test_publish_lookup_takes_only_the_master_while_the_admin_lookup_falls_back(
 
 
 def test_publish_addr_for_refreshes_the_route_then_rechecks():
-    """Java ``sendKernelImpl:919-924``：发布地址查不到，按 topic 刷一次路由再查。"""
+    pass
     holder = [None]      # 还没见过这个 topic
     inst, calls = _serving(holder)
     holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911"}})
@@ -170,9 +146,7 @@ def test_publish_addr_for_reports_not_exist_when_the_master_is_gone():
     with pytest.raises(MQClientException) as exc:
         inst.publish_addr_for("broker-a", "T")
     assert str(exc.value) == "The broker[broker-a] not exist"
-    # 本端报的错，没有 broker 侧错误码（Java 的双参构造器给 -1）
     assert exc.value.response_code is None
-    # 报错前必须先刷一次路由（Java 的 tryToFindTopicPublishInfo），不能直接拿旧结论结账
     assert calls == ["127.0.0.1:9876"]
     # 负控：跳的是「没有 master」，不是 broker-a 这个名字 —— master 一注册立刻解析得出
     holder[0] = _route_of({"broker-a": {MASTER: "127.0.0.1:10911",
@@ -211,7 +185,6 @@ def test_admin_offset_queries_are_master_only_too():
         with pytest.raises(MQClientException) as exc:
             call()
         assert str(exc.value) == "The broker[broker-a] not exist", name
-        # 本端报的错，没有 broker 侧错误码（Java 的双参构造器给 -1）
         assert exc.value.response_code is None, name
 
     # 负控：主回来之后四路都解析得出，且请求落在**主**地址上（不是路由里那台从节点）
@@ -227,12 +200,6 @@ def test_admin_offset_queries_are_master_only_too():
 
 
 # -------------------------------------- 订阅口径：findBrokerAddressInSubscribe(MASTER_ID, true)
-#
-# Java 的四处调用点形状一致（RebalanceImpl#unlock:74 / unlockAll:104 / #lock:153 / #lockAll:195、
-# PullAPIWrapper#popAsync:369-373、RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241）：
-# ``findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)`` —— 只认主、**不刷路由**；
-# 只有 POP 与位点查询在查不到时补一次 ``updateTopicRouteInfoFromNameServer(topic)``，
-# 且位点查询的**重查**放宽到从节点（``onlyThisBroker=false``），POP 的重查仍只认主。
 def _invoking(route_holder):
     """离线实例：namesrv 回 ``route_holder[0]``；broker 请求按码回包并逐个记 ``(addr, code)``。"""
     from remoting.protocol.body import LockBatchRequestBody, LockBatchResponseBody
@@ -265,11 +232,7 @@ def _invoking(route_holder):
 
 
 def test_orderly_locks_skip_the_broker_when_the_master_is_gone():
-    """Java ``RebalanceImpl#lock:153 / lockAll:195``（解锁 ``:74/:104``）：只认主、不刷路由。
-
-    路由里只剩从节点时 LOCK/UNLOCK 一条都不该上线：从节点上锁等于锁在它自己的锁管理器里，
-    master 不知情，顺序消费的互斥保证静默失效。
-    """
+    pass
     from remoting.protocol.codes import RequestCode
 
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
@@ -280,8 +243,6 @@ def test_orderly_locks_skip_the_broker_when_the_master_is_gone():
 
     assert inst.lock_batch_mq("GID", "cid", mqs) == []
     inst.unlock_batch_mq("GID", "cid", mqs)
-    # 也不许刷路由：Java 的 lock/unlock 直接 findBrokerAddressInSubscribe(false) 收场，
-    # 没有发送路径上的那一次 tryToFindTopicPublishInfo
     assert calls == []
 
     # 负控：主回来之后锁/解锁都落在主地址上、返回的锁集就是请求的那两个队列
@@ -298,7 +259,7 @@ def test_orderly_locks_skip_the_broker_when_the_master_is_gone():
 
 
 def test_pop_message_is_master_only_and_reports_not_exist():
-    """Java ``PullAPIWrapper#popAsync:369-373``：POP 只认主，查不到刷一次路由再查，仍抛 not exist。"""
+    pass
     from client.consumer_result import PopStatus
     from remoting.protocol.codes import RequestCode
 
@@ -325,11 +286,7 @@ def test_pop_message_is_master_only_and_reports_not_exist():
 
 
 def test_consumer_offset_falls_back_to_the_slave_after_a_refresh():
-    """Java ``RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241``：主没了退到从节点。
-
-    与管理侧 offset 查询（一律打主、主没了报错）的差别只在这最后一步：位点是 HA 复制来的
-    同一份数据，Java 允许从从节点读。
-    """
+    pass
     from remoting.protocol.codes import RequestCode
 
     holder = [_route_of({"broker-a": {SLAVE: "127.0.0.1:10931"}})]
@@ -419,7 +376,7 @@ def test_route_fetch_never_reraises_a_stale_connect_error():
 
 
 def test_route_fetch_raises_only_when_every_name_server_is_unreachable():
-    """全部 name server 都连不上：抛最后一次的传输异常（Java 同样往上抛）。"""
+    pass
     inst, script = _ns_instance(["127.0.0.1:19876", "127.0.0.1:19877"])
     script.append(RemotingConnectException("127.0.0.1:19876"))
     script.append(RemotingConnectException("127.0.0.1:19877"))

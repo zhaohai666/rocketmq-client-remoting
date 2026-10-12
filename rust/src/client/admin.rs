@@ -1,46 +1,10 @@
-//! 管理端（对应 Python `client/admin.py` 的 `DefaultMQAdminExt`，上游是 Java
-//! `org.apache.rocketmq.client.admin.DefaultMQAdminExt` +
-//! `org.apache.rocketmq.tools.admin.DefaultMQAdminExtImpl`）。
-//!
 //! 覆盖：Topic 增删查与配置、Broker 集群信息 / 运行时信息 / 配置、NameServer KV
 //! 配置、订阅组管理、消费者与生产者连接、消费统计、位点管理（含真实 broker 端
 //! 重置）、消息查询（key / uniqKey / msgId / ConsumeQueue）、单条消息试消费
 //! （CONSUME_MESSAGE_DIRECTLY(309) 发起端）。
 //!
-//! 对齐要点（与 `admin.py` 模块头同源，均为 Java 5.x 探针 + 源码核对结论）：
-//! - `GET_BROKER_CONFIG` 的 body 是 **properties 文本**（`k=v\n`），不是 JSON。
-//! - `UPDATE_AND_CREATE_SUBSCRIPTIONGROUP` 的 body 是 SubscriptionGroupConfig JSON。
-//! - `GET_TOPIC_CONFIG` 请求头带 `topic` + `lo`，响应体是 TopicConfigAndQueueMapping JSON。
-//! - `GET_ALL_SUBSCRIPTIONGROUP_CONFIG` 是**分页**接口（groupSeq / maxGroupNum / dataVersion）。
-//! - `ResetOffsetBody.offsetTable` 是 `Map<MessageQueue, Long>`。
-//! - KV 类请求打到 **NameServer**，且 PUT/DELETE 要广播到**每一台** NameServer。
 //!
 //! # 与 Python 参考实现的刻意差别
-//!
-//! 1. **RPC 全部 `async`**：与其它 facade 同因（tokio 运行时）。
-//!    [`DefaultMQAdminExt::shutdown`] 保持同步。
-//! 2. **实例是私有的**：Python `admin.py:92` 直接 `MQClientInstance(client_id, addrs)`
-//!    构造（不走 `create_mq_client_instance` 的复用工厂），这里照抄 —— 因此 admin 的
-//!    `shutdown()` 只会拆掉自己那份实例，不会连带同 clientId 的 producer/consumer。
-//!    （Java 走 `MQClientManager` 共享 + `adminExtTable` 守卫；本移植的 producer 与
-//!    consumer 侧现在也有守卫了，见 `mq_client.rs` 模块头差异 7，admin 不依赖它。）
-//! 3. **没有默认参数**：Python 的 `timeout_millis=None` / `topic=None` / `count=32`
-//!    在这里分成 `Option<...>` 与显式实参，常量（[`DEFAULT_TIMEOUT_MILLIS`]、
-//!    [`DEFAULT_QUERY_MESSAGE_MAX_NUM`]）给出同一默认值。
-//! 4. **`clean_unused_topic` 不带 `topic` 形参**：Python 收了它却从不下发（Java 签名里
-//!    也只有 clusterName），留着只会让人误以为能按 topic 清理。
-//! 5. **不定形 JSON 直接回 [`serde_json::Value`]**：`view_broker_stats_data` /
-//!    `query_subscription` / `get_consume_status` 在 Python 里是 `dict`，本仓库对
-//!    这类无固定 schema 的 body 既有口径就是 `Value`（见 `ConsumeStatsList`、
-//!    `SubscriptionGroupWrapper.forbidden_table`）。
-//! 6. **`query_topic_consume_by_who` 回 `Vec<String>` 而非集合**：Python 的 `set`
-//!    丢掉了 broker 的返回顺序，这里保持原序（同 `ClusterInfo` 的处理口径）。
-//! 7. **`_perm_is_valid` 的 `NumberFormatException` 等价 `false`**：见
-//!    [`PermName::is_valid_str`]，与 Python `admin._perm_is_valid` 同口径。
-//! 8. **位点/消息类 RPC 一律复用实例层 helper**：Python 在 admin 里手拼
-//!    `GET_EARLIEST_MSG_STORETIME` 并用 `_broker_addr_for_mq` 解析地址
-//!    （`admin.py:716`），这里走 `MQClientInstance::get_earliest_msg_store_time`
-//!    —— 同一份请求头、同一份响应解析，地址解析口径与其它位点 RPC 完全一致。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -78,13 +42,9 @@ use crate::remoting::protocol::subscription::{SubscriptionGroupConfig, Subscript
 use crate::remoting::rpchook::RPCHook;
 use crate::{bail, rmq_warn};
 
-/// Python `admin.DEFAULT_TIMEOUT`（Java `DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3`）。
 pub const DEFAULT_TIMEOUT_MILLIS: i64 = 5000 * 3;
 /// Python `DefaultMQAdminExt.instance_name = "ADMIN"`。
 pub const DEFAULT_INSTANCE_NAME: &str = "ADMIN";
-/// Python `create_topic` / `examine_topic_route` 走 client helper 时的固定超时
-/// （`mq_client.py:create_topic_in_route(timeout_millis=5000)`，对应 Java
-/// `MQAdminImpl.timeoutMillis`）—— 这条**不吃** [`AdminConfig::timeout_millis`]。
 const ADMIN_OP_TIMEOUT_MILLIS: i64 = 5000;
 /// Python `query_message_by_key(max_num=32)` 与 `query_message_by_uniq_key` 写死的 32。
 pub const DEFAULT_QUERY_MESSAGE_MAX_NUM: i32 = 32;
@@ -100,35 +60,16 @@ const UNIQ_QUERY_WINDOW_MILLIS: i64 = 60 * 60 * 1000;
 /// 管理端配置（对应 Python `DefaultMQAdminExt.__init__` 的那几个属性）。
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
-    /// Python `self.namespace`：与参考实现一样**只做登记、不参与 topic 拼接**
-    /// （`admin.py` 全文没有用到它；Java 的管理端同样没有 namespace）。
     pub namespace: String,
     pub instance_name: String,
     pub client_id: Option<String>,
-    /// Java `ClientConfig#unitName`（默认 null）：非空时进 clientId 后缀，
-    /// 并作为地址服务器 URL 的 `-<unitName>` 段。
     pub unit_name: Option<String>,
-    /// Java `ClientConfig#namespaceV2`（默认 null）：5.x **服务端**命名空间，
-    /// 非空时每个请求带 `nsd=true` / `ns=<namespaceV2>` 扩展头（`NamespaceRpcHook`），
-    /// 与 v1 `namespace` 的客户端 `%` 前缀机制是两套东西。
     pub namespace_v2: Option<String>,
-    /// Java `ClientConfig#enableStreamRequestType`：true 时每个请求带 `ReqT=0`，
-    /// clientId 末尾多一段 `@STREAM`。
-    ///
-    /// ⚠ admin 没有 `unitMode` 的落点：管理端不发普通消息、也不做消息过滤，
-    /// Java 的 `DefaultMQAdminExtImpl` 全程没读过 `isUnitMode()`，所以这里不设该字段。
     pub enable_stream_request_type: bool,
-    /// Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）：true 时 broker 请求
-    /// 改走 VIP 端口（端口 - 2，[`MixAll::broker_vip_channel`]）。只对本 admin 的
-    /// broker 调用生效——admin 不发消息、不注册消费者，普通收发路径的同一开关
-    /// 在本项目四端均未接线。
     pub vip_channel_enabled: bool,
-    /// Java `ClientConfig#pollNameServerInterval`（默认 30000ms）：在用 topic 的
-    /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`。
     pub poll_name_server_interval_millis: u64,
     pub name_server_addrs: Vec<String>,
     pub timeout_millis: i64,
-    /// Java `kvNamespaceToDeleteList`：`delete_topic` 时顺带清掉的 KV namespace。
     pub kv_namespace_to_delete_list: Vec<String>,
 }
 
@@ -141,7 +82,6 @@ impl Default for AdminConfig {
             namespace_v2: None,
             enable_stream_request_type: false,
             vip_channel_enabled: false,
-            // Java `ClientConfig:58`：pollNameServerInterval = 1000 * 30
             poll_name_server_interval_millis: 30_000,
             client_id: None,
             name_server_addrs: Vec::new(),
@@ -205,14 +145,6 @@ fn ext_pairs(pairs: &[(&str, String)]) -> StringMap {
 }
 
 /// 222 `INVOKE_BROKER_TO_RESET_OFFSET` 的 extFields。
-///
-/// 键名是 **isForce** 不是 force：Java `RemotingCommand.makeCustomHeaderToNet:437-450`
-/// 拿 requestHeader 的**字段名**做 ext key，而 `ResetOffsetRequestHeader` 声明的字段是
-/// `private boolean isForce`（getter `isForce()` 不参与命名）。写成 force 时 broker 侧
-/// isForce 恒为 false ⇒ `Broker2Client.resetOffset:152-158` 的分支退化成「取时间戳位点」，
-/// 前重（timestamp=-1）会把 consumerOffset 原样回显而不是跳到 maxOffset。
-/// 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
-///               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
 fn reset_offset_ext_pairs(
     topic: &str,
     group: &str,
@@ -226,7 +158,6 @@ fn reset_offset_ext_pairs(
         ("group", group.to_string()),
         ("timestamp", timestamp.to_string()),
         ("isForce", bool_flag(is_force).to_string()),
-        // Java：offset=-1 表示 offset 为空
         ("offset", offset.unwrap_or(-1).to_string()),
     ];
     if let Some(queue_id) = queue_id {
@@ -373,7 +304,6 @@ fn effective_timeout(configured: i64, explicit: Option<i64>) -> i64 {
 
 // ---------------------------------------------------------------- 消息轨迹 DTO
 
-/// 对应 Java `org.apache.rocketmq.tools.admin.api.TrackType`（字符串值即枚举名）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackType {
     Consumed,
@@ -399,7 +329,6 @@ impl TrackType {
     }
 }
 
-/// 对应 Java `MessageTrack`：一条消息在某消费组的投递判定。
 #[derive(Debug, Clone)]
 pub struct MessageTrack {
     pub consumer_group: String,
@@ -409,8 +338,6 @@ pub struct MessageTrack {
 
 // ---------------------------------------------------------------- facade
 
-/// 管理客户端（对应 Java `DefaultMQAdminExt`，移植自 Python `admin.DefaultMQAdminExt`）。
-///
 /// 用法：`set_namesrv_addr(..)` → `start().await` → 调各种 `examine*/get*/create*/delete*`
 /// → `shutdown()`。克隆出的副本共享同一份状态与同一条连接。
 #[derive(Clone)]
@@ -498,36 +425,28 @@ impl DefaultMQAdminExt {
         self.update_config(|c| c.instance_name = name);
     }
 
-    /// Java `ClientConfig#setUnitName`：`None`/空白等价于不设（拼 clientId 时按 isBlank 判）。
     pub fn set_unit_name(&self, unit_name: Option<&str>) {
         let unit_name = unit_name.map(str::to_string);
         self.update_config(|c| c.unit_name = unit_name);
     }
 
-    /// Java `ClientConfig#setNamespaceV2`：5.x **服务端**命名空间（`ns`/`nsd`
-    /// 扩展头，见 `NamespaceRpcHook`）。`None`/空串 = 不设，钩子退化为 no-op。
-    /// `start()` 时透传给私有 `MQClientInstance`，晚于 start 修改不影响已建实例。
     pub fn set_namespace_v2(&self, namespace_v2: Option<&str>) {
         let namespace_v2 = namespace_v2.map(str::to_string);
         self.update_config(|c| c.namespace_v2 = namespace_v2);
     }
 
-    /// Java `ClientConfig#getNamespaceV2`。
     pub fn get_namespace_v2(&self) -> Option<String> {
         self.config().namespace_v2
     }
 
-    /// Java `ClientConfig#setEnableStreamRequestType`。
     pub fn set_enable_stream_request_type(&self, enable: bool) {
         self.update_config(|c| c.enable_stream_request_type = enable);
     }
 
-    /// Java `ClientConfig#setVipChannelEnabled`。
     pub fn set_vip_channel_enabled(&self, enable: bool) {
         self.update_config(|c| c.vip_channel_enabled = enable);
     }
 
-    /// Java `ClientConfig#setPollNameServerInterval`。
     pub fn set_poll_name_server_interval_millis(&self, millis: u64) {
         self.update_config(|c| c.poll_name_server_interval_millis = millis);
     }
@@ -587,12 +506,6 @@ impl DefaultMQAdminExt {
             self.inner.started.store(false, Ordering::Release);
             bail!("name server address is not set");
         }
-        // Java `DefaultMQAdminExtImpl#start`:161 无条件 `changeInstanceNameToPID`，
-        // clientId 再走 `ClientConfig#buildMQClientId` 的
-        // `<本机 IP>@<instanceName>[@unitName][@STREAM]`。
-        // 本移植的 admin instanceName 默认是 "ADMIN"（不是 Java 的 "DEFAULT"，见模块头
-        // 差异 2：admin 用私有实例，不和其他客户端共用），所以改写只在调用方显式
-        // 设成 "DEFAULT" 时才起作用。
         let instance_name = MixAll::change_instance_name_to_pid(&cfg.instance_name);
         let client_id = cfg.client_id.clone().unwrap_or_else(|| {
             MixAll::build_default_client_id(
@@ -677,7 +590,6 @@ impl DefaultMQAdminExt {
     ) -> Result<RemotingCommand> {
         let client = self.require_client()?;
         let timeout = effective_timeout(self.timeout_millis(), timeout_millis);
-        // Java `brokerVIPChannel(vipChannelEnabled, addr)`：开 VIP 时端口 - 2
         let addr = &MixAll::broker_vip_channel(read_cfg(&self.inner.cfg).vip_channel_enabled, addr);
         let mut request = build_request(code, ext, body);
         let response = client.invoke_sync(addr, &mut request, timeout).await?;
@@ -685,8 +597,6 @@ impl DefaultMQAdminExt {
         Ok(response)
     }
 
-    /// Python `_invoke_namesrv_all`：广播到每一台 NameServer
-    /// （Java `putKVConfigValue` / `deleteKVConfigValue` 语义）。
     async fn invoke_namesrv_all(
         &self,
         code: i32,
@@ -714,8 +624,6 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `_invoke_namesrv_one`：打到第一台可用的 NameServer
-    /// （Java `invokeSync(null, ...)` 语义）。
     async fn invoke_namesrv_one(
         &self,
         code: i32,
@@ -763,9 +671,6 @@ impl DefaultMQAdminExt {
 
     /// Python `create_topic(key, new_topic, queue_num, topic_sys_flag)`：
     /// 走默认 topic 的路由逐 broker 下发（一台成功即可）。
-    ///
-    /// `key` 是 Java `MQAdminImpl#createTopic(topicPublishTable key, ...)` 的第一个实参，
-    /// Python 同样收下不用（真正下发时用 `TBW102` 作 defaultTopic），这里保留形参。
     pub async fn create_topic(
         &self,
         key: &str,
@@ -788,7 +693,6 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `create_and_update_topic_config`（Java 走 createTopicKey）。
     pub async fn create_and_update_topic_config(
         &self,
         addr: &str,
@@ -922,10 +826,6 @@ impl DefaultMQAdminExt {
     }
 
     /// Python `fetch_topics_by_cluster`（`GET_TOPICS_BY_CLUSTER` 打到 NameServer）。
-    ///
-    /// 字段名用 Java `GetTopicsByClusterRequestHeader.cluster` 的 `cluster`：Python
-    /// 这里发的是 `clusterName`，namesrv 取不到集群名 ⇒ `clusterAddrTable.get(null)`
-    /// 抛 NPE 被吞掉，返回 SUCCESS + 空列表（看着像「这个集群没有 topic」）。
     pub async fn fetch_topics_by_cluster(&self, cluster_name: &str) -> Result<Vec<String>> {
         let ext = ext_pairs(&[("cluster", cluster_name.to_string())]);
         let response = self
@@ -1156,7 +1056,6 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `get_broker_runtime_info`（Java 旧接口名）。
     pub async fn get_broker_runtime_info(
         &self,
         broker_addr: &str,
@@ -1308,7 +1207,6 @@ impl DefaultMQAdminExt {
 
     // ---------------- NameServer KV 配置 ----------------
 
-    /// Python `create_and_update_kv_config` → Java `putKVConfigValue`（广播全部 NameServer）。
     pub async fn create_and_update_kv_config(
         &self,
         namespace: &str,
@@ -1324,8 +1222,6 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `put_kv_config`（Java `DefaultMQAdminExtImpl.putKVConfig` 是空实现，
-    /// 真正干活的就是 `createAndUpdateKvConfig`）。
     pub async fn put_kv_config(&self, namespace: &str, key: &str, value: &str) -> Result<()> {
         self.create_and_update_kv_config(namespace, key, value)
             .await
@@ -1398,11 +1294,6 @@ impl DefaultMQAdminExt {
     }
 
     /// Python `get_subscription_group_config`（`GET_SUBSCRIPTIONGROUP_CONFIG` 单查）。
-    ///
-    /// ⚠ 这是个**会写**的读接口：Java `AdminBrokerProcessor#getSubscriptionGroup` 走
-    /// `findSubscriptionGroupConfig`，broker 开了 `autoCreateSubscriptionGroup`（默认
-    /// true）时，查一个不存在的组会顺手把它按默认配置建出来。所以「删组之后还在不在」
-    /// 必须用 [`Self::examine_subscription_group_config`]（只读全量表）判定。
     pub async fn get_subscription_group_config(
         &self,
         addr: &str,
@@ -1425,9 +1316,6 @@ impl DefaultMQAdminExt {
     }
 
     /// Python `get_all_subscription_group`：**分页**累积，直到 `groupSeq >= totalGroupNum-1`。
-    ///
-    /// 老版本 broker 不带 `totalGroupNum`，此时一次性返回全部（单轮即结束）。
-    /// 中途 `dataVersion` 变了就清零重来（Java 同），并且整轮受一个总超时约束。
     pub async fn get_all_subscription_group(
         &self,
         broker_addr: &str,
@@ -1757,11 +1645,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    // ---------------- 消息轨迹（Java DefaultMQAdminExtImpl.messageTrackDetail） ----------------
 
-    /// 对应 Java `examineConsumeStats(group[, topic])`（:389-424）：按 `%RETRY%<group>`
-    /// 的路由扇出全部 broker，逐台取统计并合并（offsetTable 并入、consumeTps 累加）；
-    /// 全空时抛错（Java 的 MQClientException 同口径）。
     pub async fn examine_consume_stats_group(
         &self,
         consumer_group: &str,
@@ -1794,8 +1678,6 @@ impl DefaultMQAdminExt {
         Ok(result)
     }
 
-    /// 对应 Java `DefaultMQAdminExtImpl.consumed:1533-1557`：该组在本队列的
-    /// consumerOffset 是否已越过这条消息的 queueOffset（位点越过 ⇒ 已消费）。
     pub async fn consumed(&self, msg: &MessageExt, group: &str) -> Result<bool> {
         let cstats = self.examine_consume_stats_group(group, None).await?;
         let ci = self.examine_broker_cluster_info().await?;
@@ -1812,8 +1694,6 @@ impl DefaultMQAdminExt {
                         .iter()
                         .find(|(id, _)| *id == MixAll::MASTER_ID as i64)
                         .map(|(_, a)| a);
-                    // Java 先把 master 地址规范化成 ip:port 再比对（convert2IpString）；
-                    // 四端存的 broker 地址本来就是注册时的 ip:port 形态，直接比。
                     if let (Some(addr), Some(store_host)) = (addr, store_host.as_deref()) {
                         if *addr == store_host && wrapper.consumer_offset > msg.queue_offset {
                             return Ok(true);
@@ -1825,8 +1705,6 @@ impl DefaultMQAdminExt {
         Ok(false)
     }
 
-    /// 对应 Java `DefaultMQAdminExtImpl.messageTrackDetail:1349-1427`：查谁在消费
-    /// 这个 topic，逐组判 CONSUMED / FILTERED / PULL / NOT_ONLINE / BROADCASTING…。
     pub async fn message_track_detail(&self, msg: &MessageExt) -> Result<Vec<MessageTrack>> {
         let mut result: Vec<MessageTrack> = Vec::new();
         let route = self.examine_topic_route(&msg.topic).await?;
@@ -1843,7 +1721,7 @@ impl DefaultMQAdminExt {
         let mut groups = self
             .query_topic_consume_by_who(&broker_addr, &msg.topic)
             .await?;
-        groups.sort(); // Java 按 broker 返回顺序遍历；这里排序让输出确定
+        groups.sort();
         for group in groups {
             let mut mt = MessageTrack {
                 consumer_group: group.clone(),
@@ -1891,9 +1769,6 @@ impl DefaultMQAdminExt {
 
                     if if_consumed {
                         mt.track_type = TrackType::Consumed;
-                        // Java 遍历订阅表找本 topic：tagsSet 非空、既不含消息 tag 也不含
-                        // "*" ⇒ 订阅比消息窄，消息是被过滤掉的那部分（SQL92 订阅 tagsSet
-                        // 为空，同样落回 CONSUMED —— 忠实保留 Java 语义）。
                         let sub = cc
                             .subscription_table
                             .iter()
@@ -1929,8 +1804,6 @@ impl DefaultMQAdminExt {
         Ok(result)
     }
 
-    /// 对应 Java `MQClientAPIImpl#queryTopicsByConsumer:2525`（343）的单 broker 原始调用。
-    ///
     /// broker 端走 `AdminBrokerProcessor#queryTopicsByConsumer:2421` →
     /// `ConsumerOffsetManager#whichTopicByConsumer`：**从位点表**（`topic@group` 键）反查该组
     /// 消费过哪些 topic。所以组从没提交过位点时回空表，这是预期而不是 bug。
@@ -1956,11 +1829,6 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// 对应 Java `DefaultMQAdminExt#queryTopicsByConsumer`（`DefaultMQAdminExtImpl:1078`）。
-    ///
-    /// Java 先按 `%RETRY%<group>` 查路由，再对路由里每个 broker 下发 343 并合并
-    /// （Java 的 `TopicList.topicList` 是 `Set<String>`，所以这里同样去重）。
-    /// Python `query_topics_by_consumer`。
     pub async fn query_topics_by_consumer(&self, group: &str) -> Result<TopicList> {
         let route = self
             .examine_topic_route(&MixAll::get_retry_topic(group))
@@ -2082,13 +1950,10 @@ impl DefaultMQAdminExt {
     }
 
     /// Python `search_offset`。
-    ///
-    /// 对应 Java `MQAdminImpl#searchOffset(mq, ts)`:189 —— 显式下发 LOWER 边界。
     pub async fn search_offset(&self, mq: &MessageQueue, timestamp: i64) -> Result<i64> {
         self.search_lower_boundary_offset(mq, timestamp).await
     }
 
-    /// 对应 Java `DefaultMQAdminExt#searchLowerBoundaryOffset`:133。
     pub async fn search_lower_boundary_offset(
         &self,
         mq: &MessageQueue,
@@ -2105,8 +1970,6 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// 对应 Java `DefaultMQAdminExt#searchUpperBoundaryOffset`:137。
-    ///
     /// 与 LOWER 的差异只在多条消息共享 storeTime、或时间戳落在空档/队尾时可见：
     /// 队尾之后 UPPER 回最后一条自己的位点，LOWER 回它的下一个位点（maxOffset）。
     pub async fn search_upper_boundary_offset(
@@ -2174,19 +2037,6 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `reset_offset_by_timestamp`（对应 Java 同名）：
-    /// 逐 broker 下发 `INVOKE_BROKER_TO_RESET_OFFSET`(222)，由 broker 端按 timestamp
-    /// 算新位点、同步在线消费者并写 offset 表，汇总 `Map<MessageQueue, Long>`。
-    ///
-    /// `is_cpp` 只影响 broker 推给**在线消费者**的 220 报文形状：broker 按发起方（也就是
-    /// 本请求）的 language 判 `isC`，仅 CPP 置真（`AdminBrokerProcessor:2263-2270`），CPP 时
-    /// 推 `ResetOffsetBodyForC`（JSON 数组）、其余推 `ResetOffsetBody`（对象即键的 map）。
-    /// Java 管理端两个重载传的都是 `false`（`MQClientAPIImpl:2405/2408`）；222 的**响应**体
-    /// 恒为 map 形状（`Broker2Client:232`），与本参数无关。
-    ///
-    /// 这里**不再**走「逐队列 searchOffset + updateConsumerOffset」的旧本地实现 ——
-    /// 那不会同步在线消费者，也不会做 broker 端一致性校验（旧实现保留在
-    /// [`DefaultMQAdminExt::reset_offset_by_timestamp_old`]，只服务于 Java 的 old 分支）。
     #[allow(clippy::too_many_arguments)]
     pub async fn reset_offset_by_timestamp(
         &self,
@@ -2235,11 +2085,6 @@ impl DefaultMQAdminExt {
     }
 
     /// 一笔 `INVOKE_BROKER_TO_RESET_OFFSET`(222)，回 broker 实际重置的队列表。
-    ///
-    /// Java 在这里有**两个**重载：`(topic, group, timestamp, isForce)` 按时间戳重置整个
-    /// topic，另一个带 `queueId` + `offset` 的只重置单个队列
-    /// （`MQClientAPIImpl#invokeBrokerToResetOffset`）。`offset` 为 `None` 时按 Java 口径
-    /// 写 `-1`（broker 侧当成 null，转去按 timestamp 算位点）。
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::fn_params_excessive_bools)]
     async fn invoke_broker_reset_offset(
@@ -2283,24 +2128,6 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `reset_offset_by_queue_id`（对应 Java
-    /// `DefaultMQAdminExt#resetOffsetByQueueId:797` → `DefaultMQAdminExtImpl:1827`）。
-    ///
-    /// Java 打**两笔** RPC，缺一不可：
-    /// 1. `updateConsumerOffset`(25) 直接把 offsetTable 改成目标位点；
-    /// 2. 带 `queueId` + `offset` 的 222 走 `AdminBrokerProcessor#resetOffsetInner`，
-    ///    先按 `[min, max+1]` 校验目标位点（越界回 SYSTEM_ERROR
-    ///    `Target offset N not in consume queue range [min-max]`），再
-    ///    `ConsumerOffsetManager#assignResetOffset`——它同时写 `resetOffsetTable`（一次性，
-    ///    下次 pull 用 `queryThenEraseResetOffset` 取走）和 `offsetTable`，并清掉该队列的
-    ///    POP 在途计数。只做第 1 步的话在线消费者仍按自己内存里的位点继续拉。
-    ///
-    /// Java 返回 void（只打日志），这里把 broker 报回的队列表返回，便于调用方核对。
-    ///
-    /// ⚠ 实测（5.5.1 真机）这两笔 RPC **不是原子的**：`ConsumerOffsetManager#commitOffset`
-    /// 只做覆盖写（连 offset 变小都只打 `[NOTIFYME]` warn，不做区间校验），所以第 2 笔被
-    /// `resetOffsetInner` 以 `Target offset N not in consume queue range [min-max]` 拒绝时，
-    /// 第 1 笔已经把非法位点落库。Java 同样如此，这里不做保护性回滚。
     pub async fn reset_offset_by_queue_id(
         &self,
         broker_addr: &str,
@@ -2316,7 +2143,6 @@ impl DefaultMQAdminExt {
             reset_offset,
         )
         .await?;
-        // Java 的单队列重载不传 force（默认 false）、timestamp 传 0（位点已给定，不参与算）
         self.invoke_broker_reset_offset(
             broker_addr,
             topic,
@@ -2502,14 +2328,6 @@ impl DefaultMQAdminExt {
             .await)
     }
 
-    /// Python `view_message`（Java `DefaultMQAdminExtImpl#viewMessage`）。
-    ///
-    /// Java 先按 offsetMsgId 解出 broker 地址 + commitLog 偏移走 `VIEW_MESSAGE_BY_ID`，
-    /// **任何**失败都退回按 UNIQ_KEY 查索引。这条兜底必须留：3.x 时代的 offsetMsgId 与
-    /// 5.x 客户端生成的 uniqKey 都是 32 位十六进制，硬解会拼出一个不存在的 `ip:port`；
-    /// 端口越界在 Rust 里更是直接不可表示，所以显式判 `0 < port <= 65535`
-    /// （`decode_message_id` 返回的端口是 `u32`，Python 不校验就会把 `OverflowError`
-    /// 抛到调用方手里，异常契约直接破掉）。
     pub async fn view_message(&self, topic: &str, msg_id: &str) -> Result<MessageExt> {
         let by_id_error: Option<String>;
         match decode_message_id(msg_id) {
@@ -2553,18 +2371,6 @@ impl DefaultMQAdminExt {
         ))
     }
 
-    /// Java `DefaultMQAdminExtImpl#consumeMessageDirectly(consumerGroup, clientId,
-    /// topic, msgId)`：让 broker 把 `msg_id` 那条消息**直接推给 `client_id` 的消费者**
-    /// 试消费（CONSUME_MESSAGE_DIRECTLY(309)），应答 body 是目标客户端的
-    /// [`ConsumeMessageDirectlyResult`]。
-    ///
-    /// Java 的取址口径（`viewMessage` → `msg.getStoreHost()`）：先解析 msgId 定位消息
-    /// —— 合法 offset msgId 走 `VIEW_MESSAGE_BY_ID`，解不动（uniqKey）退回 uniqKey
-    /// 索引查询 —— 309 打到**消息的 storeHost**；消息带客户端 uniq key（`UNIQ_KEY`
-    /// 属性）时头里的 msgId 要换成**消息本体的 offset msgId**（broker 靠它定位
-    /// commitLog 再转发给目标客户端），没有 uniq key 的（老客户端产的消息）原样透传。
-    /// 309 的 broker 端会把消息编码进 body 转发给目标客户端，把客户端的
-    /// [`ConsumeMessageDirectlyResult`] 原样带回。
     pub async fn consume_message_directly(
         &self,
         consumer_group: &str,
@@ -2572,14 +2378,10 @@ impl DefaultMQAdminExt {
         topic: &str,
         msg_id: &str,
     ) -> Result<ConsumeMessageDirectlyResult> {
-        // Java 先 viewMessage：offsetMsgId / uniqKey 两条路径都会给出消息本体。
         let msg = self.view_message(topic, msg_id).await?;
-        // Java `NetworkUtil.socketAddress2String(msg.getStoreHost())`。
         let addr = msg.get_store_host_string().ok_or_else(|| {
             Error::client(format!("message {msg_id} has no store host, cannot consume directly"))
         })?;
-        // Java：`getProperty(UNIQ_KEY) == null` ⇒ 原样透传 msgId；否则用
-        // `MessageClientExt.getOffsetMsgId()`（即消息本体的 offset msgId）。
         let direct_msg_id = match msg.get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) {
             Some(_) => msg.get_offset_msg_id().unwrap_or(msg_id),
             None => msg_id,
@@ -2595,9 +2397,6 @@ impl DefaultMQAdminExt {
             .await?;
         match response.body.as_deref().filter(|b| !b.is_empty()) {
             Some(body) => ConsumeMessageDirectlyResult::decode(body),
-            // Java 在 SUCCESS 且 body 为空时落到 default 分支抛
-            // `MQClientException(0, null)`；这里沿用 nodeJs 的可读文案（纯客户端错
-            // 不带 response_code，与 `admin` 既有口径一致）。
             None => Err(Error::client(format!(
                 "no consume result for client {client_id}"
             ))),
@@ -2636,7 +2435,6 @@ impl DefaultMQAdminExt {
         }
     }
 
-    // ---------------- 批量配置（Java 有实现、此前 Rust 侧缺失） ----------------
 
     /// Python `create_and_update_topic_config_list` → UPDATE_AND_CREATE_TOPIC_LIST(18)。
     ///
@@ -2766,10 +2564,6 @@ impl DefaultMQAdminExt {
     }
 
     /// Python `resume_check_half_message` → RESUME_CHECK_HALF_MESSAGE(323)。
-    ///
-    /// Java（MQClientAPIImpl:3279）对非 SUCCESS **返回 false 而不抛错**——broker
-    /// 拒绝（如 msgId 不是半消息，SYSTEM_ERROR）通过返回值表达，网络层异常才上抛；
-    /// `invoke_broker` 的 check_response 会把拒绝变成错误，所以这里走裸调用。
     pub async fn resume_check_half_message(
         &self,
         broker_addr: &str,
@@ -2811,7 +2605,6 @@ impl DefaultMQAdminExt {
                 .put_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key, value)
                 .await;
         }
-        // Java 打印异常后按空表继续：首写是常态，不是失败。
         let old_confs = self
             .get_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key)
             .await
@@ -3139,14 +2932,11 @@ mod tests {
         assert_eq!(cfg.namespace_v2, None, "namespaceV2 默认不设");
         assert!(!admin.is_started());
         assert_eq!(admin.client_id(), "");
-        // Java ClientConfig#vipChannelEnabled 5.x 默认 false
         assert!(!cfg.vip_channel_enabled);
     }
 
     #[test]
     fn namespace_v2_setter_getter_round_trip() {
-        // Java `ClientConfig#setNamespaceV2/getNamespaceV2`：服务端命名空间
-        //（`NamespaceRpcHook` 的 `nsd`/`ns` 头），私有实例在 start() 时取用。
         let admin = DefaultMQAdminExt::new();
         assert_eq!(admin.get_namespace_v2(), None, "默认不设");
         admin.set_namespace_v2(Some("NS_V2"));
@@ -3172,7 +2962,6 @@ mod tests {
         assert!(!admin.config().vip_channel_enabled);
     }
 
-    /// TrackType 字符串值必须与 Java 枚举名逐字一致（探针/控制台按名字展示）。
     #[test]
     fn track_type_names_match_protocol_contract() {
         assert_eq!(TrackType::Consumed.as_str(), "CONSUMED");
@@ -3205,14 +2994,6 @@ mod tests {
         );
     }
 
-    /// 222 的 force 标志在 wire 上叫 **isForce**：Java 拿字段名做 ext key
-    /// （`RemotingCommand.makeCustomHeaderToNet:437-450`），而 `ResetOffsetRequestHeader`
-    /// 声明的是 `private boolean isForce`。写成 force 时 broker 视 isForce=false，
-    /// 前重（timestamp=-1）会回显 consumerOffset 而不是跳到 maxOffset。
-    /// 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
-    ///               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
-    /// 与 python/tests/test_admin_reset_offset.py 的同名断言、C# ResetOffsetTests 的
-    /// wire 取证同题。
     #[test]
     fn reset_offset_ext_key_is_isforce() {
         let ext = reset_offset_ext_pairs("T", "G", -1, true, None, None);
@@ -3518,8 +3299,6 @@ mod tests {
         assert!(string_list(&json!({}), "topicList").is_empty());
     }
 
-    /// 抄送一遍 Python/Java 的码值口径：管理端的纯客户端错都是 code=1（`None` 的
-    /// `Error::Client` 在 Display 里没有码），带 broker 语义的才带码。
     #[tokio::test]
     async fn client_error_codes_are_documented() {
         let admin = DefaultMQAdminExt::new();
@@ -3617,7 +3396,6 @@ mod tests {
                             continue;
                         }
                         let mut response = reply_for(&request, code, body);
-                        // Java 的业务错走 remark（`check_response` 原样透传）。
                         if code != response_code::SUCCESS {
                             response.remark = Some(String::from_utf8_lossy(&direct.1).into_owned());
                             response.body = None;
@@ -3746,8 +3524,6 @@ mod tests {
         admin.shutdown();
     }
 
-    /// Java 的另一条腿：消息没有 UNIQ_KEY 属性（老客户端产的消息）⇒ 309 头里的
-    /// msgId **原样透传**调用方给的那份。
     #[tokio::test]
     async fn consume_message_directly_without_uniq_key_passes_msg_id_through() {
         let (listener, addr, port) = {
@@ -3812,8 +3588,6 @@ mod tests {
         admin.shutdown();
     }
 
-    /// SUCCESS 但 body 为空：Java 抛 `MQClientException(0, null)`，这里沿用 nodeJs
-    /// 的可读文案，且不带 response_code（纯客户端错口径）。
     #[tokio::test]
     async fn consume_message_directly_reports_missing_result_body() {
         let (listener, addr, port) = {

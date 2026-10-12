@@ -148,7 +148,6 @@ public static class LivePullHeartbeat
                 conn is not null && conn.MessageModel == MessageModel.Clustering,
                 "messageModel=" + (conn?.MessageModel ?? "-"));
 
-            // ---------------- A2b 订阅集来自 registerTopics（Java subscriptions():357-385）----
             string? subString = conn is null ? null : SubStringOf(conn, Topic);
             Check("A2b 203 的订阅表带 registerTopics 的 topic 且 subString=*",
                 subString == "*",

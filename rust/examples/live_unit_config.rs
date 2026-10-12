@@ -15,12 +15,6 @@
 //! - U5 `enableStreamRequestType=true` 时每个请求带 `ReqT=0`，普通 broker 忽略它，
 //!   发送与拉取都照常成功（lite 消费者默认就开着 stream，这里当对照组用）。
 //!
-//! ⚠ 两处顺序坑（Python 同样踩过，结论记在这里）：
-//! 1. 心跳只发给**路由表里已出现**的 broker（`sendHeartbeatToAllBroker` 遍历
-//!    `topicRouteTable`），订阅一个还不存在的 topic 时一条心跳都发不出去 ——
-//!    所以 U2/U4 必须先由生产者发预热消息、再等 topic 在 namesrv 可见。
-//! 2. 新消费组默认 `CONSUME_FROM_LAST_OFFSET`（Java 同），首拉会把位点直接设成
-//!    max，**消费者启动之前**的消息会被跳过 —— 所以 U2/U5 显式改成 FIRST。
 //!
 //! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`、
 //! `autoCreateSubscriptionGroup=true`。
@@ -50,7 +44,6 @@ use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 
 /// 集群探活与「等 broker 侧结果落地」的默认预算（秒）。
 const WAIT_SECONDS: u64 = 30;
-/// Java `org.apache.rocketmq.common.sysflag.TopicSysFlag`
 const FLAG_UNIT: i32 = 0x1 << 0;
 const FLAG_UNIT_SUB: i32 = 0x1 << 1;
 
@@ -123,7 +116,6 @@ impl MessageListenerConcurrently for Inbox {
 struct Env {
     namesrv: String,
     stamp: String,
-    /// Java `MixAll#cachedIpStr`：clientId 的前缀。
     ip: String,
     admin: DefaultMQAdminExt,
     broker_addr: Mutex<String>,
@@ -548,7 +540,6 @@ async fn u5_stream_requests_still_work(ck: &mut Checker, env: &Env) {
         ck.abort("U5 topic 路由可见", "路由在预算内没出现");
         return;
     }
-    // lite 消费者默认就开 stream（Java DefaultLitePullConsumer 构造函数即置位）
     let lite = match DefaultLitePullConsumer::with_config(LitePullConsumerConfig {
         consumer_group: group.clone(),
         instance_name: env.instance("u5"),

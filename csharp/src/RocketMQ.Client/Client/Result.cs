@@ -1,11 +1,4 @@
 // 客户端结果类型与回调/监听器接口。
-//
-// 对应：
-//   org.apache.rocketmq.client.producer.{SendResult, SendStatus, TransactionSendResult,
-//                                       MessageQueueSelector, LocalTransactionState,
-//                                       TransactionListener, SendCallback}
-//   org.apache.rocketmq.client.consumer.listener.{ConsumeConcurrentlyStatus, ...}
-//   org.apache.rocketmq.client.consumer.PullResult / PullStatus / PullCallback
 using System.Globalization;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -14,7 +7,6 @@ namespace RocketMQ.Client;
 
 // ---------------------------------------------------------------- 发送结果
 
-/// <summary>org.apache.rocketmq.client.producer.SendStatus。</summary>
 public enum SendStatus
 {
     SendOk = 0,
@@ -35,7 +27,6 @@ public static class SendStatusNames
     };
 }
 
-/// <summary>org.apache.rocketmq.client.producer.SendResult。</summary>
 public class SendResult
 {
     public SendStatus SendStatus { get; set; } = SendStatus.SendOk;
@@ -47,8 +38,6 @@ public class SendResult
     public string RegionId { get; set; } = string.Empty;
     // broker 在 SEND 响应头 TRACE_ON 里告知是否落轨迹（"false" 才关，缺省 true）。
     public bool TraceOn { get; set; } = true;
-    // 对应 Java SendResult.recallHandle：只有定时/延迟消息才有（broker 在 SEND 响应头里
-    // 挂回 recallHandle），普通消息恒为 null。原样传给 RecallMessage() 即可撤回。
     public string? RecallHandle { get; set; }
 
     public override string ToString() =>
@@ -61,7 +50,6 @@ public class SendResult
 
 // ---------------------------------------------------------------- 事务
 
-/// <summary>org.apache.rocketmq.client.producer.LocalTransactionState。</summary>
 public enum LocalTransactionState
 {
     CommitMessage = 0,
@@ -80,13 +68,11 @@ public static class LocalTransactionStateNames
     };
 }
 
-/// <summary>org.apache.rocketmq.client.producer.TransactionSendResult。</summary>
 public sealed class TransactionSendResult : SendResult
 {
     public LocalTransactionState LocalTransactionState { get; set; } = LocalTransactionState.Unknow;
 }
 
-/// <summary>org.apache.rocketmq.client.producer.TransactionListener。</summary>
 public interface ITransactionListener
 {
     /// <summary>执行本地事务，返回提交/回滚/未知。</summary>
@@ -98,22 +84,15 @@ public interface ITransactionListener
 
 // ---------------------------------------------------------------- 异步回调
 
-/// <summary>org.apache.rocketmq.client.producer.SendCallback。</summary>
 public interface ISendCallback
 {
     void OnSuccess(SendResult sendResult);
 
-    /// <summary>对应 Java <c>onException(Throwable e)</c>：交出去的是**异常对象**，类型即失败
-    /// 原因 —— broker 明确回错是 <see cref="MQBrokerException"/>（带 <c>ResponseCode</c>，
-    /// 调用方按码分流）、背压闸拒绝是 <c>RemotingTooMuchRequestException</c>、其余传输失败是
-    /// <see cref="MQClientException"/>（Java 的 operationFail 三包装）。给字符串等于把"哪一类
-    /// 失败"这个信息丢掉，调用方只能对着文案做正则。</summary>
     void OnException(Exception error);
 }
 
 // ---------------------------------------------------------------- 拉取结果
 
-/// <summary>org.apache.rocketmq.client.consumer.PullStatus。</summary>
 public enum PullStatus
 {
     Found = 0,
@@ -134,7 +113,6 @@ public static class PullStatusNames
     };
 }
 
-/// <summary>org.apache.rocketmq.client.consumer.PullResult。</summary>
 public sealed class PullResult
 {
     public PullStatus Status { get; set; } = PullStatus.NoNewMsg;
@@ -143,11 +121,6 @@ public sealed class PullResult
     public long MaxOffset { get; set; }
     public List<MessageExt> MsgFoundList { get; set; } = new();
 
-    /// <summary>
-    /// 对应 Java <c>PullResultExt.suggestWhichBrokerId</c>：broker 建议下次从哪个 brokerId
-    /// 拉（主从部署时可能是从节点）。<c>PullAPIWrapper#processPullResult:77</c> 用它更新
-    /// pullFromWhichNodeTable。null = 响应头没带（老 broker），调用方按 master=0 记账。
-    /// </summary>
     public long? SuggestWhichBrokerId { get; set; }
 
     public bool IsFound => Status == PullStatus.Found;
@@ -155,25 +128,15 @@ public sealed class PullResult
     public bool IsNoNewMsg => Status == PullStatus.NoNewMsg;
 }
 
-/// <summary>org.apache.rocketmq.client.consumer.PullCallback（异步拉取的结果转交）。</summary>
 public interface IPullCallback
 {
     void OnSuccess(PullResult pullResult);
 
-    /// <summary>对应 Java <c>onException(Throwable e)</c>：口径同
-    /// <see cref="ISendCallback.OnException"/> —— 交出异常对象本身（broker 回错是
-    /// <see cref="MQBrokerException"/>、传输超时是 RemotingTimeoutException、其余是
-    /// <see cref="MQClientException"/>），调用方按类型分流。</summary>
     void OnException(Exception error);
 }
 
 // ---------------------------------------------------------------- POP 结果
 
-/// <summary>
-/// org.apache.rocketmq.client.consumer.PopStatus。
-/// POP 与 pull 的差别：POP 不提交位点，靠 ack 确认；没有新消息时返回 POLLING_NOT_FOUND
-/// 而不是 NO_NEW_MSG。
-/// </summary>
 public enum PopStatus
 {
     Found = 0,
@@ -194,7 +157,6 @@ public static class PopStatusNames
     };
 }
 
-/// <summary>org.apache.rocketmq.client.consumer.PopResult。</summary>
 public sealed class PopResult
 {
     public PopStatus Status { get; set; } = PopStatus.PollingNotFound;
@@ -232,29 +194,20 @@ public sealed class ChangeInvisibleTimeResult
 
 // ---------------------------------------------------------------- 消费状态
 
-/// <summary>org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus。</summary>
 public enum ConsumeConcurrentlyStatus
 {
     ConsumeSuccess = 0,
     ReconsumeLater = 1,
 }
 
-/// <summary>org.apache.rocketmq.client.consumer.listener.ConsumeOrderlyStatus。</summary>
 public enum ConsumeOrderlyStatus
 {
-    // 声明顺序与 Java ConsumeOrderlyStatus 逐字对齐（Java 里 Rollback/Commit 带 @Deprecated，
-    // 注释写明 "only for binlog consumption"）：两侧数字一致才不会在「按序号写死」的调用方
-    // 手里错位。
     Success = 0,
     Rollback = 1,
     Commit = 2,
     SuspendCurrentQueueAMoment = 3,
 }
 
-/// <summary>Java 枚举名原文（钩子 status / 轨迹 contextCode 用它，不要用 C# 的枚举拼写）。
-/// Java 侧写进 <c>ConsumeMessageContext.status</c> 的是 <c>status.toString()</c>
-/// （并发 <c>ConsumeMessageConcurrentlyService:408</c>、顺序 <c>ConsumeMessageOrderlyService:507</c>），
-/// 默认实现就是成员名。</summary>
 public static class ConsumeConcurrentlyStatusNames
 {
     public static string Name(ConsumeConcurrentlyStatus s) => s switch
@@ -265,7 +218,6 @@ public static class ConsumeConcurrentlyStatusNames
     };
 }
 
-/// <summary>Java 枚举名原文（钩子 status / 轨迹 contextCode 用它，不要用 C# 的枚举拼写）。</summary>
 public static class ConsumeOrderlyStatusNames
 {
     public static string Name(ConsumeOrderlyStatus s) => s switch
@@ -278,39 +230,22 @@ public static class ConsumeOrderlyStatusNames
     };
 }
 
-/// <summary>org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyContext。</summary>
 public sealed class ConsumeConcurrentlyContext
 {
     public MessageQueue MessageQueue { get; set; }
     public int DelayLevelWhenNextConsume { get; set; }
 
-    /// <summary>
-    /// 对应 Java ConsumeConcurrentlyContext.ackIndex（默认 Integer.MAX_VALUE）：
-    /// 「listener 认可到第几条」，下标含自身，其后的消息按状态回投/丢弃。
-    /// 默认值是「全批认可」，只有 listener 主动调小才会部分 ack。
-    /// </summary>
     public int AckIndex { get; set; } = int.MaxValue;
 
     public ConsumeConcurrentlyContext(MessageQueue? mq = null) => MessageQueue = mq ?? new MessageQueue();
 }
 
-/// <summary>org.apache.rocketmq.client.consumer.listener.ConsumeOrderlyContext。</summary>
 public sealed class ConsumeOrderlyContext
 {
     public MessageQueue MessageQueue { get; set; }
 
-    /// <summary>
-    /// true 时由客户端按 listener 的状态提交位点（正常路径）；listener 置 false 拿走提交权
-    ///（Java 的 binlog 用法）：只有 Commit 才提交、Rollback 回滚重投。
-    /// </summary>
     public bool AutoCommit { get; set; } = true;
 
-    /// <summary>
-    /// 对应 Java ConsumeOrderlyContext.suspendCurrentQueueTimeMillis，<b>默认 -1</b>（Java 就是
-    /// 这个默认值）：-1 表示「没指定」，挂起时长回落到消费者配置的
-    /// <c>SuspendCurrentQueueTimeMillis</c>（默认 1000）；解析出来的值再由调度侧钳到
-    /// [10, 30000]（Java ConsumeMessageOrderlyService#submitConsumeRequestLater:216-225）。
-    /// </summary>
     public int SuspendCurrentQueueTimeMillis { get; set; } = -1;
 
     public ConsumeOrderlyContext(MessageQueue? mq = null) => MessageQueue = mq ?? new MessageQueue();
@@ -322,13 +257,11 @@ public interface IMessageListener
     bool Orderly();
 }
 
-/// <summary>org.apache.rocketmq.client.consumer.listener.MessageListenerConcurrently。</summary>
 public interface IMessageListenerConcurrently : IMessageListener
 {
     ConsumeConcurrentlyStatus ConsumeMessage(List<MessageExt> msgs, ConsumeConcurrentlyContext context);
 }
 
-/// <summary>org.apache.rocketmq.client.consumer.listener.MessageListenerOrderly。</summary>
 public interface IMessageListenerOrderly : IMessageListener
 {
     ConsumeOrderlyStatus ConsumeMessage(List<MessageExt> msgs, ConsumeOrderlyContext context);
@@ -336,13 +269,11 @@ public interface IMessageListenerOrderly : IMessageListener
 
 // ---------------------------------------------------------------- 队列选择器
 
-/// <summary>org.apache.rocketmq.client.producer.MessageQueueSelector。</summary>
 public interface IMessageQueueSelector
 {
     MessageQueue Select(IReadOnlyList<MessageQueue> mqs, Message msg, string arg);
 }
 
-/// <summary>对应 Java SelectMessageQueueByHash：arg 的 Java String.hashCode() 取模。</summary>
 public sealed class SelectMessageQueueByHash : IMessageQueueSelector
 {
     public MessageQueue Select(IReadOnlyList<MessageQueue> mqs, Message msg, string arg)
@@ -352,9 +283,6 @@ public sealed class SelectMessageQueueByHash : IMessageQueueSelector
             throw new MQClientException("no message queue");
         }
 
-        // 与 Java 一致：arg.hashCode() 取绝对值后对队列数取模。
-        // 这里用 Java String.hashCode() 语义（Python 侧用的是 hash()，对字符串会随
-        // PYTHONHASHSEED 变化，不可跨进程复现；Java 语义是确定性的，更适合做分片键）。
         int hashCode = LegacyHash.StringHash(arg);
         if (hashCode < 0)
         {
@@ -365,7 +293,6 @@ public sealed class SelectMessageQueueByHash : IMessageQueueSelector
     }
 }
 
-/// <summary>对应 Java SelectMessageQueueByRandom。</summary>
 public sealed class SelectMessageQueueByRandom : IMessageQueueSelector
 {
     public MessageQueue Select(IReadOnlyList<MessageQueue> mqs, Message msg, string arg)

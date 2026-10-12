@@ -1,24 +1,4 @@
 # -*- coding: utf-8 -*-
-"""定点发送（显式给了 ``mq``）的 topic 一致性守卫的单测。
-
-对齐基准是 Java 5.5.1 ``DefaultMQProducerImpl`` 的两处守卫：
-
-  * ``:1234-1236`` 同步 ``send(msg, mq, timeout)``：``Validators.checkMessage`` 之后、
-    ``sendKernelImpl`` 之前 —— ``if (!msg.getTopic().equals(mq.getTopic())) throw new
-    MQClientException("message's topic not equal mq's topic", null);``
-  * ``:1277-1278`` 异步：同一个判定用了**另一处**文案 ``"Topic of the message does not
-    match its target message queue"``，且抛在投进 ``AsyncSenderExecutor`` 的 runnable 里、
-    由 ``catch (Exception e) { newCallBack.onException(e); }`` 转交用户回调。
-
-比较的是**各自拼过命名空间之后**的名字：``DefaultMQProducer`` 的公开入口先
-``msg.setTopic(withNamespace(...))``、再把 mq 过 ``queueWithNamespace``（``:601-602`` 等），
-``wrapNamespace`` 幂等，所以同一命名空间下两个资源名相等即放行。少了这道守卫，topic 与
-目标队列不符的消息照样发得出去：broker 按请求里带的队列名写入，SendResult 一切正常，
-消息却落进了另一个 topic 的分区，无人消费也无人报错。
-
-两处**有意**的「不守卫」也按 Java 钉住：``sendOneway(msg, mq)``（Java ``:1303-1310``）
-没有这道检查，选择器入口同样没有。
-"""
 from __future__ import annotations
 
 import time
@@ -143,7 +123,7 @@ def test_sync_pinned_send_rejects_a_mismatched_topic():
         p.send(msg, mq=MessageQueue("OtherTopic", "broker-a", 0))
 
     assert str(ei.value) == SYNC_WORDING
-    assert ei.value.response_code is None  # Java 传的是 null cause，没有错误码
+    assert ei.value.response_code is None
     assert client.topics == [], "被拒绝的发送不该碰到网络"
     assert msg.topic == "TopicTest" and msg.body == b"x"
 
@@ -249,7 +229,7 @@ def test_async_pinned_send_accepts_a_matching_topic():
 
 
 def test_async_batch_pinned_send_uses_the_async_wording():
-    """Java 的批量异步定点发送同样落在 ``:1277-1278`` 那处文案上。"""
+    pass
     p = _producer()
     client = p._mq_client
     cb = _RecordingCallback()
@@ -264,10 +244,8 @@ def test_async_batch_pinned_send_uses_the_async_wording():
     assert client.topics == []
 
 
-# ---------------------------------------------------------------- 按 Java 不设守卫的入口
 def test_oneway_pinned_send_skips_the_guard():
-    """Java ``sendOneway(Message, MessageQueue):1303-1310`` 只做 state + Validators，
-    没有 topic 一致性检查；这里按原样钉住（免得后来的"顺手补上"造成与 Java 不一致）。"""
+    pass
     p = _producer()
     client = p._mq_client
     msg = Message("TopicTest", b"x")
@@ -278,8 +256,7 @@ def test_oneway_pinned_send_skips_the_guard():
 
 
 def test_selector_send_skips_the_guard():
-    """选择器入口由选择器自己挑队列（Java ``:729`` 的 ``queueWithNamespace`` 只补前缀），
-    没有调用方指定的队列可比。"""
+    pass
     p = _producer(NS)
     client = p._mq_client
     msg = Message("TopicTest", b"x")

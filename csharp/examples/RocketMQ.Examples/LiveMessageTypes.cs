@@ -429,8 +429,6 @@ internal static class LiveMessageTypes
             Check("按 Key 查询(query_message)", hit, "returned=" + found.Count.ToString(CultureInfo.InvariantCulture));
         }
 
-        // ---------- 7. 事务消息（对齐 Java 的两阶段：半消息 + END_TRANSACTION + 回查）----------
-        // ---------- 7.1 COMMIT ----------
         {
             string topic = _gPrefix + "_Tx";
             var listener = new CommitTxListener();
@@ -505,10 +503,6 @@ internal static class LiveMessageTypes
 
             Check("事务-UNKNOW 发送状态", txOk, "state=" + stateStr);
 
-            // broker 巡检半消息的周期是 Java BrokerConfig#transactionCheckInterval，
-            // **默认 30s**（联调 broker.conf 没覆写），所以半消息最快也要等一轮巡检才回查。
-            // 固定 sleep(25) 会稳定地早于回查 → "最终投递"必然失败。这里先等"回查发生"
-            // 这个事件（最多 90s，兼容 3s/30s 两种配置），再观察 10s 让 COMMIT 后的消息真正投递。
             long checkDeadline = UtilAll.CurrentTimeMillis() + 90_000;
             while (listener.CheckCalls == 0 && UtilAll.CurrentTimeMillis() < checkDeadline)
             {

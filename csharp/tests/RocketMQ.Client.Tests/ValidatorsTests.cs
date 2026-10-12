@@ -1,5 +1,3 @@
-// 名字校验（Java Validators + TopicValidator）的离线对拍。
-//
 // 校验的价值在于「不打网络就失败」，所以除了规则表本身，这里还断言四个入口
 // （Producer.Start / PushConsumer.Start / PullConsumer.Start / LitePullConsumer.Start）
 // 会在任何 I/O 之前拒绝非法组名——测试全程没有可用的 name server，能抛出**组名**
@@ -18,7 +16,6 @@ public class ValidatorsTests
     // ---------------------------------------------------------------- 字符表
 
     [Theory]
-    // Java 白名单 ^[%|a-zA-Z0-9_-]+$：这四个符号是仅有的非字母数字合法字符
     [InlineData("order-topic")]
     [InlineData("order_topic")]
     [InlineData("CID_ONSAPI_PULL")]
@@ -42,7 +39,6 @@ public class ValidatorsTests
     public void CharTableMatchesLegacy(string name)
     {
         bool illegal = TopicValidator.IsTopicOrGroupIllegal(name);
-        // 期望值直接由 Java 白名单正则表达：只有 % - _ | 与 ASCII 字母数字可用
         bool expected = System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-zA-Z0-9_%|\-]+$") == false;
         Assert.Equal(expected, illegal);
     }
@@ -50,7 +46,6 @@ public class ValidatorsTests
     [Fact]
     public void EmptyStringIsNotIllegalBecauseCharsetIsCheckedLast()
     {
-        // Java 的空串判定在 isBlank 那一步，字符表这一步对空串返回 false
         Assert.False(TopicValidator.IsTopicOrGroupIllegal(""));
         Assert.False(TopicValidator.IsTopicOrGroupIllegal(null));
     }
@@ -58,8 +53,6 @@ public class ValidatorsTests
     [Fact]
     public void CodePointAbove127IsAlwaysIllegal()
     {
-        // Java 的位表有 128 个槽位，但只给白名单字符置位：所以 DEL(0x7f) 这类
-        // "小于 128 却不在表里" 的字符同样非法，而 0x80 是越界即非法。
         Assert.True(TopicValidator.IsTopicOrGroupIllegal("\u007f"));
         Assert.True(TopicValidator.IsTopicOrGroupIllegal("\u0080"));
         Assert.True(TopicValidator.IsTopicOrGroupIllegal("topic\u00e9"));
@@ -143,7 +136,6 @@ public class ValidatorsTests
     [Fact]
     public void CheckMessageChecksTopicBeforeBody()
     {
-        // 顺序是 Java 的行为：topic 非法 + body 为空时，报的是 topic 的问题
         Message m = Msg("bad.topic", Array.Empty<byte>());
         MQClientException e = Assert.Throws<MQClientException>(() => Validators.CheckMessage(m, MaxBody));
         Assert.Contains("bad.topic", e.Message);
@@ -167,7 +159,6 @@ public class ValidatorsTests
         Assert.Equal("the message body size over max value, MAX: 4096", e.Message);
         Assert.Equal(ResponseCode.MessageIllegal, e.ResponseCode);
 
-        // 恰好等于阈值必须放行（Java 用的是 >，不是 >=）
         Validators.CheckMessage(Msg("T1", new byte[MaxBody]), MaxBody);
     }
 
@@ -185,8 +176,6 @@ public class ValidatorsTests
             MQClientException e = Assert.Throws<MQClientException>(
                 () => Validators.CheckMessage(Msg(topic, new byte[] { 1 }), MaxBody));
             Assert.Equal("Sending message to topic[" + topic + "] is forbidden.", e.Message);
-            // Java 这条走 MQClientException(String, null)，responseCode 是 -1（纯客户端错误），
-            // 不是 body 校验那四条的 13——混用会让上层按 broker 码分支时判错。
             Assert.NotEqual(ResponseCode.MessageIllegal, e.ResponseCode);
         }
 

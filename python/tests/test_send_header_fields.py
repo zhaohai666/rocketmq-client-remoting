@@ -1,23 +1,4 @@
 # -*- coding: utf-8 -*-
-"""SEND_MESSAGE_V2(310) 头里那三个"来自路由 / producer 配置"的字段。
-
-Java 锚点（5.5.1 逐条核对）：
-
-  * ``SendMessageRequestHeaderV2``:69 ``@CFNullable private String n; // brokerName``，
-    ``encode()``:128 按 ``writeIfNotNull(out, "n", n)`` 写字母键，
-    ``createSendMessageRequestHeaderV1/V2``:86/:105 在 V1/V2 之间搬 ``brokerName``。
-    值来自 ``DefaultMQProducerImpl.sendKernelImpl``:1007 ``requestHeader.setBrokerName(brokerName)``，
-    也就是**路由选中的那台 broker 的名字**（不是地址）。
-  * 同类 :996-997 ``setDefaultTopic(producer.getCreateTopicKey())`` /
-    ``setDefaultTopicQueueNums(producer.getDefaultTopicQueueNums())`` —— 这两个值由
-    **生产者配置**给出，字母键分别是 ``c`` / ``d``。写死成 ``TBW102``/4 的话
-    ``set_create_topic_key`` 与 ``set_default_topic_queue_nums`` 就成了假 setter：
-    broker 侧 ``TopicQueueMappingManager``/``registerTopicInBroker`` 用 ``c``+``d``
-    在自动建 topic 时决定队列数，配置根本传不过去。
-  * ``n`` 的 broker 侧消费点：经典 broker 的 ``SendMessageProcessor`` 不读它（寻址靠
-    连接本身），它主要是 **V1/V2 之间的报文对齐**与控制台/轨迹侧的排障字段 —— 所以
-    这一项按"报文一致性"来测，不假装它有业务行为。
-"""
 from __future__ import annotations
 
 import threading
@@ -46,7 +27,7 @@ def _drop(inst: MQClientInstance) -> None:
 
 # ---------------------------------------------------------------- 报文形状
 def test_send_header_carries_broker_name_as_the_single_letter_n():
-    """Java sendKernelImpl:1007 → V2 的 ``n``；值取自路由选中的 mq。"""
+    pass
     inst = _new_instance("hdr_broker")
     try:
         req = inst._build_send_request("PG", Message("T_Header", b"body"), MQ, 3000, 0)
@@ -59,11 +40,7 @@ def test_send_header_carries_broker_name_as_the_single_letter_n():
 
 
 def test_broker_name_is_omitted_when_the_queue_has_none():
-    """``n`` 是 @CFNullable：没有 broker 名就不写字段，不能发空串。
-
-    Java 的 ``writeIfNotNull`` 只跳过 null；我们把空串也归一成 None，
-    否则报文里会出现 ``n=""`` 这种 Java 侧解不出来的形状。
-    """
+    pass
     inst = _new_instance("hdr_no_broker")
     try:
         req = inst._build_send_request("PG", Message("T_Header", b"body"),
@@ -76,7 +53,7 @@ def test_broker_name_is_omitted_when_the_queue_has_none():
 
 
 def test_default_topic_and_queue_nums_follow_the_caller():
-    """c/d 来自生产者配置（Java :996-997），不传才落回 TBW102/4。"""
+    pass
     inst = _new_instance("hdr_cd")
     msg = Message("T_Header", b"body")
     try:

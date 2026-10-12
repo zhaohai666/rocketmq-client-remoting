@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Topic 路由数据（对应 org.apache.rocketmq.remoting.protocol.route.*）。"""
 from __future__ import annotations
 
 import random

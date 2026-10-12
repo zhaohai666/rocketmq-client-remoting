@@ -195,19 +195,8 @@ class MQClientInstance
     /** 路由刷新：首次延迟 10ms。 */
     public const ROUTE_REFRESH_INITIAL_DELAY_MILLIS = 10;
 
-    /**
-     * POP broker 侧分配的 RPC 超时（Java RebalanceImpl#QUERY_ASSIGNMENT_TIMEOUT:62 = 3000）。
-     */
     public const QUERY_ASSIGNMENT_TIMEOUT_MILLIS = 3000;
 
-    /**
-     * POP broker 侧分配的默认轮询周期：Java 的 QUERY_ASSIGNMENT 挂在 RebalanceService 的
-     * 调度线程上（``rocketmq.client.rebalance.waitInterval`` 默认 20000ms），本端口的分配轮
-     * 因此默认 20s —— 与 PushConsumer 本地 rebalance 的节奏一致。
-     * Java 另有一个 ``minInterval``（1000ms）：上一轮没收敛时把等待压到 1s；本端口的对应物
-     * 是 PushConsumer 启动窗口内"无分配就 2s 重试"的既有启发式，以及 {@see
-     * MQClientInstance::popAssignmentImmediately()}（Java 的 RebalanceService.wakeUp）。
-     */
     public const POP_ASSIGNMENT_INTERVAL_MILLIS = 20_000;
 
     /** 对应 Python 的 INSTANCE_MAP（clientId → 实例）。 */
@@ -255,16 +244,6 @@ class MQClientInstance
      */
     public array $brokerAddrTable = [];
 
-    /**
-     * 仅静态主题：MessageQueue(逻辑, mock broker 名, globalId) -> 真实 broker 名。
-     * Java `MQClientInstance#topicEndPointsTable`：每次路由刷新时由
-     * TopicQueueMappingUtils 那套推导重建（见 StaticTopic），mock 名通过
-     * getBrokerNameFromMessageQueue 解析。非静态主题路由会把旧条目清掉。
-     * PHP 数组键只能用标量，键是 StaticTopic::queueKey 的
-     * "topic@brokerName@queueId" 字符串。
-     *
-     * @var array<string, array<string, string>>
-     */
     public array $topicEndPointsTable = [];
 
     /** PHP 单线程顺序执行：路由表读写不跨请求，这里只保留互斥语义的标记位。 */
@@ -290,20 +269,8 @@ class MQClientInstance
     /** @var list<callable> 单线程下的「后台任务」延迟队列（本不该阻塞调用方的动作） */
     private array $pendingActions = [];
 
-    /**
-     * producer start() 时注册进来的故障规避策略（Java 无此挂接——Java 的探测是策略
-     * 自带的调度线程；PHP 无线程，探测轮收敛到 tick() 里同步跑，见 tick ⑥）。
-     */
     private ?MQFaultStrategy $faultStrategy = null;
 
-    /**
-     * POP broker 侧分配的注册表（clientId|consumerGroup → 轮询方）。
-     *
-     * Java 没有这张表：QUERY_ASSIGNMENT 挂在每个消费者自己的 Rebalance 调度上跑；PHP 无
-     * 线程，改由本实例 tick() 的阶段⑦统一按到期判定推进（注册方式照抄 {@see $faultStrategy}）。
-     *
-     * @var array<string, PopAssignmentPoller>
-     */
     private array $popAssignmentPollers = [];
 
     private bool $namesrvRefreshEnabled = false;
@@ -339,11 +306,6 @@ class MQClientInstance
         $this->vipChannelEnabled = $vipChannelEnabled;
         $this->namespaceV2 = $namespaceV2;
         $this->remotingClient = new RemotingClient($connectTimeoutMillis, $invokeTimeoutMillis, $tlsEnable, tlsOptions: $tlsOptions, socksProxy: $socksProxy);
-        // 对应 Java MQClientAPIImpl:329-335 的装链顺序：
-        //   Namespace → Stream → 用户 rpcHook（ACL 签名）→（本端口无 DynamicalExtField）
-        // namespace 钩子**无条件注册**且排在最前：nsd/ns 必须在算签名之前进 extFields，
-        // 否则开鉴权的 broker 验签会多出未签名字段而拒签；钩子自身在 namespaceV2 为空时
-        // 一个字段都不写，所以空值注册没有代价。
         $this->remotingClient->registerRpcHook(new NamespaceRpcHook(\Closure::fromCallable([$this, 'namespaceV2Value'])));
         // stream 钩子同样必须注册在用户 rpcHook 之前，这样 ReqT 才会被算进 ACL 签名内容
         // （"Inject stream rpc hook first to make reserve field signature"）。facade 都是在
@@ -476,10 +438,7 @@ class MQClientInstance
         $this->routeRefreshNextRunMillis = null;
         $this->statsSampleNextRunMillis = null;
         $this->requestScanNextRunMillis = null;
-        // 主动探活随实例下线摘除（Java LatencyFaultToleranceImpl.shutdown 停探测线程的同位）
         $this->faultStrategy = null;
-        // POP broker 侧分配轮同理：实例停了就没有 tick，轮询方一律摘掉
-        // （Java 的 RebalanceService 随 MQClientInstance#shutdownStopAll 停线程的同位）。
         $this->popAssignmentPollers = [];
         $this->pendingActions = [];
         $this->consumerStatsManager->shutdown();
@@ -545,11 +504,6 @@ class MQClientInstance
             }
         }
 
-        // ⑥故障规避主动探活（Java LatencyFaultToleranceImpl.startDetector 的
-        //   scheduleAtFixedRate(3s) 探测线程在这里收敛为 tick 的到期判定；每个 broker
-        //   的探测周期由 FaultItem.checkStamp / detectInterval 控制，与调度节奏无关）。
-        //   开关每轮现读（Java 的 runnable 同位判定），运行中翻转立即生效。探测是同步
-        //   RPC：单个到期 broker 最多阻塞 detectTimeout 毫秒，未到期的条目零开销。
         if ($this->faultStrategy !== null && $this->faultStrategy->isStartDetectorEnable()) {
             try {
                 $this->faultStrategy->detectByOneRound(
@@ -562,12 +516,6 @@ class MQClientInstance
             }
         }
 
-        // ⑦ POP broker 侧分配轮（Java 的 QUERY_ASSIGNMENT(400) 腿挂在 RebalanceService 线程
-        //   上；PHP 单线程，popMode && !clientRebalance 的 push 消费者把轮询方注册进来，
-        //   这里做到期判定 —— 未到期的注册方零开销，与阶段⑥同形）。到期即**按 topic 集合
-        //   现查**（订阅会运行中变化），每个 topic 一次 RPC。
-        //   失败语义见 runPopAssignmentRound：RPC 失败 / broker 没给指配集 = Java 的
-        //   "invalid result" → 跳过更新、保留上一次分配，**绝不**退化成"这个 topic 我全要"。
         foreach ($this->popAssignmentPollers as $poller) {
             if ($now < $poller->nextRunMillis) {
                 continue;
@@ -583,28 +531,17 @@ class MQClientInstance
 
     // ---------------- POP broker 侧分配（QUERY_ASSIGNMENT 腿的调度面） ----------------
 
-    /**
-     * 注册/覆盖一个 POP broker 侧分配轮询方（Java 的 RebalanceService 线程在 PHP 端的替身）。
-     *
-     * 新注册方立刻算作到期：Java ``DefaultMQPushConsumerImpl.start`` 末尾的
-     * ``rebalanceImmediately()`` 就是"首轮不等 20s"。
-     */
     public function registerPopAssignmentPoller(PopAssignmentPoller $poller): void
     {
         $poller->nextRunMillis = 0;
         $this->popAssignmentPollers[$poller->key] = $poller;
     }
 
-    /** 摘除一个轮询方（消费者 shutdown 的清理；对应 Java 停掉 RebalanceService）。 */
     public function unregisterPopAssignmentPoller(string $key): void
     {
         unset($this->popAssignmentPollers[$key]);
     }
 
-    /**
-     * 唤醒分配轮：下一个 tick 立刻重查（对应 Java ``RebalanceService#wakeUp()``，
-     * 即 ``MQClientInstance#rebalanceImmediately`` 的作用；传 key 只唤醒那一个）。
-     */
     public function popAssignmentImmediately(?string $key = null): void
     {
         foreach ($this->popAssignmentPollers as $k => $poller) {
@@ -620,26 +557,9 @@ class MQClientInstance
         return array_keys($this->popAssignmentPollers);
     }
 
-    /**
-     * 跑一轮 broker 侧分配：现查 topic 集合 → 每 topic 一次 QUERY_ASSIGNMENT(400) →
-     * 结果交回注册方的 apply 回调。
-     *
-     * 每个 topic 单独判定，与 Java RebalanceImpl#doRebalance:236-256 的逐 topic try/catch
-     * 同形：一个 topic 失败只影响它自己。三种"不更新"（{@see queryAssignment} 的 null
-     * 返回 / 抛异常）都保留该 topic 的上一次分配：
-     *
-     * - 传输失败、broker 回非 SUCCESS（Java MQClientAPIImpl:430 抛 MQBrokerException →
-     *   getRebalanceResultFromBroker:351 catch 后 return false）；
-     * - 路由里找不到 broker（Java MQClientInstance#queryAssignment:1387 return null）；
-     * - SUCCESS 但 body 没有指配集 = Java 的 null（topic 不存在 / 取不到 cid 列表 /
-     *   策略名不认识，QueryAssignmentProcessor#doLoadBalance 的三个 return null）。
-     *
-     * 只有 broker **明示空集**才撤销该 topic 的全部队列。
-     */
     public function runPopAssignmentRound(PopAssignmentPoller $poller, ?int $nowMillis = null): void
     {
         $now = $nowMillis ?? $this->currentTimeMillis();
-        // 轮首就重排周期：本轮无论成败都不许把下一轮拖到过去（Java 的 realWaitInterval 同理）。
         $poller->nextRunMillis = $now + $poller->intervalMillis;
         $topics = ($poller->topicsFn)();
         foreach ($topics as $topic) {
@@ -653,7 +573,6 @@ class MQClientInstance
                     self::QUERY_ASSIGNMENT_TIMEOUT_MILLIS,
                 );
             } catch (\Throwable $e) {
-                // Java getRebalanceResultFromBroker:351-354 的同一条日志口径。
                 Logger::error(sprintf(
                     'allocate message queue exception. strategy name: %s, topic %s: %s (keep current assignment)',
                     $poller->strategyName,
@@ -674,22 +593,11 @@ class MQClientInstance
         }
     }
 
-    /**
-     * producer start() 时注册故障规避策略（对应 Java DefaultMQProducerImpl.start:272 的
-     * ``mqFaultStrategy.startDetector()`` 挂接点；传 null 等价于 Java 的 shutdown 摘除）。
-     */
     public function registerFaultStrategy(?MQFaultStrategy $strategy): void
     {
         $this->faultStrategy = $strategy;
     }
 
-    /**
-     * ServiceDetector 等价物（Java DefaultMQProducerImpl 构造器 :155-169 的匿名
-     * ServiceDetector）：对 endpoint 发一个 GET_MAX_OFFSET(30)——探测 topic 的 queue 0，
-     * RPC 全链路（连接、路由、存储应答）走通即视为服务可达；任何异常（连接失败、
-     * 超时、broker 拒绝）都算仍不可达。没有在用 topic 时直接判失败
-     * （Java pickTopic 空表 → Optional.empty → false）。
-     */
     private function detectService(string $brokerAddr, int $timeoutMillis): bool
     {
         $topics = array_keys($this->topicsInUse);
@@ -1155,9 +1063,6 @@ class MQClientInstance
         foreach ($route->getBrokerDatas() as $bd) {
             $this->brokerAddrTable[$bd->brokerName] = $bd->brokerAddrs;
         }
-        // 静态主题：同一路由落库块里刷新「逻辑队列 -> 真实 broker」端点表
-        // （Java 在同处构建 topicEndPointsTable）；非静态路由清掉旧条目。
-        // 键是 StaticTopic::queueKey 的 "topic@brokerName@queueId" 字符串。
         $endpoints = StaticTopic::topicRouteData2EndpointsForStaticTopic($topic, $route);
         if ($endpoints !== null) {
             $this->topicEndPointsTable[$topic] = $endpoints;
@@ -1268,11 +1173,6 @@ class MQClientInstance
         return $addr;
     }
 
-    /**
-     * Java `MQClientInstance#getBrokerNameFromMessageQueue`：把静态主题的**逻辑**
-     * 队列（mock broker 名 "__syslo__<scope>"）经 topicEndPointsTable 解析成承载它的
-     * 真实 broker 名。非静态主题 —— 或者表里没有的队列 —— 原样透传自己的 broker 名。
-     */
     public function getBrokerNameFromMessageQueue(MessageQueue $mq): string
     {
         $endpoints = $this->topicEndPointsTable[$mq->topic] ?? null;
@@ -1285,15 +1185,6 @@ class MQClientInstance
         return $mq->brokerName;
     }
 
-    /**
-     * POP 的 ack / changeInvisibleTime 地址解析（Go popAckAddress 同形）。
-     *
-     * Java ackAsync / changePopInvisibleTimeAsync 对静态主题：来自**逻辑**队列的
-     * checkpoint 第 5 段带的是 MOCK broker 名（"__syslo__<scope>"）；真实承载者要用
-     * 实例的 topicEndPointsTable + checkpoint **自己的** queueId 解析 —— 同一静态
-     * 主题的各 globalId 可能落在**不同**真实 broker 上，用 queueId 0 会解析错机器。
-     * 请求头保留**原样**（mock）名；只有地址查找走真实名。
-     */
     public function popAckAddrFor(string $brokerName, string $topic, int $queueId): string
     {
         $resolveDes = function () use ($brokerName, $topic, $queueId): string {
@@ -1309,13 +1200,10 @@ class MQClientInstance
         $addr = $this->findBrokerAddressInPublish($des);
         if ($addr === null || $addr === '') {
             $this->updateTopicRouteInfoFromNameServer($topic);
-            // Java 在路由刷新之后**重新解析** desBrokerName —— 刷新后的映射可能把
-            // 这个逻辑队列搬到了新 broker 上。
             $des = $resolveDes();
             $addr = $this->findBrokerAddressInPublish($des);
         }
         if ($addr === null || $addr === '') {
-            // Java DefaultMQPushConsumerImpl:771 的报错原文（ack 只要主）。
             throw new MQClientException(sprintf('Broker[%s] master node does not exist', $des));
         }
         return $addr;
@@ -1767,29 +1655,6 @@ class MQClientInstance
 
     // ---------------- POP 模式（5.x 轻量消费） ----------------
 
-    /**
-     * QUERY_ASSIGNMENT(400)：向 broker 要本组的队列指配（Java MQClientAPIImpl
-     * #queryAssignment:405 + MQClientInstance#queryAssignment:1373）。
-     *
-     * ⚠ wire 口径：这个 code **没有请求头**（Java :416 传的是 `null` header），
-     * topic / consumerGroup / clientId / strategyName / messageModel 五个字段全部进
-     * body JSON（{@see QueryAssignmentRequestBody}），broker 按 Java 属性名解析。
-     *
-     * 返回值把 Java 的三档语义原样分开：
-     *
-     * - `null`（"invalid result"，Java 的 null 集 / 找不到 broker）：调用方**必须跳过
-     *   更新**，保留上一次分配（RebalanceImpl#getRebalanceResultFromBroker:356-359）；
-     * - `[]`：broker 明示"这个 topic 没有队列归你"，撤销该 topic 的分配
-     *   （QueryAssignmentProcessor#doLoadBalance:149 的 empty set 分支）；
-     * - 非空 list：指配集本身，每条一个 (MessageQueue, MessageRequestMode)。
-     *
-     * 非 SUCCESS 一律抛 {@see MQBrokerException}（Java :430），**唯一**例外是
-     * TOPIC_NOT_EXIST(17)：本端口按"该 topic 无队列可指"回空集（真实 broker 对不存在的
-     * topic 走的是 SUCCESS + 无指配集 = 上面的 null 档，两者不冲突；Java 在这里会抛，
-     * 由调用方保留旧分配 —— 这是本端口的有意收紧，见 README 的差异表）。
-     *
-     * @return list<array{mq: MessageQueue, mode: MessageRequestMode}>|null
-     */
     public function queryAssignment(
         string $topic,
         string $consumerGroup,
@@ -1800,9 +1665,6 @@ class MQClientInstance
         ?string $addr = null,
     ): ?array {
         if ($addr === null) {
-            // Java MQClientInstance#queryAssignment:1376-1380：先查路由表，查不到按该 topic
-            // 刷一次 NameServer 再查；仍查不到 return null（**不抛** no route —— 那在本端
-            // 等于"无效结果"，消费者保留上一次分配）。
             $addr = $this->findBrokerAddrByTopic($topic);
             if ($addr === null) {
                 try {
@@ -1833,7 +1695,6 @@ class MQClientInstance
         }
         $set = QueryAssignmentResponseBody::decode($response->body)->messageQueueAssignments;
         if ($set === null) {
-            // Java 的 null 集：不是"没队列"，是"这次答复无效"。
             return null;
         }
         $out = [];
@@ -2083,8 +1944,6 @@ class MQClientInstance
             $brokerName = ExtraInfoUtil::getBrokerName(ExtraInfoUtil::split($extraInfo));
         }
         if ($addr === null) {
-            // 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync /
-            // changePopInvisibleTimeAsync 的只要主 + 重写语义）。
             $addr = $this->popAckAddrFor($brokerName, $topic, $queueId);
         }
         $header = new AckMessageRequestHeader();
@@ -2116,8 +1975,6 @@ class MQClientInstance
             $brokerName = ExtraInfoUtil::getBrokerName(ExtraInfoUtil::split($extraInfo));
         }
         if ($addr === null) {
-            // 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync /
-            // changePopInvisibleTimeAsync 的只要主 + 重写语义）。
             $addr = $this->popAckAddrFor($brokerName, $topic, $queueId);
         }
         $header = new ChangeInvisibleTimeRequestHeader();

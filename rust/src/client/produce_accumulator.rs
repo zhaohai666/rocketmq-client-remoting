@@ -1,42 +1,8 @@
-//! 生产者自动攒批（对应 `org.apache.rocketmq.client.producer.ProduceAccumulator`，
-//! Java 5.5.0）。与 `python/client/produce_accumulator.py`、
-//! `csharp/src/RocketMQ.Client/Client/ProduceAccumulator.cs` 同题。
-//!
 //! 打开 `autoBatch` 之后，`send(Message)` 不再一条一条直发，而是先按
 //! `AggregateKey(topic, mq, waitStoreMsgOK, tag)` 归并进 `MessageAccumulation`，攒够
 //! `holdMs` / `holdSize`（或被守卫线程唤醒）再合成**一个** `MessageBatch` 发出去，
 //! 最后把 broker 回的**批量** `SendResult` 拆回每条消息各自的 `SendResult` —— 调用方
 //! 看到的东西与直发一致。
-//!
-//! 契约（逐条对齐 Java，别"顺手优化"）：
-//!   1. `AggregateKey` 是 topic + mq + waitStoreMsgOK + tag 四元组：tag 不同不合并
-//!      （一个 `MessageBatch` 只有一个 TAGS 属性）；指定 mq 与不指定 mq 也不合并。
-//!   2. `try_add_message` 是全局字节闸门：`currentlyHoldSize < totalHoldSize` 才放行，
-//!      放行时把本条 body 长度记进去；**批次真的发完**才扣回。⚠ 上游真实口径是
-//!      「先记账，再判延时/重试」—— `can_batch` 里因延时消息退回直发的那条，其字节数已被
-//!      记进 `currentlyHoldSize` 且**永不归还**（Java 遗漏，照抄）。
-//!   3. 批量应答拆条：broker 对批量消息回的 MsgId/OffsetMsgId 是**逗号分隔**的逐条 ID；
-//!      含逗号才拆，条数对不上报错；不含逗号（老 broker / 单条）时**所有**下标指向
-//!      同一份 `SendResult`（这里按 `Clone` 复制，语义等价）。
-//!   4. **同步 `add` 收集 keys，异步 `add` 不收集**（Java 的不对称行为，照抄）。
-//!   5. 批级 `KEYS` 是 `string.Join(" ", keys)`：分隔符是**空格**
-//!      （[`crate::common::message_const::KEY_SEPARATOR`]），且**无条件**写属性 ——
-//!      空集合写出 `KEYS=""`。
-//!   6. 守卫线程每轮 `max(1, holdMs/2)` ms：sync 版对每个批次 `wakeup()`（叫醒正在
-//!      `add` 里等阈值的调用方去自查 `ready_to_send`），再把 `messages_size == 0` 的空批次
-//!      置 closed 并摘表；async 版先 `ready_to_send` 就发，再做同样的摘表。
-//!      ⚠ 发完的批次 `messages_size` 仍 > 0（`send` 只置 closed，不重置 size），所以它
-//!      会**留在表里**，直到下一次同键 `send` 拿到它、`add` 返回 -1 才被摘掉重取。
-//!
-//! ## 与 Java 的两处「语言级」差异（语义不变）
-//!
-//! * **同步等待的载体**：Java 是 `synchronized (this) { wait(); }`，这里是
-//!   `Mutex<()> + Condvar`。守卫线程的 `wakeup()` 对应 `notify_all()`（Rust 的
-//!   `Condvar` 不需要持锁即可唤醒）。
-//! * **异常没有共享对象**：[`crate::error::Error`] 不是 `Clone`，而一批 5 条消息的 5 个
-//!   回调在 Java 里拿到的是同一个 `Throwable` 实例。这里用 [`clone_error`] 复制：可结构化
-//!   复制的变体逐字重建，`Io` / `Json` 退化成同文案的
-//!   [`crate::error::Error::Client`]（那两类本就不会出现在批量发送的失败路径上）。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -52,33 +18,19 @@ use crate::common::message_const::KEY_SEPARATOR;
 use crate::common::util_all;
 use crate::error::{Error, Result};
 
-/// Java `ProduceAccumulator.DEFAULT_TOTAL_HOLD_SIZE`（32M）。
 pub const DEFAULT_TOTAL_HOLD_SIZE: i64 = 32 * 1024 * 1024;
-/// Java `ProduceAccumulator.DEFAULT_HOLD_SIZE`（32K）。
 pub const DEFAULT_HOLD_SIZE: i64 = 32 * 1024;
-/// Java `ProduceAccumulator.DEFAULT_HOLD_MS`（10ms）。
 pub const DEFAULT_HOLD_MS: i64 = 10;
 
-/// Java `canBatch` 里的三个定时/延时属性名（`message_const` 里没有对应常量，
-/// 与 `producer.rs` 的 `DELAY_PROPERTY_KEYS` 同一口径，写死字面量）。
 pub const TIMER_DELAY_KEYS: [&str; 3] = ["TIMER_DELAY_MS", "TIMER_DELAY_SEC", "TIMER_DELIVER_MS"];
 
-/// 累加器唯一的对外依赖：一次「绕过累加器」的批量发送
-/// （Java `DefaultMQProducer.sendDirect(MessageBatch, mq, callback)`）。
-///
-/// 抽成 trait 有两个原因：① Rust 的生产者 `send_batch*` 是 `async`，而累加器的守卫线程
-/// 是普通 OS 线程，需要一个明确的同步入口；② 单测要能塞一个「只记账不联网」的假生产者
-/// （Java 单测的 `MockMQProducer` 同款）。真实实现见
-/// `impl AccumulatorSender for DefaultMQProducer`。
 pub trait AccumulatorSender: Send + Sync + 'static {
-    /// 同步语义（Java `sendDirect(batch, mq, null)`）：返回该批量的 `SendResult`。
     fn send_direct_blocking(
         &self,
         batch: MessageBatch,
         mq: Option<&MessageQueue>,
     ) -> Result<SendResult>;
 
-    /// 异步语义（Java `sendDirect(batch, mq, callback)`）：**立刻返回**，结果走 callback。
     fn send_direct_async(
         &self,
         batch: MessageBatch,
@@ -87,7 +39,6 @@ pub trait AccumulatorSender: Send + Sync + 'static {
     ) -> Result<()>;
 }
 
-/// 复制一个 [`Error`]（见文件头「与 Java 的两处语言级差异」）。
 pub fn clone_error(err: &Error) -> Error {
     match err {
         Error::RemotingCommand(m) => Error::RemotingCommand(m.clone()),
@@ -120,13 +71,11 @@ pub fn clone_error(err: &Error) -> Error {
 
 // ================================================================ 归并键
 
-/// 归并键：topic + mq + waitStoreMsgOK + tag（Java `ProduceAccumulator.AggregateKey`）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AggregateKey {
     pub topic: String,
     pub mq: Option<MessageQueue>,
     pub wait_store_msg_ok: bool,
-    /// Java `Message.getTags()`：属性缺失返回 `null` —— 这里就是 `None`（**不是**空串）。
     pub tag: Option<String>,
 }
 
@@ -139,9 +88,6 @@ impl AggregateKey {
         AggregateKey::new(
             msg.get_topic(),
             None,
-            // Java `AggregateKey(message)` 用 `message.isWaitStoreMsgOK()`：**缺省即 true**。
-            // 直接比 `== Some("true")` 会把普通消息（没设过 WAIT）判成 false，
-            // 攒出来的批量就会以 `WAIT=false` 下发。见 `message::wait_store_msg_ok_of`。
             msg.is_wait_store_msg_ok(),
             msg.get_tags().map(str::to_string),
         )
@@ -159,28 +105,20 @@ impl AggregateKey {
 
 // ================================================================ 批次
 
-/// 一个批次的状态（Java 用 `synchronized (this.closed)` 与 `synchronized (this)` 两把
-/// 监视器保护；这里前者对应 `state`、后者对应 `wait_lock` + `wait_cond`）。
 struct AccumState {
     closed: bool,
     messages: Vec<Message>,
-    /// Java `sendCallbacks`（只有异步 `add` 会写）。
     send_callbacks: Vec<Arc<dyn SendCallback>>,
-    /// Java `keys`（只有同步 `add` 会写）。
     keys: HashSet<String>,
     messages_size: i64,
     count: i64,
 }
 
-/// 一批待归并的消息（Java `ProduceAccumulator.MessageAccumulation`）。
 pub struct MessageAccumulation {
     key: AggregateKey,
-    /// 用 `Weak` 断开「累加器 → 表 → 批次 → 累加器」的引用环（Java 那个环是真泄漏，
-    /// 这里不必照抄）。
     owner: Weak<AccumulatorInner>,
     sender: Arc<dyn AccumulatorSender>,
     state: Mutex<AccumState>,
-    /// Java `synchronized (this)`：等阈值用的监视器（锁序恒为 `wait_lock` → `state`）。
     wait_lock: Mutex<()>,
     wait_cond: Condvar,
     create_time: i64,
@@ -262,13 +200,11 @@ impl MessageAccumulation {
         }
     }
 
-    /// Java `readyToSend()`：按**本批**字节数或本批存活时间（不是全局限额）。
     pub fn ready_to_send(&self) -> bool {
         self.messages_size() > self.hold_size()
             || util_all::current_time_millis() >= self.create_time + self.hold_ms()
     }
 
-    /// Java `wakeup()`：叫醒一个正在 `add` 里等阈值的调用方。
     pub fn wakeup(&self) {
         let _guard = lock(&self.wait_lock);
         if self.is_closed() {
@@ -277,9 +213,6 @@ impl MessageAccumulation {
         self.wait_cond.notify_all();
     }
 
-    /// Java 同步 `add(Message)`：入队；返回本条消息在本批里的下标，`-1` 表示本批已关闭
-    /// （调用方需重取）。返回前保证本批**已经发出去**（或已被别人发出去），因此
-    /// `send_results[index]` 可用。
     pub fn add(&self, msg: Message) -> Result<i64> {
         let index = {
             let mut st = lock(&self.state);
@@ -311,7 +244,6 @@ impl MessageAccumulation {
         Ok(index)
     }
 
-    /// Java 异步 `add(Message, SendCallback)`：`false` 表示本批已关闭（调用方需重取）。
     pub fn add_async(self: &Arc<Self>, msg: Message, callback: Arc<dyn SendCallback>) -> bool {
         {
             let mut st = lock(&self.state);
@@ -332,7 +264,6 @@ impl MessageAccumulation {
         true
     }
 
-    /// Java `batch()`：把本批组装成一个 `MessageBatch`。
     fn build_batch(&self) -> MessageBatch {
         let st = lock(&self.state);
         let mut batch = MessageBatch::new(st.messages.clone());
@@ -351,7 +282,6 @@ impl MessageAccumulation {
         batch
     }
 
-    /// Java `splitSendResults`：批量应答拆成逐条 `SendResult`。
     fn split_send_results(&self, send_result: &SendResult) -> Result<()> {
         let count = lock(&self.state).count as usize;
         let msg_id = send_result.get_msg_id().unwrap_or("").to_string();
@@ -370,7 +300,6 @@ impl MessageAccumulation {
                 results.push(item);
             }
         } else {
-            // 不含逗号：老 broker / 单条应答，所有下标都是同一份内容（Java 是同一个实例）
             for _ in 0..count {
                 results.push(send_result.clone());
             }
@@ -379,7 +308,6 @@ impl MessageAccumulation {
         Ok(())
     }
 
-    /// 取下标对应的拆条结果（Java `batch.getSendResults()[index]`）。
     pub fn send_result(&self, index: i64) -> Result<SendResult> {
         let results = lock(&self.send_results);
         results
@@ -388,8 +316,6 @@ impl MessageAccumulation {
             .ok_or_else(|| Error::client("sendResult is illegal"))
     }
 
-    /// Java 同步 `send()`。⚠ 只在**持有 `wait_lock`** 时从 [`Self::add`] 里调用，
-    /// 保证「发完 → 唤醒其他等待者」这条顺序（Java 的 `notifyAll()` 同样要求持有监视器）。
     fn send_sync(&self) -> Result<()> {
         {
             let mut st = lock(&self.state);
@@ -405,14 +331,11 @@ impl MessageAccumulation {
             Ok(result) => self.split_send_results(&result),
             Err(e) => Err(e),
         };
-        // Java：finally 里无条件归还全局字节额度
         self.release_hold(size);
         self.wait_cond.notify_all();
         outcome
     }
 
-    /// Java 异步 `send(SendCallback)`：参数与 Java 一样**不参与**逻辑（回调来自本批自己
-    /// 收集的那一串，守卫线程传的就是 `None`）。
     fn send_async_now(self: &Arc<Self>) {
         {
             let mut st = lock(&self.state);
@@ -431,8 +354,6 @@ impl MessageAccumulation {
             size,
         });
         if let Err(e) = self.sender.send_direct_async(batch, self.key.mq.as_ref(), resolver) {
-            // ⚠ Java 在这里**没有**归还 currentlyHoldSize（只有回调路径会还）—— 即"异步发送
-            // 在发起阶段就抛异常"会漏掉一份字节额度。照抄，别修。
             for cb in &callbacks {
                 cb.on_exception(clone_error(&e));
             }
@@ -445,10 +366,6 @@ impl MessageAccumulation {
         }
     }
 
-    // ---------------- 测试接缝 ----------------
-    /// 测试用：手工触发一次同步发送 —— 等价于「守卫线程在 `holdMs` 到点后叫醒某个还堵在
-    /// [`Self::add`] 里的等待者，让它自查 `ready_to_send` 并去发」。Java 单测直接
-    /// `batch.send()`，两边都绕开守卫线程，好让断言只盯归并/拆条语义。
     pub fn force_sync_send(&self) -> Result<()> {
         self.send_sync()
     }
@@ -459,8 +376,6 @@ impl MessageAccumulation {
     }
 }
 
-/// 「批量发送完成」的回调：拆条后按序交付给本批收集到的所有用户回调，并归还字节额度。
-/// 对应 Java 匿名内部类里的 `onSuccess` / `onException`。
 struct AccumulationCallback {
     batch: Arc<MessageAccumulation>,
     callbacks: Vec<Arc<dyn SendCallback>>,
@@ -500,8 +415,6 @@ impl SendCallback for AccumulationCallback {
     }
 }
 
-/// `msg.getKeys().split(MessageConst.KEY_SEPARATOR)` 的 Java 等价物：Java 的
-/// `String.split`（limit=0）**丢弃所有尾部空串**，Rust 的 `split` 会保留。
 fn split_keys_into(target: &mut HashSet<String>, keys: &str) {
     let mut parts: Vec<&str> = keys.split(KEY_SEPARATOR).collect();
     while matches!(parts.last(), Some(s) if s.is_empty()) {
@@ -539,15 +452,12 @@ struct Guards {
     asynchronous: Option<JoinHandle<()>>,
 }
 
-/// 对应 Java `ProduceAccumulator`：按 clientId 复用的自动攒批器。
 #[derive(Clone)]
 pub struct ProduceAccumulator {
     inner: Arc<AccumulatorInner>,
 }
 
 impl ProduceAccumulator {
-    /// `sender` 对应 Java `MQClientManager.getOrCreateProduceAccumulator(producer)` 里被
-    /// 记下来的那个生产者（批次创建时就捕获，之后不再换）。
     pub fn new(instance_name: &str, sender: Arc<dyn AccumulatorSender>) -> ProduceAccumulator {
         ProduceAccumulator {
             inner: Arc::new(AccumulatorInner {
@@ -569,9 +479,6 @@ impl ProduceAccumulator {
         &self.inner.instance_name
     }
 
-    // ---------------- 生命周期 ----------------
-    // 幂等且可重复：`start → shutdown → start`（生产者重启）会重建两根守卫线程
-    // （Java 的 `ServiceThread` 同样可重复 start）。
     pub fn start(&self) {
         let mut guards = lock(&self.inner.guards);
         if guards.sync.is_some() {
@@ -605,7 +512,6 @@ impl ProduceAccumulator {
         }
     }
 
-    // ---------------- 参数（Java 的校验口径与文案逐字照抄）----------------
     pub fn get_batch_max_delay_ms(&self) -> i64 {
         self.inner.hold_ms.load(Ordering::Acquire)
     }
@@ -634,7 +540,6 @@ impl ProduceAccumulator {
         Ok(())
     }
 
-    /// Java 这里也返回 `holdSize`（不是 `totalHoldSize`）—— 上游笔误，照抄。
     pub fn get_total_batch_max_bytes(&self) -> i64 {
         self.inner.hold_size.load(Ordering::Acquire)
     }
@@ -649,7 +554,6 @@ impl ProduceAccumulator {
         Ok(())
     }
 
-    /// 全局字节额度（Java 的 `totalHoldSize`）。
     pub fn total_hold_size(&self) -> i64 {
         self.inner.total_hold_size.load(Ordering::Acquire)
     }
@@ -658,8 +562,6 @@ impl ProduceAccumulator {
         *lock(&self.inner.currently_hold_size)
     }
 
-    // ---------------- 全局字节闸门 ----------------
-    /// Java `tryAddMessage`：还有额度就记账放行，否则拒绝（调用方退回直发）。
     pub fn try_add_message(&self, message: &Message) -> bool {
         let mut held = lock(&self.inner.currently_hold_size);
         if *held < self.inner.total_hold_size.load(Ordering::Acquire) {
@@ -706,7 +608,6 @@ impl ProduceAccumulator {
         batch
     }
 
-    /// Java `syncSendBatchs.remove(key, batch)`：只在值仍是它时才摘。
     fn remove_sync_batch(&self, key: &AggregateKey, batch: &Arc<MessageAccumulation>) {
         let mut table = lock(&self.inner.sync_batches);
         if matches!(table.get(key), Some(cur) if Arc::ptr_eq(cur, batch)) {
@@ -721,8 +622,6 @@ impl ProduceAccumulator {
         }
     }
 
-    // ---------------- 对外发送入口 ----------------
-    /// Java `send(Message, DefaultMQProducer)`（无 mq）。
     pub fn send(&self, msg: Message, mq: Option<&MessageQueue>) -> Result<SendResult> {
         let key = match mq {
             Some(mq) => AggregateKey::of_message_with_mq(&msg, mq),
@@ -739,7 +638,6 @@ impl ProduceAccumulator {
         }
     }
 
-    /// Java `send(Message, MessageQueue, SendCallback, DefaultMQProducer)` 的异步版。
     pub fn send_async(
         &self,
         msg: Message,
@@ -772,15 +670,11 @@ impl ProduceAccumulator {
         let batches = if sync { self.sync_batches_snapshot() } else { self.async_batches_snapshot() };
         for v in batches {
             if sync {
-                // Java GuardForSyncSendService.doWork：先 wakeup（叫醒等阈值的调用方去
-                // 自查 readyToSend），再只摘 messages_size == 0 的空批次。
                 v.wakeup();
                 if v.messages_size() == 0 {
                     v.mark_closed();
                     self.remove_sync_batch(v.aggregate_key(), &v);
                 } else {
-                    // Java 这里写的是 `v.notify()`（在 `closed` 的监视器上）—— 那是个**空操作**；
-                    // 本端口与 Python/C# 一致，落成一次真唤醒，效果等价且更贴近意图。
                     v.wait_cond.notify_all();
                 }
             } else {
@@ -831,15 +725,11 @@ impl ProduceAccumulator {
 
 // ================================================================ 进程级复用表
 
-/// 进程级复用表：对应 Java `MQClientManager.getOrCreateProduceAccumulator` —— 按 clientId
-/// 缓存，所以同进程里两个 clientId 相同的 producer 共享同一个累加器与同一对守卫线程
-/// （这也是「阈值先记在 producer 上、`start()` 时再同步下去」的原因）。
 fn registry() -> &'static Mutex<HashMap<String, ProduceAccumulator>> {
     static TABLE: OnceLock<Mutex<HashMap<String, ProduceAccumulator>>> = OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 按 clientId 取（或建）累加器。第一次创建时记下的 `sender` 会一直用下去（Java 同）。
 pub fn get_or_create_produce_accumulator(
     client_id: &str,
     sender: Arc<dyn AccumulatorSender>,

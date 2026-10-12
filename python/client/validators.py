@@ -1,21 +1,4 @@
 # -*- coding: utf-8 -*-
-"""发送/订阅入口上的名字校验（对应 ``org.apache.rocketmq.client.Validators``）。
-
-**为什么要在客户端就拦下来**：topic/group 名字非法时 broker 也会拒，但要等到请求
-真的打出去才拿到 ``TOPIC_NOT_EXIST``/``ILLEGAL_TOPIC``，而 ``TOPIC_NOT_EXIST`` 在
-发送重试的**可重试码**集合里 —— 于是每条必然失败的消息都会把重试次数和超时预算空转
-一遍，最后报的还是同一个原因。本地校验让这类输入在 ``send()`` 的第一行就失败。
-
-逐条对齐 Java：
-  * ``checkTopic`` / ``checkGroup``：blank → 长度（127 / 120）→ 字符表 ``^[%|a-zA-Z0-9_-]+$``，
-    顺序与文案都照抄。这三步走的是 Java 的 ``MQClientException(String, Throwable)``
-    构造器，``responseCode`` 是 **-1**（不是某个 broker 码，表示"纯客户端错误"）。
-  * ``checkMessage``：只有它带 ``ResponseCode.MESSAGE_ILLEGAL``(13)，且**顺序**要对——
-    Java 先查 topic、再查禁发 topic、最后才查 body。
-  * ``isNotAllowedSendTopic``：只禁 broker 内部流水那 8 个（``SCHEDULE_TOPIC_XXXX``、
-    半消息、轨迹校验…）。**``%RETRY%`` 不在名单里**：``sendMessageBack`` 就是往
-    ``%RETRY%group`` 写的，禁掉会打断重投链路。
-"""
 import os
 from typing import Optional
 
@@ -32,10 +15,8 @@ from common.topic_validator import (
 from remoting.protocol.codes import ResponseCode
 from .exception import MQClientException
 
-# 对应 Java ``Validators.CHARACTER_MAX_LENGTH``，本文件里没用到但保留常量口径
 CHARACTER_MAX_LENGTH = 255
 
-# 批量/普通消息都会走 checkMessage，这条与 Java 一样放在模块级方便测试引用
 FILE_SEPARATOR = os.sep
 
 
@@ -72,14 +53,7 @@ def is_system_topic(topic: str) -> None:
 
 
 def is_not_allowed_send_topic(topic: str) -> None:
-    """对应 ``Validators.isNotAllowedSendTopic``。
-
-    码值口径照抄 Java，别想当然：``checkMessage`` 里**只有** null message / null body /
-    zero body / oversize body / INNER_MULTI_DISPATCH 这五条带 MESSAGE_ILLEGAL(13)；禁发
-    topic、系统 topic、``checkTopic``、``checkGroup`` 走的是 ``MQClientException(String, null)``，
-    responseCode 是 -1（纯客户端错误）。于是「往 SCHEDULE_TOPIC_XXXX 发消息」在这里报 -1
-    而不是 13——看着别扭，但上层按 responseCode 分支时必须知道这一点，四语言保持一致。
-    """
+    pass
     if _is_not_allowed_send_topic(topic):
         raise MQClientException("Sending message to topic[%s] is forbidden." % topic)
 

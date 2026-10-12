@@ -35,12 +35,10 @@ std::mt19937_64 makeRng() {
     return std::mt19937_64(seq);
 }
 
-// UUID v4（RFC 4122）：8-4-4-4-12 小写十六进制，与 Java UUID.randomUUID().toString() 同形。
 std::string randomUuid() {
     static thread_local std::mt19937_64 rng = makeRng();
     uint64_t hi = rng();
     uint64_t lo = rng();
-    // 版本位 = 4，变体位 = 10xx（Java 的 UUID.randomUUID 也是这两处固定）
     hi = (hi & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
     lo = (lo & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
 
@@ -169,8 +167,6 @@ std::shared_ptr<RequestResponseFuture> RequestFutureHolder::putResponse(
         return nullptr;
     }
     future->putResponseMessage(responseMessage);
-    // 对齐 Java：成功路径也走 executeRequestCallback，让「只回调一次」的守卫生效；
-    // 同步调用方（callback 为空）靠 putResponseMessage 唤醒。
     future->executeRequestCallback();
     return future;
 }
@@ -180,9 +176,6 @@ size_t RequestFutureHolder::size() {
     return table_.size();
 }
 
-// 对应 Java RequestFutureHolder#scanExpiredRequest（:36-60）：把已过 TTL 的表项
-// **在锁内原子移除**（让「超时清理」与「应答到达」两条路径只有一个能生效），
-// 再在锁外逐个触发回调 —— 回调是用户代码，绝不能持着表锁执行。
 void RequestFutureHolder::scanExpiredRequest() {
     std::vector<std::shared_ptr<RequestResponseFuture>> expired;
     {
@@ -217,8 +210,6 @@ void RequestFutureHolder::startScheduledTask() {
     }
     sweepRunning_ = true;
     sweepStopped_ = false;
-    // Java scheduleAtFixedRate(initialDelay=3000, period=1000)（:89-91）：
-    // 首扫在启动后 3s，之后每 1s 一趟（线程名 RequestHouseKeepingService）。
     sweepThread_ = std::thread([this] {
         setThreadName("RequestHouseKeepingService");
         auto next = std::chrono::steady_clock::now() + std::chrono::milliseconds(3000);
@@ -258,10 +249,6 @@ std::string createCorrelationId() {
 }
 
 Message createReplyMessage(const Message& requestMessage, const Bytes& body) {
-    // 对应 Java ``MessageUtil.createReplyMessage``。Java 签名是 ``throws MQClientException``
-    // 且带 10007：应答方通常写在业务 listener 里，按 responseCode 分流才能把"这条请求
-    // 回不了话"和别的本地故障分开。C++ 这边 requestMessage 是引用，"为 null" 那条分支
-    // 在类型上就不存在（调用方拿不到引用只能传值），所以只有 CLUSTER 缺失这一个入口。
     const std::string cluster = requestMessage.getProperty(MessageConst::PROPERTY_CLUSTER);
     if (cluster.empty()) {
         throw MQClientException(
@@ -295,8 +282,6 @@ std::optional<RemotingCommand> processReplyMessage(const RemotingCommand& cmd,
         header.fromExtFields(cmd.extFields);
         Bytes body = cmd.body;
         const int32_t sysFlag = header.sysFlag.value_or(0);
-        // sysFlag 带压缩标志时先解压：326 推的是裸包，不走消息解码路径
-        // （对齐 Java receiveReplyMessage 同处的 Compressor 分支）。
         if (MessageSysFlag::isCompressed(sysFlag) && !body.empty()) {
             body = CompressorFactory::decompress(body, MessageSysFlag::getCompressionType(sysFlag));
         }
@@ -312,14 +297,12 @@ std::optional<RemotingCommand> processReplyMessage(const RemotingCommand& cmd,
         msg.bornHost = header.bornHost.value_or("");
         msg.storeHost = header.storeHost.value_or("");
         msg.properties = stringToMessageProperties(header.properties.value_or(""));
-        // 客户端收到应答的时刻（对应 Java RECEIVE_REPLY_MESSAGE 的同名属性）
         msg.putProperty(MessageConst::PROPERTY_REPLY_MESSAGE_ARRIVE_TIME,
                         std::to_string(UtilAll::currentTimeMillis()));
 
         const std::string correlationId =
             msg.getProperty(MessageConst::PROPERTY_CORRELATION_ID);
         if (RequestFutureHolder::getInstance().putResponse(correlationId, msg) == nullptr) {
-            // 查不到是正常情况（请求已超时 / 应答重复），Java 此处也是 warn
             logger_warn("receive reply message, but not matched any request, CorrelationId: "
                         + correlationId + ", reply from host: " + addr);
         }

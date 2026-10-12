@@ -1,12 +1,4 @@
 // 请求/响应自定义头（对应 common/protocol/header/*.java）。
-//
-// C++ 侧用 std::optional 表达「字段未设置」；C# 天然对应可空类型（string? / int? / long? / bool?）。
-// ToExtFields() 只写入已设置的字段，与 Java RemotingCommand.makeCustomHeaderToNet
-// 的「非空才写」语义等价；FromExtFields() 缺省保持 null。
-//
-// ⚠ extFields 的键名是**协议的一部分**（Java 字段名），一个字母都不能错——
-//   broker 用 fastjson2 按这些名字反序列化，错一个就静默丢字段。
-//   特别注意 HeartbeatRequestHeader 的键是 "clientID"（大写 ID），不是 "clientId"。
 using System.Globalization;
 using RocketMQ.Common;
 
@@ -47,7 +39,6 @@ public static class HeaderCodec
         }
     }
 
-    /// <summary>Java Boolean.toString(true) == "true"，与 broker 端 Boolean.parseBoolean 互为逆操作。</summary>
     public static void PutOptBool(PropertyMap outMap, string key, bool? v)
     {
         if (v.HasValue)
@@ -289,9 +280,6 @@ public sealed class SendMessageResponseHeader : ICommandCustomHeader
     }
 }
 
-// 对应 org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader。
-// ⚠ Java 侧继承 TopicRequestHeader → RpcRequestHeader，父类字段 bname 的**反射名就是
-// bname**（不是 brokerName）：写成 brokerName 会被 broker 静默丢掉。
 public sealed class RecallMessageRequestHeader : ICommandCustomHeader
 {
     public string? ProducerGroup { get; set; }
@@ -318,7 +306,6 @@ public sealed class RecallMessageRequestHeader : ICommandCustomHeader
     }
 }
 
-// 对应 RecallMessageResponseHeader：Java 只有一个字段 msgId（被撤回消息的 uniqKey）。
 public sealed class RecallMessageResponseHeader : ICommandCustomHeader
 {
     public string? MsgId { get; set; }
@@ -577,10 +564,6 @@ public sealed class SearchOffsetRequestHeader : ICommandCustomHeader
     public int? QueueId { get; set; }
     public long? Timestamp { get; set; }
 
-    /// <summary>
-    /// Java 该字段是 @CFNullable：为 null 时**不写键**（只有已废弃的 5 参
-    /// MQClientAPIImpl#searchOffset 会这样发）。
-    /// </summary>
     public BoundaryType? BoundaryType { get; set; }
 
     public PropertyMap ToExtFields()
@@ -589,7 +572,6 @@ public sealed class SearchOffsetRequestHeader : ICommandCustomHeader
         HeaderCodec.PutOptStr(outMap, "topic", Topic);
         HeaderCodec.PutOptInt(outMap, "queueId", QueueId);
         HeaderCodec.PutOptLong(outMap, "timestamp", Timestamp);
-        // 入网文本是枚举名大写（Java makeCustomHeaderToNet 的 Enum.toString()）
         if (BoundaryType is { } bt)
         {
             outMap["boundaryType"] = BoundaryTypeNames.Name(bt);
@@ -603,7 +585,6 @@ public sealed class SearchOffsetRequestHeader : ICommandCustomHeader
         Topic = HeaderCodec.GetOptStr(ext, "topic");
         QueueId = HeaderCodec.GetOptInt(ext, "queueId");
         Timestamp = HeaderCodec.GetOptLong(ext, "timestamp");
-        // 缺键 ⇒ null（读取端自行回落 LOWER）；有键但值不认识 ⇒ Java getType 的宽松语义
         BoundaryType = ext.TryGetValue("boundaryType", out string? boundary)
             ? BoundaryTypeNames.GetType(boundary)
             : null;
@@ -695,8 +676,6 @@ public sealed class EndTransactionRequestHeader : ICommandCustomHeader
     public string? MsgId { get; set; }
     public string? TransactionId { get; set; }
 
-    // ⚠ 键名必须是 "bname"（RpcRequestHeader 的字段名），不能是 brokerName——
-    //   否则 Java broker 用 setBrokerName 反序列化时静默丢字段。
     public string? Bname { get; set; }
 
     public PropertyMap ToExtFields()
@@ -770,7 +749,6 @@ public sealed class HeartbeatRequestHeader : ICommandCustomHeader
     public PropertyMap ToExtFields()
     {
         var outMap = new PropertyMap();
-        // ⚠ 键名是 "clientID"（Java 字段名如此），不是 "clientId"
         HeaderCodec.PutOptStr(outMap, "clientID", ClientId);
         return outMap;
     }
@@ -805,9 +783,6 @@ public sealed class GetConsumerListByGroupRequestHeader : ICommandCustomHeader
 {
     public string? ConsumerGroup { get; set; }
 
-    // ⚠ 该头继承 RpcRequestHeader，Java 字段名是 "bname"（不是 "brokerName"）。
-    // findConsumerIdList 发往 topic 路由里的第一个 broker，bname 填该 brokerName。
-    // broker 处理 GET_CONSUMER_LIST_BY_GROUP 时实际只用 consumerGroup，bname 是协议对齐项。
     public string? Bname { get; set; }
 
     public PropertyMap ToExtFields()
@@ -874,7 +849,6 @@ public sealed class CheckTransactionStateRequestHeader : ICommandCustomHeader
     public string? MsgId { get; set; }
     public string? TransactionId { get; set; }
 
-    /// <summary>⚠ Java 的 offsetMsgId 是 **String**，不是 long。</summary>
     public string? OffsetMsgId { get; set; }
 
     // ⚠ 键名必须是 "bname"（同 EndTransactionRequestHeader）。
@@ -905,10 +879,6 @@ public sealed class CheckTransactionStateRequestHeader : ICommandCustomHeader
     }
 }
 
-/// <summary>
-/// 对应 org.apache.rocketmq.remoting.protocol.header.CreateTopicRequestHeader，
-/// 用于 UPDATE_AND_CREATE_TOPIC：在 broker 上按指定队列数/权限建 topic。
-/// </summary>
 public sealed class CreateTopicRequestHeader : ICommandCustomHeader
 {
     public string? Topic { get; set; }
@@ -953,10 +923,6 @@ public sealed class CreateTopicRequestHeader : ICommandCustomHeader
     }
 }
 
-/// <summary>
-/// 对应 org.apache.rocketmq.remoting.protocol.header.ReplyMessageRequestHeader：
-/// broker → 请求方 的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 请求头。
-///
 /// 字段与 SendMessageRequestHeaderV2 高度重合，但多了 bornHost / storeHost /
 /// storeTimestamp（broker 的 ReplyMessageProcessor#pushReplyMessage 据此拼出头）。
 /// 请求方收到后结合 body 还原出真正的应答 MessageExt。
@@ -1018,12 +984,7 @@ public sealed class ReplyMessageRequestHeader : ICommandCustomHeader
 }
 
 // ------------------------------------------------ POP（5.x 轻量消费）
-//
-// ⚠ ext 键名必须逐字等于 Java 字段名：broker 用 fastjson2 按 Java 属性名反序列化，
-//   错一个字母就**静默丢字段**（不报错，只是那个条件不生效）。
-//   例如 maxMsgNums 写成 maxMsgNum 会被 broker 当 0 处理。
 
-/// <summary>org.apache.rocketmq.remoting.protocol.header.PopMessageRequestHeader。</summary>
 public sealed class PopMessageRequestHeader : ICommandCustomHeader
 {
     public string? ConsumerGroup { get; set; }
@@ -1047,7 +1008,6 @@ public sealed class PopMessageRequestHeader : ICommandCustomHeader
     public string? ExpType { get; set; }
     public string? Exp { get; set; }
 
-    /// <summary>Java 是 primitive boolean，**总是在 extFields 里**（与 Python/C++ 侧一致）。</summary>
     public bool Order { get; set; }
 
     public string? AttemptId { get; set; }
@@ -1087,10 +1047,6 @@ public sealed class PopMessageRequestHeader : ICommandCustomHeader
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.header.PopMessageResponseHeader。
-/// startOffsetInfo / msgOffsetInfo 是客户端反构 POP_CK 的唯一来源。
-/// </summary>
 public sealed class PopMessageResponseHeader : ICommandCustomHeader
 {
     public long? PopTime { get; set; }
@@ -1126,10 +1082,6 @@ public sealed class PopMessageResponseHeader : ICommandCustomHeader
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.header.AckMessageRequestHeader。
-/// ⚠ Offset 是 **consumeQueue offset**（CK 串第 8 段 / msgQueueOffset），不是 commitlog offset。
-/// </summary>
 public sealed class AckMessageRequestHeader : ICommandCustomHeader
 {
     public string? ConsumerGroup { get; set; }
@@ -1162,7 +1114,6 @@ public sealed class AckMessageRequestHeader : ICommandCustomHeader
     }
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.header.ChangeInvisibleTimeRequestHeader。</summary>
 public sealed class ChangeInvisibleTimeRequestHeader : ICommandCustomHeader
 {
     public string? ConsumerGroup { get; set; }
@@ -1173,7 +1124,6 @@ public sealed class ChangeInvisibleTimeRequestHeader : ICommandCustomHeader
     public long? InvisibleTime { get; set; }
     public string? LiteTopic { get; set; }
 
-    /// <summary>Java 是 primitive boolean（默认 false），**总是在 extFields 里**。</summary>
     public bool Suspend { get; set; }
 
     public PropertyMap ToExtFields()
@@ -1203,10 +1153,6 @@ public sealed class ChangeInvisibleTimeRequestHeader : ICommandCustomHeader
     }
 }
 
-/// <summary>
-/// org.apache.rocketmq.remoting.protocol.header.ChangeInvisibleTimeResponseHeader。
-/// ⚠ 返回的是**新的** invisibleTime/popTime（不是 startTime/nextVisibleTime）。
-/// </summary>
 public sealed class ChangeInvisibleTimeResponseHeader : ICommandCustomHeader
 {
     public long? PopTime { get; set; }

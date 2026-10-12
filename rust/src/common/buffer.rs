@@ -1,4 +1,3 @@
-//! 大端字节序读写缓冲（对应 Java `ByteBuffer` 的用法与 Python 的 `struct.pack(">…")`）。
 
 use crate::error::{Error, Result};
 
@@ -168,7 +167,6 @@ impl<'a> Reader<'a> {
         Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
-    /// 读出的是 Java `short` 的无符号解释（与 Python `code & 0xFFFF` 对齐）。
     pub fn i16(&mut self) -> Result<i32> {
         Ok(self.u16()? as i32)
     }

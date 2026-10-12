@@ -1,21 +1,3 @@
-// 消费执行器：Java ThreadPoolExecutor 的最小等价物（core/max 两档）。
-//
-// 为什么不用 std::async / 裸 std::thread：
-//   * 之前 C++ 的 POP 路径是"每个批次起一个 detached 线程"，**无上限**，慢监听器一上来
-//     就线程爆炸；Java 用的是 core/max 两档线程池（ConsumeMessagePopConcurrentlyService 持有
-//     consumeExecutor，队列无界），并且线程数与 consumeThreadMin/Max 挂钩 —— 但本项目的
-//     consumeThreadNums_ 此前**设了没有任何作用**（`setConsumeThreadNums(4)` 实际是死配置）。
-//   * Java 在 LinkedBlockingQueue（无界）下 **真实并发度 == corePoolSize**
-//     （poolSize < corePoolSize 才新建线程，否则入队），所以线程弹性全挂在 core 上：
-//     `AbstractConsumeMessageService.updateCorePoolSize(n)` → `setCorePoolSize(n)`。
-//
-// 对齐点（与 Python consume_executor.py 逐条同源）：
-//   1. 投递时只有 workers < core 才新建线程；否则入队（队列有界时队满先涨到 max 再 reject）。
-//   2. 入队后若 workers == 0 就补一个线程（Java execute 的兜底分支，core=0 时必须）。
-//   3. > core 的线程空闲超过 keepAlive 退出；<= core 的线程永不退出
-//      （Java allowCoreThreadTimeOut 默认 false）。
-//   4. setCorePoolSize(n)：core 变大时按 min(delta, 队列长度) 补线程（Java 的启发式算法）。
-//   5. 任务抛异常不杀 worker（Java 会补一个新 worker，效果等价）。
 #ifndef ROCKETMQ_CLIENT_CONSUME_EXECUTOR_H
 #define ROCKETMQ_CLIENT_CONSUME_EXECUTOR_H
 
@@ -32,8 +14,6 @@
 
 namespace rocketmq {
 
-// 队列已满 / 已 shutdown，任务被拒（对应 Java RejectedExecutionException）。
-// 发送路径要按类型区分"被拒"和普通运行时错误，所以单独一个类型。
 class RejectedExecutionError : public std::runtime_error {
 public:
     explicit RejectedExecutionError(const std::string& msg) : std::runtime_error(msg) {}
@@ -41,15 +21,6 @@ public:
 
 class ConsumeExecutor {
  public:
-    // core_pool_size/maximum_pool_size 直接对应 Java ThreadPoolExecutor 的
-    // consumeThreadMin / consumeThreadMax，keep_alive_seconds 默认 60s（Java 构造参数）。
-    //
-    // max_queue_size: 0 = 无界（消费池就是这个语义，Java 用 LinkedBlockingQueue）；
-    //   异步发送池必须给正值（Java 的 AsyncSenderExecutor 是 LinkedBlockingQueue(50000)），
-    //   队满时才按 Java 的语义先尝试开一个非 core 线程、再不行就 reject。
-    // thread_name_sep / thread_index_from: Java 的 ThreadFactoryImpl 从 1 开始编号且用
-    //   '_' 连接（"AsyncSenderExecutor_1"、"NettyClientPublicExecutor_1"），
-    //   消费池沿用旧的 "-0" 起法，故默认值保持不变。
     ConsumeExecutor(int32_t core_pool_size, int32_t maximum_pool_size,
                     double keep_alive_seconds = 60.0, std::string thread_name_prefix = "rmq-consume",
                     int32_t max_queue_size = 0, std::string thread_name_sep = "-",
@@ -59,7 +30,6 @@ class ConsumeExecutor {
     ConsumeExecutor(const ConsumeExecutor&) = delete;
     ConsumeExecutor& operator=(const ConsumeExecutor&) = delete;
 
-    // 投递任务（Java execute）。已 shutdown 或队列满时抛 RejectedExecutionError。
     void submit(std::function<void()> task);
 
     // 对应 ThreadPoolExecutor.setCorePoolSize。
@@ -68,13 +38,10 @@ class ConsumeExecutor {
     int32_t getCorePoolSize() const;
     int32_t getMaximumPoolSize() const;
 
-    // 观测用（对应 Java getPoolSize / getQueue().size()）。
     int32_t workerCount() const;
     int32_t queuedCount() const;
     int64_t handlerExceptionCount() const;
 
-    // 对应 Java shutdown：不再接收新任务，把队列跑完；wait=true 时等待线程收工。
-    // 注意这**不是** shutdownNow（不中断正在跑的任务）。
     void shutdown(bool wait = false);
 
  private:

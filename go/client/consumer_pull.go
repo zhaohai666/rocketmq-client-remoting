@@ -1,10 +1,5 @@
 // The consumer's runtime loops: one pull goroutine per assigned queue, one
 // dispatch goroutine, and the two sweeps (clean-expire, orderly lock).
-//
-// Why one goroutine PER QUEUE rather than Java's shared PullMessageService
-// thread: the push consumer long-polls (suspend=true), so an idle queue parks
-// its request for up to ~15s. A shared thread would serialise those parks and
-// starve every other queue. The Python/C++/C# ports made the same call.
 package client
 
 import (
@@ -31,19 +26,8 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 		if !stillMine || pq.IsDropped() {
 			return
 		}
-		// Java DefaultMQPushConsumerImpl.pullMessage:253 — the timestamp is
-		// stamped when a pull is STARTED, before the flow-control/lock
-		// decisions: the stall detector asks "is this loop alive", not "did
-		// this round make a network call".
 		pq.TouchPull()
 
-		// Java DefaultMQPushConsumerImpl.pullMessage:263-266 — a suspended consumer
-		// keeps its assignment and its ProcessQueues and simply sends nothing, then
-		// re-checks the flag after PULL_TIME_DELAY_MILLS_WHEN_SUSPEND (1000ms). The
-		// gate sits AFTER TouchPull on purpose: stamp the liveness first, or a long
-		// suspend would make every queue look idle to the 120s stall detector and
-		// rebalance would tear the loops down under a consumer that is merely
-		// paused. It sits BEFORE the lock and flow-control gates, exactly like Java.
 		if c.IsPaused() {
 			if c.sleepOrStop(stop, pullTimeDelayMillsWhenSuspend) {
 				return
@@ -78,10 +62,6 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 			continue
 		}
 
-		// Java pullMessage:458-468 — the expression goes on the wire only when
-		// postSubscriptionWhenPull is on AND the subscription is not a class
-		// filter. Off by default: the broker then does not filter and the
-		// client's second-stage tag check covers it.
 		var expr *string
 		if c.postSubscriptionWhenPull && !sub.ClassFilterMode {
 			expr = &sub.SubString
@@ -95,9 +75,6 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 		batchBytes := c.pullBatchSizeInBytes
 		c.mu.Unlock()
 
-		// The pull RT is measured from just before the request (Java
-		// DefaultMQPushConsumerImpl:343 stamps beginTimestamp immediately before
-		// pullKernelImpl), so it covers the long-poll hold too.
 		begin := common.CurrentTimeMillis()
 		result, err := c.pullAPI.pullKernel(c.consumerGroup, mq, offset, sub, sysFlag, 0,
 			batchNums, batchBytes, suspend, timeout)
@@ -139,9 +116,6 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 		c.offsetTable[mq] = result.NextBeginOffset
 		illegal := false
 		if result.PullStatus == PullOffsetIllegal {
-			// Java DefaultMQPushConsumerImpl:402-427 — freeze the corrected
-			// offset here (equivalent to updateAndFreezeOffset inside the
-			// callback) and do the revoke/persist outside the lock.
 			c.frozenOffsets[mq] = true
 			if c.offsetStore != nil {
 				c.offsetStore.UpdateOffset(mq, result.NextBeginOffset, false)
@@ -155,14 +129,6 @@ func (c *DefaultMQPushConsumer) queuePullLoop(mq common.MessageQueue, stop chan 
 			c.offsetIllegalRecover(mq)
 			return
 		}
-		// Java DefaultMQPushConsumerImpl:353-367 — both counters fire inside the
-		// FOUND arm: the RT even when the list came back empty (the broker did
-		// answer, the round trip happened), the TPS only for a non-empty one.
-		//
-		// Placed AFTER the revocation gate above, which Java does not have: a
-		// batch thrown away because its queue was revoked mid-poll was never
-		// consumed, so counting it would report throughput the consumer does not
-		// have.
 		if result.PullStatus == PullFound {
 			c.incPullRT(mq.Topic, common.CurrentTimeMillis()-begin)
 			if len(result.MsgFoundList) > 0 {
@@ -203,9 +169,6 @@ func (c *DefaultMQPushConsumer) pullCursor(mq common.MessageQueue) (int64, bool)
 	return next, true
 }
 
-// flowControlHit is Java ProcessQueue.putMessage / pullMessage's threshold
-// checks. Any one of them pauses THIS queue's pulls:
-//
 //   - pullThresholdForQueue (1000): buffered message COUNT;
 //   - pullThresholdSizeForQueue (100 MB): buffered bytes;
 //   - consumeConcurrentlyMaxSpan (2000): the offset SPAN of the buffer, so one
@@ -269,11 +232,6 @@ func (c *DefaultMQPushConsumer) topicPendingStats(topic string) (int, float64) {
 // ---------------------------------------------------------------- dispatch
 
 // dispatchLoop takes batches out of the buffers and hands them to the listener.
-//
-// Concurrent mode: a goroutine per batch, bounded by the core pool size (the
-// Java ThreadPoolExecutor with an unbounded queue, whose real concurrency is
-// therefore core). Orderly mode: consumed INLINE, so a queue's ordering is
-// preserved without any extra lock.
 func (c *DefaultMQPushConsumer) dispatchLoop() {
 	for {
 		select {
@@ -355,10 +313,6 @@ func (c *DefaultMQPushConsumer) dispatchLoop() {
 
 // ---------------------------------------------------------------- sweeps
 
-// cleanExpireLoop is Java's scheduleAtFixedRate(cleanExpireMsg,
-// consumeTimeout, consumeTimeout, MINUTES): initialDelay and period are the SAME,
-// so the first sweep also waits a full period. Sweeping immediately would walk
-// messages that are still well within their timeout.
 func (c *DefaultMQPushConsumer) cleanExpireLoop() {
 	period := time.Duration(maxInt64(1, c.consumeTimeoutValue())) * time.Minute
 	if c.sleepOrStop(nil, period) {
@@ -375,8 +329,6 @@ func (c *DefaultMQPushConsumer) cleanExpireLoop() {
 		}
 		func() {
 			defer c.inFlight.Done()
-			// Java's scheduler shell catches Throwable (:77-81): one bad round
-			// must not kill the schedule.
 			defer func() {
 				if r := recover(); r != nil {
 					common.LogErrorf("scheduleAtFixedRate cleanExpireMsg exception: %v", r)
@@ -390,9 +342,6 @@ func (c *DefaultMQPushConsumer) cleanExpireLoop() {
 	}
 }
 
-// lockLoop is Java ConsumeMessageOrderlyService#lockMQ: lock every assigned
-// queue every 20s, with one attempt immediately at startup so the first 20s is
-// not wasted.
 func (c *DefaultMQPushConsumer) lockLoop() {
 	for {
 		func() {
@@ -411,9 +360,6 @@ func (c *DefaultMQPushConsumer) lockLoop() {
 
 // ---------------------------------------------------------------- producer
 
-// innerProducer lazily builds the CLIENT_INNER_PRODUCER used by the orderly
-// send-back path. Java constructs it inside ConsumeMessageOrderlyService and
-// calls resetClientConfig, which is why unitMode is copied across.
 func (c *DefaultMQPushConsumer) innerProducer() (*DefaultMQProducer, error) {
 	c.innerProducerMu.Lock()
 	defer c.innerProducerMu.Unlock()

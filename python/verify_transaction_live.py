@@ -1,12 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""事务消息真机验证（对齐 Java 两阶段）。
-
-用法（需本地 RocketMQ 5.5.1 集群；broker 不要求改配置，走 Java 默认值
-      transactionTimeOut=6s / transactionCheckInterval=30s / transactionCheckMax=15，
-      想要更快的回查可在 broker.conf 里把前两项调成 3000）：
-    .venv/bin/python verify_transaction_live.py 127.0.0.1:9876
-"""
 from __future__ import annotations
 
 import sys
@@ -194,11 +187,6 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         check("事务-UNKNOW 发送状态", False, "throw=%s" % e)
 
-    # broker 巡检半消息的周期是 Java BrokerConfig#transactionCheckInterval，**默认 30s**
-    # （不是本文件头注释里说的 3s，除非 broker.conf 显式覆写），所以半消息最快也要等一轮
-    # 巡检才被回查。旧代码固定 sleep(25) 会稳定地早于回查 → "最终投递"必然失败。
-    # 这里改成等"回查发生"这一事件（最多 90s，兼容 3s/30s 两种配置），
-    # 再额外观察 10s 让 COMMIT 后的消息真正投递到消费者。
     deadline = time.time() + 90
     while ck_listener.check_calls == 0 and time.time() < deadline:
         time.sleep(1)

@@ -1,34 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""拉取前流控（Java ProcessQueue 五个阈值）真机验证。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_flow_control_live.py 127.0.0.1:9876
-
-离线单测（tests/test_flow_control.py）锁的是**判据本身**；这里锁的是真机上两件
-离线永远锁不住的事：
-  A. 闸门在真实 broker 上**确实会命中**（单位错一位、阈值读错一个字段，离线用
-     mock 缓冲照样"能命中"，真机上却永远不命中或永远命中）；
-  B. 命中之后**一条消息都不许丢**：流控只是"暂停拉取"，不是"丢弃/跳过"。
-     暂停期间位点不许越过还没消费完的消息，恢复后同一个队列必须继续消费到末尾。
-     这条是流控最危险的错误方向 —— 实现写成"命中就丢批/退出循环"在 10 秒窗口里
-     完全看不出来，只有把全部消息数完才发现。
-
-场景（每条都同时验 A 和 B）：
-  S0 默认闸门 + 快消费：不命中（triggered==0），消息全部到达 —— 防"闸门误触发把正常流量也停了"。
-  S1 队列级字节闸门：条数闸门放到不可能命中，size=1MiB + 400KB 大消息 + 慢消费。
-  S2 位点跨度闸门：size/条数都压到不命中，consume_concurrently_max_span=2 + 慢消费。
-  S3 topic 级条数闸门：队列级三条全关掉，pull_threshold_for_topic=4 + 4 队列 + 慢消费。
-  S4 命中后恢复：S1 用的队列继续投新消息，仍被正常消费（暂停不是停摆）。
-  S5 配置数值闸门（Java checkConfig :1099-1209）：区间**边界值**在真集群上能启动并
-     全部消费；越界的配置在本地就被拒，broker 侧根本不知道有这个消费组（离线单测
-     只能证明"抛了异常"，证不了"没把半套配置发到 broker 上"）。
-
-关于 S1~S4 里"关掉某道闸门"的写法：这里用的是 Java 允许的**极值**（65535 / 1024 /
--1），不是 0。Java 的 checkConfig 把 0 判成非法值（``pullThresholdSizeForQueue``
-区间是 [1, 1024]），本仓库运行期另有 ``max(1, n)`` 兜底，但那道兜底只服务运行期
-热改，不能拿来越过启动期闸门 —— 用极值"关掉"闸门既符合 Java，也不依赖兜底。
-"""
 from __future__ import annotations
 
 import os
@@ -49,8 +20,6 @@ from common.message import Message
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 PREFIX = "FcPy_%d" % int(time.time() * 1000)
 
-# "关掉这道闸门"的合法写法：Java checkConfig 的**上界**（[1, 65535] / [1, 1024]），
-# 而不是 0。0 会被启动期闸门拒（见 S5），且它依赖的是运行期 max(1,n) 兜底。
 OFF_COUNT = 65535        # pullThresholdForQueue / consumeConcurrentlyMaxSpan 的上界
 OFF_SIZE_MB = 1024       # pullThresholdSizeForQueue 的上界（单位 MiB）
 
@@ -174,10 +143,6 @@ def main() -> int:
           "distinct=%d" % len(set(got0)))
     c0.shutdown()
 
-    # ---------- S1 队列级字节闸门 ----------
-    # 条数闸门放到 Java 允许的上界：这条场景里**只有** size 闸门可能命中。
-    # topic 必须只有 1 个队列：8 条 400KB 摊到 4 个队列上每队才 800KB，永远够不到
-    # 1MiB 这道队列级闸门（第一次跑就是这么"闸门不命中"的，不是实现错）。
     t1 = PREFIX + "_Size"
     prepare_topic(t1, queues=1)
     c1 = run_gate_case(
@@ -249,14 +214,6 @@ def main() -> int:
     check("S4-恢复批次不重复", len(set(got4)) == 6, "distinct=%d" % len(set(got4)))
     c4.shutdown()
 
-    # ---------- S5 配置数值闸门（Java checkConfig :1099-1209）----------
-    # 离线单测（tests/test_consumer_check_config.py）锁的是区间与文案；这里补两件
-    # 只有真集群能锁死的事：
-    #   1. 落在 Java 区间**边界**上的配置在 broker 上真能把消费者跑起来并收全消息 ——
-    #      闸门写歪最常见的方式是"比 Java 还严"，把合法配置也拒了，用户直接起不来；
-    #   2. 越界的配置**没有打到 broker 上**。写成"先注册再校验"的话，broker 的
-    #      ConsumerManager 会留下一堆永不心跳的僵尸 clientId，把 rebalance 用的
-    #      cidAll 撑歪（真机表现为队列分配不均），而客户端日志里只有启动失败那一条。
     t5 = PREFIX + "_Config"
     prepare_topic(t5)
     legal = {
@@ -268,7 +225,7 @@ def main() -> int:
         "pull_threshold_size_for_topic": -1,
         "pull_interval": 0,
         "consume_message_batch_max_size": 1,
-        "pull_batch_size": 1024,          # Java 区间上界
+        "pull_batch_size": 1024,
         "pop_invisible_time": 300000,     # MAX_POP_INVISIBLE_TIME
         "pop_batch_nums": 32,
     }

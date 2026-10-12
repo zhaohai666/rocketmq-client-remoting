@@ -1,39 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""轻量拉取消费者（DefaultLitePullConsumer）真机验证。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_lite_pull_live.py 127.0.0.1:9876
-
-为什么单独测：DefaultLitePullConsumer 是三个语言都缺失的能力（Java 有，本仓库此前三语言都只有
-手动的 DefaultMQPullConsumer）。本脚本把它的核心——「subscribe/assign + 后台灌本地缓冲 + poll 取批量」——
-在真实集群上跑通。
-
-场景（围绕 Lite 相对 Pull 的本质区别：调用方不用管位点，poll 从本地缓冲拿消息）：
-  S1 建 topic + subscribe 模式等待 rebalance 分到位点
-  S2 先起消费者、再发 12 条（交替 TagA/TagB）→ subscribe + poll 收全 12 条且内容一致
-  S3 auto-commit：只读 committed()，继续 poll 过一整个自动提交周期后位点自己 > 0
-  S4 assign 模式：显式 assign 全部队列 + seek 到队首 → poll 重新收全 12 条（验证 assign/seek/poll）
-  S5 订阅 TagA：subscribe(T, "TagA") 只收 TagA 的 6 条（验证订阅级 tag 过滤）
-  S6 CONSUME_FROM_TIMESTAMP：consumeTimestamp 按 Java 的 14 位本地墙钟解释
-     S6a 新组 + 起点=30 分钟前 → 收全 12 条
-     S6b 墙钟→队列位置映射：30 分钟前 → 各队列队首（Σ=0）；10 分钟后 → 越过全部消息（Σ=12）
-     旧实现把墙钟串当 epoch 解析会把两个方向同时翻转。
-  S7 可插拔分配策略（对应 Java setAllocateMessageQueueStrategy）
-     S7a 默认策略名 AVG；置 None 由 start() 按 Java checkConfig 拒绝
-     S7b AVG_BY_CIRCLE：同组两实例把 4 个队列按下标取模交叉切开，不重不漏
-     S7c CONFIG：只分配配置进去的队列 → assignment 恰为其一，且 poll 到的消息
-         queueId 全部落在配置队列内、两半合起来覆盖全部 12 条且互不重叠
-     S7d CONSISTENT_HASH：拿**真实 clientId** 建环，线上 assignment 必须收敛到
-         「真实 mqAll/cidAll 离线跑同一策略」的预测。环可能一边 4 条一边 0 条
-         （Java 同款落点偏斜），所以判定只看「不重不漏 + 等于预测」
-     S7e MACHINE_ROOM_NEARBY：真实集群只有一个机房 ⇒ 装饰器必须原样透传内层策略；
-         resolver 的调用记录同时证明 rebalance 真的逐个问过队列/客户端的机房
-     S7f MACHINE_ROOM：真实 brokerName 不含 '@'，白名单再怎么写都筛不出队列 ——
-         验的是「配错机房安静饿死」（分不到队列、poll 不到消息、不打崩重平衡）
-  S8 三张位点表（对位 Java AssignedMessageQueue + OffsetStore）：1 队列 topic 灌 1200 条，
-      把「拉取游标 / 已消费游标 / 提交落点」三个数字在真机各自数出来
-"""
 from __future__ import annotations
 
 import sys
@@ -205,17 +171,7 @@ def make_pair(group: str, names: tuple, strategies: tuple, *subscribe: str) -> t
 def wait_until_prediction_converged(group: str, mq_all: list, cid_members: tuple,
                                    asserted: tuple, strategies: tuple,
                                    timeout: int = 45) -> tuple:
-    """用**真实**输入（路由给的 mqAll + cid_members 的真实 clientId 当 cidAll）离线跑策略，
-    并**等线上 assignment() 收敛到这份预测**，返回 (是否收敛, 两边快照)。
-
-    为什么以预测为收敛条件，而不是「先等不重不漏、再比预测」：哈希环完全可能把 4 个
-    队列全分给一个实例，另一边在首轮重平衡之前 assignment() 本来就是空 —— 那种初始态
-    同样满足「不重不漏」，比出来的其实是「一边还没算」的快照。（Rust 版第一版就在这里翻车。）
-
-    Java RebalanceImpl#rebalanceByTopic 调策略前会把 mqAll、cidAll 都 Collections.sort，
-    所以这里也得自己排：mq_all 由调用方排好，clientId 按字典序（同 String#compareTo）。
-    strategies 与 asserted 一一对应 —— S7f 要故意让两边配不同策略。
-    """
+    pass
     cid_all = sorted(c.client_id for c in cid_members)
     expected = []
     for c, strategy in zip(asserted, strategies):
@@ -268,13 +224,7 @@ def broker_offset(probe: DefaultMQPullConsumer, mq: MessageQueue) -> int:
 
 
 def s8_three_offset_tables(foreign_pool: list) -> None:
-    """S8 三张位点表（对位 Java AssignedMessageQueue.MessageQueueState + RemoteBrokerOffsetStore）：
-    拉取游标 / 已消费游标 / 提交落点，在一队列 topic 上灌 1200 条，把三个数字在真机各自数出来。
-
-    单测锁得住表形状，锁不住「提交错一格在真机是静默丢消息」这条后果：把拉取游标当提交源，
-    位点会跑到消费前面，重启后那段消息永远不再投；反过来提交得太保守只会重复投，肉眼看得见。
-    与 C++ live_lite_pull.cpp 的 S8、Rust live_lite_pull_consumer.rs 的 L11 同场景同断言。
-    """
+    pass
     off_topic = "LiteOff_%d" % STAMP
     off_group = "LiteOffPG_%d" % STAMP
     n_big = 1200          # > poll 单次上限 1024 ⇒ 一次交付必然留下没交出去的尾巴
@@ -417,10 +367,6 @@ def s8_three_offset_tables(foreign_pool: list) -> None:
         check("S8f seek 之后 commit 落到 60", seeked == 60, "brokerOffset=%d" % seeked)
         o.resume([q0])
 
-        # S8g Java RemoteBrokerOffsetStore#persistAll 的 "remove unused mq"：点名提交
-        # 只发被点名的队列，内存表里**其余**条目顺手删掉 —— 上一轮 persist=False 攒下、
-        # 还没落盘的内存值就此丢掉。这条在 broker 上可观测：清掉之后 committed() 只能
-        # 回读到 broker 上那一格，再也读不到 300。
         if len(foreign_pool) < 2:
             check("S8g 需要主 topic 至少 2 条队列", False, "queues=%d" % len(foreign_pool))
             return
@@ -429,7 +375,6 @@ def s8_three_offset_tables(foreign_pool: list) -> None:
         o.commit({q0: 300}, persist=False)
         check("S8g 未落盘的内存值先看得见", o.pending_commit_of(q0) == 300,
               "pending=%d" % o.pending_commit_of(q0))
-        # 空集合：Java 的 commit(Set) 直接 return，表不动、消息也不发
         o.commit([], persist=True)
         check("S8g 空集合不清表也不发消息", o.pending_commit_of(q0) == 300,
               "pending=%d" % o.pending_commit_of(q0))
@@ -486,9 +431,6 @@ def main() -> int:
 
     # ===== S3 auto-commit =====
     print("\nS3 auto-commit 位点")
-    # 场景故意不手动 commit：验的是「继续 poll 的常态下位点会自己落到 broker」。
-    # Java 的自动提交只在 poll() 开头按 nextAutoCommitDeadline 到点才跑（默认 5s），
-    # 而第一次检查发生在交付之前（已消费游标还是 -1，提交不出东西），所以要 poll 过一整个周期。
     before = {mq: c1.committed(mq) for mq in assigned}
     deadline = time.time() + 20
     after = before
@@ -572,9 +514,6 @@ def main() -> int:
     c5.subscribe(TOPIC, "*")
     c5.start()
     q5 = wait_assignment(c5)
-    # 不断言「未来时间戳收不到消息」：Java 的 RebalanceLitePullImpl 先读已提交位点，
-    # 新组只要队首仍在 commitlog 内，broker 就直接回 0，consume_from_where 不参与。
-    # 墙钟真正影响的是「时间戳 → 队列位置」的映射，所以断言这个量。
     sum_past = sum(c5.offset_for_timestamp(mq, wall - 30 * 60 * 1000) for mq in q5)
     sum_future = sum(c5.offset_for_timestamp(mq, wall + 10 * 60 * 1000) for mq in q5)
     check("S6b 30 分钟前 → 各队列队首", sum_past == 0, "sumOffset=%d" % sum_past)
@@ -588,7 +527,6 @@ def main() -> int:
                         key=lambda mq: (mq.topic, mq.broker_name, mq.queue_id))
     total_queues = len(all_queues)
 
-    # S7a 默认策略 / None 守卫（Java 在 checkConfig 里拒绝 null）
     probe = DefaultLitePullConsumer(GROUP6)
     probe.set_namesrv_addr(NAMESRV)
     check("S7a 默认策略名 = AVG",
@@ -665,9 +603,6 @@ def main() -> int:
     c6.shutdown()
     c7.shutdown()
 
-    # S7d CONSISTENT_HASH：用**真实 clientId** 建哈希环，线上分配要收敛到离线预测。
-    # 注意判定只看「不重不漏」：环的落点由 clientId 的 MD5 决定，真实集群上完全可能
-    # 一边 4 条、另一边 0 条（Java 同款），所以不能要求两边都非空。
     ch = AllocateMessageQueueConsistentHash()
     d1, d2 = make_pair(GROUP10, ("s7da", "s7db"), (ch, ch), TOPIC, "*")
     check("S7d 替换后策略名 = CONSISTENT_HASH",
@@ -711,8 +646,6 @@ def main() -> int:
     e1.shutdown()
     e2.shutdown()
 
-    # S7f MACHINE_ROOM：真实 brokerName 是 `broker-a`，Java 的 split("@") 只切出 1 段
-    # ⇒ 白名单怎么写都筛不出队列。要验的是「配错机房安静饿死」，而不是把 rebalance 打崩。
     room = AllocateMessageQueueByMachineRoom({ROOM})
     check("S7f 策略名 = MACHINE_ROOM 且白名单能读回",
           room.get_name() == "MACHINE_ROOM" and room.consumeridcs == {ROOM},
@@ -725,8 +658,6 @@ def main() -> int:
     check("S7f 同组对照组（AVG）正常分到队列", bool(ctrl), "ctrl=%s" % sorted(queue_keys(ctrl)))
     check("S7f 机房不匹配真实 brokerName → 一条都不分（不报错也不误吃）",
           not f1.assignment(), "assignment=%s" % sorted(queue_keys(f1.assignment())))
-    # 两边各自算策略（Java 就是各算各的）：配错机房的一方算出空，对照组按**两个** cid
-    # 算 AVG 只拿到自己那半边 —— 它没有替配错的那位兜底，这才是 Java 的语义。
     ok, snap = wait_until_prediction_converged(GROUP12, all_queues, (f1, f2), (f1, f2),
                                               (room, avg))
     check("S7f 两边线上分配各自收敛到自己策略的离线预测", ok, snap)

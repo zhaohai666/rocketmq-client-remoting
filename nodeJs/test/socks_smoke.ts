@@ -3,11 +3,6 @@
 //
 //   node --experimental-strip-types test/socks_smoke.ts
 //
-// Java baseline: ClientConfig#socksProxyConfig (SocksProxyConfig: addr /
-// username / password) + NettyRemotingClient's Socks5ProxyHandler prepended
-// BEFORE the SSL handler, i.e. wire order TCP connect → SOCKS CONNECT → TLS.
-// The node port hand-rolls the handshake on node:net (zero deps): SOCKS5
-// (RFC 1928 no-auth + RFC 1929 user/pass) and SOCKS4/4a.
 //
 // Structure:
 //   1. Pure handshake logic (byte shapes, reply parsing, config parsing) — no network.
@@ -17,9 +12,6 @@
 //      the rejection paths (bad password, no acceptable method, CONNECT refused,
 //      dead proxy port). Failure-class assertions get a 30s+ budget (loopback
 //      quirk: a just-closed port can take ~2s to refuse on Windows).
-//
-// NOTE: TopAddressing's HTTP route fetch uses the global fetch() and never
-// enters RemotingClient, so it is intentionally NOT proxied — same as Java.
 import net from 'node:net';
 import { Buffer } from 'node:buffer';
 
@@ -470,7 +462,6 @@ function testPlumbing(): void {
   const consumer = new DefaultMQPushConsumer('GID_SOCKS_SMOKE');
   check('consumer setter returns this', consumer.setSocksProxyConfig(cfg) === consumer);
 
-  // env surface: Java-shaped JSON map on ROCKETMQ_SOCKS_PROXY_CONFIG.
   process.env['ROCKETMQ_SOCKS_PROXY_CONFIG'] = JSON.stringify({ '0.0.0.0/0': { addr: '10.0.0.2:1080' } });
   const rcEnv = new RemotingClient({});
   check('RemotingClient picks up env JSON map', rcEnv.socksProxyConfig != null && rcEnv.socksProxyConfig.addr === '10.0.0.2:1080');

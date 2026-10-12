@@ -34,8 +34,6 @@ internal sealed class WireRecord
     public byte[] Body { get; init; } = Array.Empty<byte>();
     public bool HasBody { get; init; }
 
-    /// <summary>发起方言（Java 0 / CPP 1 / DOTNET 2…）。broker 只拿它判"是不是 C 系"
-    /// （如 222 是否回数组形状的 ResetOffsetBodyForC），所以它必须从报文头上取证。</summary>
     public byte Language { get; init; }
 
     /// <summary>到达时刻（ms，相对 <see cref="MockCluster.ClockOrigin" />）。
@@ -252,12 +250,6 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
-    /// <summary>
-    /// PULL_MESSAGE 的应答：排了脚本就按脚本回（挂了闸先等闸），否则按**空 broker** 的忠实
-    /// 形态回 PULL_NOT_FOUND + nextBeginOffset = 请求 queueOffset（Java
-    /// PullMessageProcessor#composeResponseHeader 对 NO_NEW_MSG 同样回填 nextBeginOffset；
-    /// min/max 为 0）。lite-pull 每轮都信 nextBeginOffset，这里不忠实就会把游标推到 0。
-    /// </summary>
     private RemotingCommand PullRespond(RemotingCommand req)
     {
         ScriptedPull? script;
@@ -371,10 +363,6 @@ internal sealed class MockCluster : IDisposable
         }
     }
 
-    /// <summary>
-    /// 第一笔**发送**请求的取证：本端口按 Java 的三级判据发 SendMessageV2(310) /
-    /// SendBatchMessage(320) / SendReplyMessageV2(325)，写死某一个码会永远抓不到。
-    /// </summary>
     public WireRecord? FirstSendRequest()
     {
         lock (_gate)
@@ -495,7 +483,6 @@ internal sealed class MockCluster : IDisposable
 
         if (req.IsOnewayRpc() || code == NoReply)
         {
-            // 收而不答：客户端只能等到自己的响应超时（Java 的 scanResponseTable）
             return null;
         }
 
@@ -561,10 +548,6 @@ internal sealed class MockCluster : IDisposable
     private static string EndPointOf(Socket server) =>
         ((IPEndPoint)server.LocalEndPoint!).ToString();
 
-    /// <summary>
-    /// 一个绑好又立刻关掉的 loopback 端口：连它必然被拒（Java 的 RemotingConnectException），
-    /// 而且**毫秒级**返回 —— 异步链的「建连失败要重试」只有靠它才不用等满超时。
-    /// </summary>
     internal static string DeadAddr()
     {
         Socket probe = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);

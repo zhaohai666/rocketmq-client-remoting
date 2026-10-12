@@ -1,7 +1,4 @@
 // 编解码往返单测：JSON / RocketMQ 二进制 / RemotingCommand / 消息格式 / 工具函数。
-//
-// 目标：镜像 C++ test_codec.cpp（262 行 65 项断言）——在不依赖真实集群的前提下，
-// 证明 C# 协议层与 Python/C++/Java 参考实现行为一致（字节级往返正确）。
 using System.Buffers.Binary;
 using System.Text;
 using RocketMQ.Common;
@@ -251,20 +248,11 @@ public class CodecTests
         MessageBatch batch = MessageBatch.GenerateFromList(new List<Message> { a, b });
         Assert.Equal(2, batch.Size);
         Assert.Equal("T_B", batch.Topic);
-        // ⚠ GenerateFromList 会给每条子消息补 UNIQ_KEY（对齐 Java DefaultMQProducerImpl:933
-        // "for MessageBatch, ID has been set in the generating process"），所以 batch.Body
-        // **不等于**补 ID 之前算出来的 body（会多一个 UNIQ_KEY 属性）。用同一批消息
-        // 重编一次来比对，同时顺带验证 SetUniqId 的幂等性。
         Assert.Equal(MessageDecoder.EncodeMessages(new List<Message> { a, b }), batch.Body);
         Assert.Equal(32, MessageClientIDSetter.GetUniqId(a).Length);
         Assert.Equal(32, MessageClientIDSetter.GetUniqId(b).Length);
     }
 
-    /// <summary>回归：**没设过 WAIT** 的普通消息组成的批量必须是 WAIT=true。</summary>
-    /// <remarks>Java <c>MessageBatch.generateFromList:70</c> 是
-    /// <c>setWaitStoreMsgOK(first.isWaitStoreMsgOK())</c> —— 属性缺省即 true。
-    /// 判成 false 会让批量以 <c>WAIT=false</c> 下发，broker 不等刷盘就回 SEND_OK。
-    /// Python / Rust 两端此前正是这个缺陷，四端在本提交里统一。</remarks>
     [Fact]
     public void BatchDefaultsWaitStoreMsgOkToTrue()
     {
@@ -285,8 +273,6 @@ public class CodecTests
         Assert.False(off.WaitStoreMsgOk);
     }
 
-    /// <summary>判据本身：Java <c>Message.isWaitStoreMsgOK()</c> =
-    /// 缺省 true + <c>Boolean.parseBoolean</c>（只有忽略大小写的 "true" 为真）。</summary>
     [Fact]
     public void WaitStoreMsgOkFollowsLegacyParseBoolean()
     {
@@ -311,7 +297,6 @@ public class CodecTests
     [Fact]
     public void MessageQueue_HashCode_LegacySemantics()
     {
-        // MessageQueue.hashCode 与 Java 语义一致（topic=A, broker=B, qid=0 -> 93282）
         var mq = new MessageQueue("A", "B", 0);
         Assert.Equal(93282, mq.HashCode());
     }
@@ -328,8 +313,6 @@ public class CodecTests
     [Fact]
     public void Crc32_KnownVector()
     {
-        // 标准 CRC32("123456789") = 0xCBF43926（注意：Java UtilAll.crc32 的 bodyCrc
-        // 会 & 0x7FFFFFFF，那是发送路径的事，本工具函数是标准 CRC32）
         Assert.Equal(0xCBF43926u, UtilAll.Crc32(Encoding.ASCII.GetBytes("123456789")));
     }
 

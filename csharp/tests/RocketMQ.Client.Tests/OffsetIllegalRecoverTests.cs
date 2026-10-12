@@ -1,5 +1,3 @@
-// OFFSET_ILLEGAL 纠错分支单测（Java DefaultMQPushConsumerImpl:402-427），不需要集群。
-//
 // 为什么必须离线锁死：这条路径错了是**静默**的两种极端 ——
 //
 //   - 只把拉取游标拨到 nextBeginOffset 而不丢队列/不冻结：broker 刚把位点纠正到合法区间，
@@ -11,10 +9,6 @@
 // 两个方向在真机短期窗口里都看不出差别（消息照消费、只是一直在弹/一次崩溃才暴露），
 // 所以断言全部放离线；真机另有一条链路证明（examples 的 live-offset-illegal 子命令）。
 //
-// 判据来源：PullMessageProcessor 对 OFFSET_OVERFLOW_BADLY / OFFSET_TOO_SMALL / OFFSET_RESET
-// 一律回 PULL_OFFSET_MOVED，MQClientAPIImpl:1099 把它映射成 PullStatus.OffsetIllegal，修正值
-// 在应答头 nextBeginOffset。Java 的处理是 setNextOffset → ProcessQueue.setDropped(true) → 异步
-// { updateAndFreezeOffset; persist; removeProcessQueue; rebalanceImmediately }。
 //
 // 与 python/tests/test_offset_illegal_recover.py、rust/src/client/consumer.rs、
 // cpp/tests/test_offset_illegal_recover.cpp 的同名用例逐条对拍。
@@ -116,11 +110,6 @@ public class OffsetIllegalRecoverTests
         Assert.False(h.C.MqMapContainsForTest(h.Key));
     }
 
-    /// <summary>
-    /// Java 的显式 persist：不等周期落盘，纠错当场写回 broker。离线只能断言"交给持久化路径的
-    /// 材料"（记录里的 ConsumeOffset/HadOffset）；真机上 broker 侧位点由非法值回到修正值，
-    /// 见 examples 的 live-offset-illegal。
-    /// </summary>
     [Fact]
     public void Recover_HandsTheCorrectedOffsetToPersist()
     {
@@ -148,7 +137,6 @@ public class OffsetIllegalRecoverTests
         Assert.True(h.C.RebalancePendingForTest());
     }
 
-    /// <summary>代号 +1 是「旧批次作废」的依据（Java setDropped(true)）。</summary>
     [Fact]
     public void Recover_BumpsTheQueueEpoch()
     {
@@ -160,11 +148,6 @@ public class OffsetIllegalRecoverTests
         Assert.Equal(1L, h.C.QueueEpochForTest(h.Key));
     }
 
-    /// <summary>
-    /// 队列已经不在本实例名下（并发撤销后又轮到这条回调）：没有可落盘的位点就**不能**凭空造一条
-    /// ——写一个 0 会把 broker 上别的实例推进的位点抹掉。重建请求照样发（Java 的
-    /// rebalanceImmediately 无条件）。
-    /// </summary>
     [Fact]
     public void Recover_WithoutAConsumedOffset_DoesNotInventOne()
     {
@@ -179,7 +162,6 @@ public class OffsetIllegalRecoverTests
 
     // ------------------------------------------------- 冻结：修正值不被在途 ack 推翻
 
-    /// <summary>旧批次（offset 0..2 已消费）迟到的 ack：把位点推回 3 就是 Java 的弹跳现场。</summary>
     [Fact]
     public void FrozenOffset_IgnoresAck()
     {
@@ -191,7 +173,6 @@ public class OffsetIllegalRecoverTests
         Assert.Equal(0L, h.Offset());
     }
 
-    /// <summary>被冻结的位点同样不许被 correctTagsOffset 抬走（Java allowToUpdate=false）。</summary>
     [Fact]
     public void FrozenOffset_IgnoresCorrectTagsOffset()
     {
@@ -203,10 +184,6 @@ public class OffsetIllegalRecoverTests
         Assert.Equal(0L, h.Offset());
     }
 
-    /// <summary>
-    /// 有意偏差：Java 在 removeOffset 时解冻、靠 ProcessQueue.isDropped() 兜底；本端口没有
-    /// per-batch 的 ProcessQueue 对象，冻结一直留到队列重建（更严）。
-    /// </summary>
     [Fact]
     public void FreezeSurvivesTheDrop_UntilTheQueueIsRebuilt()
     {
@@ -240,7 +217,6 @@ public class OffsetIllegalRecoverTests
         Assert.Equal(2L, h.Offset());
     }
 
-    // ------------------------------------------------- 旧代号的批次整批作废（Java :267/:339）
 
     /// <summary>队列被撤销/重建（代号 0 → 1）后，旧批次迟到的 ack 不能再动位点。</summary>
     [Fact]
@@ -265,8 +241,6 @@ public class OffsetIllegalRecoverTests
         Assert.Equal(3L, h.Offset());
     }
 
-    /// <summary>Java ConsumeMessageConcurrentlyService:339 —— 排队期间被丢弃的批次连 listener
-    /// 都不该进（消息已由新属主/重建后的队列接管）。</summary>
     [Fact]
     public void StaleEpochBatch_IsNotConsumed()
     {

@@ -1,7 +1,3 @@
-// -*- coding: utf-8 -*-
-// Fair semaphore for async-send backpressure (org.apache.rocketmq.client.producer.backpressure).
-// Faithful port of python/client/backpressure.py.
-//
 // A fair semaphore bounds the number of in-flight async sends. When the free permits drop below
 // MIN_ASYNC_SEND_NUM (or the pending byte size below MIN_ASYNC_SEND_SIZE), the client falls back
 // to synchronous sending to avoid unbounded queueing.

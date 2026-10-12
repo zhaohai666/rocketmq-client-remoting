@@ -57,8 +57,6 @@ int8_t base64Value(char c) {
     return -1;
 }
 
-// 解码 base64url；带不带 '=' 填充都吃（见头文件里的差异说明）。
-// 返回 false 表示输入不是合法 base64url（Java 此处抛 DecoderException）。
 bool base64UrlDecode(const std::string& text, std::string& out) {
     std::vector<uint8_t> buf;
     buf.reserve(text.size() / 4 * 3 + 3);
@@ -75,14 +73,11 @@ bool base64UrlDecode(const std::string& text, std::string& out) {
             buf.push_back(static_cast<uint8_t>((acc >> bits) & 0xFF));
         }
     }
-    // 剩下不足一个字节的悬挂位必须是 0，否则是伪造的尾位（Java 解码器同样拒绝）。
     if (bits > 0 && ((acc & ((1U << bits) - 1U)) != 0)) return false;
     out.assign(reinterpret_cast<const char*>(buf.data()), buf.size());
     return true;
 }
 
-// Java 的 new String(bytes, UTF_8) 对非法序列是替换而不是报错，本端口与 Rust 版一致：
-// 非法 utf-8 直接判为「句柄非法」。差别只在畸形句柄上，正常句柄永远是 ASCII。
 bool isUtf8(const std::string& s) {
     size_t i = 0;
     const auto* b = reinterpret_cast<const unsigned char*>(s.data());
@@ -159,7 +154,6 @@ HandleV1 decodeRecallHandle(const std::string& handle) {
     if (!base64UrlDecode(handle, raw) || !isUtf8(raw)) {
         throw MQClientException(kInvalidHandle);
     }
-    // Java: split(" ") 后 items[0] 必须是 v1 且长度 >= 5，取 items[1..4]。
     const std::vector<std::string> items = splitBySpace(raw);
     if (items.size() < 5 || items[0] != kVersion1) {
         throw MQClientException(kInvalidHandle);

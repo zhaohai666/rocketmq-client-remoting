@@ -1,5 +1,3 @@
-// Topic 路由数据（对应 org.apache.rocketmq.remoting.protocol.route.*）。
-//
 // 用途：客户端向 NameServer 发 GET_ROUTEINFO_BY_TOPIC，响应 body 即 TopicRouteData
 // 的 JSON。据此得知集群里 broker 的地址（brokerDatas）与每个 topic 的读写队列数
 // （queueDatas），进而组装出可发送/可拉取的 MessageQueue 列表。

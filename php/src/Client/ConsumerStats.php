@@ -6,24 +6,7 @@ namespace RocketMQ\Client;
 
 use RocketMQ\Remoting\Protocol\ConsumeStatus;
 
-/**
- * 消费侧统计（对应 org.apache.rocketmq.client.stat.ConsumerStatsManager 与
- * org.apache.rocketmq.common.stats.{StatsItem,StatsItemSet,StatsSnapshot}），
- * 移植自 consumer_stats.py。
- *
- * Java 真实模型（5.5.1 源码逐条核对）：
- * * ``StatsItem`` 持有**累计值** value / times（只增不减），以及两个采样快照链：
- *   ``csListMinute``（每 10s 采一个累计点）与 ``csListHour``（每 10 分钟采一个累计点）；
- * * 快照计算 ``computeStatsData``：sum = last.value - first.value（窗口增量），
- *   tps = sum*1000/(last.ts-first.ts)（**每秒**，不是每分钟），
- *   avgpt = sum / (last.times - first.times)。
- *
- * PHP 单线程适配：Python 给每个 StatsItem 排 10s/10min 的调度任务 + 一个统一采样
- * 线程；这里改成由调用方驱动的 ``ConsumerStatsManager::sampleOnce()``（每次 = 一轮
- * 10s 采样，每 60 轮补一次小时级采样）。
- */
 
-/** 对应 Java StatsSnapshot：sum / tps / avgpt / times。 */
 final class StatsSnapshot
 {
     public int $sum = 0;
@@ -55,13 +38,6 @@ final class StatsItem
     ) {
     }
 
-    /**
-     * Java ``StatsItem.computeStatsData`` 逐条照抄（StatsItem.java:53-79）。
-     *
-     * 元素结构 [timestamp_ms, 累计 value, 累计 times]。
-     *
-     * @param list<array{0:int,1:int,2:int}> $csList
-     */
     public static function computeStatsData(array $csList): StatsSnapshot
     {
         $ss = new StatsSnapshot();
@@ -132,20 +108,17 @@ final class StatsItem
         return self::computeStatsData($this->hour);
     }
 
-    /** 分钟级采样链长度（Java ``csListMinute.size()``）。仅供观测/单测。 */
     public function getMinuteSampleCount(): int
     {
         return count($this->minute);
     }
 
-    /** 小时级采样链长度（Java ``csListHour.size()``）。仅供观测/单测。 */
     public function getHourSampleCount(): int
     {
         return count($this->hour);
     }
 }
 
-/** key -> StatsItem（对应 Java StatsItemSet；key = topic@group）。 */
 final class StatsItemSet
 {
     /** @var array<string, StatsItem> */
@@ -196,18 +169,10 @@ final class StatsItemSet
     }
 }
 
-/**
- * 消费统计管理器（Java ConsumerStatsManager）。
- *
- * 五个 StatsItemSet，key 一律是 ``topic@group``：
- * PULL_RT / PULL_TPS / CONSUME_RT / CONSUME_OK_TPS / CONSUME_FAILED_TPS。
- */
 final class ConsumerStatsManager
 {
-    // 采样参数（Java StatsItem.init 的 scheduleAtFixedRate 参数）
     public const SAMPLING_INTERVAL_SECONDS = 10.0;
     public const HOUR_SAMPLING_INTERVAL_SECONDS = 600.0;
-    // 快照链长度（Java csListMinute 最多约 60 个点 ≈ 10 分钟窗口）
     public const MINUTE_LIST_MAX = 60;
     public const HOUR_LIST_MAX = 60;
 
@@ -242,10 +207,6 @@ final class ConsumerStatsManager
 
     // ---------------- 生命周期 ----------------
 
-    /**
-     * 对应 Java ``start()``（Java 侧也是空实现，采样挂在各 StatsItem 的调度器上）。
-     * PHP 单线程不启动后台线程；采样由调用方驱动 ``sampleOnce()``。幂等。
-     */
     public function start(): void
     {
         if ($this->started) {
@@ -278,7 +239,6 @@ final class ConsumerStatsManager
         }
     }
 
-    // ---------------- 记数（Java ConsumerStatsManager 同名方法）----------------
 
     private static function key(string $topic, string $group): string
     {
@@ -312,10 +272,6 @@ final class ConsumerStatsManager
 
     // ---------------- 查询 ----------------
 
-    /**
-     * Java ``ConsumerStatsManager.consumeStatus``：全部取 minute 快照；
-     * consumeFailedMsgs 取 failed 的 **hour** 窗口 sum（Java 特意跨窗口，照抄）。
-     */
     public function consumeStatus(string $group, string $topic): ConsumeStatus
     {
         $cs = new ConsumeStatus();

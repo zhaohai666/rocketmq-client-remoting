@@ -1,16 +1,3 @@
-// 消息轨迹单测（对齐 Java client.trace 包）。
-//
-// 最有价值的是第一组：EXPECTED_* 里的字符串是 **Java 官方实现直接打印出来的**
-// （探针 /tmp/TraceParity.java 跑真实 TraceDataEncoder.encoderFromContextBean 得到，
-// SOH=\x01 / STX=\x02 做了可读化）。只要 C# 的编码器与这些常量逐字节一致，
-// 轨迹就能与 RocketMQ 控制台 / Java 客户端互认。
-//
-// 另外三组是**真机踩出来的回归**，别删：
-//   1. 无 keys 的消息，其 SubBefore 被 Java 的 split 语义（丢弃末尾空串）截成 7 段，
-//      Java 原生此处 line[7] 抛 AIOOBE（上游真实缺陷）；我们按空串兜底。
-//   2. 一条坏记录不能让**整条**轨迹消息解码全废，坏记录只跳过自己。
-//   3. 轨迹里的枚举一律写 Java 枚举名（COMMIT_MESSAGE / SUCCESS），
-//      不是 C# 的帕斯卡成员名（CommitMessage）—— 控制台按 Java 名字识别。
 using System.Collections.Generic;
 using System.Globalization;
 using System.Reflection;
@@ -30,7 +17,6 @@ public class TraceTests
     private const string MsgId2 = "AC1400A1F0A018B4AAC2A1B2C3D4E5F7";
     private const string OffsetMsgId = "AC1400A1000027100000000000000001";
 
-    // ---- Java 官方实现的编码结果（勿手改；改了就与 Java/控制台不兼容）----
     private static readonly string ExpectedPub = string.Join(Soh, new[]
     {
         "Pub", "1700000000000", "DefaultRegion", "GID_test", "TopicTest",
@@ -83,7 +69,6 @@ public class TraceTests
         TransactionState = "COMMIT_MESSAGE",
     };
 
-    // ---------------------------------------------------------------- 编码：与 Java 逐字节一致
 
     [Fact]
     public void EncodePubMatchesLegacyVector()
@@ -149,7 +134,6 @@ public class TraceTests
         Assert.Equal(ExpectedSubAfter, tb.TransData);
     }
 
-    // CLOUD 通道不补 timestamp + groupName 两段（Java TraceDataEncoder:208）
     [Fact]
     public void EncodeSubAfterOnCloudOmitsTimestampAndGroup()
     {
@@ -297,7 +281,6 @@ public class TraceTests
         Assert.Equal("TopicTest", bean.Topic);
     }
 
-    // ---- 回归 1：无 keys 的消息，SubBefore 只有 7 段（Java 原生此处 AIOOBE）----
     [Fact]
     public void DecodeSubBeforeWithoutKeysDoesNotThrow()
     {
@@ -316,7 +299,6 @@ public class TraceTests
         Assert.Equal("7F00000100002A9F0000000000000001", ctx.TraceBeans[0].MsgId);
     }
 
-    // ---- 回归 2：坏记录只跳过自己，其余记录照常解出（Java 会整条丢弃）----
     [Fact]
     public void DecodeOneBadRecordDoesNotDropTheBatch()
     {
@@ -350,8 +332,6 @@ public class TraceTests
     [Fact]
     public void LegacySplitDropsTrailingEmptyFields()
     {
-        // Java 的 split 丢掉末尾空串；C# 的 Split(char) 会保留 —— 这条差异是编码末尾补
-        // FIELD_SPLITOR 的直接后果，写错会让解码整体错位。
         Assert.Equal(new List<string> { "a", "b" }, LegacySplit.Split("a\u0001b\u0001", Soh));
         Assert.Equal(new List<string> { "a", "", "b" }, LegacySplit.Split("a\u0001\u0001b", Soh));
         Assert.Empty(LegacySplit.Split("\u0001\u0001", Soh));
@@ -426,7 +406,6 @@ public class TraceTests
             }
         }
 
-        // 队列容量 2048：满了之后 Append 返回 false（与 Java 一致，不阻塞业务）
         Assert.Equal(2048, accepted);
         Assert.Equal(2048, d.QueueSize);
     }
@@ -592,7 +571,6 @@ public class TraceTests
         Assert.Equal("TagA", bean.Tags);
     }
 
-    // ---- 回归 3：contextCode 用 Java 的 ConsumeReturnType 名字（不是 ConsumeConcurrentlyStatus）----
     [Theory]
     [InlineData("SUCCESS", 0)]
     [InlineData("TIME_OUT", 1)]

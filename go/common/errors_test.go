@@ -37,7 +37,6 @@ func TestRequestTimeoutTextMatchesPython(t *testing.T) {
 	if e.Error() != want {
 		t.Fatalf("got %q", e.Error())
 	}
-	// Java 构造 RequestTimeoutException 时带上 10006，按码分流依赖它
 	if code, ok := e.ResponseCode(); !ok || code != RequestTimeoutException {
 		t.Fatalf("code %d %v", code, ok)
 	}
@@ -65,7 +64,6 @@ func TestResponseCodeOnlyOnBusinessErrors(t *testing.T) {
 }
 
 func TestClientErrorCodeConstantsMatchProtocol(t *testing.T) {
-	// org.apache.rocketmq.client.exception.ClientErrorCode
 	cases := []struct {
 		name string
 		code int32

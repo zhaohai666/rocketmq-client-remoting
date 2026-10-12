@@ -1,5 +1,3 @@
-// Tests for the admin surface aligned with Java's
-// updateNameServerConfig / getNameServerConfig / consumeMessageDirectly.
 package client
 
 import (
@@ -12,9 +10,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// UPDATE_NAMESRV_CONFIG(318): the properties ride in the BODY as
-// java.util.Properties TEXT, and the request reaches EVERY nameserver; the
-// first failing nameserver decides the error (Java's errResponse handling).
 func TestAdminUpdateNameServerConfigSendsPropertiesBodyToEveryNameServer(t *testing.T) {
 	c := newAdminCluster(t)
 	c.nsAnswer[remoting.ReqUpdateNameSrvConfig] = func(*remoting.RemotingCommand) *remoting.RemotingCommand {
@@ -35,7 +30,6 @@ func TestAdminUpdateNameServerConfigSendsPropertiesBodyToEveryNameServer(t *test
 		t.Fatalf("body = %q, want Properties text with listenPort=10915", body)
 	}
 
-	// An empty property set is a silent no-op, exactly as in Java.
 	before := c.nsLog.count(remoting.ReqUpdateNameSrvConfig)
 	requireNoError(t, "empty update", c.admin.UpdateNameServerConfig(map[string]string{}, 0))
 	if after := c.nsLog.count(remoting.ReqUpdateNameSrvConfig); after != before {
@@ -73,10 +67,6 @@ func TestAdminGetNameServerConfigRejectsFailure(t *testing.T) {
 	}
 }
 
-// The admin-initiated CONSUME_MESSAGE_DIRECTLY(309) goes to the broker with
-// consumerGroup/clientId/msgId/topic ext fields and decodes the verdict body.
-// This drives the wire half (Java MQClientAPIImpl#consumeMessageDirectly(addr))
-// directly, Java addr-overload style.
 func TestAdminConsumeMessageDirectlySendsHeaderAndParsesResult(t *testing.T) {
 	c := newAdminCluster(t)
 	c.brokerAnswer[remoting.ReqConsumeMessageDirectly] = func(*remoting.RemotingCommand) *remoting.RemotingCommand {
@@ -120,9 +110,6 @@ func TestAdminConsumeMessageDirectlyRejectsFailure(t *testing.T) {
 	}
 }
 
-// storedOnBroker encodes a broker-stored record whose store host is the mock
-// broker, so the round-tripped msgId (store host + commitLog offset, Java
-// MessageDecoder#decodeMessageId) decodes straight back to it.
 func storedOnBroker(t *testing.T, c *adminCluster) (raw []byte, msgID string) {
 	t.Helper()
 	host, portStr, err := net.SplitHostPort(c.brokerSrv.addr)
@@ -144,9 +131,6 @@ func storedOnBroker(t *testing.T, c *adminCluster) (raw []byte, msgID string) {
 	return raw, decoded[0].MsgID
 }
 
-// The Java-shape entry resolves the caller's msgId first (VIEW_MESSAGE_BY_ID(33)
-// sent to the broker the msgId decodes to) and then sends 309 to the STORE
-// HOST. An offset msgId passes through untouched.
 func TestAdminConsumeMessageDirectlyResolvesMsgIDToStoreHost(t *testing.T) {
 	c := newAdminCluster(t)
 	raw, msgID := storedOnBroker(t, c)
@@ -186,10 +170,6 @@ func TestAdminConsumeMessageDirectlyResolvesMsgIDToStoreHost(t *testing.T) {
 	}
 }
 
-// The uniq-key branch: a resolved message carrying UNIQ_KEY makes the 309
-// travel with the OFFSET msgId (Java MessageClientExt#getOffsetMsgId), never
-// the caller's id — the broker needs the physical commitLog offset to find the
-// message body it forwards to the named client.
 func TestAdminConsumeMessageDirectlySwapsUniqKeyForOffsetMsgID(t *testing.T) {
 	c := newAdminCluster(t)
 	host, portStr, err := net.SplitHostPort(c.brokerSrv.addr)
@@ -242,8 +222,6 @@ func TestAdminConsumeMessageDirectlySwapsUniqKeyForOffsetMsgID(t *testing.T) {
 	}
 }
 
-// Java's viewMessage failure propagates: an id that neither decodes to an
-// offset msgId nor matches the uniq-key index must fail BEFORE any 309 is sent.
 func TestAdminConsumeMessageDirectlyWithoutResolutionSendsNothing(t *testing.T) {
 	c := newAdminCluster(t)
 	// The uniq-key fallback (12) finds nothing for this key.

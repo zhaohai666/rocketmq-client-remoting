@@ -1,8 +1,5 @@
 //! [`DefaultMQPullConsumer`] 对**真实 5.5.1 broker** 的联调验证。
 //!
-//! 场景与 `python/verify_pull_live.py`（S1..S7）对齐，另外补了两条只有真机才暴露的点：
-//! 长轮询真的挂起（P7）、以及**未提交过的消费组读位点得到 `None` 而不是 0**（P5，
-//! 对应 Java `QueryConsumerOffsetRequestHeader` 缺省 `setZeroIfNotFound=true` 被显式关掉）。
 //!
 //! 拉模式的核心是「调用方自己拉、自己管位点」，所以断言都围绕这一点：
 //! - P1 生命周期：未配 name server 时 `start()` 失败；未 start 就拉取报错；
@@ -375,15 +372,6 @@ async fn p2_queues(ck: &mut Checker, fx: &Fixture, topic: &str) -> Vec<MessageQu
         &format!("{ids:?}"),
     );
 
-    // P2b `fetch_message_queues_in_balance`（Java DefaultMQPullConsumerImpl:120-135）。
-    // 此刻本实例**一笔都没拉过**：算不动时的兜底是「保留现有分配」=空集，所以拿到
-    // 非空只可能来自真实路由 + broker 的 GET_CONSUMER_LIST_BY_GROUP(38) —— 也就是
-    // 心跳真的把本组注册进了 broker 的 consumerTable。
-    //
-    // 心跳的订阅集来自 `registerTopic`（Java `DefaultMQPullConsumerImpl.subscriptions()`
-    // :357-385 就是拿 registerTopics 建的），没登记过就没人收心跳、38 空列表是**正确**
-    // 行为（python 的 S8 早先就踩过同一件事）。这里显式登记 + 补发一次心跳，把「本组
-    // 在 broker 可见」这一前置条件准备好，再读视图。
     c.register_topic(topic);
     let hb_ok = c.send_heartbeat_to_all_broker().await;
     ck.check("P2b 登记 topic 后心跳发出去了（38 可见的前提）", hb_ok > 0, &format!("heartbeat_ok={hb_ok}"));

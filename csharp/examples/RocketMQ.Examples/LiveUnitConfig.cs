@@ -25,7 +25,6 @@ namespace RocketMQ.Examples;
 
 public static class LiveUnitConfig
 {
-    // TopicSysFlag 的两个单元位（Java TopicSysFlag：FLAG_UNIT=0x1、FLAG_UNIT_SUB=0x2）
     private const int FlagUnit = 0x1;
     private const int FlagUnitSub = 0x2;
     private const string StreamSuffix = "@STREAM";
@@ -332,8 +331,6 @@ public static class LiveUnitConfig
         string t = Topic("U5");
         string g = Group("u5");
 
-        // 不动 EnableStreamRequestType：Java 在 DefaultLitePullConsumer 的构造函数里置 true，
-        // 这里要验的就是「默认值真的生效」。
         var lite = new DefaultLitePullConsumer(g);
         lite.SetInstanceName("uc-dotnet-u5-" + _stamp);
         lite.SetNamesrvAddr(_namesrv);
@@ -341,7 +338,6 @@ public static class LiveUnitConfig
         lite.SetPollTimeoutMillis(1000);
         lite.Subscribe(t, "*");
         lite.Start();
-        // Java 在 DefaultLitePullConsumer 的每个构造函数里置 true ⇒ 默认就该带 @STREAM
         Check("U5 lite 消费者默认 clientId 带 @STREAM", lite.ClientId.EndsWith(StreamSuffix),
             "actual=" + lite.ClientId);
 

@@ -1,17 +1,3 @@
-// 拉模式消费者的「平衡视图」（Java MQPullConsumer#fetchMessageQueuesInBalance:187）离线单测。
-//
-// 对齐基准（Java 5.5.1，逐行读过）：
-//   * DefaultMQPullConsumer.fetchMessageQueuesInBalance:434-435 先 withNamespace(topic)
-//     再交给 Impl；Impl:120-135 先 isRunning()、topic 为 null 抛 IllegalArgumentException，
-//     然后读 rebalanceImpl.processQueueTable 的键、按 topic 过滤，最后
-//     parseSubscribeMessageQueues 把命名空间剥掉再交给调用方。
-//   * 那张表由 RebalanceImpl.rebalanceByTopic 填：mqAll=订阅信息（读位 + readQueueNums、
-//     不筛 master）、cidAll=GET_CONSUMER_LIST_BY_GROUP(38)、BROADCASTING 不查列表全量分配。
-//     官方 example/simple/PullConsumer.java:62 就是用这个接口决定「我该拉哪些队列」。
-// 本端口拉模式没有后台 rebalance 线程（见 PullConsumer.cs 文件头），所以按同一条公式
-// 当场算；算不动（没路由 / 消费组查不到）时**保留现有分配** = 本实例实际拉过的队列
-// （Java 同名表 pullFromWhichNodeTable 的键集），绝不回退成「独占全部队列」。
-// 与 python/tests/test_pull_consumer.py、php RunClientConsumer 的同名用例对拍。
 using System.Text;
 using RocketMQ.Common;
 using RocketMQ.Remoting;
@@ -71,7 +57,6 @@ public class PullBalanceViewTests
         DefaultMQPullConsumer consumer = Started(cluster, "bal-null");
         try
         {
-            // Java Impl:122-124 抛 IllegalArgumentException("topic is null")。
             Assert.Throws<MQClientException>(() => consumer.FetchMessageQueuesInBalance(null!));
         }
         finally
@@ -120,7 +105,6 @@ public class PullBalanceViewTests
                 _ => CidBody(consumer.ClientId));
             List<MessageQueue> mine = consumer.FetchMessageQueuesInBalance(Topic);
             Assert.Equal(3, mine.Count);
-            // 顺序稳定：topic → brokerName → queueId（Java MessageQueue.compareTo）。
             Assert.Equal("broker-0", mine[0].BrokerName);
             Assert.Equal("broker-2", mine[2].BrokerName);
         }
@@ -141,7 +125,6 @@ public class PullBalanceViewTests
         consumer.Start();
         try
         {
-            // 列表里全是别人：BROADCASTING 也不查列表（Java rebalanceByTopic 的分支）。
             cluster.SetReplyBody(RequestCode.GetConsumerListByGroup,
                 _ => CidBody("peer-1", "peer-2", "peer-3"));
             Assert.Equal(3, consumer.FetchMessageQueuesInBalance(Topic).Count);
@@ -171,7 +154,6 @@ public class PullBalanceViewTests
             List<MessageQueue> view = consumer.FetchMessageQueuesInBalance(Topic);
             Assert.Equal(new[] { mine.BrokerName }, view.Select(m => m.BrokerName));
 
-            // 一个新实例什么都没拉过 → 空集（Java 在 rebalance 之前的空表同语义）。
             DefaultMQPullConsumer fresh = Started(cluster, "bal-fresh");
             try
             {
@@ -188,7 +170,6 @@ public class PullBalanceViewTests
         }
     }
 
-    // ---------------------------------------------------------------- 4. 命名空间按 Java 口径剥掉
 
     [Fact]
     public void NamespacedInstance_ReturnsBareTopics()
@@ -200,8 +181,6 @@ public class PullBalanceViewTests
             cluster.SetReplyBody(RequestCode.GetConsumerListByGroup,
                 _ => CidBody(consumer.ClientId));
             List<MessageQueue> view = consumer.FetchMessageQueuesInBalance(Topic);
-            // Java：门面 withNamespace(topic) → Impl 按带名空间的名字查表 →
-            // parseSubscribeMessageQueues 剥掉前缀再交给用户。
             Assert.NotEmpty(view);
             foreach (MessageQueue mq in view)
             {

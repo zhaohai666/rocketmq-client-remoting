@@ -1,39 +1,6 @@
-//! 发送延迟故障容错（对应 Java `org.apache.rocketmq.client.latency.*`，
-//! 逐条对齐 `python/client/latency.py`）。
-//!
 //! 实现 [`MQFaultStrategy`] + [`LatencyFaultToleranceImpl`]（带 [`FaultItem`]）：
 //! 追踪每个 broker 的发送延迟，延迟过高或发生异常时**隔离**一段时间
 //! （不分配给新消息），默认关闭。
-//!
-//! 与 Java 关键点逐条对齐（对拍向量取自 Python 参考实现，见各单测）：
-//! - `latency_max` / `not_available_duration` 两套阈值表；
-//! - [`MQFaultStrategy::update_fault_item`] 的隔离场景固定按 `10000ms` 查档位，
-//!   但**记进表里的仍是真实延迟**（`isolation` 只影响隔离时长，不影响 `currentLatency`）；
-//! - [`FaultItem::is_available`] = `now >= startTimestamp`（隔离期未过则不可用）；
-//! - [`LatencyFaultToleranceImpl::is_available`] / [`LatencyFaultToleranceImpl::is_reachable`]
-//!   在**没有记录**时返回 true，即「从未出过问题的 broker 默认可用/可达」；
-//! - 隔离期只增不减：更短的 `notAvailableDuration` 不会缩短已有窗口（Java 同）。
-//!
-//! 默认 `send_latency_fault_enable = false`，与 Java / Python 一致；开启后才会记录与生效。
-//!
-//! 与 Python 的**有意差异**（均不改变判定结果）：
-//! 1. 时间单位用 `i64` 毫秒（Java 就是 `long`），Python 的 `time.time() * 1000.0` 是 float，
-//!    阈值表与窗口都是整毫秒，落到 `i64` 后判定完全一致（无 `round`/`int` 差异）；
-//! 2. `FaultItem` 的方法显式收 `now_millis` 参数，`LatencyFaultToleranceImpl` 持有
-//!    可注入时钟 [`NowFn`]（Python 直接调 `time.time()`）——单测要靠它 pin 隔离窗口，
-//!    否则会随真实时钟漂移；
-//! 3. [`LatencyFaultToleranceImpl::get_fault_item`] 返回**快照副本**：Python 返回表里的活对象
-//!    （改它就改表），Rust 里表由锁持有所有权，改动只能走 `update_fault_item`；
-//! 4. Java 的后台可达性探测（`startDetector` / `detectByOneRound`）**本端口已补齐**：
-//!    [`LatencyFaultToleranceImpl::detect_by_one_round`] 逐条对拍 Java
-//!    `LatencyFaultToleranceImpl#detectByOneRound`（`check_stamp` 去重 → `Resolver` 解析
-//!    地址 → `ServiceDetector` 探活 → 恢复可达即放回）。注意 Java 语义里探测**只负责把
-//!    broker 探回来**：探活失败不写表，可达性只由发送链路 `updateFaultItem` 的
-//!    `reachable` 实参写坏。调度循环在 `client::producer` 的 tokio 任务里（Java 是
-//!    `scheduleAtFixedRate(3, 3, SECONDS)` 的调度线程）；`pickOneAtLeast` /
-//!    `FaultItem#compareTo` 仍省略（Python 也没有）；
-//!    Java `updateFaultItem` / `updateNotAvailableDuration` 里的两条 `log.info` 也未移植
-//!    （Python 没有）。
 
 use std::collections::HashMap;
 use std::fmt;
@@ -49,20 +16,10 @@ use crate::error::{Error, Result};
 /// 可注入时钟（见模块头差异 2）。签名固定为无参函数指针，便于 `Default` 与 `Clone`。
 pub type NowFn = fn() -> i64;
 
-/// 队列过滤器（对应 Java `TopicPublishInfo.QueueFilter#filter`、
-/// Python 里传给 `select_one_message_queue(*filters)` 的可调用对象）。
 pub type QueueFilter<'a> = dyn Fn(&MessageQueue) -> bool + 'a;
 
 /// 发布信息的选队列接口面（对应 Python `TopicPublishInfo` 的
 /// `reset_index` / `select_one_message_queue(*filters)` 两个方法）。
-///
-/// 队列列表与轮询游标的所有权在**生产者层**（`client::producer`，对应
-/// `mq_client.TopicPublishInfo`），本模块只声明策略需要的这点接口，
-/// 避免 latency 反向依赖 producer 造成循环。语义必须与 Python 一致：
-/// - `filters` 为空 ⇒ 无条件轮询，**永不返回 `Ok(None)`**；
-/// - `filters` 非空 ⇒ 从当前游标起最多试 `n` 个队列，全被过滤掉才 `Ok(None)`；
-///   每次试探都会推进游标（所以失败一轮会让下次起点前移，这是 Java 的行为）；
-/// - 队列列表为空 ⇒ `Err`（Python `MQClientException("no message queue for publish info")`）。
 pub trait PublishInfo: Send + Sync {
     /// Python `TopicPublishInfo.reset_index`：把游标清零。
     fn reset_index(&self);
@@ -73,7 +30,6 @@ pub trait PublishInfo: Send + Sync {
 
 // ---------------------------------------------------------------- FaultItem
 
-/// 单个 broker 的故障项（对应 Java `LatencyFaultToleranceImpl.FaultItem`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultItem {
     /// broker 名字。
@@ -82,19 +38,12 @@ pub struct FaultItem {
     pub current_latency: i64,
     /// 隔离结束时间点（毫秒）；`now >= start_timestamp` 才算可用。
     pub start_timestamp: i64,
-    /// Java 探测线程的去重时间戳（`detectByOneRound` 里写：本轮开工时
-    /// `check_stamp = now + detect_interval`，`detect_interval` 内不重复探测）。
-    /// Python 只留字段、不写它（见模块头差异 4）。
     pub check_stamp: i64,
-    /// 可达性标志（Java `reachableFlag`）。
     pub reachable_flag: bool,
 }
 
 impl FaultItem {
     /// 对应 Python `FaultItem(name)`：延迟 0、隔离窗口 0、**可达 = true**。
-    ///
-    /// ⚠ Java 的 `reachableFlag` 是 `boolean` 字段，默认 `false`；Python 显式选了 `True`，
-    /// 且两个实现都会在构造后立刻被 `update_fault_item` 覆写，所以这里跟随 Python。
     pub fn new(name: &str) -> FaultItem {
         FaultItem {
             name: name.to_string(),
@@ -105,35 +54,28 @@ impl FaultItem {
         }
     }
 
-    /// Java `updateNotAvailableDuration`：**仅当** `duration > 0` 且
-    /// `now + duration > startTimestamp` 时才前移窗口（保持最长隔离期）。
     pub fn update_not_available_duration(&mut self, not_available_duration: i64, now_millis: i64) {
         if not_available_duration > 0 && now_millis + not_available_duration > self.start_timestamp {
             self.start_timestamp = now_millis + not_available_duration;
         }
     }
 
-    /// Java `isAvailable`：隔离期已过（含边界相等）即可用。
     pub fn is_available(&self, now_millis: i64) -> bool {
         now_millis >= self.start_timestamp
     }
 
-    /// Java `isReachable`。
     pub fn is_reachable(&self) -> bool {
         self.reachable_flag
     }
 
-    /// Java `getName`。
     pub fn get_name(&self) -> &str {
         &self.name
     }
 
-    /// Java `getCurrentLatency`。
     pub fn get_current_latency(&self) -> i64 {
         self.current_latency
     }
 
-    /// Java `getStartTimestamp`。
     pub fn get_start_timestamp(&self) -> i64 {
         self.start_timestamp
     }
@@ -142,9 +84,6 @@ impl FaultItem {
 impl fmt::Display for FaultItem {
     /// 对齐 Python `FaultItem.__repr__`
     /// （`FaultItem{name=broker-a, latency=123, startTs=1700000000123, reachable=true}`）。
-    ///
-    /// Python 用 `%.0f` 打印浮点、`%s` 打印 bool（于是输出 `True`）；这里数值是 `i64`、
-    /// 布尔按 Java/Rust 口径输出 `true`/`false`（Java 的 `FaultItem` 根本没有 `toString`）。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -156,21 +95,10 @@ impl fmt::Display for FaultItem {
 
 // ------------------------------------------------------------ 可达性探测
 
-/// Java `client.latency.Resolver`：把 broker 名解析成可发送地址
-/// （生产侧用 `findBrokerAddressInPublish`，只认 master；解析不到 = 路由里
-/// 已经没有这个 broker，故障项要一并清掉）。
 pub trait Resolver: Send + Sync {
     fn resolve(&self, broker_name: &str) -> Option<String>;
 }
 
-/// Java `client.latency.ServiceDetector`：探测 endpoint 上的服务是否恢复正常
-/// （返回 `true` = back to normal）。Java 默认实现是 `GET_MAX_OFFSET` RPC。
-///
-/// 与 Java 的差异：Java 的 `detect(endpoint, timeoutMillis)` 只收地址；这里多传
-/// `broker_name`（探测轮里现成有的），实现方可以用它挑一个路由到该 broker 的
-/// topic 塞进探测请求 —— Java 的 `pickTopic()` 从生产者的 topicPublishInfoTable
-/// 里随便挑一个，topic 与被探 broker 之间本来就没有耦合。
-/// 返回值用 `Pin<Box<dyn Future>>` 是为了保持对象安全（`async_trait` 会引入新依赖）。
 pub trait ServiceDetector: Send + Sync {
     fn detect(
         &self,
@@ -182,10 +110,6 @@ pub trait ServiceDetector: Send + Sync {
 
 // -------------------------------------------------- LatencyFaultToleranceImpl
 
-/// 对应 Java `client.latency.LatencyFaultToleranceImpl`（Python 简化为纯内存版；
-/// Java 5.x 的后台探测循环见 [`LatencyFaultToleranceImpl::detect_by_one_round`]，
-/// 调度在 `client::producer` 的 tokio 任务里），线程安全：内部 `RwLock<HashMap<..>>`
-/// 承担 Python 的 `RLock`。
 #[derive(Debug)]
 pub struct LatencyFaultToleranceImpl {
     /// Python `_fault_item_table`。
@@ -218,8 +142,6 @@ impl LatencyFaultToleranceImpl {
         (self.now_millis)()
     }
 
-    /// Java `updateFaultItem(name, currentLatency, notAvailableDuration, reachable)`。
-    ///
     /// 建新项与更新旧项的三步赋值顺序一致（Python 写了两份分支只是为了插入），
     /// 所以这里用 entry -or-insert 后统一改字段。
     pub fn update_fault_item(
@@ -239,7 +161,6 @@ impl LatencyFaultToleranceImpl {
         item.reachable_flag = reachable;
     }
 
-    /// Java `isAvailable`：没有记录 ⇒ `true`（从未出过问题的 broker 默认可用）。
     pub fn is_available(&self, name: &str) -> bool {
         let now = self.now_millis();
         read_guard(&self.fault_item_table)
@@ -248,7 +169,6 @@ impl LatencyFaultToleranceImpl {
             .unwrap_or(true)
     }
 
-    /// Java `isReachable`：没有记录 ⇒ `true`。
     pub fn is_reachable(&self, name: &str) -> bool {
         read_guard(&self.fault_item_table)
             .get(name)
@@ -256,7 +176,6 @@ impl LatencyFaultToleranceImpl {
             .unwrap_or(true)
     }
 
-    /// Java `remove`：路由里没有这个 broker 时由上层清理。
     pub fn remove(&self, name: &str) {
         write_guard(&self.fault_item_table).remove(name);
     }
@@ -276,21 +195,6 @@ impl LatencyFaultToleranceImpl {
         names
     }
 
-    /// Java 5.x `LatencyFaultToleranceImpl#detectByOneRound`：对表里每个
-    /// `now >= check_stamp` 的故障项做一轮主动探活。由 `client::producer`
-    /// 的后台 tokio 任务周期调用（Java 是 3s 固定周期的调度线程；
-    /// `startDetectorEnable` 的开关判断由调用方负责，对应 Java 调度体里的
-    /// `if (startDetectorEnable)`）。
-    ///
-    /// 逐条对拍 Java：
-    /// 1. `check_stamp` 去重 —— 开工先把 `check_stamp = now + detect_interval`，
-    ///    同一 broker 在 `detect_interval` 内不会被重复探测；
-    /// 2. `Resolver::resolve` 返回空（路由里已经没有这个 broker）⇒ 故障项一并移除，
-    ///    且不再探测（Java `faultItemTable.remove(key); continue;`）；
-    /// 3. 探测成功且 `reachable_flag == false` ⇒ 置回可达（恢复放行）；
-    /// 4. 探测**失败什么都不写** —— 可达性只由发送链路 `updateFaultItem` 的
-    ///    `reachable` 实参写坏，探测只负责把 broker 探回来。
-    ///
     /// 锁纪律：`RwLock` 的守卫绝不跨 `.await` 持有（写表的三段各自成对）。
     pub async fn detect_by_one_round(
         &self,
@@ -309,7 +213,6 @@ impl LatencyFaultToleranceImpl {
                 .collect()
         };
         for name in due {
-            // 先落 check_stamp 再探测（Java 同序）：探测再慢也不会把下一轮提前。
             {
                 let mut table = write_guard(&self.fault_item_table);
                 match table.get_mut(&name) {
@@ -338,23 +241,14 @@ impl LatencyFaultToleranceImpl {
 
 // ------------------------------------------------------------ MQFaultStrategy
 
-/// Java `MQFaultStrategy.latencyMax` 默认表。
 pub const LATENCY_MAX: [i64; 7] = [50, 100, 550, 1800, 3000, 5000, 15000];
-/// Java `MQFaultStrategy.notAvailableDuration` 默认表（与 `LATENCY_MAX` 一一对应）。
 pub const NOT_AVAILABLE_DURATION: [i64; 7] = [0, 0, 2000, 5000, 6000, 10000, 30000];
-/// Java `updateFaultItem` 里隔离场景查档位用的固定延迟。
 pub const ISOLATION_LATENCY: i64 = 10000;
 
-/// 对应 Java `client.latency.MQFaultStrategy`。
-///
 /// 仅当 `send_latency_fault_enable` 为 true 时，发送选队列阶段才会：
 /// 1. 先选 available（隔离期已过）的 broker；
 /// 2. 否则选 reachable 的 broker；
 /// 3. 否则退化为普通轮询。
-///
-/// 发送结果/异常会回调 [`MQFaultStrategy::update_fault_item`] 写延迟与隔离信息。
-/// 开关用 `AtomicBool`（Java 是 `volatile boolean`），这样 `&self` 也能 set，
-/// 上层可以安全地把策略放进 `Arc`。
 #[derive(Debug)]
 pub struct MQFaultStrategy {
     send_latency_fault_enable: AtomicBool,
@@ -390,34 +284,26 @@ impl MQFaultStrategy {
         }
     }
 
-    /// Java `isSendLatencyFaultEnable`。
     pub fn is_send_latency_fault_enable(&self) -> bool {
         self.send_latency_fault_enable.load(Ordering::Relaxed)
     }
 
-    /// Java `setSendLatencyFaultEnable`（`DefaultMQProducer.set_send_latency_fault_enable` 会同时调它）。
     pub fn set_send_latency_fault_enable(&self, enable: bool) {
         self.send_latency_fault_enable.store(enable, Ordering::Relaxed);
     }
 
-    /// 故障表（对应 Java `getLatencyFaultTolerance` / Python 的 `latency_fault_tolerance` 属性）。
     pub fn latency_fault_tolerance(&self) -> &LatencyFaultToleranceImpl {
         &self.latency_fault_tolerance
     }
 
-    /// Python `_available_filter` / Java `availableFilter`：按 broker 名查隔离窗口。
     pub fn available_filter(&self, mq: &MessageQueue) -> bool {
         self.latency_fault_tolerance.is_available(mq.get_broker_name())
     }
 
-    /// Python `_reachable_filter` / Java `reachableFilter`。
     pub fn reachable_filter(&self, mq: &MessageQueue) -> bool {
         self.latency_fault_tolerance.is_reachable(mq.get_broker_name())
     }
 
-    /// 对应 Python `MQFaultStrategy.select_one_message_queue(tp_info, last_broker_name, reset_index=False)`
-    /// / Java `MQFaultStrategy.selectOneMessageQueue(tpInfo, lastBrokerName, resetIndex)`。
-    ///
     /// `broker_filter` 的语义：`last_broker_name` 为 `None` 时**全部通过**，
     /// 否则排除上一轮用过的那个 broker。退化路径（最后一档无过滤器）永不返回 `None`，
     /// 所以只有「路由里一个队列都没有」才会 `Err`。
@@ -439,8 +325,6 @@ impl MQFaultStrategy {
             if reset_index {
                 tp_info.reset_index();
             }
-            // 注意档次的先后：available 档**不看** reachable，所以「可用但不可达」的 broker
-            // 会被选中（Python/Java 皆如此，见单测 available_filter_beats_reachable_filter）。
             if let Some(mq) = tp_info.select_one_message_queue(&[available, broker])? {
                 return Ok(mq);
             }
@@ -456,13 +340,6 @@ impl MQFaultStrategy {
         select_unfiltered(tp_info)
     }
 
-    /// 对应 Python `update_fault_item(broker_name, current_latency, isolation, reachable)`
-    /// / Java `updateFaultItem`。
-    ///
-    /// 开关关着时**什么都不记**（Python 直接 `return`）。`isolation = true`
-    /// （发送抛异常）时固定按 10000ms 的延迟查档位 —— 即隔离 10s，
-    /// 但表里写的 `current_latency` 仍是真实延迟（Java 的 `isolation ? 10000 : currentLatency`
-    /// 只出现在档位实参里）。
     pub fn update_fault_item(
         &self,
         broker_name: &str,
@@ -479,9 +356,6 @@ impl MQFaultStrategy {
             .update_fault_item(broker_name, current_latency, duration, reachable);
     }
 
-    /// 对应 Python `_compute_not_available_duration` / Java `computeNotAvailableDuration`：
-    /// 从高档往低档找**第一个 `latency >= latency_max[i]`**，命中即返回对应窗口。
-    ///
     /// Python 直接 `not_available_duration[i]` 索引，两表长度不一致时会 `IndexError`；
     /// 这里按「越界的档位等于 0」处理，以免配置写歪时把发送线程搞崩（唯一的行为差别）。
     fn compute_not_available_duration(&self, current_latency: i64) -> i64 {
@@ -622,7 +496,6 @@ mod tests {
         let mut item = FaultItem::new("x");
         item.update_not_available_duration(30_000, NOW);
         assert_eq!(item.start_timestamp, NOW + 30_000);
-        // 更短的窗口不缩短（Python/Java：only when now + dur > startTimestamp）
         item.update_not_available_duration(2_000, NOW);
         assert_eq!(item.start_timestamp, NOW + 30_000);
         // 0 与负数一律忽略
@@ -814,8 +687,6 @@ mod tests {
 
     #[test]
     fn available_filter_beats_reachable_filter() {
-        // 奇点：available 档不看可达性 ⇒ 「可用但不可达」的 broker-a 会被选中，
-        // 「可达但隔离」的 broker-b 反而落选。Python/Java 皆如此。
         let strategy = MQFaultStrategy::with_clock(true, fixed_now);
         strategy.update_fault_item("broker-a", 1, false, false);
         strategy.update_fault_item("broker-b", 20_000, false, true);

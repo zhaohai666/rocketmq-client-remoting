@@ -196,9 +196,6 @@ final class AllocationHelper
     }
 }
 
-/**
- * 消息选择器（对应 Java MessageSelector）。
- */
 final class MessageSelector
 {
     public function __construct(
@@ -218,27 +215,12 @@ final class MessageSelector
     }
 }
 
-/**
- * 队列变更监听器（对应 Java MessageQueueListener）。
- *
- * Python 是 raise NotImplementedError 的契约类；PHP 用 interface 表达
- * （Python MessageQueueListener.message_queue_changed ↔ 本方法）。
- *
- * @phpstan-require-implements MessageQueueListener
- */
 interface MessageQueueListener
 {
     /** @param list<MessageQueue> $mqAll @param list<MessageQueue> $mqDivided */
     public function messageQueueChanged(string $topic, array $mqAll, array $mqDivided): void;
 }
 
-/**
- * 队列分配策略接口（对应 Java AllocateMessageQueueStrategy）。
- *
- * 与 Java 的有意差异：Java 的 ``AbstractAllocateMessageQueueStrategy#check`` 在非法入参时抛
- * ``IllegalArgumentException``，这里一律返回空列表——rebalance 是后台周期任务，
- * 一条脏入参不该把消费者打挂。
- */
 interface AllocateMessageQueueStrategy
 {
     /**
@@ -248,23 +230,13 @@ interface AllocateMessageQueueStrategy
      */
     public function allocate(string $consumerGroup, string $currentCID, array $mqAll, array $cidAll): array;
 
-    /**
-     * 对应 Java ``AllocateMessageQueueStrategy#getName``：算法名（AVG 等）。
-     */
     public function getName(): string;
 }
 
-/**
- * 平均分配（对应 Java AllocateMessageQueueAveragely）。
- */
 final class AllocateMessageQueueAveragely implements AllocateMessageQueueStrategy
 {
     public function allocate(string $consumerGroup, string $currentCID, array $mqAll, array $cidAll): array
     {
-        // 守卫顺序与 Java AbstractAllocateMessageQueueStrategy#check 一致：currentCID →
-        // mqAll → cidAll。唯一偏差：Java 这三种情况都抛 IllegalArgumentException，
-        // 这里只返回空列表（rebalance 是后台周期任务，脏入参不该把消费者打挂）；
-        // currentCID 不在 cidAll 时保留 Java 那条 [BUG] info 日志。
         if ($currentCID === '' || $mqAll === [] || $cidAll === []) {
             return [];
         }
@@ -300,14 +272,10 @@ final class AllocateMessageQueueAveragely implements AllocateMessageQueueStrateg
     }
 }
 
-/**
- * 环形平均分配（对应 Java AllocateMessageQueueAveragelyByCircle）。
- */
 final class AllocateMessageQueueAveragelyByCircle implements AllocateMessageQueueStrategy
 {
     public function allocate(string $consumerGroup, string $currentCID, array $mqAll, array $cidAll): array
     {
-        // 守卫与 Averagely 同款（Java AbstractAllocateMessageQueueStrategy#check），同样只返回空列表。
         if ($currentCID === '' || $mqAll === [] || $cidAll === []) {
             return [];
         }
@@ -335,13 +303,6 @@ final class AllocateMessageQueueAveragelyByCircle implements AllocateMessageQueu
     }
 }
 
-/**
- * 按显式配置分配（对应 Java AllocateMessageQueueByConfig）。
- *
- * 与 Java 的有意差异：Java 直接 ``return this.messageQueueList``，未配置时是 ``null``；
- * 这里构造器规整成空列表、allocate 返回列表副本。两边的 ``allocate`` 都**不**做
- * check，所以空 group / 空 cid_all 也照样返回配置值。
- */
 final class AllocateMessageQueueByConfig implements AllocateMessageQueueStrategy
 {
     /** @var list<MessageQueue> */
@@ -364,26 +325,12 @@ final class AllocateMessageQueueByConfig implements AllocateMessageQueueStrategy
     }
 }
 
-// ------------------------------------------------------ 一致性哈希环（Java common 包）
-//
-// 对应 org.apache.rocketmq.common.consistenthash.{HashFunction, Node, VirtualNode,
-// ConsistentHashRouter}。只有 AllocateMessageQueueConsistentHash 用它，但整套照搬而不做
-// "等价改写"：环上的落点由 MD5 取字节的方式、虚拟节点命名、tailMap 含端点这三处细节
-// 共同决定，任何一处不同都会让全体队列换主，与 Java 客户端混跑时表现为重复/漏消费。
 
-/**
- * 对应 Java `HashFunction#hash(String)`。自定义哈希用它注入策略。
- */
 interface HashFunction
 {
     public function hash(string $key): int;
 }
 
-/**
- * 对应 Java `ConsistentHashRouter.MD5Hash`：MD5 摘要的**前 4 字节**按大端拼成整数。
- *
- * ⚠ 只取前 4 字节（不是完整 128 bit），换成其它取法就与 Java 不是同一个环。
- */
 final class MD5Hash implements HashFunction
 {
     public function hash(string $key): int
@@ -397,17 +344,11 @@ final class MD5Hash implements HashFunction
     }
 }
 
-/**
- * 对应 Java `Node#getKey`：环上可寻址的东西，物理或虚拟都行。
- */
 interface Node
 {
     public function getKey(): string;
 }
 
-/**
- * 对应 Java `AllocateMessageQueueConsistentHash.ClientNode`：key 就是 clientId。
- */
 final class ClientNode implements Node
 {
     public function __construct(public readonly string $clientId)
@@ -420,9 +361,6 @@ final class ClientNode implements Node
     }
 }
 
-/**
- * 对应 Java `VirtualNode`：key = 物理节点 key + "-" + 副本序号。
- */
 final class VirtualNode implements Node
 {
     public function __construct(
@@ -447,18 +385,10 @@ final class VirtualNode implements Node
     }
 }
 
-/**
- * 对应 Java `ConsistentHashRouter`：把节点哈希成环，路由到顺时针最近的物理节点。
- *
- * Java 用 `TreeMap<Long, VirtualNode>`；这里用「升序 key 列表 + hash 表」等价替代。
- * `routeNode` 要的是 `tailMap(hashVal).firstKey()`，而 TreeMap 的 tailMap **含端点**，
- * 所以等价的查找是 bisect_left（相等的 hash 归自己），环空或越过末尾时回绕到首节点。
- */
 final class ConsistentHashRouter
 {
     private HashFunction $hashFunction;
 
-    /** @var array<int, VirtualNode> hash → 虚拟节点（同 hash 后者覆盖，同 Java TreeMap.put） */
     private array $ring = [];
 
     /** @var list<int> 升序 hash key 列表（对应 TreeMap 的 keySet） */
@@ -477,8 +407,6 @@ final class ConsistentHashRouter
 
     public function addNode(Node $pNode, int $vNodeCount): void
     {
-        // 对应 Java `#addNode`：已有副本要接着编号，否则同一个物理节点的 v 个虚拟节点
-        // 会全落在同一个 hash 上（Java 分两次 addNode 时靠 i + existingReplicas 区分）。
         if ($vNodeCount < 0) {
             throw new \ValueError(sprintf('illegal virtual node counts :%d', $vNodeCount));
         }
@@ -489,7 +417,6 @@ final class ConsistentHashRouter
             if (!isset($this->ring[$key])) {
                 $this->insertKeySorted($key);
             }
-            // Java 是 TreeMap.put：同 hash 时后来者覆盖，位置不变
             $this->ring[$key] = $vNode;
         }
     }
@@ -514,7 +441,7 @@ final class ConsistentHashRouter
         }
         $index = $this->bisectLeft($this->keys, $this->hashFunction->hash($objectKey));
         if ($index === count($this->keys)) {
-            $index = 0; // 越过环的末尾 → 回绕到第一个（Java 的 ring.firstKey()）
+            $index = 0;
         }
         return $this->ring[$this->keys[$index]]->getPhysicalNode();
     }
@@ -558,23 +485,8 @@ final class ConsistentHashRouter
     }
 }
 
-/**
- * 一致性哈希分配（对应 Java `AllocateMessageQueueConsistentHash`，`getName()` 为
- * `CONSISTENT_HASH`）。
- *
- * 与 AVG / AVG_BY_CIRCLE 的差别不是"分得均不均"，而是**稳定性**：队列数或消费者数变化时，
- * 只有落在新增/移除节点之间弧段上的队列会换主（Java 单测
- * `AllocateMessageQueueConsitentHashTest` 正是断言这一点），AVG 则会把所有人的分界整体挪掉。
- *
- * 守卫口径同其它策略：Java 的 `check` 抛 IllegalArgumentException，这里返回空列表。
- * 唯一保留抛的是构造函数里的 `virtualNodeCnt < 0`（Java 也在构造时抛，且不属于 rebalance
- * 后台路径）。
- */
 final class AllocateMessageQueueConsistentHash implements AllocateMessageQueueStrategy
 {
-    /**
-     * 对应 Java 三个构造函数的链：默认 10 个虚拟节点、默认 MD5Hash。
-     */
     public function __construct(
         private readonly int $virtualNodeCnt = 10,
         private readonly ?HashFunction $customHashFunction = null,
@@ -623,20 +535,6 @@ final class AllocateMessageQueueConsistentHash implements AllocateMessageQueueSt
     }
 }
 
-/**
- * 按机房分配（对应 Java `AllocateMessageQueueByMachineRoom`，`getName()` 为
- * `MACHINE_ROOM`，注释里的场景是"支付宝逻辑机房"）。
- *
- * 约定 broker 名写成 `<机房>@<brokerName>`，只有前缀落在 `consumeridcs` 里的队列参与
- * 分配，然后在这些队列内部再做一次"平均分配"（分片算法与 AVG 逐行相同，但 rem 的归属
- * 判据是 `rem > currentIndex`，即余数队列发给前 rem 个消费者）。
- *
- * ⚠ broker 名的切分走 AllocationHelper::wireSplit()，不是 PHP 原生 explode：Java 会丢掉
- * 末尾空段，`"room1@"` 在 Java 是 1 段（不参与分配）、`"room1@b@"` 是 2 段（参与）。
- *
- * ⚠ Java 的 `consumeridcs` 字段没有默认值，没 set 就 `contains` → NPE；这里默认空集合，
- * 表现为"一条都不分"，与本端口一贯的"守卫返回空结果"口径一致。
- */
 final class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueStrategy
 {
     /** set 语义（对应 Python set）：key = 机房名，value 同名占位。 @var array<string, string> */
@@ -675,7 +573,7 @@ final class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueStr
                 $premqAll[] = $mq;
             }
         }
-        $mod = intdiv(count($premqAll), count($cidAll)); // Java 是 int 除法
+        $mod = intdiv(count($premqAll), count($cidAll));
         $rem = count($premqAll) % count($cidAll);
         $startIndex = $mod * $currentIndex;
         $result = array_slice($premqAll, $startIndex, $mod);
@@ -706,12 +604,6 @@ final class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueStr
     }
 }
 
-/**
- * 对应 Java `AllocateMachineRoomNearby.MachineRoomResolver`：告诉策略"谁在哪个机房"。
- *
- * Java 注释明确写了两个方法**都不能返回 null**（否则该机房视为空，队列会被撤走）；
- * Python 侧以返回空串表示 null，这里同样以空串触发异常。
- */
 interface MachineRoomResolver
 {
     public function brokerDeployIn(MessageQueue $messageQueue): string;
@@ -719,22 +611,6 @@ interface MachineRoomResolver
     public function consumerDeployIn(string $clientId): string;
 }
 
-/**
- * 机房就近分配（对应 Java `AllocateMachineRoomNearby`）。
- *
- * 代理模式：先按机房把队列和消费者各自分组，
- * 1. 本消费者所在机房的队列只分给**同机房**的消费者（用内层策略）；
- * 2. 那些**机房里没有任何活消费者**的队列，交给所有消费者按内层策略瓜分——
- *    否则它们就没人消费了。
- *
- * `getName()` 是 `"MACHINE_ROOM_NEARBY" + "-" + 内层策略名`（Java 同），因为日志里
- * 必须能看出实际用的是哪个分配算法。
- *
- * 两个构造参数缺失时 Java 抛 NullPointerException；PHP 由非空类型标注在传入 null 时抛
- * TypeError 达成同样效果（调用期即失败，不属于 rebalance 后台静默路径）。
- * resolver 给出空机房时 Python 抛 ValueError —— 这里**照抛**：静默返回空列表等于把整个
- * topic 的队列撤走，而 rebalance 抓住异常时反而会保住现有分配，与 Java 行为一致。
- */
 final class AllocateMachineRoomNearby implements AllocateMessageQueueStrategy
 {
     public function __construct(
@@ -758,8 +634,6 @@ final class AllocateMachineRoomNearby implements AllocateMessageQueueStrategy
             return [];
         }
 
-        // 按机房分组。Java 用 TreeMap ⇒ 机房名**字典序**遍历，这里同样排序，
-        // 否则同名机房的处理顺序会随插入顺序变（结果集是并集，顺序也会进日志/断言）。
         /** @var array<string, list<MessageQueue>> $mr2Mq */
         $mr2Mq = [];
         foreach ($mqAll as $mq) {

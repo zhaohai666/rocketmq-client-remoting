@@ -1,18 +1,4 @@
 # -*- coding: utf-8 -*-
-"""CheckForbiddenHook / FilterMessageHook 与订阅语义（tagsSet/codeSet）的单测。
-
-对齐基准是 Java 5.5.1 官方实现：
-  * `FilterAPI.buildSubscriptionData` 的对拍向量由探针
-    （`/tmp/subprobe/SubProbe.java`，`java -cp <rmq classpath> SubProbe.java`）打印：
-      "*" / null / ""   → subString="*"，tagsSet=[]，codeSet=[]
-      "TagA"            → tagsSet=[TagA]，codeSet=[2598919]
-      "TagA||TagB"      → tagsSet=[TagA,TagB]，codeSet=[2598919,2598920]
-      " TagA || TagB "  → **subString 原样保留空格**，标签各自 trim
-  * CheckForbiddenHook 的调用点在 `DefaultMQProducerImpl.sendKernelImpl:956-965`，
-    异常沿 `sendDefaultImpl` 的 `catch (MQClientException e) { ... continue; }` 重试；
-  * FilterMessageHook 在两个位置：`PullAPIWrapper.processPullResult:124-128`（拉取）
-    与 `DefaultMQPushConsumerImpl.processPopResult:637-661`（POP，摘掉的要 ackAsync）。
-"""
 from __future__ import annotations
 
 import pytest
@@ -34,7 +20,6 @@ MQ = MessageQueue("TopicTest", "broker-a", 0)
 
 # ---------------------------------------------------------------- 订阅语义对拍
 def test_sub_all_leaves_tags_and_codes_empty():
-    # Java：StringUtils.isEmpty(subString) || subString.equals("*") → setSubString("*") 后直接 return
     for raw in ("*", None, ""):
         sub = FilterAPI.build_subscription_data("T", raw)
         assert sub.sub_string == "*", raw
@@ -43,9 +28,6 @@ def test_sub_all_leaves_tags_and_codes_empty():
 
 
 def test_blank_substring_is_not_isempty():
-    # 纯空白 ≠ 空串：Java StringUtils.isEmpty 只认 null/""，
-    # 所以 "   " 会走 split 分支 —— 标签被 trim 成空 ⇒ 集合仍空，但 subString **原样保留**。
-    # 探针实测：subString=[   ] -> sub=[   ] tags=[] codes=[]
     sub = FilterAPI.build_subscription_data("T", "   ")
     assert sub.sub_string == "   "
     assert sub.tags_set == set()
@@ -53,16 +35,12 @@ def test_blank_substring_is_not_isempty():
 
 
 def test_all_separator_substring_throws():
-    # Java String.split("\\|\\|") 丢弃末尾空串 → "||" 切完是空数组 → tags.length == 0
-    # → 抛 new Exception("subString split error")
     for raw in ("||", "||||"):
         with pytest.raises(ValueError):
             FilterAPI.build_subscription_data("T", raw)
 
 
 def test_single_pipe_is_a_literal_tag():
-    # 确认我们实现的是 Java-split 而不是"丢所有空段"：
-    # "|||".split("\\|\\|") == ["", "|"] → 丢末尾空串后非空 → 标签是字面量 "|"（hash 124）
     sub = FilterAPI.build_subscription_data("T", "|||")
     assert sub.tags_set == {"|"}
     assert sub.code_set == {124}
@@ -79,7 +57,6 @@ def test_multi_tag_split_trim_and_codes():
     sub = FilterAPI.build_subscription_data("T", "TagA||TagB")
     assert sub.tags_set == {"TagA", "TagB"}
     assert sub.code_set == {2598919, 2598920}
-    # Java 不重写 subString：两侧空格原样保留
     spaced = FilterAPI.build_subscription_data("T", " TagA || TagB ")
     assert spaced.sub_string == " TagA || TagB "
     assert spaced.tags_set == {"TagA", "TagB"}
@@ -87,7 +64,6 @@ def test_multi_tag_split_trim_and_codes():
 
 
 def test_split_error_raises_on_an_empty_tag_list():
-    # Java：split 后无标签 → throw new Exception("subString split error")
     with pytest.raises(ValueError):
         FilterAPI.build_subscription_data("T", "||")
 
@@ -99,7 +75,6 @@ def test_tag_hash_vectors():
     assert utf16_int32_hash("P") == 80
     assert utf16_int32_hash("PA") == 2545
     assert utf16_int32_hash("*") == 42
-    # 负数回绕（Java int 语义，必须与 Python 的任意精度整数区分开）
     assert utf16_int32_hash("RocketMQClient") == -47506045
     assert utf16_int32_hash("polling") == -397904957
     assert utf16_int32_hash("PID_CLIENT_INNER_TRACE_PRODUCER") == -660858443
@@ -282,7 +257,7 @@ def test_client_side_tag_filter_keeps_only_matching_tags():
 def test_client_side_tag_filter_ignores_class_filter_mode():
     msgs = _msgs(("TagA", b"a"))
     sub = FilterAPI.build_subscription_data("TopicTest", "TagB")
-    sub.class_filter_mode = True                   # Java：classFilterMode 时跳过
+    sub.class_filter_mode = True
     assert client_side_tag_filter(sub, msgs) == msgs
 
 
@@ -295,7 +270,7 @@ def test_filter_hook_drops_messages():
 
 
 def test_filter_hook_exception_is_swallowed():
-    """过滤钩子抛异常不能影响消费（Java PullAPIWrapper.executeHook 记 error 后继续）。"""
+    pass
     msgs = _msgs(("TagA", b"a"))
     kept = filter_messages_for_delivery("GID_test", [_BoomFilter()], MQ, None, msgs)
     assert kept == msgs
@@ -334,7 +309,7 @@ def test_pull_consumer_registers_filter_hook():
 
 
 def test_filter_hook_runs_after_tag_filter():
-    """顺序：先二次 tag 过滤，再跑钩子（Java PullAPIWrapper 亦然）。"""
+    pass
     seen = []
 
     class Sniffer(FilterMessageHook):

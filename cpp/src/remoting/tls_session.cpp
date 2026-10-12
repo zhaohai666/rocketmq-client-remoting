@@ -51,9 +51,7 @@ std::shared_ptr<void> createClientSslContext(std::string& err,
         err = "SSL_CTX_new failed: " + lastOpenSslError();
         return nullptr;
     }
-    // test mode（对齐 Java tls.test.mode.enable 默认 true）：信任 broker 自签证书。
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
-    // 客户端证书可选：给了一对就加载（Java tls.client.certPath/keyPath 独立于 test.mode）。
     if (!certPath.empty()) {
         if (SSL_CTX_use_certificate_chain_file(ctx, certPath.c_str()) != 1 ||
             SSL_CTX_use_PrivateKey_file(ctx, keyPath.c_str(), SSL_FILETYPE_PEM) != 1 ||
@@ -79,8 +77,6 @@ std::shared_ptr<void> createStrictClientSslContext(const std::string& caPath,
         err = "SSL_CTX_new failed: " + lastOpenSslError();
         return nullptr;
     }
-    // 严格校验（对齐 Java tls.test.mode.enable=false）：verify=PEER，主机名/SAN 的逐连接
-    // 校验在 handshake() 里做（OpenSSL 不做 SSL_set1_host/X509 param 就不校验名字）。
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
     if (SSL_CTX_load_verify_locations(ctx, caPath.c_str(), nullptr) != 1) {
         err = "load CA file failed (" + caPath + "): " + lastOpenSslError();
@@ -123,10 +119,6 @@ bool TlsSession::handshake(netcompat::socket_t sock, const std::string& host, in
         // SNI：broker 侧 PERMISSIVE 不校验，但带上是标准客户端行为
         SSL_set_tlsext_host_name(ssl_, host.c_str());
     }
-    // 严格模式的主机名/SAN 校验（test-mode 的 ctx verify=NONE 时跳过）。
-    // OpenSSL 与 Java 不同：不显式设置校验目标就**只验链不验名字**，所以两条都得自己做——
-    // 目标是 IP 字面量时用 X509_VERIFY_PARAM_set1_ip_asc（对 X509 IP SAN），
-    // 否则 SSL_set1_host（对 DNS SAN，支持单层 *. 通配，Java HostnameVerifier 同口径）。
     if (SSL_CTX_get_verify_mode(ctx) & SSL_VERIFY_PEER) {
         const std::string& name = expectedName_.empty() ? host : expectedName_;
         if (name.empty()) {

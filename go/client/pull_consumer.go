@@ -273,9 +273,6 @@ func (c *DefaultMQPullConsumer) SetTlsEnable(enable bool) {
 	c.tlsEnable = &enable
 }
 
-// SetSocksProxy tunnels the consumer's remoting connections through a SOCKS
-// proxy (Java ClientConfig#socksProxyConfig). nil = direct connections. The
-// address-server HTTP fetch (TopAddressing) is not proxied.
 func (c *DefaultMQPullConsumer) SetSocksProxy(proxy *remoting.SocksProxyConfig) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -830,18 +827,11 @@ func buildPullSelectorSubscription(mq common.MessageQueue, selector MessageSelec
 	return sub, nil
 }
 
-// pullSync is Java pullSyncImpl:229-285. The sync facades never expose a byte
-// budget, so they run it with the unlimited default (-1 = "not set", which is
-// what pullKernel writes into the header when maxSizeInBytes is absent).
 func (c *DefaultMQPullConsumer) pullSync(mq common.MessageQueue, sub *remoting.SubscriptionData,
 	offset int64, maxNums int32, block bool, timeoutMillis int64) (*PullResult, error) {
 	return c.pullSyncWithMaxBytes(mq, sub, offset, maxNums, -1, block, timeoutMillis)
 }
 
-// pullSyncWithMaxBytes is pullSync with Java's maxSizeInBytes argument made
-// explicit: pullAsyncImpl:517 checks it as `<= 0`, and the async entry points
-// pass the caller's value (Integer.MAX_VALUE for the variants without one,
-// which -1 and the header omission below model the same way).
 func (c *DefaultMQPullConsumer) pullSyncWithMaxBytes(mq common.MessageQueue, sub *remoting.SubscriptionData,
 	offset int64, maxNums int32, maxMsgBytes int32, block bool, timeoutMillis int64) (*PullResult, error) {
 

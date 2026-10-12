@@ -6,32 +6,6 @@
 //! 它是 producer / consumer / admin 三层唯一的出口，所以「请求发出去了、响应回来了」
 //! 这两件事不足以判合格。本示例锁死的是只有真集群能证明的性质：
 //!
-//! - M1 **实例身份与生命周期**：clientId 登记进进程级实例表、同 id 复用同一实例、
-//!   `start` / `shutdown` 翻转 `started` 且对所有 handle 可见、`shutdown` 之后登记表
-//!   里不再留死的实例、空 namesrv 列表不改写
-//!   地址、没配地址服务器时 `fetch_name_server_addr` 回 `None`（Python 同）。
-//! - M2 **路由与发布信息缓存**：真实路由落库后 `TopicPublishInfo` 的队列视图、
-//!   轮询游标（含 `reset_index` 与过滤器语义：过滤全拒回 `None` 而不是报错）、
-//!   brokerName→addr 解析、未知 topic 在 `is_default=true` 时按 Java **生产者**语义
-//!   回退到 `TBW102` 并真能把消息发进去；消费者路径（`is_default=false`）禁止回退。
-//! - M3 **收发**：`send_message` 自己解析路由，`SendResult` 逐字段对齐 Python
-//!   `_parse_send_response`；UNIQ_KEY 由实例补写且调用方看得见；批量走 `batch` 标志、
-//!   在 broker 上落成一条物理消息；oneway 之后必须能被拉回。
-//! - M4 **位点**：`query/update/max/min/searchOffset` 五个 RPC 对真实队列成立，
-//!   `setZeroIfNotFound` 与 broker 行为一致。
-//! - M5 **注册表与心跳**：`RegisteredConsumer` 注入后 `prepare_heartbeat_data` 的
-//!   JSON 字段名、心跳真被 broker 采纳（用 GET_CONSUMER_LIST_BY_GROUP 反查客户端 ID
-//!   证明）、`persist_consumer_offsets` 与 `adjust_thread_pool` 真的逐个调到消费者。
-//! - M6 **POP 链路**：弹回来的消息必须带上客户端反构的 8 段 `POP_CK` 与
-//!   `1ST_POP_TIME`；用它 ACK 成功；`change_invisible_time` 返回的**新** extraInfo
-//!   能直接用于后续 ACK；全部确认后同组再弹拿不到这些消息。
-//! - M7 **管理与清理**：集群信息 / namesrv topic 列表 / 队列批量锁（含「锁真互斥」
-//!   的反证）/ 注销，最后删掉本次建的 topic。
-//! - M8 **共用实例的关闭守卫**（Java `MQClientInstance#shutdown` 读的那三张表 +
-//!   `removeClientFactory`）：同 clientId 的两个生产者与一个 lite 消费者共用一份实例，
-//!   先退的门面不能把还在用的心跳、路由刷新和连接拆掉（用「兄弟退出后另一个仍能真发消息」
-//!   证明），最后一个退掉时实例要真拆并**从进程级登记表摘掉**，同 clientId 才能拿到新实例。
-//!   排在 M7 之前跑，因为要用 M7 删掉的 topic 发消息。
 //!
 //! ⚠ 未覆盖：broker 主动请求（220/221/307/309/326）无法从外部注入 —— 它们走 broker
 //! 已建立的那条连接。协议与分派由 `mq_client.rs` 的离线单测覆盖（对齐
@@ -499,7 +473,6 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
         &format!("{} / {:?}", instance.client_id(), instance.name_server_addrs()),
     );
 
-    // Java `createMQClientInstance`：同 id 复用存活实例（Python 只写不读）。
     let reused = MQClientInstance::create_mq_client_instance(
         &client_id,
         vec!["10.0.0.1:9876".to_string()],
@@ -524,8 +497,6 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
         !instance.is_started() && MQClientInstance::find_instance(&client_id).is_none(),
         "flag stuck or the factory stayed in INSTANCE_MAP",
     );
-    // Java `removeClientFactory`：摘掉登记后同 clientId 拿到的是干净的新实例，
-    // 复用的工厂不会把一个已关掉的死实例发给后来者。
     let rebuilt = MQClientInstance::create_mq_client_instance(
         &client_id,
         vec![namesrv.to_string()],
@@ -745,8 +716,6 @@ async fn m2_route_and_publish(
         &format!("refreshed={none} err={err}"),
     );
 
-    // 未知 topic + is_default=true ⇒ 按 Java 生产者语义回退 TBW102，并裁剪到
-    // broker 实际创建用的队列数，之后真能把消息发进去（broker autoCreateTopicEnable）。
     let fallback = instance
         .update_topic_route_info_from_name_server(fallback_topic, 5000, true)
         .await
@@ -814,8 +783,6 @@ async fn m3_send_and_pull(
         let result = send_one(instance, producer_group, &mut msg, &mq).await?;
         per_queue.entry(mq.queue_id).or_default().push(body);
         let uniq = get_uniq_id(&msg).unwrap_or_default();
-        // Java broker `SendMessageProcessor:504` 会把客户端 UNIQ_KEY 原样回填成
-        // transactionId，所以普通消息也该看得到它。
         let ids_ok = result.msg_id.as_deref() == Some(uniq.as_str())
             && result.offset_msg_id.as_deref().unwrap_or_default().len() == 32
             && result.transaction_id.as_deref() == Some(uniq.as_str());
@@ -833,7 +800,6 @@ async fn m3_send_and_pull(
         );
     }
 
-    // ---- UNIQ_KEY 由实例补上（Java 在 sendKernelImpl 里、发请求之前）
     let mut bare = build_message(topic, b"needs-uniq-key", "", "mqKeyBare");
     ck.check(
         "M3 the caller only sets KEYS; UNIQ_KEY is still absent before send",
@@ -1022,7 +988,6 @@ async fn m3_send_and_pull(
         &format!("status={:?} next={} max={}", empty.status, empty.next_begin_offset, max_offset),
     );
 
-    // ---- 越界位点：broker 回 PULL_OFFSET_MOVED，Java/Python 映射成 OFFSET_ILLEGAL
     let moved = instance
         .pull_message(
             consumer_group,
@@ -1489,11 +1454,6 @@ async fn m6_pop(
 
 // ---------------------------------------------------------------------- M8
 
-/// 共用实例的关闭守卫（Java `MQClientInstance#shutdown`:1101-1137 读的三张表 +
-/// `MQClientManager#removeClientFactory`）在**真门面**上的效果：同 clientId 的
-/// producer / lite 消费者共用一份实例时，先退的那个不能把还在用的心跳、路由刷新
-/// 和连接一起拆掉；最后一个退掉之后，实例要从进程级登记表里消失。
-///
 /// 排在 M7 之前跑：M7 会删掉本示例的 topic，这里要用它真发消息。
 async fn m8_shared_factory(
     namesrv: &str,
@@ -1561,8 +1521,6 @@ async fn m8_shared_factory(
         sent.err().as_deref().unwrap_or(""),
     );
 
-    // 拉模式消费者同样进守卫（Java 把它和推送消费者一起放 consumerTable；这里按
-    // 组名登记）。它复用同一份实例，不是新建。
     let lite = DefaultLitePullConsumer::with_config(LitePullConsumerConfig {
         consumer_group: lite_group.to_string(),
         name_server_addrs: vec![namesrv.to_string()],

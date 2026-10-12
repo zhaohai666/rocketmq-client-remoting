@@ -1,27 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Go push 消费者真机对拍的 Python 侧：建 topic + 喂消息 + 回读 broker 上的位点。
-
-为什么必须有这一半：Go 的 live_consumer 只能证明「Go 自己把消息收下了」。
-报文/位点/注销任何一处错了它都可能自说自话 —— 比如 ack 只写了本地内存、
-OFFSET 没真的提交到 broker、停机没发 UNREGISTER_CLIENT，Go 侧看起来全是绿的。
-所以判定口径是另一件事：**用已验证的 Python 客户端生产消息给 Go 消费**，
-再用 admin 接口（QUERY_CONSUMER_OFFSET / GET_CONSUMER_CONNECTION_LIST）
-从 broker 侧回读，证明位点与注销真的落地了。
-
-用法:
-  python go_consumer_feed_check.py produce <topic> <count> [orderly_topic] [orderly_count]
-  python go_consumer_feed_check.py verify  <topic> <group> <count> [unreg_group]
-
-两条容易踩的口径，写在这里省得下次再调：
-
-1. **topic 必须先建再起消费者**（`create_topic` 走 broker 的 CREATE_TOPIC，broker 会
-   立刻把新路由注册进 namesrv）。不建就靠发送自动建 topic 的话，broker 到 namesrv 的
-   路由注册有个最长 30s 的周期，消费者这一侧就会「拿不到队列 → 一条都不消费」，
-   表现为诡异的假失败。建的时候**显式给队列数**，测试里才能断言确定性的分配结果。
-2. **`%RETRY%<group>` 是消费者自己隐式订阅的**（Java `copySubscription` 同款），
-   所以「消费者分到的队列」= 主 topic 的若干条 **加上** 重投 topic 的若干条。
-   回读主 topic 的位点时只查主 topic，别把重投 topic 混进来。
-"""
 from __future__ import annotations
 
 import os
@@ -165,11 +142,6 @@ def verify(topic, group, count, unreg_group=None):
                 check("停机后 broker 上无 %s 的残留连接" % unreg_group,
                       len(ids) == 0, "connections=%d" % len(ids))
             except MQBrokerException as e:
-                # broker 侧的判据是 Java ConsumerManager#getConsumerConnectionList：
-                # consumerTable 里查不到这个组就抛
-                # `MQBrokerException(SYSTEM_ERROR, "the consumer group[x] not online")`。
-                # 所以**不能**断言响应码是 SUBSCRIPTION_NOT_EXIST（那是别的路径的码），
-                # 要认的是那句 remark —— 它是"组已不存在"的唯一信号。
                 text = str(e)
                 check("停机后 %s 已从 broker 注销（组不在线）" % unreg_group,
                       "not online" in text, "code=%s %s" % (e.response_code, text))

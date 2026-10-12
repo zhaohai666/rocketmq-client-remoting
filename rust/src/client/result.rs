@@ -1,14 +1,3 @@
-//! 发送 / 拉取 / 消费结果类型（对应 Java
-//! `org.apache.rocketmq.client.producer.{SendResult,SendStatus}`、
-//! `org.apache.rocketmq.client.consumer.*`、`...consumer.listener.*`，
-//! 参考实现 `python/client/send_result.py` 与 `consumer_result.py`）。
-//!
-//! 两个容易踩的点：
-//! - `from_code` 对**未知 code 一律回落默认值**（`SendStatus::SEND_OK` /
-//!   `PullStatus::FOUND`），这是 Java `RemotingHelper` 与 Python 一致的行为，
-//!   不是「懒得报错」：broker 加新状态时老客户端要能继续工作。
-//! - [`ConsumeReturnType`] 的顺序**就是** Java 枚举的 ordinal，轨迹 SubAfter 的
-//!   `contextCode` 直接用它，改动顺序会让控制台显示错乱。
 
 use std::fmt;
 
@@ -16,7 +5,6 @@ use crate::common::message::{MessageExt, MessageQueue};
 
 // ---------------------------------------------------------------- 发送
 
-/// 对应 Java `SendStatus`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SendStatus {
     #[default]
@@ -54,7 +42,6 @@ impl fmt::Display for SendStatus {
     }
 }
 
-/// 对应 Java `SendResult` / Python `SendResult`。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SendResult {
     pub status: SendStatus,
@@ -64,11 +51,7 @@ pub struct SendResult {
     pub transaction_id: Option<String>,
     pub offset_msg_id: Option<String>,
     pub region_id: Option<String>,
-    /// 定时/延迟消息的撤回句柄（Java `SendResult.recallHandle`，来自 SEND 响应头的
-    /// `recallHandle`）。普通消息恒为 `None`。
     pub recall_handle: Option<String>,
-    /// 轨迹开关：来自 SEND 响应头的 `TRACE_ON`。Java 的判据是
-    /// `!"false".equals(extFields.get("TRACE_ON"))`，所以默认为 true。
     pub trace_on: bool,
 }
 
@@ -161,14 +144,12 @@ pub(crate) fn opt_str(value: &Option<String>) -> String {
     }
 }
 
-/// 对应 Java `TransactionSendResult`（比 `SendResult` 多一个本地事务状态）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransactionSendResult {
     pub local_transaction_state: Option<LocalTransactionState>,
     pub inner: SendResult,
 }
 
-/// 对应 Java `LocalTransactionState`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LocalTransactionState {
     CommitMessage = 0,
@@ -204,7 +185,6 @@ impl fmt::Display for LocalTransactionState {
 
 // ---------------------------------------------------------------- 拉取
 
-/// 对应 Java `PullStatus`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PullStatus {
     #[default]
@@ -215,8 +195,6 @@ pub enum PullStatus {
 }
 
 impl PullStatus {
-    /// 对应 Java `PullStatus.valueOf(String)` + Python `from_code`：
-    /// 未知值（含 code 越界、名字不认识的字符串）一律 `FOUND`。
     pub fn from_code(code: i32) -> PullStatus {
         match code {
             1 => PullStatus::NoNewMsg,
@@ -255,7 +233,6 @@ impl fmt::Display for PullStatus {
     }
 }
 
-/// 对应 Java `PullResult` / Python `PullResult`。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PullResult {
     pub status: PullStatus,
@@ -263,7 +240,6 @@ pub struct PullResult {
     pub min_offset: i64,
     pub max_offset: i64,
     pub msg_found_list: Vec<MessageExt>,
-    /// Java `PullResultExt.suggestWhichBrokerId`：每次拉取后回写 pullFromWhichNodeTable。
     pub suggest_which_broker_id: Option<i64>,
 }
 
@@ -299,7 +275,6 @@ impl fmt::Display for PullResult {
     }
 }
 
-/// 对应 Java `PopStatus`。⚠ 与 `PullStatus` 的 code 排布不同，别混用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PopStatus {
     #[default]
@@ -336,8 +311,6 @@ impl fmt::Display for PopStatus {
     }
 }
 
-/// 对应 Java `PopResult` / Python `PopResult`。
-///
 /// `start_offset_info` / `msg_offset_info` / `order_count_info` 保留 broker 原样字符串，
 /// 解析交给 [`crate::remoting::protocol::extra_info`]。
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -407,7 +380,6 @@ impl fmt::Display for ChangeInvisibleTimeResult {
 
 // ---------------------------------------------------------------- 消费
 
-/// 对应 Java `ConsumeReturnType`（轨迹 `contextCode` 用它）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConsumeReturnType {
     Success = 0,
@@ -422,8 +394,6 @@ impl ConsumeReturnType {
         self as i32
     }
 
-    /// Java `ConsumeReturnType#name()`：轨迹 `ConsumeContextType` 属性存的是这个名字，
-    /// 消费端按名反查 ordinal（见 `trace_hook` 里的 `ConsumeReturnType.valueOf`）。
     pub fn name(self) -> &'static str {
         match self {
             ConsumeReturnType::Success => "SUCCESS",
@@ -435,7 +405,6 @@ impl ConsumeReturnType {
     }
 }
 
-/// 对应 Java `ConsumeConcurrentlyStatus`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ConsumeConcurrentlyStatus {
     #[default]
@@ -458,11 +427,6 @@ impl fmt::Display for ConsumeConcurrentlyStatus {
     }
 }
 
-/// 对应 Java `ConsumeOrderlyStatus`。
-///
-/// 变体顺序与判别值逐字对齐 Java 枚举（`SUCCESS, ROLLBACK, COMMIT, SUSPEND_...`）：
-/// `ROLLBACK` / `COMMIT` 在 Java 侧标着 `@Deprecated` + "only for binlog consumption"，
-/// 用法见 `consumer.rs` 的 `auto_commit` 两条分支。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ConsumeOrderlyStatus {
     #[default]
@@ -491,16 +455,12 @@ impl fmt::Display for ConsumeOrderlyStatus {
     }
 }
 
-/// 对应 Java `ConsumeConcurrentlyContext`。
 #[derive(Debug, Clone)]
 pub struct ConsumeConcurrentlyContext {
     pub message_queue: Option<MessageQueue>,
     /// 缺省 0；为 0 时由投递线程改写成 `3 + reconsumeTimes`
     /// （见 `consumer.rs` 的重投逻辑，对齐 Python `_send_back_batch`）。
     pub delay_level_when_next_consume: i32,
-    /// 对应 Java `ConsumeConcurrentlyContext.ackIndex`（默认 `Integer.MAX_VALUE`）：
-    /// listener 用它表达「这批只认可到第几条」（含自身），其后的条目按状态回投/丢弃。
-    /// 默认即「整批认可」，只有 listener 主动调小才会部分 ack。
     pub ack_index: i32,
 }
 
@@ -514,17 +474,10 @@ impl ConsumeConcurrentlyContext {
     }
 }
 
-/// 对应 Java `ConsumeOrderlyContext`。
 #[derive(Debug, Clone)]
 pub struct ConsumeOrderlyContext {
     pub message_queue: Option<MessageQueue>,
-    /// 对应 Java `ConsumeOrderlyContext.autoCommit`（默认 true）。置 false 后 SUCCESS 只记
-    /// TPS 不提交、COMMIT/ROLLBACK 才生效（只给 binlog 消费用）。
     pub auto_commit: bool,
-    /// 对应 Java `ConsumeOrderlyContext.suspendCurrentQueueTimeMillis`，**默认 -1**
-    /// （Java 就是这个默认值）：-1 表示"没指定"，挂起时长回落到消费者配置的
-    /// `suspend_current_queue_time_millis`；解析出来的值再由投递侧钳到 [10, 30000]
-    /// （Java `ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234`）。
     pub suspend_current_queue_time_millis: i64,
 }
 
@@ -538,7 +491,6 @@ impl ConsumeOrderlyContext {
     }
 }
 
-/// 对应 Java `MessageListenerConcurrently`。
 pub trait MessageListenerConcurrently: Send + Sync {
     fn consume_message(
         &self,
@@ -547,7 +499,6 @@ pub trait MessageListenerConcurrently: Send + Sync {
     ) -> ConsumeConcurrentlyStatus;
 }
 
-/// 对应 Java `MessageListenerOrderly`。
 pub trait MessageListenerOrderly: Send + Sync {
     fn consume_message(
         &self,
@@ -566,7 +517,6 @@ mod tests {
         assert_eq!(SendStatus::from_code(1), SendStatus::FlushDiskTimeout);
         assert_eq!(SendStatus::from_code(2), SendStatus::FlushSlaveTimeout);
         assert_eq!(SendStatus::from_code(3), SendStatus::SlaveNotAvailable);
-        // 未知 code 回落 SEND_OK（与 Python/Java 一致，别改成报错）
         assert_eq!(SendStatus::from_code(42), SendStatus::SendOk);
         assert_eq!(SendStatus::from_code(-1), SendStatus::SendOk);
         assert_eq!(SendStatus::FlushSlaveTimeout.code(), 2);
@@ -666,18 +616,15 @@ mod tests {
     fn consume_contexts_use_contract_defaults() {
         let ctx = ConsumeConcurrentlyContext::new(None);
         assert_eq!(ctx.delay_level_when_next_consume, 0);
-        // Java ConsumeConcurrentlyContext:33 —— 默认「整批认可」，不是「一条都不认可」
         assert_eq!(ctx.ack_index, i32::MAX);
         let orderly = ConsumeOrderlyContext::new(Some(MessageQueue::new("T", "b", 0)));
         assert!(orderly.auto_commit);
-        // Java ConsumeOrderlyContext:27 —— 默认 -1 = 「没指定」，回落到消费者配置
         assert_eq!(orderly.suspend_current_queue_time_millis, -1);
         assert_eq!(ConsumeConcurrentlyStatus::ReconsumeLater.to_string(), "RECONSUME_LATER");
         assert_eq!(
             ConsumeOrderlyStatus::SuspendCurrentQueueAMoment.name(),
             "SUSPEND_CURRENT_QUEUE_A_MOMENT"
         );
-        // 声明顺序（= Java 枚举序号）也要对得上：COMMIT/ROLLBACK 只给 binlog 消费用
         assert_eq!(ConsumeOrderlyStatus::Success as i32, 0);
         assert_eq!(ConsumeOrderlyStatus::Rollback as i32, 1);
         assert_eq!(ConsumeOrderlyStatus::Commit as i32, 2);

@@ -5,20 +5,6 @@
 //!
 //! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
 //!
-//! 离线单测（`src/client/producer/send_retry_tests.rs`）锁的是**上线形状**：V2 头的单字母
-//! 键 `c` / `d` / `n` 有没有真的写进 extFields、五种发送入口是不是带同一份值。但「字段上了
-//! 线」和「broker 真拿它做了决定」是两件事，后者只有真集群能证：
-//! - H1 默认值：不带任何配置发到新 topic，broker 按 `min(d=4, TBW102.writeQueueNums)` 建
-//!   队列（`TopicConfigManager.java:289`），与 Java 客户端默认行为一致。
-//! - H2 `default_topic_queue_nums=2` 真的生效：建出来的 topic 只有 2 条队列。修之前这里
-//!   写死 4，这条必然变 4 —— 那是那个假 setter 唯一可观测的后果。
-//! - H3 `create_topic_key=src` 真的生效：先建一个带 PERM_INHERIT、3 条队列的模板 topic，
-//!   再以它为 `c` 发送 → 新 topic 继承模板的 3 条队列，而不是 TBW102 的 8 条。
-//! - H4 补上这三个字段之后，五种入口（同步 / 定点 / 单向 / 批量 320 / 异步）在真 broker
-//!   上仍逐条落地，条数一条不差。
-//! - H5 `n`（brokerName）：落点就是路由选中的那台 broker 名。⚠ 经典 broker 的发送链路里
-//!   **没有** `requestHeader.getBrokerName()` 的读者（5.5.1 源码 grep 过），所以 `n` 在线上
-//!   的存在只能由离线抓帧证明，这里不假装能观测到它。
 //!
 //! 用法：
 //! ```text

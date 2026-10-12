@@ -1,10 +1,6 @@
 //! 跨语言压缩互通的一端：`send` 发一条会自动压缩的消息，`recv` 用
 //! [`DefaultLitePullConsumer`] 收回来并本地重建同一份载荷比 CRC32。
 //!
-//! 载荷配方与 `python/verify_compression_live.py`、`cpp/examples/compression_live.cpp`、
-//! `C# CompressionLive` **逐字节相同**（同一行文本重复后截断），所以四端不需要交换
-//! 文件就能互相判定：只看接收端打印的 `match=`，**不要**比两边打印的 CRC 数字
-//! （Java 口径的 `UtilAll.crc32` 会 `& 0x7FFFFFFF`，本仓库四端都用标准 CRC-32）。
 //!
 //! 用法：
 //! ```text
@@ -18,11 +14,6 @@
 //!
 //! `recv` 走 lite 拉取消费者（订阅 + 后台灌缓冲 + poll），顺带证明解压发生在
 //! 解码路径里（`MessageDecoder` 会清掉 `COMPRESSED_FLAG`）。
-//!
-//! `reuse` 用**同一条 `Message`** 连发两次再各收一条：证明发送后调用方那条消息被
-//! 还原（Java `sendKernelImpl:1095-1096` 的 finally）。不还原时第二次发出去的是
-//! 压缩流、长度已低于阈值不再压、`COMPRESSED_FLAG` 也不置位 —— broker 照存、
-//! 消费端不解压，业务拿到 zlib 字节，全程零报错。
 
 use std::env;
 use std::process::ExitCode;
@@ -37,7 +28,6 @@ use rocketmq_client_remoting::common::sysflag::MessageSysFlag;
 use rocketmq_client_remoting::common::util_all::crc32;
 use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 
-/// 与 Java `CompressProbe.buildPayload` / Python `build_payload` 完全一致。
 const LINE: &[u8] = b"rocketmq-compress-interop-payload-line-0123456789\n";
 
 fn build_payload(size: usize) -> Vec<u8> {
@@ -236,10 +226,6 @@ async fn recv(namesrv: &str, topic: &str, group: &str, payload: &[u8], crc: u32)
 }
 
 /// 同一条 `Message` 连发两次，再各收一条回来比对。
-///
-/// 第一项检查不依赖 broker：第一次 `send` 之后调用方手里的 body 必须还是原文
-/// （压缩是就地的，Java 靠 `finally` 里的 `prevBody` 换回来）。
-/// 第二项是真机端到端：第二条消息在 broker 里必须是**压缩体**、收回来必须是原文。
 async fn reuse(
     namesrv: &str,
     topic: &str,

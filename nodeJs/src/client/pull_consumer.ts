@@ -110,15 +110,10 @@ export class DefaultMQPullConsumer {
     }
     this.clientID = MixAll.clientIdFor(
       this.instanceName, this.unitName || null, this.enableStreamRequestType);
-    // 跨 facade 复用（Java MQClientManager.factoryTable）：同 clientId 的门面共享
-    // 一个实例，引用计数归零才真关闭；hook 链只由创建者注册（first-wins 快照）。
     const manager = MQClientManager.getInstance();
     const { instance: client, created } = manager.getOrCreateMQClientInstance(
       this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
     if (created) {
-      // Java MQClientAPIImpl:329 — NamespaceRpcHook first on the remoting
-      // client, then StreamTypeRPCHook (pull consumers enable it), before any
-      // user hook (this facade has none today).
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         enableStreamRequestType: this.enableStreamRequestType,
@@ -172,8 +167,6 @@ export class DefaultMQPullConsumer {
     return (await this.routeOf(topic, 'subscribe')).getAllSubscribeMessageQueue(topic);
   }
 
-  // routeOf refreshes then returns the topic's route; a route that cannot be
-  // had is Java's "topic not exist" and throws rather than returning [].
   private async routeOf(topic: string, view: 'publish' | 'subscribe'): Promise<TopicRouteData> {
     if (!this.mqClient) throw new Error('consumer not started');
     await this.mqClient.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
@@ -251,27 +244,6 @@ export class DefaultMQPullConsumer {
     await this.offsetStore.persistAll(mqs);
   }
 
-  // fetchMessageQueuesInBalance is Java MQPullConsumer:187 →
-  // DefaultMQPullConsumerImpl:120-135: the queues THIS instance owns once the
-  // group is balanced — what example/simple/PullConsumer.java:62 iterates before
-  // pulling, so taking the whole topic here is the classic duplicate-consumption
-  // bug in a multi-instance group.
-  //
-  // Java reads rebalanceImpl.getProcessQueueTable(), a table its background
-  // rebalance thread fills. This port runs no pull-side rebalance thread, so the
-  // view is computed on demand with the exact formula RebalanceImpl
-  // #rebalanceByTopic uses — the same one this port's push consumer rebalances
-  // with, so the two can never disagree and hand one queue to two instances: the
-  // subscribe view as mqAll, the group's clientIds from
-  // GET_CONSUMER_LIST_BY_GROUP(38) as cidAll, both sorted, then the AVG strategy
-  // slices out my share. Under BROADCASTING Java never asks for the cid list.
-  //
-  // "No route / no answered consumer list" means CANNOT compute, not "my share is
-  // empty": the last computed assignment is kept (Java's table still holds it
-  // then), or — before the first computation — the queues already being pulled.
-  // Falling back to "all of them" would make every co-instance read the same
-  // messages twice. A share that genuinely computes to empty (more consumers
-  // than queues) returns [], exactly like Java's empty table at that moment.
   async fetchMessageQueuesInBalance(topic: string): Promise<MessageQueue[]> {
     if (!this.mqClient) throw new Error('consumer not started');
     const client = this.mqClient;
@@ -325,8 +297,6 @@ export class DefaultMQPullConsumer {
     const { AllocateMessageQueueAveragely } = await import('./allocate.ts');
     const got = new AllocateMessageQueueAveragely().allocate(
       this.consumerGroup, this.clientID, mqAll, ids.slice().sort());
-    // Java :128-131 compares every table key's topic: never let another topic
-    // leak into the caller's pull loop.
     const mine = (got || []).filter(mq => mq.getTopic() === topic)
       .sort((a, b) => a.compareTo(b));
     this.balancedQueues.set(topic, mine);

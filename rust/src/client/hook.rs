@@ -1,31 +1,3 @@
-//! 客户端钩子（对应 Java `org.apache.rocketmq.client.hook` 包，
-//! 逐条对齐 `python/client/hook.py`）。
-//!
-//! Java 侧钩子是「业务无关的切面」：生产者在 `sendKernelImpl` 前后各调一次
-//! [`SendMessageHook`]，消费者在投递 listener 前后各调一次 [`ConsumeMessageHook`]。
-//! 消息轨迹（`client.trace.hook.*`）正是建在这两个接口上的。
-//!
-//! 设计约定（与 Java / Python 一致）：
-//! - 钩子「抛出的异常」**必须被吞掉并记 warn**（Java `DefaultMQProducerImpl:1159/1172`），
-//!   绝不能因为轨迹出错影响正常收发。Rust 没有异常，所以钩子方法返回 [`Result`]，
-//!   吞异常的职责落在本模块的 `execute_*` 系列函数上（对应 Python producer/consumer 里同名方法），
-//!   调用方**不要**自己用 `?` 传播，否则破坏语义；
-//! - **唯二的例外**：[`CheckForbiddenHook::check_forbidden`]（发送前拦截，Java 签名就是
-//!   `throws MQClientException`）——它的异常要向上传播，见 [`execute_check_forbidden_hook`]；
-//! - [`SendMessageContext::mq_trace_context`] 是钩子自己的私有状态：before 写入、after 取出，
-//!   中间不允许别的钩子依赖它的具体类型（Java 是 `Object`，这里用 `Arc<dyn Any>`，
-//!   取值用 [`any_downcast`]）。
-//!
-//! 与 Python 的**有意差异**（都不影响可观测行为）：
-//! 1. `SendMessageContext.producer`（Java 回指 `DefaultMQProducerImpl`）未移植：
-//!    Python 侧该字段**只写不读**（`producer.py:365`），而 Rust 里回指会形成 `Arc` 循环，
-//!    钩子真正用到的是 `producer_group`；
-//! 2. Python 抽象方法的 `raise NotImplementedError` 在 Rust 里没有等价物，于是
-//!    「不关心的一侧」给默认空实现（同 [`crate::remoting::rpchook::RPCHook::do_after_response`]
-//!    的口径），`hook_name` 保持必填；
-//! 3. `access_channel` 存名字串（`"LOCAL"` / `"CLOUD"`）而不是枚举：Python 的
-//!    `AccessChannel` 定义在 `client/trace.py`，不属于本文件，避免两处重复定义；
-//! 4. Java `ConsumeMessageContext.namespace` 未移植（Python 的 `__init__` 里没有该字段）。
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -39,21 +11,14 @@ use crate::{rmq_error, rmq_warn};
 
 use super::result::{LocalTransactionState, SendResult};
 
-/// Java 的 `Object` 字段（`mqTraceContext` / `arg`）在 Rust 里的载体。
 pub type AnyHolder = Arc<dyn Any + Send + Sync>;
 
-/// 把 [`AnyHolder`] 取回具体类型（等价于 Java 的强制转型）。
-///
 /// 类型不匹配时返回 `None` 而不是 panic —— 钩子之间互不相干，
 /// 一个钩子塞错类型不该让整个发送链路挂掉。
 pub fn any_downcast<T: Any + Send + Sync>(holder: &Option<AnyHolder>) -> Option<&T> {
     holder.as_ref().and_then(|value| value.downcast_ref::<T>())
 }
 
-/// 对应 Java `org.apache.rocketmq.client.impl.CommunicationMode`。
-///
-/// Python 侧是三个字符串常量（`CommunicationMode.SYNC == "SYNC"`），Java 是枚举；
-/// 这里用枚举 + [`Display`](fmt::Display) 输出同名串，两边都对得上。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CommunicationMode {
     /// `SYNC`
@@ -66,7 +31,6 @@ pub enum CommunicationMode {
 }
 
 impl CommunicationMode {
-    /// Python 常量的值（也是 Java `Enum#name()`）。
     pub fn name(self) -> &'static str {
         match self {
             CommunicationMode::Sync => "SYNC",
@@ -75,9 +39,6 @@ impl CommunicationMode {
         }
     }
 
-    /// 按名字解析（对应 Java `CommunicationMode.valueOf`）。
-    /// 未知值回落 `SYNC`：与 `result.rs` 里 `from_code` 的口径一致，
-    /// 认不出来的新枚举值不该让老客户端报错。
     pub fn from_name(name: &str) -> CommunicationMode {
         match name {
             "ASYNC" => CommunicationMode::Async,
@@ -95,10 +56,8 @@ impl fmt::Display for CommunicationMode {
 
 // ------------------------------------------------------------ SendMessageHook
 
-/// 对应 Java `org.apache.rocketmq.client.hook.SendMessageContext`。
 #[derive(Default)]
 pub struct SendMessageContext {
-    /// 对应 Python `producer_group`（Java 的 `DefaultMQProducerImpl` 回指见模块头说明 1）。
     pub producer_group: String,
     pub message: Option<Message>,
     pub mq: Option<MessageQueue>,
@@ -108,9 +67,7 @@ pub struct SendMessageContext {
     pub send_result: Option<SendResult>,
     /// 对应 Python `exception`：发送失败时由调用方写入，`after` 钩子里读它判成败。
     pub exception: Option<Error>,
-    /// 钩子私有状态（Java `Object mqTraceContext`），见模块头约定。
     pub mq_trace_context: Option<AnyHolder>,
-    /// Java `Map<String, String> props`；Python 默认 `None`（钩子自己决定要不要建）。
     pub props: Option<HashMap<String, String>>,
     pub msg_type: MessageType,
     pub namespace: String,
@@ -136,17 +93,13 @@ impl fmt::Debug for SendMessageContext {
     }
 }
 
-/// 对应 Java `org.apache.rocketmq.client.hook.SendMessageHook`。
 pub trait SendMessageHook: Send + Sync {
-    /// Java `hookName()`：日志与排错用，必填（Python 里是抽象方法）。
     fn hook_name(&self) -> &str;
 
-    /// Java `sendMessageBefore`。`Err` 由 [`execute_send_message_hook_before`] 吞掉。
     fn send_message_before(&self, _context: &mut SendMessageContext) -> Result<()> {
         Ok(())
     }
 
-    /// Java `sendMessageAfter`：成功时 `context.send_result` 有值，失败时 `context.exception` 有值。
     fn send_message_after(&self, _context: &mut SendMessageContext) -> Result<()> {
         Ok(())
     }
@@ -154,14 +107,11 @@ pub trait SendMessageHook: Send + Sync {
 
 // ------------------------------------------------------ ConsumeMessageHook
 
-/// 对应 Java `org.apache.rocketmq.client.hook.ConsumeMessageContext`。
 #[derive(Clone, Default)]
 pub struct ConsumeMessageContext {
     pub consumer_group: String,
     pub msg_list: Vec<MessageExt>,
     pub mq: Option<MessageQueue>,
-    /// Python `__init__` 的缺省是 `True`；Java 与投递路径（`consumer.py:645`
-    /// `_build_consume_hook_context`）会显式改成 `False`，两者别搞混。
     pub success: bool,
     /// 消费状态的名字串（Python `str(status)`，如 `"CONSUME_SUCCESS"`）。
     pub status: Option<String>,
@@ -206,16 +156,13 @@ impl fmt::Debug for ConsumeMessageContext {
     }
 }
 
-/// 对应 Java `org.apache.rocketmq.client.hook.ConsumeMessageHook`。
 pub trait ConsumeMessageHook: Send + Sync {
     fn hook_name(&self) -> &str;
 
-    /// Java `consumeMessageBefore`。
     fn consume_message_before(&self, _context: &mut ConsumeMessageContext) -> Result<()> {
         Ok(())
     }
 
-    /// Java `consumeMessageAfter`。
     fn consume_message_after(&self, _context: &mut ConsumeMessageContext) -> Result<()> {
         Ok(())
     }
@@ -223,7 +170,6 @@ pub trait ConsumeMessageHook: Send + Sync {
 
 // ------------------------------------------------------ EndTransactionHook
 
-/// 对应 Java `org.apache.rocketmq.client.hook.EndTransactionContext`。
 #[derive(Debug, Clone, Default)]
 pub struct EndTransactionContext {
     pub producer_group: String,
@@ -232,16 +178,13 @@ pub struct EndTransactionContext {
     pub msg_id: Option<String>,
     pub transaction_id: Option<String>,
     pub transaction_state: Option<LocalTransactionState>,
-    /// `true` 表示这次收尾来自 broker 的事务回查，而不是客户端主动提交（Java 同名标志）。
     pub from_transaction_check: bool,
     pub namespace: String,
 }
 
-/// 对应 Java `org.apache.rocketmq.client.hook.EndTransactionHook`。
 pub trait EndTransactionHook: Send + Sync {
     fn hook_name(&self) -> &str;
 
-    /// Java `endTransaction`。`Err` 由 [`execute_end_transaction_hook`] 吞掉。
     fn end_transaction(&self, _context: &mut EndTransactionContext) -> Result<()> {
         Ok(())
     }
@@ -249,8 +192,6 @@ pub trait EndTransactionHook: Send + Sync {
 
 // ------------------------------------------------------- CheckForbiddenHook
 
-/// 对应 Java `org.apache.rocketmq.client.hook.CheckForbiddenContext`。
-///
 /// 发送前拦截钩子的上下文。与 [`SendMessageContext`] 的关键差别：**没有 sendResult**
 /// （此刻还没发），带上 `arg`（`send(msg, selector, arg)` 里的业务参数）。
 #[derive(Default)]
@@ -263,10 +204,7 @@ pub struct CheckForbiddenContext {
     pub communication_mode: Option<CommunicationMode>,
     pub send_result: Option<SendResult>,
     pub exception: Option<Error>,
-    /// Java `Object arg`。
     pub arg: Option<AnyHolder>,
-    /// Java `CheckForbiddenContext#setUnitMode(tc.isUnitMode())`
-    /// （`DefaultMQProducerImpl:964`），来自门面的 `ClientConfig#unitMode`。
     pub unit_mode: bool,
 }
 
@@ -287,15 +225,9 @@ impl fmt::Debug for CheckForbiddenContext {
     }
 }
 
-/// 对应 Java `org.apache.rocketmq.client.hook.CheckForbiddenHook`。
-///
-/// ⚠ 与 Send/Consume 钩子**相反**：`check_forbidden` 返回的 `Err` **不会被吞掉**
-/// （Java 签名就是 `throws MQClientException`），而是沿发送重试链向上传播 ——
-/// 这正是「拦截」能力的实现方式。
 pub trait CheckForbiddenHook: Send + Sync {
     fn hook_name(&self) -> &str;
 
-    /// Java `checkForbidden`，`Err` 会传播给发送方。
     fn check_forbidden(&self, _context: &mut CheckForbiddenContext) -> Result<()> {
         Ok(())
     }
@@ -303,8 +235,6 @@ pub trait CheckForbiddenHook: Send + Sync {
 
 // --------------------------------------------------------- FilterMessageHook
 
-/// 对应 Java `org.apache.rocketmq.client.hook.FilterMessageContext`。
-///
 /// `msg_list` 是**可变的**：钩子把它替换/裁剪掉的消息会被客户端直接丢弃
 /// （拉取路径 = 静默跳过；POP 路径 = 立刻 ack）。
 #[derive(Clone, Default)]
@@ -312,16 +242,11 @@ pub struct FilterMessageContext {
     pub consumer_group: String,
     pub msg_list: Vec<MessageExt>,
     pub mq: Option<MessageQueue>,
-    /// Java `Object arg`（`pull(mq, sub, ..., arg)` 的业务参数）。
     pub arg: Option<AnyHolder>,
     pub unit_mode: bool,
 }
 
 impl FilterMessageContext {
-    /// 对应 Python `FilterMessageContext(consumer_group, msg_list, mq)`：
-    /// `arg` 为 None；`unit_mode` 取消费者的配置（Java 是
-    /// `DefaultMQPushConsumerImpl:640` 的 `context.setUnitMode(...)`，Python 早期
-    /// 固定 False，这里跟 Java 走）。
     pub fn new(
         consumer_group: &str,
         msg_list: Option<Vec<MessageExt>>,
@@ -349,12 +274,9 @@ impl fmt::Debug for FilterMessageContext {
     }
 }
 
-/// 对应 Java `org.apache.rocketmq.client.hook.FilterMessageHook`。
 pub trait FilterMessageHook: Send + Sync {
     fn hook_name(&self) -> &str;
 
-    /// Java `filterMessage`：`Err` 由 [`execute_filter_hooks`] 吞掉并记 **error**
-    /// （Java `PullAPIWrapper.executeHook:171-178`；级别与 send/consume 的 warn 不同）。
     fn filter_message(&self, _context: &mut FilterMessageContext) -> Result<()> {
         Ok(())
     }
@@ -496,7 +418,6 @@ pub fn execute_consume_hook_after(hooks: &ConsumeMessageHookList, context: &mut 
     }
 }
 
-/// `consumer.execute_filter_hooks`：异常吞掉并记 **error**（Java `PullAPIWrapper.executeHook`）。
 pub fn execute_filter_hooks(hooks: &FilterMessageHookList, context: &mut FilterMessageContext) {
     for hook in hooks.hooks() {
         if let Err(e) = hook.filter_message(context) {

@@ -160,7 +160,6 @@ func TestStoreSizeRespected(t *testing.T) {
 	if declared != 139 {
 		t.Fatalf("declared %d", declared)
 	}
-	// 大于计算值：按 storeSize 分配，尾部补零（Java ByteBuffer.allocate 同语义）
 	ext.StoreSize = 200
 	raw, err = EncodeMessageExt(ext, false)
 	if err != nil {
@@ -179,7 +178,6 @@ func TestStoreSizeRespected(t *testing.T) {
 func TestTopicTooLongIsAnEncodeError(t *testing.T) {
 	ext := buildExt()
 	ext.Topic = strings.Repeat("T", 256)
-	// Java 静默截断成 (byte) 长度；Go 端口选择显式报错而不是产出坏帧
 	_, err := EncodeMessageExt(ext, false)
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("expected length error, got %v", err)
@@ -316,7 +314,6 @@ func TestDecodeMessagesSplitsStream(t *testing.T) {
 	if string(msgs[1].GetBody()) != "hello rocketmq" || msgs[1].QueueID != 3 {
 		t.Fatalf("second message wrong: %v", msgs[1])
 	}
-	// 尾部垃圾/截断：停在最后一条完整消息（Java decodes 的 break 同语义）
 	if got := DecodeMessages(append(append([]byte{}, frame...), 'g', 'a', 'r', 'b')); len(got) != 1 {
 		t.Fatalf("garbage tail decoded %d", len(got))
 	}
@@ -482,7 +479,6 @@ func TestIPHelpers(t *testing.T) {
 	if err != nil || len(v6) != 16 {
 		t.Fatalf("v6: %v %v", v6, err)
 	}
-	// 非v4-mapped 的 IPv6 不带 v6 标志必须报错（Java 跨族规则）
 	if _, err := IPToBytes("2001:db8::1", false); err == nil {
 		t.Fatal("ipv6 without the v6 flag must fail")
 	}
@@ -563,7 +559,6 @@ func TestPropertiesStringRoundTripAndDrops(t *testing.T) {
 	if !back.Equal(props) {
 		t.Fatalf("round trip lost data: %v", back.Keys())
 	}
-	// Java：长度 < 3、没有 kv 分隔符的片段、空值片段都会被丢掉 —— 锁住该行为
 	if String2MessageProperties("").Len() != 0 {
 		t.Fatal("empty string")
 	}

@@ -59,10 +59,6 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 def make_consumer() -> DefaultMQPullConsumer:
     c = DefaultMQPullConsumer(GROUP)
     c.set_namesrv_addr(NAMESRV)
-    # 登记 topic 是心跳的前提（Java DefaultMQPullConsumer.registerMessageQueueListener
-    # 同时往 registerTopics 里加）：拉模式消费者没有订阅集就不知道该把本组报给哪台
-    # broker，broker 的 consumerTable 里就没有这个组，GET_CONSUMER_LIST_BY_GROUP(38)
-    # 也就数不出任何成员 —— S8 的平衡视图正是靠 38 的。
     c.register_topics.add(TOPIC)
     c.start()
     return c
@@ -227,13 +223,7 @@ def scenario_offset_query(consumer: DefaultMQPullConsumer, q, lo: int, hi: int) 
 
 def scenario_send_back(consumer: DefaultMQPullConsumer, sample: MessageExt,
                        expect_body: bytes) -> None:
-    """S7 回投。
-
-    ⚠ 必须复用**已跑过 S1–S6 的那个 consumer**：send_message_back 要用
-    `broker_addr_of(msg.broker_name)` 反查 broker 地址，而该表来自路由表——
-    新起的 consumer 路由表是空的，会报 "broker broker-a not found"。
-    这与 Java 一致（Java 也走 findBrokerAddressInPublish 读 brokerAddrTable）。
-    """
+    pass
     print("\nS7 send_message_back -> %%RETRY%%group 可拉取")
     try:
         # delayLevel=0 时 broker 改写成 3 + reconsumeTimes（默认 10s 延迟）
@@ -282,20 +272,7 @@ def scenario_send_back(consumer: DefaultMQPullConsumer, sample: MessageExt,
 
 
 def scenario_balance_view(consumer: DefaultMQPullConsumer) -> None:
-    """S8 fetch_message_queues_in_balance（Java DefaultMQPullConsumerImpl:120-135）。
-
-    离线单测锁的是分配公式，这条真机腿锁的是**公式的两路输入是真的**：队列表来自
-    真实 name server 的路由，成员表来自 broker 的 GET_CONSUMER_LIST_BY_GROUP(38)
-    —— 只有本组真的注册进了 broker（心跳），38 才数得出第二个实例。
-
-    关键的判据是 B：**一个从没拉取过任何队列的新实例**。算不动时本端口的设计是
-    「保留现有分配」，而 B 的现有分配是空集，所以 B 拿到非空队列 ⇒ 走的必然是
-    路由 + 38 那条真算出来的路，不是兜底。
-
-    ⚠ 两个实例都上线之后**再**各自算：A 先算的话那一刻 38 里只有 A 一个人，
-    它会拿走全部队列，等 B 起来再比就成了「A 4 条 + B 2 条 = 重叠」——那是测
-    调用顺序，不是测分配。broker 侧的心跳可见性有延迟，所以先等到 38 数得出 2 个成员。
-    """
+    pass
     print("\nS8 fetch_message_queues_in_balance")
     whole = consumer.fetch_subscribe_message_queues(TOPIC)
     key = lambda qs: sorted((q.broker_name, q.queue_id) for q in qs)  # noqa: E731

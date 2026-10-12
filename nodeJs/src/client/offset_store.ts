@@ -1,11 +1,3 @@
-// Consumer offset stores (Java org.apache.rocketmq.client.consumer.store.*).
-//
-// RemoteBrokerOffsetStore is the CLUSTERING store: offsets live broker-side,
-// the local table is a write-through cache. LocalFileOffsetStore is the
-// BROADCASTING store: offsets live under
-// $HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json in Java fastjson2's
-// MessageQueue-as-object-key format, with offsets.json.bak as the previous
-// generation.
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -14,7 +6,6 @@ import { getLogger } from '../logging.ts';
 
 const logger = getLogger('client.offset_store');
 
-// Java OffsetStore.ReadOffsetMode.
 export const ReadOffsetMode = {
   READ_FROM_MEMORY: 0,
   READ_FROM_STORE: 1,
@@ -53,9 +44,6 @@ export class RemoteBrokerOffsetStore implements OffsetStore {
   // Load is a no-op: remote offsets are fetched on demand.
   async load(): Promise<void> { /* nothing to do */ }
 
-  // UpdateOffset records the offset. A missing entry is created even for
-  // offset 0 (Java updateOffset's putIfAbsent — the second commit of a pair
-  // may carry the lower value and must not erase the first).
   updateOffset(mq: MessageQueue, offset: number, increaseOnly: boolean): void {
     const key = mqKey(mq);
     const old = this.table.get(key);
@@ -92,11 +80,6 @@ export class RemoteBrokerOffsetStore implements OffsetStore {
     }
   }
 
-  // PersistAll flushes the given queues to their brokers and removes table
-  // entries for queues not in the list (Java's "remove unused mq" —
-  // rebalanced-away queues must not re-appear on the next load). Broadcasting
-  // is the caller's concern; this store only ever runs for clustering
-  // consumers.
   async persistAll(mqs: MessageQueue[]): Promise<void> {
     if (mqs.length === 0) return;
     let firstErr: Error | null = null;
@@ -109,9 +92,6 @@ export class RemoteBrokerOffsetStore implements OffsetStore {
         if (!firstErr) firstErr = e as Error;
       }
     }
-    // Drop entries the caller did not name — Java's removal condition is
-    // literally `!mqs.contains(mq)`, so a named queue keeps its table slot
-    // even when its offset was negative and never committed.
     const requested = new Set<string>();
     for (const mq of mqs) requested.add(mqKey(mq));
     for (const key of Array.from(this.table.keys())) {
@@ -132,8 +112,6 @@ export class RemoteBrokerOffsetStore implements OffsetStore {
     return new Map(this.table);
   }
 
-  // updateConsumeOffsetToBroker picks the address Java-style: master from the
-  // publish table first, then "any addr for this broker in a cached route".
   private async updateConsumeOffsetToBroker(mq: MessageQueue, offset: number): Promise<void> {
     const addr = this.mqClient.findBrokerAddrForQueue(mq);
     if (!addr) throw new Error(`The broker[${mq.getBrokerName()}] not exist`);
@@ -151,9 +129,6 @@ export class LocalFileOffsetStore implements OffsetStore {
   private table = new Map<string, number>(); // mqKey -> offset
   private storePath: string;
 
-  // Builds the store under the default path (~/.rocketmq_offsets). An env
-  // override rocketmq.client.localOffsetStoreDir takes the place of the base
-  // directory, matching Java. `baseDir` is a swappable test hook.
   constructor(clientID: string, group: string, baseDir?: string) {
     this.clientID = clientID;
     this.group = group;
@@ -162,8 +137,6 @@ export class LocalFileOffsetStore implements OffsetStore {
     this.storePath = path.join(base, clientID, group, 'offsets.json');
   }
 
-  // Load reads offsets.json, falling back to offsets.json.bak when the main
-  // file is missing; both missing is an empty table, not an error (Java same).
   async load(): Promise<void> {
     let data: Buffer | null = null;
     try {
@@ -178,8 +151,6 @@ export class LocalFileOffsetStore implements OffsetStore {
     try {
       this.table = decodeLocalOffsetTable(data);
     } catch (e) {
-      // A corrupt file must not brick the consumer; Java logs and keeps an
-      // empty table.
       logger.warning('load local offset store %s failed: %s', this.storePath, (e as Error).message);
       this.table = new Map();
     }
@@ -209,7 +180,6 @@ export class LocalFileOffsetStore implements OffsetStore {
     return this.persistFile();
   }
 
-  // Persist writes the whole table too (Java keeps one file per group).
   async persist(_mq: MessageQueue): Promise<void> {
     return this.persistFile();
   }
@@ -221,8 +191,6 @@ export class LocalFileOffsetStore implements OffsetStore {
       if (parsed) entries[messageQueueKeyJson(parsed)] = offset;
     }
     const body = JSON.stringify({ offsetTable: entries });
-    // Java MixAll.string2File: the FIRST write creates the file, every later
-    // write rolls the previous content to offsets.json.bak before replacing.
     if (fs.existsSync(this.storePath)) {
       try { fs.writeFileSync(this.storePath + '.bak', fs.readFileSync(this.storePath)); } catch (e) { /* best effort */ }
     }
@@ -240,9 +208,6 @@ export class LocalFileOffsetStore implements OffsetStore {
 
 // ------------------------------------------------------------- file format
 
-// messageQueueKeyJson writes Java fastjson2's shape:
-//   {"brokerName":"b","queueId":1,"topic":"T"}
-// object keys alphabetically: brokerName, queueId, topic.
 function messageQueueKeyJson(mq: MessageQueue): string {
   return JSON.stringify({
     brokerName: mq.getBrokerName(),
@@ -251,10 +216,6 @@ function messageQueueKeyJson(mq: MessageQueue): string {
   });
 }
 
-// decodeLocalOffsetTable parses Java's compact and pretty variants. Legacy
-// flat "topic+broker+queueId" string keys cannot round-trip through a
-// MessageQueue-keyed table and are skipped (the file is rewritten in the Java
-// shape on the next persist).
 function decodeLocalOffsetTable(data: Buffer): Map<string, number> {
   const out = new Map<string, number>();
   const obj = JSON.parse(data.toString('utf-8'));

@@ -1,22 +1,4 @@
 # -*- coding: utf-8 -*-
-"""admin 消息轨迹（messageTrackDetail / consumed / examineConsumeStatsGroup）与
-VIP 通道开关的离线单测，不需要集群。
-
-对齐 Java `DefaultMQAdminExtImpl`：
-  - `examineConsumeStats(group[, topic])`（:389-424）：按 `%RETRY%<group>` 的路由扇出
-    全部 broker，逐台取统计并合并；全空时抛 MQClientException。
-  - `consumed(msg, group)`（:1533-1557）：按 topic + queueId 匹配位点表，且 master
-    地址（brokerId=0）必须等于消息的 storeHost，consumerOffset 越过 queueOffset 才算已消费。
-  - `messageTrackDetail(msg)`（:1349-1427）：逐组判
-    CONSUMED / CONSUMED_BUT_FILTERED / PULL / NOT_CONSUME_YET / NOT_ONLINE /
-    CONSUME_BROADCASTING，异常分支的 desc 口径与 Java 一致（NOT_ONLINE 带
-    "CODE:n DESC:msg"，BROADCAST_CONSUMPTION 不带，其余异常只带文案）。
-
-VIP 开关（Java `ClientConfig#vipChannelEnabled`，5.x 默认 false）只作用于 broker 类
-请求：`MixAll.brokerVIPChannel` = 端口 - 2。NameServer 类请求（topic 删除、KV 配置、
-读写权限清理）永远直连 NameServer 原端口 —— 这是曾经的回归点：python/rust 曾把
-DELETE_TOPIC_IN_NAMESRV、WIPE/ADD_WRITE_PERM_OF_BROKER 误路由进 broker 通道。
-"""
 from __future__ import annotations
 
 import pytest
@@ -120,7 +102,6 @@ def test_broker_vip_channel_vectors():
     assert MixAll.broker_vip_channel(False, ADDR_A) == ADDR_A
     assert MixAll.broker_vip_channel(True, ADDR_A) == "127.0.0.1:10909"
     assert MixAll.broker_vip_channel(True, "10.0.0.1:8899") == "10.0.0.1:8897"
-    # 端口不可解析 / 无冒号：原样返回（Java 抛 NumberFormatException，这里不崩）
     assert MixAll.broker_vip_channel(True, "127.0.0.1:abc") == "127.0.0.1:abc"
     assert MixAll.broker_vip_channel(True, "127.0.0.1") == "127.0.0.1"
 
@@ -128,7 +109,7 @@ def test_broker_vip_channel_vectors():
 def test_vip_knob_defaults_off_and_only_rewrites_broker_requests():
     client = _FakeClient([_ok() for _ in range(3)])
     admin = _admin(client)
-    assert admin.vip_channel_enabled is False  # Java 5.x 默认 false
+    assert admin.vip_channel_enabled is False
 
     # 开关关闭：broker 请求走原端口
     admin._invoke_broker(ADDR_A, 17)
@@ -164,7 +145,6 @@ def test_examine_consume_stats_group_merges_brokers_and_sums_tps():
     assert set(result.offset_table) == {
         MessageQueue(TOPIC, "broker-a", 0), MessageQueue(TOPIC, "broker-b", 0)}
     assert result.consume_tps == pytest.approx(2.0)
-    # 路由必须落在 %RETRY%<group> 上（Java examineConsumeStats(group) 同口径）
 
 
 def test_examine_consume_stats_group_raises_when_empty():
@@ -270,7 +250,7 @@ def test_message_track_broadcasting_has_no_desc(monkeypatch):
         consumed_error=MQBrokerException(ResponseCode.BROADCAST_CONSUMPTION, "broadcast"))
     tracks = admin.message_track_detail(_msg())
     assert tracks[0].track_type == TrackType.CONSUME_BROADCASTING
-    assert tracks[0].exception_desc is None  # Java 的 BROADCAST_CONSUMPTION 分支不带 desc
+    assert tracks[0].exception_desc is None
 
 
 def test_message_track_not_consumed_yet(monkeypatch):
@@ -296,7 +276,6 @@ def test_message_track_consumed_but_filtered_by_tags(monkeypatch):
 
 
 def test_message_track_sql92_empty_tags_set_falls_back_to_consumed(monkeypatch):
-    # SQL92 订阅没有 tagsSet：忠实保留 Java 语义，落回 CONSUMED
     admin = _track_admin(monkeypatch, [GROUP],
                          _cc("CONSUME_PASSIVELY", {"tagsSet": []}),
                          consumed_result=True)
@@ -317,7 +296,6 @@ def test_message_track_groups_sorted_and_no_route_means_empty(monkeypatch):
     tracks = admin.message_track_detail(_msg())
     assert [t.consumer_group for t in tracks] == ["g-a", "g-b"]  # set 排序，输出确定
 
-    # topic 无路由（broker 地址全空）⇒ Java 同样返回空列表
     monkeypatch.setattr(admin, "examine_topic_route", lambda topic: _route())
     assert admin.message_track_detail(_msg()) == []
 

@@ -1,11 +1,5 @@
 // 订阅后置 + 立即心跳（#73）离线单测 —— 不需要集群。
 //
-// 对齐基准（Java 5.5.1 DefaultMQPushConsumerImpl）：
-//   * subscribe(topic, subExpression):1265-1275（class-filter / MessageSelector 两个重载同理）
-//     都是 put 进 subscriptionInner 之后 `if (mQClientFactory != null)
-//     mQClientFactory.sendHeartbeatToAllBrokerWithLock();` —— **没有**「started 之后禁止订阅」
-//     这道闸门，心跳是同步立即发的。
-//   * unsubscribe(topic):1317-1319 只 remove，**不**发心跳。
 //
 // 为什么必须锁死：真机上「新订阅没推给 broker」是静默的 —— 只表现为
 // QUERY_TOPIC_CONSUME_BY_WHO(300) 查不到本组、新 topic 分不到队列，客户端一声不响。
@@ -64,7 +58,6 @@ public class SubscribeAfterStartTests
             c.Subscribe("LateTopic", "TagA||TagB");
             Assert.Contains("LateTopic", c.SubscribedTopics());
 
-            // MessageSelector 重载同样允许（Java :1289-1303）。
             c.Subscribe("LateSqlTopic", MessageSelector.BySql("a > 1"));
             Assert.Contains("LateSqlTopic", c.SubscribedTopics());
 

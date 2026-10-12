@@ -1,13 +1,5 @@
 // 顺序消费的重投闸门（checkReconsumeTimes / 回投）单测 —— 不需要集群。
 //
-// 对齐 Java ConsumeMessageOrderlyService（:236-362）：
-//   - processConsumeResult:254-266 —— SUSPEND 先过 checkReconsumeTimes，返回 true 才
-//     makeMessageToConsumeAgain + 延后重试，返回 false 走 commit()（位点前进）
-//   - getMaxReconsumeTimes:313-320 —— 顺序侧 -1 读成 Integer.MAX_VALUE，
-//     **不是**并发侧（DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890）的 16
-//   - checkReconsumeTimes:322-339 —— 没用尽就本地 +1 并挂起；用尽则回投，
-//     **只有回投失败**才继续挂起
-//   - sendMessageBack:341-362 —— 走内部生产者当**普通消息**发到 %RETRY%<group>
 //
 // 外加 DefaultMQProducerImpl.sendKernelImpl:1004-1018 的那次「抬进请求头」：broker 的
 // handleRetryAndDLQ（SendMessageProcessor:197-210）判死信读的是 requestHeader 的
@@ -79,7 +71,6 @@ class OrderlyListener : public MessageListenerOrderly {
 public:
     explicit OrderlyListener(ConsumeOrderlyStatus status) : status_(status) {}
 
-    // 模拟 binlog 消费方：listener 置 autoCommit=false 拿走提交权（Java 手动提交用法）。
     OrderlyListener& manualCommit(bool autoCommit) {
         autoCommit_ = autoCommit;
         return *this;
@@ -187,7 +178,6 @@ void testBelowCapCountsLocallyAndSuspends() {
 }
 
 void testAtCapWithFailedSendBackStillSuspends() {
-    // 未 start → 回投必败：Java :328-331 这时 suspend=true 并且再 +1，下一轮再来。
     Harness h(2);
     std::vector<MessageExt> batch;
     batch.push_back(ext(7, 2));
@@ -262,9 +252,6 @@ void testSuccessPathSkipsTheReconsumeGate() {
 // ------------------------------------------------ 挂起时长（context 优先 + 钳位）
 
 void testOrderlySuspendMillisResolvesThenClamps() {
-    // Java submitConsumeRequestLater:211-234 —— context（默认 -1 = 没指定）优先，-1 回落
-    // 消费者配置，结果钳到 [10, 30000]。三个坏法都是静默的：不回落到配置等于吞掉用户的
-    // 配置；不钳下限则 listener 传 0 会把消费线程变成忙等；不钳上限则一次挂起能顶到天亮。
     Harness h(0);
     h.c().setSuspendCurrentQueueTimeMillis(900);
     ConsumeOrderlyContext ctx;
@@ -282,7 +269,6 @@ void testOrderlySuspendMillisResolvesThenClamps() {
     expect(resolve(30001) == 30000, "suspend.aboveCeiling", std::to_string(resolve(30001)));
     expect(resolve(std::numeric_limits<int32_t>::max()) == 30000, "suspend.intMaxClamped",
            std::to_string(resolve(std::numeric_limits<int32_t>::max())));
-    // 配置侧 -1 同样回落：Java 这时读到的还是 -1，落到钳位下限 10ms
     h.c().setSuspendCurrentQueueTimeMillis(-1);
     ctx.suspendCurrentQueueTimeMillis = -1;
     expect(h.c().orderlySuspendMillis(ctx) == 10, "suspend.bothMinusOneHitsFloor",
@@ -292,9 +278,6 @@ void testOrderlySuspendMillisResolvesThenClamps() {
 // ------------------------------------------------ autoCommit=true 的非法状态
 
 void testIllegalCommitAndRollbackUnderAutoCommitAreAcked() {
-    // Java processConsumeResult:246-250 —— autoCommit=true 时 COMMIT/ROLLBACK 是**非法**
-    // 用法（只给 binlog 消费用）：Java 只 warn、**不写 break**，顺势落进 SUCCESS 分支。
-    // 写错方向（当回滚处理）会让普通消费者被一个手滑的返回值永久卡住队列。
     for (ConsumeOrderlyStatus status :
          {ConsumeOrderlyStatus::COMMIT, ConsumeOrderlyStatus::ROLLBACK}) {
         Harness h(0);
@@ -311,7 +294,6 @@ void testIllegalCommitAndRollbackUnderAutoCommitAreAcked() {
 // ------------------------------------------------ autoCommit=false（手动提交）
 
 void testManualCommitAdvancesWithoutRequeueing() {
-    // Java:275-277 —— 显式提交：位点前进、不回投（**不记 TPS**，但 RT 在分支外照记）。
     Harness h(0);
     auto listener = std::make_shared<OrderlyListener>(ConsumeOrderlyStatus::COMMIT);
     listener->manualCommit(false);
@@ -323,7 +305,6 @@ void testManualCommitAdvancesWithoutRequeueing() {
 }
 
 void testManualRollbackRequeuesAndHoldsTheOffset() {
-    // Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试，位点不动。
     Harness h(0);
     auto listener = std::make_shared<OrderlyListener>(ConsumeOrderlyStatus::ROLLBACK);
     listener->manualCommit(false);
@@ -336,8 +317,6 @@ void testManualRollbackRequeuesAndHoldsTheOffset() {
 }
 
 void testManualSuccessHoldsTheBatchWithoutCommitting() {
-    // Java:272-274 —— autoCommit=false 的 SUCCESS 只记 OK TPS、**不提交**。本端口的等价
-    // 处理是把批次塞回队首（没有 ProcessQueue 可留给 listener），位点必须原地不动。
     Harness h(0);
     auto listener = std::make_shared<OrderlyListener>(ConsumeOrderlyStatus::SUCCESS);
     listener->manualCommit(false);
@@ -349,8 +328,6 @@ void testManualSuccessHoldsTheBatchWithoutCommitting() {
 }
 
 void testManualSuspendNeverCommitsTheOffset() {
-    // Java:288-296 —— 与自动提交分支的差别：毒消息交给 broker 之后**不 commit**，
-    // 位点前不前进由 binlog 消费方自己拿主意（写错成"照常提交"会静默丢消息）。
     Harness h(0);
     auto listener = std::make_shared<OrderlyListener>(
         ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT);
@@ -365,9 +342,6 @@ void testManualSuspendNeverCommitsTheOffset() {
 // ------------------------------------------------ 309 CONSUME_MESSAGE_DIRECTLY 的映射
 
 void testDirectConsumeOrderlyMapping() {
-    // Java 顺序 consumeMessageDirectly:103-161 —— 比并发侧多 CR_COMMIT/CR_ROLLBACK 两档，
-    // 且 order=true、autoCommit 取 listener 跑完之后的值（broker 按它决定这条直接消费算不算
-    // 已提交）。映射写错是静默的：真机上只表现为 mqadmin 的返回少一档语义。
     const std::pair<ConsumeOrderlyStatus, const char*> cases[] = {
         {ConsumeOrderlyStatus::SUCCESS, "CR_SUCCESS"},
         {ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT, "CR_LATER"},
@@ -431,8 +405,6 @@ void testRetryTopicPropertiesAreLiftedIntoTheHeader() {
     // V2 的短字段名：j=reconsumeTimes、l=maxReconsumeTimes、i=properties
     expect(wire["j"] == "4", "lift.wireJ", wire["j"]);
     expect(wire["l"] == "6", "lift.wireL", wire["l"]);
-    // ⚠ 线上属性里 RECONSUME_TIME **仍在**：Java 先序列化 properties 再抬字段。
-    // 改成「先抬后清」会让消费端读不到 broker 写的重试次数。
     expect(wire["i"].find("RECONSUME_TIME") != std::string::npos, "lift.wireKeepsProperty",
            wire["i"]);
 }

@@ -1,15 +1,3 @@
-// ProcessQueue — the per-queue buffer and bookkeeping
-// (Java org.apache.rocketmq.client.impl.consumer.ProcessQueue).
-//
-// Java keeps ONE ConcurrentSkipListMap<queueOffset, MessageExt> holding both
-// "pulled, not yet dispatched" and "dispatched, not yet acked" messages, plus a
-// separate consumingMsgOrderlyTreeMap for the orderly path. This port keeps the
-// single sorted map and marks dispatched entries with a flag instead: the
-// observables that matter (msgCount, msgSize, maxSpan, "is this message still
-// mine", removeMessage's floor) are identical, and the same model is used by
-// the Python/C++/C# ports, which is what keeps cross-language behaviour
-// comparable.
-//
 // Two flags carry the rebalance contract:
 //
 //   - dropped: the queue was revoked (rebalance, OFFSET_ILLEGAL recovery,
@@ -47,36 +35,14 @@ type processQueue struct {
 
 	msgAccCnt int64
 
-	// queueOffsetMax is Java ProcessQueue#queueOffsetMax: the highest offset
-	// ever put into the buffer (cleared by clear()). Java's removeMessage falls
-	// back to it when the buffer drains, which is how a batch that completes out
-	// of order still lets the cursor reach the end of the queue.
 	queueOffsetMax int64
 
 	lastPullTimestamp    int64 // unix millis
 	lastConsumeTimestamp int64 // unix millis of the last completion
 
-	// tryUnlockTimes / lastLockTimestamp are Java ProcessQueue's
-	// AtomicLong tryUnlockTimes + volatile lastLockTimestamp. Both ride inside
-	// ProcessQueueInfo in the 307 answer, which is the only reason they exist.
-	//
-	// lastLockTimestamp is stamped at construction and re-stamped every time the
-	// broker CONFIRMS the queue lock (Java: setLocked(true) is always paired with
-	// setLastLockTimestamp(now) in RebalanceImpl.lock/lockAll; the failure branch
-	// calls setLocked(false) WITHOUT touching the stamp, which is why the stamp
-	// lives in the true branch here too).
-	//
-	// tryUnlockTimes counts "the queue could not be released cleanly" — Java
-	// increments it when removeUnnecessaryMessageQueue fails to take the 500ms
-	// consume-lock tryLock, or throws. This port retires a queue under its own
-	// mutex with nothing to block on, so there is no failing branch to count and
-	// the value stays 0; the field is kept so the wire shape matches and so a
-	// future blocking release has somewhere to record it.
 	lastLockTimestamp int64
 	tryUnlockTimes    int64
 
-	// consumeOrderly mirrors the consumer's mode at creation time (Java reads
-	// the consumer's flag inside cleanExpiredMsg).
 	consumeOrderly bool
 }
 
@@ -89,8 +55,6 @@ func newProcessQueue(consumeOrderly bool) *processQueue {
 	}
 }
 
-// PutMessage mirrors Java ProcessQueue#putMessage. Returns true when the queue
-// went from empty to non-empty, i.e. "there is something to dispatch".
 func (pq *processQueue) PutMessage(msgs []*common.MessageExt) bool {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -112,19 +76,12 @@ func (pq *processQueue) PutMessage(msgs []*common.MessageExt) bool {
 	return wasEmpty && len(pq.msgs) > 0
 }
 
-// QueueOffsetMax is Java ProcessQueue#queueOffsetMax, kept as a running max
-// rather than "the last offset of the last put": a re-pulled batch always moves
-// forwards on a consume queue, so the two agree there, and the running max
-// cannot be dragged backwards by an out-of-order put.
 func (pq *processQueue) QueueOffsetMax() int64 {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	return pq.queueOffsetMax
 }
 
-// computeMsgAccCnt is Java ProcessQueue#putMessage's tail: backlog size taken
-// from the LAST message of the batch, as MAX_OFFSET - queueOffset, only when
-// positive.
 func computeMsgAccCnt(current int64, msgs []*common.MessageExt) int64 {
 	if len(msgs) == 0 {
 		return current
@@ -149,12 +106,6 @@ func (pq *processQueue) MsgAccCnt() int64 {
 
 // PendingStats is the flow-control triple (count, size in MB, offset span)
 // computed over the NOT-yet-dispatched entries only.
-//
-// Java measures msgCount/msgSize/maxSpan over the whole msgTreeMap, which also
-// holds messages a listener is currently chewing on. Measuring only the pending
-// buffer is what the Python/C++/C# ports do, and it is the more useful signal:
-// a slow listener must not look like a backlog and stall the pull. Kept
-// consistent across the four ports so the numbers are comparable.
 func (pq *processQueue) PendingStats() (int, float64, int64) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -187,8 +138,6 @@ func (pq *processQueue) PendingStats() (int, float64, int64) {
 	return count, float64(size) / (1024.0 * 1024.0), span
 }
 
-// MsgCount is Java ProcessQueue#getMsgCount: everything pulled but not acked,
-// dispatched included.
 func (pq *processQueue) MsgCount() int {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -204,8 +153,6 @@ func (pq *processQueue) PendingCount() int {
 	return len(pq.msgs) - len(pq.dispatched)
 }
 
-// MsgSizeMB is Java ProcessQueue#getMsgSize expressed in MB (the threshold the
-// consumer compares against is in MB too).
 func (pq *processQueue) MsgSizeMB() float64 {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -216,8 +163,6 @@ func (pq *processQueue) MsgSizeMB() float64 {
 	return float64(total) / (1024.0 * 1024.0)
 }
 
-// MaxSpan is Java ProcessQueue#getMaxSpan: lastOffset - firstOffset. It exists
-// so one message that keeps failing cannot let the offset span run away.
 func (pq *processQueue) MaxSpan() int64 {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -249,9 +194,6 @@ func (pq *processQueue) FirstMessage() (*common.MessageExt, bool) {
 	return msg, ok
 }
 
-// Contains reports whether the offset is still buffered. Java uses
-// msgTreeMap.containsValue(msg); identity does not survive a redelivery, so the
-// offset key is the honest test.
 func (pq *processQueue) Contains(offset int64) bool {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -331,12 +273,6 @@ func (pq *processQueue) RemoveMessage(batch []*common.MessageExt) int64 {
 	return pq.order[0]
 }
 
-// MinRemainingExcept is Java ProcessQueue#removeMessage's first half: the
-// smallest buffered offset that is NOT in `skip`, i.e. what the head of the
-// buffer WILL be once the entries about to be acked are gone; -1 when nothing
-// would be left. `skip` must therefore be the ACKED set. Passing the FAILED set
-// instead inverts the guard — the floor would step over exactly the entries that
-// have to hold the cursor.
 func (pq *processQueue) MinRemainingExcept(skip []*common.MessageExt) int64 {
 	skipSet := make(map[int64]struct{}, len(skip))
 	for _, msg := range skip {
@@ -353,8 +289,6 @@ func (pq *processQueue) MinRemainingExcept(skip []*common.MessageExt) int64 {
 	return -1
 }
 
-// Clear empties the buffer (Java ProcessQueue#clear, which also zeroes
-// queueOffsetMax).
 func (pq *processQueue) Clear() {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -372,7 +306,6 @@ func (pq *processQueue) rebuildOrderLocked() {
 	sort.Slice(pq.order, func(i, j int) bool { return pq.order[i] < pq.order[j] })
 }
 
-// SetDropped marks the queue revoked. Irreversible, same as Java.
 func (pq *processQueue) SetDropped() {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -386,10 +319,6 @@ func (pq *processQueue) IsDropped() bool {
 	return pq.dropped
 }
 
-// SetLocked records the LOCK_BATCH_MQ outcome for orderly consumption. A grant
-// also re-stamps lastLockTimestamp (Java's lock()/lockAll(), which pair
-// setLocked(true) with setLastLockTimestamp(now)); a refusal leaves the stamp
-// alone, again as Java does.
 func (pq *processQueue) SetLocked(locked bool) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -420,15 +349,6 @@ func (pq *processQueue) LastConsumeTimestamp() int64 {
 	return pq.lastConsumeTimestamp
 }
 
-// FillProcessQueueInfo mirrors Java ProcessQueue#fillProcessQueueInfo
-// (:432-465) for the 307 answer.
-//
-// Three of the fields are CONDITIONAL in Java and the difference is observable:
-// cachedMsgMinOffset/MaxOffset/Count are only written when the buffer is
-// non-empty (an empty queue reports 0/0/0 rather than a stale range), and the
-// transaction triple only when messages are actually in flight on the ORDERLY
-// path (Java's consumingMsgOrderlyTreeMap). cachedMsgSizeInMiB is written
-// unconditionally.
 func (pq *processQueue) FillProcessQueueInfo(info *remoting.ProcessQueueInfo) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -444,9 +364,6 @@ func (pq *processQueue) FillProcessQueueInfo(info *remoting.ProcessQueueInfo) {
 	}
 	info.CachedMsgSizeInMiB = int32(size / (1024 * 1024))
 
-	// Java's consumingMsgOrderlyTreeMap only ever receives entries when
-	// consumeOrderly is set (takeMessages), so the concurrent path must leave
-	// the triple at zero.
 	if pq.consumeOrderly {
 		inflightMin, inflightMax, inflightCount := pq.inflightOrderlyRangeLocked()
 		if inflightCount > 0 {
@@ -506,8 +423,6 @@ func (pq *processQueue) LastPullTimestamp() int64 {
 	return pq.lastPullTimestamp
 }
 
-// IsPullExpired is Java ProcessQueue#isPullExpired: no pull started within
-// PULL_MAX_IDLE_TIME. A queue that never pulled does not count as expired.
 func (pq *processQueue) IsPullExpired() bool {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
@@ -537,8 +452,6 @@ func insertOffset(sorted []int64, v int64) []int64 {
 	return sorted
 }
 
-// parseInt64 parses a property value the way Java's Long.parseLong does; the
-// caller decides what a failure means.
 func parseInt64(raw string) (int64, error) {
 	return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 }

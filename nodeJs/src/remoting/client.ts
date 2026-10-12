@@ -1,8 +1,3 @@
-// -*- coding: utf-8 -*-
-// Socket long-connection client (org.apache.rocketmq.remoting.netty.NettyRemotingClient core).
-// Provides: connection mgmt (lazy connect + reuse), invokeSync / invokeAsync / invokeOneway,
-// opaque routing, timeout, GO_AWAY reconnect-and-retry-once, fail-fast on disconnect, TLS,
-// and broker-initiated request processors.
 import net from 'node:net';
 import tls from 'node:tls';
 import fs from 'node:fs';
@@ -51,9 +46,6 @@ export class RemotingClient {
   enableReconnectForGoAway = true;
   tlsEnable = false;
   tlsOptions: TlsOptions | null = null;
-  // SOCKS proxy (Java ClientConfig#socksProxyConfig / SocksProxyConfig). null =
-  // direct connection. Applied to ALL remoting connections (Java's 0.0.0.0/0
-  // entry); TopAddressing's HTTP route fetch never goes through it.
   socksProxyConfig: SocksProxyConfig | null = null;
   private conns = new Map<string, any>();
   private buffers = new Map<string, Buffer>();
@@ -74,8 +66,6 @@ export class RemotingClient {
     if (opts.tlsOptions !== undefined) this.tlsOptions = opts.tlsOptions;
     if (opts.socksProxyConfig !== undefined) this.socksProxyConfig = opts.socksProxyConfig;
     else {
-      // Java reads the JSON from system property com.rocketmq.socks.proxy.config;
-      // the env var is the Node surface for the same shape.
       const env = (process.env['ROCKETMQ_SOCKS_PROXY_CONFIG'] || '').trim();
       if (env) this.socksProxyConfig = parseSocksProxyConfig(env);
     }
@@ -122,9 +112,6 @@ export class RemotingClient {
       const proxy = this.socksProxyConfig;
       let sock: any;
       if (proxy != null) {
-        // Java NettyRemotingClient#createBootstrap: the proxy bootstrap dials
-        // the SOCKS server itself and Socks5ProxyHandler sits BEFORE the SSL
-        // handler — wire order is TCP connect → SOCKS CONNECT → TLS upgrade.
         const [phost, pport] = parseProxyAddr(proxy.addr);
         sock = net.connect({ host: phost, port: pport });
       } else if (this.tlsEnable) {

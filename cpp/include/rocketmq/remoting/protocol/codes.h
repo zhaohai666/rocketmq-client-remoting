@@ -1,5 +1,3 @@
-// 请求码 / 响应码 / 语言码 / 序列化类型（对应 org.apache.rocketmq.remoting.protocol 枚举与常量）。
-//
 // 本文件由工具脚本依据 ROCKETMQ_JAVA_SRC 指向的 RocketMQ 服务端源码树生成
 // （RequestCode.java / ResponseCode.java / LanguageCode.java）；
 // tests/test_protocol_alignment.cpp 在设置了该环境变量时会做同样的回归守卫。
@@ -10,7 +8,6 @@
 
 namespace rocketmq {
 
-// org.apache.rocketmq.remoting.protocol.RequestCode（166 项）
 struct RequestCode {
     static constexpr int32_t SEND_MESSAGE = 10;
     static constexpr int32_t PULL_MESSAGE = 11;
@@ -180,7 +177,6 @@ struct RequestCode {
     static constexpr int32_t BATCH_ACK_MESSAGE = 200151;
 };
 
-// org.apache.rocketmq.remoting.protocol.RemotingSysResponseCode（5 项）
 struct RemotingSysResponseCode {
     static constexpr int32_t SUCCESS = 0;
     static constexpr int32_t SYSTEM_ERROR = 1;
@@ -189,7 +185,6 @@ struct RemotingSysResponseCode {
     static constexpr int32_t TRANSACTION_FAILED = 4;
 };
 
-// org.apache.rocketmq.remoting.protocol.ResponseCode（含客户端侧 RPC_* 伪响应码）
 struct ResponseCode : public RemotingSysResponseCode {
     static constexpr int32_t RPC_TIME_OUT = -1006;
     static constexpr int32_t RPC_SEND_TO_CHANNEL_FAILED = -1004;
@@ -256,7 +251,6 @@ struct ResponseCode : public RemotingSysResponseCode {
     static constexpr int32_t POLICY_NOT_EXIST = 3002;
 };
 
-// org.apache.rocketmq.remoting.protocol.LanguageCode（应用层可选 identity 提示）
 struct LanguageCode {
     static constexpr uint8_t JAVA = 0;
     static constexpr uint8_t CPP = 1;
@@ -312,7 +306,6 @@ struct LanguageCode {
 
 };
 
-// org.apache.rocketmq.remoting.protocol.SerializeType
 struct SerializeType {
     static constexpr uint8_t JSON = 0;
     static constexpr uint8_t ROCKETMQ = 1;

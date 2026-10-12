@@ -1,27 +1,5 @@
-// 异步发送内核（Java DefaultMQProducerImpl 的 ASYNC 分支 + MQClientAPIImpl.sendMessageAsync/
-// onExceptionImpl）真机验证（对齐 csharp/examples/RocketMQ.Examples/LiveAsyncSend.cs 的 A1–A6）。
-// 用法：rmq_live_async_send 127.0.0.1:9876
-//
 // 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
 //
-// 离线单测（``tests/test_producer_async.cpp``）锁的是链的形状：调用方立刻返回、钩子各跑
-// 一次、预算共享、闸门/队满怎么拒。那些场景真集群造不出来（造不出 SYSTEM_BUSY，也造不
-// 出慢 broker），但离线对拍也证不了真 broker 上的六件事：
-//   A1  「立刻返回」是真的：before 钩子睡 400ms 时调用方仍在 200ms 内返回；这一笔最后
-//       SEND_OK，且用 broker 回的 offsetMsgId 能 **viewMessage 读回原 body 和 queueOffset**
-//       （回调里的 SendResult 不是自说自话）；before 钩子在 AsyncSenderExecutor_N 上跑、
-//       用户回调在 NettyClientPublicExecutor_N 上跑（Java executeInvokeCallback 的线程口径）。
-//   A2  并发 30 笔异步发送：**每笔恰好一个终态**、全部 SEND_OK、broker 上正好落 30 条，
-//       并且各笔的 (broker, queueId, queueOffset) 互不重叠（串台的话两个回调会指向同一位置）。
-//   A3  定点发送（给了 mq）真的落在那条队列上，别的队列一条都不多。
-//   A4  拦截钩子（CheckForbidden）看到的是 CommunicationMode::ASYNC；它拒绝时异常文本原样
-//       到回调，而且 broker 上一条都没落（连请求都没发出去）。
-//   A5  批量异步（sendBatchAsync，对位 Java send(Collection, SendCallback, timeout)）：
-//       一批 5 条回调恰好一次 + broker 侧真落 5 条；定点批量真的落在指定队列；
-//       混 topic / 空批的本地校验没被异步路径绕过（错误**进回调**，一次都不欠）；
-//       背压扣的是**整批**字节，而且两份许可原样归还。
-//   A6  Shutdown 排空在途准备段（C++ 这里用的是 ``shutdown(true)``，Java 用的是不等待的
-//       ``shutdown()``）：交进来的每一笔都真的上线了，broker 上条条落地。
 //
 // ⚠ 三条脚本纪律（沿用 live_backpressure 那一轮真机联调踩出来的口径）：
 //   ① topic 一律带 stamp —— 三语言**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
@@ -98,8 +76,6 @@ bool startsWith(const std::string& s, const std::string& prefix) {
     return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
 }
 
-// 回调记账：终态条数、SEND_OK 条数、结果、异常文本，以及**跑在哪根线程上**
-// （Java 的 executeInvokeCallback 口径只能这么验）
 class Recorder : public SendCallback {
 public:
     void onSuccess(const SendResult& r) override {
@@ -150,7 +126,6 @@ public:
         return errors_.empty() ? std::string() : errors_.front();
     }
 
-    // 第一笔异常的类型名（Java 的 e.getClass().getSimpleName()）：失败**分类**看这里
     std::string firstErrorType() {
         std::lock_guard<std::mutex> lk(m_);
         return errorTypes_.empty() ? std::string() : errorTypes_.front();
@@ -230,7 +205,6 @@ public:
         ++calls_;
         mode_ = ctx.communicationMode;
         if (ctx.message != nullptr && ctx.message->getTags() == "forbidden") {
-            // 钩子抛的异常**不吞**（Java checkForbidden 的 throws 语义），一路传到回调
             throw MQClientException("live test: tag forbidden is not allowed");
         }
     }
@@ -526,10 +500,6 @@ int64_t othersLanded(DefaultMQAdminExt& admin, const std::vector<MessageQueue>& 
     return total;
 }
 
-/// 批量异步入口对位 Java `send(Collection<Message>, SendCallback, long)` / Python
-/// `send_async(list)`（走同步批量内核 `_send_batch`）。每条断言都刻意选在「只跑离线单测
-/// 看不出来」的那一侧：回调有没有交付、批量内核的本地校验有没有被异步路径绕过、错误有没有
-/// 被静默吞掉、许可有没有漏。
 void a5BatchAsync(Env& env, const std::string& t) {
     auto p = makeProducer(env, "a5");
 
@@ -550,10 +520,6 @@ void a5BatchAsync(Env& env, const std::string& t) {
     check("*  A5 请求码 = SEND_BATCH_MESSAGE(320) 由离线单测取证", true,
           "真机看不到上线报文，这一条由 tests/test_producer_async.cpp 在进程内取证");
 
-    // ①b 逐条 ID 的**落地**证据：读回 broker 存下来的那条子消息，它必须带客户端生成的
-    //     32 位 UNIQ_KEY。Java batch():1176 的顺序是「逐条 setUniqID → 才 encode()」；
-    //     顺序错了（或像修复前的本端口那样压根不写），broker 拆开批量后存的就是没有 ID 的
-    //     裸消息 —— 消费端去重、轨迹控制台串线全废，而发送侧回调照样 SEND_OK，看不出来。
     const std::vector<SendResult> batchResults = rec->results();
     const SendResult batchResult = batchResults.empty() ? SendResult{} : batchResults[0];
     // 批量 msgId 口径：客户端为整批生成的 UNIQ_KEY，而不是 broker 那串 offsetMsgId
@@ -622,8 +588,6 @@ void a5BatchAsync(Env& env, const std::string& t) {
               + " 该队列 " + num(aimedBefore) + "->" + num(aimedAfter)
               + " 其它 " + num(othersBefore) + "->" + num(othersAfter));
 
-    // ③ 混 topic 的一批：批量内核的同质性校验必须在异步路径上照样跑，且异常**进回调**
-    //    （Java 的 runnable catch → onException），不是同步抛、也不是静默丢掉。
     auto mixed = std::make_shared<Recorder>();
     p->sendBatchAsync({msg(t, "async-a5-mixed-1"), msg(env.topic("BatchOther"), "async-a5-mixed-2")},
                       mixed, 5000);
@@ -688,7 +652,6 @@ void a6ShutdownDrains(Env& env, const std::string& t) {
     auto p = makeProducer(env, "a6", hook);
     auto rec = std::make_shared<Recorder>();
     for (int32_t i = 0; i < sends; ++i) p->sendAsync(msg(t, "async-a6-" + num(i)), rec, 8000);
-    // 立刻关：Java 在这里会把队列里没跑到的任务连人带回调一起丢掉
     p->shutdown();
     const int64_t landed = waitLanded(env, t, sends, 40);
     check("A6 Shutdown 排空了队列：交进来的每一笔都上线了", landed == sends,

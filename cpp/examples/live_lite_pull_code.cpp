@@ -79,8 +79,6 @@ std::string join(const std::vector<std::string>& v) {
     return s + "]";
 }
 
-// 与 Java DefaultLitePullConsumerImpl#pullSyncImpl:1058 的
-// buildSysFlag(false, block, true, false, /*litePull=*/true) 对齐
 int32_t liteFlag() {
     return PullSysFlag::buildSysFlag(/*commitOffset=*/false, /*suspend=*/false,
                                      /*subscription=*/true, /*classFilter=*/false,

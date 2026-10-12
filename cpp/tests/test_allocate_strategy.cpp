@@ -1,5 +1,3 @@
-// 队列分配策略单测（对应 Java client/test/.../AllocateMessageQueue*Test）。
-//
 // 不起网络：策略是纯算法，真机 rebalance 另见 examples/rmq_live_*。
 // 期望值与 rust/src/client/allocate_strategy.rs 的表**逐格一致**（四语言对拍）。
 #include <algorithm>
@@ -44,14 +42,12 @@ static int g_fail = 0;
 
 namespace {
 
-// Java 测试里的 createMessageQueueList(size)：new MessageQueue("topic", "brokerName", i)
 std::vector<MessageQueue> queuesOf(int32_t size) {
     std::vector<MessageQueue> out;
     for (int32_t i = 0; i < size; ++i) out.emplace_back("topic", "brokerName", i);
     return out;
 }
 
-// Java 测试里的 createConsumerIdList(size)："CID_PREFIX" + i
 std::vector<std::string> cidsOf(size_t size) {
     std::vector<std::string> out;
     for (size_t i = 0; i < size; ++i) out.push_back("CID_PREFIX" + std::to_string(i));
@@ -86,16 +82,12 @@ struct Case {
     std::vector<std::vector<int32_t>> expect;
 };
 
-// Java `AllocateMessageQueueConsitentHashTest` 的 createConsumerIdList：`CID-i`。
-// 与 [`cidsOf`] 的 "CID_PREFIX i" **刻意不同名** —— clientId 参与哈希，改一个字符整张表就废了。
 std::vector<std::string> chCids(size_t size) {
     std::vector<std::string> out;
     for (size_t i = 0; i < size; ++i) out.push_back("CID-" + std::to_string(i));
     return out;
 }
 
-// CONSISTENT_HASH 的 Java 单测用组名 "testConsumerGroup"；组名不参与哈希，
-// 这里保留同名只为与 Java / Rust 的表可对照。
 std::vector<int32_t> chAllocateIds(const AllocateMessageQueueStrategy& strategy,
                                    const std::string& currentCid,
                                    const std::vector<MessageQueue>& mqAll,
@@ -109,7 +101,6 @@ std::vector<MessageQueue> roomQueuesOf(const std::string& brokerName, int32_t fr
     return out;
 }
 
-// Java 测试同款 resolver：broker `IDCx-brokerName` / 消费者 `IDCx-CID-i` 取 '-' 前段。
 struct DashRoom : public MachineRoomResolver {
     std::string brokerDeployIn(const MessageQueue& messageQueue) override {
         return messageQueue.brokerName.substr(0, messageQueue.brokerName.find('-'));
@@ -173,7 +164,6 @@ void runTable(const AllocateMessageQueueStrategy& strategy, const std::vector<Ca
     }
 }
 
-// Java AllocateMessageQueueAveragelyTest：10 队列 / 4 消费者 → size {3,3,2,2}
 void testAveragelyMatchesKnownSplit() {
     runTable(AllocateMessageQueueAveragely(), averagelyCases());
     std::vector<MessageQueue> mqAll = queuesOf(10);
@@ -184,18 +174,15 @@ void testAveragelyMatchesKnownSplit() {
     CHECK(sizes == std::vector<size_t>({3, 3, 2, 2}), "Java 单测 size {3,3,2,2}");
 }
 
-// Java AllocateMessageQueueAveragelyByCircleTest：10 / 4 → {0,4,8} {1,5,9} {2,6} {3,7}
 void testCircleMatchesKnownSplit() {
     runTable(AllocateMessageQueueAveragelyByCircle(), circleCases());
     std::vector<MessageQueue> mqAll = queuesOf(10);
     std::vector<std::string> cidAll = cidsOf(4);
     AllocateMessageQueueAveragelyByCircle s;
-    // Java 单测第一段断言：currentCID 不在 cidAll 里 → size 0
     CHECK_EQ(s.allocate("G", "CID_PREFIX", mqAll, cidAll).size(), static_cast<size_t>(0),
              "不在 cidAll 里 → 空结果");
 }
 
-// 守卫：非法入参返回空列表，而不是像 Java check() 那样抛 IllegalArgumentException
 void testGuardsReturnEmpty() {
     struct Guard {
         const char* name;
@@ -221,7 +208,6 @@ void testGuardsReturnEmpty() {
     }
 }
 
-// Java AllocateMessageQueueByConfigTest：配 4 个队列，2 个消费者都拿到 [0,1,2,3]
 void testByConfigMatchesKnownSplit() {
     std::vector<MessageQueue> mqAll = queuesOf(4);
     std::vector<std::string> cidAll = cidsOf(2);
@@ -233,7 +219,6 @@ void testByConfigMatchesKnownSplit() {
     CHECK(join(idsOf(s.getMessageQueueList())) == "[0,1,2,3]", "getMessageQueueList 返回配置值");
 }
 
-// Java / Python 的 ByConfig.allocate 都不调 check：守卫场景照样返回配置值
 void testByConfigIgnoresGuards() {
     AllocateMessageQueueByConfig s(queuesOf(2));
     std::vector<std::string> emptyCid;
@@ -251,7 +236,6 @@ void testByConfigDefaultsEmptyAndReturnsCopy() {
     CHECK(join(idsOf(s.allocate("G", "CID0", {}, {}))) == "[0,1,2]", "改配置后对新调用生效");
 }
 
-// getName() 字面值（Java 六个策略的 getName 返回值）
 void testStrategyNamesMatchProtocol() {
     std::vector<std::shared_ptr<AllocateMessageQueueStrategy>> strategies = {
         std::make_shared<AllocateMessageQueueAveragely>(),
@@ -294,7 +278,6 @@ void testPartitionCoversEveryQueueOnce() {
     }
 }
 
-// 与 Rust/Python 的算式对拍（直译 Java 公式，独立于被测实现）
 void testCrossCheckAgainstPythonFormula() {
     // Python consumer.py:188-214 的算式（start/end 双分支 + 切片）
     auto pythonAveragely = [](const std::vector<int32_t>& mq, const std::vector<std::string>& cid,
@@ -397,9 +380,6 @@ void runConsistentHashTable(const AllocateMessageQueueStrategy& strategy,
     }
 }
 
-// 落点表（virtualNodeCnt = 3）。期望值来自**真实 Java 5.5.1 客户端**，与 Rust / Python /
-// C# 的表逐值相同：四语言 + Java 必须算出同一个环，否则混跑时全体队列换主
-// （重复 / 漏消费），而不是"分得稍有不均"。
 const std::vector<Case>& consistentHashCases() {
     static const std::vector<Case> kCases = {
         {6, 2, {{2}, {0, 1, 3, 4, 5}}},
@@ -420,7 +400,6 @@ const std::vector<Case>& consistentHashCases() {
     return kCases;
 }
 
-// 同一算法、默认 virtualNodeCnt = 10（Java 无参构造）
 const std::vector<Case>& consistentHashDefaultVcCases() {
     static const std::vector<Case> kCases = {
         {4, 2, {{0, 2}, {1, 3}}},
@@ -437,7 +416,6 @@ void testConsistentHashRingTableLayout() {
              "默认 vc=10（Java 无参构造）");
 }
 
-// Java verifyAllocateAll：任意规模下每条队列恰好分给一个消费者（不重不漏）
 void testConsistentHashCoversEveryQueueOnce() {
     const AllocateMessageQueueConsistentHash strategy(3);
     for (int32_t mqSize = 1; mqSize <= 11; ++mqSize) {
@@ -496,7 +474,6 @@ void testConsistentHashIsStableWhenMembershipChanges() {
     }
 }
 
-// 构造期就抛（Java IllegalArgumentException）；0 合法（Java 只挡 <0）⇒ 环空 ⇒ 一条都分不到
 void testConsistentHashRejectsNegativeVirtualNodeCnt() {
     std::string text;
     bool threw = false;
@@ -514,8 +491,6 @@ void testConsistentHashRejectsNegativeVirtualNodeCnt() {
     CHECK(chAllocateIds(zero, "CID-0", queuesOf(4), chCids(2)).empty(), "vc=0 ⇒ 谁都拿不到队列");
 }
 
-// Java 探针场景：两个 cid 的虚拟节点 key（"CID-0-0"…）首字符都是 'C' ⇒ 哈希相同
-// ⇒ Java TreeMap.put 后者覆盖前者，环上只剩 CID-1 ⇒ 队列全归它。
 struct FirstCharHash : public HashFunction {
     mutable int calls = 0;
     int64_t hash(const std::string& key) const override {
@@ -548,9 +523,6 @@ void testConsistentHashGuardsReturnEmpty() {
 
 // =============================================================== MACHINE_ROOM
 
-// Java AllocateMessageQueueByMachineRoomTest：10 队列（0..4 在 room1）+ 白名单 {room1}
-// + 2 消费者 → [0,1,4] / [2,3]（真实 Java 客户端复核）。
-// 余数队列给**前 rem 个**消费者（rem > currentIndex），与 AVG 的切法不同。
 void testByMachineRoomMatchesKnownSplit() {
     std::vector<MessageQueue> mqAll;
     for (int32_t i = 0; i < 10; ++i) {
@@ -563,8 +535,6 @@ void testByMachineRoomMatchesKnownSplit() {
     CHECK_EQ(strategy.getConsumeridcs().size(), static_cast<size_t>(1), "白名单只配了 room1");
 }
 
-// broker 名必须是 `机房@名字`，且切分按 Java String#split 的裁尾口径。
-// expectedParts 一列是 JDK 17 实测的 `String#split("@")` 段数。
 void testByMachineRoomSplitsBrokerName() {
     const std::vector<std::string> cidAll = cidsOf(1);
     AllocateMessageQueueByMachineRoom strategy({"room1"});
@@ -575,7 +545,7 @@ void testByMachineRoomSplitsBrokerName() {
     };
     const std::vector<SplitCase> cases = {
         {"room1@broker-a", 2, true},
-        {"room1@", 1, false},   // 尾空段被 Java 丢掉
+        {"room1@", 1, false},
         {"room1@b@", 2, true},  // 裁尾后仍是 2 段
         {"@room1", 2, false},   // 2 段，但机房是空串、不在白名单
         {"room1@broker@a", 3, false},
@@ -590,11 +560,9 @@ void testByMachineRoomSplitsBrokerName() {
         const bool got = !allocateIds(strategy, cidAll[0], mqAll, cidAll).empty();
         CHECK_EQ(got, c.allocated, std::string("broker=\"") + c.broker + "\" 参与/剔除判定不一致");
     }
-    // 没配机房 = 一条都不分（Java 此处是 NPE，本端口按"守卫返回空"口径）
     AllocateMessageQueueByMachineRoom unset;
     CHECK(unset.allocate("G", cidAll[0], roomQueuesOf("room1@b", 0, 1), cidAll).empty(),
           "未配置白名单 ⇒ 不分（Java 是 NPE）");
-    // 白名单可替换（Java setter），换完立刻对同一条队列生效
     strategy.setConsumeridcs({"room2"});
     CHECK_EQ(strategy.getConsumeridcs().count("room2"), static_cast<size_t>(1), "getConsumeridcs 反映新配置");
     CHECK(allocateIds(strategy, cidAll[0], roomQueuesOf("room1@broker-a", 0, 1), cidAll).empty(),
@@ -614,7 +582,6 @@ void testByMachineRoomGuardsReturnEmpty() {
 
 // ========================================================= MACHINE_ROOM_NEARBY
 
-// Java AllocateMachineRoomNearbyTest#createMessageQueueList：idc 个机房 × 每机房 size 条队列
 std::vector<MessageQueue> nearbyMq(size_t idcSize, int32_t queueSize) {
     std::vector<MessageQueue> out;
     for (size_t i = 1; i <= idcSize; ++i) {
@@ -625,7 +592,6 @@ std::vector<MessageQueue> nearbyMq(size_t idcSize, int32_t queueSize) {
     return out;
 }
 
-// Java #createConsumerIdList：idc 个机房 × 每机房 consumerSize 个消费者
 std::vector<std::string> nearbyCids(size_t idcSize, size_t consumerSize) {
     std::vector<std::string> out;
     for (size_t i = 1; i <= idcSize; ++i) {
@@ -636,8 +602,6 @@ std::vector<std::string> nearbyCids(size_t idcSize, size_t consumerSize) {
     return out;
 }
 
-// Java testWhenIDCSizeEquals：机房数相等时每人只拿到**同机房**的队列，
-// 且全员并集恰好是全集（不重不漏）。四组规模与 Java 参数化用例一致。
 void testNearbyAllocatesSameRoomOnlyAndCoversEverything() {
     const AllocateMachineRoomNearby strategy(
         std::make_shared<AllocateMessageQueueAveragely>(), std::make_shared<DashRoom>());
@@ -670,12 +634,9 @@ void testNearbyAllocatesSameRoomOnlyAndCoversEverything() {
     }
 }
 
-// Java testWhenConsumerIDCIsLess：broker 机房多于消费者机房时，**没有活消费者**的机房
-// 要交给全部消费者共享（否则没人消费），有消费者的机房仍然只给自己的消费者。
 void testNearbySharesRoomsWithNoConsumer() {
     const AllocateMachineRoomNearby strategy(
         std::make_shared<AllocateMessageQueueAveragely>(), std::make_shared<DashRoom>());
-    // 真实 Java 客户端：mqs = IDC2×4 + IDC1×2，cids = IDC1 的两个消费者
     std::vector<MessageQueue> mqAll = roomQueuesOf("IDC2-brokerName", 0, 4);
     const std::vector<MessageQueue> idc1 = roomQueuesOf("IDC1-brokerName", 0, 2);
     mqAll.insert(mqAll.end(), idc1.begin(), idc1.end());
@@ -683,7 +644,6 @@ void testNearbySharesRoomsWithNoConsumer() {
 
     CHECK(join(idsOf(strategy.allocate("G", "IDC1-CID-0", mqAll, cidAll))) == "[0,0,1]",
           "IDC1 自己 2 条 + 空机房 IDC2 的 4 条按 AVG 分一半");
-    // 顺序同样是 Java 的口径：先收同机房队列，再补空机房的共享队列
     CHECK(describe(strategy.allocate("G", "IDC1-CID-0", mqAll, cidAll)) ==
               "[IDC1-brokerName#0,IDC2-brokerName#0,IDC2-brokerName#1]",
           "第 1 个消费者的分配顺序");
@@ -710,7 +670,6 @@ void testNearbySharesRoomsWithNoConsumer() {
     CHECK_EQ(claimed, manyMq.size(), "有空机房的场景下必须不重不漏");
 }
 
-// getName() = "MACHINE_ROOM_NEARBY-<内层策略名>"（Java 复核）
 void testNearbyNameExposesInnerStrategy() {
     const std::shared_ptr<MachineRoomResolver> resolver = std::make_shared<DashRoom>();
     CHECK_EQ(AllocateMachineRoomNearby(std::make_shared<AllocateMessageQueueAveragely>(), resolver)
@@ -725,8 +684,6 @@ void testNearbyNameExposesInnerStrategy() {
              std::string("MACHINE_ROOM_NEARBY-CONFIG"), "内层 CONFIG 也一样拼出来");
 }
 
-// resolver 给出空机房 ⇒ Java 抛 IllegalArgumentException。这里照抛而不返回空：
-// 静默返回空等于把整个 topic 的队列撤走，而 rebalance 抓住异常会保住现有分配。
 struct BlankBrokerRoom : public MachineRoomResolver {
     std::string brokerDeployIn(const MessageQueue&) override { return std::string(); }
     std::string consumerDeployIn(const std::string&) override { return "IDC1"; }
@@ -777,7 +734,6 @@ void testNearbyThrowsWhenRoomIsUnknown() {
     CHECK(nearby.allocate("G", "CID-0", mqAll, none).empty(), "守卫优先于 resolver 报错");
 }
 
-// Java 构造器对 null 参数抛 NullPointerException，文案照抄
 void testNearbyRejectsNullArguments() {
     const std::shared_ptr<MachineRoomResolver> resolver = std::make_shared<DashRoom>();
     bool threw = false;
@@ -821,7 +777,6 @@ void testBrokerNameSplitMatchesSpec() {
 
 }  // namespace
 
-// push / lite pull 消费者默认策略 = AVG，可替换；置 null 由 start() 拒绝（Java checkConfig）
 void testConsumersExposeStrategy() {
     DefaultMQPushConsumer push("G_test");
     CHECK(push.allocateMessageQueueStrategy() != nullptr, "push 消费者默认有策略");
@@ -864,8 +819,6 @@ void testConsumersExposeStrategy() {
     CHECK(msg.find("allocateMessageQueueStrategy is null") != std::string::npos,
           "lite 策略为 null 的文案对齐 Java：" + msg);
 
-    // 拉模式消费者同样带这份配置（Java DefaultMQPullConsumer:89 字段 + :196-202 读写口，
-    // checkConfig:803 拒绝 null）；本端口拉模式不做 rebalance，所以它是配置面。
     DefaultMQPullConsumer pull("G_test");
     CHECK_EQ(pull.allocateMessageQueueStrategy()->getName(), std::string("AVG"),
              "pull 默认策略 = AVG");

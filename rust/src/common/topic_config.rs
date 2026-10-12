@@ -1,20 +1,3 @@
-//! `TopicConfig`（对应 `org.apache.rocketmq.common.TopicConfig`，
-//! Python `rocketmq/common/topic_config.py`）。
-//!
-//! 字段与默认值以 Java 5.x 为准（探针实测，勿凭记忆改）：
-//! `new TopicConfig("t")` → readQueueNums=16, writeQueueNums=16, perm=6,
-//! topicFilterType=SINGLE_TAG, topicSysFlag=0, order=false, attributes={}。
-//! `attributes` **会被序列化**（Java 的 `getAttributes()` 没有 `serialize=false`）。
-//!
-//! ## 键顺序：与 Python 一致，而不是与 Java 一致
-//!
-//! [`TopicConfig::to_json_value`] 按 Python `to_dict()` 的声明顺序写
-//! （topicName → … → attributes）。Java `JSON.toJSONString` 走的是 POJO 字段
-//! **字母序**（`attributes, order, perm, readQueueNums, topicFilterType, topicName,
-//! topicSysFlag, writeQueueNums`），所以同一条配置的两端报文文本不同。broker 按 key
-//! 名解析，顺序不影响语义；本仓库以 Python 为参照实现，故测试里的期望文本是 Python 顺序，
-//! [`TOPIC_CONFIG_ATTRIBUTES_FIRST`] 只是留档的 Java 真值。
-//!
 //! ## 为什么协议层不引它
 //!
 //! `remoting::protocol::admin_body::TopicConfigSerializeWrapper` 里
@@ -33,16 +16,11 @@ use crate::remoting::protocol::admin_body::{
 use crate::remoting::protocol::ext_fields::StringMap;
 use crate::remoting::protocol::serialize::RemotingSerializable;
 
-/// Java `TopicConfig.defaultReadQueueNums`。
 pub const DEFAULT_READ_QUEUE_NUMS: i32 = 16;
-/// Java `TopicConfig.defaultWriteQueueNums`。
 pub const DEFAULT_WRITE_QUEUE_NUMS: i32 = 16;
 /// `PermName.PERM_READ | PermName.PERM_WRITE`。
 pub const DEFAULT_PERM: i32 = 6;
 
-/// Java `TopicConfig.TopicFilterType` 枚举名；线上就是这两个字符串，
-/// 所以与 Python 一样用 `&'static str` 而不是 Rust 枚举
-/// （`CreateTopicRequestHeader.topicFilterType` 直接收字符串）。
 pub struct TopicFilterType;
 
 impl TopicFilterType {
@@ -50,7 +28,6 @@ impl TopicFilterType {
     pub const MULTI_TAG: &'static str = "MULTI_TAG";
 }
 
-/// 对应 Java `TopicConfig`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicConfig {
     pub topic_name: String,
@@ -65,7 +42,6 @@ pub struct TopicConfig {
 }
 
 impl Default for TopicConfig {
-    /// Java 无参构造：topicName 为空串，其余取类里的默认值。
     fn default() -> TopicConfig {
         TopicConfig {
             topic_name: String::new(),
@@ -81,8 +57,6 @@ impl Default for TopicConfig {
 }
 
 impl TopicConfig {
-    /// 对应 Java `new TopicConfig(topicName)` / Python `TopicConfig("t")`：
-    /// 只有 topic 名可变，其余保持 Java 默认。
     pub fn new(topic_name: &str) -> TopicConfig {
         TopicConfig {
             topic_name: topic_name.to_string(),
@@ -112,7 +86,6 @@ impl TopicConfig {
         ])
     }
 
-    /// 对应 Python `from_dict()`：缺键回 Java 默认值，脏数据不 panic。
     pub fn from_json_value(value: &Value) -> Result<TopicConfig> {
         expect_object(value, "TopicConfig")?;
         let mut attributes = StringMap::new();
@@ -131,9 +104,6 @@ impl TopicConfig {
         })
     }
 
-    /// 对应 Python `decode(json_str)`。Python 用严格 `json.loads`；这里走
-    /// [`RemotingSerializable::decode`]（严格失败再退 fastjson2 容忍解析），
-    /// 这样 broker/Java 写出的内联对象键也能读。
     pub fn decode(text: &str) -> Result<TopicConfig> {
         let value = RemotingSerializable::decode(text.as_bytes())?;
         TopicConfig::from_json_value(&value)
@@ -148,7 +118,6 @@ impl TopicConfig {
         self.attributes.insert(key, value);
     }
 
-    /// Java 侧只认 topicName 非空；admin 用它挡掉「查不到配置」的空响应。
     pub fn has_topic_name(&self) -> bool {
         !self.topic_name.is_empty()
     }
@@ -173,8 +142,6 @@ mod tests {
     use super::*;
     use crate::error::Error;
 
-    /// Java 探针输出：`JSON.toJSONString(new TopicConfig("attr-topic"))`（字母序）。
-    /// 本模块**不产出**这段文本，留作与 Java 对拍时的参照。
     const TOPIC_CONFIG_ATTRIBUTES_FIRST: &str = concat!(
         r#"{"attributes":{"+fileReservedTime":"72","+deleteWhen":"04"},"order":false,"perm":6,"#,
         r#""readQueueNums":16,"topicFilterType":"SINGLE_TAG","topicName":"attr-topic","#,
@@ -207,7 +174,6 @@ mod tests {
 
     #[test]
     fn decode_server_output_keeps_attributes() {
-        // Java 文本能读回来（键顺序无关），attributes 逐项保留
         let cfg = TopicConfig::decode(TOPIC_CONFIG_ATTRIBUTES_FIRST).unwrap();
         assert_eq!(cfg.topic_name, "attr-topic");
         assert_eq!(cfg.attribute("+deleteWhen"), Some("04"));

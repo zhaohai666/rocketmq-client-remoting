@@ -1,20 +1,4 @@
 # -*- coding: utf-8 -*-
-"""admin 位点重置 / 组级 topic 反查的离线协议单测，不需要集群。
-
-对齐 Java `DefaultMQAdminExtImpl#resetOffsetByQueueId:1827` 与 `#queryTopicsByConsumer:1078`。
-这两条都是「看着能跑、字段错一位就静默失效」的接口：
-
-  - `resetOffsetByQueueId` 必须**先 25 后 222**，且 222 带 `queueId` + `offset`。只做第
-    1 笔的话 broker 的 `resetOffsetTable`（一次性、下次 pull 由
-    `ConsumerOffsetManager#queryThenEraseResetOffset` 取走）根本没被写入，在线消费者照旧
-    从内存位点继续拉——Java 真机实测「首笔 pull 回 PULL_OFFSET_MOVED」正是这条链路的证据。
-  - `resetOffsetByTimestamp` 反过来**不能**带 `queueId`，且 `offset` 必须是 `-1`（Java 的
-    null 口径），否则 broker 的 `resetOffsetInner` 会走单队列分支而不按 timestamp 算位点。
-  - 组级 `queryTopicsByConsumer` 路由的是 `%RETRY%<group>`（业务 topic 未必落在同一 broker
-    上），合并语义对齐 Java `TopicList.topicList`（`Set<String>`）。
-
-真机行为（5.5.1）由 `verify_admin_live.py` 第 9.5/9.6 节覆盖，这里只把协议形状锁死。
-"""
 from __future__ import annotations
 
 from client.admin import DefaultMQAdminExt
@@ -107,9 +91,7 @@ def _reset_body(mq: MessageQueue, offset: int) -> bytes:
 # ------------------------------------------------------------------ 222 编码
 
 def test_reset_offset_by_queue_id_sends_update_then_222_with_queue_id():
-    """Java `DefaultMQAdminExtImpl:1829-1837`：第 1 笔 updateConsumerOffset(25)，第 2 笔带
-    queueId + offset 的 222；且单队列重载的 timestamp 传 0、force 不传（Java 默认 false）。
-    """
+    pass
     target_mq = MessageQueue(TOPIC, "", 3)
     # 第 1 笔(25)在 client.update_consumer_offset 这一层被替身吃掉，队列里只剩 222 的响应
     client = _FakeClient([_ok(_reset_body(MessageQueue(TOPIC, "broker-a", 3), 7))])
@@ -127,7 +109,6 @@ def test_reset_offset_by_queue_id_sends_update_then_222_with_queue_id():
     assert request.ext_fields["queueId"] == "3"
     assert request.ext_fields["offset"] == "7"
     assert request.ext_fields["timestamp"] == "0"
-    # 键名必须是 isForce（Java 字段名），不是 force——负向对照见下面的 isForce 断言组
     assert request.ext_fields["isForce"] == "false"
     assert "force" not in request.ext_fields
     assert request.ext_fields["topic"] == TOPIC
@@ -136,16 +117,7 @@ def test_reset_offset_by_queue_id_sends_update_then_222_with_queue_id():
 
 
 def test_reset_offset_by_timestamp_omits_queue_id_and_keeps_map_body_language():
-    """按 timestamp 的那笔必须**不带** queueId、offset 写成 -1（Java 的 null 口径），
-    且 language 不能是 CPP。
-
-    broker 的 ``AdminBrokerProcessor.resetOffset:2263`` 只看**发起方** language 判 ``isC``
-    （仅 CPP 置真），CPP 时 220 推给在线消费者的是 ``ResetOffsetBodyForC``（JSON 数组），
-    而本端口消费者解析的是 map 形状的 ``ResetOffsetBody`` —— 用 CPP 重发会让自己的
-    消费者收不到重置。Java 管理端两个重载传的 isC 都是 false
-    （``MQClientAPIImpl:2405/2408``），且 222 的**响应**体恒为 map 形状（``Broker2Client:232``），
-    与 isC 无关。
-    """
+    pass
     client = _FakeClient([_ok(_reset_body(MessageQueue(TOPIC, "broker-a", 0), 9))],
                          route=_route(("broker-a", ADDR_A)))
     admin = _admin(client)
@@ -157,10 +129,6 @@ def test_reset_offset_by_timestamp_omits_queue_id_and_keeps_map_body_language():
     assert "queueId" not in request.ext_fields
     assert request.ext_fields["offset"] == "-1"
     assert request.ext_fields["timestamp"] == "1234567890"
-    # ext key 用 Java 的**字段名**（RemotingCommand.makeCustomHeaderToNet:437-450）：
-    # ResetOffsetRequestHeader 声明的是 `private boolean isForce` ⇒ "isForce"。
-    # 5.5.1 真机探针：发 "force" 时 broker 视 isForce=false，前重（timestamp=-1）
-    # 会把 consumerOffset 原样回显（3）而不是跳到 maxOffset（10）。
     assert request.ext_fields["isForce"] == "true"
     assert "force" not in request.ext_fields
     assert request.language == LanguageCode.PYTHON
@@ -199,12 +167,11 @@ def test_reset_offset_by_queue_id_propagates_broker_remark():
     except MQClientException as e:
         assert e.response_code == ResponseCode.SYSTEM_ERROR
         assert "not in consume queue range" in str(e)
-    # 第 1 笔已经把非法位点落库：Java 语义（两笔 RPC 非原子），这里不做保护性回滚
     assert len(client.offset_updates) == 1
 
 
 def test_reset_offset_by_timestamp_requires_at_least_one_offset_table():
-    """所有 broker 都回空表时按 Java 抛错，避免「静默重置失败」。"""
+    pass
     client = _FakeClient([_ok(b"")], route=_route(("broker-a", ADDR_A)))
     admin = _admin(client)
     try:
@@ -236,10 +203,7 @@ def test_query_topics_by_consumer_to_broker_uses_343_with_group():
 
 
 def test_query_topics_by_consumer_routes_by_retry_topic_and_dedupes():
-    """Java `DefaultMQAdminExtImpl:1078`：路由查的是 `%RETRY%<group>`，逐 broker 扇出后
-    合并进 `Set<String>`。路由查错 topic（业务 topic）在单 broker 集群上看不出来，
-    多 broker 时才会静默漏掉整个 topic。
-    """
+    pass
     client = _FakeClient(
         [_ok(_topic_list_body([TOPIC, GROUP_RETRY])), _ok(_topic_list_body([TOPIC]))],
         route=_route(("broker-a", ADDR_A), ("broker-b", ADDR_B)))

@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""公共 body（对应 org.apache.rocketmq.remoting.protocol.body.* 常用部分）。"""
 from __future__ import annotations
 
 from typing import Dict, List, Optional
@@ -525,7 +524,7 @@ class ResetOffsetBody:
 
 
 class MessageQueueForC:
-    """对应 org.apache.rocketmq.common.message.MessageQueueForC（ForC 数组的元素）。"""
+    pass
 
     def __init__(self, topic: str = "", broker_name: str = "", queue_id: int = 0,
                  offset: int = 0):
@@ -580,14 +579,10 @@ class ResetOffsetBodyForC:
 
 # ---------------------------------------------------------------- 42 GET_CONSUMER_STATUS_FROM_CLIENT
 class GetConsumerStatusBody:
-    """对应 org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody。
-
-    两个 map 的键都是 ``MessageQueue``（fastjson2 内联对象键）。
-    """
+    pass
 
     def __init__(self):
         self.message_queue_table: Dict[MessageQueue, int] = {}
-        # 已废弃的字段：Java 仍保留（consumerTable: clientId → 位点表）
         self.consumer_table: Dict[str, Dict[MessageQueue, int]] = {}
 
     def to_dict(self) -> dict:
@@ -618,7 +613,7 @@ class GetConsumerStatusBody:
 
 # ---------------------------------------------------------------- 307 / 309
 class ProcessQueueInfo:
-    """对应 org.apache.rocketmq.remoting.protocol.body.ProcessQueueInfo。"""
+    pass
 
     def __init__(self):
         self.commit_offset: int = 0
@@ -632,7 +627,7 @@ class ProcessQueueInfo:
         self.locked: bool = False
         self.try_unlock_times: int = 0
         self.last_lock_timestamp: int = 0
-        self.droped: bool = False          # Java 字段名就是 droped（拼写如此）
+        self.droped: bool = False
         self.last_pull_timestamp: int = 0
         self.last_consume_timestamp: int = 0
 
@@ -679,7 +674,7 @@ class ProcessQueueInfo:
 
 
 class CMResult:
-    """对应 org.apache.rocketmq.remoting.protocol.body.CMResult。"""
+    pass
 
     CR_SUCCESS = "CR_SUCCESS"
     CR_LATER = "CR_LATER"
@@ -690,11 +685,7 @@ class CMResult:
 
 
 class ConsumeMessageDirectlyResult:
-    """对应 org.apache.rocketmq.remoting.protocol.body.ConsumeMessageDirectlyResult。
-
-    这是 309 的应答 body，字段全是标量 —— 是四个 body 里唯一不需要处理
-    MessageQueue 内联键的一个。
-    """
+    pass
 
     def __init__(self):
         self.order: bool = False

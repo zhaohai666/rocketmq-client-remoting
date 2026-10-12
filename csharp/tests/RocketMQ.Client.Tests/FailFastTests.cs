@@ -1,12 +1,3 @@
-// 对端断开时立刻判死在途请求（Java NettyRemotingHandler#close -> NettyRemotingAbstract#failFast
-// -> requestFail），镜像 Python tests/test_fail_fast.py 与 C++ test_fail_fast.cpp。
-//
-// 缺这一步会错两件事，都不只是"慢一点"：
-//   - 时机：调用方要等满 invoke 超时（或清理线程的 timeout+1s 宽限）才发现对端早就断了，
-//     broker 重启 / 主备切换 / 网络抖动时这段空等直接压在发送链路上。
-//   - 语义：报成 RemotingTimeoutException，Java 报 RemotingSendRequestException。
-//     异步发送的重试分类按异常**类型**分流，错类型等于错决策。
-//
 // 用真 socket，不用 MockCluster：要被测的就是"读线程看见 EOF 之后做了什么"。
 using System.Buffers.Binary;
 using System.Diagnostics;
@@ -212,7 +203,6 @@ public class FailFastTests
         Assert.IsType<RemotingSendRequestException>(raw);
         Assert.DoesNotContain("timeout", raw!.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("connection closed", raw.Message);
-        // 等满超时要 30s；毫秒级判死才是 Java failFast 的口径。
         Assert.True(sw.ElapsedMilliseconds < 5000,
             "failFast must not wait for the invoke timeout, took " + sw.ElapsedMilliseconds + "ms");
     }

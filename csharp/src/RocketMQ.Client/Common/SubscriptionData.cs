@@ -1,12 +1,5 @@
-// 订阅数据（对应 org.apache.rocketmq.remoting.protocol.heartbeat.SubscriptionData
-// 与 org.apache.rocketmq.common.filter.ExpressionType / FilterAPI）。
-//
 // 用途：Consumer 注册到 broker 的心跳里携带 SubscriptionData，broker 依据
 // tagsSet / codeSet 做 TAG 过滤；subString 为 "||" 分隔的 tag 表达式。
-//
-// JSON 字段（与 fastjson2 序列化结果一致，键按字母序）：
-//   classFilterMode | codeSet | expressionType | subString | subVersion | tagsSet | topic
-// 注意：Java 的 filterClassSource 标注了 @JSONField(serialize = false)，**不参与**序列化。
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -14,7 +7,6 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Common;
 
-// org.apache.rocketmq.common.filter.ExpressionType
 public static class ExpressionType
 {
     public const string TAG = "TAG";
@@ -31,7 +23,6 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
     public SortedSet<long> CodeSet { get; set; } = new SortedSet<long>();
     public long SubVersion { get; set; }
     public string ExpressionType { get; set; } = RocketMQ.Common.ExpressionType.TAG;
-    // 仅本地使用，不参与 JSON（对齐 Java @JSONField(serialize = false)）
     public string FilterClassSource { get; set; } = string.Empty;
 
     public SubscriptionData()
@@ -116,8 +107,6 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
         return sd;
     }
 
-    // Java equals 语义：比较 classFilterMode/codeSet/subString/subVersion/tagsSet/
-    // topic/expressionType（**含** subVersion；不含 filterClassSource）。
     public override bool Equals(object? obj)
     {
         if (obj is not SubscriptionData other)
@@ -134,7 +123,6 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
             && ExpressionType == other.ExpressionType;
     }
 
-    // Java compareTo：按 "topic@subString" 字符串序
     public int CompareTo(SubscriptionData? other)
     {
         if (other is null)
@@ -154,7 +142,6 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
 
     public override int GetHashCode()
     {
-        // Java int/long 溢出语义：结果按 32 位有符号回绕
         long result = 1;
         result = 31 * result + (ClassFilterMode ? 1231 : 1237);
         result = 31 * result + SetHashCode(CodeSet);
@@ -188,8 +175,6 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
             + ", expressionType=" + ExpressionType + "]";
     }
 
-    // ---- 内部辅助 ----
-    // Java Set.hashCode() = 各元素 hashCode 之和（32 位有符号回绕）
     private static int SetHashCode(SortedSet<string> s)
     {
         long h = 0;
@@ -214,7 +199,6 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
         return unchecked((int)h);
     }
 
-    // Java set 序列化为 JSON 数组
     private static JsonValue SetToJson(SortedSet<string> s)
     {
         JsonValue arr = JsonValue.MakeArray();
@@ -238,28 +222,10 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
     }
 }
 
-// org.apache.rocketmq.common.filter.FilterAPI
 public static class FilterAPI
 {
     public const string SubAll = "*";
 
-    // 对齐 Java FilterAPI.buildSubscriptionData（Java 探针实测向量）：
-    //   null / "" / "*"   → subString 归一为 "*"，**tagsSet 与 codeSet 都保持空**
-    //   "TagA"            → tagsSet={TagA}, codeSet={2598919}
-    //   "TagA||TagB"      → tagsSet={TagA,TagB}, codeSet={2598919,2598920}
-    //   " TagA || TagB "  → subString 原样保留空格，标签各自 trim
-    //   "   "（纯空白）    → tagsSet 空、subString 原样保留（IsEmpty 只认 null/""）
-    //   "|||"             → tagsSet={|}, codeSet={124}（Java-split 只丢**末尾**空串）
-    //   "||" / "||||"     → 抛 "subString split error"（Java-split 结果数组长度为 0）
-    //
-    // ⚠ 两处曾有的偏差（都会污染心跳、并让客户端二次 tag 过滤失效）：
-    //   ① 给 "*" 塞 tagsSet={"*"} —— Java 里 tagsSet 非空才是"客户端二次 tag 过滤"的开关
-    //      （PullAPIWrapper.processPullResult 的 `!tagsSet.isEmpty()`），塞了 "*" 会让订阅
-    //      全量时把所有正常 tag 的消息客户端自己过滤掉；
-    //   ② 从不填 codeSet —— 它是 broker 侧按 tag 哈希过滤的依据
-    //      （ExpressionMessageFilter.isMatchedByConsumeQueue 走 codeSet.contains）。
-    // 另注：判空必须用"空串"而不是"全空白"—— Java StringUtils.isEmpty 只认 null/""，
-    // 纯空白（如 "   "）会走进 split 分支，结果 tagsSet 空但 subString 原样保留。
     public static SubscriptionData BuildSubscriptionData(string topic, string subString)
     {
         SubscriptionData sub = new SubscriptionData(topic, subString);
@@ -269,7 +235,6 @@ public static class FilterAPI
             return sub;
         }
 
-        // Java String.split("\\|\\|")：先全切，再丢弃**末尾**空串
         List<string> rawTags = new List<string>();
         int pos = 0;
         while (true)
@@ -292,7 +257,6 @@ public static class FilterAPI
 
         if (rawTags.Count == 0)
         {
-            // Java: throw new Exception("subString split error")
             throw new ArgumentException("subString split error");
         }
 

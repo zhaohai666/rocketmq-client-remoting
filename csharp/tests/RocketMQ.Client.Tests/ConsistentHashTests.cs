@@ -18,8 +18,6 @@ public class ConsistentHashTests
     private static string RoutedKey(ConsistentHashRouter router, string objectKey) =>
         router.RouteNode(objectKey)?.GetKey() ?? "<null>";
 
-    /// Java 只取摘要前 4 字节大端拼接（不是完整 128 bit）。
-    /// 参考值：MD5("") = d41d8cd9…、MD5("abc") = 90015098 3cd24fb0…（RFC 1321 附录 A）。
     [Theory]
     [InlineData("", 0xD41D8CD9)]
     [InlineData("abc", 0x90015098)]
@@ -29,7 +27,6 @@ public class ConsistentHashTests
         Assert.Equal(expected, new Md5Hash().Hash(key));
     }
 
-    /// 结果必须落在 32 位内：Java 的 long 只装了 4 个字节，负数永远不会出现。
     [Fact]
     public void Md5_hash_stays_in_the_low_32_bits()
     {
@@ -71,7 +68,6 @@ public class ConsistentHashTests
         Assert.Empty(router.RingHashes());
     }
 
-    /// Java 的构造器只是遍历 pNodes 调 addNode ⇒ 空集合时不会抛；检查在 addNode 里。
     [Fact]
     public void Negative_virtual_node_count_is_rejected_by_add_node()
     {
@@ -81,8 +77,6 @@ public class ConsistentHashTests
         Assert.Contains("illegal virtual node counts :-1", e.Message);
     }
 
-    /// Java 的 `i + existingReplicas`：同一物理节点二次 addNode 得到 2×v 个**不同**落点，
-    /// 而不是全撞在同一个 hash 上（TreeMap.put 会覆盖 ⇒ 实际少一半节点）。
     [Fact]
     public void Re_adding_a_node_keeps_virtual_nodes_distinct()
     {
@@ -95,7 +89,6 @@ public class ConsistentHashTests
         Assert.Equal(5, router.RingHashes().Count);
     }
 
-    /// removeNode 只摘该物理节点的虚拟节点（按 key 判定，Java 亦如此）。
     [Fact]
     public void Remove_node_drops_only_that_physical_node()
     {
@@ -108,7 +101,6 @@ public class ConsistentHashTests
         Assert.Equal("b", RoutedKey(router, "whatever"));
     }
 
-    /// 注入的 HashFunction 必须参与每一次查找（Java 允许注入）。
     private sealed class FirstByte : IHashFunction
     {
         public int Calls { get; private set; }
@@ -132,7 +124,6 @@ public class ConsistentHashTests
         Assert.True(injected.Calls > 0, "自定义哈希没被调用");
     }
 
-    /// null 哈希函数 = 默认 MD5Hash（Java 此处抛 NPE，本端口「空即默认」）。
     [Fact]
     public void Null_hash_function_falls_back_to_md5()
     {
@@ -141,7 +132,6 @@ public class ConsistentHashTests
         Assert.Equal(withMd5.RingHashes(), withNull.RingHashes());
     }
 
-    /// 环上的 hash 升序 = Java TreeMap 的遍历序（ceiling/回绕口径一致的前提）。
     [Fact]
     public void Ring_hashes_are_ascending()
     {

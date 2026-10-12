@@ -1,15 +1,5 @@
 // 推送消费者 suspend()/resume()（挂起/恢复）的离线单测 —— 进程内假集群，不需要真集群。
 //
-// 对齐基准（Java 5.5.1，逐行读过）：
-//   * DefaultMQPushConsumer#suspend():890 / #resume():898 / #isPause():902
-//     → DefaultMQPushConsumerImpl#suspend():1312-1315 只置 pause=true 并记一条 info；
-//       #resume():741-745 清标志 + **立刻 doRebalance()** 一次 + info。
-//   * 标志的读点在 pullMessage:263-266 与 popMessage:518-521，退避都是
-//     PULL_TIME_DELAY_MILLS_WHEN_SUSPEND=1000ms（:113）。
-//   * 关键顺序：盖章 lastPullTimestamp 在 pullMessage:253，**位于挂起判定之前**。
-//     写反了的后果很安静：挂起超过 120s（PULL_MAX_IDLE_TIME）后 rebalance 的停摆判据
-//     （ProcessQueue#isPullExpired）把这条循环当死循环拆掉并打 "[BUG]doRebalance ...
-//     because pull is pause" —— 一个只是被暂停的消费者被当成故障消费者处理。
 //
 // 为什么必须从 socket 上取证：suspend() 不抛错、不返回任何东西，唯一的可观测事实就是
 // 「PULL_MESSAGE(11) 到底还上不上线」。这里挂起 2.5s 数请求，恢复后再数一次。
@@ -374,10 +364,6 @@ public class SuspendResumeTests
         }
     }
 
-    /// <summary>
-    /// 幂等腿：Java 的 suspend()/resume() 都只是置标志、不判前置状态，重复调用不抛错，
-    /// 未 Start() 的消费者同样可以置标志（挂起语义由拉取循环读标志时生效）。
-    /// </summary>
     [Fact]
     public void SuspendAndResumeAreIdempotentAndSafeBeforeStart()
     {

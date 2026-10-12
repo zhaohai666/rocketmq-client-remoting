@@ -1,5 +1,3 @@
-// 220 RESET_CONSUMER_CLIENT_OFFSET（Java MQClientInstance.resetOffset:1403-1450）真机验证。
-//
 // 与 python/verify_reset_offset_live.py、rust/examples/live_reset_offset.rs、C# 的对应
 // 场景同题、逐条对应。
 //
@@ -321,9 +319,6 @@ std::string queueKeyOf(DefaultMQPushConsumer& c, const std::string& topic) {
 }
 
 // 本端口内存里的「已消费位点」；nullopt = 该队列在表里没有记录。
-//
-// 220 的重置语义（Java removeOffset）就是"重置后表里没有旧位点"，所以 nullopt 与 0 必须
-// 能分开：只有 nullopt 才能证明旧批次的 ack 没有把位点推回去。
 std::optional<int64_t> localOffset(DefaultMQPushConsumer& c, const std::string& topic) {
     const std::map<MessageQueue, int64_t> status = c.getConsumerStatus(topic);
     for (const auto& kv : status) {
@@ -424,8 +419,6 @@ void s1BackwardReset(Fixture& fx, const std::string& topic, const std::string& g
         return;
     }
 
-    // 等周期落盘的**首跳**过去（Java initialDelay＝start 后 10s，之后才是 60s 周期）。
-    // 不等它，重置后那次 persist 会与首跳混在一起，"broker 位点之所以是 3" 就说不清。
     waitUntil([&] { return nowMs() - tStart > 12000; }, 15000, 200);
     check("S1-首跳周期落盘已过（此后 60s 内不再有周期写）",
           nowMs() - tStart > 12000 && brokerIs(fx, group, topic, kMsgs),

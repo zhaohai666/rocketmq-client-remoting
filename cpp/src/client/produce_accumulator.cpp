@@ -20,14 +20,6 @@ namespace {
 
 // ---------------------------------------------------------------- 小工具
 
-// Java `String.split(sep)`（limit=0）：**丢弃所有尾部空串**，C++ 的朴素 split 会保留。
-// 用在批量应答的 MsgId/OffsetMsgId 拆条上 —— 与 Java 同口径才不会把
-// `"a,b,"` 拆成 3 段导致「条数对不上」误判。
-//
-// 唯一与 Java 不同的输入是**全空串**：Java `"".split(" ")` 返回 `[""]`（长度 1），
-// 这里返回空表。这条差异只可能经由 `KEYS` 的 join 显形，而且只在「同一批里既有
-// `KEYS=""` 又有关键字」时才看得见 —— Java 会拼出一个前导/尾随空格（HashSet 顺序还不定），
-// 这里确定性地不拼。两者对 broker 都只是"一对多的 key 索引"，取值取确定的那一个。
 std::vector<std::string> split(const std::string& text, char sep) {
     std::vector<std::string> parts;
     size_t start = 0;
@@ -46,20 +38,12 @@ std::vector<std::string> split(const std::string& text, char sep) {
     return parts;
 }
 
-// Java `String.split(MessageConst.KEY_SEPARATOR)` 的等价物（分隔符是**字符串**" "，不是 char）。
 void splitKeysInto(std::set<std::string>& target, const std::string& keys) {
     for (const std::string& p : split(keys, MessageConst::KEY_SEPARATOR[0])) {
         target.insert(p);
     }
 }
 
-// 发送前确保消息带有 UNIQ_KEY（32 位十六进制唯一 ID），与 Java
-// `MessageClientIDSetter.setUniqID` 对齐：缺失才生成，已存在则保留（幂等）。
-// 与 producer.cpp 里的 `ensureUniqId` 同实现 —— 那里是文件静态函数，不进公共头。
-//
-// ⚠ 这里**只**给批量对象本身补 ID。子消息的 UNIQ_KEY 由 `sendByAccumulator` 逐条写好
-// （Java `sendByAccumulator:791`），在**编码之前**；少了它，broker 拆开批量后每条子消息都
-// 没有客户端 ID，消费端与轨迹控制台都串不起来。
 void ensureUniqId(Message& msg) {
     std::string uniq = msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
     if (uniq.empty()) {
@@ -68,16 +52,9 @@ void ensureUniqId(Message& msg) {
     }
 }
 
-// 异步批量发送的「结局折回器」：对应 Java `MessageAccumulation.send(sendCallback)` 里那个
-// 匿名 `SendCallback`。把**一次批量发送**的结果（或异常）折回它所属批次的逐条结果，
-// 再按序交付给本批收集到的所有用户回调，最后归还全局字节额度。
-//
 // 为什么不直接把 `MessageAccumulation*` 交给回调：`finish()` 是私有的，而这里只需要
 // 「一个终点函数」。用 `std::function` 让 `sendAsyncNow()` 在成员函数里组一个闭包，
 // 就不必为了跨类访问再开一条 friend。
-//
-// 生命周期：闭包按 Java 同款捕获批次裸指针。批次由累加器的表持有，而累加器活在进程级
-// 注册表里（见文件尾 `getOrCreateProduceAccumulator`），所以批次不会先于在途回调消失。
 class AccumulationCallback : public SendCallback {
 public:
     using Reducer = std::function<void(const SendResult*, const std::exception_ptr&)>;
@@ -109,9 +86,6 @@ AggregateKey AggregateKey::ofMessage(const Message& msg) {
     AggregateKey key;
     key.topic = msg.getTopic();
     key.hasMq = false;
-    // Java `AggregateKey(message)` 用 `message.isWaitStoreMsgOK()`：**缺省即 true**。
-    // 直接比 `getWaitStoreMsgOk() == "true"` 会把普通消息（没设过 WAIT）判成 false，
-    // 攒出来的批量就会以 `WAIT=false` 下发（broker 不等刷盘就回 SEND_OK）。
     key.waitStoreMsgOk = msg.isWaitStoreMsgOk();
     const std::string tag = msg.getTags();
     key.hasTag = msg.properties.count(MessageConst::PROPERTY_TAGS) > 0;
@@ -169,15 +143,12 @@ int64_t MessageAccumulation::add(const Message& msg) {
         if (bodySize > 0) {
             messagesSize_ += bodySize;
         }
-        // Java：`String msgKeys = msg.getKeys(); if (msgKeys != null) ...` —— 注意判的是
-        // **属性存在**而不是非空串（空串会被 split 出一个空 key，join 回来还是空串）。
         auto it = msg.properties.find(MessageConst::PROPERTY_KEYS);
         if (it != msg.properties.end()) {
             splitKeysInto(keys_, it->second);
         }
         messages_.push_back(msg);
     }
-    // Java `synchronized (this) { while (!closed) { if (readyToSend()) { send(); break; } wait(); } }`
     std::unique_lock<std::mutex> lk(waitMutex_);
     while (!closed_.load()) {
         if (readyToSend()) {
@@ -200,7 +171,6 @@ bool MessageAccumulation::add(const Message& msg, std::shared_ptr<SendCallback> 
         if (bodySize > 0) {
             messagesSize_ += bodySize;
         }
-        // ⚠ 异步 `add` **不**收集 keys（Java 的不对称行为，照抄）：异步批次的 KEYS 恒为空串。
         messages_.push_back(msg);
         callbacks_.push_back(std::move(callback));
     }
@@ -255,9 +225,6 @@ MessageBatch MessageAccumulation::buildBatch() const {
     MessageBatch batch(messages_);
     batch.topic = key_.topic;
     batch.setWaitStoreMsgOk(key_.waitStoreMsgOk);
-    // 无条件写（空集合即 KEYS=""，见头文件第 5 条）。Java 是 `String.join(" ", keys)`，
-    // 顺序由 HashSet 的哈希决定（未定义）；这里用 `std::set` 的字典序，顺序确定 ——
-    // 属性语义是"空格分隔的集合"，broker 只拿它做索引，顺序无关。
     std::string joined;
     for (auto it = keys_.begin(); it != keys_.end(); ++it) {
         if (it != keys_.begin()) {
@@ -279,7 +246,6 @@ MessageBatch MessageAccumulation::buildBatch() const {
 void MessageAccumulation::splitSendResults(const SendResult& sendResult) {
     std::vector<SendResult> results;
     const size_t total = static_cast<size_t>(count());
-    // Java `isBatchConsumerQueue = !sendResult.getMsgId().contains(",")`
     if (sendResult.msgId.find(',') != std::string::npos) {
         const std::vector<std::string> ids = split(sendResult.msgId, ',');
         const std::vector<std::string> offsets = split(sendResult.offsetMsgId, ',');
@@ -287,10 +253,6 @@ void MessageAccumulation::splitSendResults(const SendResult& sendResult) {
             throw MQClientException("sendResult is illegal");
         }
         for (size_t i = 0; i < total; ++i) {
-            // 逐字段构造（Java 用的是 7 参构造器，**不是**拷贝整个 result）：
-            // `traceOn` 落回默认 true、`recallHandle` 落回 null —— 与 Java 同。
-            // 那两个字段对累加器的调用方没有意义（延时消息根本进不了累加器，
-            // 见 `canBatch`），但"少拷贝一个字段"这种事不该靠推理，照 Java 写死。
             SendResult item;
             item.sendStatus = sendResult.sendStatus;
             item.msgId = ids[i];
@@ -302,7 +264,6 @@ void MessageAccumulation::splitSendResults(const SendResult& sendResult) {
             results.push_back(std::move(item));
         }
     } else {
-        // 不含逗号：老 broker / 单条应答，所有下标都是同一份内容（Java 是同一个实例）
         results.assign(total, sendResult);
     }
     std::lock_guard<std::mutex> lk(stateMutex_);
@@ -314,7 +275,6 @@ void MessageAccumulation::releaseHold() {
 }
 
 void MessageAccumulation::sendSync() {
-    // 调用方（`add`）已经持有 `waitMutex_`，与 Java 在监视器里调 `send()` 一致。
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
         if (closed_.load()) {
@@ -336,7 +296,6 @@ void MessageAccumulation::sendSync() {
             sender->sendDirectBlocking(batch, key_.hasMq ? &key_.mq : nullptr);
         splitSendResults(result);
     } catch (...) {
-        // Java：finally 里无条件归还全局字节额度，异常继续向上抛
         releaseHold();
         waitCv_.notify_all();
         throw;
@@ -355,7 +314,6 @@ void MessageAccumulation::finish(const SendResult* result, const std::exception_
         try {
             splitSendResults(*result);
         } catch (...) {
-            // Java：`onSuccess` 里拆条失败就转 `onException`（额度在那一支里归还一次）
             const std::exception_ptr e = std::current_exception();
             releaseHold();
             for (const auto& cb : callbacks) {
@@ -374,19 +332,12 @@ void MessageAccumulation::finish(const SendResult* result, const std::exception_
             if (i < results.size()) {
                 callbacks[i]->onSuccess(results[i]);
             } else {
-                // Java 在 `if (i != count) throw` / `sendResults[i]` 越界处抛
-                // `IllegalArgumentException("sendResult is illegal")`，被外层 catch 抓住后
-                // 对**所有**回调调 `onException`。`sendResults` 恒为 `count` 长、回调也恒为
-                // `count` 个，所以这一支实际不可达，留作护栏。
                 callbacks[i]->onException(std::make_exception_ptr(
                     MQClientException("sendResult is illegal")));
             }
         }
         return;
     }
-    // Java `splitSendResults(null)` 抛 `IllegalArgumentException("sendResult is null")`；
-    // 其余情况是 `onException` 原样把 Throwable 转给每个回调（这里按 `exception_ptr` 逐个
-    // 复制 —— 语言级差异，见头文件）。
     const std::exception_ptr e =
         error != nullptr ? error
                          : std::make_exception_ptr(MQClientException("sendResult is null"));
@@ -426,9 +377,6 @@ void MessageAccumulation::sendAsyncNow() {
         sender = owner_->sender_;
     }
     if (sender == nullptr) {
-        // cpp 结构性差异：Java 的 `defaultMQProducer` 是强引用（永不为 null），这里生产者
-        // 可能已经 `detachSender()`（析构）。行为对齐 Java 的 `else throw` 支路：交错误给
-        // 回调、**不**归还额度。
         notifyCallbacksError(std::make_exception_ptr(
             MQClientException("defaultMQProducer is null, can not send message")));
         return;
@@ -439,8 +387,6 @@ void MessageAccumulation::sendAsyncNow() {
     try {
         sender->sendDirectAsync(batch, key_.hasMq ? &key_.mq : nullptr, reducer);
     } catch (...) {
-        // ⚠ Java 在这里**没有**归还 currentlyHoldSize（只有回调路径会还）—— 即"异步发送在
-        // 发起阶段就抛异常"会漏掉一份字节额度。照抄，别修。
         notifyCallbacksError(std::current_exception());
     }
 }
@@ -465,16 +411,12 @@ ProduceAccumulator::~ProduceAccumulator() {
     }
 }
 
-// Java 的 `start()` 是 `guardThreadForSyncSend.start(); guardThreadForAsyncSend.start();`
-// —— ServiceThread 的 start **可重复**（stopped=false + 起新线程），生产者重启时照样走一遍。
-// 这里用"两根线程都 joinable 才当已启动"，语义等价。
 void ProduceAccumulator::start() {
     std::lock_guard<std::mutex> lk(guardMutex_);
     if (syncGuard_.joinable() || asyncGuard_.joinable()) {
         return;
     }
     stopped_.store(false);
-    // Java 的服务名：`String.format("Client_%s_GuardForSyncSend", clientInstanceName)`
     const std::string syncName = "Client_" + instanceName_ + "_GuardForSyncSend";
     const std::string asyncName = "Client_" + instanceName_ + "_GuardForAsyncSend";
     syncGuard_ = std::thread([this, syncName] { guardLoop(true, syncName); });
@@ -500,10 +442,6 @@ void ProduceAccumulator::shutdown() {
     }
 }
 
-// ---------------- 参数 ----------------
-// Java 的 `batchMaxDelayMs / batchMaxBytes / totalBatchMaxBytes` 三个 setter 的校验区间与
-// 文案逐字照抄（`String.format("... but get %d!", v)`）。Java 抛 IllegalArgumentException，
-// 这里是 `std::invalid_argument` —— cpp 里参数域错误的标准映射。
 void ProduceAccumulator::setBatchMaxDelayMs(int32_t holdMs) {
     if (holdMs <= 0 || holdMs > 30 * 1000) {
         throw std::invalid_argument("batchMaxDelayMs expect between 1ms and 30s, but get "
@@ -551,8 +489,6 @@ int64_t ProduceAccumulator::currentlyHoldSize() const {
     return currentlyHoldSize_;
 }
 
-// ---------------- 表 ----------------
-// Java 是 `get` → `putIfAbsent` → 返回 previous。这里一把锁里做完，等价且更强。
 std::shared_ptr<MessageAccumulation> ProduceAccumulator::getOrCreateSyncBatch(
     const AggregateKey& key) {
     std::lock_guard<std::mutex> lk(syncTableMutex_);
@@ -577,8 +513,6 @@ std::shared_ptr<MessageAccumulation> ProduceAccumulator::getOrCreateAsyncBatch(
     return created;
 }
 
-// Java `map.remove(key, value)`：**只有当前映射仍指向这个 value** 才摘 ——
-// 否则会把「别人刚换上去的新批次」误摘掉。cpp 的 map 没有条件删除，手写这段判断。
 void ProduceAccumulator::removeSyncBatch(const AggregateKey& key,
                                          const std::shared_ptr<MessageAccumulation>& batch) {
     std::lock_guard<std::mutex> lk(syncTableMutex_);
@@ -597,9 +531,6 @@ void ProduceAccumulator::removeAsyncBatch(const AggregateKey& key,
     }
 }
 
-// ---------------- 归并入口 ----------------
-// Java 的 `while (true)` 重试环：拿到一个**已关闭**的批次（发过头 / 被守卫摘表）时，
-// `add` 返回 -1 / false，调用方把它从表里摘掉再重取一个。
 SendResult ProduceAccumulator::send(const Message& msg) {
     const AggregateKey partitionKey = AggregateKey::ofMessage(msg);
     while (true) {
@@ -611,11 +542,6 @@ SendResult ProduceAccumulator::send(const Message& msg) {
         }
         const std::vector<SendResult> results = batch->sendResults();
         if (static_cast<size_t>(index) >= results.size()) {
-            // Java 这里是 `batch.sendResults[index]` 裸数组访问 —— 越界抛
-            // ArrayIndexOutOfBoundsException。可达性：batch 里只有**空 body** 消息时
-            // messagesSize 恒为 0，守卫线程那支 `messagesSize == 0` 会把批次直接置 closed
-            // 摘表，被卡在 `wait()` 里的 `add` 于是醒来、跳过循环、返回一个合法下标，而
-            // 这一批从来没发过 → sendResults 为空。上游同样会抛（只是异常类型不同）。
             throw MQClientException("sendResult is illegal");
         }
         return results[static_cast<size_t>(index)];
@@ -665,27 +591,9 @@ void ProduceAccumulator::sendAsyncWithMq(const Message& msg, const MessageQueue&
     }
 }
 
-// ---------------- 守卫线程 ----------------
-// Java `GuardForSyncSendService.doWork()`：
-//   for v in syncSendBatchs.values():
-//       v.wakeup()                       // 叫醒正在 add 里等阈值的调用方去自查 readyToSend
-//       synchronized(v) { synchronized(v.closed) {
-//           if (v.messagesSize == 0) { v.closed.set(true); syncSendBatchs.remove(k, v); }
-//           else { v.notify(); } } }
-//   Thread.sleep(max(1, holdMs/2))
-//
-// Java `GuardForAsyncSendService.doWork()`：
-//   for v in asyncSendBatchs.values():
-//       if (v.readyToSend()) v.send(null)
-//       synchronized(v.closed) { if (v.messagesSize == 0) { v.closed.set(true); remove } }
-//   Thread.sleep(max(1, holdMs/2))
-//
 // ⚠ 发完的批次 `messagesSize` 仍 > 0（`send` 只置 closed，不清 size），所以它**留在表里**，
 // 直到下一次同键 `send` 拿到它、`add` 返回 -1 / false 才被摘掉重取 —— 不是守卫清的。
 void ProduceAccumulator::guardOnce(bool sync) {
-    // 先抄一份快照：Java 遍历 ConcurrentHashMap.values() 时允许并发 remove，cpp 的
-    // std::map 不行（迭代器失效）。快照里可能包含已经不在表里的批次，那也没关系 ——
-    // 下面的"摘表"判断是条件删除（值相等才删），而 wakeup / notify 对已关闭批次是无害的。
     std::vector<std::shared_ptr<MessageAccumulation>> batches;
     if (sync) {
         std::lock_guard<std::mutex> lk(syncTableMutex_);
@@ -704,9 +612,7 @@ void ProduceAccumulator::guardOnce(bool sync) {
     for (const auto& batch : batches) {
         if (sync) {
             batch->wakeup();
-            // Java 的 `synchronized (v)` —— 就是 add 里 wait/notify 的那把监视器
             std::lock_guard<std::mutex> lk(batch->waitMutex_);
-            // Java 的 `synchronized (v.closed)` —— 对应这里的 stateMutex_
             if (batch->messagesSize() == 0) {
                 batch->markClosed();
                 removeSyncBatch(batch->aggregateKey(), batch);
@@ -738,8 +644,6 @@ void ProduceAccumulator::guardLoop(bool sync, const std::string& name) {
         if (stopped_.load()) {
             break;
         }
-        // Java `Thread.sleep(Math.max(1, holdMs / 2))`：睡在 doWork 的**末尾**，
-        // 所以线程起来后的第一轮是立即跑的。
         const int64_t ms = std::max<int64_t>(1, holdMs() / 2);
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
     }
@@ -754,8 +658,6 @@ void ProduceAccumulator::detachSender() {
 
 void ProduceAccumulator::attachSender(AccumulatorSender* sender) {
     std::lock_guard<std::mutex> lk(senderMutex_);
-    // 只在"上一任已 detach"时重绑：还活着的那位继续用它（Java 是"第一次记下的那个
-    // 用到天荒地老"，同 clientId 的第二个生产者会被忽略）。
     if (sender_ == nullptr) {
         sender_ = sender;
     }
@@ -818,8 +720,6 @@ std::shared_ptr<ProduceAccumulator> getOrCreateProduceAccumulator(const std::str
         table[clientId] = created;
         return created;
     }
-    // 与 Java 的唯一差异（见头文件）：上一任生产者已经 detach（析构）时重绑到本次的生产者。
-    // sender 还活着时 `attachSender` 是空操作，与 Java 的"只认第一个"一致。
     it->second->attachSender(sender);
     return it->second;
 }

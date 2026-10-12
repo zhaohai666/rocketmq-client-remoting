@@ -1,24 +1,4 @@
 # -*- coding: utf-8 -*-
-"""CHECK_CLIENT_CONFIG(46) 的离线单测（对应 Java MQClientInstance#checkClientInBroker）。
-
-为什么要有这一步：SQL92 表达式写错时 broker **不会**报错 ——
-``ExpressionMessageFilter#isMatched`` 在 ConsumeQueue 阶段拿不到编译好的过滤数据就直接
-``return true``（静默放行全部消息），消费者启动照常成功。Java 因此在
-``DefaultMQPushConsumerImpl.start:1014`` 主动发一笔 46 号请求，把「写错的表达式」
-变成启动期错误。本端口此前只有 RequestCode 常量、没有调用方，所以这里锁死协议形状
-与分支语义（真机行为见 ``verify_sql92_live.py``）。
-
-对齐基准（Java 5.5.1，逐行读过）：
-  * ``MQClientAPIImpl#checkClientInBroker:3256``：请求头是 **null**，body 是
-    ``CheckClientRequestBody`` 的 JSON（clientId / group / subscriptionData）；
-    响应码非 SUCCESS 时抛 ``MQClientException(响应码, remark)``。
-  * ``MQClientInstance#checkClientInBroker:534``：只查非 TAG 订阅
-    （``ExpressionType.isTagType``：null / "" / TAG 都算 TAG）；broker 地址来自
-    ``findBrokerAddrByTopic``（随机一个 broker、优先 master），取不到就**跳过**；
-    某个消费者「无订阅」时是 ``return`` 而不是 ``continue``（Java 源码如此）；
-    网络类异常包装成固定文案的 MQClientException（"…server has not been upgraded…"）。
-  * ``ClientConfig#mqClientApiTimeout`` 默认 **3000ms**，这笔请求用的就是它。
-"""
 from __future__ import annotations
 
 import json
@@ -110,7 +90,7 @@ def _instance(*subs: SubscriptionData) -> MQClientInstance:
 
 
 def test_tag_only_subscription_sends_nothing():
-    """TAG（含 null/空串）一律不发 46：Java ``ExpressionType.isTagType`` 短路。"""
+    pass
     inst, rec = _instance(
         _sub("TagTopic", "tagA || tagB", ExpressionType.TAG),
         _sub("NullTypeTopic", "*", None),
@@ -128,7 +108,7 @@ def test_sql92_request_shape_matches_the_wire_contract():
     assert addr == BROKER
     # 请求头 null ⇒ 线上没有 extFields；body 是 CheckClientRequestBody 的 JSON
     assert not req.ext_fields
-    assert timeout == 3000                     # Java ClientConfig.mqClientApiTimeout
+    assert timeout == 3000
     body = rec.body_of()
     assert body["clientId"] == CLIENT_ID
     assert body["group"] == GROUP
@@ -136,7 +116,6 @@ def test_sql92_request_shape_matches_the_wire_contract():
     assert sd["topic"] == TOPIC
     assert sd["subString"] == "a > 10"
     assert sd["expressionType"] == ExpressionType.SQL92
-    # Java SubscriptionData 的序列化字段名（filterClassSource 是 @JSONField(serialize=false)）
     assert sorted(sd.keys()) == ["classFilterMode", "codeSet", "expressionType",
                                  "subString", "subVersion", "tagsSet", "topic"]
     assert "filterClassSource" not in sd
@@ -153,7 +132,7 @@ def test_broker_reject_code_becomes_client_exception():
 
 
 def test_broker_without_property_filter_support_reports_system_error():
-    """broker 未开 enablePropertyFilter 时回 SYSTEM_ERROR(1)（Java 同码）。"""
+    pass
     inst, rec = _instance(_sub())
     rec.responses = [ResponseCode.SYSTEM_ERROR]
     with pytest.raises(MQClientException) as ei:
@@ -162,11 +141,7 @@ def test_broker_without_property_filter_support_reports_system_error():
 
 
 def test_no_route_skips_the_subscription():
-    """查不到路由 → 跳过（Java findBrokerAddrByTopic 返回 null 即 continue）。
-
-    缓存被清掉后 ``find_broker_addr_by_topic`` 会先补拉一次路由（105），这里让它回空 body，
-    所以最终仍然一笔 46 都不发。
-    """
+    pass
     inst, rec = _instance(_sub())
     inst.topic_route_table.clear()
     inst.check_client_in_broker()
@@ -174,7 +149,7 @@ def test_no_route_skips_the_subscription():
 
 
 def test_transport_error_is_wrapped_with_the_protocol_message():
-    """连不上 broker 时 Java 不吞异常，而是换成一段固定文案再抛。"""
+    pass
     inst, rec = _instance(_sub())
     rec.responses = [RemotingConnectException(BROKER)]
     with pytest.raises(MQClientException) as ei:
@@ -186,7 +161,7 @@ def test_transport_error_is_wrapped_with_the_protocol_message():
 
 
 def test_empty_subscription_returns_whole_check():
-    """Java 的 ``return``（不是 ``continue``）：空订阅的消费者会把后面的检查一起终止。"""
+    pass
     inst = MQClientInstance(CLIENT_ID, ["127.0.0.1:9876"])
     rec = _Recorder()
     inst.remoting_client = rec

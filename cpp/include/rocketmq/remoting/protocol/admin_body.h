@@ -1,8 +1,3 @@
-// 管理端专用响应体（对应 org.apache.rocketmq.remoting.protocol.admin.* 与
-// body.* 中的管理类）：
-//   TopicStatsTable / TopicOffset / ConsumeStats / OffsetWrapper /
-//   TopicConfigSerializeWrapper / ConsumeQueueData / QueryConsumeQueueResponseBody
-//
 // ⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，broker 侧 fastjson 会把键直接内联成 JSON 对象，
 // 产出**非法 JSON**，例如：
 //   {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
@@ -36,8 +31,6 @@ bool parseMessageQueueKey(const std::string& key, MessageQueue& out);
 // 通用：解析以 MessageQueue 为键的 map，值为原始 JsonValue
 std::map<MessageQueue, JsonValue> decodeMessageQueueMap(const JsonValue& raw);
 
-// ---------------------------------------------------------------- TopicStatsTable
-// 对应 org.apache.rocketmq.remoting.protocol.admin.TopicOffset
 struct TopicOffset {
     int64_t minOffset = 0;
     int64_t maxOffset = 0;
@@ -47,8 +40,6 @@ struct TopicOffset {
     static TopicOffset fromJson(const JsonValue& v);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.admin.TopicStatsTable
-// 探针输出：{"offsetTable":{<MessageQueue>:{...}},"topicPutTps":0.0}
 struct TopicStatsTable {
     std::map<MessageQueue, TopicOffset> offsetTable;
     double topicPutTps = 0.0;
@@ -63,8 +54,6 @@ struct TopicStatsTable {
     static bool decode(const Bytes& data, TopicStatsTable& out);
 };
 
-// ---------------------------------------------------------------- ConsumeStats
-// 对应 org.apache.rocketmq.remoting.protocol.admin.OffsetWrapper
 struct OffsetWrapper {
     int64_t brokerOffset = 0;
     int64_t consumerOffset = 0;
@@ -78,8 +67,6 @@ struct OffsetWrapper {
     static OffsetWrapper fromJson(const JsonValue& v);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.admin.ConsumeStats
-// 探针输出：{"consumeTps":1.5,"offsetTable":{<MessageQueue>:<OffsetWrapper>}}
 struct ConsumeStats {
     std::map<MessageQueue, OffsetWrapper> offsetTable;
     double consumeTps = 0.0;
@@ -93,9 +80,6 @@ struct ConsumeStats {
     static bool decode(const Bytes& data, ConsumeStats& out);
 };
 
-// ---------------------------------------------------------------- TopicConfigSerializeWrapper
-// 对应 org.apache.rocketmq.remoting.protocol.body.TopicConfigSerializeWrapper
-// 探针输出：{"dataVersion":{...},"topicConfigTable":{"Topic":{"attributes":{},...}}}
 struct TopicConfigSerializeWrapper {
     std::map<std::string, TopicConfig> topicConfigTable;
     JsonValue dataVersion;  // 透传
@@ -107,9 +91,6 @@ struct TopicConfigSerializeWrapper {
     static bool decode(const Bytes& data, TopicConfigSerializeWrapper& out);
 };
 
-// ---------------------------------------------------------------- QueryConsumeQueue
-// 对应 org.apache.rocketmq.remoting.protocol.body.ConsumeQueueData
-// 字段：physicOffset, physicSize, tagsCode, extendDataJson, bitMap, eval, msg
 struct ConsumeQueueData {
     int64_t physicOffset = 0;
     int64_t physicSize = 0;
@@ -126,9 +107,6 @@ struct ConsumeQueueData {
     static ConsumeQueueData fromJson(const JsonValue& v);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.QueryConsumeQueueResponseBody
-// 探针输出：{"filterData":"*","maxQueueIndex":88,"minQueueIndex":1,"subscriptionData":{...}}
-// （queueData 为 null 时不出现）
 struct QueryConsumeQueueResponseBody {
     JsonValue subscriptionData;  // 透传（null 表示不出现）
     std::string filterData;

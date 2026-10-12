@@ -1,10 +1,5 @@
 // 压缩/解压单测：压缩类型解析、zlib/lz4/zstd 与外部实现的互通、17 段报文里
 // "解压后清 COMPRESSED_FLAG" 的语义、以及老版本 **类型位为 0** 的兼容路径。
-//
-// 关键点：本文件里有多条用**硬编码外部字节**做的用例——zlib 段由 Python
-// zlib.compress 生成，lz4 / zstd 段由**真 RocketMQ Java 生产代码**用的同一套库
-// （lz4-java 1.10.3 的 LZ4FrameOutputStream、zstd-jni 1.5.2-2 的 ZstdOutputStream）
-// 生成。它们用来证明我们读写的是真正的**线上格式**，而不是"自己压自己解"的自嗨。
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -47,14 +42,10 @@ const char* kZlibHex =
     "785e2bca4fce4e2dc92dd44dcecf2d284a2d2e4e4dd12d48acccc94f4cd12d1a951b951b951b95a3400e"
     "0058e0b9f0";
 
-// 同一段 1120B 明文，由 **Java lz4-java 1.10.3 的 LZ4FrameOutputStream**（即
-// Lz4Compressor 用的那个类）产出，58B。帧头 04 22 4d 18 = LZ4 Frame magic。
 const char* kLz4ExternalHex =
     "04224d186070732b000000ff0d726f636b65746d712d636f6d707265737365642d7061796c6f61642d1c"
     "00ffffffff30506c6f61642d00000000";
 
-// 同一段明文，由 **Java zstd-jni 1.5.2-2 的 ZstdOutputStream(out, 5)**（即
-// ZstdCompressor 用的那个类）产出，48B。帧头 28 b5 2f fd = zstd magic。
 const char* kZstdExternalHex =
     "28b52ffd0058240100e0726f636b65746d712d636f6d707265737365642d7061796c6f61642d010004f1"
     "ff7402010000";
@@ -70,8 +61,6 @@ std::string bigPayload(size_t size) {
     return s;
 }
 
-// 确定性**不可压缩**载荷：线性同余伪随机字节，与 Java 探针逐位一致。
-// 用于验证"膨胀也要原样往返"——压缩后端绝不能因为压不动就静默透传。
 std::string incompressiblePayload(size_t size) {
     std::string s;
     s.resize(size);
@@ -134,7 +123,6 @@ MessageExt makeMessageExt(const std::string& body, int32_t sysFlag) {
 static void testTypeResolution() {
     CHECK(hasZlibSupport(), "zlib support compiled in");
 
-    // Java CompressionType.findByValue 的向后兼容映射：0 与 3 都是 ZLIB
     CHECK(CompressionType::findByValue(0) == CompressionType::ZLIB,
           "type bits 0 -> ZLIB (legacy compatibility)");
     CHECK(CompressionType::findByValue(3) == CompressionType::ZLIB, "type bits 3 -> ZLIB");
@@ -182,10 +170,6 @@ static void testZlibRoundTrip() {
 }
 
 // ---------------------------------------------------------------- LZ4 Frame
-//
-// Java Lz4Compressor 用 lz4-java 的 LZ4FrameOutputStream，即 **LZ4 Frame 互操作格式**。
-// 这里要证明两件事：(1) 我们产的帧带标准帧头（不是 LZ4_compress_default 的裸 block）；
-// (2) 我们能把**真 Java 产的**帧解回原文——这只有硬编码外部字节才能证明。
 static void testLz4RoundTrip() {
     const std::string payload = repeatedPayload();
     if (!hasLz4Support()) {
@@ -212,7 +196,6 @@ static void testLz4RoundTrip() {
     CHECK(CompressorFactory::decompress(compressed, 1) == payload,
           "lz4 round-trip via raw type bit 1");
 
-    // 外部真值：Java lz4-java 产的 58B 帧必须能解成同一段明文
     Bytes external = UtilAll::string2Bytes(kLz4ExternalHex);
     CHECK(external.size() == 58, "external (Java lz4-java) lz4 frame fixture length == 58");
     CHECK(CompressorFactory::decompress(external, CompressionType::LZ4) == payload,
@@ -220,9 +203,6 @@ static void testLz4RoundTrip() {
 }
 
 // ---------------------------------------------------------------- ZSTD
-//
-// Java ZstdCompressor 用 zstd-jni 的 ZstdOutputStream/ZstdInputStream，产出标准
-// zstd 帧。同样需要"Java 真值"来证明格式对齐。
 static void testZstdRoundTrip() {
     const std::string payload = repeatedPayload();
     if (!hasZstdSupport()) {
@@ -244,8 +224,6 @@ static void testZstdRoundTrip() {
     CHECK(CompressorFactory::decompress(compressed, 2) == payload,
           "zstd round-trip via raw type bit 2");
 
-    // 外部真值 1：Java zstd-jni（流式写，帧头**不带** content size）产的 48B 帧。
-    // 这条覆盖的是"未知长度"分支——解码必须靠指数扩容而不是预先按声明长度开缓冲。
     Bytes external = UtilAll::string2Bytes(kZstdExternalHex);
     CHECK(external.size() == 48, "external (Java zstd-jni) zstd frame fixture length == 48");
     CHECK(CompressorFactory::decompress(external, CompressionType::ZSTD) == payload,
@@ -327,10 +305,6 @@ static void testEncodeDecodeCompressed() {
     CHECK((legacyOut.sysFlag & MessageSysFlag::COMPRESSED_FLAG) == 0,
           "legacy COMPRESSED_FLAG cleared");
 
-    // 未支持的压缩类型：**绝不能原样透传**。Java 是 CompressorFactory 抛异常 ->
-    // MessageDecoder.decode 的 catch 吞掉 -> 返回 null（消息被丢弃）。
-    // C++ 对齐为 decodeMessage 返回 false。若哪天退化成"交出压缩字节流"，
-    // 就是静默数据损坏（标志位已被清，事后无法识别）。
     {
         MessageExt bogus = makeMessageExt(payload, MessageSysFlag::COMPRESSED_FLAG | (0x4 << 8));
         bogus.body = CompressorFactory::compress(payload, CompressionType::ZLIB, 5);
@@ -349,10 +323,6 @@ static void testEncodeDecodeCompressed() {
 }
 
 // ---------------------------------------------------------------- 17 段报文 x LZ4/ZSTD
-//
-// 上面几段只证明了 codec 本身；这条走的是**线上路径**：sysFlag 的类型位
-// (COMPRESSED_FLAG | 0x1<<8 / 0x2<<8) 要能把消息正确路由到 lz4 / zstd 后端，
-// 解压后清 COMPRESSED_FLAG 但**保留类型位**（对齐 Java MessageDecoder）。
 static void testEncodeDecodeCompressedLz4Zstd() {
     const std::string payload = bigPayload(8192);  // 远超 4096 阈值，形状同线上大消息
     const int32_t codecs[] = {CompressionType::LZ4, CompressionType::ZSTD};
@@ -400,8 +370,6 @@ static void testFailuresAreLoud() {
     }
     CHECK(threw, "truncated zlib stream throws");
 
-    // **未知**压缩类型（SNAPPY=4 及 5/6/7）：Java 的 findByValue 直接抛
-    // RuntimeException，这里同样必须抛——这是"静默透传"的最后一条退路。
     for (int32_t bogus : {4, 5, 6, 7}) {
         CHECK(!throwsWhat([&] { CompressorFactory::compress(payload, bogus, 5); }).empty(),
               "unknown compression type " + std::to_string(bogus) + " -> compress throws");

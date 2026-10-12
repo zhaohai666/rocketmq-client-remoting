@@ -1,10 +1,3 @@
-# 本地位点文件格式对齐 Java LocalFileOffsetStore 的回归守卫。
-#
-# Java 侧 fastjson2 序列化 Map<MessageQueue, AtomicLong> 时把 MessageQueue 对象直接
-# 当 JSON key 写出（用真实 jar 跑 OffsetSerializeWrapper.toJson 实测）：
-#   {"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,...}}
-# 严格 JSON 非法，但 fastjson2 自产自销能读回。四端按同一格式落盘，Java 消费者
-# 与本端消费者共用同一份 ~/.rocketmq_offsets/<clientId>/<group>/offsets.json 时互认。
 import json
 import os
 
@@ -86,13 +79,11 @@ def test_save_writes_the_object_as_key_format_and_rolls_bak(offset_home):
     path = c._local_offset_path()
     raw = open(path, encoding="utf-8").read()
     assert raw.startswith('{"offsetTable":{')
-    # 首次写不产生 .bak（Java string2File 只在已有旧内容时滚动）
     assert not os.path.exists(path + ".bak")
 
     with c._lock:
         c._consume_offsets["Ttbroker-a0"] = 99
     c._save_local_offsets()
-    # .bak = 上一代内容（Java MixAll.string2File 语义）
     assert open(path + ".bak", encoding="utf-8").read() == raw
 
 
@@ -115,7 +106,6 @@ def test_load_main_then_bak_fallback(offset_home):
 
 
 def test_load_reads_a_fastjson_written_file(offset_home):
-    # Java 写出的文件本端要能读（跨端互认的核心）
     c = _consumer_with_offsets(offset_home)
     path = c._local_offset_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)

@@ -1,30 +1,3 @@
-// 异步发送链路单测：本机起 mock（同时扮演 name server 与 broker），离线、确定性地锁死
-// Java DefaultMQProducerImpl(ASYNC) + MQClientAPIImpl#sendMessageAsync/onExceptionImpl 的语义。
-//
-// 为什么必须离线：真 broker 不会稳定地"连不上""回超时""队满"，而这三种恰恰是异步重试链
-// 的判据来源（Java 的分类是 `instanceof`，见 ``MQClientAPIImpl:680-693``）。
-//
-// 覆盖：
-//   1. sendAsync 立即返回，准备工作在 AsyncSenderExecutor_N 上跑，用户回调在
-//      NettyClientPublicExecutor_N 上跑（Java 的 ThreadFactoryImpl 命名 + publicExecutor）；
-//   2. 用户回调抛异常必须被吞掉，不能带走线程池的 worker；
-//   3. 发送前校验失败走 onException，不给调用方抛异常；
-//   4. 未启动 / 已 shutdown：入口就地抛；
-//   5. broker 回非 SUCCESS 响应码**不重试**（Java operationSucceed 的 catch，needRetry=false），
-//      与同步发送按 retryResponseCodes 换 broker 的行为**刻意不同**，且容错表的
-//      reachable 位两者也不同（异步 true / 同步 false）；
-//   6. 响应超时：一次尝试就把剩余预算吃光 -> 只发一次，文案 "wait response timeout, cost=N"；
-//   7. 建连失败：快、可重试 -> 按 retryTimesWhenSendAsyncFailed 重试且**换 broker**，
-//      重试次数上限生效（用日志取证，见下方说明）；
-//   8. 定点异步发送（带 mq）永不换 broker（Java 传下去的 topicPublishInfo 是 null）；
-//   9. AsyncSenderExecutor 队满 -> MQClientException("executor rejected")。
-//
-// ⚠ 为什么第 7/8 条用日志而不是上线报文取证：Java 的语义决定了"能换 broker 的失败"只有
-//   建连级失败（快），而它根本到不了 broker；能到 broker 的失败只有响应超时（必然吃掉整个
-//   剩余预算，于是一次都不会重试）与"响应处理失败"（Java 明确不重试）。所以
-//   "重试了几次、每次换没换 broker"在离线用例里只能从 warn 日志的
-//   "async send msg by retry N times. ..., brokerName=..." 这一行取证 —— 那行日志本身就是
-//   运维排查异步重试的唯一线索，把它一起锁死更划算。
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -213,7 +186,6 @@ struct Attempt {
 struct Reply {
     int32_t code = ResponseCode::SUCCESS;
     int delayMillis = 0;
-    // true = 收下请求但永不回响应：让传输层超时（Java 的 RemotingTimeoutException 分支）
     bool silence = false;
 };
 
@@ -421,8 +393,6 @@ public:
         SendStatus status = SendStatus::SEND_OK;
         int64_t offset = -1;
         std::string message;
-        // 回调拿到的**异常对象**的类型名（Java 的 e.getClass().getSimpleName()）：
-        // 失败分类靠它，别只看 message（#78）。
         std::string errorType;
         int32_t errorCode = 0;  // 仅 MQBrokerException 有意义
         std::string threadName;
@@ -562,8 +532,6 @@ std::vector<std::string> readLogLines(const std::string& path) {
     return out;
 }
 
-// 异步重试的每一笔都会打一行 warn（Java ``onExceptionImpl:726``），带上第几次、
-// 换到哪台 broker —— 这是离线能拿到的最直接的链路证据。
 int countRetryLines(const std::string& path, std::vector<std::string>* lines = nullptr) {
     int n = 0;
     for (const std::string& line : readLogLines(path)) {
@@ -624,7 +592,6 @@ void testNonBlockingAndThreadOwnership() {
     expectInt(s.exceptionCount, 0, "no onException on success");
     expect(s.status == SendStatus::SEND_OK, "send status SEND_OK");
     expectInt(static_cast<long long>(s.offset), 1000, "result carries the broker's queueOffset");
-    // Java ThreadFactoryImpl("AsyncSenderExecutor_") / clientCallbackExecutorThreads 池
     expect(startsWith(hook->beforeName(), "AsyncSenderExecutor_"),
            "prepare+send runs on AsyncSenderExecutor_N", hook->beforeName());
     expect(startsWith(hook->afterName(), "NettyClientPublicExecutor_"),
@@ -653,7 +620,6 @@ void testNonBlockingAndThreadOwnership() {
     p.shutdown();
 }
 
-// 2. 发送前的校验失败走 onException，不给调用方抛异常（Java：准备工作在池里，异常进回调）
 void testValidationFailureGoesToCallback() {
     MockServer ns;
     MockServer broker;
@@ -728,8 +694,6 @@ void testNotStartedAndShutdown() {
            "the rejection is a producer lifecycle error", what2);
 }
 
-// 4. broker 回非 SUCCESS 响应码：异步**不重试**（Java operationSucceed 的 catch），
-//    与同步按 retryResponseCodes 换 broker 不同；容错表的 reachable 位也不同。
 void testBrokerErrorCodeDoesNotRetry() {
     MockServer ns;
     MockServer broker;
@@ -751,8 +715,6 @@ void testBrokerErrorCodeDoesNotRetry() {
         expectInt(s.exceptionCount, 1, "a broker error code goes to onException");
         expect(s.message.find("CODE:") != std::string::npos,
                "the broker's own exception text is passed through unwrapped", s.message);
-        // 回调拿到的是**异常对象**：类型是 MQBrokerException，码随响应一起过来
-        // （Java processSendResponse 抛的就是它，调用方按码分流）
         expect(s.errorType == "MQBrokerException",
                "the callback receives an MQBrokerException, not a generic client error",
                "type=" + s.errorType);
@@ -763,8 +725,6 @@ void testBrokerErrorCodeDoesNotRetry() {
         expect(item != nullptr, "the failed broker is isolated in the fault table");
         if (item != nullptr) {
             expect(!item->isAvailable(), "an async failure isolates the broker");
-            // Java updateFaultItem(brokerName, cost, true, true)：响应是 broker 给的，
-            // 所以链路是**通**的，只隔离不判不可达（同步路径传的是 false）。
             expect(item->isReachable(),
                    "an answered response keeps the broker reachable (Java async passes reachable=true)",
                    "reachable=" + std::to_string(item->isReachable()));
@@ -798,8 +758,6 @@ void testBrokerErrorCodeDoesNotRetry() {
     }
 }
 
-// 5. 响应超时：一次尝试就吃掉整个剩余预算（Java 传下去的是 timeoutMillis - cost），
-//    所以超时后剩余为 0，链路停下，文案是 Java 的 "wait response timeout, cost=N"。
 void testTimeoutSharesOneBudget() {
     MockServer ns;
     MockServer silent;
@@ -824,15 +782,12 @@ void testTimeoutSharesOneBudget() {
     expectInt(s.exceptionCount, 1, "timeout goes to onException");
     expect(s.message.find("wait response timeout, cost=") != std::string::npos,
            "Java's timeout wording is preserved", s.message);
-    // Java 在 operationFail 里把传输层异常**包成** MQClientException（文案是包装层写的），
-    // 所以回调看到的类型是 MQClientException 而不是 RemotingTimeoutException
     expect(s.errorType == "MQClientException",
            "the transport timeout reaches the callback as Java's wrapper type",
            "type=" + s.errorType);
     expectInt(silent.sendCount(), 1,
               "the shared remaining budget stops the chain after one timed-out attempt");
     expectInt(live.sendCount(), 0, "no second attempt once the budget is gone");
-    // 超时的判分在清理线程上（Java 的 scanResponseTable 每 1s 一轮），所以只卡下界
     expect(totalMs >= 700, "one full request timeout was waited out",
            "totalMs=" + std::to_string(totalMs));
     p.shutdown();
@@ -905,7 +860,6 @@ void testConnectFailureRecoversOnAnotherBroker() {
     expect(s.status == SendStatus::SEND_OK, "recovered send is SEND_OK");
     expectInt(live.sendCount(), 1, "only the live broker got the message");
     expectInt(countRetryLines(log), 1, "exactly one retry happened before recovering");
-    // Java 的 operationFail/外层 catch：建连失败既隔离也不可达（同步路径同样传 false）
     const FaultItem* dead =
         p.mqFaultStrategy().latencyFaultTolerance().getFaultItem("AsyncRecoverDead");
     expect(dead != nullptr, "the unreachable broker is recorded");
@@ -916,7 +870,6 @@ void testConnectFailureRecoversOnAnotherBroker() {
     p.shutdown();
 }
 
-// 8. 定点异步发送（带 mq）永不换 broker：Java 传下去的 topicPublishInfo 是 null
 void testPinnedQueueNeverSwitchesBroker() {
     MockServer ns;
     MockServer live;
@@ -999,10 +952,6 @@ void testQueueFullRejects() {
 
 // ================================================================ 异步发送背压
 //
-// 对端是 Java ``DefaultMQProducerImpl.executeAsyncMessageSend:635-682`` +
-// ``BackpressureSendCallBack:577-633``。这里锁的是**生产者这一侧**怎么用那两个信号量：
-// 闸在**调用方线程**上等、拿不到就回调（一次请求都不发）、链终点归还、队满时改为就地跑。
-// 基元本身（公平、原地改容量）在 test_backpressure.cpp。
 //
 // 占用在途不需要钩子：mock 的 ``delayMillis`` 让 broker 晚回响应，许可在回调之前不会归还。
 
@@ -1028,7 +977,6 @@ struct AsyncFixture {
 
 }  // namespace
 
-// 10. 默认配置与 Java 逐字一致；开关关着时**一格许可都不动**
 void testBackPressureDefaultsAndGateOff() {
     AsyncFixture fx("BpDefaults");
     DefaultMQProducer p("PG_bp_defaults");
@@ -1053,7 +1001,6 @@ void testBackPressureDefaultsAndGateOff() {
     p.shutdown();
 }
 
-// 11. 地板值（Java DefaultMQProducer:1386 / :1402 的 Math.max 与那两条日志）
 void testBackPressureFloors() {
     AsyncFixture fx("BpFloors");
     DefaultMQProducer p("PG_bp_floors");
@@ -1066,7 +1013,6 @@ void testBackPressureFloors() {
     expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 10, "the semaphore honours the floor");
     expectInt(p.getSemaphoreAsyncSendSizeAvailablePermits(), 1024 * 1024,
              "the size semaphore honours the floor");
-    // 高于地板值时原样生效（Java 的 `if (cfg > 10)` 分支）
     p.setBackPressureForAsyncSendNum(11);
     expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 11, "11 > 10 is taken literally");
 }
@@ -1096,11 +1042,9 @@ void testNumGateRejectsOnCallerThread() {
     expectInt(s.exceptionCount, 1, "the over-budget send calls back an error");
     expect(s.message == "send message tryAcquire semaphoreAsyncNum timeout",
            "the num gate text matches Java word for word", s.message);
-    // 闸门拒绝在 Java 里是 RemotingTooMuchRequestException（唯一不重试的传输错误）
     expect(s.errorType == "RemotingTooMuchRequestException",
            "the gate rejection keeps the Java type (callers branch on it)",
            "type=" + s.errorType);
-    // Java 的 executeAsyncMessageSend 在调用方线程上直接 sendCallback.onException(...)
     expect(!startsWith(s.threadName, "AsyncSenderExecutor_")
                && !startsWith(s.threadName, "NettyClientPublicExecutor_"),
            "the rejection is reported on the caller thread, not on a pool", s.threadName);
@@ -1147,7 +1091,6 @@ void testSizeGateRejectsAndGivesTheNumPermitBack() {
            "the size gate text matches Java word for word", s.message);
     expect(s.errorType == "RemotingTooMuchRequestException",
            "the size gate keeps the Java type too", "type=" + s.errorType);
-    // Java 用 isSemaphoreAsyncNumAcquired 标记做到「只还拿到的那份」
     expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), kMinAsyncSendNum - 1,
              "the in-flight send still holds exactly one num permit");
     expect(first->waitDone(10000), "the first big send still completes");
@@ -1185,7 +1128,6 @@ void testInFlightSendBorrowsBothPermits() {
     p.shutdown();
 }
 
-// 15. 运行时扩容把正卡在闸上的人叫醒（Java 换 Semaphore 对象做不到的事，本实现能）
 void testRuntimeResizeWakesABlockedSender() {
     AsyncFixture fx("BpResize", 2000 /* 占满 10 格，留出观察窗口 */);
     DefaultMQProducer p("PG_bp_resize");
@@ -1223,7 +1165,6 @@ void testRuntimeResizeWakesABlockedSender() {
     p.shutdown();
 }
 
-// 16. 队满 + 背压开：Java 就地跑完这一笔（阻塞调用方），而不是抛 executor rejected
 void testQueueFullRunsWithBackPressureOn() {
     AsyncFixture fx("BpQueueFull");
     int32_t cores = static_cast<int32_t>(std::thread::hardware_concurrency());
@@ -1309,10 +1250,6 @@ void testFailedAndRetriedSendsReleasePermits() {
     }
 }
 
-// 18. 批量异步（对应 Java DefaultMQProducer.send(Collection, SendCallback, timeout):1121，
-//     也就是 Python send_async 收到 list 时走的批量分支）：一批**一个请求**、回调恰好一次、
-//     请求码是 SEND_BATCH_MESSAGE，而**每条子消息**的本地校验照样生效。
-//     离线用例只能证到「校验/回调」这一半；真落盘的那一半在 live 用例里。
 void testBatchAsyncOneRequestOneCallback() {
     AsyncFixture fx("BatchAsync");
     auto hook = std::make_shared<ThreadNameHook>();
@@ -1424,10 +1361,6 @@ void testBatchAsyncRejectsBeforeStart() {
               "no callback on a synchronous rejection");
 }
 
-// 21. 批量消息的**逐条客户端 ID**：Java DefaultMQProducer.batch():1172-1184 的顺序是
-//     逐条 setUniqID → 批量自身 setUniqID → **才** encode()。少了任何一步都只能在上线
-//     报文上取证：broker 把批量拆开之后每条子消息都没有 UNIQ_KEY，消费端与轨迹控制台
-//     串不起发送侧和消费侧，而发送侧看起来一切「正常」。
 void testBatchAsyncWritesClientIdsBeforeEncodingTheBody() {
     AsyncFixture fx("BatchIds");
     DefaultMQProducer p("PG_batch_ids");
@@ -1468,9 +1401,6 @@ void testBatchAsyncWritesClientIdsBeforeEncodingTheBody() {
     p.shutdown();
 }
 
-// 22. 异步链的 n/c/d：异步自己建头（buildSendRequest），所以同步侧对齐了不代表它也对齐了。
-// Java sendKernelImpl:996-997/1007 对四种通信模式是同一段代码，报文形状必须一致；
-// 而且请求跨重试只建一次，n 应当始终是第一次选中的那台 broker。
 void testAsyncSendHeaderCarriesBrokerNameAndTopicKeys() {
     AsyncFixture fx("AsyncHeaderFields");
     DefaultMQProducer p("PG_async_header");
@@ -1499,8 +1429,6 @@ void testAsyncSendHeaderCarriesBrokerNameAndTopicKeys() {
     p.shutdown();
 }
 
-// 23. 定点发送的守卫在异步入口上是**另一句文案**（Java `DefaultMQProducerImpl:1277-1278`），
-//     异常走回调；拒绝发生在任何请求之前（mock 的 SEND 计数不动）。批量异步共用同一处。
 void testPinnedTopicGuardAsync() {
     AsyncFixture fx("AsyncPinnedGuard");
     DefaultMQProducer p("PG_async_pinned_guard");

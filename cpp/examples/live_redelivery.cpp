@@ -1,42 +1,3 @@
-// 消费侧补齐真机验证（对齐 Java：回投 / 位点持久化 / 顺序锁 / 广播 / 流控）。
-// 用法：rmq_live_redelivery 127.0.0.1:9876
-//
-// 场景：
-//   S1 回投：listener 对 "retry-me" 首次返回 RECONSUME_LATER → 应经 %RETRY%topic
-//      （延迟梯度 level3=10s）二次投递且 reconsumeTimes=1；正常消息只投一次。
-//   S2 位点持久化：消费 3 条后重启同组消费者 → 旧消息不重复，新消息继续投递。
-//   S3 顺序消费：orderly listener 消费正常，且 broker 队列锁（LOCK_BATCH_MQ）生效。
-//   S4 广播模式：同组两个消费者各自收全所有消息。
-//   S5 流控：阈值 2 + 慢消费 → 流控触发计数 >0，最终消息全部消费。
-//   S6 集群多实例 rebalance：同组两实例均分队列（不重不漏），40 条消息无重复消费，
-//      并且两侧都收到过 broker 反向推的 NOTIFY_CONSUMER_IDS_CHANGED(40)。
-//   S7 优雅注销：shutdown 发 UNREGISTER_CLIENT，broker 端立刻摘除 clientId。
-//   S8 命名空间：带 namespace 的生产者/消费者在 "<ns>%<topic>" 上收发成功；不带 namespace
-//      的消费者订阅同名裸 topic 收不到（多租户隔离）。
-//   S9 死信终态：maxReconsumeTimes=2 ⇒ 恰好投递 3 次（reconsumeTimes 0/1/2），第 3 次回投后
-//      broker 改投 %DLQ%<group>（自动建 topic 并注册路由），死信里 reconsumeTimes=3、
-//      RETRY_TOPIC 保留业务 topic，且原组不再有第 4 次投递。
-//   S10 部分 ack（ackIndex）：CONSUME_SUCCESS + 一批 3 条里只认可第 1 条 ⇒ 尾巴 2 条经
-//      %RETRY% 重投（reconsumeTimes>=1、listener 看到业务 topic）、已认可的那条整个窗口
-//      只投一次、3 条最终全部消费完、业务队列位点仍整批提交到 3；对照组（不碰 ackIndex）
-//      一条都不回投。
-//   S12 顺序消费毒消息：listener 一直 SUSPEND + maxReconsumeTimes=2 ⇒ 本地恰好投 3 次
-//      （reconsumeTimes 0/1/2，每次自己 +1），第 3 次交 broker 后业务队列继续前进，
-//      消息因 rebalance 锁未过期被 broker 立刻改投 %DLQ%<group>（reconsumeTimes=3、
-//      RETRY_TOPIC 保留业务 topic）。S12b：默认 -1 在顺序侧是不设上限（投过 >=18 次、
-//      %DLQ% 空），不是并发侧的 16。S12c：context.suspendCurrentQueueTimeMillis 优先于
-//      消费者配置（配置 900/context 70 ⇒ 相邻投递中位间隔贴着 70ms+50ms 节拍；context -1
-//      ⇒ 回落配置 400ms；1ms/0 两个非法值钳到下限不忙等）。
-//   S11 拉取停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME=120s）：把仍归本实例的队列
-//      的 lastPull 时刻倒拨到阈值之外 ⇒ 这一趟 rebalance 必须撤掉它（持久化位点）并重建
-//      拉取线程，之后同一队列继续消费、307 运行信息里的 lastPullTimestamp 是真值、
-//      且前面消费过的 6 条一条都不重投（位点没回退）。
-//
-// ⚠ 每个场景都必须**先建 topic 再启动消费者**（见 prepareTopic）。消费者不做默认 topic
-//   兜底（对齐 Java：只有生产者才会拿 TBW102 为新 topic 合成发布信息），所以 topic 不存在
-//   时消费者拿不到路由 → 不分配队列 → 不消费；等它自己发现路由时，CONSUME_FROM_LAST_OFFSET
-//   已把位点解析到"发现时刻的最新"，期间生产的消息会被正常跳过（Java 同样）。那是语义
-//   正确但测不出东西的假失败，不是客户端 bug。
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -655,18 +616,6 @@ int main(int argc, char* argv[]) {
         nsProducer.shutdown();
     }
 
-    // ---------------- S9 死信终态（%DLQ%） ----------------
-    // 为什么只能真机验：「重试到第几次算用尽」两端各写一半。客户端只把
-    // maxReconsumeTimes 塞进 CONSUMER_SEND_MSG_BACK 请求头（Java
-    // DefaultMQPushConsumerImpl#sendMessageBack:773，-1 时按 16 传，见
-    // #getMaxReconsumeTimes:890）；判定与改投 %DLQ%<group> 全在 broker
-    // （AbstractSendMessageProcessor#consumerSendMsgBack:183 用
-    // `msgExt.getReconsumeTimes() >= maxReconsumeTimes`，注意是 >= 而不是 >；
-    // 转死信时 topic 换成 MixAll::getDlqTopic(group)、顺手建 topic 并注册路由，
-    // :226 又给 reconsumeTimes +1）。两种写反都表现为「看起来正常」：客户端漏传
-    // header ⇒ broker 用订阅组默认的 16 次，测试等到天荒地老；把 >= 写成 > ⇒
-    // 多投一次才进死信。离线单测锁不住任何一边。
-    // 这里用 maxReconsumeTimes=2 把终态压到几十秒，逐条钉住投递次数与死信内容。
     {
         const std::string topic = gPrefix + "_Dlq";
         const std::string group = gPrefix + "_g9";
@@ -776,15 +725,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ---------------- S10 部分 ack（ackIndex） ----------------
-    // Java ConsumeMessageConcurrentlyService#processConsumeResult:207-269：CONSUME_SUCCESS
-    // 时 listener 写的 ackIndex 把本批切成「已认可前缀 / 待回投后缀」，尾巴逐条
-    // sendMessageBack；默认 Integer.MAX_VALUE 就是整批认可。
-    // 离线单测（tests/test_consume_ack_index.cpp）只能锁「回投**失败**时位点不越过它」
-    // —— 未 start 的消费者回投必败；「回投成功时尾巴真的被 broker 收下重投、已 ack 的那条
-    // 整个窗口只投一次、业务队列位点仍整批前进」只有真 broker 说得了算得了。
-    // 两种写错在离线看不出差别：忘记回投（尾巴静默丢失，收到的条数照样对）、
-    // 把已 ack 的前缀也回投（看起来"没丢"，其实重复投递）。
     {
         const std::string topic = gPrefix + "_AckIndex";
         prepareTopic(producer, topic, 1);  // 1 队列：一批 3 条才连续且有序
@@ -944,12 +884,6 @@ int main(int argc, char* argv[]) {
         cc->shutdown();
     }
 
-    // ---------------- S11 拉取停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME）----------------
-    // 队列还归本实例、但拉取循环死了或卡住：Java RebalanceImpl:438-461 会在同一趟
-    // rebalance 里把它撤掉（持久化位点 + 丢缓冲）再重建。不做这一步的坏法最难发现——
-    // 客户端不报错、心跳照发、别的队列照常推进，只有"这个队列的位点永远不动"。
-    // 阈值（120s）离线单测锁死（tests/test_pull_expired.cpp），这里锁真机闭环：
-    // 注入停摆 → 撤+建 → **同一个队列继续消费**，且位点不回退（前 3 条不重投）。
     {
         const std::string topic11 = gPrefix + "_Heal";
         const std::string group11 = gPrefix + "_g11";
@@ -1006,8 +940,6 @@ int main(int argc, char* argv[]) {
             const bool base = waitUntil([&] { return sink.count() >= 3; }, 40000);
             check("S11-基线：3 条被消费", base, "arrivals=" + std::to_string(sink.count()));
 
-            // 307 应答里必须看得见这个时刻（Java ProcessQueue.fillOutRunningInfo:456）；
-            // 写死 0 就等于把停摆判据的现场证据全丢了。
             const int64_t injected = epochMs() - kPullMaxIdleTime - 5000;
             c->setLastPullAt(key, injected);
             std::string body;
@@ -1022,7 +954,7 @@ int main(int argc, char* argv[]) {
                   "want=" + std::to_string(injected));
             check("S11-倒拨超过 120s 即判停摆", c->pullStalled(key), "key=" + key);
 
-            c->syncPullThreads();   // Java updateProcessQueueTableInRebalance 的撤+建
+            c->syncPullThreads();
             const bool healed = waitUntil([&] {
                 const int64_t now = c->lastPullAt(key);
                 return now > injected && !c->pullStalled(key);
@@ -1051,19 +983,6 @@ int main(int argc, char* argv[]) {
         c->shutdown();
     }
 
-    // ---------------- S12 顺序消费毒消息：本地计数 → 交 broker → %DLQ% ----------------
-    // Java ConsumeMessageOrderlyService#processConsumeResult:236-307 的 SUSPEND 分支先过
-    // checkReconsumeTimes(:322-339)：次数没用尽就本地 reconsumeTimes+1 并原地挂起（broker
-    // 那边压根没记这次失败）；用尽了才 sendMessageBack(:341-362) 把整条投给 %RETRY%<group>，
-    // **投成功就不挂起**、commit 位点让路（所以下一条 ord-after 必须被消费）。
-    // 而「投给 %RETRY% 之后进不进 %DLQ%」全在 broker：SendMessageProcessor#handleRetryAndDLQ
-    // :185-234 读 V2 请求头 j/l（AbstractSendMessageProcessor:427 把 j 直接写进存储消息的
-    // reconsumeTimes），并且只有本组的 rebalance 锁还没过期（:202-207，即这个实例真的持有
-    // LOCK_BATCH_MQ）才「立刻进死信」。三种写错在客户端本地都表现为「看起来正常」：
-    // 少 +1 ⇒ 毒消息原地转到天荒地老且永远不进死信；把 -1 读成并发侧的 16 ⇒ 顺序消费凭空
-    // 多出死信；回投成功后仍挂起 ⇒ 队列永久卡死，跟消费者进程死掉一模一样。
-    // 离线单测（tests/test_orderly_reconsume.cpp）只能锁「回投失败」那一半——未 start() 的
-    // 内部生产者必败；「回投成功 ⇒ 位点前进、%DLQ% 出现、锁真的握着」只有真 broker 说得了。
     {
         const std::string topic = gPrefix + "_OrdDlq";
         const std::string group = gPrefix + "_g12";
@@ -1137,9 +1056,6 @@ int main(int argc, char* argv[]) {
             && firstThree[1].first == 1 && firstThree[2].first == 2;
         check("S12-毒消息恰好投 3 次（本地每次 +1：reconsumeTimes 0/1/2）",
               threeTimes && counted, "times=[" + ladder + "]");
-        // 交棒判据：回投成功后 Java commit 位点，队列必须往前走。少了这一步就是
-        // 「毒消息把整个队列钉住」，与消费者死掉无法区分；多了（回投还没成功就前进）
-        // 则是静默丢消息。
         const bool handedOver = waitUntil([&] { return sink.afterCount() >= 1; }, 60000);
         check("S12-交给 broker 后业务队列继续前进（后一条被消费）", handedOver,
               "after=" + std::to_string(sink.afterCount()));
@@ -1176,14 +1092,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ---------------- S12b 顺序消费默认 -1 = 不设上限（不是并发侧的 16）----------------
-    // 两处 getMaxReconsumeTimes 是**故意不同**的：Java ConsumeMessageOrderlyService:313-320
-    // 把 -1 读成 Integer.MAX_VALUE（顺序消费一直在本地原地重试，broker 侧没有计数，默认
-    // 就该重试到成功为止）；DefaultMQPushConsumerImpl:890 把 -1 读成 16（那边每轮都过一遍
-    // broker，16 是 broker 默认的 retryMaxTimes）。合成一个常量的两种坏法都得分别挡住：
-    // 顺序侧读成 16 ⇒ 第 17 次投给 broker，锁还没过期就直接造出一条死信；
-    // 并发侧读成 MAX ⇒ 毒消息永远不进 %DLQ%（S9 那条用 2 覆盖了阈值生效，这条覆盖
-    // 「默认值绝不生效」）。
     {
         const std::string topic = gPrefix + "_OrdNoCap";
         const std::string group = gPrefix + "_g12b";
@@ -1252,12 +1160,6 @@ int main(int argc, char* argv[]) {
                   + " n=" + std::to_string(sight.msgs.size()));
     }
 
-    // ---------------- S12c 顺序挂起时长：context 上的值优先于消费者配置（#74）----------------
-    // Java ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234：`-1`（context 默认）
-    // 才回落到消费者配置，解析出来的值再钳到 [10, 30000]。真机这一条证的是「listener 在
-    // context 上设的值真的决定等待时长」：配置故意设 900ms、context 要 70ms ⇒ 相邻两次投递
-    // 的中位间隔必须贴着 70ms —— 把 context 读丢或读成配置，间隔会落到 0.9s 以上。
-    //
     // 钳位的两个端点用同一条链路的间隔法只能兜「不忙等」（`>= 10ms`）：分发循环本身有 50ms
     // 固定节拍（consumer.cpp 里没进展就 sleep 50ms），间隔法分不出 10ms 与 1ms —— 精确值由
     // 离线矩阵锁死（tests/test_orderly_reconsume.cpp::testOrderlySuspendMillisResolvesThenClamps）。
@@ -1393,16 +1295,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // ---------------- S13 顺序消费的显式批量 ack 与显式回滚（立即重投）----------------
-    // Java ConsumeMessageOrderlyService:244-300：autoCommit=false 时提交权在 listener 手里 ——
-    // COMMIT 走 processQueue.commit() 整批认可（:275-277）；ROLLBACK 走 processQueue.rollback()
-    // 把这批退回队首、再 submitConsumeRequestLater(context.getSuspendCurrentQueueTimeMillis())
-    // （:278-285）：**本地**重投，不过 broker、不换 topic、reconsumeTimes 不动。而
-    // autoCommit=true（默认）时 COMMIT/ROLLBACK 是非法用法：Java 只 warn、不写 break，
-    // 顺势落进 SUCCESS 分支（:246-250），消息照 ack。
-    // 三条腿的差别只在返回值与 autoCommit 这一个布尔位，而真机行为完全可分：本地重投的
-    // 相邻间隔贴着挂起时长（200ms 档 + 分发节拍），任何"交给 broker 走 %RETRY%"的实现
-    // 最快也只能等第一个延迟档（delayLevel=3 即 10s），差一个数量级。
     {
         enum class Manual { COMMIT_ONCE, ROLLBACK_THEN_COMMIT, ILLEGAL_ROLLBACK };
 
@@ -1519,7 +1411,6 @@ int main(int argc, char* argv[]) {
                         return ConsumeOrderlyStatus::COMMIT;
                     case Manual::ILLEGAL_ROLLBACK:
                     default:
-                        // 不碰 autoCommit（保持默认 true）却回 ROLLBACK —— Java:246-250 的非法用法
                         return ConsumeOrderlyStatus::ROLLBACK;
                 }
             }
@@ -1538,7 +1429,6 @@ int main(int argc, char* argv[]) {
         DefaultMQAdminExt admin(gPrefix + "_admin13");
         admin.setNamesrvAddr(nsAddr);
 
-        // ---- S13a autoCommit=false + COMMIT：显式批量 ack（Java:275-277）----
         {
             const std::string topic = gPrefix + "_OrdCommit";
             const std::string group = gPrefix + "_g13a";
@@ -1602,8 +1492,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // ---- S13b autoCommit=false + ROLLBACK：显式回滚、本地立即重投（Java:278-285）----
-        // 回滚 6 次后显式提交：前 6 次每次把这条退回来，且**不走 broker**。
         {
             const std::string topic = gPrefix + "_OrdRollback";
             const std::string group = gPrefix + "_g13b";
@@ -1689,7 +1577,6 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // ---- S13c autoCommit=true（默认）+ ROLLBACK：非法用法，按 ack 处理（Java:246-250）----
         {
             const std::string topic = gPrefix + "_OrdIllegal";
             const std::string group = gPrefix + "_g13c";

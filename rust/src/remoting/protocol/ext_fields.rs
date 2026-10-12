@@ -39,8 +39,6 @@ impl ExtFields {
             .map(|(_, v)| v.as_str())
     }
 
-    /// 覆盖已有 key 时保持原位置（与 Java `HashMap.put` 的迭代顺序差异不影响签名，
-    /// 因为签名前会按 key 排序；这里保持与 Python `dict` 赋值一致的语义）。
     pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
         let key = key.into();
         let value = value.into();
@@ -145,13 +143,8 @@ impl ExtFields {
 /// 消息属性等「字符串 -> 字符串」容器与 extFields 结构相同，共用一个保序实现。
 pub type StringMap = ExtFields;
 
-/// 自定义 header（对应 Java `CommandCustomHeader` 的反射读写）。
-///
-/// `to_ext_fields` 只写非 `None` 的字段，对齐 Java 反射里 `field.get() != null` 的过滤。
 pub trait CustomHeader: Send + Sync + Any {
     fn to_ext_fields(&self, out: &mut ExtFields);
-    // 名字对齐 Java `FastCodesHeader#decode(ExtFields)` / Python 的 `fill_header_from_ext`：
-    // 从 extFields 读回自身，故带 &mut self。
     #[allow(clippy::wrong_self_convention)]
     fn from_ext_fields(&mut self, ext: &ExtFields);
     fn as_any(&self) -> &dyn Any;

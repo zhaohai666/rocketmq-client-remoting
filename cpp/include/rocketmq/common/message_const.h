@@ -1,4 +1,3 @@
-// org.apache.rocketmq.common.message.MessageConst 的 C++ 对应：消息属性键常量。
 #ifndef ROCKETMQ_COMMON_MESSAGE_CONST_H
 #define ROCKETMQ_COMMON_MESSAGE_CONST_H
 
@@ -21,8 +20,6 @@ struct MessageConst {
     static constexpr const char* PROPERTY_REAL_TOPIC = "REAL_TOPIC";
     static constexpr const char* PROPERTY_REAL_QUEUE_ID = "REAL_QID";
     static constexpr const char* PROPERTY_TRANSACTION_PREPARED = "TRAN_MSG";
-    // ⚠ Java 里这个属性的字面值是 "PGROUP"（不是 "PRODUCER_GROUP"）。
-    // broker 事务回查时正是用这个属性反查生产者，写错会导致回查永远找不到 listener。
     static constexpr const char* PROPERTY_PRODUCER_GROUP = "PGROUP";
     static constexpr const char* PROPERTY_MIN_OFFSET = "MIN_OFFSET";
     static constexpr const char* PROPERTY_MAX_OFFSET = "MAX_OFFSET";
@@ -54,16 +51,12 @@ struct MessageConst {
     static constexpr const char* PROPERTY_CORRELATION_ID = "CORRELATION_ID";
     static constexpr const char* PROPERTY_MESSAGE_REPLY_TO_CLIENT = "REPLY_TO_CLIENT";
     static constexpr const char* PROPERTY_MESSAGE_TTL = "TTL";
-    // 客户端收到应答时打的时间戳（Java ClientRemotingProcessor#receiveReplyMessage 写入）
     static constexpr const char* PROPERTY_REPLY_MESSAGE_ARRIVE_TIME = "REPLY_MESSAGE_ARRIVE_TIME";
-    // broker 成功把应答推回请求方时写入（Java ReplyMessageProcessor#pushReplyMessage）
     static constexpr const char* PROPERTY_PUSH_REPLY_TIME = "PUSH_REPLY_TIME";
     static constexpr const char* PROPERTY_INNER_MULTI_DISPATCH = "INNER_MULTI_DISPATCH";
     static constexpr const char* PROPERTY_INNER_MULTI_QUEUE_OFFSET = "INNER_MULTI_QUEUE_OFFSET";
     static constexpr const char* PROPERTY_POP_CK = "POP_CK";
     static constexpr const char* PROPERTY_POP_CK_OFFSET = "POP_CK_OFFSET";
-    // Java 侧写的是 "1ST_POP_TIME"（MessageConst.PROPERTY_FIRST_POP_TIME）；
-    // 客户端在 POP 响应后处理时"仅在缺失时"补上，值为响应头的 popTime。
     static constexpr const char* PROPERTY_FIRST_POP_TIME = "1ST_POP_TIME";
     static constexpr const char* PROPERTY_POP_TIME = "POP_TIME";
     static constexpr const char* PROPERTY_INVISIBLE_TIME = "INVISIBLE_TIME";

@@ -1,27 +1,6 @@
 // 退出注销 UNREGISTER_CLIENT(35) 的离线单测 —— 不需要集群。
 //
-// 为什么要这一步：35 是**只在 shutdown 那一瞬间**发一次的请求，真机只能看到「组消失了」
-// 这个最终结果，看不到线上到底走了什么形状的头、到底打给了哪几台 broker。而 broker 端
-// `ClientManageProcessor#unregisterClient`:213-249 的两处判据恰好都是「字段级」的：
-//   * `if (group != null) producerManager.unregisterProducer(group, info)`
-//   * `if (group != null) { findSubscriptionGroupConfig(group); ... }`
-// 也就是说 Java 空着的那个槽位传的是 **null（整个字段不上线）**，我们若传空串，broker 会
-// 拿 `""` 去查订阅组配置、再白做一轮注销。这类偏差真机不会报错，只能靠抓帧锁住。
 //
-// 对齐基准（Java 5.5.1，逐行读过；与 python/tests/test_producer_unregister.py、
-// rust/src/client/mq_client.rs 的同一组断言对拍）：
-//   * `MQClientInstance#unregisterProducer`:1198-1201 → 私有
-//     `unregisterClient(producerGroup, null)`:1158-1182 —— 遍历 `brokerAddrTable` 的
-//     **每个 brokerId**（主 + 从），每台一发，超时 `getMqClientApiTimeout()`（3000ms），
-//     RemotingException / InterruptedException / MQBrokerException 一律吞成 log.warn。
-//   * `MQClientAPIImpl#unregisterClient`:1615-1639 —— 头是
-//     `UnregisterClientRequestHeader{clientID, producerGroup, consumerGroup}`，
-//     注意键名是大写 ID 的 `clientID`。
-//   * 心跳的收件人分流（Java `MQClientInstance#sendHeartbeatToAllBroker`:732-750）：
-//     遍历 `brokerAddrTable` 的每个 brokerId，仅当 `consumerEmpty && id != MASTER_ID`
-//     才跳过 —— 带消费数据的心跳**覆盖从节点**，只带生产数据的心跳只打 master。
-//     C++ 侧两个 helper 的分工必须守住：`getRouteOfAllBrokers`（`selectBrokerAddr`，
-//     生产者心跳用）与 `getAllBrokerAddrs`（消费者心跳、注销用）。
 //
 // 覆盖：
 //   1. 生产者侧头形状：只有 clientID + producerGroup，consumerGroup 整个字段不上线
@@ -319,7 +298,6 @@ public:
     }
 };
 
-// 一台 brokerName 下两个 brokerId：0 是 master、1 是 slave（Java 的 brokerAddrTable 形状）
 std::unique_ptr<MQClientInstance> seeded(MockBroker& namesrv, MockBroker& master,
                                          MockBroker& slave) {
     auto instance = std::make_unique<MQClientInstance>(
@@ -334,7 +312,6 @@ std::unique_ptr<MQClientInstance> seeded(MockBroker& namesrv, MockBroker& master
     return instance;
 }
 
-// 1 / 2 / 3. 头的形状：空槽位整个不上线（Java 传的是 null，不是 ""）
 void testHeaderShape() {
     MockBroker broker;
     auto instance = std::make_unique<MQClientInstance>(
@@ -374,7 +351,6 @@ void testHeaderShape() {
         expect(keys == want, "三个键都在", keyText(got[0].ext));
     }
 
-    // 纯空白也按「没这个组」处理：Java 那边是 null，broker 判的是 group != null
     broker.scriptUnregisters({});
     instance->unregisterClient(broker.address(), kClientId, "   ", kGroup);
     got = broker.recordsOf(RequestCode::UNREGISTER_CLIENT);
@@ -400,8 +376,6 @@ void testFanOutIncludesSlaves(MockBroker& namesrv, MockBroker& master, MockBroke
 // 5. 单台失败只吞不抛；直接调用的那一层照旧抛出带码的异常
 void testFailureIsSwallowed(MockBroker& namesrv, MockBroker& master, MockBroker& slave) {
     auto instance = seeded(namesrv, master, slave);
-    // master 先回 SYSTEM_ERROR、slave 回 SUCCESS：Java 的 catch 只 log.warn，
-    // 剩下那台照样要注销到。
     master.scriptUnregisters({ResponseCode::SYSTEM_ERROR});
     slave.scriptUnregisters({});
     int threw = 0;

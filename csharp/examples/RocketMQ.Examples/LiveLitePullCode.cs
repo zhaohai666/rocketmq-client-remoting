@@ -58,7 +58,6 @@ public static class LiveLitePullCode
 
     private static string Join(IEnumerable<string> items) => "[" + string.Join(", ", items) + "]";
 
-    /// <summary>与 Java DefaultLitePullConsumerImpl#pullSyncImpl:1058 的 buildSysFlag(false, block, true, false, litePull=true) 对齐。</summary>
     private static int LiteFlag() => PullSysFlag.BuildSysFlag(commitOffset: false, suspend: false,
         subscription: true, classFilter: false, litePull: true);
 

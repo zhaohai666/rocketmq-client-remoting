@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消息属性访问器（对应 org.apache.rocketmq.common.message.MessageAccessor）。"""
 from __future__ import annotations
 
 from .message import Message
@@ -73,9 +72,7 @@ class MessageAccessor:
 
     @staticmethod
     def get_reconsume_time(msg: Message):
-        """Java MessageAccessor.getReconsumeTime：重试次数以**属性**形式挂在消息上，
-        只由回投链路（``sendMessageBack``）写入，与 MessageExt 线上第 13 字段的
-        reconsumeTimes 不是一回事 —— broker 消费投递给客户端的是后者。"""
+        pass
         return msg.properties.get(MessageConst.PROPERTY_RECONSUME_TIME)
 
     @staticmethod

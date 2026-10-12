@@ -1,25 +1,11 @@
-//! topic / group 名字的合法性判定（对应 `org.apache.rocketmq.common.topic.TopicValidator`，
-//! 口径以 `python/common/topic_validator.py` 为准）。
-//!
-//! Java 的字符表白名单是 `^[%|a-zA-Z0-9_-]+$`，实现方式是一张 128 长的
-//! `VALID_CHAR_BIT_MAP`：**码点 >= 128 一律非法**。这里逐字节照抄，因为 broker 侧
-//! （`TopicConfigValidator`）用的是同一张表，客户端放行而 broker 拒绝只会把错误推迟到
-//! 建 topic 那一刻，而名字是**发送路径**上就该定的东西。
-//!
-//! ⚠ 与 Java 的差别（有意为之，Python 端口同口径）：`TopicValidator.validateTopic` /
-//! `validateGroup` 那对返回 `ValidateResult` 的管理端入口未移植 —— 客户端只用抛异常式
-//! 的 [`crate::client::validators`]。
 
 use std::collections::HashSet;
 
-/// topic 名长度上限（Java `TOPIC_MAX_LENGTH`）。
 pub const TOPIC_MAX_LENGTH: i32 = 127;
 /// group 名要参与拼 `%RETRY%group_topic` / `%DLQ%group_topic`，所以比 topic 更短。
 pub const GROUP_MAX_LENGTH: i32 = 120;
-/// 仅 Java `validateTopic` 用到（`checkTopic` 不查这一档），保留常量口径。
 pub const RETRY_OR_DLQ_TOPIC_MAX_LENGTH: i32 = 255;
 
-/// Java 报错文案里引用的正则原文（判定本身走查表，不用正则，与 Java 一致）。
 pub const VALID_CHAR_PATTERN: &str = "^[%|a-zA-Z0-9_-]+$";
 
 pub const AUTO_CREATE_TOPIC_KEY_TOPIC: &str = "TBW102";
@@ -37,10 +23,6 @@ pub const RMQ_SYS_ROCKSDB_OFFSET_TOPIC: &str = "CHECKPOINT_TOPIC";
 
 pub const SYSTEM_TOPIC_PREFIX: &str = "rmq_sys_";
 
-/// 客户端**不能直接发**的 topic：这几个是 broker 内部状态流水（半消息、延迟、轨迹校验…），
-/// 用户发进去会污染 broker 的事务/延迟/校验逻辑。
-/// ⚠ `%RETRY%` 前缀不在名单里：`sendMessageBack` 就是往 `%RETRY%group` 写的，
-/// 禁掉会打断重投链路（`%DLQ%` 同理，只是本集合按 Java 口径不含它）。
 pub fn not_allowed_send_topic_set() -> &'static HashSet<&'static str> {
     static SET: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -59,7 +41,6 @@ pub fn not_allowed_send_topic_set() -> &'static HashSet<&'static str> {
     })
 }
 
-/// 系统 topic 名单（Java `getSystemTopicSet`）；判定另看 [`SYSTEM_TOPIC_PREFIX`]。
 pub fn system_topic_set() -> &'static HashSet<&'static str> {
     static SET: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
     SET.get_or_init(|| {
@@ -82,16 +63,10 @@ pub fn system_topic_set() -> &'static HashSet<&'static str> {
     })
 }
 
-/// 对应 Java 位表：只有 ASCII 数字、大小写字母与 `% - _ |` 置位。
 fn allowed_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'%' | b'-' | b'_' | b'|')
 }
 
-/// 对应 `TopicValidator.isTopicOrGroupIllegal`：**空串返回 false**（空/纯空白由
-/// `UtilAll::is_blank` 那一步管，与 Java 的顺序一致）。
-///
-/// Rust 的 `String` 是 UTF-8 字节串，Java 按 `char`（UTF-16 码元）判定：
-/// 非 ASCII 字符的 UTF-8 首字节必然 >= 0x80，因此在真实输入上与 Java 等价。
 pub fn is_topic_or_group_illegal(name: &str) -> bool {
     name.as_bytes().iter().any(|&b| b >= 0x80 || !allowed_char(b))
 }

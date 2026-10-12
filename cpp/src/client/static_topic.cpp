@@ -55,7 +55,6 @@ bool topicRouteData2EndpointsForStaticTopic(
         return false;
     }
 
-    // 按 scope 分组（Java 里没有 scope 的条目不参与，同此）。
     std::map<std::string, std::vector<std::pair<std::string, TopicQueueMappingInfo>>> infosByScope;
     for (const auto& entry : route.topicQueueMappingByBroker.objectItems()) {
         TopicQueueMappingInfo info;
@@ -69,9 +68,6 @@ bool topicRouteData2EndpointsForStaticTopic(
     for (auto& scopeEntry : infosByScope) {
         const std::string& scope = scopeEntry.first;
         auto& infos = scopeEntry.second;
-        // map 迭代本身按 broker 名升序；再做稳定的 epoch 降序排序。Java 对
-        // ConcurrentHashMap 的 entrySet 做 epoch 降序排序，同 epoch 的覆盖顺序本就
-        // 未定义；钉死 broker 升序让结果可复现。
         std::stable_sort(infos.begin(), infos.end(),
                          [](const std::pair<std::string, TopicQueueMappingInfo>& a,
                             const std::pair<std::string, TopicQueueMappingInfo>& b) {
@@ -79,7 +75,6 @@ bool topicRouteData2EndpointsForStaticTopic(
                          });
 
         int32_t maxTotalNums = 0;
-        // Java 从不更新 maxTotalNumOfEpoch —— 守卫恒真，照抄。
         const int64_t maxTotalNumOfEpoch = -1;
         const std::string mockName = getMockBrokerName(scope);
         std::map<MessageQueue, std::pair<int64_t, std::string>> mqEndPoints;

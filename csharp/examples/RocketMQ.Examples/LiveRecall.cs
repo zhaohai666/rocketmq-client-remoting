@@ -6,18 +6,7 @@
 // 挂回 SEND 响应头；撤回是否真的生效也只能靠「到点没投递」来证明。
 // 离线单测（tests/RecallMessageTests.cs）锁的是编解码、报文键名和本地校验顺序，证不了语义。
 //
-// R0 读得到 broker 的 recallMessageEnable，并临时打开
-// R1 定时消息带回句柄、普通消息不带、两条定时消息句柄不同
-// R2 句柄能解出 topic / brokerName / uniqKey，且与发送结果一致
-// R3 RecallMessage 返回被撤回消息的 uniqKey（Java 取响应头 msgId）
-// R4 %RETRY% topic 在本地就被拒（Java "topic is not supported"），不打网络
-// R5 非法句柄在本地就被拒（Java "recall handle is invalid"），且是秒回
-// R6 **语义**：同时发两条同样延迟的消息，撤回其中一条 → 到点后对照消息被投递、
-//    被撤回的那条永远不到；这才是撤回真正的定义
-// R7 全程把 broker 的 recallMessageEnable 改回原值（跑之前是 false 就跑完还是 false）
 //
-// broker 的 recallMessageEnable 默认 false（Java BrokerConfig:546），本地 conf 也是 false，
-// 所以先 UPDATE_BROKER_CONFIG 打开，退出前无条件还原。
 //
 // 与 python/verify_recall_live.py、cpp/examples/recall_live.cpp、
 // rust/examples/live_producer.rs 的 P9 段同题。

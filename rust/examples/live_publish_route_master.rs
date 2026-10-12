@@ -1,46 +1,13 @@
-//! 发布路由必须跳过「没有 master 的 broker」真机验证（Java `MQClientInstance:294-303`）。
-//!
 //! 与 `python/verify_publish_route_master_live.py`、`cpp/examples/live_publish_route_master.cpp`、
 //! `csharp/examples/RocketMQ.Examples/LivePublishRouteMaster.cs` 同场景、逐条同断言。
 //!
 //! 前置：namesrv + master + slave 都在跑（按本地集群 runbook）；脚本自己**只停一次 master**
 //! （`scripts/rmq_test_broker.sh` 只认 master 的 java 进程），`Drop` 保险保证 master 一定回来。
 //!
-//! Java 依据：`MQClientInstance.topicRouteData2TopicPublishInfo:294-303` 组装发布信息时，
-//! brokerDatas 里没有同名 broker、或它的 brokerAddrs 没有 MASTER_ID，整条 QueueData 跳过。
-//! 从节点自己也注册进 namesrv，且默认配置下照样带写位（`RouteInfoManager` 只在「prime slave
-//! 且 enableActingMaster」时才抹掉 WRITE，本机 broker.conf 是 false），所以 master 一掉线，
-//! 路由里同一个 brokerName 只剩 brokerId=1 —— 漏判这条，生产者就会把消息发到从节点上，
-//! 而从节点对发送请求一律 reject（`SendMessageProcessor` ⇒ `SYSTEM_BUSY(2)`，**还是可重试
-//! 码**），白烧重试。消费侧是另一份口径（`topicRouteData2TopicSubscribeInfo:318-332`：
-//! 读位 + readQueueNums、**不要求有 master**），停窗口内消费者仍要看得见队列、还得能从从节点拉。
 //!
 //! 离线单测（`src/client/mq_client.rs` 的 `publish_route_*` 组）锁的是**判据**；真机锁的是
 //! 判据作用在真实路由形状上的结果 —— 名字服务里 broker-a 真的只剩 `{1: slave}`。
 //!
-//! 场景（同一停窗口里做完）：
-//! - S0 控制腿（master 在）：路由 {0: master, 1: slave}；发布队列 4、订阅队列 4。
-//! - S1 预埋：每队列定点一条共 4 条，等从节点 store 追上（不然 S6 无从消费）。
-//! - S2 停 master → 刷新路由直到 broker-a 只剩 {1: slave}。
-//! - S3 (A) 发布信息组不出队列：访问器本端抛 `Can not find Message Queue for topic`
-//!   —— 本端口没有「读原始表」的公开访问器，改用访问器语义断言：它只在发布信息**有队列**
-//!   时才 Ok，此刻连重新拉回来的路由都组不出队列（比读表多证一次刷新腿）。
-//! - S4 (C) 订阅队列仍是 4（消费侧不看 master）。
-//! - S5 发送快速失败、报错里没有从节点地址（旧缓存腿打的是死掉的 master；周期刷新恰好
-//!   已跑过则是本端 10005）；再显式把发送实例刷成停后形状：(A) 生效 —— 发送本端 10005
-//!   且**一条 wire 都不发**。
-//! - S5d 对照：定点发到该队列 → 地址解析两步都只认 master，主没了 ⇒ 本端
-//!   `MQClientException("The broker[broker-a] not exist")`、**一条 wire 都不发**
-//!   （Java `sendKernelImpl:919-924` + `findBrokerAddressInPublish:1295-1305`）——
-//!   从节点因此根本收不到写请求（旧版本会打到从节点换一个可重试的 SYSTEM_BUSY(2)，
-//!   白烧一轮重试）；S5c 若漏做，不指定队列的发送就是 3 次 wire 全被拒的下场。
-//! - S5e (D) 订阅口径：顺序锁整台跳过（`RebalanceImpl#lock:153/lockAll:195` 只认主、
-//!   不刷路由；对照腿证明同一窗口内从节点对该队列照常服务 —— 空锁集不是"从节点不可达"）。
-//! - S5f (E) 订阅口径：POP 本端报「broker 不存在」（`PullAPIWrapper#popAsync:369-373`）。
-//! - S5g (F) 位点读取：冷实例（缓存里没这个 topic）刷一次路由后**放宽**到从节点
-//!   （`RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241`）。
-//! - S6 (C 端到端) 停窗口内新起的 push 消费者仍看到 4 条队列，并从**从节点**把 S1 的 4 条收齐。
-//! - S7 负控：master 拉回 → 发布队列恢复 4、两条失败发送都没在 broker 上留下消息、发送 SEND_OK。
 //!
 //! 用法：
 //! ```text
@@ -626,10 +593,6 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         Ok(r) => format!("Ok(status={:?})", r.status),
         Err(e) => e.to_string(),
     };
-    // 定点发送不走 `sendDefaultImpl` 的队列选择，地址解析是它唯一的路由来源：
-    // 发布地址平表里只有 brokerId=1 ⇒ 刷一次路由仍拿不到 ⇒ 本端立刻报错
-    // （Java `sendKernelImpl:919-924/:1100`），**不像旧版本那样打到从节点**换一个
-    // 可重试的 SYSTEM_BUSY(2)。没有 BrokersSent 后缀 = 一次 send 都没发出去。
     ck.check(
         "S5d 定点发送本端报「The broker[broker-a] not exist」，无 wire 调用（无 BrokersSent）",
         pinned
@@ -646,11 +609,6 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         &format!("{pinned_ms:.0}ms {pinned_text}"),
     );
 
-    // ---------- S5e (D) 订阅口径：顺序锁只认主 ----------
-    // Java `RebalanceImpl#lock:153 / lockAll:195` 走 findBrokerAddressInSubscribe(brokerName,
-    // MASTER_ID, true)：只认主、**不刷路由**，拿不到就整台跳过。退到从节点上锁等于锁在从
-    // 节点的锁管理器里，master 不知情，顺序消费的互斥静默失效。此刻 admin 实例的路由缓存
-    // 已被 S2 刷成 masterless 形状，任何"退让"口径都会落到从节点上并拿回非空锁集。
     println!("\nS5e (D) 顺序锁：停窗口内整台跳过（不刷路由、不发 wire）");
     let group = format!("GID_PrMasterRs_{}", fx.stamp);
     let client_id = format!("pr_master_rs_lock_{}", fx.stamp);
@@ -720,11 +678,6 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
         &format!("{pop_ms:.0}ms {pop_text}"),
     );
 
-    // ---------- S5g (F) 位点读取：刷一次路由后放宽到从节点 ----------
-    // Java `RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241`：只认主 → 刷一次
-    // 路由 → 重查**放宽**（onlyThisBroker=false，位点是 HA 复制来的同一份数据，可以从从节点
-    // 读）。冷实例（路由缓存里没有这个 topic）是这条路径最纯的形状：旧的 `_broker_addr`
-    // 口径在此直接报「No route info of this topic」，连刷新都没有。
     println!("\nS5g (F) 位点读取：冷实例刷一次路由后放宽到从节点");
     let cold = MQClientInstance::new(
         &format!("pr_master_rs_cold_{}", fx.stamp),

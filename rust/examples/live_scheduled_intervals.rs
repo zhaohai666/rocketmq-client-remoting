@@ -6,16 +6,6 @@
 //! topic 当探针 —— 只有周期到了才会去 NameServer 拉，缓存里何时出现它就等于周期。
 //! 位点落盘同理，用 `QUERY_CONSUMER_OFFSET` 读 broker 侧的位点当探针。
 //!
-//! 场景：
-//! - I1 路由刷新周期：两个生产者同时 start，`poll_name_server_interval` 分别设 1000ms 与
-//!   Java 默认 30000ms；两者都把**尚未创建**的 topic 登记进在用集合（登记不拉取）。
-//!   先等 1.5s 让两边首跳（initialDelay 10ms）各落空一次，再建 topic，然后看缓存：
-//!   1s 组几秒内拿到新路由，30s 组在同一个时刻**还没有**，间隔与配置同量级（≥20s）。
-//! - I2 位点落盘周期：两个消费者（1s / 60s）同订阅一个 1 队列 topic，`CONSUME_FROM_FIRST_OFFSET`，
-//!   各消费 3 条后 broker 侧位点仍为 0；首个落盘不早于 Java 的 initialDelay(10s)；
-//!   再消费 3 条后 1s 组在一个周期内把 6 落盘，60s 组仍是 3；`shutdown()` 收尾把 6 落盘。
-//! - I3 实例级周期转发：facade 上配的周期真的落到了 `MQClientInstanceConfig`
-//!   （`route_refresh_interval_millis` / `persist_offset_interval_millis`）。
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
 //! ```text
@@ -40,10 +30,9 @@ use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 
 const FAST_POLL_MS: u64 = 1_000;
-const SLOW_POLL_MS: u64 = 30_000; // Java ClientConfig#pollNameServerInterval 默认
+const SLOW_POLL_MS: u64 = 30_000;
 const FAST_PERSIST_MS: u64 = 1_000;
 const SLOW_PERSIST_MS: u64 = 60_000;
-/// Java `scheduleAtFixedRate(persistAllConsumerOffset, 1000 * 10, ...)` 的 initialDelay。
 const PERSIST_INITIAL_DELAY_MS: u64 = 10_000;
 
 fn now_ms() -> i64 {
@@ -298,7 +287,7 @@ async fn run_all(
     let slow = DefaultMQProducer::new(g_poll_slow).map_err(|e| e.to_string())?;
     slow.set_namesrv_addr(&fx.namesrv);
     slow.set_instance_name(&format!("interval-poll-slow-{}", fx.stamp));
-    slow.start().await.map_err(|e| format!("slow producer start: {e}"))?; // 不设周期 = Java 默认 30s
+    slow.start().await.map_err(|e| format!("slow producer start: {e}"))?;
 
     let fast_client: MQClientInstance = fast.client().ok_or("fast producer 没有实例")?;
     let slow_client: MQClientInstance = slow.client().ok_or("slow producer 没有实例")?;
@@ -326,10 +315,6 @@ async fn run_all(
         "登记后两边缓存都为空",
     );
 
-    // 先让两个实例各自的**首跳**（Java scheduleAtFixedRate 的 initialDelay=10ms）跑完并把
-    // 这个还不存在的 topic 拉失败一次，再去建 topic。否则首跳可能落在建 topic 之后：
-    // 那一跳对两组都是"第一次拉"，30s 组照样当场拿到路由，两组间隔就退化成一个传输 RTT，
-    // 这条对照实验也就失去意义（真机上表现为 30s 组和 1s 组同时命中）。
     tokio::time::sleep(Duration::from_millis(1_500)).await;
 
     let t0 = Instant::now();
@@ -456,7 +441,6 @@ async fn run_all(
         &format!("fast={off_fast} slow={off_slow} elapsed={}", secs(t_first.elapsed())),
     );
 
-    // 首个落盘：Java 的 initialDelay=10s 到了才写第一笔（周期 1s/60s 此刻都还没到）
     let fast_first = wait_offset_at_least(fx, g_persist_fast, &mq, 3, 20_000).await;
     let dt_first = t_first.elapsed();
     ck.check(
@@ -514,7 +498,6 @@ async fn run_all(
         &format!("elapsed={}", secs(dt_slow_first + t_second.elapsed())),
     );
 
-    // shutdown() 收尾：Java persistConsumerOffset 在关停时补一笔
     slow_c.shutdown();
     let slow_flushed = wait_offset_at_least(fx, g_persist_slow, &mq, 6, 10_000).await;
     ck.check(

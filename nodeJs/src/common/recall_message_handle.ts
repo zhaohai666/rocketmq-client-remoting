@@ -1,11 +1,3 @@
-// -*- coding: utf-8 -*-
-// RecallMessageHandle (org.apache.rocketmq.common.producer.RecallMessageHandle).
-// Faithful port of python/common/recall_message_handle.py.
-//
-// The handle is produced by the broker (SendMessageProcessor#attachRecallHandle) and returned
-// on the SEND response; the client only carries it back to recallMessage. Encoding matches Java
-// exactly: base64url("v1 <topic> <brokerName> <timestampStr> <messageId>") — 5 space-separated
-// segments, with padding (consistent with Java Base64.getUrlEncoder).
 
 import { MQClientException } from '../remoting/exception.ts';
 
@@ -16,8 +8,6 @@ const INVALID_HANDLE = 'recall handle is invalid';
 const RMQ_SYS_RECALL_TOPIC_PREFIX = 'rmq_sys_recall_';
 const RMQ_SYS_RECALL_TOPIC_SUFFIX = '_request';
 
-// Mirror Java RecallMessageHandle.HandleV1 — timestamps are kept as strings (broker decides
-// validity), extra trailing segments are ignored on decode.
 export class HandleV1 {
   topic: string | null;
   brokerName: string | null;
@@ -50,7 +40,6 @@ export class HandleV1 {
   }
 }
 
-// base64url with '=' padding (mirrors Java Base64.getUrlEncoder).
 export function buildHandle(topic: string, brokerName: string, timestampStr: string, messageId: string): string {
   const raw = [VERSION_1, topic, brokerName, timestampStr, messageId].join(SEPARATOR);
   return Buffer.from(raw, 'utf-8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_');
@@ -78,7 +67,6 @@ export function decodeHandle(handle: string | null): HandleV1 {
   if (items.length < 5 || items[0] !== VERSION_1) {
     throw new MQClientException(INVALID_HANDLE);
   }
-  // Java reads items[1..4]; extra segments are ignored (tolerant decode).
   return new HandleV1(items[1], items[2], items[3], items[4]);
 }
 

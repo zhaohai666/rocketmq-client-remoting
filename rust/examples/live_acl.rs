@@ -1,14 +1,6 @@
 //! ACL 鉴权对**真实 5.5.1 broker** 的联调验证（对齐 `python/verify_acl_live.py` S1..S7，
 //! 另补 Python 没测的拉模式签名链路 S8）。
 //!
-//! 前置：broker 开了新鉴权插件（broker.conf）：
-//! ```text
-//! authenticationEnabled=true
-//! authenticationMetadataProvider=org.apache.rocketmq.auth.authentication.provider.LocalAuthenticationMetadataProvider
-//! initAuthenticationUser={"username":"AK_TEST","password":"SK_TEST_SECRET_12345678"}
-//! ```
-//! `LocalAuthenticationMetadataProvider` 初始化时把 `initAuthenticationUser` 建成 SUPER
-//! 用户，username 即 accessKey、password 即 secretKey。
 //!
 //! 断言的都是「签名真的被 broker 认/不认」，而不是本地编解码：
 //! - S1 带凭据的实例建 topic 成功（管理路径签名被接受）。
@@ -73,8 +65,6 @@ use rocketmq_client_remoting::remoting::rpchook::{AclClientRPCHook, RPCHook, Ses
 const QUEUE_NUMS: i32 = 4;
 /// S4 发送条数。
 const N_MSG: usize = 3;
-/// broker 鉴权失败的响应码：所有拒绝都走 `AuthenticationPipeline` 抛
-/// `AbortProcessException(NO_PERMISSION)`（Java broker/auth/pipeline/AuthenticationPipeline.java:53）。
 const NO_PERMISSION: i32 = 16;
 /// 等 push 消费者收满的窗口。
 const RECV_WAIT: Duration = Duration::from_secs(30);

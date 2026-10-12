@@ -1,9 +1,3 @@
-// 消息模型实现（对应 org.apache.rocketmq.common.message.*）。
-//
-// 对齐 python/common/message.py：
-//   - MessageQueue.hashCode 与 Java 逐位一致（32 位有符号回绕）；
-//   - 属性快捷方式（TAGS/KEYS/DELAY/WAIT）读写 properties；
-//   - MessageBatch.generateFromList 的约束：非空 / 同 topic / 同 waitStoreMsgOK / 禁延时 / 禁重试 topic。
 #include "rocketmq/common/message.h"
 
 #include <stdexcept>
@@ -48,9 +42,6 @@ int32_t Message::getDelayTimeLevel() const {
     }
 }
 
-// 5.x 定时消息 getter（Message.java:243-267）：属性缺失返回 0；值非法时与
-// Java Long.parseLong 一样**直接抛**，不静默吞成 0（否则批量/定时判定会拿到
-// 错误的"0 延时"）—— 与 canBatch 的 maxDelayValue 同一口径。
 int64_t Message::getDelayTimeSec() const {
     auto it = properties.find(MessageConst::PROPERTY_TIMER_DELAY_SEC);
     if (it == properties.end() || it->second.empty()) return 0;
@@ -70,11 +61,6 @@ int64_t Message::getDeliverTimeMs() const {
 }
 
 bool Message::isWaitStoreMsgOk() const {
-    // Java Message.isWaitStoreMsgOK()：属性**缺省即 true**，其余走 Boolean.parseBoolean
-    // —— 只有忽略大小写的 "true" 为真。
-    // ⚠ 别把缺省判成 false：本类（同 Python / Rust / C#）**不**在构造时预写 WAIT，
-    // 所以"属性缺省"是常态。缺省判成 false 会让 MessageBatch::generateFromList 攒出
-    // WAIT=false 的批量，broker 不等刷盘就回 SEND_OK（持久性静默降级）。
     auto it = properties.find(MessageConst::PROPERTY_WAIT_STORE_MSG_OK);
     if (it == properties.end()) return true;
     const std::string& s = it->second;

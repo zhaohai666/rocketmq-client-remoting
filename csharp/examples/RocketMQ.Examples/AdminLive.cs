@@ -1,23 +1,5 @@
 // C# 管理客户端（DefaultMQAdminExt）的**真实集群**联调（对应 cpp/examples/admin_live.cpp）。
 //
-// 全部打真实 nameServer + broker，无 mock。覆盖：
-//   1. 集群探活 / fetchBrokerClusterInfo / getClusterList
-//   2. createTopic（队列数校验）→ fetchAllTopicList → examineTopicRoute
-//   3. examineTopicConfig / getAllTopicConfig
-//   4. getBrokerConfig（**properties 文本**，验证没被当 KVTable JSON 解析）
-//   5. updateBrokerConfig → 回读确认生效（可逆，测完还原）
-//   6. NameServer KV：createAndUpdateKvConfig → getKvConfig → getKvListByNamespace → delete
-//   7. 订阅组：create/update → 单查 → 分页全量 → examine → delete
-//   8. 生产 N 条 → examineTopicStats / examineConsumeStats / queryConsumeQueue /
-//      queryMessage（可达性）/ viewMessage(msgId)
-//   9. maxOffset / minOffset / searchOffset / earliestMsgStoreTime / examineConsumerOffset
-//  10. sendMessageBack：消费 1 条后重投 → 轮询 %RETRY%<group> 出现该消息
-//  11. resetOffsetByTimestamp（真实 INVOKE_BROKER_TO_RESET_OFFSET，language=CPP）
-//  12. resetOffsetByQueueId（25 + 带 queueId/offset 的 222）：拉回 min ⇒ 首笔 pull 被
-//      OFFSET_RESET 短路成 PULL_OFFSET_MOVED、第二笔取到历史消息；越界目标被 broker 拒
-//      ⇒ 位点停在第 1 笔写入的非法值（两笔 RPC 非原子，与 Java 同构）
-//  13. queryTopicsByConsumerToBroker / queryTopicsByConsumer(group)（343，按 %RETRY% 路由扇出）
-//  14. 清理：deleteSubscriptionGroup / deleteTopic
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
 // autoCreateTopicEnable=true。用法（由 Program 以 "admin-live [namesrv]" 形式调用）。
@@ -504,12 +486,6 @@ internal static class AdminLive
             Check("Offset 只读查询", false, e.Message);
         }
 
-        // ---------- 7.5 searchOffset 的 boundaryType（Java DefaultMQAdminExt:133/:137）----------
-        // 单开一个 1 队列 topic：位点语义只在单队列上才确定（多队列时分不清落哪一条）。
-        // 3 条消息 ⇒ maxOffset=3；远未来时间戳下 UPPER = 最后一条自身位点(2)、
-        // LOWER = 它的下一个位点(3) = maxOffset（ConsumeQueue.binarySearchInQueueByTime
-        // 的 case 1）。两者不同即证明 boundaryType 字段真的到了 broker 并被解析 ——
-        // 若字段丢失或被忽略，两次都会落到 LOWER。
         string bndTopic = "AdminBoundaryTopicDotnet_" + stamp;
         try
         {
@@ -568,7 +544,6 @@ internal static class AdminLive
                 loPast == 0 && upPast == 0,
                 "lower=" + loPast.ToString(CultureInfo.InvariantCulture)
                 + " upper=" + upPast.ToString(CultureInfo.InvariantCulture));
-            // admin.SearchOffset 走的就是 LOWER（Java MQAdminImpl:189）：同时间戳必须同结果
             Check("searchOffset 默认边界与显式 LOWER 同结果",
                 admin.SearchOffset(bmq, future) == lo,
                 "lower=" + lo.ToString(CultureInfo.InvariantCulture));
@@ -607,7 +582,6 @@ internal static class AdminLive
             if (listener.Count() >= 1)
             {
                 MessageExt first = listener.First();
-                // 消费者仍在线时重投（对齐 Java：在消费线程内调用 sendMessageBack）
                 try
                 {
                     bool ok = cons.SendMessageBack(first, 0);
@@ -655,12 +629,6 @@ internal static class AdminLive
                 + "s；broker 把 delayLevel=0 改写为 3，约 10s 后可见）");
         }
 
-        // ---------- 8.5 FetchConsumeStatsInBroker（341）：按订阅组出行，本组带 offsetTable ----------
-        // Java `AdminBrokerProcessor#fetchAllConsumeStatsInBroker` 对
-        // `subscriptionGroupTable.keySet()` 的每个组建一行 {group: [ConsumeStats]}，内层 topic
-        // 才来自位点表 `whichTopicByConsumer`（所以要等消费者刷过位点）。
-        // ⚠ 响应 JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错键名时真机响应
-        // 会解析成空集合，看着像「这个 broker 没有积压」—— 这条断言就是回归护栏。
         {
             int rows = 0;
             bool groupWithOffsets = false;
@@ -723,8 +691,6 @@ internal static class AdminLive
             }
         }
 
-        // ---------- 9.5 resetOffsetByQueueId（Java DefaultMQAdminExtImpl:1827，两笔 RPC）+
-        //             queryTopicsByConsumer(343) ----------
         {
             int queueId = mq.QueueId;
             long minReset;
@@ -743,8 +709,6 @@ internal static class AdminLive
                 {
                     SortedDictionary<MessageQueue, long> table =
                         admin.ResetOffsetByQueueId(brokerAddr, group, topic, queueId, minReset);
-                    // Java 该方法是 void：broker 只在 language=CPP 时回可解析的 offsetTable，
-                    // 空表合法；非空时必须是我们操作的那个队列。
                     Check("resetOffsetByQueueId(回到 minOffset)",
                         table.Count == 0 || table.Keys.First().QueueId == queueId,
                         "returnedTable=" + table.Count.ToString(CultureInfo.InvariantCulture)
@@ -759,11 +723,6 @@ internal static class AdminLive
                     Check("resetOffsetByQueueId(回到 minOffset)", false, e.Message);
                 }
 
-                // 一次性 resetOffsetTable 真的被下一次 pull 取走：Java
-                // PullMessageProcessor:539-548 在 useServerSideResetOffset 下**不读消息**，
-                // 直接回 OFFSET_RESET ⇒ PULL_OFFSET_MOVED(:672)，客户端映射成
-                // PullStatus.OffsetIllegal + nextBeginOffset=重置位点（MQClientAPIImpl:1098）。
-                // 所以第一笔 pull 必须是 OffsetIllegal，第二笔才真正拿到历史消息。
                 try
                 {
                     var pull = new DefaultMQPullConsumer(group);
@@ -785,9 +744,6 @@ internal static class AdminLive
                     Check("重置后回拉", false, e.Message);
                 }
 
-                // 越界负例：resetOffsetInner 的 [min, max+1] 校验必须拒掉。同时量化 Java 语义——
-                // 两笔 RPC **不是原子的**：commitOffset 无区间校验，第 1 笔已把非法位点落库，
-                // 所以失败后位点停在非法目标上（这里不断言"回滚"）。
                 try
                 {
                     long badTarget = admin.MaxOffset(mq) + 100;
@@ -823,8 +779,6 @@ internal static class AdminLive
                 Check("queryTopicsByConsumerToBroker 读出本组消费过的 topic",
                     byBroker.Topics.Contains(topic),
                     "topics=" + byBroker.Topics.Count.ToString(CultureInfo.InvariantCulture));
-                // Java 的 admin 级方法（DefaultMQAdminExtImpl:1078）只收 group：按
-                // %RETRY%<group> 路由逐 broker 扇出再合并（Set 语义去重）。
                 TopicList byGroup = admin.QueryTopicsByConsumer(group);
                 Check("queryTopicsByConsumer(group) 按 %RETRY% 路由扇出并合并",
                     byGroup.Topics.Contains(topic),

@@ -140,14 +140,6 @@ export async function queuePopLoop(c: DefaultMQPushConsumer, mq: MessageQueue, s
 }
 
 // popOnce issues one POP_MESSAGE and returns the processed result.
-//
-// Static topics: like Java's PullAPIWrapper.popAsync (5.5.1), the POP request
-// resolves its address by mq.getBrokerName() and carries that name + the
-// queueId in the header — NO mock-broker-name rewrite exists on this path in
-// Java either, so a logical queue fails address resolution with
-// "The broker[__syslo__...] not exist" on both implementations. Only the
-// ACK / CHANGE_INVISIBLE_TIME paths rewrite the mock name (see
-// popAckAddress). This parity is deliberate: do NOT invent a rewrite here.
 async function popOnce(c: DefaultMQPushConsumer, mq: MessageQueue, sub: any): Promise<PopResult> {
   const client = c.mqClient;
   if (!client) throw new Error('consumer not started');
@@ -369,14 +361,6 @@ function popMaxReconsumeTimes(c: DefaultMQPushConsumer): number {
 // popAckAddress resolves the broker address an ACK/CHANGE_INVISIBLETIME
 // belongs to: the broker name from checkpoint segment 5, looked up against
 // the master, refreshing the route once.
-//
-// Static topics (Java ackAsync / changePopInvisibleTimeAsync): a checkpoint
-// from a LOGICAL queue carries the MOCK broker name ("__syslo__<scope>");
-// the REAL hosting broker is resolved through the instance's
-// topicEndPointsTable with the checkpoint's own queueId — globalIds of one
-// static topic may map to DIFFERENT real brokers, so queueId 0 would resolve
-// the wrong host. The request header keeps the ORIGINAL (mock) name either
-// way; only the address lookup goes through the real one.
 async function popAckAddress(c: DefaultMQPushConsumer, brokerName: string, topic: string,
   queueId: number): Promise<string> {
   const client = c.mqClient;
@@ -389,8 +373,6 @@ async function popAckAddress(c: DefaultMQPushConsumer, brokerName: string, topic
   let resolved = resolveAddr(desBrokerName);
   if (!resolved) {
     await client.updateTopicRouteInfoFromNameServer(topic, false).catch(() => {});
-    // retry the (possibly mock) name resolution after the route refresh —
-    // Java re-resolves desBrokerName after updateTopicRouteInfoFromNameServer.
     const retryName = isLogicalQueueMockBrokerName(brokerName)
       ? client.getBrokerNameFromMessageQueue(new MessageQueue(topic, brokerName, queueId))
       : brokerName;

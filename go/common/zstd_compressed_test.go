@@ -8,13 +8,6 @@ import (
 )
 
 // Tests for the ZSTD Compressed-block decoder (zstd.go + zstd_entropy.go).
-//
-// The fixtures below are frames produced by the official `zstd` CLI, i.e. the
-// same encoder family Java's zstd-jni uses on the broker. Before this decoder
-// existed the port only understood Raw/RLE blocks, so a message compressed by
-// any other port (cpp/libzstd, rust/zstd, csharp/ZstdStream) or by Java was
-// undecodable and the consumer simply never saw it. These vectors pin the
-// implementation to the reference format.
 
 // `zstd -3 --no-check` over zlibPayload (1040 B): one Compressed block, 4
 // Huffman literal streams, FSE-coded sequences.

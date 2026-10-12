@@ -1,9 +1,5 @@
 // 定时消息撤回（RecallMessage 370）的离线对拍。
 //
-// 覆盖三层：句柄编解码（Java RecallMessageHandle 的 vector）、协议头字段名（broker 用
-// fastjson2 按属性名反序列化，写错就是静默丢字段）、producer 侧的本地校验顺序。
-// 真正打到 broker 的端到端验证在 examples/RocketMQ.Examples/Program.cs 的 live_recall 里，
-// 因为撤回开关（recallMessageEnable）默认关着，不能塞进单测。
 //
 // 与 python/tests/test_recall_message.py、cpp/tests/test_recall_message.cpp、
 // rust/src/common/recall_message_handle.rs 的测试同题。
@@ -22,7 +18,6 @@ public class RecallMessageTests
     private const string UniqKey = "0123456789ABCDEF0123456789abcdef";
     private const string Timestamp = "1700000000000";
 
-    /// <summary>Java RecallMessageHandle.buildHandle 的实际输出（带 '=' 填充）。</summary>
     private const string LegacyVector =
         "djEgVG9waWNBIGJyb2tlci1hIDE3MDAwMDAwMDAwMDAgMDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlhYmNkZWY=";
 
@@ -48,8 +43,6 @@ public class RecallMessageTests
     [Fact]
     public void DecodeHandleAcceptsUnpaddedBase64Url()
     {
-        // Java 的 getUrlDecoder 只吃带填充的串；本端口四个移植版都放宽成两种通吃，
-        // 否则别的客户端写下的无填充句柄就撤不回。
         string unpadded = LegacyVector.TrimEnd('=');
         Assert.DoesNotContain('=', unpadded);
         HandleV1 h = RecallMessageHandle.DecodeHandle(unpadded);
@@ -59,7 +52,6 @@ public class RecallMessageTests
     [Fact]
     public void DecodeHandleIgnoresExtraSegments()
     {
-        // Java split 后只取 items[1..4]，尾段（新版句柄格式）忽略而不是报错。
         HandleV1 h = RecallMessageHandle.DecodeHandle(
             "djEgVG9waWNBIGJyb2tlci1hIDE3MDAwMDAwMDAwMDAgYWJjIGp1bms=");
         Assert.Equal("abc", h.MessageId);
@@ -101,7 +93,6 @@ public class RecallMessageTests
         Assert.Equal("PG_recall", ext["producerGroup"]);
         Assert.Equal(Topic, ext["topic"]);
         Assert.Equal(LegacyVector, ext["recallHandle"]);
-        // 继承字段在 Java 里反射名就是 bname，写成 brokerName 会被 broker 静默丢掉
         Assert.Equal(Broker, ext["bname"]);
         Assert.False(ext.ContainsKey("brokerName"));
 
@@ -180,9 +171,6 @@ public class RecallMessageTests
             Assert.Equal(RecallMessageHandle.InvalidHandle, corrupt);
             Assert.True(costMs < 200, "非法句柄必须不打网络，实际 " + costMs + "ms");
 
-            // 句柄合法但拿不到路由：Java 的 tryToFindTopicPublishInfo 异常照抛
-            // （DefaultMQProducerImpl:1586），所以这里 surfacing 的是路由错误而不是
-            // "The broker service address not found"。
             Assert.Equal("Can not find Message Queue for topic: " + Topic,
                 RecallMessageThrows(p, Topic, LegacyVector));
         }

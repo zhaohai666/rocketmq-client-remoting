@@ -1,7 +1,3 @@
-// -*- coding: utf-8 -*-
-// Heartbeat data (org.apache.rocketmq.remoting.protocol.heartbeat.*).
-// Mirrors python/remoting/protocol/heartbeat.py.
-//
 // NOTE: the heartbeat SubscriptionData uses the SAME fields as
 // common/subscriptionData.ts (topic, subString, tagsSet, codeSet, subVersion,
 // expressionType, classFilterMode) and the same JSON keys, so we reuse it here.

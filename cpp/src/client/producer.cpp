@@ -232,15 +232,9 @@ void DefaultMQProducer::start() {
     if (tlsOptionsSet_) {
         mqClient_->setTlsOptions(tlsOptions_);
     }
-    // SOCKS 代理（对齐 Java NettyRemotingClient#createBootstrap(SocksProxyConfig)）：
-    // 透传给传输层，首条连接建立时生效
     if (socksProxySet_) {
         mqClient_->setSocksProxy(socksProxy_);
     }
-    // 请求钩子：必须在**任何请求发出之前**绑定（start() 里的路由拉取与心跳也要带签名，
-    // 开了 namespaceV2 时还要带 `nsd`/`ns`、开了 stream 时还要带 `ReqT`）。Java 把钩子绑在
-    // MQClientAPIImpl 构造函数里，这里同样先绑钩子再 start()。
-    // 传**取值函数**而非字符串：Java 每笔请求实时读 clientConfig.getNamespaceV2()。
     if (std::shared_ptr<RPCHook> requestHook =
             composeRequestHooks(enableStreamRequestType_, rpcHook_,
                                 [this] { return namespaceV2_; })) {
@@ -261,7 +255,6 @@ void DefaultMQProducer::start() {
         [this](const RemotingCommand& cmd, const std::string& addr)
             -> std::optional<RemotingCommand> {
             this->checkTransactionState(cmd, addr);
-            // 不回响应：broker 用 invokeOneway 发回查，与 Java checkTransactionState 返回 null 一致。
             return std::nullopt;
         });
     // 异步发送的两个线程池：必须在 started_ 置位前建好，否则 sendAsync 会看到
@@ -270,10 +263,6 @@ void DefaultMQProducer::start() {
     started_ = true;
     logger_info("DefaultMQProducer[" + producerGroup_ + "] started, clientId=" + clientId_);
 
-    // 自动攒批：按 clientId 取（或建）进程级累加器，再起两根守卫线程
-    // （Java `DefaultMQProducer.start():377-379` 的 `produceAccumulator.start()`）。
-    // 必须排在 `started_ = true` 之后：守卫线程攒够一批就会调 `sendDirectBlocking`，
-    // 而那要求生产者可用（`client()` / 两个线程池都已在位）。
     initProduceAccumulator();
     if (produceAccumulator_ != nullptr) {
         produceAccumulator_->start();
@@ -283,8 +272,6 @@ void DefaultMQProducer::start() {
     // 必须在心跳线程之前完成 —— 分发器内部生产者要先把轨迹 topic 的路由拉起来。
     startTraceDispatcher();
 
-    // RequestFutureHolder 的守护扫描（Java DefaultMQProducerImpl.start():291 —— 计数
-    // 引用，最后一个 shutdown 的生产者把扫描线程收掉）。
     RequestFutureHolder::getInstance().startScheduledTask();
 
     // 心跳线程：周期性向 broker 注册 ProducerData。没有它 broker 无法主动回查事务。
@@ -306,11 +293,6 @@ void DefaultMQProducer::start() {
         }
     });
 
-    // 故障规避主动探测（Java DefaultMQProducerImpl.start():272 的 mqFaultStrategy.startDetector()
-    // → LatencyFaultToleranceImpl 的单线程 scheduled executor，固定速率 3s 一跳）。与 Go 端
-    // fault_detector.go 同口径：线程随 start/shutdown 启停、每跳先看 startDetectorEnable
-    // （开关运行期可翻）；Resolver / ServiceDetector 需要客户端实例，在这里装（Java 在
-    // 构造函数里装，cpp 的 MQClientInstance 也是 start() 时才建）。
     mqFaultStrategy_.latencyFaultTolerance().setResolver(
         [this](const std::string& brokerName) -> std::string {
             return mqClient_ ? mqClient_->findBrokerAddressInPublish(brokerName) : std::string();
@@ -324,15 +306,6 @@ void DefaultMQProducer::start() {
 }
 
 void DefaultMQProducer::shutdown() {
-    // 自动攒批：先停守卫线程 + 解除绑定（Java `shutdown()` 里那句
-    // `produceAccumulator.shutdown()`）。
-    //
-    // ⚠ ① 必须放在最前面：守卫线程跑在**别人**的线程上、会调 `sendDirectBlocking`
-    //      → `client()` / 两个线程池 / 传输层，晚于它们被拆掉就会在别人线程上摸到
-    //      已析构的成员。
-    //   ② 必须在 `lock_` **之外** join（下面的临界区会拿走 lock_）。
-    //   ③ `detachSender` 是本端口的必要补充（cpp 结构性差异，见 produce_accumulator.h）：
-    //      Java 的累加器强引用生产者，所以不需要；cpp 的生产者常是栈对象。
     if (produceAccumulator_ != nullptr) {
         produceAccumulator_->shutdown();
         produceAccumulator_->detachSender();
@@ -350,10 +323,6 @@ void DefaultMQProducer::shutdown() {
         asyncSender.swap(asyncSenderExecutor_);
         callbackPool.swap(callbackExecutor_);
     }
-    // 先回收异步发送的两个池（它们的任务内部持有 mqClient_ 引用），再关客户端。
-    // ⚠ 与 Java 的差别：Java 的 defaultAsyncSenderExecutor.shutdown() **不等**在途任务
-    // （GC 兜住了回调里引用的对象），C++ 里回调打在一个已析构的生产者上是 UB，
-    // 所以必须先跑完再放行。副作用是"发完立刻 shutdown"在这里不会丢在途回调。
     if (asyncSender) {
         asyncSender->shutdown(true);
     }
@@ -379,15 +348,10 @@ void DefaultMQProducer::shutdown() {
     if (heartbeatThread_.joinable()) {
         heartbeatThread_.join();
     }
-    // 故障规避探测线程（Java LatencyFaultToleranceImpl.shutdown 的对位）：与心跳线程同一
-    // 约束 —— 内部持有 mqClient_ 引用，必须在 mqClient_->shutdown() 之前停掉。
-    // 探测最坏拖着一个 detectTimeout 毫秒的同步请求，join 会等到它收尾。
     detectorRunning_.store(false);
     if (detectorThread_.joinable()) {
         detectorThread_.join();
     }
-    // RequestFutureHolder 守护扫描的计数注销（Java shutdown():319）。这里不持
-    // producer 的任何锁：扫描线程不回摸生产者成员，只动自己的表。
     RequestFutureHolder::getInstance().shutdownScheduledTask();
     {
         std::vector<std::thread> txThreads;
@@ -399,14 +363,6 @@ void DefaultMQProducer::shutdown() {
             if (t.joinable()) t.join();
         }
     }
-    // 优雅注销（对齐 Java DefaultMQProducerImpl.shutdown:313 → MQClientInstance
-    // #unregisterProducer:1198-1201 → unregisterClient(group, null)）：逐台 broker 发
-    // UNREGISTER_CLIENT(35)，broker 端 ProducerManager 立刻把本 clientId 从 groupChannelTable
-    // 摘掉。不发就只能等心跳超时（默认 ~120s）清理，这期间 `examineProducerConnectionInfo`
-    // 仍看得见这个已经退出的连接、事务回查也可能挑到它。
-    // ⚠ 必须在下面的 mqClient_->shutdown() **之前**：35 只能走还开着的长连接，且 broker
-    //   只摘除「这条 frame 到达的那条 channel」（ClientManageProcessor:226-230）。
-    // 与消费侧同一口径：异常只记 debug，shutdown 不因网络抖动抛出来。
     if (mqClient_) {
         try {
             mqClient_->unregisterClientAllBrokers(clientId_, producerGroup_, "");
@@ -430,10 +386,6 @@ MQClientInstance& DefaultMQProducer::client() {
     return *mqClient_;
 }
 
-// ---------------------------------------------------------------- 校验
-// 对应 Java DefaultMQProducerImpl 发送前的 Validators.checkMessage(msg, this)：
-// 全部判定收敛到 Validators（topic blank/长度/字符表 → 禁发 topic → body 三档 →
-// INNER_MULTI_DISPATCH 分隔符），文案与顺序以 python/client/validators.py 为准。
 void DefaultMQProducer::checkMessage(const Message& msg) const {
     Validators::checkMessage(msg, maxMessageSize_);
 }
@@ -445,19 +397,12 @@ Message DefaultMQProducer::withNamespace(const Message& msg) const {
     return out;
 }
 
-// 定点发送守卫的两处 Java 文案（同步 DefaultMQProducerImpl:1235、异步 :1278），逐字保留：
-// 两处文案不同是 Java 的原样，按入口取用。
 namespace {
 constexpr const char* kPinnedTopicMismatchSync = "message's topic not equal mq's topic";
 constexpr const char* kPinnedTopicMismatchAsync =
     "Topic of the message does not match its target message queue";
 }  // namespace
 
-// Java 的守卫比的是**各自拼过命名空间之后**的名字：公开入口先
-// `msg.setTopic(withNamespace(...))`、再把 mq 过 `ClientConfig.queueWithNamespace`，所以两边
-// 是同一命名空间下的两个资源名（`wrapNamespace` 幂等，已经带前缀的入参不会套两层）。少了这
-// 道守卫，topic 与目标队列不符的消息照样发得出去：broker 按请求里带的队列名写入，
-// SendResult 一切正常，消息却落进了**另一个 topic** 的分区，无人消费也无人报错。
 void DefaultMQProducer::checkPinnedTopic(const std::string& msgTopic, const MessageQueue& mq,
                                          const std::string& message) const {
     if (NamespaceUtil::wrapNamespace(namespace_, msgTopic) !=
@@ -466,13 +411,6 @@ void DefaultMQProducer::checkPinnedTopic(const std::string& msgTopic, const Mess
     }
 }
 
-// 对应 Java DefaultMQProducerImpl.tryToCompressMessage + sendKernelImpl 的 sysFlag 组装。
-//
-// 语义逐条对齐 Java：
-//   * 批量消息（MessageBatch）**永不压缩**；
-//   * body 长度 >= compressMsgBodyOverHowmuch（默认 4096）才压缩；
-//   * 压缩失败按 Java 的做法**降级为不压缩**并记日志，而不是让发送失败；
-//   * 压缩后不比较体积（Java 也不比较：即使压完更大也照发）。
 int32_t DefaultMQProducer::prepareForSend(Message& msg) const {
     if (msg.isBatch) {
         return 0;
@@ -500,10 +438,6 @@ int32_t DefaultMQProducer::prepareForSend(Message& msg) const {
 }
 
 // ---------------------------------------------------------------- 消息轨迹 / 钩子
-//
-// 对应 Java DefaultMQProducerImpl 的 sendMessageHookList / executeSendMessageHook*，
-// 以及 DefaultMQProducer.start() 里的 traceDispatcher 装配（Java 5.x :380-405）。
-// 钩子异常一律吞掉并记 warn —— 轨迹挂了绝不能影响正常收发。
 SendMessageContext DefaultMQProducer::buildSendMessageContext(
     const Message& msg, const MessageQueue& mq, const std::string& brokerAddr) const {
     SendMessageContext context;
@@ -513,14 +447,9 @@ SendMessageContext DefaultMQProducer::buildSendMessageContext(
     context.brokerAddr = brokerAddr;
     context.ns = namespace_;
     context.msgType = static_cast<int32_t>(TraceMessageType::NORMAL);
-    // 判定顺序照抄 Java DefaultMQProducerImpl:975-990：
-    //   TRAN_MSG == "true"      -> Trans_Msg_Half(1)
-    //   带 DELAY 属性            -> Delay_Msg(3)（覆盖前者，与 Java 的两段 if 顺序一致）
     if (msg.getProperty(MessageConst::PROPERTY_TRANSACTION_PREPARED) == "true") {
         context.msgType = static_cast<int32_t>(TraceMessageType::TRANS);
     }
-    // Java 判的是 "属性存在"（null 判定）；C++ 的 getProperty 对缺失返回空串，
-    // 故用非空判定 —— 值为空的 DELAY 属性本身也没有语义。
     if (!msg.getProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL).empty()) {
         context.msgType = static_cast<int32_t>(TraceMessageType::DELAY);
     }
@@ -552,8 +481,6 @@ void DefaultMQProducer::executeSendMessageHookAfter(SendMessageContext& context)
 }
 
 void DefaultMQProducer::executeCheckForbiddenHook(CheckForbiddenContext& context) {
-    // ⚠ 与 send/consume 钩子**相反**：这里不吞异常（Java 签名就是 throws MQClientException）。
-    // 异常会沿 sendDefaultImpl 的重试链向上传播 —— 这正是"禁止发送"的实现方式。
     for (auto& hook : checkForbiddenHookList_) {
         hook->checkForbidden(context);
     }
@@ -571,7 +498,6 @@ void DefaultMQProducer::runCheckForbidden(const Message& msg, const MessageQueue
     context.brokerAddr = brokerAddr;
     context.communicationMode = mode;
     context.arg = arg;
-    // Java `DefaultMQProducerImpl:964` 把 `tc.isUnitMode()` 放进 CheckForbiddenContext
     context.unitMode = unitMode_;
     executeCheckForbiddenHook(context);
 }
@@ -585,19 +511,12 @@ SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Mess
     if (enableTraceContext_) {
         injectTraceContext(const_cast<Message*>(&msg));
     }
-    // Java sendKernelImpl:918-924 + :1100：发布地址在**钩子之前**解析，解析不到时整段
-    // 直接抛，连 CheckForbiddenHook 都不跑（`if (brokerAddr != null) { ...hooks... }`
-    // 把钩子和发送圈在同一个分支里，异常在分支外抛）。所以这里不能像从前那样
-    // try/catch 降级成空串再把钩子跑下去 —— 那会凭空多发一对 before/after。
     if (!hasSendInterceptors()) {
         // 无钩子时零开销透传；client.sendMessage 内部同样走发布地址，失败抛同一句。
         return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_,
                                     createTopicKey_, defaultTopicQueueNums_);
     }
     const std::string brokerAddr = client.publishAddrFor(mq.brokerName, mq.topic);
-    // 顺序严格照抄 Java sendKernelImpl:956-990：
-    //   1. CheckForbiddenHook（每次尝试都跑；异常不吞）  2. SendMessageHook.before
-    //   3. 发请求  4. SendMessageHook.after
     runCheckForbidden(msg, mq, brokerAddr, arg, mode);
     if (sendMessageHookList_.empty()) {
         return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_,
@@ -656,30 +575,19 @@ void DefaultMQProducer::startTraceDispatcher() {
     try {
         auto dispatcher = std::make_shared<AsyncTraceDispatcher>(
             producerGroup_, TraceDispatcherType::PRODUCE, traceMsgBatchNum_, traceTopic_, rpcHook_);
-        // Java AsyncTraceDispatcher.start():155 `traceProducer.setNamespaceV2(namespaceV2)`：
-        // 轨迹的内部生产者也要带上实例命名空间，否则 broker 侧把轨迹写到别的实例下。
         dispatcher->setNamespaceV2(namespaceV2_);
         dispatcher->setHostProducer(this);
         dispatcher->setHostClientId(clientId_);
         dispatcher->start(getNamesrvAddr());
         traceDispatcher_ = dispatcher;
-        // 顺序与 Java DefaultMQProducer.start() 一致：先 SendMessageTraceHook，再 EndTransactionTraceHook
         registerSendMessageHook(std::make_shared<SendMessageTraceHook>(dispatcher.get()));
         registerEndTransactionHook(std::make_shared<EndTransactionTraceHook>(dispatcher.get()));
         logger_info("producer trace enabled, traceTopic=" + dispatcher->getTraceTopicName());
     } catch (const std::exception& e) {
-        // 轨迹挂了不能影响正常发送（对齐 Java 的 try/catch 语义）
         logger_warn(std::string("start trace dispatcher failed: ") + e.what());
     }
 }
 
-// ---------------------------------------------------------------- 路由漏斗
-// 对应 Java DefaultMQProducerImpl#tryToFindTopicPublishInfo（:875-911）。Java 里三条
-// "拿不到路由"的分支（sendDefaultImpl:888 / sendSelectImpl:1366 / invokeMessageQueueSelector:716）
-// 都是同一个形状：先真实路由、失败才 isDefault=true、再失败先 validateNameServerSetting。
-// 本端口原来只在同步发送那一处做了两步，其余入口只调 isDefault=true 的那一次，
-// 于是 selector/oneway/batch/request/recall 五条链把"寻址坏了"和"这个 topic 没路由"
-// 混成同一条 "Can not find Message Queue for topic" —— 收口到这里，一处定义处处生效。
 std::shared_ptr<TopicPublishInfo> DefaultMQProducer::topicPublishInfo(MQClientInstance& c,
                                                                      const std::string& topic) {
     try {
@@ -694,11 +602,6 @@ std::shared_ptr<TopicPublishInfo> DefaultMQProducer::topicPublishInfo(MQClientIn
     }
 }
 
-// 对应 Java DefaultMQProducerImpl#validateNameServerSetting（:729）：读的是
-// MQClientAPIImpl#getNameServerAddressList，空列表 → 10004。
-// 少了这一步，用户把地址服务器配错（拿到空列表）看到的会是 "No route info of this topic"
-// ——那是"topic 不存在"的意思，把人往建 topic 的方向查，而真正坏的是寻址。
-// Java 的文案后面拼了 FAQUrl.suggestTodo(...)，本仓库按约定不带后缀。
 void DefaultMQProducer::validateNameServerSetting(MQClientInstance& c) {
     if (c.nameServerAddrs().empty()) {
         throw MQClientException("No name server address, please set it.",
@@ -706,12 +609,8 @@ void DefaultMQProducer::validateNameServerSetting(MQClientInstance& c) {
     }
 }
 
-// ---------------------------------------------------------------- 自动攒批的转发层
-// 对应 Java `DefaultMQProducer:434-452`（canBatch）/ `:759-776`（sendDirect）/
-// `:778-793`（sendByAccumulator）/ `:1190-1243`（阈值读写）/ `:1475-1490`（初始化）。
 
 bool DefaultMQProducer::getAutoBatch() const {
-    // Java `getAutoBatch():1232-1236`：累加器为空时恒 false（哪怕 autoBatch=true）。
     if (produceAccumulator_ == nullptr) {
         return false;
     }
@@ -719,13 +618,7 @@ bool DefaultMQProducer::getAutoBatch() const {
 }
 
 void DefaultMQProducer::initProduceAccumulator() {
-    // Java 在 `DefaultMQProducerImpl` 的构造里调（:256），本端口在 `start()` 里调 ——
-    // 因为 cpp 的 clientId 是 start() 里才由 `changeInstanceNameToPID` + `buildClientId`
-    // 拼出来的（Java 的 `buildMQClientId()` 在构造时就能算）。注册表按 clientId 分桶，
-    // 键为空会把同进程所有生产者塞进同一桶，所以必须等到 clientId 有值。
     produceAccumulator_ = getOrCreateProduceAccumulator(clientId_, this);
-    // Java 只下发「调用方设过」的那几项（> -1）—— 同一个 clientId 的第二个生产者不能把
-    // 第一个调好的阈值改掉。
     if (batchMaxDelayMs_ > -1) {
         produceAccumulator_->setBatchMaxDelayMs(batchMaxDelayMs_);
     }
@@ -780,8 +673,6 @@ int64_t DefaultMQProducer::getTotalBatchMaxBytes() const {
 }
 
 bool DefaultMQProducer::canBatch(const Message& msg) const {
-    // ⚠ 先过全局字节闸门：**放行即记账**，而后面三条「不能攒批」的判断只是让调用方退回
-    // 直发 —— 那条消息的字节数**不会被归还**（Java 遗漏，照抄；改掉就与 Java 对不上了）。
     if (produceAccumulator_ == nullptr || !produceAccumulator_->tryAddMessage(msg)) {
         return false;
     }
@@ -802,9 +693,6 @@ bool DefaultMQProducer::canBatch(const Message& msg) const {
 
 std::optional<SendResult> DefaultMQProducer::sendDirect(const Message& msg, const MessageQueue* mq,
                                                         std::shared_ptr<SendCallback> callback) {
-    // Java `sendDirect`：mq == null 走轮询选队列（`defaultMQProducerImpl.send(msg)`），
-    // 否则定点。两条都**不走**公开入口 —— 那会再判一次 autoBatch，攒批被拒时就成了
-    // 无限递归。
     if (callback == nullptr) {
         return mq == nullptr ? sendDefaultImpl(msg, -1) : sendToMqImpl(msg, *mq, -1);
     }
@@ -822,8 +710,6 @@ std::optional<SendResult> DefaultMQProducer::sendByAccumulator(
         return sendDirect(msg, mq, std::move(callback));
     }
     checkMessage(msg);
-    // 在**编码成批量 body 之前**给这条子消息写好客户端 ID（Java `setUniqID(msg)`）。
-    // `buildBatch()` 里再补的那次是给**批量对象自己**的，两者不能混。
     Message stamped = msg;
     ensureUniqId(stamped);
     if (callback == nullptr) {
@@ -842,15 +728,11 @@ std::optional<SendResult> DefaultMQProducer::sendByAccumulator(
 
 SendResult DefaultMQProducer::sendDirectBlocking(const MessageBatch& batch,
                                                  const MessageQueue* mq) {
-    // Java `sendDirect(batch, mq, null)` → `defaultMQProducerImpl.send(batch[, mq])`，
-    // 默认超时（`sendMsgTimeout`）—— 攒批的调用方没有自己的超时可传。
     return sendPreparedBatch(batch, mq, -1);
 }
 
 void DefaultMQProducer::sendDirectAsync(const MessageBatch& batch, const MessageQueue* mq,
                                         std::shared_ptr<SendCallback> callback) {
-    // Java `sendDirect(batch, mq, callback)` → `defaultMQProducerImpl.send(batch[, mq], cb)`。
-    // 复用既有的批量异步入口（不阻塞调用方、回调在同口径的线程上跑）。
     if (mq == nullptr) {
         sendBatchAsync(batch.messages, std::move(callback), -1);
     } else {
@@ -862,8 +744,6 @@ SendResult DefaultMQProducer::sendPreparedBatch(const MessageBatch& batch, const
                                                int32_t timeoutMillis) {
     MQClientInstance& c = client();
     const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
-    // 批级校验（Java `sendDefaultImpl` 第一步的 `Validators.checkMessage(batch, this)`）：
-    // 子消息在 `sendByAccumulator` 里已经逐条校验过，这里校验的是**编码后的整批**。
     checkMessage(batch);
     MessageBatch outbound = batch;
     // 累加器的 AggregateKey.topic 已经是拼过命名空间的（生产者的公开入口先 withNamespace
@@ -873,8 +753,6 @@ SendResult DefaultMQProducer::sendPreparedBatch(const MessageBatch& batch, const
     }
     MessageQueue target;
     if (pinned != nullptr) {
-        // Java `sendDirect(batch, mq, null)`：回调为 null 时落到**同步**入口
-        // `impl.send(msg, mq, timeout)`，所以文案是同步那一处。
         checkPinnedTopic(outbound.topic, *pinned, kPinnedTopicMismatchSync);
         target = *pinned;
     } else {
@@ -887,28 +765,13 @@ SendResult DefaultMQProducer::sendPreparedBatch(const MessageBatch& batch, const
     return sendWithHooks(c, outbound, target, timeout, sysFlag);
 }
 
-// ---------------------------------------------------------------- 同步发送
-// 公开入口只做一件事：判 autoBatch 决定走累加器还是直发（Java `DefaultMQProducer:469-478`）。
-// 真正的发送链在 `sendDefaultImpl` 里（见下面）。
-//
-// 不分流的两条与 Java 一一对应：
-//   * **显式给了 timeout** → `sendDefaultImpl`，不攒批（Java 的 `send(msg, timeout)` 重载）；
-//   * `msg.isBatch` → 那是累加器自己发出去的东西，不挡就会无限递归。
 SendResult DefaultMQProducer::send(const Message& msg, int32_t timeoutMillis) {
     if (timeoutMillis < 0 && getAutoBatch() && !msg.isBatch) {
-        // Java 在入口就地 setTopic；本工程按既有口径不动调用方那份，传副本进去
-        // （子消息的 topic 会逐条编码进批量 body，broker 落盘、消费侧看到的是带前缀的）。
         return *sendByAccumulator(withNamespace(msg), nullptr, nullptr);
     }
     return sendDefaultImpl(msg, timeoutMillis);
 }
 
-// 逐条对齐 Java DefaultMQProducerImpl#sendDefaultImpl：
-//   * timesTotal = 1 + retryTimesWhenSendFailed（只有同步发送有重试）；
-//   * 每次尝试先算 costTime，总超时已用完则整体放弃（→ RemotingTooMuchRequestException）；
-//     还剩重试机会时，单次请求超时被 sendMsgMaxTimeoutPerRequest 压住，把余量留给后面的 broker；
-//   * 异常按类型分档写容错表，且只有 retryResponseCodes 里的 broker 响应码才继续重试；
-//   * 全部失败时把原因映射成 ClientErrorCode 塞进 MQClientException。
 SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeoutMillis) {
     MQClientInstance& c = client();
     const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
@@ -917,8 +780,6 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
     ensureUniqId(outbound);
     const int32_t sysFlag = prepareForSend(outbound);
 
-    // 路由完全取不到时 Java 在循环外就抛 NOT_FOUND_TOPIC，不会把重试次数空转掉。
-    // 与 Java 一致：整条重试链只用这一份发布信息，中途路由刷新不会换掉候选队列。
     std::shared_ptr<TopicPublishInfo> publish;
     try {
         publish = topicPublishInfo(c, outbound.topic);
@@ -936,8 +797,6 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
     SendResult result;
     bool gotResult = false;
     bool callTimeout = false;
-    // Java DefaultMQProducerImpl#pickTopic 的记账点：tryToFindTopicPublishInfo 就在发送
-    // 路径上，cpp 把"发布信息拉过哪个 topic"记下来，主动探测用第一个候选发 GET_MAX_OFFSET。
     rememberDetectTopic(outbound.topic);
     // 最后一次失败的原因，用于循环结束后的错误码映射
     enum class Cause { NONE, BROKER, CONNECT, TIMEOUT, CLIENT, OTHER };
@@ -950,9 +809,6 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
         int64_t beginPrev = UtilAll::currentTimeMillis();
         std::chrono::steady_clock::time_point attemptBegan = std::chrono::steady_clock::now();
         try {
-            // 故障规避：开启时按 broker 延迟/隔离状态选队列（Java MQFaultStrategy）；
-            // 关闭时退化为普通轮询（策略内部判断）。重试时 resetIndex 让轮询从头开始，
-            // 从而能避开 lastBrokerName 选到别的 broker。
             selected = mqFaultStrategy_.selectOneMessageQueue(*publish, lastBrokerName,
                                                               /*resetIndex=*/times > 0);
             lastBrokerName = selected.brokerName;
@@ -976,8 +832,6 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
             // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
             mqFaultStrategy_.updateFaultItem(selected.brokerName, elapsedMillis(attemptBegan),
                                              false, true);
-            // Java：非 SEND_OK 且开了 retryAnotherBrokerWhenNotStoreOK 才换 broker，
-            // 否则把这个"存了但没存好"的结果原样返回
             if (result.sendStatus != SendStatus::SEND_OK && retryAnotherBrokerWhenNotStoreOK_) {
                 continue;
             }
@@ -995,9 +849,6 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
             if (gotResult) return result;
             throw;
         } catch (const RemotingException& e) {
-            // 连不上/超时/发不出去：隔离该 broker。Java sendDefaultImpl:817-821 的语义：
-            // 探测线程在跑时 RemotingException 记 **unreachable**（等探测器把它放回）；
-            // 没跑时记 reachable（只隔离，否则故障规避会把 broker 永久拉黑）。
             if (!selected.brokerName.empty()) {
                 mqFaultStrategy_.updateFaultItem(selected.brokerName, elapsedMillis(attemptBegan),
                                                  true, !mqFaultStrategy_.isStartDetectorEnable());
@@ -1011,7 +862,6 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
                 cause = Cause::OTHER;
             }
         } catch (const MQClientException& e) {
-            // 客户端自己的问题（选不到队列、路由没了…）：Java 同样只记延迟、不隔离
             if (!selected.brokerName.empty()) {
                 mqFaultStrategy_.updateFaultItem(selected.brokerName,
                                                  elapsedMillis(attemptBegan), false, true);
@@ -1041,7 +891,6 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
     throw MQClientException(info, responseCode);
 }
 
-// 定点同步发送（Java `DefaultMQProducer.send(Message, MessageQueue):574-582`）。
 SendResult DefaultMQProducer::send(const Message& msg, const MessageQueue& mq,
                                    int32_t timeoutMillis) {
     if (timeoutMillis < 0 && getAutoBatch() && !msg.isBatch) {
@@ -1056,7 +905,6 @@ SendResult DefaultMQProducer::sendToMqImpl(const Message& msg, const MessageQueu
     MQClientInstance& c = client();
     int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(msg);
-    // Java 的顺序：Validators → 定点守卫 → sendKernelImpl（压缩在核里）→ 超时复检。
     checkPinnedTopic(msg.topic, mq, kPinnedTopicMismatchSync);
     Message outbound = withNamespace(msg);
     ensureUniqId(outbound);
@@ -1064,9 +912,6 @@ SendResult DefaultMQProducer::sendToMqImpl(const Message& msg, const MessageQueu
     return sendWithHooks(c, outbound, mq, timeout, sysFlag);
 }
 
-// 按选择器发送（顺序消息：同一 arg 落到同一队列）。
-// Java `DefaultMQProducer.send(Message, MessageQueueSelector, Object):678-688`：
-// **先算队列**（选择器可能触发一次路由拉取），再判 autoBatch 分流。
 SendResult DefaultMQProducer::sendBySelector(const Message& msg,
                                              const MessageQueueSelector& selector,
                                              const std::string& arg, int32_t timeoutMillis) {
@@ -1082,30 +927,15 @@ SendResult DefaultMQProducer::sendBySelector(const Message& msg,
     }
     // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
     const int32_t sysFlag = prepareForSend(outbound);
-    // arg 透传给 CheckForbiddenHook（Java CheckForbiddenContext.arg 就是它）
     return sendWithHooks(c, outbound, selected, timeout, sysFlag, &arg, CommunicationMode::SYNC);
 }
 
-// ---------------------------------------------------------------- 异步 / 单向
-// 异步链逐段对应 Java：
-//   DefaultMQProducerImpl:133-140  AsyncSenderExecutor（core==max==CPU 核数、队列 50000）
-//   DefaultMQProducerImpl:553-575  出队才算耗时，预算被排队吃光就直接失败
-//   DefaultMQProducerImpl:756      ASYNC 的 timesTotal 恒为 1（换 broker 全在 onExceptionImpl）
-//   MQClientAPIImpl:616-702        sendMessageAsync：成功/失败分类 + 容错表
-//   MQClientAPIImpl:704-743        onExceptionImpl：复用请求、换新 opaque、共享剩余预算
-//   NettyRemotingAbstract:488-517  回调挪到 NettyClientPublicExecutor，不占连接读线程
 namespace {
 
-// 一次尝试的耗时（整数毫秒，Java 全程用毫秒）
 int32_t elapsedMs(const std::chrono::steady_clock::time_point& from) {
     return static_cast<int32_t>(elapsedMillis(from));
 }
 
-// 对应 Java ``MQClientAPIImpl:680-693`` 的 operationFail 分类：**按异常类型**决定文案和
-// 要不要重试。注意"响应已到达但处理失败"（RESPONSE_FAILED）时 Java 走的是
-// operationSucceed 里的 catch（:669-673，needRetry=false），和同步发送按
-// retryResponseCodes 换 broker 的语义**不同**，别顺手"统一"掉。
-// 文本逐字对齐 Java/Python，跨端对比时看的就是这几个短语。
 void classifyAsyncFailure(const InvokeError& error, int32_t cost, InvokeError* wrapped,
                           bool* needRetry) {
     switch (error.kind) {
@@ -1124,7 +954,7 @@ void classifyAsyncFailure(const InvokeError& error, int32_t cost, InvokeError* w
             return;
         case InvokeError::Kind::TOO_MUCH_REQUEST:
             *wrapped = InvokeError(InvokeError::Kind::OTHER, "unknown reason");
-            *needRetry = false;  // Java: !(t instanceof RemotingTooMuchRequestException)
+            *needRetry = false;
             return;
         default:
             *wrapped = InvokeError(InvokeError::Kind::OTHER, "unknown reason");
@@ -1133,12 +963,6 @@ void classifyAsyncFailure(const InvokeError& error, int32_t cost, InvokeError* w
     }
 }
 
-// 交到用户回调手里的那个 Throwable（Java ``SendCallback#onException(Throwable)``）。
-// 与 Python ``_classify_async_failure`` / C# ``ClassifyAsyncFailure`` 同口径：
-//   * 本地闸门（背压/预算）拒绝 → RemotingTooMuchRequestException（Java 直接抛的原类型）
-//   * broker 明确回错 → MQBrokerException(code, msg)（码随 InvokeError.responseCode 过来）
-//   * 响应到了但解析不出来 → RemotingCommandException（Java processSendResponse 那一支）
-//   * 其余（含 operationFail 三包装后的文案）→ MQClientException
 std::exception_ptr makeSendException(const InvokeError& error) {
     switch (error.kind) {
         case InvokeError::Kind::TOO_MUCH_REQUEST:
@@ -1162,13 +986,8 @@ std::exception_ptr makeSendException(const InvokeError& error) {
 
 }  // namespace
 
-// ---------------------------------------------------------------- 异步发送背压配置
-// Java DefaultMQProducer:1368-1408。改容量必须走这两个 setter：直接改字段只动配置值，
-// 信号量不会跟着变（Java 的字段是 private，没这个坑）。
 void DefaultMQProducer::setBackPressureForAsyncSendNum(int32_t num) {
     backPressureForAsyncSendNum_ = std::max(num, static_cast<int32_t>(kMinAsyncSendNum));
-    // 语义是「总量变成 num、在途那份原样保留」⇒ 空闲 = num - 在途，调小后可以为负。
-    // Java 写成 acquired = 旧配置 - 空闲; setSemaphore(num - acquired)，同一个结果。
     semaphoreAsyncSendNum_.setTotalPermits(backPressureForAsyncSendNum_);
 }
 
@@ -1186,8 +1005,6 @@ int64_t DefaultMQProducer::getSemaphoreAsyncSendSizeAvailablePermits() const {
 }
 
 void DefaultMQProducer::createAsyncExecutors() {
-    // Java 的两个池都以 availableProcessors 为大小；本机的 CPU 数在 ConsumeExecutor
-    // 里从 1 开始编号，线程名 "AsyncSenderExecutor_1"、"NettyClientPublicExecutor_1"。
     int32_t cores = static_cast<int32_t>(std::thread::hardware_concurrency());
     if (cores <= 0) {
         cores = 1;  // 取不到 CPU 数时按 1 核算，不能建出一个跑不动任务的池
@@ -1196,18 +1013,12 @@ void DefaultMQProducer::createAsyncExecutors() {
         cores, cores, 60.0, "AsyncSenderExecutor", asyncSenderQueueCapacity_, "_", 1);
     int32_t callbackThreads = clientCallbackExecutorThreads_;
     if (callbackThreads <= 0) {
-        callbackThreads = cores;  // Java NettyClientConfig:28 的默认就是 availableProcessors
+        callbackThreads = cores;
     }
     callbackExecutor_ = std::make_shared<ConsumeExecutor>(
         callbackThreads, callbackThreads, 60.0, "NettyClientPublicExecutor", 0, "_", 1);
 }
 
-// 公开入口的 autoBatch 分流（Java `DefaultMQProducer.send(Message, SendCallback):514-525`）：
-// 同样只在**没显式给 timeout** 时判（`send(msg, cb, timeout)` 那个重载不攒批）。
-//
-// ⚠ 与 Java 的差别：Java 把这段包在 `try { } catch (Throwable e) { sendCallback.onException(e); }`
-// 里，所以本地校验失败也是"进回调"。本端口沿用既有口径 —— 未 start() 时同步抛
-// （见头文件 `sendAsync` 的注释），累加器路径的本地校验失败同样同步抛，两条一致。
 void DefaultMQProducer::sendAsync(const Message& msg, std::shared_ptr<SendCallback> callback,
                                   int32_t timeoutMillis) {
     if (timeoutMillis < 0 && getAutoBatch() && !msg.isBatch) {
@@ -1225,7 +1036,6 @@ void DefaultMQProducer::sendAsyncImpl(const Message& msg, std::shared_ptr<SendCa
     enqueueAsync(state, nullptr, timeoutMillis);
 }
 
-// 定点异步（Java `send(Message, MessageQueue, SendCallback):615-632`）
 void DefaultMQProducer::sendAsync(const Message& msg, const MessageQueue& mq,
                                   std::shared_ptr<SendCallback> callback, int32_t timeoutMillis) {
     if (timeoutMillis < 0 && getAutoBatch() && !msg.isBatch) {
@@ -1279,7 +1089,6 @@ void DefaultMQProducer::enqueueAsync(const std::shared_ptr<AsyncSendState>& stat
     }
     const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     state->timeout = timeout;
-    // 许可按**压缩前**的 body 长度扣（Java 在调用方线程上算，那时还没压缩）
     state->msgLen =
         state->batch ? batchBackPressureMsgLen(state->batchMsgs) : backPressureMsgLen(state->msg);
     if (pinned != nullptr) {
@@ -1288,8 +1097,6 @@ void DefaultMQProducer::enqueueAsync(const std::shared_ptr<AsyncSendState>& stat
     }
     const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
     const std::function<void()> runnable = [this, state, began, timeout]() {
-        // 出队之后才算真实耗时：Java 的 runnable 用 `timeout > costTime` 把关，
-        // 排队已经把预算吃光时连请求都不建。
         const int32_t cost = elapsedMs(began);
         if (timeout <= cost) {
             const InvokeError tooMuch(InvokeError::Kind::TOO_MUCH_REQUEST,
@@ -1305,7 +1112,6 @@ void DefaultMQProducer::enqueueAsync(const std::shared_ptr<AsyncSendState>& stat
                 sendAsyncInner(state, state->pinned ? &state->mq : nullptr);
             }
         } catch (const std::exception& e) {
-            // Java：runnable 的 catch → newCallBack.onException(e)
             const InvokeError err(InvokeError::Kind::OTHER, e.what());
             completeAsync(state, nullptr, &err);
         } catch (...) {
@@ -1322,9 +1128,6 @@ void DefaultMQProducer::executeAsyncMessageSend(const std::shared_ptr<AsyncSendS
                                                 const std::chrono::steady_clock::time_point& began,
                                                 const std::shared_ptr<ConsumeExecutor>& pool) {
     if (enableBackpressureForAsyncMode_) {
-        // 两个许可**顺序**申请、都用「从 began 算起的剩余预算」去等（Java :648 / :661 都是
-        // `timeout - costTime`），所以第一个闸就能把预算花光；已经拿到手的由
-        // releaseBackPressure 在链终点原样归还。
         const int32_t numBudget = timeout - elapsedMs(began);
         state->numAcquired =
             numBudget > 0 && semaphoreAsyncSendNum_.tryAcquire(1, numBudget);
@@ -1348,21 +1151,14 @@ void DefaultMQProducer::executeAsyncMessageSend(const std::shared_ptr<AsyncSendS
         pool->submit(runnable);
     } catch (const RejectedExecutionError&) {
         if (enableBackpressureForAsyncMode_) {
-            // Java :675-681：许可已经扣掉了，就地跑完这一笔（**阻塞调用方**），
-            // 好让回调把许可还回来；否则队列一满就直接抛，白扣的容量还得等超时。
             runnable();
         } else {
-            // Java DefaultMQProducerImpl:635-682：executor.submit 抛
-            // RejectedExecutionException → MQClientException("executor rejected ")
             throw MQClientException("executor rejected");
         }
     }
 }
 
 void DefaultMQProducer::releaseBackPressure(const std::shared_ptr<AsyncSendState>& state) {
-    // Java BackpressureSendCallBack.semaphoreProcessor:599-610（先还字节、再还条数）。
-    // 与 Java 的一处加固：这里用 permitsReleased 保证只还一次 —— Java 直接还，链上任何
-    // 一次走到终点之后的重复回调都会把容量虚增出去；本端口的重试链更长，还一次更稳妥。
     if (state->permitsReleased) {
         return;
     }
@@ -1386,8 +1182,6 @@ void DefaultMQProducer::sendBatchAsyncInner(const std::shared_ptr<AsyncSendState
                                                   kPinnedTopicMismatchAsync);
         executeOnCallbackThread([this, state, result]() { completeAsync(state, &result, nullptr); });
     } catch (const MQBrokerException& e) {
-        // broker 明确回错：Java 的批量异步同样走 processSendResponse 的 catch，交给回调的是
-        // MQBrokerException（带码），不是包装层文案
         executeOnCallbackThread([this, state, msg = std::string(e.what()), code = e.responseCode]() {
             const InvokeError err(InvokeError::Kind::RESPONSE_FAILED, msg, code);
             completeAsync(state, nullptr, &err);
@@ -1406,8 +1200,6 @@ void DefaultMQProducer::sendAsyncInner(const std::shared_ptr<AsyncSendState>& st
     MQClientInstance& c = client();
     checkMessage(state->msg);
     if (pinned != nullptr) {
-        // Java `:1277-1278`：异步分支在同一位置用另一处文案抛，异常由 runnable 的 catch
-        // 转给 `newCallBack.onException`（这里由 enqueueAsync 的 catch 收口）。
         checkPinnedTopic(state->msg.topic, *pinned, kPinnedTopicMismatchAsync);
     }
     state->msg = withNamespace(state->msg);
@@ -1415,12 +1207,9 @@ void DefaultMQProducer::sendAsyncInner(const std::shared_ptr<AsyncSendState>& st
     // 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍
     state->sysFlag = prepareForSend(state->msg);
     if (pinned != nullptr) {
-        // Java send(msg, mq, cb, timeout) → sendKernelImpl 直接定点发，传下去的
-        // topicPublishInfo 是 null，所以失败只会在**同一台 broker** 上换 opaque 重试。
         sendKernelAsync(state);
         return;
     }
-    // 路由完全取不到时 Java 在循环外就抛 NOT_FOUND_TOPIC，不会把重试次数空转掉
     try {
         state->publish = topicPublishInfo(c, state->msg.topic);
     } catch (const MQClientException& e) {
@@ -1442,15 +1231,9 @@ void DefaultMQProducer::sendAsyncInner(const std::shared_ptr<AsyncSendState>& st
 
 void DefaultMQProducer::sendKernelAsync(const std::shared_ptr<AsyncSendState>& state) {
     MQClientInstance& c = client();
-    // Java sendKernelImpl:917 —— beginStartTime 每次进 sendKernelImpl 都重取；
-    // 重试链走的是 sendMessageAsync，不经过这里，所以这道闸一次发送只算一次。
     const std::chrono::steady_clock::time_point beginKernel = std::chrono::steady_clock::now();
     state->brokerName = state->mq.brokerName;
 
-    // 地址解析，与 Java sendKernelImpl:919-924 + :1100 逐字对齐：查发布地址（**只认主**）
-    // → 查不到按 topic 刷一次路由 → 重查 → 仍查不到抛 "The broker[X] not exist"。
-    // 定点发送（pinned）不会在 sendDefaultImpl 里取发布信息，这一步是它唯一的路由来源 ——
-    // 少了这一步，第一次定点发送必然拿到空地址。异常由 enqueueAsync 的 catch 转给回调。
     const std::string brokerAddr = c.publishAddrFor(state->mq.brokerName, state->mq.topic);
     if (hasCheckForbiddenHook()) {
         runCheckForbidden(state->msg, state->mq, brokerAddr, nullptr, CommunicationMode::ASYNC);
@@ -1458,8 +1241,6 @@ void DefaultMQProducer::sendKernelAsync(const std::shared_ptr<AsyncSendState>& s
     if (enableTraceContext_) {
         injectTraceContext(&state->msg);
     }
-    // 请求只建一次：跨重试复用同一个对象（Java onExceptionImpl 只换 opaque），
-    // 所以 header 里的 queueId 也跟着第一次那次 —— 这是 Java 的真实行为，别"修"它。
     state->request =
         c.buildSendRequest(producerGroup_, state->msg, state->mq, state->sysFlag, unitMode_,
                            createTopicKey_, defaultTopicQueueNums_);
@@ -1468,9 +1249,6 @@ void DefaultMQProducer::sendKernelAsync(const std::shared_ptr<AsyncSendState>& s
             buildSendMessageContext(state->msg, state->mq, brokerAddr));
         executeSendMessageHookBefore(*state->context);
     }
-    // Java sendKernelImpl:1043-1046：ASYNC 分支自己的总闸 —— 钩子、压缩、路由
-    // 都算耗时，预算被它们吃光就不再发起请求（RemotingTooMuchRequestException 是
-    // RemotingException 的子类，所以会先走 :1088 的 hook.after 再抛给回调）。
     const int32_t costAsync = elapsedMs(beginKernel);
     if (state->timeout < costAsync) {
         const InvokeError tooMuch(InvokeError::Kind::TOO_MUCH_REQUEST,
@@ -1504,9 +1282,6 @@ void DefaultMQProducer::sendAttempt(const std::shared_ptr<AsyncSendState>& state
     } catch (const RemotingTimeoutException& e) {
         onTransportThrow(state, e.what(), InvokeError::Kind::TIMEOUT);
     } catch (const std::exception& e) {
-        // Java sendMessageAsync 的外层 catch：就地失败（连不上/通道没了），
-        // 异常**原样**传递（不包装）、needRetry=true —— 类名也要跟着走，
-        // 因为回调拿到的就是那个对象（建连失败给 RemotingConnectException）
         onTransportThrow(state, e.what(), InvokeError::Kind::OTHER);
     } catch (...) {
         onTransportThrow(state, "unknown error", InvokeError::Kind::OTHER);
@@ -1516,12 +1291,8 @@ void DefaultMQProducer::sendAttempt(const std::shared_ptr<AsyncSendState>& state
 void DefaultMQProducer::onTransportThrow(const std::shared_ptr<AsyncSendState>& state,
                                          const std::string& message, InvokeError::Kind kind) {
     const int32_t cost = elapsedMs(state->attemptBegan);
-    // 同步就地失败 ⇒ 链路根本没通（Java 外层 catch 传 reachable=false，与 operationFail 的
-    // reachable=true 刻意不同）
     mqFaultStrategy_.updateFaultItem(state->brokerName, cost, true, false);
     state->timeout -= cost;
-    // 不在这里过 classifyAsyncFailure：Java 把**原对象**直接交给 onExceptionImpl，
-    // 包装只发生在 operationFail（异步应答那一侧）
     onSendException(state, InvokeError(kind, message), true);
 }
 
@@ -1537,7 +1308,6 @@ void DefaultMQProducer::onAttemptComplete(const std::shared_ptr<AsyncSendState>&
     InvokeError wrapped;
     bool needRetry = false;
     classifyAsyncFailure(error, cost, &wrapped, &needRetry);
-    // Java operationFail:678-693 —— 换 broker 之前记一次原文，否则包装之后查不到真因
     logger_warn("async send to broker " + state->brokerName + " failed: " + error.message
                 + " (reported as " + wrapped.message + ")");
     // 超时预算是**所有尝试共享**的剩余时间，不是每次尝试各给一份
@@ -1559,8 +1329,6 @@ void DefaultMQProducer::onSendException(const std::shared_ptr<AsyncSendState>& s
                 retryBroker = selected.brokerName;
             }
         }
-        // Java onExceptionImpl:725 只查发布地址表（同样只认 master）、**不刷路由**；
-        // 查不到就带着 null 撞进 sendMessageAsync。这里就地终止，别让空地址传进传输层。
         const std::string addr = client().findBrokerAddressInPublish(retryBroker);
         if (addr.empty()) {
             // 路由里连这台 broker 的主地址都没了，再试也没有意义
@@ -1582,8 +1350,6 @@ void DefaultMQProducer::onSendException(const std::shared_ptr<AsyncSendState>& s
 }
 
 void DefaultMQProducer::executeOnCallbackThread(std::function<void()> fn) {
-    // Java NettyRemotingAbstract.executeInvokeCallback：能交给 publicExecutor 就交出去，
-    // 池子不可用（未启动/已关/队满）时**就地跑**，与 Java 的 runInThisThread 一致。
     std::shared_ptr<ConsumeExecutor> pool;
     {
         std::lock_guard<std::mutex> lk(lock_);
@@ -1611,8 +1377,6 @@ void DefaultMQProducer::completeAsync(const std::shared_ptr<AsyncSendState>& sta
         }
         executeSendMessageHookAfter(*state->context);
     }
-    // 顺序与 Java 一致：after 钩子（在 sendKernelImpl 的包装回调里）→ 归还许可 → 用户回调。
-    // 归还必须在交给用户之前，否则用户回调里再发一笔异步消息会多占一格。
     releaseBackPressure(state);
     if (state->callback == nullptr) {
         return;
@@ -1624,8 +1388,6 @@ void DefaultMQProducer::completeAsync(const std::shared_ptr<AsyncSendState>& sta
             state->callback->onSuccess(*result);
         }
     } catch (...) {
-        // 用户回调抛的异常必须吞掉（Java 两处都是 catch Throwable），
-        // 否则它会带走回调线程池的 worker。
         logger_warn("sendAsync callback threw an exception");
     }
 }
@@ -1637,8 +1399,6 @@ void DefaultMQProducer::sendOneway(const Message& msg) {
     std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
     MessageQueue selected = publish->selectOneMessageQueue();
     const int32_t sysFlag = prepareForSend(outbound);
-    // 单向发送在 Java 里同样走 sendKernelImpl → CheckForbiddenHook 必须生效，
-    // 且地址解析同样**只认 master**（publishAddrFor 拿不到就抛，钩子不跑）。
     const std::string brokerAddr = c.publishAddrFor(selected.brokerName, selected.topic);
     runCheckForbidden(outbound, selected, brokerAddr, nullptr, CommunicationMode::ONEWAY);
     // W3C traceparent 透传（opt-in）：单向发送同样注入
@@ -1654,9 +1414,6 @@ void DefaultMQProducer::sendOneway(const Message& msg, const MessageQueue& mq) {
     checkMessage(msg);
     Message outbound = withNamespace(msg);
     const int32_t sysFlag = prepareForSend(outbound);
-    // 地址与 Java sendKernelImpl 同口径：findBrokerAddressInPublish（**只认 master**）→
-    // 查不到按 topic 刷一次路由 → 仍查不到抛「The broker[X] not exist」（钩子不跑）。
-    // 别退回"单向没有应答所以不兜底"的宽容写法：那会拿到从节点地址把写请求打过去。
     const std::string brokerAddr = c.publishAddrFor(mq.brokerName, mq.topic);
     runCheckForbidden(outbound, mq, brokerAddr, nullptr, CommunicationMode::ONEWAY);
     if (enableTraceContext_) {
@@ -1670,8 +1427,6 @@ void DefaultMQProducer::sendOneway(const Message& msg, const MessageQueue& mq) {
 
 namespace {
 
-// RAII：无论正常返回还是异常，都把等待槽摘掉（对应 Java request() 的 finally remove）。
-// putResponse 已经先原子 remove 了，这里再摘一次是幂等的。
 struct RequestFutureRemover {
     const std::string& correlationId;
     ~RequestFutureRemover() { RequestFutureHolder::getInstance().removeRequest(correlationId); }
@@ -1701,9 +1456,6 @@ Message DefaultMQProducer::requestWithQueue(Message& outbound, const MessageQueu
                                             int32_t timeout) {
     MQClientInstance& c = client();
 
-    // 请求方三件事（对齐 Java prepareSendRequest / DefaultMQProducerImpl#request）：
-    // CORRELATION_ID（随机 UUID）、REPLY_TO_CLIENT（本客户端 clientId）、TTL（= timeout）。
-    // REPLY_TO_CLIENT 是 broker 反查 channel 的键 —— 撞名会把应答推到别人的连接上。
     const std::string correlationId = createCorrelationId();
     outbound.putProperty(MessageConst::PROPERTY_CORRELATION_ID, correlationId);
     outbound.putProperty(MessageConst::PROPERTY_MESSAGE_REPLY_TO_CLIENT, clientId_);
@@ -1731,8 +1483,6 @@ Message DefaultMQProducer::requestWithQueue(Message& outbound, const MessageQueu
         c.sendMessage(producerGroup_, outbound, mq, timeout, sysFlag, unitMode_,
                       createTopicKey_, defaultTopicQueueNums_);
     } catch (...) {
-        // 发送失败三件事：标 !sendRequestOk + 空唤醒（别让等待方白等满 timeout）+ 记 cause。
-        // 与 Java 的匿名 SendCallback#onException 完全一致。
         future->setSendRequestOk(false);
         future->setCause(std::current_exception());
         future->putResponseMessage();
@@ -1777,8 +1527,6 @@ SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, const 
     return sendBatchKernel(msgs, &mq, timeoutMillis, kPinnedTopicMismatchSync);
 }
 
-// 两个公开重载 + 批量异步共用的内核。pinned 非空时整批定点落到该队列（Java
-// send(Collection, MessageQueue, timeout)），不查路由、不换 broker。
 SendResult DefaultMQProducer::sendBatchKernel(const std::vector<Message>& msgs,
                                               const MessageQueue* pinned,
                                               int32_t timeoutMillis,
@@ -1788,12 +1536,6 @@ SendResult DefaultMQProducer::sendBatchKernel(const std::vector<Message>& msgs,
     if (msgs.empty()) {
         throw MQClientException("message list is empty");
     }
-    // 对应 Java DefaultMQProducer.batch():1172-1184 的**顺序**：逐条 Validators.checkMessage
-    // （在拼命名空间之前、用原始 topic）→ 逐条 setUniqID → 逐条拼命名空间 → 批量自身
-    // setUniqID → **才编码**。少 checkMessage 等于批量路径绕过所有本地校验（超长/空 body/
-    // 非法 topic 都能发出去）；少 setUniqID 或把编码放到写 ID 之前，批量 body 里每条子消息
-    // 都没有客户端 ID —— 消费端和轨迹控制台都串不起来，SendResult.msgId 也只能退化成
-    // broker 的 offsetMsgId，而「发成功了没」完全看不出来。
     std::vector<Message> subs;
     subs.reserve(msgs.size());
     for (const Message& m : msgs) {
@@ -1813,8 +1555,6 @@ SendResult DefaultMQProducer::sendBatchKernel(const std::vector<Message>& msgs,
         batch.topic = NamespaceUtil::wrapNamespace(namespace_, batch.topic);
     }
     if (pinned != nullptr) {
-        // Java：`impl.send(batch(msgs), mq, timeout)` 与单条共用同一处同步守卫
-        // （MessageBatch extends Message）；批量异步入口是另一处文案，由调用方传入。
         checkPinnedTopic(batch.topic, *pinned, pinnedGuardMessage);
     }
     MessageQueue target;
@@ -1845,8 +1585,6 @@ int32_t DefaultMQProducer::sendHeartbeatToAllBroker() {
         return 0;
     }
 
-    // 只带 ProducerData：对齐 Java MQClientInstance 里 producerTable 的注册内容。
-    // broker 会把该 group 登记到 ProducerManager（事务回查即通过该 channel 反向联系）。
     HeartbeatData hb(clientId_);
     ProducerData pd;
     pd.groupName = producerGroup_;
@@ -1867,20 +1605,11 @@ int32_t DefaultMQProducer::sendHeartbeatToAllBroker() {
 }
 
 // ---------------------------------------------------------------- 故障规避主动探测
-//
-// Java DefaultMQProducerImpl.start():272 的 mqFaultStrategy.startDetector()：
-// LatencyFaultToleranceImpl 内部那根 "LatencyFaultToleranceScheduledThread" 按
-// scheduleAtFixedRate(3s, 3s) 跑 detectByOneRound，每跳先看 startDetectorEnable。
-// cpp 没有共享 scheduled executor，线程归生产者所有（与 Go 端 fault_detector.go 同口径），
-// 首跳立刻跑（与心跳线程同一口径；Java 的 initialDelay=3s 只是延迟首次探测，故障表
-// 未建立时探测本来就是空转）。
 void DefaultMQProducer::detectorLoop() {
     setThreadName("FaultDetectorThread");
     auto next = std::chrono::steady_clock::now();
     while (detectorRunning_.load()) {
         sleepUntilDeadline(detectorRunning_, next);
-        // Java startDetector 的固定速率：3s 一跳；每个 broker 自己再按 detectInterval 限频
-        //（见 LatencyFaultToleranceImpl::detectByOneRound 的 checkStamp 占坑）。
         next += std::chrono::milliseconds(3000);
         if (!mqFaultStrategy_.isStartDetectorEnable()) {
             continue;
@@ -1888,7 +1617,6 @@ void DefaultMQProducer::detectorLoop() {
         try {
             mqFaultStrategy_.latencyFaultTolerance().detectByOneRound();
         } catch (const std::exception& e) {
-            // Java 的 runnable 整段 try/catch：探测抖动绝不能带走调度线程
             logger_debug(std::string("fault detector round failed: ") + e.what());
         } catch (...) {
             logger_debug("fault detector round failed: unknown exception");
@@ -1896,9 +1624,6 @@ void DefaultMQProducer::detectorLoop() {
     }
 }
 
-// Java DefaultMQProducerImpl#pickTopic（:180-185）：topicPublishInfoTable 的第一个 key。
-// cpp 的发布信息缓存在 MQClientInstance 里，这里按「发送过的 topic」记账（记账点在
-// sendDefaultImpl 的 topicPublishInfo 调用点，与 Java 的表填充点是同一个）。
 std::string DefaultMQProducer::pickDetectTopic() {
     std::lock_guard<std::mutex> lk(detectTopicsMutex_);
     return detectTopics_.empty() ? std::string() : *detectTopics_.begin();
@@ -1912,17 +1637,12 @@ void DefaultMQProducer::rememberDetectTopic(const std::string& topic) {
     detectTopics_.insert(topic);
 }
 
-// ServiceDetector 等价物（Java DefaultMQProducerImpl 构造函数 :155-169 的匿名实现）：
-// 对 endpoint 发一笔 GET_MAX_OFFSET(30)（Java 用候选 topic 的 queueId=0），这是最便宜的
-// 能验证「传输 + 请求路由 + 存储」全链路都通的 RPC。任何失败 —— 传输错误、broker 拒绝、
-// 超时 —— 都算仍然不可达，并且（按 Java detectByOneRound 的语义）不动 reachable 标志。
 bool DefaultMQProducer::detectBrokerByMaxOffset(const std::string& addr, int32_t timeoutMillis) {
     if (addr.empty()) {
         return false;
     }
     const std::string topic = pickDetectTopic();
     if (topic.empty()) {
-        // Java pickTopic：候选 topic 表为空 → Optional.empty → detect 返回 false
         return false;
     }
     try {
@@ -1936,10 +1656,6 @@ bool DefaultMQProducer::detectBrokerByMaxOffset(const std::string& addr, int32_t
 }
 
 // ---------------------------------------------------------------- 事务消息
-//
-// 对齐 Java DefaultMQProducerImpl 的两阶段实现：
-//   半消息(TRAN_MSG/PGROUP + sysFlag TRANSACTION_PREPARED) -> 本地事务 ->
-//   END_TRANSACTION(37, oneway)；UNKNOW 时由 broker 回查 CHECK_TRANSACTION_STATE(39)。
 static int32_t transactionFlagOf(LocalTransactionState state) {
     switch (state) {
         case LocalTransactionState::COMMIT_MESSAGE:
@@ -1971,7 +1687,6 @@ void DefaultMQProducer::endTransaction(const Message& msg, const SendResult& sen
         header.tranStateTableOffset = checkHeader->tranStateTableOffset;
         header.transactionId = checkHeader->transactionId;
         header.bname = checkHeader->bname;
-        // Java: uniqueKey = msg 属性 UNIQ_KEY，取不到才用 msgId
         std::string uniqueKey;
         if (checkMsg != nullptr) {
             uniqueKey = checkMsg->getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
@@ -1982,7 +1697,6 @@ void DefaultMQProducer::endTransaction(const Message& msg, const SendResult& sen
         header.msgId = uniqueKey.empty() ? std::optional<std::string>() : uniqueKey;
         addr = brokerAddr;
     } else {
-        // Java: id = decodeMessageId(offsetMsgId != null ? offsetMsgId : msgId)
         const std::string& idText = sendResult.offsetMsgId.empty() ? sendResult.msgId
                                                                    : sendResult.offsetMsgId;
         std::string idIp;
@@ -1997,9 +1711,6 @@ void DefaultMQProducer::endTransaction(const Message& msg, const SendResult& sen
         header.transactionId = sendResult.transactionId;
         header.bname = sendResult.messageQueue.brokerName;
         header.msgId = sendResult.msgId;
-        // Java endTransaction:1541 用的也是 findBrokerAddressInPublish（只认 master），
-        // 且**不做 null 检查**就直接 oneway；这里保留本端提前报错的守卫（比 Java 的
-        // NPE 干净），但地址来源必须同样是 master-only。
         addr = c.findBrokerAddressInPublish(sendResult.messageQueue.brokerName);
     }
 
@@ -2011,13 +1722,8 @@ void DefaultMQProducer::endTransaction(const Message& msg, const SendResult& sen
     if (addr.empty()) {
         throw MQClientException("no broker address for end transaction");
     }
-    // Java 走 endTransactionOneway：单向发送，不等 broker 响应
     c.remotingClient().invokeOneway(addr, request);
 
-    // 事务收尾轨迹（对应 Java DefaultMQProducerImpl:1561 / :442 的 doExecuteEndTransactionHook）：
-    // 客户端主动提交与 broker 回查两条路径都会产生 EndTransaction 轨迹。
-    // msgId 取 header 里的（本地路径 = SendResult.msgId 即 UNIQ_KEY；回查路径 = 消息 UNIQ_KEY）；
-    // transactionId 取消息自身的（Java 用的是 msg.getTransactionId()，不是 header 的）。
     executeEndTransactionHook(msg, addr, header.msgId.value_or(std::string()),
                               msg.transactionId, localTransactionStateName(state), fromCheck);
 }
@@ -2026,7 +1732,6 @@ void DefaultMQProducer::checkTransactionState(const RemotingCommand& cmd, const 
     CheckTransactionStateRequestHeader header;
     header.fromExtFields(cmd.extFields);
 
-    // broker 把整条 MessageExt 编码后放在 body 里（Java Broker2Client.checkProducerTransactionState）
     MessageExt msgExt;
     if (cmd.body.empty() || !decodeMessage(cmd.body, msgExt)) {
         logger_warn("checkTransactionState: decode message failed");
@@ -2047,7 +1752,6 @@ void DefaultMQProducer::checkTransactionState(const RemotingCommand& cmd, const 
         return;
     }
 
-    // Java 在独立线程里执行回查回调，避免阻塞读线程
     MessageExt captured = std::move(msgExt);
     CheckTransactionStateRequestHeader capturedHeader = header;
     std::thread th([this, captured, capturedHeader, addr, listener]() {
@@ -2087,7 +1791,6 @@ void DefaultMQProducer::checkTransactionState(const RemotingCommand& cmd, const 
 TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message& msg,
                                                                   TransactionListener& listener,
                                                                   const std::string& arg) {
-    // Java ensureNotDelayedForTransactional：事务消息不支持延迟投递
     if (msg.getProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL).size() > 0) {
         throw MQClientException("Transactional messages do not support delayed delivery");
     }
@@ -2104,8 +1807,7 @@ TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message&
     std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
     MessageQueue selected = publish->selectOneMessageQueue();
 
-    // 压缩与普通发送一致；再叠加事务类型位（Java sendKernelImpl 检测 TRAN_MSG 后置 PREPARED）
-    ensureUniqId(outbound);   // 对齐 Java sendKernelImpl：非批量消息发送前注入 UNIQ_KEY
+    ensureUniqId(outbound);
     int32_t sysFlag = prepareForSend(outbound);
     sysFlag = MessageSysFlag::resetTransactionValue(sysFlag,
                                                     MessageSysFlag::TRANSACTION_PREPARED_TYPE);
@@ -2129,7 +1831,7 @@ TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message&
         }
         try {
             LocalTransactionState ret = listener.executeLocalTransaction(outbound, arg);
-            state = ret;  // Java：null 视为 UNKNOW → C++ 枚举已覆盖三态
+            state = ret;
         } catch (const std::exception& e) {
             logger_error("executeLocalTransactionBranch exception, topic=" + outbound.topic +
                          ": " + e.what());
@@ -2151,7 +1853,6 @@ TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message&
         endTransaction(outbound, sendResult, state, hasLocalException, localExceptionText, false,
                        nullptr, nullptr, "");
     } catch (const std::exception& e) {
-        // Java：end broker transaction 失败只 warn，不影响返回结果
         logger_warn("local transaction execute " + std::string(localTransactionStateName(state)) +
                     ", but end broker transaction failed: " + e.what());
     }
@@ -2187,8 +1888,6 @@ std::vector<MessageQueue> DefaultMQProducer::fetchPublishMessageQueues(const std
 void DefaultMQProducer::createTopic(const std::string& key, const std::string& newTopic,
                                     int32_t queueNum) {
     MQClientInstance& c = client();
-    // 对应 Java DefaultMQProducerImpl.createTopic：先 checkTopic（blank/长度/字符表），
-    // 再 isSystemTopic —— 建与 broker 内部资源重名的 topic 会静默篡改系统流水。
     (void)key;
     Validators::checkTopic(newTopic);
     Validators::isSystemTopic(newTopic);
@@ -2199,9 +1898,6 @@ void DefaultMQProducer::createTopic(const std::string& key, const std::string& n
 
 std::string DefaultMQProducer::recallMessage(const std::string& topic,
                                              const std::string& recallHandle) {
-    // 校验顺序逐条对齐 Java DefaultMQProducerImpl#recallMessage(:1570-1601)：
-    // 状态 → checkTopic → 禁 retry/DLQ → 解句柄 → 预热路由 → 定位 broker → 发请求。
-    // 前三步必须在打网络**之前**跑完，否则一个手滑的句柄就要耗掉一次 RPC 超时。
     MQClientInstance& c = client();
     const std::string realTopic =
         namespace_.empty() ? topic : NamespaceUtil::wrapNamespace(namespace_, topic);
@@ -2211,13 +1907,9 @@ std::string DefaultMQProducer::recallMessage(const std::string& topic,
     }
     const HandleV1 handle = decodeRecallHandle(recallHandle);
 
-    // Java 只是调用 tryToFindTopicPublishInfo 预热路由，返回值并不使用，但**异常照抛**
-    // （DefaultMQProducerImpl:1586）—— 连路由都拿不到时，后面的 broker 定位也没有意义。
     c.registerTopicInUse(realTopic);
     (void)topicPublishInfo(c, realTopic);
 
-    // Java:1586-1594：优先按 handle 里的 brokerName 查**发布地址**（只认 master）；拿不到
-    // 再退到 `findBrokerAddrByTopic` —— 后者走 select_broker_addr()，**允许**落到从节点上。
     std::string addr = c.findBrokerAddressInPublish(handle.brokerName);
     if (addr.empty()) {
         addr = c.findBrokerAddrByTopic(realTopic);
@@ -2231,7 +1923,6 @@ std::string DefaultMQProducer::recallMessage(const std::string& topic,
     header.producerGroup = producerGroup_;
     header.topic = realTopic;
     header.recallHandle = recallHandle;
-    // 继承字段在 Java 里反射名就是 bname，写成 brokerName 会被 broker 静默丢掉。
     header.bname = handle.brokerName;
     return c.recallMessage(addr, header, sendMsgTimeout_);
 }

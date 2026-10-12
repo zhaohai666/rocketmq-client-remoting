@@ -1,15 +1,5 @@
 // Admin 发起端 CONSUME_MESSAGE_DIRECTLY(309) 单测 —— 不需要集群。
 //
-// 对齐基准（Java 5.5.1，逐行读过）：
-//   * DefaultMQAdminExtImpl.consumeMessageDirectly:1323-1347 —— 先 viewMessage 把 msgId
-//     解成消息（offsetMsgId 直查 commitLog、失败退 uniqKey 检索两条路径），目标 broker 取
-//     消息的**存储主机**；消息带 uniq key 时把请求里的 msgId 换成 offsetMsgId。
-//   * MQClientAPIImpl#consumeMessageDirectly:2741-2771 —— 单笔 309，头字段
-//     topic / consumerGroup / clientId / msgId（brokerName / topicSysFlag /
-//     groupSysFlag 不下发），响应体是 ConsumeMessageDirectlyResult JSON；非 SUCCESS 或
-//     body 为 null 时抛 MQClientException(响应码)。
-//   * 消费侧（DefaultMQPushConsumer 收 309 的处理器与状态映射）在
-//     rmq_test_orderly_reconsume 里锁，本文件只管发起端。
 //
 // 为什么必须离线锁死：这条链路错起来全是**静默**的 —— msgId 键名写错时 broker 侧头
 // 解析不到、推给消费者的消息对不上号，admin 拿到的结果里 remark/msgId 全错；目标
@@ -405,8 +395,6 @@ void expectDirectExt(const WireRecord& rec, const std::string& wantMsgId, const 
 void testExtFieldKeyNames() {
     PropertyMap ext = DefaultMQAdminExt::buildConsumeMessageDirectlyExtFields(
         "TopicA", "GID_A", "cid-1", "msg-1");
-    // Java MQClientAPIImpl:2747-2751 只 set 这四个字段 —— 多一个 brokerName 都说明
-    // 实现照着消费侧的 ConsumeMessageDirectlyResultRequestHeader 抄错了
     expectInt(static_cast<long long>(ext.size()), 4, "309 头恰好四个字段");
     auto it = ext.find("topic");
     expect(it != ext.end() && it->second == "TopicA", "309 头 topic");
@@ -481,7 +469,6 @@ void testUniqKeyPath(DefaultMQAdminExt& admin, MockBroker& mock) {
            "uniqKeyPath.indexType");
     expect(query.ext.count("key") == 1 && query.ext.at("key") == uniqKey, "uniqKeyPath.queryKey");
 
-    // 消息带 uniq key ⇒ 请求里的 msgId 换成 offsetMsgId（Java MessageClientExt 同口径）
     expectInt(mock.directCount(), 1, "uniqKeyPath.directCount");
     expectDirectExt(mock.directRecord(0), uniqKey, "uniqKeyPath.direct");
 }
@@ -517,8 +504,6 @@ void testBrokerRejectPropagates(DefaultMQAdminExt& admin, MockBroker& mock) {
 }
 
 void testEmptyResultBodyThrows(DefaultMQAdminExt& admin, MockBroker& mock) {
-    // Java :2761-2764 的 body == null 分支：SUCCESS 但没带回消费者的判据必须报出来，
-    // 不能静默返回一张全默认的结果表（consumeResult 空 = admin 看不出探针失败）
     const std::string msgId = offsetMsgIdFor(mock, 400);
     const MessageExt stored = storedMessage(mock, 400, false, "");
     mock.scriptView({{ResponseCode::SUCCESS, "", encodeMessageExt(stored)}});

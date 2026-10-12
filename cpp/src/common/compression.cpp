@@ -1,15 +1,6 @@
-// 消息体压缩/解压实现（对应 org.apache.rocketmq.common.compression.*）。
-//
 // 编译期开关 ROCKETMQ_HAS_ZLIB / ROCKETMQ_HAS_ZSTD / ROCKETMQ_HAS_LZ4 由 CMake 的
 // find_package(ZLIB) 与 find_path/find_library(zstd|lz4) 决定。若某个后端未编入，
 // 遇到该算法压缩的消息会**抛异常**而不是原样返回——静默透传等于数据损坏。
-//
-// 三种格式的"线上格式"以 Java 参考实现为准（本文件与之逐字节互通，见 examples/
-// compression_live.cpp 与 /tmp 下的一次性 Java 探针）：
-//   ZLIB -> java.util.zip.Deflater/Inflater，RFC1950 zlib 流
-//   ZSTD -> zstd-jni 的 ZstdOutputStream/ZstdInputStream，标准 zstd 帧（magic 0xFD2FB528）
-//   LZ4  -> lz4-java 的 LZ4FrameOutputStream/LZ4FrameInputStream，
-//           **LZ4 Frame 互操作格式**（magic 0x184D2204），不是 raw block
 #include "rocketmq/common/compression.h"
 
 #include <cstring>
@@ -67,7 +58,7 @@ namespace {
 
 Bytes zlibDeflate(const Bytes& src, int level) {
     if (level < 0 || level > 9) {
-        level = 5;  // Java/Python 的默认级别
+        level = 5;
     }
     if (src.empty()) {
         return Bytes();
@@ -108,7 +99,6 @@ Bytes zlibInflate(const Bytes& src) {
     }
     z_stream zs;
     std::memset(&zs, 0, sizeof(zs));
-    // inflateInit 默认按 zlib 流格式（RFC1950）解析，与 Java InflaterInputStream 一致
     if (::inflateInit(&zs) != Z_OK) {
         throw std::runtime_error("zlib inflateInit failed");
     }
@@ -143,13 +133,6 @@ Bytes zlibInflate(const Bytes& src) {
 #endif  // ROCKETMQ_HAS_ZLIB
 
 // ---------------------------------------------------------------- zstd 细节
-//
-// 对应 org.apache.rocketmq.common.compression.ZstdCompressor：Java 侧用 zstd-jni 的
-// ZstdOutputStream(stream, level) / ZstdInputStream，产出/消费的是**标准 zstd 帧**
-// （magic 0xFD2FB528，即任务书里说的 zstd-jni simple API 写法）。这里用 libzstd 的
-// ZSTD_compress / ZSTD_decompress 处理同样的帧。帧头自带窗口大小与 content size，
-// 解码不依赖对端参数，所以**帧格式**与 Java / Python(zstandard) / Rust(zstd) 互通
-// （压缩级别只影响产出字节，不影响互解；已用 Java 真值双向验证）。
 #if defined(ROCKETMQ_HAS_ZSTD)
 
 namespace {
@@ -186,8 +169,6 @@ constexpr size_t kMaxZstdOutput = 2048ULL * 1024ULL * 1024ULL;
 
 Bytes zstdDecompressBytes(const Bytes& src) {
     if (src.empty()) {
-        // Java ZstdCompressor#decompress 对空输入是 read() 立即 -1 → 返回空正文，
-        // 这里保持同样语义（而不是把"空"当成坏帧抛错）。
         return Bytes();
     }
     unsigned long long declared = ::ZSTD_getFrameContentSize(src.data(), src.size());
@@ -231,12 +212,6 @@ Bytes zstdDecompressBytes(const Bytes& src) {
 #endif  // ROCKETMQ_HAS_ZSTD
 
 // ---------------------------------------------------------------- LZ4 Frame 细节
-//
-// 对应 org.apache.rocketmq.common.compression.Lz4Compressor：Java 用 lz4-java 的
-// LZ4FrameOutputStream / LZ4FrameInputStream，即 **LZ4 Frame 互操作格式**
-// （magic 0x184D2204，自描述：帧头写明 block 大小/是否独立/有无校验和）。
-// 因此这里必须走 liblz4 的 LZ4F（frame）API；LZ4_compress_default 产出的是**裸
-// block**，没有帧头和块边界标记，Java/Python/Rust 三端都解不开，绝不能拿来对齐。
 #if defined(ROCKETMQ_HAS_LZ4)
 
 namespace {
@@ -247,12 +222,6 @@ constexpr size_t kLz4OutputChunk = 64ULL * 1024ULL;
 constexpr size_t kMaxLz4Output = 2048ULL * 1024ULL * 1024ULL;
 
 Bytes lz4CompressFrame(const Bytes& src) {
-    // ⚠ 必须显式给出 prefs，不能用 liblz4 的默认帧参数：默认是 **blockLinked**
-    //（后一块可引用前一块），而 lz4-java 的 LZ4FrameInputStream **拒绝依赖块**
-    // ——单块（<=64KB）时看不出来，一旦载荷跨块就抛
-    // "Dependent block stream is unsupported (BLOCK_INDEPENDENCE must be set)"。
-    // 所以这里对齐 lz4-java / Python lz4.frame 的默认写法：块独立 + 64KB 块 + 无校验和。
-    // 解码侧不受此约束（LZ4F_decompress 两种模式都能读），故 Java 产的 linked 块我们能解。
     LZ4F_preferences_t prefs;
     std::memset(&prefs, 0, sizeof(prefs));
     prefs.frameInfo.blockSizeID = LZ4F_max64KB;
@@ -278,7 +247,6 @@ Bytes lz4CompressFrame(const Bytes& src) {
 // 返回 0 表示帧结束，>0 是"到下一个块边界还需多少输入字节"的提示。
 Bytes lz4DecompressFrame(const Bytes& src) {
     if (src.empty()) {
-        // 与 Java LZ4FrameInputStream 对空流的行为一致：read() 直接 EOF → 空正文
         return Bytes();
     }
     LZ4F_decompressionContext_t ctx = nullptr;
@@ -364,10 +332,6 @@ Bytes CompressorFactory::compress(const Bytes& src, int32_t compressionType, int
     }
     if (type == CompressionType::ZSTD) {
 #if defined(ROCKETMQ_HAS_ZSTD)
-        // 与 Java 一致把 level 透传给 zstd（Java: new ZstdOutputStream(out, level)）。
-        // ⚠ 因此本端 ZSTD 产出的字节可能与 Python/Rust 不同（它们固定用默认级别 3，
-        // 而消息编码路径传的是 zlib 用的 level=5）。帧格式仍是标准 zstd frame，
-        // 互解不受影响——级别只影响压缩率，不影响可解码性。
         return zstdCompressBytes(src, level);
 #else
         throw std::runtime_error(
@@ -376,7 +340,6 @@ Bytes CompressorFactory::compress(const Bytes& src, int32_t compressionType, int
     }
     if (type == CompressionType::LZ4) {
 #if defined(ROCKETMQ_HAS_LZ4)
-        // level 对 LZ4 无意义：Java 的 LZ4FrameOutputStream 构造时就不接受 level。
         (void)level;
         return lz4CompressFrame(src);
 #else

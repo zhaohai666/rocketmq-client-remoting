@@ -1,7 +1,5 @@
 //! POP 模式的 extraInfo（俗称 CK 串）编解码。
 //!
-//! 逐条移植 `python/remoting/protocol/extra_info.py`（257 行），即 Java
-//! `org.apache.rocketmq.remoting.protocol.header.ExtraInfoUtil`。
 //!
 //! CK 串是 POP 模式的核心凭据：broker 在 POP 响应里**不**给普通 topic 的消息写
 //! `POP_CK` 属性（只在 retry topic 重编码路径写），客户端必须自己用响应头的
@@ -18,8 +16,6 @@
 use crate::common::mix_all::MixAll;
 use crate::error::{Error, Result};
 
-/// 段内分隔符；对应 Java `MessageConst.KEY_SEPARATOR`（也是
-/// `common::message_const::KEY_SEPARATOR`），必须是单个空格。
 pub const KEY_SEPARATOR: &str = " ";
 /// 队列之间的分隔符（`startOffsetInfo` / `msgOffsetInfo` / `orderCountInfo`）。
 pub const QUEUE_SEPARATOR: &str = ";";
@@ -32,20 +28,16 @@ pub const NORMAL_TOPIC: &str = "0";
 pub const RETRY_TOPIC: &str = "1";
 /// `retryFlag`：V2 retry topic（`%RETRY%<cid>+<topic>`）。
 pub const RETRY_TOPIC_V2: &str = "2";
-/// `queueOffset` 键的前缀（Java `ExtraInfoUtil.QUEUE_OFFSET`）。
 pub const QUEUE_OFFSET: &str = "qo";
 
-/// 顺序消费用的固定 revive 队列号，对应 Java `KeyBuilder.POP_ORDER_REVIVE_QUEUE`。
 pub const POP_ORDER_REVIVE_QUEUE: i32 = 999;
 
-/// V1 retry topic 的 topic/cid 连接符（Java `KeyBuilder.POP_RETRY_SEPARATOR`）。
 const POP_RETRY_SEPARATOR_V1: &str = "_";
 /// V2 retry topic 的 topic/cid 连接符。
 const POP_RETRY_SEPARATOR_V2: &str = "+";
 
 // ---------------------------------------------------------------- retry topic 命名
 
-/// `%RETRY%<cid>_<topic>`（Java `KeyBuilder.buildPopRetryTopicV1`）。
 pub fn build_pop_retry_topic_v1(topic: &str, cid: &str) -> String {
     format!(
         "{}{}{}{}",
@@ -56,7 +48,6 @@ pub fn build_pop_retry_topic_v1(topic: &str, cid: &str) -> String {
     )
 }
 
-/// `%RETRY%<cid>+<topic>`（Java `KeyBuilder.buildPopRetryTopicV2`）。
 pub fn build_pop_retry_topic_v2(topic: &str, cid: &str) -> String {
     format!(
         "{}{}{}{}",
@@ -67,7 +58,6 @@ pub fn build_pop_retry_topic_v2(topic: &str, cid: &str) -> String {
     )
 }
 
-/// Java `buildPopRetryTopic`：`enableRetryTopicV2` 关（默认）走 V1。
 pub fn build_pop_retry_topic(topic: &str, cid: &str, enable_retry_v2: bool) -> String {
     if enable_retry_v2 {
         build_pop_retry_topic_v2(topic, cid)
@@ -76,8 +66,6 @@ pub fn build_pop_retry_topic(topic: &str, cid: &str, enable_retry_v2: bool) -> S
     }
 }
 
-/// Java `KeyBuilder.isPopRetryTopicV2`：`%RETRY%` 前缀**且**含 `+`。
-///
 /// 只看含 `+` 不够：普通 topic 名里也可能有 `+`，那样会被误判成 retry V2。
 pub fn is_pop_retry_topic_v2(retry_topic: Option<&str>) -> bool {
     match retry_topic {
@@ -90,8 +78,6 @@ pub fn is_pop_retry_topic_v2(retry_topic: Option<&str>) -> bool {
     }
 }
 
-/// 由 topic 形状判定 `retryFlag`（Java `ExtraInfoUtil.getRetry(topic)`）。
-///
 /// 顺序很重要：先判 V2（含 `+`），再判 `%RETRY%` 前缀（V1），否则普通 topic
 /// 一律是 `"0"`。
 pub fn retry_of_topic(topic: &str) -> &'static str {
@@ -104,8 +90,6 @@ pub fn retry_of_topic(topic: &str) -> &'static str {
     }
 }
 
-/// 由 `retryFlag` 还原真实 topic（Java `ExtraInfoUtil.getRealTopic`）。
-///
 /// 未知 flag 报错而不是回退到 `topic`：回退会把 retry 消息当普通消息确认掉。
 pub fn get_real_topic(topic: &str, cid: &str, retry: &str) -> Result<String> {
     if retry == NORMAL_TOPIC {
@@ -121,10 +105,6 @@ pub fn get_real_topic(topic: &str, cid: &str, retry: &str) -> Result<String> {
 
 // ---------------------------------------------------------------- CK 串切分与取值
 
-/// 模拟 Java `String.split`：**丢弃末尾空串**（Python `str.split(sep)` 会保留）。
-///
-/// 这个差异是真实的：Java `"a b ".split(" ")` 得 `["a","b"]`，
-/// Python 得 `["a","b",""]`；段数校验依赖它（`extra_info.py:64-73`）。
 fn split_drop_trailing(value: &str, sep: &str) -> Vec<String> {
     let mut parts: Vec<String> = value.split(sep).map(str::to_string).collect();
     while parts.last().map(|p| p.is_empty()).unwrap_or(false) {
@@ -133,12 +113,10 @@ fn split_drop_trailing(value: &str, sep: &str) -> Vec<String> {
     parts
 }
 
-/// 按空格切分 CK 串（Java `ExtraInfoUtil.split`）。
 pub fn split(extra_info: &str) -> Result<Vec<String>> {
     Ok(split_drop_trailing(extra_info, KEY_SEPARATOR))
 }
 
-/// 段数校验（Java 的 `IllegalArgumentException` 文案逐字照抄）。
 fn require(segments: &[String], need: usize, what: &str) -> Result<()> {
     if segments.len() < need {
         return Err(Error::Decode(format!(
@@ -202,19 +180,12 @@ pub fn get_queue_offset(segments: &[String]) -> Result<i64> {
     segment_as(segments, 7, 8, "getQueueOffset")
 }
 
-/// reviveQid 是 999 表示顺序消费（Java `ExtraInfoUtil.isOrder`）。
 pub fn is_order(segments: &[String]) -> Result<bool> {
     Ok(get_revive_qid(segments)? == POP_ORDER_REVIVE_QUEUE)
 }
 
 // ---------------------------------------------------------------- CK 串拼装
 
-/// 拼 CK 串。传 `msg_queue_offset` 得 8 段，不传得 7 段
-/// （Java 的两个 `buildExtraInfo` 重载；ACK 场景用 8 段版本）。
-///
-/// 第 5 段写的是 [`retry_of_topic`] 的结果，**不是** topic 原文。
-// 参数表与 Java `buildExtraInfo(ckQueueOffset, popTime, invisibleTime, reviveQid,
-// topic, brokerName, queueId, msgQueueOffset)` 一一对应，合并参数会破坏逐段对照。
 #[allow(clippy::too_many_arguments)]
 pub fn build_extra_info(
     ck_queue_offset: i64,
@@ -241,8 +212,6 @@ pub fn build_extra_info(
     parts.join(KEY_SEPARATOR)
 }
 
-/// 往 `startOffsetInfo` 里追加一个队列（Java `buildStartOffsetInfo`）。
-///
 /// `out` 非空时先补 `;`，所以调用方按队列顺序连续 append 即可。
 pub fn build_start_offset_info(out: &mut String, topic: &str, queue_id: i32, start_offset: i64) {
     append_queue_segment(
@@ -255,7 +224,6 @@ pub fn build_start_offset_info(out: &mut String, topic: &str, queue_id: i32, sta
     );
 }
 
-/// 往 `orderCountInfo` 里追加「队列 → 计数」（Java `buildQueueIdOrderCountInfo`）。
 pub fn build_queue_id_order_count_info(
     out: &mut String,
     topic: &str,
@@ -272,8 +240,6 @@ pub fn build_queue_id_order_count_info(
     );
 }
 
-/// 往 `orderCountInfo` 里追加「queueOffset → 计数」（Java
-/// `buildQueueOffsetOrderCountInfo`，键换成 [`get_queue_offset_key_value_key`]）。
 pub fn build_queue_offset_order_count_info(
     out: &mut String,
     topic: &str,
@@ -291,9 +257,6 @@ pub fn build_queue_offset_order_count_info(
     );
 }
 
-/// 往 `msgOffsetInfo` 里追加一个队列的若干 offset（Java `buildMsgOffsetInfo`）。
-///
-/// 第三段内部用 `,` 连接；空列表会留下一个只有两段的坏串，与 Java 一致。
 pub fn build_msg_offset_info(out: &mut String, topic: &str, queue_id: i32, msg_offsets: &[i64]) {
     let joined = msg_offsets
         .iter()
@@ -317,10 +280,6 @@ fn append_queue_segment(out: &mut String, segments: &[&str]) {
 // ---------------------------------------------------------------- 响应头信息表解析
 
 /// 响应头 map 的通用形状：`"<retryFlag> <queueKey> <value>"`，多条用 `;` 连接。
-///
-/// 组内用**不丢尾空串**的 split（`extra_info.py:177`：Python 直接 `one.split(" ")`），
-/// 所以 `"0 3 0 "` 这种带尾空格的串会被判成 4 段而报错 —— Java 反而会容忍，
-/// 这里以参考实现为准。
 fn split_queue_segments(value: &str) -> Vec<String> {
     if value.contains(QUEUE_SEPARATOR) {
         split_drop_trailing(value, QUEUE_SEPARATOR)
@@ -353,9 +312,6 @@ fn one_segment<T>(
 }
 
 /// 解析 `startOffsetInfo`，形如 `"0 3 0;0 2 1"`。
-///
-/// key 是 `"<retryFlag>@<queueId>"`，value 是该队列本次弹出的起始 offset。
-/// 空 / 缺失回 `None`（Java 直接 `return null`，调用方按 null 判）。
 pub fn parse_start_offset_info(
     start_offset_info: Option<&str>,
 ) -> Result<Option<Vec<(String, i64)>>> {
@@ -425,17 +381,14 @@ pub fn parse_order_count_info(
 
 // ---------------------------------------------------------------- 查表键
 
-/// `startOffsetInfo` 表的查询键（Java `getStartOffsetInfoMapKey`）。
 pub fn get_start_offset_info_map_key(topic: &str, key: i64) -> String {
     format!("{}@{}", retry_of_topic(topic), key)
 }
 
-/// `queueOffset` 形态的键值：`"qo<queueId>%<queueOffset>"`（Java `getQueueOffsetKeyValueKey`）。
 pub fn get_queue_offset_key_value_key(queue_id: i64, queue_offset: i64) -> String {
     format!("{QUEUE_OFFSET}{queue_id}%{queue_offset}")
 }
 
-/// `orderCountInfo`（按 queueOffset 计数时）的查询键（Java `getQueueOffsetMapKey`）。
 pub fn get_queue_offset_map_key(topic: &str, queue_id: i64, queue_offset: i64) -> String {
     format!(
         "{}@{}",
@@ -532,7 +485,6 @@ mod tests {
             build_pop_retry_topic_v2(TOPIC, GROUP)
         );
 
-        // 只有 7 段时取第 8 段：Java 文案 "getQueueOffset fail, extraInfoStrs length 7"
         let short = segments(CK_NORMAL);
         let err = get_queue_offset(&short).unwrap_err().to_string();
         assert!(
@@ -551,12 +503,10 @@ mod tests {
 
     #[test]
     fn split_drops_trailing_empty_segments() {
-        // Java `"a b ".split(" ")` -> ["a","b"]；Python split 会多一个空串
         assert_eq!(
             split("12345 1700000000000 ").unwrap(),
             vec!["12345".to_string(), "1700000000000".to_string()]
         );
-        // 中间的空段保留（会让段数校验失败，与 Java 一致）
         assert_eq!(
             split("1  2").unwrap(),
             vec!["1".to_string(), "".to_string(), "2".to_string()]
@@ -585,7 +535,6 @@ mod tests {
             "2@3"
         );
         assert_eq!(get_start_offset_info_map_key(TOPIC, 3), "0@3");
-        // 空 / None -> None（Java return null）
         assert!(parse_start_offset_info(None).unwrap().is_none());
         assert!(parse_start_offset_info(Some("")).unwrap().is_none());
         // 段数不对 / 重复键 -> Decode
@@ -625,7 +574,6 @@ mod tests {
         );
         assert!(parse_msg_offset_info(None).unwrap().is_none());
         assert!(parse_msg_offset_info(Some("")).unwrap().is_none());
-        // 尾随逗号按 Java 口径丢掉
         assert_eq!(
             parse_msg_offset_info(Some("0 3 1,2,")).unwrap().unwrap(),
             vec![("0@3".to_string(), vec![1i64, 2])]
@@ -669,7 +617,6 @@ mod tests {
 
     #[test]
     fn offset_info_builders_append_into_one_string() {
-        // 对应 Java 的 StringBuilder 版本：startOffsetInfo / msgOffsetInfo / orderCountInfo
         let mut start = String::new();
         build_start_offset_info(&mut start, TOPIC, 3, 0);
         build_start_offset_info(&mut start, &build_pop_retry_topic_v1(TOPIC, GROUP), 2, 1);

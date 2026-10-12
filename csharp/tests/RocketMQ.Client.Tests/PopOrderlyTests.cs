@@ -1,10 +1,3 @@
-// POP + 顺序监听器（Java ConsumeMessagePopOrderlyService，5.5.0 未完成骨架）本地单测。
-//
-// Java DefaultMQPushConsumerImpl:960-990 按 listener 类型选服务：顺序监听器 + POP 走
-// ConsumeMessagePopOrderlyService。上游 5.5.0 那是个未完成骨架（:533 POPTODO）：请求
-// 去重入队后 run() 拿到队列锁就返回 —— 消息**不消费、不 ack**，invisibleTime 到期由
-// broker 复活重投，宏观表现是「顺序 + POP 收不到消息且积压不消」。
-//
 // 覆盖：分派进顺序骨架（listener 不被调、不 ack）、并发分支回归护栏、去重集按
 // (pq 引用, mq key) 判等、pq 撤销才摘请求、活队列 no-op。
 // 与 cpp tests/test_pop_orderly.cpp、python tests/test_pop_orderly.py 逐条对应。

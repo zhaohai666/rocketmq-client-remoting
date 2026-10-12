@@ -1,10 +1,4 @@
 # -*- coding: utf-8 -*-
-"""协议常量取值的回归守卫。
-
-若环境变量 ``ROCKETMQ_JAVA_SRC`` 指向 Java 的 ``rocketmq/remoting/src/main/java``，
-则逐条比对 RequestCode / ResponseCode / LanguageCode 的取值，防止 Python 侧漂移；
-未配置时整体跳过（不依赖 Java 源码也能跑完其余测试）。
-"""
 from __future__ import annotations
 
 import os

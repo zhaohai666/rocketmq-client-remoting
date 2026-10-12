@@ -1,4 +1,3 @@
-//! 客户端层（`org.apache.rocketmq.client.impl.*`）。
 
 pub mod admin;
 pub mod allocate_strategy;

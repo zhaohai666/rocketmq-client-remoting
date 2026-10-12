@@ -1,16 +1,8 @@
 // ACL 鉴权单测：SHA1 / HMAC-SHA1 / Base64 原语 + AclClientRPCHook 签名内容与签名值。
 //
-// 关键点：本文件的**签名向量全部来自 Java 官方实现**（用
-// org.apache.rocketmq.acl.common.AclClientRPCHook#doBeforeRequest 跑出来的
-// content + Signature），不是"自己算自己验"。任何一处拼接顺序 / 分隔符 /
-// 字符集 / Base64 字母表的偏差都会立刻暴露。
 //
 // SHA1 / HMAC / Base64 的原语向量则取自公开标准（RFC 3174 / RFC 2202 / RFC 4648），
 // 用来保证即使签名向量通过，也不是"两个错误互相抵消"。
-//
-// 后半部分还覆盖 StreamTypeRPCHook 与钩子**顺序**：Java 把 stream 钩子注册在 ACL 之前
-// （MQClientAPIImpl:329-332），`ReqT` 因此必须落在签名内容里；顺序写反在不开鉴权的
-// broker 上完全看不出来，只有对拍能守住。
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -50,7 +42,6 @@ std::string hex(const Bytes& b) {
     return out;
 }
 
-// 构造一个只填 extFields/body 的请求（与 Java 探针 createRequestCommand(code,null) 等价）
 RemotingCommand makeRequest(const std::vector<std::pair<std::string, std::string>>& ext,
                             const Bytes& body) {
     RemotingCommand cmd = RemotingCommand::createRequestCommand(310, nullptr);
@@ -149,13 +140,6 @@ static void testBase64Vectors() {
     CHECK(base64Encode(Bytes("\xfb\xff\xbf", 3)) == "+/+/", "base64 uses standard alphabet (+/)");
 }
 
-// ---------------------------------------------------------------- 与 Java 逐字节对拍
-//
-// 下面 4 组向量的 content_hex 与 signature 全部由 Java 官方 AclClientRPCHook
-// 对同一个 (extFields, body, accessKey, secretKey, token) 跑出来：
-//   RemotingCommand cmd = RemotingCommand.createRequestCommand(310, null);
-//   ... setExtFields / setBody ...
-//   new AclClientRPCHook(new SessionCredentials(ak, sk[, token])).doBeforeRequest(addr, cmd);
 static void testAclSignatureVectors() {
     const std::string sk = "SK_TEST_SECRET_12345678";
     const std::vector<std::pair<std::string, std::string>> v1Ext = {
@@ -222,7 +206,6 @@ static void testAclSignatureVectors() {
 
 // ---------------------------------------------------------------- Signature 必须被排除
 static void testSignatureExcluded() {
-    // Java 侧：combineRequestContent 会跳过 key == "Signature" 的项。
     RemotingCommand withoutSig = makeRequest({{"topic", "MyTopic"}}, Bytes());
     RemotingCommand withFakeSig =
         makeRequest({{"topic", "MyTopic"}, {"Signature", "SHOULD_BE_EXCLUDED"}}, Bytes());
@@ -252,17 +235,12 @@ static void testNoHookNoMutation() {
     CHECK(cmd.getExtField("Signature").empty(), "no hook => empty signature");
 }
 
-// ---------------------------------------------------------------- StreamTypeRPCHook
-// 对应 Java remoting/.../rpchook/StreamTypeRPCHook.java:28：
-// `request.addExtField(MixAll.REQ_T, String.valueOf(RequestType.STREAM.getCode()))`，
-// 而 RequestType.STREAM 的 code 是 0 ⇒ 线上值是字面量 "0"（不是 "STREAM"）。
 static void testStreamHookWritesReqT() {
     RemotingCommand cmd = makeRequest({{"topic", "MyTopic"}}, Bytes());
     StreamTypeRPCHook hook;
     hook.doBeforeRequest("127.0.0.1:10911", cmd);
     CHECK(cmd.getExtField(MixAll::REQ_T) == "0", "stream hook writes ReqT=0");
     CHECK(cmd.extFields.size() == 2, "stream hook only adds ReqT");
-    // doAfterResponse 是空实现（Java 该钩子只覆写 doBeforeRequest）
     std::vector<std::string> log;
     auto probe = std::make_shared<LogHook>(log, "probe");
     ChainedRPCHook chain{std::vector<std::shared_ptr<RPCHook>>{probe}};
@@ -293,8 +271,6 @@ static void testComposeRequestHooksShape() {
     CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(onlyStream) == nullptr,
           "stream only => no chain shell around a single hook");
 
-    // 给了 namespaceV2 取值函数就装 Namespace 钩子（Java 无条件注册），此时 stream +
-    // namespace 两个钩子必须成链，且 Namespace 在前（nsd/ns 要进 ACL 签名内容）。
     const std::shared_ptr<RPCHook> streamAndNs =
         composeRequestHooks(true, nullptr, [] { return std::string("MQINST_shape"); });
     auto nsStreamChain = std::dynamic_pointer_cast<ChainedRPCHook>(streamAndNs);
@@ -315,10 +291,6 @@ static void testComposeRequestHooksShape() {
     }
 }
 
-// ---------------------------------------------------------------- 顺序：ReqT 必须进签名
-// Java MQClientAPIImpl:329-332 的注释是 "Inject stream rpc hook first to make reserve
-// field signature"：StreamTypeRPCHook 注册在用户 ACL 钩子**之前**，所以 broker 验签时
-// 看到的 extFields（含 ReqT）与客户端签名时看到的一致。
 static void testStreamRunsBeforeUserHook() {
     std::vector<std::string> log;
     auto probe = std::make_shared<LogHook>(log, "user");

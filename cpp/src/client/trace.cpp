@@ -1,6 +1,3 @@
-// 消息轨迹实现（对应 org.apache.rocketmq.client.trace.TraceDataEncoder 等）。
-//
-// 字段顺序与 Java 官方实现逐字节一致；回归守卫见 cpp/tests/test_trace.cpp。
 #include "rocketmq/client/trace.h"
 
 #include <cstdlib>
@@ -14,13 +11,10 @@ namespace rocketmq {
 
 namespace {
 
-// 按 sep 切分（与 Java 的 result.split(sep) 等价，但显式丢弃末尾空串）。
-// 例："a\x02" -> ["a"]；"a\x02b\x02" -> ["a","b"]；"\x02" -> []。
 std::string safeAt(const std::vector<std::string>& parts, size_t idx) {
     return idx < parts.size() ? parts[idx] : std::string();
 }
 
-// 按空格切分 keys（Java 用 KEY_SEPARATOR = " " 的 split，且丢弃空段）。
 std::vector<std::string> splitBySpace(const std::string& s) {
     std::vector<std::string> out;
     std::string cur;
@@ -38,7 +32,6 @@ std::vector<std::string> splitBySpace(const std::string& s) {
     return out;
 }
 
-// 把若干字段用 CONTENT_SPLITOR 拼起来，末尾补 FIELD_SPLITOR（对应 Java SOH.join + STX）。
 std::string joinRecord(const std::vector<std::string>& fields) {
     std::string out;
     for (size_t i = 0; i < fields.size(); ++i) {
@@ -103,10 +96,6 @@ bool parseSingleRecord(const std::vector<std::string>& line, TraceContext& ctx) 
         return true;
     }
     if (kind == "SubBefore") {
-        // ⚠ 最小 7 段，**不是 8**。被消费的消息没有 keys 时，末段为空，javaSplit 会连末尾的
-        //    CONTENT_SPLITOR 一起丢弃（Java String.split 的语义）→ 只剩 type..retryTimes 共 7 段。
-        //    这里若要求 8 段就会把这条合法记录整条丢掉（Java 原生实现是 line[7] 直接 AIOOBE）。
-        //    回归守卫：test_trace.cpp 的 "SubBefore 空 keys" 用例 + 真机 S17。
         if (line.size() < 7) return false;
         ctx.traceType = TraceType::SUB_BEFORE;
         ctx.timeStamp = toInt64(safeAt(line, 1), 0);
@@ -181,8 +170,6 @@ bool parseSingleRecord(const std::vector<std::string>& line, TraceContext& ctx) 
 std::string localAddressForTrace() {
     std::string ip = UtilAll::localIp();
     if (UtilAll::isIpv4(ip)) return ip;
-    // IPv6：与 Python/Java 一致，走 inet_pton 后的十六进制拼法。此处简单回退到原串；
-    // 绝大多数联调环境是 IPv4，IPv6 仅影响 storeHost/clientHost 默认展示值。
     if (!ip.empty()) return ip;
     return "127.0.0.1";
 }
@@ -205,7 +192,6 @@ std::vector<std::string> TraceDataEncoder::javaSplit(const std::string& value,
         parts.push_back(value.substr(start, pos - start));
         start = pos + sep.size();
     }
-    // 丢弃末尾空串（Java String.split 的语义）
     while (!parts.empty() && parts.back().empty()) {
         parts.pop_back();
     }
@@ -263,7 +249,6 @@ std::optional<TraceTransferBean> TraceDataEncoder::encoderFromContextBean(const 
             sb.push_back(ctx->isSuccess ? "true" : "false");
             sb.push_back(bean.keys);
             sb.push_back(std::to_string(ctx->contextCode));
-            // 非 CLOUD 才追加 timestamp + groupName（对齐 Java AccessChannel 判定）
             if (ctx->accessChannelOrLocal() != AccessChannel::CLOUD) {
                 sb.push_back(std::to_string(ctx->timeStamp));
                 sb.push_back(ctx->groupName);
@@ -302,7 +287,6 @@ std::optional<TraceTransferBean> TraceDataEncoder::encoderFromContextBean(const 
         tb.transData = joinRecord(sb);
     }
 
-    // 收集 keys：msgId + 按空格拆开的业务 keys（Java split(KEY_SEPARATOR)）
     for (const TraceBean& bean : ctx->traceBeans) {
         if (!bean.msgId.empty()) tb.transKey.insert(bean.msgId);
         for (const std::string& k : splitBySpace(bean.keys)) {

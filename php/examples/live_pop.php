@@ -273,12 +273,6 @@ function pop_wait_route(string $ns, string $topic, float $windowSec): bool
     }
 }
 
-/**
- * 把消费组切到 POP 投递模式（SET_MESSAGE_REQUEST_MODE(401)）。
- *
- * Java classic 是在 DefaultMQPushConsumerImpl.start() 里自动发的；PHP 端有意做成
- * 显式步骤（与"消费者不做默认 topic 兜底"同属显式化约定），用 Admin 发送。
- */
 function pop_set_request_mode(string $ns, string $topic, string $group): void
 {
     $a = pop_new_admin($ns);
@@ -532,10 +526,6 @@ if ($want('s2')) {
             $check($second['topic'] === $topic && $first['topic'] === $topic,
                 'S2 重投 listener 看到的仍是业务 topic',
                 "first={$first['topic']} second={$second['topic']} want=$topic");
-            // 1ST_POP_TIME 在 Java（MQClientAPIImpl:1224）与本端都是 computeIfAbsent：
-            // broker 提供的值必须保留，绝不能盖成重投自己的 popTime。刻意**不**断言与
-            // 首投逐字节相等——broker 打的是被 revive 选中的那个 checkpoint 的
-            // popTime，与首投差几毫秒是 broker 记账问题，本腿只钉客户端这半。
             $secondPopTime = 0;
             try {
                 $secondPopTime = pop_parse_ck($second['ck'])['popTime'];

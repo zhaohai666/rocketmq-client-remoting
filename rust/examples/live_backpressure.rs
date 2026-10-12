@@ -1,32 +1,6 @@
-//! 异步发送背压（`enableBackpressureForAsyncMode` 那一套公平信号量）真机验证，
-//! 与 `python/verify_backpressure_live.py`（B1–B5）、`cpp/examples/live_backpressure.cpp`、
-//! `csharp/examples/RocketMQ.Examples/LiveBackPressure.cs` 同套场景。
-//! 对端是 Java `DefaultMQProducerImpl:635-682`（两道闸、共享一份预算）与 `:577-633`
-//! （`BackpressureSendCallBack` 的归还）。
-//!
 //! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
 //!
-//! 离线单测（`src/client/backpressure.rs` 与 `src/client/producer/send_retry_tests.rs`
-//! 的「异步发送背压」一节）锁的是语义；这个脚本锁的是**打到真 broker 时**的五件事：
-//!   B1  默认容量（1024 条 / 100M 字节）开着背压发一整轮异步消息：全部 SEND_OK，
-//!       且发完之后两个信号量**满额归还**（真机不泄配额 —— 泄了迟早把生产者自己锁死）。
-//!   B2  条数闸夹到地板值 10、用 `send_message_before` 钩子睡 600ms 把在途占满：
-//!       另外两笔等不到许可，回调 `send message tryAcquire semaphoreAsyncNum timeout`
-//!       （Java `:654-658` 原文案），而且 broker 上**一条都没多** —— 被拒的连发送内核
-//!       都没进（钩子在闸门之后，进过没进过一查便知），更没发过一次请求。
-//!   B3  运行时把容量从 10 调到 12：正卡在闸上的那笔被叫醒并真的落库，
-//!       全部落地后空闲许可 = 新容量。这一轮钩子睡 2.5s，扩容由**另一个线程**在 1s
-//!       那一刻做，于是「它是被扩容放行的」与「它是被前 10 笔归还放行的」分得开。
-//!   B4  字节闸（容量 1M 地板值 + 600KB body ⇒ 在途只能 1 笔）：另两笔回调
-//!       `send message tryAcquire semaphoreAsyncSize timeout`（Java `:667-671`），
-//!       在途时空闲字节许可正好是 `1M - 600K`，broker 上只落 1 条，
-//!       且被拦下的那两笔也没漏还它们已经拿到的条数许可。
-//!   B5  关掉背压：同样的（夹到地板值的）容量配置**完全不限流**，30 笔并发全部落地。
 //!
-//! ⚠ **本端口与 Java/Python/C++/C# 的唯一可观测量差别：闸门等许可发生在被 spawn
-//! 出去的发送任务里，不在调用方线程上**（调用方线程 park 住会让单线程运行时死锁，见
-//! [`DefaultMQProducer::send_async`] 的文档）。所以「等不到许可」的等待时间记在回调到达
-//! 之前，而不是记在 `send_async` 的返回上；被拒的文案、扣费与归还完全一致。
 //!
 //! ⚠ 四条脚本纪律（①②③ 是 Python 那一轮真机联调踩出来的，④ 是 Rust 这一轮踩出来的）：
 //!   ① topic 一律带 stamp —— 四语言**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
@@ -69,7 +43,6 @@ use rocketmq_client_remoting::error::Result;
 
 /// 集群探活与「等 broker 侧结果落地」的默认预算（秒）。
 const WAIT_SECONDS: u64 = 30;
-/// B2/B3/B4 用的条数闸容量（Java 地板值）。
 const GATE_NUM: i64 = MIN_ASYNC_SEND_NUM;
 /// B4 一笔 600KB body：1M 的字节闸下在途只能容 1 笔。
 const BIG_BODY: usize = 600 * 1024;
@@ -136,7 +109,6 @@ impl Recorder {
         lock(&self.errors).clone()
     }
 
-    /// 「每一条错误都带这句文案」—— Java 的文案是逐字对齐的，只查条数会放过内容漂移。
     fn all_errors_contain(&self, needle: &str, expected: usize) -> bool {
         let errors = lock(&self.errors);
         errors.len() == expected && errors.iter().all(|e| e.contains(needle))
@@ -403,10 +375,6 @@ impl Env {
 // ---------------------------------------------------------- 通用助手
 
 /// 打标签发送：标签写在 keys 属性上，钩子按它归类（见 [`SlowHook`]）。
-///
-/// 为什么不用 body 前几字节当标签：超过 4KB 的 body 在进钩子**之前**就被压缩了
-/// （Java `DefaultMQProducerImpl:943-990` 同样先 `tryToCompressMessage` 再建
-/// `SendMessageContext`），钩子看到的是一串 zlib 字节，根本没法按内容认领。
 fn message(topic: &str, label: &str, body: &[u8]) -> Message {
     let mut msg = Message::new(topic, Some(body));
     msg.set_keys(label);

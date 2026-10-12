@@ -84,7 +84,6 @@ int main() {
     // ------------------------------------------------ 应答消息构造
     {
         Message reply = createReplyMessage(requestMsg(), Bytes{'p', 'o', 'n', 'g'});
-        // topic 必须是 <cluster>_REPLY_TOPIC（Java MixAll.getReplyTopic）
         expect(reply.topic == "DefaultCluster_REPLY_TOPIC", "reply topic is <cluster>_REPLY_TOPIC");
         expect(reply.body == (Bytes{'p', 'o', 'n', 'g'}), "reply body carried");
         // 四个属性一个都不能少，且 CORRELATION_ID/REPLY_TO_CLIENT/TTL 原样带回
@@ -99,10 +98,6 @@ int main() {
                "reply TTL echoed");
     }
     {
-        // CLUSTER 由 broker 写入；没有它说明这条消息不是 broker 转来的，Java 同样抛错，
-        // 而且抛的是带 10007 CREATE_REPLY_MESSAGE_EXCEPTION 的 MQClientException
-        // （MessageUtil.createReplyMessage:46/49）：应答方写在业务 listener 里，
-        // 只能按 responseCode 把"这条请求不能回话"和别的本地错误分开。
         Message noCluster(kTopic, Bytes{'x'});
         noCluster.putProperty(MessageConst::PROPERTY_CORRELATION_ID, "corr-1");
         bool threwNull = false, threwNoCluster = false;
@@ -165,8 +160,6 @@ int main() {
 
     // ------------------------------------------------ 等待槽
     {
-        // isTimeout 用严格的 elapsed > timeoutMillis（与 Java 一致）：future 超时与等待预算
-        // 必须拉开差距，否则并行跑满负载时会正好压在边界上偶发失败。
         RequestResponseFuture f("c1", 20);
         expect(!f.waitResponseMessage(200), "wait times out returns false");
         expect(f.isTimeout(), "future isTimeout after wait");
@@ -187,8 +180,6 @@ int main() {
         expect(!f.isTimeout(), "future not timed out after response");
     }
     {
-        // Java 用 remove 抢所有权：应答到达与超时清理只能有一个生效。
-        // RequestFutureHolder 是进程单例，用一次性 key 隔离。
         RequestFutureHolder& holder = RequestFutureHolder::getInstance();
         auto f = std::make_shared<RequestResponseFuture>("ut-c1", 1000);
         holder.putRequest("ut-c1", f);
@@ -210,7 +201,6 @@ int main() {
 
     // ------------------------------------------------ 异常类型
     {
-        // Java: RequestTimeoutException extends MQClientException
         RequestTimeoutException e("timeout");
         MQClientException* base = &e;
         expect(base != nullptr, "RequestTimeoutException extends MQClientException");

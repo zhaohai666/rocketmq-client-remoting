@@ -1,16 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消息轨迹钩子（对应 org.apache.rocketmq.client.trace.hook 包）。
-
-  * ``SendMessageTraceHook``    ← SendMessageTraceHookImpl
-  * ``ConsumeMessageTraceHook`` ← ConsumeMessageTraceHookImpl
-
-两条硬性约定：
-  1. **轨迹消息本身不再被追踪**：before/after 都先看 topic 是否以轨迹 topic 开头，
-     是则直接 return（否则轨迹会自我复制）。
-  2. **是否落轨迹由 broker 说了算**：发送侧看 SendResult 的 ``region_id`` /
-     ``trace_on``（由 SEND 响应头的 MSG_REGION / TRACE_ON 解析而来，broker 默认
-     traceOn=true）；消费侧看消息属性 TRACE_ON 是否为 "false"。
-"""
 from __future__ import annotations
 
 import time
@@ -67,7 +55,6 @@ class SendMessageTraceHook(SendMessageHook):
         if context.send_result is None:
             return
         result = context.send_result
-        # broker 侧 traceOn=false 或没带回 region 时不落库（对齐 Java）
         if result.region_id is None or not result.trace_on:
             return
         trace_context: TraceContext = context.mq_trace_context
@@ -142,11 +129,6 @@ class ConsumeMessageTraceHook(ConsumeMessageHook):
         sub_after.trace_beans = sub_before.trace_beans
         props = context.props
         if props:
-            # props["ConsumeContextType"] 是 ConsumeReturnType 的**名字**（Java 用
-            # ConsumeReturnType.valueOf(contextType) 按名查），其 ordinal 就是轨迹里的
-            # contextCode（Java ConsumeMessageTraceHookImpl:113）。
-            # ⚠ 必须用 [name] 查名，不能写 ConsumeReturnType(context_type)（那按值查，
-            # 值是 0..4 的整数，传名字必然 ValueError → 静默退化成 SUCCESS）。
             from .consumer_result import ConsumeReturnType
             context_type = props.get("ConsumeContextType")
             if context_type is not None:

@@ -1,5 +1,3 @@
-// 发送重试内核（Java DefaultMQProducerImpl#sendDefaultImpl）的离线对拍。
-//
 // 真集群造不出 SYSTEM_BUSY，也造不出「慢 broker 把总预算吃光」，而这两条恰好是这段
 // 内核的全部难点，所以这里用进程内假集群（MockCluster.cs：1 个 namesrv + N 个 broker，
 // 只说 remoting 协议），把每个 broker 的应答码和应答延迟脚本化。
@@ -38,7 +36,6 @@ public class SendRetryTests
 
     private static Message Msg() => new(Topic, Encoding.UTF8.GetBytes("hello"));
 
-    /// <summary>默认集合与 Java DefaultMQProducer#retryResponseCodes 逐项一致（8 个码）。</summary>
     [Fact]
     public void DefaultRetryResponseCodes_MatchLegacy()
     {
@@ -145,10 +142,6 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// Java <c>validateNameServerSetting</c>（DefaultMQProducerImpl:729）：一个 name server 地址
-    /// 都没有时报 10004，而不是把寻址故障说成"这个 topic 没路由"（10005）。
-    ///
     /// 少了这一步，配错地址服务器的运维会去查 topic 存在不存在，方向完全错。
     /// 这里在 Start 之后把实例的地址列表清空，模拟"跑着跑着地址没了"。
     /// </summary>
@@ -259,15 +252,6 @@ public class SendRetryTests
 
     /// <summary>
     /// 总预算用完：抛 RemotingTooMuchRequestException 而不是「重试耗尽」，且第二笔不许上线。
-    ///
-    /// ⚠ 预算是让**发送钩子睡 120ms** 吃掉的，不靠 broker 的应答延迟：后者的耗时恰好等于
-    /// 本次调用的预算（100ms 的等待在 100.0~100.9ms 之间返回完全正常），而判定是
-    /// <c>timeout &lt; costTime</c> 的整数毫秒比较（Java 用 currentTimeMillis，同样如此），
-    /// 卡在边界上就会偶发地多跑一笔 0ms 预算的尝试、最后抛成「重试耗尽」——实测整跑测试集时
-    /// 会随机红一次。python 同题用例（test_send_retry.py
-    /// ::test_call_timeout_stops_retrying_and_raises_too_much_request）用的是同一招：
-    /// 往发送路径注入 first_send_sleep_ms=60 &gt; timeout=30。
-    /// </summary>
     [Fact]
     public void ExhaustedBudget_ReportsCallTimeout()
     {
@@ -359,15 +343,6 @@ public class SendRetryTests
 
     private const string WireSk = "SK_wire_12345678";
 
-    /// <summary>
-    /// 钩子的四段取证，全部只看**抓下来的报文**：
-    /// ① 只注册 ACL → 有 AccessKey/Signature、没有 ReqT；
-    /// ② ACL + stream → 有 ReqT="0"，且把抓到的报文按 broker 的口径复算 HMAC 能对上
-    ///    （证明 ReqT 落在签名内容里，而不是签完之后又改了几个字段）；
-    /// ③ lite 消费者（Java 默认开 stream）→ 路由与心跳都带 ReqT；
-    /// ④ 关掉开关 → 一笔都不带，但请求照发（不是"没打出去"造成的假绿）。
-    /// 顺序在 RequestHooks.Compose 里，绑定位置在各 facade 的 Start() 里，两处都得线上验证。
-    /// </summary>
     [Fact]
     public void RequestHooksReachTheWire()
     {
@@ -392,7 +367,7 @@ public class SendRetryTests
             Assert.Equal(SendStatus.SendOk, producer.Send(Msg()).SendStatus);
 
             WireRecord rec = cluster.FirstSendRequest()!;
-            Assert.Equal("0", rec.Ext[MixAll.ReqT]); // Java 写 code 的字符串形式，不是枚举名
+            Assert.Equal("0", rec.Ext[MixAll.ReqT]);
             // broker 侧复算：拿抓到的报文（含 ReqT、排除 Signature）重算一遍签名
             Assert.Equal(rec.Ext[SessionCredentials.SignatureField],
                 AclClientRPCHook.CalcSignature(WireSk, rec.ToCommand()));
@@ -423,10 +398,6 @@ public class SendRetryTests
         }
     }
 
-    /// <summary>
-    /// 发送请求码的三级判据（Java MQClientAPIImpl#sendMessage:550-563）：先判 isReply
-    /// ⇒ 325，再判「这条消息是不是批量」⇒ SendBatchMessage(320)，否则 310。
-    ///
     /// ⚠ 请求码与 V2 头的单字母键 <c>m</c>（batch）是两件事：broker 按 <c>m</c> 选
     /// sendBatchMessage 还是单条写入（SendMessageProcessor:117 读 requestHeader.isBatch()），
     /// 码只影响服务端按码归类（proxy AbstractRemotingActivity:69 与 auth
@@ -465,13 +436,6 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// Java <c>sendKernelImpl</c> 在同一个发送头上还写了三个值（本端口此前全部漏掉）：
-    /// <c>:996 setDefaultTopic(producer.getCreateTopicKey())</c> → V2 键 <c>c</c>、
-    /// <c>:997 setDefaultTopicQueueNums(...)</c> → V2 键 <c>d</c>、
-    /// <c>:1007 setBrokerName(brokerName)</c> → V2 键 <c>n</c>
-    /// （SendMessageRequestHeaderV2.java:69，<c>@CFNullable</c> 所以空值整条不上线）。
-    ///
     /// <c>c</c>/<c>d</c> 是功能问题：broker 侧自动建 topic 时按这两个值决定队列数
     /// （<c>AbstractSendMessageProcessor.createTopicInSendMessageMethod</c>），写死
     /// TBW102/4 等于把 <c>CreateTopicKey</c> / <c>DefaultTopicQueueNums</c> 变成假 setter。
@@ -487,7 +451,6 @@ public class SendRetryTests
         using var cluster = MockCluster.Start(2);
         DefaultMQProducer producer = Started(cluster, "GID_SendHeaderFields");
 
-        // ---- ① 不配置时就是 Java 的那两个常量；n 是这一笔选中的那台 broker
         cluster.ClearRequests();
         Assert.Equal(SendStatus.SendOk, producer.Send(Msg()).SendStatus);
         WireRecord first = cluster.FirstSendRequest()!;
@@ -530,11 +493,6 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 定点批量 <c>send(Collection, MessageQueue, timeout)</c>：整批落进指定队列
-    /// （V2 头 e=queueId、n=brokerName），码仍是 320、m 仍是 true，且不做任何
-    /// 选队/重试（Java 直接进 sendKernelImpl）。
-    /// </summary>
     [Fact]
     public void PinnedSendBatch_LandsOnTheGivenQueue()
     {
@@ -553,12 +511,6 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 定点发送的 topic 一致性守卫（Java <c>DefaultMQProducerImpl:1234-1236</c> 同步一处）：
-    /// 不符就拒、一个 SEND 都不上线；命名空间下比的是各自包装后的资源名（WrapNamespace
-    /// 幂等，已带前缀的队列 topic 不能被误拒）；批量走的是同一处守卫
-    /// （Java 的 MessageBatch extends Message）。
-    /// </summary>
     [Fact]
     public void PinnedSendRefusesAMismatchedTopic_BeforeAnyRequest()
     {
@@ -593,12 +545,6 @@ public class SendRetryTests
         code is RequestCode.SendMessage or RequestCode.SendMessageV2
             or RequestCode.SendBatchMessage or RequestCode.SendReplyMessageV2;
 
-    /// <summary>
-    /// 定点单向（Java <c>DefaultMQProducer.sendOneway(Message, MessageQueue):660-663</c>）：
-    /// 有意**没有**守卫（<c>:1303-1310</c> 的 sendOneway 不判）—— topic 不符照样发。
-    /// 报文头里的 topic 取 msg 自己的（b）、只有 queueId 来自 mq（e），这正是「topic 写错
-    /// 会静默落进另一条 topic 的同号队列」的机制，所以三个字段都要取证。
-    /// </summary>
     [Fact]
     public void PinnedOnewayHasNoTopicGuard_AndTakesOnlyTheQueueIdFromTheMq()
     {
@@ -646,11 +592,6 @@ public class SendRetryTests
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 队列没有 broker 名（手工指定的 MessageQueue）时，<c>n</c> 整条不上线，而不是写
-    /// 一个空串 —— Java 那个字段是 <c>@CFNullable</c>，<c>writeIfNotNull</c> 会跳过 null。
-    /// 纯离线：只建请求、不发出去（Encode 前要把头展开成 extFields，同 broker 侧口径）。
-    /// </summary>
     [Fact]
     public void EmptyBrokerNameStaysOutOfTheSendHeader()
     {
@@ -669,7 +610,6 @@ public class SendRetryTests
             new MessageQueue(Topic, "", 0));
         without.MakeCustomHeaderToNet();
         Assert.False(without.ExtFields.ContainsKey("n"), "空 brokerName 不该上线");
-        // c/d 仍然按 Java 默认值上线
         Assert.Equal(MixAll.DefaultTopic, without.ExtFields["c"]);
         Assert.Equal("4", without.ExtFields["d"]);
     }
@@ -691,11 +631,6 @@ public class SendRetryTests
         return cond();
     }
 
-    /// <summary>
-    /// 带 ACL 钩子的生产者。钩子必须排在 Start() **之前**：Java 的 rpcHook 随
-    /// <c>MQClientAPIImpl</c> 构造传入，本端口各 facade 也在 <c>Start()</c> 里把它绑到
-    /// 传输层 —— 启动后再 SetRpcHook 已经来不及，报文会裸着出去（这正是 ① ② 要抓的东西）。
-    /// </summary>
     private static DefaultMQProducer StartedWithHook(MockCluster cluster, string group, bool stream)
     {
         var producer = new DefaultMQProducer(group)
@@ -709,10 +644,6 @@ public class SendRetryTests
         return producer;
     }
 
-    /// <summary>
-    /// 起一个 lite 消费者：stream 传 null 表示**不动默认值**（Java 的
-    /// DefaultLitePullConsumer 在构造函数里就置 true，③ 段要验的正是这个默认）。
-    /// </summary>
     private static DefaultLitePullConsumer StartedLite(MockCluster cluster, string group,
         bool? stream)
     {

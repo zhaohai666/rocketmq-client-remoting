@@ -1,17 +1,8 @@
-// 异步发送内核（Java DefaultMQProducerImpl.sendDefaultImpl 的 ASYNC 分支 +
-// MQClientAPIImpl.sendMessageAsync/onExceptionImpl）的离线对拍。
-//
 // 对端实现：python/tests/test_producer_async.py（38 项）、
 // cpp/tests/test_producer_async.cpp、rust/src/client/producer/send_retry_tests.rs。
 // 这里按 C# 能观察到的证据取样：假集群（MockCluster.cs）能看见**上线的报文**，
 // 日志能看见**重试链**，两者合起来足够钉死「调用方立刻返回 / 回调恰好一次 /
 // 异步不看 retryResponseCodes / 预算共享 / 闸门与队满怎么拒绝」这几条不变式。
-//
-// ⚠ C# 的传输层照 Java/Netty 的口径实现：对端关连接**不**提前惊动在途请求，
-// 只能等自己的响应超时。而一笔「等到超时」的尝试必然把共享预算吃光，于是
-// 「同一台 broker 上换 opaque 重试」在进程内造不出来（C++/Rust 的端口能在
-// 连接断掉时立刻失败，所以它们有那条断言）。这里改成断言**重试换了哪些 broker**
-// （日志取证）与**并发发送彼此不串台**（opaque 取证）。
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -52,10 +43,6 @@ public class ProducerAsyncTests : IDisposable
 
     // ---------------------------------------------------------------- 夹具
 
-    /// <summary>
-    /// 起一个已启动的生产者。<paramref name="senderPool"/> 必须在 <c>Start()</c> **之前**挂上
-    /// （池在 Start 里定，对应 Java setAsyncSenderExecutor 的用法），所以这里一并传入。
-    /// </summary>
     private static DefaultMQProducer Started(MockCluster cluster, string group,
         ConsumeExecutor? senderPool = null)
     {
@@ -89,8 +76,6 @@ public class ProducerAsyncTests : IDisposable
         return cond();
     }
 
-    /// <summary>记录每一笔终态回调（次数、结果/**异常对象**、跑在哪根线程上）。异常按对象存，
-    /// 因为 Java 的 onException 收的就是 Throwable —— 类型本身是失败分类，别退回成字符串。</summary>
     private sealed class Recorder : ISendCallback
     {
         private readonly object _gate = new();
@@ -239,7 +224,6 @@ public class ProducerAsyncTests : IDisposable
             _mode = context.CommunicationMode;
             if (_sleepMillis > 0)
             {
-                // 钩子接口是同步的（Java 也是），睡的就是预算用的那把挂钟
                 Thread.Sleep(_sleepMillis);
             }
 
@@ -251,8 +235,6 @@ public class ProducerAsyncTests : IDisposable
         }
     }
 
-    /// <summary>取本轮写进日志文件里的「异步重试」行数（Java 的那条 warn 是重试链唯一
-    /// 能被外部看到的证据：它带着第几次、换到了哪台 broker）。</summary>
     private string CaptureLog(string tag)
     {
         string path = Path.Combine(_dir, tag + ".log");
@@ -398,9 +380,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 未 Start / 已 Shutdown：同步抛给调用方（Java 走回调，那边问题更难查），回调一次都不跑。
-    /// </summary>
     [Fact]
     public void OutsideTheProducerLifecycle_ThrowsAtTheCaller()
     {
@@ -421,12 +400,10 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
         MQClientException after = Assert.Throws<MQClientException>(
             () => producer.SendAsync(Msg(), cb, 1000));
-        // 关池之后分得清「没启动」和「已经关掉」（Java 的 CREATE_JUST / SHUTDOWN_ALREADY）
         Assert.Contains("producer already shutdown", after.Message);
         Assert.Equal(1, cb.Count);
     }
 
-    /// <summary>用户回调自己抛异常不能带走回调池的 worker（Java 两处都 catch Throwable）。</summary>
     [Fact]
     public void UserCallbackException_KeepsThePoolAlive()
     {
@@ -490,15 +467,10 @@ public class ProducerAsyncTests : IDisposable
             .GetFaultItem(MockCluster.BrokerName(0));
         Assert.NotNull(item);
         Assert.False(item!.IsAvailable(), "回了错误的 broker 要被隔离");
-        // 响应是 broker 给的 ⇒ 链路是通的，只隔离不判不可达（Java 异步传 reachable=true）
         Assert.True(item.IsReachable());
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 超时预算是**所有尝试共享**的：一笔等到超时就吃光了剩余时间，链必须停在这里，
-    /// 不许再换 broker 试第二台（Java 往下传的是 timeoutMillis - costTime）。
-    /// </summary>
     [Fact]
     public void Timeout_SharesOneBudgetAcrossAttempts()
     {
@@ -517,15 +489,10 @@ public class ProducerAsyncTests : IDisposable
         Assert.Contains("wait response timeout, cost=", cb.Errors()[0]);
         Assert.Equal(1, cluster.Requests(0));
         Assert.True(cluster.Requests(1) == 0, "预算没了就不该有第二次尝试");
-        // 超时的判分在清理线程上（Java 的 scanResponseTable 每轮 1s），只卡下界
         Assert.True(elapsed >= 700, "等满了一次请求超时，elapsed=" + elapsed);
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 建连失败（Java 的 RemotingConnectException）算「没收到响应」：快、可重试，
-    /// 按 RetryTimesWhenSendAsyncFailed 试满，且每次**避开刚失败的那台**。
-    /// </summary>
     [Fact]
     public void ConnectFailure_RetriesOntoAnotherBroker_AndAvoidsTheFailedOne()
     {
@@ -607,10 +574,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 定点发送（调用方给了 mq）永不换 broker：Java 传下去的 topicPublishInfo 是 null，
-    /// 重试只能在**同一台**上原地换 opaque。
-    /// </summary>
     [Fact]
     public void PinnedQueue_NeverSwitchesBroker()
     {
@@ -634,10 +597,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 定点发送的唯一路由来源是 sendKernelImpl 里的那一次刷路由（Java :919-924）：
-    /// 调用方没走 sendDefaultImpl 取发布信息，不刷路由就解析不出地址。
-    /// </summary>
     [Fact]
     public void PinnedQueue_RefreshesTheRouteToResolveTheAddress()
     {
@@ -695,14 +654,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 异步链的定性不能和同步链分叉：一个 name server 地址都没有时，回调里拿到的也是
-    /// 10004 那条判定（Java 的 ASYNC 走的正是 sendDefaultImpl:888 的 validateNameServerSetting）。
-    /// 以前异步侧把异常重新包成 MQClientException 时会把码改写成 10005。
-    ///
-    /// onException 现在收的是**异常对象**（Java 的 Throwable），所以这里直接按码断言，
-    /// 不再只能靠文案反推。
-    /// </summary>
     [Fact]
     public void NoNameServerAddress_Reports10004ThroughTheCallback()
     {
@@ -779,10 +730,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// Java sendKernelImpl:1043-1046 —— ASYNC 分支**自己**还有一道预算闸：准备工作
-    /// （这里用拦截钩子的耗时代表）把预算花光就不再建请求，但 after 钩子照跑一次。
-    /// </summary>
     [Fact]
     public void PrepStageBeyondBudget_ReportsSendKernelImplTimeout()
     {
@@ -828,7 +775,6 @@ public class ProducerAsyncTests : IDisposable
 
     // ---------------------------------------------------------------- 背压闸门
 
-    /// <summary>默认配置与 Java 一致，而且闸门默认**不拦路**。</summary>
     [Fact]
     public void BackpressureDefaultsMatchLegacy()
     {
@@ -842,7 +788,6 @@ public class ProducerAsyncTests : IDisposable
         Assert.Equal(50000, producer.AsyncSenderQueueCapacity);
     }
 
-    /// <summary>条数闸地板值 10、字节闸地板值 1M（Java DefaultMQProducerImpl:141-153）。</summary>
     [Fact]
     public void BackpressureFloorsAreLegacyFloors()
     {
@@ -861,10 +806,6 @@ public class ProducerAsyncTests : IDisposable
         Assert.Equal(20, producer.SemaphoreAsyncSendNumAvailablePermits);
     }
 
-    /// <summary>
-    /// 条数闸打满：第 11 笔**在调用方线程上**等到预算耗尽，报 Java 的原文案，
-    /// 且一笔都不许上线（闸在 submit 之前）。
-    /// </summary>
     [Fact]
     public void NumGate_RejectsWithLegacyMessageAndSendsNothing()
     {
@@ -968,10 +909,6 @@ public class ProducerAsyncTests : IDisposable
 
     // ---------------------------------------------------------------- 有界发送队列
 
-    /// <summary>
-    /// 队列满了（Java 的 LinkedBlockingQueue(50000) 投不进去）：把这一笔**退回调用方**，
-    /// 不排队、不走回调；等池子空出来之后，前一笔照常发出去。
-    /// </summary>
     [Fact]
     public void QueueFull_RejectsTheCallerWithoutSending()
     {
@@ -1001,10 +938,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 队列满 + **开了背压**（Java :675-681）：许可已经扣了，就地跑完这一笔（阻塞调用方），
-    /// 好让回调把许可还回来 —— 不退给调用方，也不白等一次超时。
-    /// </summary>
     [Fact]
     public void QueueFull_RunsInlineWhenBackpressureIsOn()
     {
@@ -1036,10 +969,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 排队把预算吃光：出队之后才算真实耗时，超了就直接回调
-    /// 「DEFAULT ASYNC send call timeout」，不再发请求（Python _run / Java :555）。
-    /// </summary>
     [Fact]
     public void QueueWaitBeyondBudget_ReportsAsyncSendCallTimeout()
     {
@@ -1070,16 +999,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 关池要把手上的活干完（Java/Python 用的是不等待的 <c>shutdown()</c>，队列里还没跑到的
-    /// 准备段会连同任务一起被丢掉）：交进来的每一笔准备段都必须**跑到**。
-    ///
-    /// ⚠ 「上线多少笔」断不到精确值：准备段把报文写进 socket 之后，紧接着就是关客户端，
-    /// broker 还没读走的**尾部**几帧会随连接一起丢掉（跑整套用例时实测 32/36 上线、单跑
-    /// 稳定 36/36），那几笔既不上线也没回调 —— 与 Java 同一条：客户端一关就停超时清理并清空
-    /// 在途表，没回来的那笔就此没有终态。所以这里只断言「至少一半上线」：防的回归（把队列
-    /// 里的任务丢掉）只能让 cores 笔上线，即总数的 1/3，差得够远。
-    /// </summary>
     [Fact]
     public void Shutdown_DrainsTheHandedOffSends()
     {
@@ -1125,7 +1044,6 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(terminal >= 1, "排空之后总该有几笔拿到了终态");
     }
 
-    /// <summary>调用方自带的池（Java setAsyncSenderExecutor）由它自己关，生产者不接手。</summary>
     [Fact]
     public void CallerOwnedSenderPool_SurvivesProducerShutdown()
     {
@@ -1148,11 +1066,6 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(WaitUntil(() => pool.WorkerCount() >= 1, 1000), "池子还归调用方");
     }
 
-    /// <summary>
-    /// 批量异步（Java <c>send(Collection, SendCallback, timeout)</c>:1121，也就是 Python
-    /// <c>send_async</c> 收到 list 时走的批量分支）：一批<b>一个请求</b>、请求码是
-    /// SendBatchMessage(320)、回调恰好一次。
-    ///
     /// 后半段锁的是「每条子消息都要过 Validators.CheckMessage」：直接把 MessageBatch 丢给
     /// SendAsync 会漏掉这步，等于批量路径绕过本地校验；而且这类失败必须<b>进回调</b>（Python
     /// 的批量分支在 runnable 里抛、由外层 catch 接住），不能砸回调用方的栈。
@@ -1194,10 +1107,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 定点发送的守卫在异步入口上是**另一句文案**（Java <c>DefaultMQProducerImpl:1277-1278</c>），
-    /// 异常走回调；拒绝发生在任何请求之前（假集群一笔 SEND 都收不到）。批量异步共用同一处。
-    /// </summary>
     [Fact]
     public void PinnedAsyncSendUsesTheAsyncWording_AndStopsBeforeTheWire()
     {
@@ -1237,13 +1146,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 异步内核自己建请求（<c>BuildSendRequest</c> 在 sendKernelAsync 里，不走
-    /// <c>MqClient.SendMessage</c>），所以 Java <c>sendKernelImpl:996-997</c> / <c>:1007</c>
-    /// 写进发送头的三个值要在这里再取证一遍：V2 的 <c>n</c>（brokerName）、
-    /// <c>c</c>（createTopicKey）、<c>d</c>（自动建 topic 的队列数）。
-    /// 只在同步路径补的话，异步这一路会裸着出去 —— 而同步/异步的报文形状必须一致。
-    /// </summary>
     [Fact]
     public void SendAsyncHeaderCarriesBrokerNameAndTopicKeys()
     {
@@ -1267,20 +1169,6 @@ public class ProducerAsyncTests : IDisposable
         producer.Shutdown();
     }
 
-    /// <summary>
-    /// 批量发送的客户端 ID 口径（对应 Java <c>DefaultMQProducer.batch():1176-1182</c> 的顺序 +
-    /// <c>MQClientAPIImpl.processSendResponse:785</c>）：
-    ///   ① <b>每条子消息</b>的 UNIQ_KEY 必须在<b>编码之前</b>写好 —— 否则落进 commitLog 的子
-    ///     消息没有客户端 ID，消费端轨迹、按 uniqKey 反查全断，而发送侧看起来一切正常；
-    ///   ② <c>SendResult.MsgId</c> 取<b>批量自身</b>那条消息写在报文属性里的 UNIQ_KEY，
-    ///     不是 broker 回的 offsetMsgId。同步与异步两条入口必须同一口径。
-    ///
-    /// ⚠ 有意不跟 Java 的「broker 没回 batchUniqId 时把 MsgId 换成逐条逗号串」：同步批量在
-    /// <see cref="DefaultMQProducer.SendBatch"/> 里要 CloneMessage（免得把压缩后的 body 写回
-    /// 调用方的原始消息），克隆出来的是普通 Message，解析应答时子消息列表已经拿不到了；
-    /// 四种语言（Python/Rust/C++/C#）统一取批量自身的 ID 才能互相比对。要紧的那一半
-    /// （逐条 ID 进 body）与 Java 一致。
-    /// </summary>
     [Fact]
     public void BatchSends_CarryPerSubClientIds_AndReportTheBatchId()
     {
@@ -1349,7 +1237,6 @@ public class ProducerAsyncTests : IDisposable
             "字节闸要按整批扣，空闲=" + producer.SemaphoreAsyncSendSizeAvailablePermits);
         Assert.Equal(9, producer.SemaphoreAsyncSendNumAvailablePermits);
 
-        // 闸上只剩 420 KiB：第二笔同样的批量扣不下，按 Java 原文拒掉（而且只占一格条数都不该留）
         var rejected = new Recorder();
         producer.SendBatchAsync(batch, rejected, 150);
         Assert.True(rejected.WaitDone(1, 5000));

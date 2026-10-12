@@ -1,14 +1,5 @@
 // MQClientManager 跨门面复用 MQClientInstance 的离线单测 —— 用 MockCluster，不依赖真集群。
 //
-// 对齐基准（Java 5.5.1，逐行读过）：
-//   * `MQClientManager#getOrCreateMQClientInstance`:50-66 —— factoryTable 按 clientId 缓存，
-//     同进程内同 clientId 的 producer/consumer/admin 复用同一个 MQClientInstance
-//     （连接、路由缓存、路由/动态取址周期任务、统计采样全共享）。
-//   * `MQClientInstance#shutdown`:1101-1133 —— consumerTable/adminExtTable 非空或
-//     producerTable 还有人在用时**直接 return**，引用归零才真正关停周期任务与连接，
-//     关停时才 removeClientFactory(clientId, this)。等价于本端口的引用计数。
-//   * shutdown 顺序：先退出的门面不能拖垮还在用的实例（Java 的空表判据保证），
-//     全部退出后实例必须真的关停（周期任务/连接不泄漏）。
 //
 // 用 MockCluster 的原因与 SendRetryTests 相同：start/shutdown 的全部报文（路由、心跳、
 // 35 注销）都能在进程内假集群上走通，引用计数的生死可以同步断言，不用等任何超时。
@@ -99,7 +90,6 @@ public class MQClientManagerTests
 
             producer.Shutdown();
 
-            // 引用计数 2 → 1：实例不能被先退出的门面关掉（Java shutdown() 的空表判据）
             Assert.Equal(1, MQClientManager.Instance.RefCountOf(producer.ClientId));
             Assert.True(shared.Started, "shared instance must survive while consumer still uses it");
             Assert.Same(shared, consumer.Client());
@@ -165,7 +155,6 @@ public class MQClientManagerTests
         producer.Shutdown();
         consumer.Shutdown();
 
-        // 引用归零：表项摘除 + 实例真关停（对应 Java removeClientFactory + shutdown OK）
         Assert.Equal(0, MQClientManager.Instance.RefCountOf(clientId));
         Assert.False(MQClientManager.Instance.TryGetMQClientInstance(clientId, out _));
         Assert.False(shared.Started, "instance must be shut down after the last facade leaves");
@@ -202,11 +191,6 @@ public class MQClientManagerTests
     }
 
     // ---------------- 6：共享实例上的反向请求处理器不互相顶掉 ----------------
-    //
-    // remoting 的处理器表一个 code 只有一个槽：两个生产者共享实例时，后启动的若直接
-    // RegisterProcessor 会把先启动的 39（CHECK_TRANSACTION_STATE）顶掉。实例级多播
-    // （Java 把这些处理器挂在实例级 ClientRemotingProcessor 上按组路由）的落点就是
-    // 同 code 的登记人数 —— 用两个同 clientId 的生产者把这个「不覆盖」锁死。
 
     [Fact]
     public void FacadeProcessorsStackOnSharedInstanceInsteadOfOverwriting()

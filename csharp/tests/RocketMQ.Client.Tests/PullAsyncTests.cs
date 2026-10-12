@@ -1,17 +1,3 @@
-// DefaultMQPullConsumer.PullAsync（Java DefaultMQPullConsumer.pull(mq, sub, offset, maxNums,
-// PullCallback[, timeoutMillis]):362-378 的本端口对应物）离线单测 —— 假 namesrv + 假 broker，
-// 不连真集群。
-//
-// 锁的四条可观察语义（实现口径见 PullConsumer.cs:742-802 的注释）：
-//   1. 调用线程**立即返回**（Java netty invokeAsync；本端口 Task.Run 包同步内核 —— 对外
-//      形状一致）；回调**恰好一次**，成功/异常二选一（Java PullCallback.onSuccess/onException）。
-//   2. 未启动 / 已关停：本端口选择在调用栈上**同步抛**（口径从 SendAsync 沿用的有意差异），
-//      而不是静默转 onException。
-//   3. 异常分流按 Result.cs:158-168 的注释：broker 回错是 MQBrokerException、传输超时是
-//      RemotingTimeoutException —— 用 ScriptPull 错误码与「挂闸不应答」两条可控假路径制造，
-//      不依赖死端口（Windows 回环拒连自带 ~2s 噪声）。
-//   4. 回调自己再抛不许逃逸（Java 的回调异常同样不会回到任何调用方）：只留日志，
-//      消费者还能继续正常发起下一笔。
 using System.Diagnostics;
 using System.Text;
 using RocketMQ.Client;

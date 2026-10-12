@@ -1,10 +1,3 @@
-// -*- coding: utf-8 -*-
-// Validators (org.apache.rocketmq.client.Validators).
-// Faithful port of python/client/validators.py.
-//
-// checkGroup mirrors Python check_group: blank -> length (GROUP_MAX_LENGTH) -> illegal chars,
-// throwing MQClientException. The character check reuses topic_validator's allow-set. The
-// RESERVED_GROUP_PREFIXES / GROUP_NOT_EXIST / GROUP_ALREADY_EXIST constants follow Java Validators.
 
 import path from 'node:path';
 import { MQClientException } from '../remoting/exception.ts';
@@ -14,9 +7,7 @@ import {
 } from './topic_validator.ts';
 import { Message } from './message.ts';
 
-// Java Validators.CHARACTER_MAX_LENGTH (kept for parity even though unused here).
 export const CHARACTER_MAX_LENGTH = 255;
-// Java Validators.CHARSET_ILLEGAL / VALID_PATTERN.
 export const CHARSET_ILLEGAL = '{}\n';
 export const VALID_PATTERN = '^[%|a-zA-Z0-9_-]+$';
 
@@ -28,8 +19,6 @@ export const TOPIC_NOT_EXIST = 'the specified topic[%s] does not exist';
 // Group names reserved for broker-internal retry / dlq routing.
 export const RESERVED_GROUP_PREFIXES = ['%RETRY%', '%DLQ%'];
 
-// Java checkMessage's isNotAllowedSendTopic step (TopicValidator.java:64-75):
-// a client may not SEND into the system/RMV topics.
 function checkTopicNotAllowed(topic: string | null): void {
   if (topic != null && isNotAllowedSendTopic(topic)) {
     throw new MQClientException(
@@ -68,8 +57,6 @@ export const Validators = {
     }
   },
 
-  // Java Validators.checkTopic (Validators.java:95-107): blank -> length
-  // (TOPIC_MAX_LENGTH=127) -> illegal characters.
   checkTopic(topic: string | null): void {
     if (topic == null || !String(topic).trim()) {
       throw new MQClientException('The specified topic is blank');
@@ -84,10 +71,6 @@ export const Validators = {
     }
   },
 
-  // Java Validators.checkMessage (Validators.java:66-93): null message ->
-  // topic (checkTopic + not-allowed-send) -> body null / empty / over the
-  // producer's maxMessageSize -> the LMQ (INNER_MULTI_DISPATCH) path must not
-  // contain the file separator. Every send path funnels through here.
   checkMessage(msg: Message | null, maxMessageSize: number): void {
     if (msg == null) {
       throw new MQClientException('the message is null');
@@ -108,10 +91,6 @@ export const Validators = {
         `the message body size over max value, MAX: ${maxMessageSize}`);
     }
 
-    // Java: StringUtils.contains(lmqPath, File.separator) — LMQ dispatch paths
-    // are flat; a separator would escape the LMQ queue directory. File.separator
-    // is '/' on every POSIX broker; also reject the platform separator so a
-    // Windows client cannot smuggle a '\\' path through.
     const lmqPath = msg.getUserProperty
       ? msg.getUserProperty('INNER_MULTI_DISPATCH')
       : (msg.getProperty ? msg.getProperty('INNER_MULTI_DISPATCH') : null);

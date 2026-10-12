@@ -1,11 +1,3 @@
-// clientId 口径与 Java `ClientConfig#buildMQClientId` 对齐的回归测试。
-//
-// Java 的默认 clientId 是 `<本机 IP>@<instanceName>`，并且 instanceName 还是默认值
-// "DEFAULT" 时会在 start() 里被就地改写成 `<pid>#<nanoTime>`。本端口旧口径
-// `<instanceName>@<秒级时间戳>@<pid>@<seq>` 靠后缀也不撞号，但少了本机 IP：broker 的消费组
-// channel 表以 clientId 为键，运维工具（examineConsumerRunningInfo 等）按 Java 的
-// `<ip>@<instanceName>` 形态查不到本客户端。
-//
 // 与 python/tests/test_client_id.py、cpp/tests/test_client_id.cpp、
 // rust/src/client/{producer,consumer}.rs 的同名测试同题。
 using System.Text.RegularExpressions;
@@ -22,10 +14,6 @@ public class ClientIdTests
     private static readonly Regex LegacyStyle =
         new Regex(@"^[^@\s]+@" + Environment.ProcessId + @"#\d+$");
 
-    /// <summary>
-    /// Java <c>ClientConfig#buildMQClientId</c> 的 stream 后缀用的是 <c>sb.append
-    /// (RequestType.STREAM)</c>，即枚举 **name**；ExtFields 里的 <c>ReqT</c> 才是 code "0"。
-    /// </summary>
     private const string StreamSuffix = "@STREAM";
 
     private static string Ip => MixAll.CachedIpStr();
@@ -46,10 +34,6 @@ public class ClientIdTests
         return (clientId[..at], clientId[(at + 1)..]);
     }
 
-    /// <summary>
-    /// 盖 clientId 发生在任何 I/O 之前，但 `127.0.0.1:1` 上没有 broker，start() 可能抛；
-    /// 这里把异常吞掉，只关心 clientId 有没有按 Java 的口径盖上。
-    /// </summary>
     private static T Stamped<T>(T client, Action start, Action shutdown)
     {
         try
@@ -83,7 +67,6 @@ public class ClientIdTests
     public void UnitNameIsAnOptionalSuffix()
     {
         Assert.Equal("10.0.0.1@inst@unit-a", ClientIds.BuildMqClientId("10.0.0.1", "inst", "unit-a"));
-        // Java `UtilAll.isBlank(unitName)`：空白等同于没有
         Assert.Equal("10.0.0.1@inst", ClientIds.BuildMqClientId("10.0.0.1", "inst", "   "));
         Assert.Equal("10.0.0.1@inst", ClientIds.BuildMqClientId("10.0.0.1", "inst", null));
     }
@@ -94,7 +77,6 @@ public class ClientIdTests
         Assert.Equal("inst", ClientIds.ChangeInstanceNameToPID("inst"));
         string rewritten = ClientIds.ChangeInstanceNameToPID(MixAll.DefaultInstanceName);
         Assert.StartsWith(Environment.ProcessId + "#", rewritten);
-        // Java 是就地覆盖字段，第二次调用不许再换一个名字（否则重启换 clientId）
         Assert.Equal(rewritten, ClientIds.ChangeInstanceNameToPID(rewritten));
     }
 
@@ -157,7 +139,6 @@ public class ClientIdTests
 
     // ---------------------------------------------------------------- 消费者
 
-    /// 只有 CLUSTERING 才改写 instanceName（Java 的三个 impl 都是这个条件）。
     [Fact]
     public void PushClusteringRewritesAndBroadcastDoesNot()
     {
@@ -177,13 +158,9 @@ public class ClientIdTests
         broadcast.SetMessageListener(new EmptyListener());
         Stamped(broadcast, broadcast.Start, broadcast.Shutdown);
         Assert.Equal(MixAll.DefaultInstanceName, broadcast.InstanceName);
-        // Java 只对 CLUSTERING 改写 instanceName，广播消费者保留 "DEFAULT" —— 本端口每个
-        // facade 各建私有 MQClientInstance（不共用），但 clientId 形态要跟 Java 一致。
         Assert.Equal(Ip + "@DEFAULT", broadcast.ClientId);
     }
 
-    /// pull / lite 消费者在 Java 里**默认**开 stream（DefaultMQPullConsumer:113/126、
-    /// DefaultLitePullConsumer:213/228），所以 clientId 尾巴上多一段 `@STREAM`。
     [Fact]
     public void PullAndLiteFollowTheSameRule()
     {
@@ -205,11 +182,9 @@ public class ClientIdTests
         liteBroadcast.SetMessageModel(MessageModel.Broadcasting);
         liteBroadcast.Subscribe("T", "*");
         Stamped(liteBroadcast, liteBroadcast.Start, liteBroadcast.Shutdown);
-        // Java 只对 CLUSTERING 改写 instanceName；stream 后缀与消息模型无关，照样带上。
         Assert.Equal(Ip + "@DEFAULT" + StreamSuffix, liteBroadcast.ClientId);
     }
 
-    /// 显式关掉 stream 后 `@STREAM` 后缀必须消失（Java 的 sb.append 在 if 分支里）。
     [Fact]
     public void StreamSuffixIsOptOutable()
     {
@@ -229,7 +204,6 @@ public class ClientIdTests
     [Fact]
     public void StreamSuffixComesAfterUnitName()
     {
-        // Java ClientConfig#buildMQClientId：先 unitName，再 RequestType.STREAM 的 **name**。
         Assert.Equal("10.0.0.1@inst@unit-a@STREAM",
             ClientIds.BuildMqClientId("10.0.0.1", "inst", "unit-a", true));
         Assert.Equal("10.0.0.1@inst@STREAM",
@@ -249,7 +223,6 @@ public class ClientIdTests
         Assert.True(new DefaultLitePullConsumer("CID_stream_default").EnableStreamRequestType);
     }
 
-    /// unitName 会同时进 clientId 和 TopAddressing（Java 的 ns 后缀），这里只断言 clientId。
     [Fact]
     public void UnitNameReachesProducerClientId()
     {
@@ -263,7 +236,6 @@ public class ClientIdTests
         Assert.Equal(Ip + "@unitname-fixed@unit-east", p.ClientId);
     }
 
-    /// unitMode 是消费者/生产者上的独立开关，默认 false（Java ClientConfig#isUnitMode）。
     [Fact]
     public void UnitModeDefaultsToFalseAndIsSettable()
     {
@@ -283,7 +255,6 @@ public class ClientIdTests
     [Fact]
     public void AdminKeepsItsOwnInstanceName()
     {
-        // Java 的 admin 也调用 changeInstanceNameToPID，但本端口默认名是 ADMIN 不是 DEFAULT。
         var admin = new DefaultMQAdminExt();
         admin.SetNamesrvAddr("127.0.0.1:1");
         Stamped(admin, admin.Start, admin.Shutdown);

@@ -1,7 +1,3 @@
-// Broker-side POP/pull assignment: QUERY_ASSIGNMENT(400) (Java
-// RebalanceImpl#getRebalanceResultFromBroker:345, MQClientAPIImpl
-// #queryAssignment:405, RebalancePushImpl#clientRebalance).
-//
 // What is worth asserting: the 400 request body's exact fields (the broker
 // load-balances by them), the null-vs-empty reply semantics (keep current vs
 // clear), and that the answer's queue set — not the local strategy — becomes
@@ -48,8 +44,6 @@ func (b *consumerBroker) answerQueryAssignment(req *remoting.RemotingCommand) *r
 	b.mu.Unlock()
 
 	if fixture == nil {
-		// No canned answer: SUCCESS with no set — the client reads this as
-		// Java's null ("invalid result, skip the update").
 		return remoting.CreateResponseCommand(remoting.RespSuccess, "")
 	}
 	if fixture.code != 0 {
@@ -184,9 +178,6 @@ func TestBrokerAssignmentBuildsPopQueues(t *testing.T) {
 	})
 }
 
-// A broker ERROR answer keeps the current assignment: Java's
-// getRebalanceResultFromBroker returns false without touching the process
-// queue tables, so a broker blip must not revoke everything.
 func TestBrokerAssignmentErrorKeepsCurrentAssignment(t *testing.T) {
 	f, c := popFixtureWithConsumer(t, &countingConcurrentlyListener{
 		fn: func(_ []*common.MessageExt, _ *ConsumeConcurrentlyContext) ConsumeConcurrentlyStatus {

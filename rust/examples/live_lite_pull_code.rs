@@ -77,8 +77,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 与 Java `DefaultLitePullConsumerImpl#pullSyncImpl:1058` 的
-/// `buildSysFlag(false, block, true, false, /*litePull=*/true)` 对齐。
 fn lite_flag() -> i32 {
     PullSysFlag::build_sys_flag(/*commit_offset=*/false, /*suspend=*/false,
                                 /*subscription=*/true, /*class_filter=*/false,

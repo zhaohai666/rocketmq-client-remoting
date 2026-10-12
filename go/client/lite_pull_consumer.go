@@ -1,7 +1,3 @@
-// DefaultLitePullConsumer — the LIGHT pull consumer (Java
-// org.apache.rocketmq.client.consumer.DefaultLitePullConsumer +
-// impl.consumer.DefaultLitePullConsumerImpl + RebalanceLitePullImpl).
-//
 // It sits between the push consumer and the classic pull consumer: the client
 // still owns the pull (a background SHORT-poll loop over every assigned
 // queue), but the CALLER pulls the results out at its own pace through Poll.
@@ -14,44 +10,6 @@
 //     heartbeat and the broker-side filter keep working).
 //
 // The two rules that are easy to get wrong and expensive to debug:
-//
-//  1. There are TWO cursors per queue and collapsing them loses or duplicates
-//     messages. nextOffset is the PULL cursor ("where the next pull goes");
-//     consumeOffset is the CONSUME cursor ("what Poll has handed to the
-//     caller") and is the only thing commit ever reads. Messages still sitting
-//     in the local buffer are NOT consumed — committing from the pull cursor
-//     would silently skip them after a restart (Java's
-//     updateConsumeOffset(mq, processQueue.removeMessage(msgs)) is the same
-//     line drawn differently: only delivery advances the commitable offset).
-//  2. The pull cursor follows nextBeginOffset after EVERY round, whatever the
-//     status (Java PullTaskImpl.run:982-998). NO_MATCHED_MSG would otherwise
-//     re-scan the same unmatched window forever, and OFFSET_ILLEGAL carries the
-//     broker's corrected offset in that field. The one brake: an in-flight
-//     round must not overwrite a cursor that a concurrent Seek (or a revoke)
-//     moved while the request was on the wire — the request-offset comparison
-//     below is Java's seekOffset==-1 + isDropped checks folded into one.
-//
-// Wired differently from Java on purpose:
-//
-//   - The consumer is NOT registered in the instance's consumer table (it
-//     cannot answer the broker's reverse requests the way a push consumer
-//     does); it registers the GROUP only and sends its OWN heartbeat — one
-//     ConsumerData with ConsumeType CONSUME_ACTIVELY (Java
-//     DefaultLitePullConsumerImpl.consumeType():1111, the 5.4.0+ value) and
-//     its own subscription set, fanned out to every broker address including
-//     slaves (a slave that never hears the beat answers pulls with
-//     SUBSCRIPTION_NOT_EXIST).
-//   - The pull goes out as LITE_PULL_MESSAGE(361) with the
-//     FLAG_LITE_PULL_MESSAGE sysFlag bit — the broker tags lite traffic with
-//     them (Java DefaultLitePullConsumerImpl.PullTaskImpl:820-828).
-//   - Shutdown persists the final offsets INLINE (Go has no async-runtime
-//     constraint; the Rust/Python ports must spawn theirs), but in Java's
-//     order: persistConsumerOffset first, unregister + factory shutdown last.
-//   - Rebalance keeps the CURRENT assignment for a topic whose consumer-id
-//     list could not be fetched — the same rule the push consumer follows
-//     (Instance.GetConsumerIDListByGroup's "never fall back to I own every
-//     queue"; the Rust/Python ports instead add themselves to an empty list,
-//     which duplicates work between co-located instances after a blip).
 package client
 
 import (
@@ -65,8 +23,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// Lite-pull timings and limits (Java DefaultLitePullConsumerImpl + the shared
-// port values the Rust/Python/C++/C# consumers use).
 const (
 	// DefaultLitePullBatchSize is pullBatchSize — messages per pull request.
 	DefaultLitePullBatchSize = int32(32)
@@ -90,24 +46,12 @@ const (
 	liteRebalanceIntervalMillis = int64(1000)
 	// liteGotAnyBackoffMillis is the immediate follow-up when a round pulled
 	// something (drain the queue, don't wait out the idle interval).
-	liteGotAnyBackoffMillis = int64(5)
-	// maxPollBatchSize caps one Poll's return (Java MAX_POLL_BATCH_SIZE).
-	maxPollBatchSize = 1024
-	// DefaultLiteTopicMetadataCheckIntervalMillis is Java
-	// DefaultLitePullConsumer.topicMetadataCheckIntervalMillis:160 (30s) — how
-	// often the background task re-lists the queues of every topic registered
-	// through RegisterTopicMessageQueueChangeListener.
+	liteGotAnyBackoffMillis                     = int64(5)
+	maxPollBatchSize                            = 1024
 	DefaultLiteTopicMetadataCheckIntervalMillis = int64(30 * 1000)
-	// liteMetadataFirstDelayMillis is Java startScheduleTask's initial delay:
-	// scheduleAtFixedRate(..., 1000*10, topicMetadataCheckIntervalMillis).
-	liteMetadataFirstDelayMillis = int64(10 * 1000)
+	liteMetadataFirstDelayMillis                = int64(10 * 1000)
 )
 
-// TopicMessageQueueChangeListener is Java's consumer/TopicMessageQueueChangeListener:
-// OnChanged fires when a topic's queue SET differs from the snapshot the
-// background task took last round (the scale-out / scale-in case). Like Java,
-// the topic handed back is the key the listener was registered under, and an
-// unchanged set never re-fires.
 type TopicMessageQueueChangeListener interface {
 	OnChanged(topic string, messageQueues []common.MessageQueue)
 }
@@ -146,10 +90,6 @@ type DefaultLitePullConsumer struct {
 	allocateStrategy AllocateMessageQueueStrategy
 	queueListener    MessageQueueListener
 
-	// topicChangeListeners / messageQueuesForTopic back
-	// RegisterTopicMessageQueueChangeListener (Java Impl:144 + :146): the
-	// listener map keys the topic, the snapshot map holds the queue set the
-	// last round reported. Both guarded by mu.
 	topicChangeListeners       map[string]TopicMessageQueueChangeListener
 	messageQueuesForTopic      map[string][]common.MessageQueue
 	topicMetadataCheckInterval int64
@@ -161,21 +101,14 @@ type DefaultLitePullConsumer struct {
 	// assign mode needs the broker-side filter just as much).
 	subscriptionData map[string]*remoting.SubscriptionData
 	// assignSubExpr is the per-topic TAG expression for assign mode.
-	assignSubExpr map[string]string
-	assignMode    bool
-	assigned      map[common.MessageQueue]struct{}
-	// nextOffset is the PULL cursor; consumeOffset the CONSUME cursor (see
-	// rule 1 in the file header); offsetTable is the commit target (Java
-	// RemoteBrokerOffsetStore.offsetTable's role); seekOffset pins Seek's
-	// value ahead of the first pull.
-	nextOffset    map[common.MessageQueue]int64
-	consumeOffset map[common.MessageQueue]int64
-	offsetTable   map[common.MessageQueue]int64
-	seekOffset    map[common.MessageQueue]int64
-	paused        map[common.MessageQueue]struct{}
-	// nextAutoCommitDeadline starts at -1: 0 would be "never again" only until
-	// 1970, but -1 makes the FIRST MaybeAutoCommit fire immediately (Java's
-	// nextAutoCommitDeadline initialises the same way).
+	assignSubExpr          map[string]string
+	assignMode             bool
+	assigned               map[common.MessageQueue]struct{}
+	nextOffset             map[common.MessageQueue]int64
+	consumeOffset          map[common.MessageQueue]int64
+	offsetTable            map[common.MessageQueue]int64
+	seekOffset             map[common.MessageQueue]int64
+	paused                 map[common.MessageQueue]struct{}
 	nextAutoCommitDeadline int64
 	lastRebalanceTs        int64
 
@@ -193,9 +126,6 @@ type DefaultLitePullConsumer struct {
 	bufNotify chan struct{}
 }
 
-// NewDefaultLitePullConsumer mirrors the Java constructor: the group is
-// mandatory. STREAM request type defaults to ON (every Java lite constructor
-// sets enableStreamRequestType = true, like the classic pull consumer).
 func NewDefaultLitePullConsumer(group string) (*DefaultLitePullConsumer, error) {
 	if err := common.CheckGroup(group); err != nil {
 		return nil, err
@@ -319,9 +249,6 @@ func (c *DefaultLitePullConsumer) SetTlsEnable(enable bool) {
 	c.tlsEnable = &enable
 }
 
-// SetSocksProxy tunnels the consumer's remoting connections through a SOCKS
-// proxy (Java ClientConfig#socksProxyConfig). nil = direct connections. The
-// address-server HTTP fetch (TopAddressing) is not proxied.
 func (c *DefaultLitePullConsumer) SetSocksProxy(proxy *remoting.SocksProxyConfig) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -354,7 +281,6 @@ func (c *DefaultLitePullConsumer) SetPollNameServerInterval(millis int64) {
 	c.pollNamesrvIntv = millis
 }
 
-// SetPullBatchSize clamps at 1 (Java setPullBatchSize).
 func (c *DefaultLitePullConsumer) SetPullBatchSize(n int32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -364,7 +290,6 @@ func (c *DefaultLitePullConsumer) SetPullBatchSize(n int32) {
 	c.pullBatchSize = n
 }
 
-// SetPollTimeoutMillis clamps at 0 (Java setPollTimeoutMillis).
 func (c *DefaultLitePullConsumer) SetPollTimeoutMillis(ms int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -401,7 +326,6 @@ func (c *DefaultLitePullConsumer) SetPullIntervalMillis(ms int64) {
 	c.pullIntervalMillis = ms
 }
 
-// SetAllocateMessageQueueStrategy mirrors the Java setter; Start refuses nil.
 func (c *DefaultLitePullConsumer) SetAllocateMessageQueueStrategy(s AllocateMessageQueueStrategy) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -416,12 +340,6 @@ func (c *DefaultLitePullConsumer) SetMessageQueueListener(l MessageQueueListener
 	c.queueListener = l
 }
 
-// SetTopicMetadataCheckIntervalMillis sets how often the background task
-// re-lists the queues of every topic registered through
-// RegisterTopicMessageQueueChangeListener (Java
-// DefaultLitePullConsumer.setTopicMetadataCheckIntervalMillis:563, default 30s).
-// Java has no floor, but 0 would make scheduleAtFixedRate throw, so this port
-// clamps at 1s like the C++/Python ports.
 func (c *DefaultLitePullConsumer) SetTopicMetadataCheckIntervalMillis(ms int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -438,20 +356,6 @@ func (c *DefaultLitePullConsumer) TopicMetadataCheckIntervalMillis() int64 {
 	return c.topicMetadataCheckInterval
 }
 
-// RegisterTopicMessageQueueChangeListener registers a callback for topic
-// metadata changes (Java DefaultLitePullConsumer:325 →
-// DefaultLitePullConsumerImpl.registerTopicMessageQueueChangeListener:1267):
-// the background task (first round 10s after Start, then every
-// SetTopicMetadataCheckIntervalMillis) lists the topic's subscribe queues and
-// calls OnChanged only when that SET differs from the previous snapshot.
-//
-// Java-faithful details: re-registering a topic overwrites the old listener
-// with a warning (:1272); while running, the current set is snapshotted
-// immediately (:1275-1277) so "what exists right now" is not reported as a
-// change on the first round. Like every other topic key in this port's lite
-// consumer (Subscribe, route lookups, rebalance), the topic is stored exactly
-// as handed in — Java wraps it with the namespace at this entry point, this
-// port keeps bare keys throughout and applies the namespace on the wire.
 func (c *DefaultLitePullConsumer) RegisterTopicMessageQueueChangeListener(
 	topic string, listener TopicMessageQueueChangeListener) error {
 	if strings.TrimSpace(topic) == "" || listener == nil {
@@ -478,10 +382,6 @@ func (c *DefaultLitePullConsumer) RegisterTopicMessageQueueChangeListener(
 	return nil
 }
 
-// FetchTopicMessageQueuesAndCompare is one round of Java's
-// DefaultLitePullConsumerImpl.fetchTopicMessageQueuesAndCompare:1230 — the
-// background task's body, exposed so tests and callers can drive a round
-// without waiting out the period. Returns how many listeners fired.
 func (c *DefaultLitePullConsumer) FetchTopicMessageQueuesAndCompare() int {
 	c.mu.Lock()
 	topics := make([]string, 0, len(c.topicChangeListeners))
@@ -501,11 +401,6 @@ func (c *DefaultLitePullConsumer) FetchTopicMessageQueuesAndCompare() int {
 		}
 		newQueues, err := c.FetchMessageQueues(topic)
 		if err != nil {
-			// DELIBERATE divergence from Java: Java's catch sits in the
-			// startScheduleTask wrapper (Impl:382-393), so one failing topic
-			// drops the REST of that round. Skipping only that topic keeps a
-			// permanently unroutable topic from starving the listeners that
-			// happen to iterate after it.
 			common.LogErrorf("ScheduledTask fetchMessageQueuesAndCompare for %s failed: %v", topic, err)
 			continue
 		}
@@ -525,10 +420,6 @@ func (c *DefaultLitePullConsumer) FetchTopicMessageQueuesAndCompare() int {
 	return fired
 }
 
-// isQueueSetEqual is Java's isSetEqual:1246-1260: a missing snapshot is the
-// `oldSet == null` branch (never equal — fetchMessageQueues hands back an
-// empty set, not null, so the both-null case cannot arise), then size, then
-// membership.
 func isQueueSetEqual(oldQueues []common.MessageQueue, hadSnapshot bool,
 	newQueues []common.MessageQueue) bool {
 	if !hadSnapshot {
@@ -549,8 +440,6 @@ func isQueueSetEqual(oldQueues []common.MessageQueue, hadSnapshot bool,
 	return true
 }
 
-// metadataLoop is Java's startScheduleTask: first round 10s after start, then
-// one every period.
 func (c *DefaultLitePullConsumer) metadataLoop(stop chan struct{}, firstDelay, period time.Duration) {
 	timer := time.NewTimer(firstDelay)
 	defer timer.Stop()
@@ -622,13 +511,6 @@ func (c *DefaultLitePullConsumer) SetSubExpressionForAssign(topic, subExpression
 	}
 }
 
-// Assign switches to assign mode with an explicit queue set — no rebalance.
-// Dropped queues lose their cursors entirely (Java
-// AssignedMessageQueue.updateAssignedMessageQueue removes the whole
-// MessageQueueState); the commit table is deliberately NOT touched, the
-// persisted values only age out through Commit's persistAll scope rules.
-// Queues already holding a pull cursor keep it (Java's
-// `if (!nextPullOffsetMap.containsKey(mq))` on the resolve side).
 func (c *DefaultLitePullConsumer) Assign(mqs []common.MessageQueue) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -685,8 +567,6 @@ func (c *DefaultLitePullConsumer) Subscriptions() []*remoting.SubscriptionData {
 	return out
 }
 
-// Pause stops the pull loop from pulling these queues (buffered messages are
-// unaffected — Java pauses pulls, not deliveries).
 func (c *DefaultLitePullConsumer) Pause(mqs []common.MessageQueue) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -725,7 +605,6 @@ func (c *DefaultLitePullConsumer) Start() error {
 		c.consumerGroup = common.WrapNamespace(c.namespace, c.consumerGroup)
 	}
 	if c.messageModel == MessageModelClustering {
-		// Java start:288-291 — only CLUSTERING rewrites DEFAULT to pid#nanotime.
 		c.instanceName = common.ChangeInstanceNameToPID(c.instanceName)
 	}
 	if c.clientID == "" {
@@ -744,7 +623,6 @@ func (c *DefaultLitePullConsumer) Start() error {
 	stream := c.streamRequest
 	c.mu.Unlock()
 
-	// Namespace + stream + user(ACL) + zone, in Java's order, once per instance.
 	instance.EnsureRPCHooks(namespaceV2, stream, userHook)
 	if err := instance.Start(); err != nil {
 		c.mu.Lock()
@@ -754,9 +632,6 @@ func (c *DefaultLitePullConsumer) Start() error {
 	}
 
 	c.mu.Lock()
-	// Java start:339 registers with the factory; this port registers the GROUP
-	// only (see the file header) — the heartbeat task must not pick a lite
-	// consumer up as if it could answer reverse requests.
 	instance.RegisterConsumerGroup(c.consumerGroup)
 	c.pullAPI = newPullAPI(instance, c.consumerGroup)
 	c.started = true
@@ -789,17 +664,11 @@ func (c *DefaultLitePullConsumer) Start() error {
 	c.mu.Unlock()
 	go c.heartbeatLoop(stop)
 	go c.pullServiceLoop(stop)
-	// Java Impl.start() → startScheduleTask(): the queue-set comparison task
-	// runs whether or not any listener exists yet.
 	go c.metadataLoop(stop, time.Duration(liteMetadataFirstDelayMillis)*time.Millisecond,
 		time.Duration(period)*time.Millisecond)
 	return nil
 }
 
-// checkConfigLocked is Java DefaultLitePullConsumerImpl.checkConfig:413 — the
-// group checks first, then the address, then the subscription gate, then the
-// timestamp format (a bad format would otherwise fail silently later and
-// degrade CONSUME_FROM_TIMESTAMP into "consume from max offset").
 func (c *DefaultLitePullConsumer) checkConfigLocked() error {
 	if err := common.CheckGroup(c.consumerGroup); err != nil {
 		return err
@@ -820,10 +689,6 @@ func (c *DefaultLitePullConsumer) checkConfigLocked() error {
 	return nil
 }
 
-// Shutdown stops the loops, persists the final offsets (Java
-// persistConsumerOffset, plus the autoCommit catch-up flush of
-// "delivered but not yet deadline-reached" offsets), then unregisters the
-// group and shuts the instance down — in that order. Idempotent.
 func (c *DefaultLitePullConsumer) Shutdown() {
 	c.mu.Lock()
 	if !c.started {
@@ -841,10 +706,6 @@ func (c *DefaultLitePullConsumer) Shutdown() {
 	c.mu.Unlock()
 
 	if autoCommit {
-		// Java shutdown → commitAll: copy the consume cursor into the commit
-		// table for every held queue. The -1 guard matters: a queue Poll never
-		// delivered from must not enter the table (a -1 on the wire would
-		// replay the whole queue from zero after a restart).
 		c.mu.Lock()
 		for _, mq := range assigned {
 			off, ok := c.consumeOffset[mq]
@@ -891,11 +752,7 @@ func (c *DefaultLitePullConsumer) Poll() []*common.MessageExt {
 	return c.PollWithTimeout(timeout)
 }
 
-// PollWithTimeout is Poll with an explicit budget (Java poll(timeout)).
 func (c *DefaultLitePullConsumer) PollWithTimeout(timeoutMillis int64) []*common.MessageExt {
-	// Java poll() opens with maybeAutoCommit BEFORE touching the buffer: the
-	// commit sends an RPC, and holding the buffer lock across it would stall
-	// the enqueue side for the round trip.
 	if c.autoCommitOn() {
 		c.maybeAutoCommit()
 	}
@@ -942,10 +799,6 @@ func (c *DefaultLitePullConsumer) tryDrain() []*common.MessageExt {
 	return out
 }
 
-// advanceConsumeOffset moves the CONSUME cursor past every delivered message.
-// Only queues that are CURRENTLY assigned AND already pulled count (Java's
-// updateConsumeOffset no-ops when the MessageQueueState is gone — a message
-// whose queue was revoked mid-flight must not resurrect an offset).
 func (c *DefaultLitePullConsumer) advanceConsumeOffset(msgs []*common.MessageExt) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1007,11 +860,6 @@ func (c *DefaultLitePullConsumer) PendingCommitOf(mq common.MessageQueue) int64 
 
 // ---------------------------------------------------------------- seek / cursors
 
-// Seek pins the cursors at offset and drops buffered messages of this queue
-// that sit below it (Java: seekOffset then the next pull's nextPullOffset
-// writes it through; the port writes all three cells at once — same effect,
-// no window where a replayed message would be skipped by the committed
-// offset).
 func (c *DefaultLitePullConsumer) Seek(mq common.MessageQueue, offset int64) {
 	c.mu.Lock()
 	c.seekOffset[mq] = offset
@@ -1096,14 +944,6 @@ func (c *DefaultLitePullConsumer) OffsetForTimestamp(mq common.MessageQueue, tim
 
 // FetchMessageQueues lists the topic's queues from the SUBSCRIBE info (read
 // queues, no master filtering — the set a caller Assigns from).
-//
-// Java DefaultLitePullConsumerImpl.fetchMessageQueues:1224 →
-// MQAdminImpl.fetchSubscribeMessageQueues:169-183 does two things this port must
-// keep: it asks the NAME SERVER for the route every single call (:171, it does
-// not read the 30s-polled cache), and it raises when the answer carries no
-// queue (:177 "Can not find Message Queue for this topic"). The second one is
-// what keeps the queue-change listener honest: an unanswered query is "no
-// information", not "the topic shrank to zero queues".
 func (c *DefaultLitePullConsumer) FetchMessageQueues(topic string) ([]common.MessageQueue, error) {
 	instance, err := c.requireInstance()
 	if err != nil {
@@ -1134,9 +974,6 @@ func (c *DefaultLitePullConsumer) requireInstance() (*Instance, error) {
 
 // ---------------------------------------------------------------- commit
 
-// Commit submits every assigned queue's CONSUME cursor (Java commitAll).
-// Committing from the pull cursor here is the classic lite-pull data-loss bug:
-// buffered-but-undelivered messages would be skipped after a restart.
 func (c *DefaultLitePullConsumer) Commit() error {
 	targets := make(map[common.MessageQueue]int64)
 	c.mu.Lock()
@@ -1152,11 +989,6 @@ func (c *DefaultLitePullConsumer) Commit() error {
 	return c.commitTargets(targets, sortedQueueKeys(targets), true)
 }
 
-// CommitOffsets is the caller-specified form (Java
-// commit(Map<MessageQueue, Long>, persist)): ONLY the commit table moves,
-// neither cursor does. An empty map is Java's
-// "MessageQueues is empty, Ignore this commit" — a warn and no table access,
-// so a previously accumulated persist=false value survives.
 func (c *DefaultLitePullConsumer) CommitOffsets(offsets map[common.MessageQueue]int64, persist bool) error {
 	if len(offsets) == 0 {
 		common.LogWarnf("MessageQueues is empty, Ignore this commit ")
@@ -1166,8 +998,6 @@ func (c *DefaultLitePullConsumer) CommitOffsets(offsets map[common.MessageQueue]
 	return c.commitTargets(offsets, scope, persist)
 }
 
-// CommitQueues commits only the named queues, from their current CONSUME
-// cursor. An empty list is a silent no-op (Java commit(List, persist)).
 func (c *DefaultLitePullConsumer) CommitQueues(mqs []common.MessageQueue, persist bool) error {
 	if len(mqs) == 0 {
 		return nil
@@ -1181,24 +1011,14 @@ func (c *DefaultLitePullConsumer) CommitQueues(mqs []common.MessageQueue, persis
 		}
 	}
 	c.mu.Unlock()
-	// Java persistAll over exactly the commit's own keys — see commitTargets.
 	return c.commitTargets(targets, sortedQueueKeys(targets), persist)
 }
 
-// commitTargets is the shared body of the three commit entries: guarded write
-// into the commit table, then (persist) a flush of exactly the commit's own
-// keys. That scope is a SWEEP, not just a filter: Java RemoteBrokerOffsetStore
-// persistAll deletes every table cell OUTSIDE the given set ("offset is not in
-// mqs, remove it"), which is why a persist=false CommitOffsets' accumulated
-// value on an unrelated queue disappears when a later commit(persist=true)
-// does not name it.
 func (c *DefaultLitePullConsumer) commitTargets(targets map[common.MessageQueue]int64,
 	scope []common.MessageQueue, persist bool) error {
 	c.mu.Lock()
 	for mq, off := range targets {
 		if off == -1 {
-			// Java: "consumerOffset is -1" → error log, skip. A -1 on the wire
-			// would replay the whole queue from zero on the next start.
 			common.LogErrorf("consumerOffset is -1 in messageQueue [%s@%s-%d].",
 				c.consumerGroup, mq.Topic, mq.QueueID)
 			continue
@@ -1212,11 +1032,6 @@ func (c *DefaultLitePullConsumer) commitTargets(targets map[common.MessageQueue]
 	return c.persistOffsetTable(scope)
 }
 
-// persistOffsetTable is Java RemoteBrokerOffsetStore#persistAll(Set): every
-// in-scope table cell goes to its broker, and entries OUTSIDE the scope are
-// dropped from the table on the way out ("remove unused mq"). The second half
-// is why a partial Commit(persist=true) must hand in the full queue set — the
-// unsent remainder of the table would be discarded.
 func (c *DefaultLitePullConsumer) persistOffsetTable(scope []common.MessageQueue) error {
 	if len(scope) == 0 {
 		return nil
@@ -1262,10 +1077,6 @@ func (c *DefaultLitePullConsumer) persistOffsetTable(scope []common.MessageQueue
 	return firstErr
 }
 
-// persistOneOffset is Java OffsetStore#persist(mq): one queue's commit-table
-// cell goes to its broker, no cleanup. Rebalance uses it for surrendered
-// queues, BEFORE their table cell is deleted (Java's removeUnnecessaryMessage
-// Queue order: persist(mq) → removeOffset(mq)).
 func (c *DefaultLitePullConsumer) persistOneOffset(mq common.MessageQueue) {
 	c.mu.Lock()
 	off, ok := c.offsetTable[mq]
@@ -1280,9 +1091,6 @@ func (c *DefaultLitePullConsumer) persistOneOffset(mq common.MessageQueue) {
 	}
 }
 
-// maybeAutoCommit is Java maybeAutoCommit: one global deadline, checked (and
-// re-armed) at the top of every Poll. Errors only log — an auto-commit that
-// failed will retry on the next deadline.
 func (c *DefaultLitePullConsumer) maybeAutoCommit() {
 	c.mu.Lock()
 	interval := c.autoCommitIntervalMillis
@@ -1354,9 +1162,6 @@ func (c *DefaultLitePullConsumer) Rebalance() {
 		got := strategy.Allocate(group, clientID, mqAll, cidAll)
 		if reporter, ok := strategy.(AllocateErrReporter); ok {
 			if err := reporter.AllocateErr(); err != nil {
-				// Same rule as the push consumer: a hard strategy failure
-				// aborts the round and keeps the current slice (Java lets the
-				// exception bubble out of the rebalance thread).
 				common.LogErrorf("lite rebalance: allocate failed, strategy=%s group=%s: %v, keep current",
 					strategyName(strategy), group, err)
 				for _, mq := range baseline {
@@ -1373,10 +1178,6 @@ func (c *DefaultLitePullConsumer) Rebalance() {
 		changes = append(changes, topicChange{topic: topic, mqAll: mqAll, divided: got})
 	}
 
-	// Apply the union, dropping revoked queues' cursors with them (Java
-	// removeUnnecessaryMessageQueue = persist(mq) then removeOffset(mq) — the
-	// commit cell must SURVIVE until the persist went out, which is why the
-	// revoked list is collected here and flushed below, outside the lock).
 	var added []common.MessageQueue
 	var revoked []common.MessageQueue
 	var changedTopics []topicChange
@@ -1444,13 +1245,6 @@ func (c *DefaultLitePullConsumer) Rebalance() {
 	}
 }
 
-// resolveOffsetsFor fills the pull cursor for queues that have none: seek pin
-// → broker-committed offset (restart continuity) → CONSUME_FROM_FIRST_OFFSET
-// means 0 (no minOffset RPC — Java's RebalanceLitePullImpl branch is a plain
-// `result = 0L`, and the master-only min lookup would starve a new consumer
-// while the master is down; the broker's OFFSET_ILLEGAL self-heals the rest)
-// → CONSUME_FROM_TIMESTAMP → max offset. Failures only log: the next pull
-// round retries resolution.
 func (c *DefaultLitePullConsumer) resolveOffsetsFor(mqs []common.MessageQueue) {
 	instance, err := c.requireInstance()
 	if err != nil {
@@ -1649,12 +1443,6 @@ func (c *DefaultLitePullConsumer) pullIntervalValue() int64 {
 
 // pullOne runs one short-pull round for one queue. true = something entered
 // the buffer (drives the loop's backoff choice).
-//
-// Cursor discipline (rule 2 in the file header): nextBeginOffset wins after
-// EVERY round — FOUND, NO_NEW_MSG, NO_MATCHED_MSG, OFFSET_ILLEGAL alike —
-// unless a concurrent Seek/Assign moved the cursor while the request was on
-// the wire (the "intact" check folds Java's seekOffset==-1 and isDropped
-// guards into one comparison).
 func (c *DefaultLitePullConsumer) pullOne(mq common.MessageQueue) bool {
 	c.mu.Lock()
 	api := c.pullAPI
@@ -1726,7 +1514,6 @@ func (c *DefaultLitePullConsumer) pullOne(mq common.MessageQueue) bool {
 	}
 	msgs := result.MsgFoundList
 	if namespace != "" {
-		// Java PullTaskImpl's resetTopic: the caller sees un-wrapped topics.
 		for _, m := range msgs {
 			m.Topic = common.WithoutNamespace(m.Topic, namespace)
 		}

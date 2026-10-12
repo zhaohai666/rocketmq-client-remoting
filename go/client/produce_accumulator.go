@@ -1,7 +1,3 @@
-// ProduceAccumulator — auto-batch send, ported from
-// org.apache.rocketmq.client.producer.ProduceAccumulator (Java 5.5.x) via the
-// heavily-commented C# reference RocketMQ.Client/Client/ProduceAccumulator.cs.
-//
 // When a producer enables autoBatch, Send(Message) no longer goes out one by one:
 // messages are accumulated by an AggregateKey (topic + mq + waitStoreMsgOK + tag)
 // into a MessageAccumulation, and only flushed as ONE MessageBatch when this
@@ -9,30 +5,6 @@
 // goroutine wakes waiting senders. The broker returns a comma-separated list of
 // per-message MsgIds which is split back into one SendResult per message — the
 // caller sees exactly what a direct send would have shown.
-//
-// Contract quirks mirrored EXACTLY from the reference (do not "tidy"):
-//  1. AggregateKey = topic + mq + waitStoreMsgOK + tag. A pinned mq never merges
-//     with an unpinned send; a null tag (property absent) is NOT the same as an
-//     empty tag (property present "").
-//  2. TryAddMessage is the global byte gate: currentlyHoldSize < totalHoldSize
-//     admits the message and accounts its body length; the bytes are returned
-//     (ReleaseHold) only once the batch actually sent.
-//  3. canBatch calls TryAddMessage FIRST, THEN the delay/retry checks. A delayed
-//     message is therefore admitted by the gate (bytes counted) and then bounced
-//     to a direct send whose bytes are NEVER released (Java's leak; copied).
-//  4. splitSendResults: a broker MsgId containing ',' is split and the count must
-//     equal the batch size, otherwise it is an illegal result; a MsgId WITHOUT a
-//     comma means every index shares the SAME SendResult instance.
-//  5. Sync Add collects per-message keys; async Add does NOT (Java asymmetry).
-//     Message.Keys is written with a space separator.
-//  6. The guard goroutine runs every max(1, holdMs/2) ms. For sync it wakes
-//     waiting Add goroutines (which re-check ReadyToSend) and removes empty
-//     batches; for async it flushes ready batches then removes the empty ones.
-//
-// Concurrency model: ONE mutex + cond per MessageAccumulation. Every field is
-// guarded by that mutex; there is no second lock and no atomic flag to keep in
-// sync, so the wait loop and the flush cannot deadlock (the flush runs while the
-// mutex is held, exactly like Java's synchronized(this) send()).
 package client
 
 import (
@@ -44,18 +16,12 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// Defaults mirror Java ProduceAccumulator / MessageAccumulation.
 const (
 	DefaultTotalHoldSize int64 = 32 * 1024 * 1024
 	DefaultHoldSize      int64 = 32 * 1024
 	DefaultHoldMs        int64 = 10
 )
 
-// AggregateKey is the batch-merge key. It is a comparable struct used directly
-// as a map key. A pinned queue (Pinned == true) never merges with an unpinned
-// send, and two different pinned mq values never merge because Mq is part of the
-// value. TagNull distinguishes an absent TAGS property (Java null) from an
-// explicitly empty one — a null-tag batch must not carry a TAGS property.
 type AggregateKey struct {
 	Topic          string
 	Mq             common.MessageQueue
@@ -109,8 +75,6 @@ func boolText(b bool) string {
 	return "false"
 }
 
-// MessageAccumulation is one batch of messages pending flush for a single
-// AggregateKey (Java ProduceAccumulator.MessageAccumulation).
 type MessageAccumulation struct {
 	aggregateKey AggregateKey
 	producer     *DefaultMQProducer
@@ -211,9 +175,6 @@ func (b *MessageAccumulation) Add(msg *common.Message) int {
 	return ret
 }
 
-// AddAsync accumulates a message and returns false if the batch was already
-// closed (caller retries). It does NOT collect keys (Java asymmetry). When the
-// batch is immediately ready it is flushed here, on the caller's goroutine.
 func (b *MessageAccumulation) AddAsync(msg *common.Message, cb SendCallback) bool {
 	b.mu.Lock()
 	if b.closed {
@@ -242,11 +203,6 @@ func (b *MessageAccumulation) wakeup() {
 	b.mu.Unlock()
 }
 
-// flushLocked sends the batch synchronously. It MUST be called with b.mu held
-// (either from Add's wait loop or nowhere else for the sync path). Holding mu
-// across the network send is deliberate: it mirrors Java's synchronized(this)
-// send() and keeps concurrent same-key Adds from racing the flush — they simply
-// observe closed==true afterwards and retry with a fresh batch.
 func (b *MessageAccumulation) flushLocked() {
 	if b.closed {
 		return
@@ -268,7 +224,6 @@ func (b *MessageAccumulation) flushLocked() {
 	} else {
 		b.sendResults = results
 	}
-	// Bytes are returned to the global gate here (Java finally).
 	b.owner.releaseHold(size)
 	b.cond.Broadcast()
 }
@@ -358,8 +313,6 @@ func splitBatchResults(sendResult *SendResult, count int) ([]*SendResult, error)
 	return results, nil
 }
 
-// splitKeysInto mirrors Java's msg.getKeys().split(KEY_SEPARATOR) with the
-// trailing-empty discard that Java's String.split(limit=0) does.
 func splitKeysInto(target map[string]struct{}, keys string) {
 	parts := strings.Split(keys, common.KeySeparator)
 	end := len(parts)
@@ -371,8 +324,6 @@ func splitKeysInto(target map[string]struct{}, keys string) {
 	}
 }
 
-// canBatch mirrors Java ProduceAccumulator.canBatch: delayed messages and
-// retry-topic messages cannot be accumulated.
 func canBatch(msg *common.Message) bool {
 	if msg.DelayTimeLevel() > 0 {
 		return false
@@ -411,7 +362,6 @@ type ProduceAccumulator struct {
 	wg      sync.WaitGroup
 }
 
-// NewProduceAccumulator creates an accumulator with the Java defaults.
 func NewProduceAccumulator(instanceName string) *ProduceAccumulator {
 	a := &ProduceAccumulator{
 		instanceName: instanceName,
@@ -423,8 +373,6 @@ func NewProduceAccumulator(instanceName string) *ProduceAccumulator {
 	a.totalHoldSize.Store(DefaultTotalHoldSize)
 	return a
 }
-
-// ---- configuration (validation copied verbatim from Java) ----
 
 func (a *ProduceAccumulator) GetBatchMaxDelayMs() int64 { return a.holdMs.Load() }
 
@@ -446,7 +394,6 @@ func (a *ProduceAccumulator) BatchMaxBytes(holdSize int64) error {
 	return nil
 }
 
-// GetTotalBatchMaxBytes returns holdSize here — Java's own documented slip; copied.
 func (a *ProduceAccumulator) GetTotalBatchMaxBytes() int64 { return a.holdSize.Load() }
 
 func (a *ProduceAccumulator) TotalBatchMaxBytes(totalHoldSize int64) error {
@@ -585,8 +532,6 @@ func (a *ProduceAccumulator) sendSync(key AggregateKey, msg *common.Message, mq 
 	if !a.TryAddMessage(msg) {
 		return producer.sendDirectWithMq(msg, mq, producer.sendMsgTimeout)
 	}
-	// Then canBatch: a delayed/retry message is sent directly, but its bytes
-	// were already counted and are never released (Java's leak; copied).
 	if !canBatch(msg) {
 		return producer.sendDirectWithMq(msg, mq, producer.sendMsgTimeout)
 	}
@@ -628,7 +573,6 @@ func (a *ProduceAccumulator) sendAsync(key AggregateKey, msg *common.Message, mq
 		return
 	}
 	if !canBatch(msg) {
-		// bytes leaked (Java quirk, copied)
 		producer.sendAsyncDirect(msg, mq, callback, producer.sendMsgTimeout)
 		return
 	}

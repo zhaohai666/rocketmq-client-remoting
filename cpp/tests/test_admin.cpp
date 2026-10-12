@@ -1,11 +1,6 @@
 // 管理端单测：fastjson2 非法 JSON 容忍、管理响应体 DTO、TopicConfig /
 // SubscriptionGroupConfig 字段名与默认值、MixAll properties 语义、权限与分组判定、
 // 以及 CreateTopic / QueryMessage 请求头的关键字段。
-//
-// 本文件里的 JSON 夹具全部是 **Java fastjson2 探针的真实输出**（含非法部分），
-// 不是手写理想 JSON —— 这正是本层最容易出错的地方：
-//   {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"t"}:{...}}}
-// 注意里面 map 的键是一个**内联 JSON 对象**，标准 JSON 解析器会直接报错。
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -132,7 +127,6 @@ void testMessageQueueKeyRoundTrip() {
 // ---------------------------------------------------------------- 3. TopicStatsTable / ConsumeStats
 
 void testTopicStatsTableFromRealFixture() {
-    // Java 探针：{"offsetTable":{<MessageQueue>:{"lastUpdateTimestamp":..,"maxOffset":..,"minOffset":..}},"topicPutTps":0.0}
     const char* body =
         "{\"offsetTable\":{"
         "{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"t\"}"
@@ -159,7 +153,6 @@ void testTopicStatsTableFromRealFixture() {
 }
 
 void testConsumeStatsFromRealFixture() {
-    // Java 探针：{"consumeTps":1.5,"offsetTable":{<MessageQueue>:<OffsetWrapper>}}
     const char* body =
         "{\"consumeTps\":0.0,\"offsetTable\":{"
         "{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"t\"}"
@@ -192,7 +185,6 @@ void testResetOffsetBodyUsesMessageQueueKeys() {
 // ---------------------------------------------------------------- 4. TopicConfig
 
 void testTopicConfigDefaultsAndAttributes() {
-    // Java: new TopicConfig("t") -> 16/16/6/SINGLE_TAG/0/false/{}，且 attributes 会被序列化
     TopicConfig c("t");
     CHECK_EQ(c.readQueueNums, 16, "TopicConfig 默认 readQueueNums=16");
     CHECK_EQ(c.writeQueueNums, 16, "TopicConfig 默认 writeQueueNums=16");
@@ -204,7 +196,6 @@ void testTopicConfigDefaultsAndAttributes() {
     CHECK(v.find("attributes") != nullptr, "TopicConfig 序列化必须带 attributes（即使为空）");
     CHECK(v.find("topicFilterType") != nullptr, "TopicConfig 序列化必须带 topicFilterType");
 
-    // Java 探针：{"attributes":{},"order":false,"perm":4,"readQueueNums":4,...}
     const char* probe =
         "{\"attributes\":{},\"order\":false,\"perm\":4,\"readQueueNums\":4,"
         "\"topicFilterType\":\"SINGLE_TAG\",\"topicName\":\"t\",\"topicSysFlag\":0,"
@@ -232,7 +223,6 @@ void testTopicConfigDefaultsAndAttributes() {
 // ---------------------------------------------------------------- 5. SubscriptionGroupConfig
 
 void testSubscriptionGroupConfigProbeFixture() {
-    // Java 探针：JSON.toJSONString(new SubscriptionGroupConfig("MyGroup"))
     const char* probe =
         "{\"attributes\":{},\"brokerId\":0,\"consumeBroadcastEnable\":true,"
         "\"consumeEnable\":true,\"consumeFromMinEnable\":true,\"consumeMessageOrderly\":false,"
@@ -252,7 +242,6 @@ void testSubscriptionGroupConfigProbeFixture() {
     CHECK_EQ(cfg.groupRetryPolicy.type, std::string("CUSTOMIZED"), "groupRetryPolicy.type");
     CHECK_EQ(cfg.hasSubscriptionDataSet, false, "subscriptionDataSet 为 null 时不出现");
 
-    // 默认构造也应与 Java 默认值一致
     SubscriptionGroupConfig def("g");
     CHECK_EQ(def.retryMaxTimes, 16, "默认 retryMaxTimes=16");
     CHECK_EQ(def.consumeEnable, true, "默认 consumeEnable=true");
@@ -375,8 +364,6 @@ void testPublicBodies() {
           "GetConsumerListByGroup decode");
     CHECK_EQ(g.consumerIdList.size(), static_cast<size_t>(2), "consumerIdList 2 项");
 
-    // ConsumeStatsList：JSON 键必须是 Java 字段名 consumeStatsList（早期实现写成
-    // statsList，真机 341 响应会被解析成空集合，看着像 broker 没有积压）
     ConsumeStatsList sl;
     CHECK(ConsumeStatsList::decode(
               std::string("{\"consumeStatsList\":[{\"G_BROKER\":\"x\"}],"
@@ -445,7 +432,6 @@ void testTopicConfigPropertiesWireSemantics() {
 // ---------------------------------------------------------------- 8. 权限 / 分组判定
 
 void testPermAndGroupHelpers() {
-    // Java PermName.isValid：0 <= perm < PERM_PRIORITY(8)
     CHECK(PermName::isValid(0), "isValid(0)");
     CHECK(PermName::isValid(7), "isValid(7)");
     CHECK(!PermName::isValid(8), "isValid(8) 非法");
@@ -494,7 +480,6 @@ void testCreateTopicRequestHeaderSendsTopicFilterType() {
     CHECK_EQ(ext["force"], std::string("false"), "force 必须是小写 false（Java Boolean.toString）");
     CHECK(ext.count("topic") == 1 && ext.count("perm") == 1, "topic/perm 一并下发");
 
-    // 未设置的字段不应出现（Java "非空才写" 语义）
     CreateTopicRequestHeader minimal;
     minimal.topic = "t";
     PropertyMap ext2 = minimal.toExtFields();
@@ -521,8 +506,6 @@ void testQueryMessageRequestHeaderIndexType() {
 }
 
 void testSearchOffsetRequestHeaderBoundaryType() {
-    // Java DefaultMQAdminExt:133/:137 —— 入网文本是 Enum.toString() 的大写枚举名，
-    // 未设置时整键不写（@CFNullable），回解走 BoundaryType.getType 的宽松语义。
     SearchOffsetRequestHeader h;
     h.topic = "t";
     h.queueId = 2;
@@ -554,7 +537,6 @@ void testSearchOffsetRequestHeaderBoundaryType() {
     CHECK(!empty.boundaryType.has_value(), "缺键回 nullopt");
 }
 
-// 对应 Java MixAll.brokerVIPChannel：端口 - 2；关着/端口不可解析时原样返回。
 void testBrokerVipChannel() {
     CHECK(MixAll::brokerVipChannel(false, "127.0.0.1:10911") == "127.0.0.1:10911",
           "isChange=false 原样返回");
@@ -566,7 +548,6 @@ void testBrokerVipChannel() {
     CHECK(MixAll::brokerVipChannel(true, "10.0.0.1:8899") == "10.0.0.1:8897", "8899 ⇒ 8897");
 }
 
-// 对应 Java org.apache.rocketmq.remoting.admin.track.TrackType 的枚举名集合。
 void testTrackTypeNamesMatchProtocol() {
     CHECK(std::string(trackTypeName(TrackType::CONSUMED)) == "CONSUMED", "CONSUMED");
     CHECK(std::string(trackTypeName(TrackType::CONSUMED_BUT_FILTERED)) == "CONSUMED_BUT_FILTERED",
@@ -583,7 +564,6 @@ void testTrackTypeNamesMatchProtocol() {
           "MessageTrack 默认 UNKNOWN、无异常描述");
 }
 
-// 对应 Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）。
 void testAdminVipChannelKnobDefaultsOff() {
     DefaultMQAdminExt admin;
     CHECK(!admin.isVipChannelEnabled(), "默认 false");

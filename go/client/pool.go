@@ -8,19 +8,8 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// errPoolRejected is Java RejectedExecutionException. Every RocketMQ client
-// pool is a ThreadPoolExecutor with a BOUNDED LinkedBlockingQueue, so a busy
-// client rejects instead of growing without limit — and the three callers each
-// react differently (see their doc comments): the async sender either runs the
-// task inline or fails the send with "executor rejected", while the callback
-// executor falls back to running in the calling goroutine.
 var errPoolRejected = common.ClientError("executor rejected")
 
-// boundedPool is the ThreadPoolExecutor shape the RocketMQ client pools rely
-// on: a fixed worker count plus a bounded queue, with rejection once the queue
-// is full. Go needs no core/max distinction — the Java pools all pass
-// core == max, which is exactly "N workers, extra tasks wait".
-//
 // Unlike ThreadPoolExecutor this pool does NOT block on submit: Submit is the
 // non-blocking `offer()` branch, so a full queue is reported immediately. That
 // is what makes it usable as a back-pressure signal.
@@ -90,19 +79,12 @@ func (p *boundedPool) Submit(task func()) error {
 	}
 }
 
-// SubmitOrRunInline enqueues, running the task in the CALLER's goroutine when
-// the queue is full. Java's async-send path does exactly this once back
-// pressure is enabled (DefaultMQProducerImpl:675-681): the permits were already
-// taken, so the send must run somewhere or the capacity leaks until timeout.
 func (p *boundedPool) SubmitOrRunInline(task func()) {
 	if err := p.Submit(task); err != nil {
 		task()
 	}
 }
 
-// QueueCapacity reports the bounded queue size (Java getQueue().remainingCapacity()
-// + size, i.e. the fixed capacity). Used by tests and by callers that want to
-// size their own buffers.
 func (p *boundedPool) QueueCapacity() int { return cap(p.tasks) }
 
 // Shutdown stops accepting new tasks and lets the already-queued ones finish,

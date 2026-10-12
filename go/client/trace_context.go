@@ -1,8 +1,3 @@
-// W3C Trace Context (traceparent) propagation — the message-level context used
-// by OpenTracing/OpenTelemetry integrations (Java leaves this to a
-// SkyWalking/OTel SendMessageHook; the Python and Rust ports build the
-// equivalent in, and so does this one).
-//
 //	traceparent: 00-<trace-id 32hex>-<parent-id 16hex>-<flags 2hex>
 //
 // Rules that matter:

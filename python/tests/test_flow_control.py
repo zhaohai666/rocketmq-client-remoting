@@ -1,5 +1,3 @@
-# 拉取前流控判定（Java ProcessQueue 五个阈值）单测 —— 不需要集群。
-#
 # 为什么必须离线锁死：五条闸门里只有**条数**那条会在"消息小、拉得快"的场景先命中，
 # 其余四条判错方向是**静默**的：
 #   - 队列级字节闸门失效 ⇒ 大消息把已拉未消费的堆撑爆（真机表现为 OOM/RT 飙升，无异常）；
@@ -83,7 +81,6 @@ def test_count_gate_fires_at_threshold_and_treats_zero_as_one():
     _stage(c, mq, _n_sized(TOPIC, 100, 3))
     assert _hit(c, mq)
     assert c._flow_control_triggered == 1
-    # Java 的 Math.max(1, n) 守卫：配 0 不是"全放行"，而是"1 条就停"
     c.pull_threshold_for_queue = 0
     _stage(c, mq, _n_sized(TOPIC, 100, 1))
     assert _hit(c, mq), "pull_threshold_for_queue=0 要按 1 条算（Java 的 max(1,n) 守卫）"
@@ -113,7 +110,6 @@ def test_span_gate_is_strictly_greater_and_measures_real_span():
     c.consume_concurrently_max_span = 10
     _stage(c, mq, [_sized(TOPIC, 1, 0), _sized(TOPIC, 1, 100)])
     assert _hit(c, mq)
-    # **严格大于**：跨度正好等于阈值不算（Java 同）
     c.consume_concurrently_max_span = 100
     assert not _hit(c, mq), "跨度 100 不严格大于 100，不该命中"
     # 乱序缓冲也要量出真实跨度（min/max 而不是首尾差）

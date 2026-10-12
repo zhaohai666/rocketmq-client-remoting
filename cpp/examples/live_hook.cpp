@@ -148,7 +148,6 @@ private:
     std::string onlyTopic_;
 };
 
-// 摘掉 body 以 prefix 开头的消息（msgList 可变，见 Java FilterMessageContext）
 class DropHook : public FilterMessageHook {
 public:
     explicit DropHook(const std::string& prefix) : prefix_(prefix) {}

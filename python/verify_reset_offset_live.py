@@ -1,34 +1,4 @@
 # -*- coding: utf-8 -*-
-"""220 RESET_CONSUMER_CLIENT_OFFSET（Java ``MQClientInstance.resetOffset:1403-1450``）真机验证。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_reset_offset_live.py 127.0.0.1:9876
-
-220 是 broker 推给**消费端**的重置指令，管理端那笔 INVOKE_BROKER_TO_RESET_OFFSET(222)
-的响应只是一张"每个队列重置到哪"的表；真正让消费端改位点的是 broker 随后 oneway 推的
-220（``Broker2Client.resetOffset:181-238``）。而 broker 只在
-``useServerSideResetOffset=false`` 时才走这条推送路径（默认 true 在
-``AdminBrokerProcessor:2255-2263`` 直接服务端改位点、一台消费端都不通知），所以本验证
-先把该开关热改成 false（回读确认），跑完还原。
-
-离线单测（``tests/test_reset_offset_handler.py``）锁死了请求体两种形状与"撤队列 +
-代号 +1 + 新位点经撤销尾巴落盘"的本地状态；下面这些事只有真集群能证明：
-
-  S1 「回退重置立刻生效 + 在途批次作废」——位点从 10 往回重置到 3。三段判据：
-      a) broker 上的已提交位点在 ~2s 内变成 3：**只有**重置路径那次 persist 会写它
-         （周期落盘已拉长到 60s），只写内存表的实现在这里原地不动（broker 停在 10）。
-      b) listener 里卡着的旧批次（重置前取回的 offset 10）放行后，它的 ack 必须整批作废
-         —— 采样点：放行旧批次、新队列的**第一批**已进 listener 且还没 ack 时，本地已消费
-         位点必须还是"没有记录/≤3"；没有代号闸门的实现这时会跳到 11。
-      c) 队列被真正重建：3..14 每一批都**重投一次**（旧缓冲里没 ack 的 11..14 也随之
-         作废，只能作为重投的一部分出现），放行一轮断言一轮。
-
-  S2 「前跳 + 恢复」——timestamp=-1 重置到 maxOffset：位点直接跳到 10，中间 4..9 一条都不
-      投；随后新消息照常消费、位点继续前进。
-
-为什么不把时序判断塞进离线单测：这里每一步都依赖真 broker 的推送与 offset 表，而"重置
-生效"的失败模式在真机上只表现为"位点没动、消息照旧不重投"，admin 侧完全看不出异常。
-"""
 from __future__ import annotations
 
 import sys
@@ -167,11 +137,7 @@ def consumer_key(c: DefaultMQPushConsumer, topic: str):
 
 
 def local_offset(c: DefaultMQPushConsumer, topic: str):
-    """本端口内存里的「已消费位点」；返回 None = 该队列在表里没有记录。
-
-    220 的重置语义（Java removeOffset）就是"重置后表里没有旧位点"，所以 None 与 0 必须
-    能分开：只有 None 才能证明旧批次的 ack 没有把位点推回去。
-    """
+    pass
     status = c.get_consumer_status(topic)
     for mq, off in status.items():
         if mq.queue_id == 0:
@@ -269,8 +235,6 @@ def s1_backward_reset(setup: MQClientInstance, admin: DefaultMQAdminExt,
         c.shutdown()
         return
 
-    # 等周期落盘的**首跳**过去（Java initialDelay＝start 后 10s，之后才是 60s 周期）。
-    # 不等它，重置后那次 persist 会与首跳混在一起，"broker 位点之所以是 3" 就说不清。
     wait_until(lambda: time.time() - t_start > 12, 15, 0.5)
     check("S1-首跳周期落盘已过（此后 60s 内不再有周期写）",
           time.time() - t_start > 12 and broker_is(MSGS),

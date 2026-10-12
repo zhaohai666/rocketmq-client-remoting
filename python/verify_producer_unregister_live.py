@@ -1,39 +1,4 @@
 # -*- coding: utf-8 -*-
-"""生产者退出时真的发了 ``UNREGISTER_CLIENT``(35) —— 真机验证。
-
-Java 的 ``DefaultMQProducerImpl.shutdown():313`` 会调 ``mQClientFactory.unregisterProducer(group)``
-（``MQClientInstance:1198-1201``），后者进私有的 ``unregisterClient(group, null)``
-（``:1158-1182``）：给 ``brokerAddrTable`` 里**每台 broker（含 slave）**同步发一发 code 35，
-超时 ``getMqClientApiTimeout()``（3000ms），任何异常只 ``log.warn``。
-``MQClientAPIImpl.unregisterClient:1615-1639`` 组的头是
-``UnregisterClientRequestHeader{clientID, producerGroup, consumerGroup}`` —— 注意键名是大写 ID 的
-``clientID``，生产者退出时 ``consumerGroup`` 是 null（不上线）。
-
-本脚本证的是**线上真的走了这一发**，四件事：
-
-  U1  生产者起来并真的发了消息（组注册的前置条件）。
-  U2  broker 侧 204 ``GET_PRODUCER_CONNECTION_LIST`` 能看到本 clientId —— 注册确实发生过，
-      不是「一直就没有所以消失也说明不了什么」。注册靠心跳上线（30s 一轮），所以要轮询等。
-  U3  ``shutdown()`` 期间钩子抓到 code 35：``clientID`` 是自己的、``producerGroup`` 是本组、
-      ``consumerGroup`` 不存在（Java 传 null），并且**每台已知 broker 各一发**。
-  U4  每一发 35 都拿到 SUCCESS：说明它走的是**还开着的**那条长连接（broker 的
-      ``ClientManageProcessor.unregisterClient:213-249`` 只摘除「这条 frame 到达的那条 channel」，
-      连接都断了就不可能回 SUCCESS）。
-  U5  紧接着查 204：这个组已经不在了（broker 回 SYSTEM_ERROR
-      ``the producer group[...] not exist``，Java 的 ``mqadmin`` 也是这么判的）。
-  U6  对照组：另一个**没退出**的生产者组仍能被 204 看见 —— 排除「broker 把所有连接都清了」
-      这种假阳性。
-
-⚠ 关于「这一发 35 到底有没有用」的判据强度：Python/C++/C# 三套实现里每个生产者各自持有一份
-``MQClientInstance``（各自一条 TCP 连接），所以退出时连接也会关掉，broker 的通道扫描同样会把
-组摘掉 —— 单看 U5 分不出是 35 的功劳还是断连的功劳。U3/U4 是直接证据（抓帧），而**行为级**的
-判别式证明在 ``rust/examples/live_producer.rs`` 的 P11：Rust 按 clientId 复用实例，两个同
-instanceName、不同组的生产者共用一条连接，先退的那个连接还活着，组能消失只可能是因为 35。
-
-前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
-
-用法：.venv/bin/python verify_producer_unregister_live.py [127.0.0.1:9876]
-"""
 from __future__ import annotations
 
 import os
@@ -86,8 +51,6 @@ class UnregisterProbe(RPCHook):
     def do_before_request(self, remote_addr: str, request: RemotingCommand) -> None:
         ext = dict(request.ext_fields or {})
         if not ext and request.custom_header is not None:
-            # 头还挂在 custom_header 上，编码时才摊进 extFields（Java `headerEncode` 同一步）；
-            # 这里只取快照，不改 request。
             ext = dict(request.custom_header.to_ext_fields() or {})
         with self.lock:
             self.codes.append(request.code)
@@ -195,7 +158,6 @@ def main():
         for addr, ext in requests:
             if ext.get("clientID") != client_id or ext.get("producerGroup") != group:
                 shape_ok = False
-            # Java 的 unregisterClient(group, null)：消费者槽位不上线
             if ext.get("consumerGroup"):
                 shape_ok = False
             if addr not in all_addrs:

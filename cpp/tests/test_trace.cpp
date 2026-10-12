@@ -1,10 +1,3 @@
-// 消息轨迹单测（对齐 python/tests/test_trace.py 的 Java 对拍向量 + client.trace 语义）。
-//
-// 最有价值的是第一组：EXPECTED_* 的字段序列与 Java 官方
-// TraceDataEncoder.encoderFromContextBean 的输出**逐字节一致**（SOH=\x01 / STX=\x02），
-// 字段序列一旦改动就与 Java 客户端 / 控制台不兼容。向量的来源见
-// python/tests/test_trace.py 头注释（Java 探针 /tmp/TraceParity.java）。
-//
 // 另外两组是**真机踩出来的回归守卫**，勿删：
 //   * 无 keys 的 SubBefore（末段为空）解出来只剩 7 段，必须能解出而不是被跳过/越界；
 //   * 一条坏记录不能毁掉整条 trace data（真机表现：2 条轨迹消息只解出 1 条记录）。
@@ -85,7 +78,6 @@ const char* MSG_ID_1 = "AC1400A1F0A018B4AAC2A1B2C3D4E5F6";
 const char* MSG_ID_2 = "AC1400A1F0A018B4AAC2A1B2C3D4E5F7";
 const char* OFFSET_MSG_ID = "AC1400A1000027100000000000000001";
 
-// ---- Java 官方实现的编码结果（勿手改；改了就与 Java/控制台不兼容）----
 std::string expectedPub() {
     return joinFields({"Pub", "1700000000000", "DefaultRegion", "GID_test", "TopicTest", MSG_ID_1,
                        "TagA", "KeyA KeyB", "127.0.0.1:10911", "42", "7", "0", OFFSET_MSG_ID,
@@ -166,7 +158,6 @@ protected:
 }  // namespace
 
 int main() {
-    // ================================================= 1. 编码：与 Java 逐字节一致
     {
         TraceContext ctx;
         ctx.traceType = TraceType::PUB;
@@ -220,7 +211,6 @@ int main() {
                "sub_after: matches java vector");
     }
     {
-        // CLOUD 通道不追加 timestamp + groupName 两段（Java TraceDataEncoder:208）
         TraceContext ctx;
         ctx.traceType = TraceType::SUB_AFTER;
         ctx.timeStamp = 1700000000000;
@@ -275,7 +265,6 @@ int main() {
         expectInt(static_cast<long long>(ctx.requestId.size()), 32, "context: requestId length");
     }
 
-    // ================================================= 2. javaSplit（Java String.split 语义）
     {
         auto parts = TraceDataEncoder::javaSplit("a" + STX, STX);
         expect(parts.size() == 1 && parts[0] == "a", "javaSplit: trailing empty dropped");
@@ -362,9 +351,6 @@ int main() {
 
     // ================================================= 4. 回归守卫：无 keys 的 SubBefore
     {
-        // 被消费的消息没有 keys 时，SubBefore 的末段（keys）为空 → Java String.split
-        // 连末尾 CONTENT_SPLITOR 一起丢弃 → 只剩 7 段。Java 原生实现会 AIOOBE，
-        // 我们必须解成 keys=""，绝不能按"段数不足"跳过或越界。
         std::string raw = joinFields({"SubBefore", "1700000000000", "DefaultRegion",
                                       "GID_trace_live", "REQ-001", MSG_ID_1, "0", ""}) + STX;
         auto records = TraceDataEncoder::decoderFromTraceDataString(raw);
@@ -437,7 +423,6 @@ int main() {
         expectInt(static_cast<long long>(d.sent.size()), 2, "dispatcher: different topics -> 2 msgs");
     }
     {
-        // 空 region / 空 bean 的上下文直接跳过（Java sendTraceData 的 continue）
         CapturingDispatcher d("G", TraceDispatcherType::PRODUCE, 20, "");
         auto noRegion = pubContext("T", MSG_ID_1, "K");
         noRegion->regionId.clear();
@@ -450,7 +435,6 @@ int main() {
         expectInt(static_cast<long long>(d.sent.size()), 0, "dispatcher: empty region/beans skipped");
     }
     {
-        // 自定义 traceTopic（对应 Java setTraceTopic）
         CapturingDispatcher d("G", TraceDispatcherType::PRODUCE, 10, "MY_TRACE_TOPIC");
         expect(d.getTraceTopicName() == "MY_TRACE_TOPIC", "dispatcher: custom trace topic name");
         d.append(pubContext("T", MSG_ID_1, "K"));
@@ -461,7 +445,6 @@ int main() {
         }
     }
     {
-        // CLOUD 通道 -> 轨迹 topic 变成 rmq_sys_TRACE_DATA_<region>（Java TRACE_TOPIC_PREFIX）
         CapturingDispatcher d("G", TraceDispatcherType::PRODUCE, 10, "");
         auto ctx = pubContext("T", MSG_ID_1, "K");
         ctx->accessChannel = AccessChannel::CLOUD;

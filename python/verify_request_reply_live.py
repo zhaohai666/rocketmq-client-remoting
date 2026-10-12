@@ -1,47 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Request-Reply（5.x）真机验证。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_request_reply_live.py 127.0.0.1:9876
-
-链路（三侧 C++/C#/Python 同一套场景）：
-
-    请求方 producer.request(msg, timeout)               应答方 push consumer
-    ────────────────────────────────────              ─────────────────────
-    CORRELATION_ID = uuid
-    REPLY_TO_CLIENT = <本客户端 clientId>          ──► 收到请求消息（broker 已写 CLUSTER）
-    TTL = timeout                                      create_reply_message(request_msg, body)
-                                                         → topic = <CLUSTER>_REPLY_TOPIC
-                                                         → MSG_TYPE = "reply"
-    ◄── PUSH_REPLY_MESSAGE_TO_CLIENT(326) ─────────       producer.send(reply) → 325
-        由 broker 按 REPLY_TO_CLIENT 找到请求方连接推回
-
-场景：
-  S1 只建请求 topic；断言客户端 **不能** 建 <cluster>_REPLY_TOPIC（broker 的系统 topic），
-     并确认请求方已心跳注册（REPLY_TO_CLIENT 要靠它反查 channel）
-  S2 请求消息确实带上了 CORRELATION_ID / REPLY_TO_CLIENT / TTL 三个属性
-  S3 request() 拿回应答：body 正确、topic 是 <cluster>_REPLY_TOPIC、带 REPLY_MESSAGE_ARRIVE_TIME
-  S4 应答确实走了 SEND_REPLY_MESSAGE_V2(325)：第三个客户端订阅 <cluster>_REPLY_TOPIC 能看到该消息
-     （broker 的 storeReplyMessageEnable 默认 true，应答会落盘 → 可被独立订阅证明）
-  S5 无应答方时 request() 在 timeout 附近抛 RequestTimeoutException（而不是卡死/静默返回），
-     并且带上 Java 的 10006 ``REQUEST_TIMEOUT_EXCEPTION`` —— 只有类型没有码不够：调用方按
-     ``response_code`` 分流时，"消息已发出去、只是没等到应答"和别的客户端故障是两类处置
-  S6 并发 3 个 request：每个拿到的都是自己的应答（CORRELATION_ID 不串台）
-  S7 应答方（消费者）本身是普通 push 消费者：Reply 流量不影响后续普通消费
-  S8 CLUSTER 属性由 broker 在存储时写入（``SendMessageProcessor``）：投递到的消息有、
-     客户端手里那份没有 —— 这正是 ``MessageUtil.createReplyMessage`` 存在意义；用错对象
-     （拿本地那份发请求）必须撞上带 10007 ``CREATE_REPLY_MESSAGE_EXCEPTION`` 的
-     MQClientException，文案点到缺失的 CLUSTER，而不是裸 ValueError
-
-⚠ 两个真机必踩点：
-   1) <cluster>_REPLY_TOPIC 是 broker 启动时注册的**系统 topic**
-      （TopicConfigManager.init() → addSystemTopic），客户端 create_topic 它会被
-      INVALID_PARAMETER(29)「conflict with system topic」拒绝，且 broker 侧**不留日志**。
-      不要去"预建"它 —— 路由本来就在。
-   2) 消费者一律用 CONSUME_FROM_FIRST_OFFSET，避免默认 CONSUME_FROM_LAST_OFFSET 带来的
-      时序敏感（见项目 MEMORY 里的第 8 条硬性约定）。
-"""
 from __future__ import annotations
 
 import sys
@@ -106,12 +64,7 @@ def broker_error(exc: BaseException):
 
 
 def new_producer(group: str, instance: str) -> DefaultMQProducer:
-    """instance_name 必须各不相同。
-
-    clientId 对齐 Java ``ClientConfig#buildMQClientId`` = ``<本机IP>@<instanceName>``
-    （没有秒级时间戳兜底），所以同一台机器上只有 instanceName 不同才能保证 clientId 不同；
-    而 REPLY_TO_CLIENT 用的就是 clientId，撞名会让 broker 把应答推到错误的那条连接上。
-    """
+    pass
     p = DefaultMQProducer(group)
     p.set_namesrv_addr(NAMESRV)
     p.set_instance_name(instance)
@@ -142,11 +95,7 @@ def wait_for(pred, timeout_s: float) -> bool:
 
 
 class Replier:
-    """应答方：普通 push 消费者 + 用来发应答的生产者。
-
-    这就是 Java 文档里 Request-Reply 的标准写法：消费者收到请求后
-    ``MessageUtil.createReplyMessage`` + ``producer.send(reply)``。
-    """
+    pass
 
     def __init__(self) -> None:
         self.received: list = []          # (body, correlation_id, reply_to, ttl)
@@ -283,9 +232,6 @@ def main() -> int:
         check("S5 抛的是 RequestTimeoutException（不是静默返回/别的异常）",
               isinstance(raised, RequestTimeoutException),
               "raised=%s: %s" % (type(raised).__name__, raised))
-        # 只有类型不够：Java 的 waitResponse 抛的是 RequestTimeoutException(10006, ...)，
-        # 调用方按 response_code 分流时才知道"消息已发出去、只是没等到应答"（对方可能只是慢），
-        # 这跟"发送本身失败"是两类处置。
         check("S5 异常带上 Java 的 10006 REQUEST_TIMEOUT_EXCEPTION",
               getattr(raised, "response_code", None) == ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION,
               "code=%s" % getattr(raised, "response_code", None))
@@ -326,12 +272,6 @@ def main() -> int:
         check("S7 后续普通消息仍被消费", ok,
               "received=%s" % [b for b, _, _, _ in replier.received])
 
-        # ---------------- S8 CLUSTER 属性来自 broker；拿不到时是 10007 ----------------
-        # Java ``MessageUtil.createReplyMessage``（:46/49）抛的是
-        # ``MQClientException(ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION=10007, ...)``。
-        # 这一条既要验"错误码带上了"，也要验它**为什么**存在：CLUSTER 是 broker 在存储时
-        # 补的（``SendMessageProcessor``），客户端手里那份消息永远没有 —— 所以应答必须
-        # 建立在**投递到的**那条消息上，用错对象就会撞上 10007。
         print("\nS8 CLUSTER 由 broker 写入；造不出应答时报 10007 而不是别的错")
         delivered = None
         with replier.lock:

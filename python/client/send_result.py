@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""发送结果（对应 org.apache.rocketmq.client.producer.SendResult / SendStatus）。"""
 from __future__ import annotations
 
 from enum import Enum
@@ -34,11 +33,7 @@ class SendResult:
         self.transaction_id = transaction_id
         self.offset_msg_id = offset_msg_id
         self.region_id = region_id
-        # 轨迹开关：来自 SEND 响应头的 TRACE_ON（broker 默认 true）。
-        # Java 的判据是「extFields.get("TRACE_ON") != "false"」，所以默认 True。
         self.trace_on: bool = True
-        # 对应 Java SendResult.recallHandle：只有定时/延迟消息才非 None，
-        # 是 broker 发的撤回句柄，原样传给 producer.recall_message() 才能撤回。
         self.recall_handle: Optional[str] = None
 
     def get_recall_handle(self) -> Optional[str]:

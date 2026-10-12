@@ -1,13 +1,4 @@
 # -*- coding: utf-8 -*-
-"""客户端日志配置回归守卫。
-
-核心是**文件名不能和 Java 客户端撞车**：Java 的客户端日志是 ``rocketmq_client.log``
-（logback 按大小 64MB 滚动 + gzip 到 other_days/），Python 侧是 TimedRotatingFileHandler
-按天重命名。同机同时跑两套客户端时若落同一文件：轻则互相插行，重则 Python 在午夜把文件改走，
-JVM 仍持有旧 fd，后续 Java 日志写进已 unlink 的 inode 而静默消失。
-
-所以断言默认文件名**不等于** ``rocketmq_client.log``，并断言环境变量仍可覆盖。
-"""
 from __future__ import annotations
 
 import importlib
@@ -45,7 +36,6 @@ def test_default_filename_does_not_collide_with_the_shared_log(monkeypatch):
 
 def test_default_filename_env_override(monkeypatch):
     rl = _reload(monkeypatch, {"ROCKETMQ_CLIENT_LOG_FILE": SHARED_ROCKETMQ_CLIENT_LOG})
-    # 显式要求与 Java 一致时必须生效（向后兼容：老用户就是靠这个变量改名的）
     assert rl._LOG_FILE == SHARED_ROCKETMQ_CLIENT_LOG
 
 

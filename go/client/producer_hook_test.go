@@ -320,9 +320,6 @@ func TestCheckForbiddenHookContextFields(t *testing.T) {
 		t.Fatalf("interceptor ran %d times, want 1", hook.count())
 	}
 	ctx := hook.last()
-	// The group is namespaced by Start() — Java DefaultMQProducer.start:375
-	// does setProducerGroup(withNamespace(producerGroup)) — so the interceptor
-	// sees the prefixed name, not the one the caller passed to the constructor.
 	if ctx.ProducerGroup != "ns-hook%GID_hook_forbid_ctx" {
 		t.Errorf("group = %q, want the namespaced group", ctx.ProducerGroup)
 	}
@@ -341,12 +338,9 @@ func TestCheckForbiddenHookContextFields(t *testing.T) {
 	if ctx.Message != msg {
 		t.Error("the context must carry the message being sent")
 	}
-	// The topic has been namespaced in place by the time the interceptor runs
-	// (Java compresses and namespaces first, then calls the hook).
 	if ctx.MQ.Topic != "ns-hook%"+topic {
 		t.Errorf("mq topic = %q, want the namespaced topic", ctx.MQ.Topic)
 	}
-	// Java never populates arg on this context; our port mirrors that.
 	if ctx.Arg != nil {
 		t.Errorf("arg = %v, want nil (Java sends none)", ctx.Arg)
 	}
@@ -460,12 +454,6 @@ func TestEndTransactionHookOnCallerPath(t *testing.T) {
 	if ctx.ProducerGroup != group {
 		t.Errorf("producerGroup = %q", ctx.ProducerGroup)
 	}
-	// Java's doExecuteEndTransactionHook takes transactionId from the MESSAGE
-	// (msg.getTransactionId()), not from the send result — and
-	// sendMessageInTransaction has just overwritten that field with the
-	// message's UNIQ_KEY. So the context sees the uniq id, while the broker
-	// response's own transactionId survives only as the __transactionId__
-	// property. Asserting against SendResult.TransactionID would be wrong.
 	if ctx.TransactionID == "" || ctx.TransactionID != msg.TransactionID {
 		t.Errorf("transactionId = %q, want the message's %q", ctx.TransactionID, msg.TransactionID)
 	}
@@ -520,16 +508,9 @@ func TestEndTransactionHookOnCheckBackPath(t *testing.T) {
 	if check.TransactionState != RollbackMessage {
 		t.Errorf("state = %s, want ROLLBACK", check.TransactionState)
 	}
-	// Java uses the message's UNIQ_KEY here, not its msgId.
 	if check.MsgID != "UNIQ-HOOK-1" {
 		t.Errorf("msgId = %q, want the UNIQ_KEY", check.MsgID)
 	}
-	// The context's transactionId comes from the decoded MESSAGE, and neither
-	// Java's MessageDecoder nor this port encodes a transactionId into the
-	// message body — so on the check-back path it is legitimately empty. The
-	// transaction id only exists in the check request's HEADER (and in
-	// check.MsgID above, which is the closest equivalent). Asserting the
-	// header's value here would be a bug, not a fix.
 	if check.TransactionID != "" {
 		t.Errorf("transactionId = %q, want empty (the body carries none)", check.TransactionID)
 	}

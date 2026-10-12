@@ -1,12 +1,6 @@
 // 轻量拉取消费者的**拉取游标**（#105）离线单测 —— 假 namesrv + 假 broker（真 socket），
 // 不碰真集群。
 //
-// 对齐基准（Java 5.5.1）：DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998 —— 一轮
-// 拉取**成功返回**之后，无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都把
-// 拉取游标推进到 pullResult.getNextBeginOffset()（:998 updatePullOffset）；唯一的刹车是
-// 「这轮里刚 seek 过」（:808 的 getSeekOffset(mq) == -1 检查）与「队列已被撤走」
-// （AssignedMessageQueue.updatePullOffset:82-91 的 processQueue 身份比对），FOUND 分支的
-// 入缓冲（:986）挂的是同一只刹车。
 //
 // 为什么必须离线锁死：旧实现只在 FOUND 时用 `msgs[^1].QueueOffset + 1` 推进游标，于是
 // broker 回 NO_MATCHED_MSG（本轮扫过的整段都不匹配）时游标原地不动 —— 下一轮从同一位点
@@ -34,7 +28,6 @@ public class LitePullCursorTests
 
     private static MessageQueue Queue0() => new(Topic, MockCluster.BrokerName(0), 0);
 
-    /// <summary>PULL_MESSAGE 与 LITE_PULL_MESSAGE 都算（Java PullMessageProcessor 同口径）。</summary>
     private static int Pulls(MockCluster cluster) =>
         cluster.CountRequests(RequestCode.PullMessage) +
         cluster.CountRequests(RequestCode.LitePullMessage);
@@ -106,10 +99,6 @@ public class LitePullCursorTests
 
     // ---------------------------------------------------------------- 1. NO_MATCHED_MSG
 
-    /// <summary>
-    /// Java :982-998：NO_MATCHED_MSG 的 nextBeginOffset 已越过本轮扫过的整段不匹配区间，
-    /// 拉取游标必须跟过去 —— 旧实现只在 FOUND 时推游标，会永远卡在 0 重扫同一段。
-    /// </summary>
     [Fact]
     public void CursorFollowsNextBeginOffsetOnNoMatchedMsg()
     {
@@ -124,7 +113,6 @@ public class LitePullCursorTests
             // 不是内存表里改了个数：下一笔 PULL_MESSAGE 真的从 5 起
             Assert.True(WaitFor(() => PullsFrom(cluster, 5) > 0),
                 "下一笔 PULL_MESSAGE 从 5 开始（游标真的上了线）");
-            // FIRST_OFFSET 的起点是字面量 0（Java RebalanceLitePullImpl:114-124），不该发 minOffset 查询
             Assert.Equal(0, cluster.CountRequests(RequestCode.GetMinOffset));
             Assert.Empty(c.Poll(50));
         }
@@ -162,12 +150,6 @@ public class LitePullCursorTests
 
     // ---------------------------------------------------------------- 3. 在途 seek
 
-    /// <summary>
-    /// 唯一一只刹车（Java :808 的 seekOffset == -1 + :979 的 isDropped）：在途应答回来时，
-    /// 这轮里刚 seek 过的位点不许被盖掉，也不许把应答里的消息塞进缓冲（seek 的语义就是
-    /// 「游标钉在这里、旧位点的消息全丢」）。发车闸把在途窗口拉成确定性的：请求已到 broker
-    /// → seek → 放闸。旧实现没有刹车：FOUND + 一条 offset=2 的消息会把游标改成 3 并入库。
-    /// </summary>
     [Fact]
     public void InFlightSeekWinsOverThePullResult()
     {
@@ -197,13 +179,6 @@ public class LitePullCursorTests
 
     // ---------------------------------------------------------------- 4. 线上报文契约（#107）
 
-    /// <summary>
-    /// lite-pull 的每一笔拉取都必须走 LITE_PULL_MESSAGE(361) 且 sysFlag 与 Java
-    /// `DefaultLitePullConsumerImpl#pullSyncImpl:1058` 的 buildSysFlag(false, block,
-    /// true, false, litePull=true) 逐位一致（MQClientAPIImpl#pullMessage:816-820 就是
-    /// 按这个位切码）。对照组：经典拉取（4 参 build，:248）仍是 11 且 lite 位为 0 ——
-    /// 少了它，「361」可能只是所有 pull 都变成了 361。
-    /// </summary>
     [Fact]
     public void LitePullCarriesCode361AndTheLiteBit()
     {
@@ -226,7 +201,6 @@ public class LitePullCursorTests
                 Assert.True(PullSysFlag.HasLitePullFlag(flag), "lite 位必须置起");
                 Assert.False(PullSysFlag.HasSuspendFlag(flag), "lite 是短轮询，suspend 位为 0");
                 Assert.Equal(expectedFlag, flag);
-                // SUBSCRIPTION 位置起时表达式进报文（Java 的 makeCustomHeaderToNet 口径）
                 Assert.Equal("*", rec.Ext["subscription"]);
             }
 

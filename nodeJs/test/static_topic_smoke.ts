@@ -1,22 +1,5 @@
 // Static topic (unitized topic) support — offline wire test.
 //
-// 行为基线（对齐 Java）：
-//   * TopicRouteData.topicQueueMappingByBroker 从路由 JSON 原样解码（null 与
-//     {} 语义不同：null = 非静态主题；{} 空表 = 静态但暂无映射）。
-//   * topicRouteData2EndpointsForStaticTopic：按 scope 分组 → epoch 降序 →
-//     currIdMap 展开为逻辑队列 (topic, __syslo__<scope>, globalId) → 真实
-//     broker 名；totalQueues 范围内无人托管的逻辑队列映射到
-//     __syslo__none__（Java LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST）。
-//   * 同 epoch 后写覆盖先写（Java oldEpoch <= epoch）；epoch 更小的信息
-//     不得覆盖更大 epoch 的端点。
-//   * __global__ 的 mock broker 名剥掉前两个下划线：__syslo__global__。
-//   * TopicQueueMappingDetail.encode 的字段名必须是 Java 属性名（broker 用
-//     fastjson2 反序列化，错一个静默丢字段）；currIdMap/hostedQueues 的
-//     JSON 键是字符串化整数。
-//   * 静态主题的发布/订阅队列集取逻辑端点（按 queueId 排序），不再走
-//     queueDatas 的物理布局。
-//   * MQClient.getBrokerNameFromMessageQueue 通过端点表把 mock 名解析回
-//     真实 broker 名；未知队列原样透传。
 //
 // Run: node --experimental-strip-types test/static_topic_smoke.ts
 import assert from 'node:assert';
@@ -133,9 +116,6 @@ function check(name: string, cond: boolean, extra = '') {
   check('higher epoch fences the endpoint', view.get('T@__syslo__global__@0') === 'broker-new');
 }
 
-// ---------------------------------------------------------------------------
-// 5. TopicQueueMappingDetail encode — exact Java property names
-// ---------------------------------------------------------------------------
 {
   const detail = new TopicQueueMappingDetail('StaticTopic', 2, 'broker-a', 1,
     METADATA_SCOPE_GLOBAL, false, { '0': 0, '1': 1 }, {

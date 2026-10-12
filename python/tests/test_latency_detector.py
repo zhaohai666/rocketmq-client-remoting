@@ -1,21 +1,4 @@
 # -*- coding: utf-8 -*-
-"""主动探活探测器（Java 5.x startDetectorEnable / detectTimeout / detectInterval）离线单测。
-
-对应 Java `LatencyFaultToleranceImpl.detectByOneRound / startDetector / pickOneAtLeast`
-与 `DefaultMQProducerImpl:155-170` 的匿名 ServiceDetector（GET_MAX_OFFSET(30) 验证
-broker 全链路可达）。语义逐条对齐：
-
-  * 探测成功且原来不可达 → reachableFlag 翻回 True（从隔离放回）；
-  * 探测失败/超时 **不** 清 reachableFlag（清位只来自发送失败的 updateFaultItem）；
-  * resolver 解析不到地址 → 直接删表项（Java 同）；
-  * checkStamp 未到（now - checkStamp < 0）→ 本轮跳过；
-  * startDetector 线程默认 3s 初始延迟 + 3s 周期，开关关着就空转。
-
-测试不依赖真实集群：协议层用本地 socket 假 broker（回 SUCCESS+offset 的 remoting
-应答 / 只收不回的超时 broker / 已关闭端口），配置层用假 resolver/detector 函数。
-loopback 怪癖：刚关闭的端口约 2s 内才拒绝，失败类断言的调用预算给足（探活超时
-5000ms > 2s），不做秒级轮询等待。
-"""
 from __future__ import annotations
 
 import socket
@@ -63,7 +46,7 @@ class TestDetectByOneRound:
         assert t.is_reachable(BROKER)
 
     def test_probe_failure_keeps_unreachable(self):
-        """Java 语义：探测失败**不**清位 —— reachableFlag 只由发送失败置 False。"""
+        pass
         t = LatencyFaultToleranceImpl(resolver=lambda name: "10.0.0.1:10911",
                                       service_detector=_recording_detector([], False))
         t.update_fault_item(BROKER, 10.0, 60000, False)
@@ -78,7 +61,7 @@ class TestDetectByOneRound:
         assert t.is_reachable(BROKER)
 
     def test_resolver_none_drops_fault_item(self):
-        """resolver 解析不到地址：删表项，且不触发探测（Java detectByOneRound 同）。"""
+        pass
         def _boom(addr, timeout):
             raise AssertionError("resolver 返回 None 后不应再探测")
         t = LatencyFaultToleranceImpl(resolver=lambda name: None, service_detector=_boom)
@@ -148,7 +131,7 @@ class TestDetectorThread:
         assert not thread.is_alive()
 
     def test_disabled_switch_spins_without_detecting(self):
-        """开关关着线程照起但空转；运行中翻开立即生效（Java 同）。"""
+        pass
         calls = []
         t = self._make(calls)
         t.set_start_detector_enable(False)
@@ -316,8 +299,6 @@ def _producer_with_client(client_id: str):
     producer = DefaultMQProducer("GID_DetectorUnit")
     client = MQClientInstance(client_id, ["127.0.0.1:9876"])
     producer._mq_client = client
-    # _detector_probe 只取 topic_route_table 的**键**当探活 topic（Java pickTopic 同形），
-    # 值不需要是真路由。
     client.topic_route_table[TOPIC] = None
     return producer, client
 

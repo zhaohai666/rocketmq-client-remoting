@@ -1,12 +1,4 @@
 // 客户端结果类型与回调/监听器接口。
-//
-// 对应：
-//   org.apache.rocketmq.client.producer.{SendResult, SendStatus, TransactionSendResult,
-//                                       MessageQueueSelector, LocalTransactionState,
-//                                       TransactionListener, SendCallback}
-//   org.apache.rocketmq.client.consumer.listener.{ConsumeConcurrentlyStatus, ...}
-//   org.apache.rocketmq.client.consumer.PullResult / PullStatus
-//   Python: client/send_result.py, client/consumer_result.py, client/producer.py
 #ifndef ROCKETMQ_CLIENT_RESULT_H
 #define ROCKETMQ_CLIENT_RESULT_H
 
@@ -54,8 +46,6 @@ struct SendResult {
     // broker 是否开启轨迹（由 SEND 响应头 TRACE_ON 解析，默认 true）。
     // 轨迹钩子据此决定是否落轨迹（traceOn=false 或 regionId 为空则不落）。
     bool traceOn = true;
-    // 对应 Java SendResult.recallHandle：只有定时/延迟消息才有（broker 在 SEND 响应头
-    // 里挂回 recallHandle），普通消息恒为 nullopt。原样传给 recallMessage() 即可撤回。
     std::optional<std::string> recallHandle;
 
     SendStatus getSendStatus() const { return sendStatus; }
@@ -111,15 +101,6 @@ class SendCallback {
 public:
     virtual ~SendCallback() = default;
     virtual void onSuccess(const SendResult& sendResult) = 0;
-    // 对应 Java ``onException(Throwable e)``：交出去的是**异常对象**，类型即失败原因
-    // —— broker 明确回错是 MQBrokerException（带 responseCode，调用方按码分流）、
-    // 背压闸/预算耗尽拒绝是 RemotingTooMuchRequestException、其余传输失败是
-    // MQClientException（Java operationFail 三包装的文案）。只给字符串等于把"哪一类失败"
-    // 丢掉，调用方只能对着文案做正则。
-    //
-    // 与 Java 的差异（结构性）：Java 在包装 MQClientException 时会把原始 Throwable 挂成
-    // cause，本端口跨不了这道边界 —— remoting 层按设计不抛异常（InvokeError 是纯数据），
-    // 所以回调拿到的是**没有 cause 的** MQClientException。文案与类型仍逐字对位。
     virtual void onException(const std::exception_ptr& error) = 0;
 };
 
@@ -147,9 +128,6 @@ struct PullResult {
     int64_t minOffset = 0;
     int64_t maxOffset = 0;
     std::vector<MessageExt> msgFoundList;
-    // 对应 Java PullResultExt.suggestWhichBrokerId：broker 建议下次从哪个 brokerId 拉
-    // （主从部署时可能是从节点）。PullAPIWrapper#processPullResult:77 用它更新
-    // pullFromWhichNodeTable。nullopt = 响应头没带（老 broker），调用方按 master=0 记账。
     std::optional<int64_t> suggestWhichBrokerId;
 
     bool isFound() const { return status == PullStatus::FOUND; }
@@ -158,7 +136,6 @@ struct PullResult {
 
 // ---------------------------------------------------------------- POP 模式
 
-// 对应 Java org.apache.rocketmq.client.consumer.PopStatus
 enum class PopStatus {
     FOUND = 0,
     NO_NEW_MSG = 1,
@@ -176,10 +153,6 @@ inline const char* popStatusName(PopStatus s) {
     return "UNKNOWN";
 }
 
-// POP 响应（对应 Java PopResult）。
-// startOffsetInfo / msgOffsetInfo / orderCountInfo 保留 broker 原样字符串，
-// 解析交给 remoting::protocol::extra_info；msgFoundList 里每条消息都已盖好
-// POP_CK（客户端反构）与 1ST_POP_TIME 属性。
 struct PopResult {
     PopStatus status = PopStatus::NO_NEW_MSG;
     std::vector<MessageExt> msgFoundList;
@@ -213,16 +186,12 @@ enum class ConsumeConcurrentlyStatus {
 };
 
 enum class ConsumeOrderlyStatus {
-    // 声明顺序与 Java ``ConsumeOrderlyStatus`` 逐字对齐（Java 里 ROLLBACK/COMMIT 带
-    // @Deprecated，注释写明 "only for binlog consumption"）：两侧数字一致才不会在
-    // 「按序号写死」的调用方手里错位。
     SUCCESS = 0,
     ROLLBACK = 1,
     COMMIT = 2,
     SUSPEND_CURRENT_QUEUE_A_MOMENT = 3,
 };
 
-/// Java 枚举名原文（钩子 status / 轨迹 contextCode 用它，不要用 C++ 的枚举拼写）。
 inline const char* consumeOrderlyStatusName(ConsumeOrderlyStatus s) {
     switch (s) {
         case ConsumeOrderlyStatus::SUCCESS:
@@ -240,22 +209,13 @@ inline const char* consumeOrderlyStatusName(ConsumeOrderlyStatus s) {
 struct ConsumeConcurrentlyContext {
     MessageQueue messageQueue;
     int32_t delayLevelWhenNextConsume = 0;
-    // 对应 Java ConsumeConcurrentlyContext.ackIndex（默认 Integer.MAX_VALUE）：
-    // 「listener 认可到第几条」，下标含自身，其后的消息按状态回投/丢弃。
-    // 默认值是「全批认可」，只有 listener 主动调小才会部分 ack。
     int32_t ackIndex = std::numeric_limits<int32_t>::max();
     explicit ConsumeConcurrentlyContext(const MessageQueue& mq = MessageQueue()) : messageQueue(mq) {}
 };
 
 struct ConsumeOrderlyContext {
     MessageQueue messageQueue;
-    // true 时由客户端按 listener 的状态提交位点（正常路径）；listener 置 false 拿走提交权
-    //（Java 的 binlog 用法）：只有 COMMIT 才提交、ROLLBACK 回滚重投。
     bool autoCommit = true;
-    // 对应 Java ConsumeOrderlyContext.suspendCurrentQueueTimeMillis，**默认 -1**（Java 就是
-    // 这个默认值）：-1 表示「没指定」，挂起时长回落到消费者配置的
-    // ``suspendCurrentQueueTimeMillis``（默认 1000）；解析出来的值再由调度侧钳到
-    // [10, 30000]（Java ConsumeMessageOrderlyService#submitConsumeRequestLater:216-225）。
     int32_t suspendCurrentQueueTimeMillis = -1;
     explicit ConsumeOrderlyContext(const MessageQueue& mq = MessageQueue()) : messageQueue(mq) {}
 };
@@ -289,26 +249,18 @@ public:
                                 const std::string& arg) const = 0;
 };
 
-// 对应 Java SelectMessageQueueByHash：arg 的 Java String.hashCode() 取模
 class SelectMessageQueueByHash : public MessageQueueSelector {
 public:
     MessageQueue select(const std::vector<MessageQueue>& mqs, const Message& msg,
                         const std::string& arg) const override;
 };
 
-// 对应 Java SelectMessageQueueByRandom
 class SelectMessageQueueByRandom : public MessageQueueSelector {
 public:
     MessageQueue select(const std::vector<MessageQueue>& mqs, const Message& msg,
                         const std::string& arg) const override;
 };
 
-// 对应 Java SelectMessageQueueByMachineRoom（producer/selector/）。
-// ⚠ Java 的 select() 是个**未实现的桩**：直接 return null（实际发送时在
-// sendKernelImpl 里 NPE），consumeridcs 读写一对也从未被内部使用。这里按
-// Java 语义原样移植：select 不选队列 —— 但 MessageQueue 无法表达 null，
-// 所以在 select 时抛出（等价于 Java 用它发送必然失败的结局），并保留
-// consumeridcs 的读写对。
 class SelectMessageQueueByMachineRoom : public MessageQueueSelector {
 public:
     MessageQueue select(const std::vector<MessageQueue>& mqs, const Message& msg,

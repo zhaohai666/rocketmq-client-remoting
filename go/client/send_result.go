@@ -6,8 +6,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// SendStatus mirrors Java SendStatus (Python SendStatus, Rust SendStatus).
-// The numeric values are the enum ordinals, not response codes.
 type SendStatus int
 
 const (
@@ -31,14 +29,6 @@ func (s SendStatus) String() string {
 	return fmt.Sprintf("SendStatus(%d)", int(s))
 }
 
-// SendResult mirrors Java SendResult / Python SendResult.
-//
-// msg_id vs offset_msg_id (Java MQClientAPIImpl.processSendResponse):
-//   - msg_id        = the client-side unique id (UNIQ_KEY) — this is what the
-//     broker and the dashboard use to join a publish trace with the consume
-//     trace, and what END_TRANSACTION carries back;
-//   - offset_msg_id = the header's msgId, the broker-generated offset id.
-//
 // Swapping the two is a silent, hard-to-debug break: everything still
 // "succeeds" while traces and console lookups stop matching.
 type SendResult struct {
@@ -48,9 +38,7 @@ type SendResult struct {
 	QueueOffset   int64
 	TransactionID string
 	OffsetMsgID   string
-	// RegionID comes from the response header's MSG_REGION; absent falls back
-	// to DefaultRegion (Java MixAll.DEFAULT_TRACE_REGION_ID).
-	RegionID string
+	RegionID      string
 	// TraceOn is `extFields["TRACE_ON"] != "false"`, so absent means TRUE.
 	TraceOn bool
 	// RecallHandle is only set for scheduled/delayed messages; hand it back to
@@ -63,15 +51,11 @@ func (r SendResult) String() string {
 		r.SendStatus, r.MsgID, r.OffsetMsgID, r.MessageQueue, r.QueueOffset)
 }
 
-// TransactionSendResult mirrors Java TransactionSendResult: the send result of
-// the half message plus the local transaction state the client decided on.
 type TransactionSendResult struct {
 	SendResult
 	LocalTransactionState LocalTransactionState
 }
 
-// LocalTransactionState mirrors Java LocalTransactionState (Python
-// LocalTransactionState, Rust LocalTransactionState).
 type LocalTransactionState int32
 
 const (
@@ -79,8 +63,6 @@ const (
 	// TRANSACTION_COMMIT_TYPE / TRANSACTION_ROLLBACK_TYPE.
 	CommitMessage LocalTransactionState = iota
 	RollbackMessage
-	// Unknow (Java's spelling) leaves the half message pending: the broker will
-	// check it back. It is also what a nil/absent listener decision becomes.
 	Unknow
 )
 

@@ -1,52 +1,8 @@
-//! 异步发送内核（非阻塞与线程口径、并发不串台、定点/拦截/批量/关池行为）真机验证，
-//! 与 `python/verify_async_send_live.py`（A1–A6）、`cpp/examples/live_async_send.cpp`、
-//! `csharp/examples/RocketMQ.Examples/LiveAsyncSend.cs` 同套场景。
-//! 对端是 Java `DefaultMQProducerImpl` 的 ASYNC 链（`sendDefaultImpl` → `AsyncSenderExecutor`
-//! → `sendKernelImpl`）与 `MQClientAPIImpl.sendMessageAsync` / `onExceptionImpl`。
-//!
 //! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
 //!
-//! 离线单测（`src/client/producer.rs` 的发送链与 `send_retry_tests.rs`）锁的是语义；
-//! 这个脚本锁的是**打到真 broker 时**的六件事：
-//!   A1  非阻塞 + 线程口径 + 读回：`send_async` 在准备段（`send_message_before` 钩子睡
-//!       400ms）之前就返回；before 钩子与用户回调**都不在调用方线程上**跑（Java 的
-//!       `AsyncSenderExecutor_N` / `NettyClientPublicExecutor_N`，见差异 ①）；回调里的
-//!       `offset_msg_id` 能 `view_message` 读回原 body，`queue_offset` 就是它落在的位置，
-//!       `msg_id` 是客户端补的 32 位 UNIQ_KEY。
-//!   A2  30 笔并发各拿**恰好一个**终态、全部 SEND_OK、`(broker, queueId, queueOffset)`
-//!       与 UNIQ_KEY 互不重叠 —— 池子既不串台也不吞消息。
-//!   A3  定点异步发送只落在指定队列上，别的队列一条都不多。
-//!   A4  拦截钩子（`CheckForbiddenHook`）拒绝时异常原样到了回调、看到的是 `ASYNC`，
-//!       而且被拒那笔在 broker 上没留痕（连路由都没建出来）；同一个生产者换个标签照常落地。
-//!   A5  批量异步（`send_batch_async`）：一批 5 条回调恰好一次 + broker 侧真落 5 条、
-//!       定点批量只落在指定队列、混 topic / 空批的本地校验异常照样**进回调**、
-//!       字节闸按**整批**算（1.2 MiB 的一批过不了 1 MiB 闸，200 KiB 的一批过得去）、
-//!       许可（含被闸拦下那笔已拿到的条数许可）原样归还。
-//!   A6  `shutdown()` **不等在途**（Java `ThreadPoolExecutor.shutdown()`：不接新的、队列里的
-//!       照跑，但主流程立刻返回）：交进来的每一笔仍然各自拿到一个终态回调，可这批是在
-//!       「客户端实例已拆」的状态上跑的 ⇒ 实测**一笔都没上线**（差异 ③）；
-//!       关停之后 `send_async` 同步被拒、不会再追加回调。
 //!
-//! ① **线程口径与 Java/C++/C# 的差别**：本端口的发送任务跑在 tokio 工作线程上，没有
-//!   `AsyncSenderExecutor_N` / `NettyClientPublicExecutor_N` 这种池线程名可查（见
-//!   `producer.rs` 里 `send_async` 的文档「差异 3」）。所以这里只能退一步证「准备段与回调
-//!   都不在**调用方线程**上」，且用 `ThreadId` 而不是线程名对位。为了让这条比对有意义，
-//!   调用方那一段跑在 `spawn_blocking` 的阻塞线程池上：那条线程池与 tokio 工作线程集合
-//!   不相交，「不同线程」才是硬结论而不是运气。
 //!
-//! ② **批量异步跑的是同步批量内核**：Java `send(Collection<Message>, SendCallback, long)`
-//!   在 `send(batch(msgs), sendCallback, timeout)` 之后走 SEND_BATCH + `invokeAsync`，
-//!   本端口（同 Python `_send_async_inner` 的批量分支）批量只有同步内核，于是「在异步池里
-//!   跑完 `send_batch`」。对调用方的四条语义（不阻塞、回调恰好一次、错误进回调、失败归还
-//!   许可）一致，差的只是「池内那一条任务会占住到网络回来为止」。Python/C++/C# 三端口
-//!   同一口径（见各自的批量异步入口）。
 //!
-//! ③ **关停语义按语言分两派，本端口与 Java/Python 同派**：Java `shutdown()` 与 Python
-//!   都「不等」——队列里的任务照样跑完准备段、照样回调，但实例已经拆掉，所以这一批基本
-//!   全部报错、broker 上一条都不落（本机实测 36 笔全报 `client already shutdown`、
-//!   `landed=-1` 即连路由都没建出来）。C++/C# 那两版是 `shutdown(true)`/join 池线程，
-//!   同一用例能落满 36 条 —— 那是它们相对 Java 的偏离，不是本端口的。这里锁死「不等待
-//!   真的会丢消息」这条，用户要保消息就得自己等回调再关。
 //!
 //! ⚠ 四条脚本纪律（沿用 `live_backpressure.rs`）：
 //!   ① topic 一律带 stamp —— 四语言**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
@@ -255,7 +211,6 @@ impl SendMessageHook for TracingHook {
     }
 }
 
-/// 拒绝 `forbidden` 标签的拦截钩子（Java `CheckForbiddenHook`，异常**不吞**）。
 #[derive(Default)]
 struct ForbiddenTagHook {
     calls: AtomicUsize,
@@ -503,8 +458,6 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
             && rec.errors().is_empty(),
         &rec.summary(),
     );
-    // Java 的这两条线程分别叫 AsyncSenderExecutor_N / NettyClientPublicExecutor_N；
-    // 本端口没有池线程名（差异 ①），只能退到「都不是调用方那条」。
     ck.check(
         "A1 before 钩子不在调用方线程上跑（Java 的 AsyncSenderExecutor_N）",
         hook.first_before_thread().is_some_and(|t| t != caller_thread),
@@ -835,10 +788,6 @@ async fn queues_landed(env: &Env, queues: &[MessageQueue]) -> i64 {
 
 // ------------------------------------------------- A5 批量异步（send_batch_async）
 
-/// 批量异步入口对位 Java `send(Collection<Message>, SendCallback, long)` /
-/// Python `send_async(list)` / C++ `sendAsync(MessageBatch,…)` / C#
-/// `SendAsync(IEnumerable<Message>,…)`。
-///
 /// 每条断言都刻意选在「只跑离线单测看不出来」的那一侧：回调有没有交付、批量内核的本地
 /// 校验有没有被异步路径绕过、错误有没有被静默吞掉、许可有没有漏。
 async fn a5_batch_async(ck: &mut Checker, env: &Env) {
@@ -875,10 +824,6 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
         &format!("landed={landed}（-1 = 路由还没建出来）"),
     );
 
-    // ①b 读回 broker 上**存下来的那条子消息**：它必须带客户端生成的 32 位 UNIQ_KEY。
-    //     Java DefaultMQProducer.batch():1176 是「逐条 setUniqID → 才 encode()」；顺序错了
-    //     （或像修复前的本端口那样干脆不写），broker 拆开批量后存的就是没有 ID 的裸消息 ——
-    //     消费端去重、轨迹控制台串线全废，而发送侧回调照样是 SEND_OK，看不出来。
     let batch_offset = rec.results().first().and_then(|r| r.offset_msg_id.clone());
     // 批量应答的 offsetMsgId 是 broker **逐条**回的一串（逗号分隔，一条子消息一个 commitLog
     // 偏移），所以它自己就是「这一批真被拆开存成 5 条」的证据；读回时取第一条的偏移。
@@ -968,8 +913,6 @@ async fn a5_batch_async(ck: &mut Checker, env: &Env) {
         ),
     );
 
-    // ③ 混 topic 的一批：批量内核的同质性校验必须在异步路径上照样跑，
-    //    且异常**进回调**（Java 的 runnable catch → onException），不是同步抛、也不是静默丢掉。
     let mixed = Arc::new(Recorder::default());
     let mixed_batch = vec![
         message(&topic, b"async-a5-mixed-1", "TagA5"),
@@ -1091,7 +1034,6 @@ async fn a6_shutdown_does_not_wait(ck: &mut Checker, env: &Env) {
             return ck.abort("A6 每一笔都被接下了", &format!("第 {i} 笔: {e}"));
         }
     }
-    // 立刻关：Java 的 `ThreadPoolExecutor.shutdown()` 不等在途，但队列里的照跑。
     let began = Instant::now();
     producer.shutdown();
     let shut_took = began.elapsed();
@@ -1119,10 +1061,6 @@ async fn a6_shutdown_does_not_wait(ck: &mut Checker, env: &Env) {
             shut_took.as_millis()
         ),
     );
-    // ⚠ 但代价是真的会丢：客户端实例已经先一步拆掉了，这批任务是在「路由表/传输层已关」
-    // 的状态上跑的，整轮以 `client already shutdown` 收场、broker 上一条都没落（实测连
-    // topic 都没建出来 ⇒ 路由都查不到）。C++/C# 那个版本会 join 完池子才关客户端，
-    // 同样用例能落满；这里照抄 Java 的 `shutdown()`，锁的就是「调用方必须自己等回调再关」。
     let errors = rec.errors().len();
     ck.check(
         "A6 不等待的代价：客户端先关，在途发送基本全部报错",

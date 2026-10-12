@@ -1,5 +1,3 @@
-// RemotingCommand：RocketMQ 远程命令（对应 org.apache.rocketmq.remoting.protocol.RemotingCommand）。
-//
 // 线格式：totalLength(4) | headerLength(高 8 位放序列化类型, 4) | header | body
 //
 //   header(JSON)      : {"code":..,"language":..,"version":..,"opaque":..,"flag":..,

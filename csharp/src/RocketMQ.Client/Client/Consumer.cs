@@ -405,18 +405,12 @@ public sealed class DefaultMQPushConsumer
 
     private SocksProxyConfig? _socksProxyConfig;
 
-    /// <summary>
-    /// SOCKS 代理（对应 Java ClientConfig#socksProxyConfig / SocksProxyConfig 的
-    /// addr / username / password；Version 另支持 SOCKS4/4a）。只作用于传输层
-    /// remoting 长连接，NameServer 的 HTTP 动态取址请求不走 SOCKS（与 Java 口径一致）。
-    /// </summary>
     public SocksProxyConfig? SocksProxyConfig
     {
         get => _socksProxyConfig;
         set => _socksProxyConfig = value;
     }
 
-    /// <summary>弹出后对其它实例不可见的时长（Java popInvisibleTime 默认 60000）。</summary>
     public long PopInvisibleTime { get; set; } = 60000;
 
     /// <summary>单次 POP 的最大条数（协议字段 popBatchNums，默认 32；broker 侧 >32 会回 INVALID_PARAMETER）。</summary>
@@ -1199,9 +1193,6 @@ public sealed class DefaultMQPushConsumer
             // rpcHook 随 remoting 实例构造传入，实例第一笔报文就带着它。
             // 顺序由 RequestHooks.Compose 还原（Namespace → stream → ACL ⇒ ns/nsd 先写、ReqT 落在签名内容里）。
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
-            // 跨门面复用（Java MQClientManager.getOrCreateMQClientInstance）：同 clientId 命中
-            // 即复用已有实例（与同进程的生产者/拉消费者共享连接与周期任务），只有第一个
-            // 到达者的实例级参数生效；Start 是幂等的，共享时这是一次空转。
             _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
                 () => new MQClientInstance(_clientId, _nameServerAddrs,
                     /*connectTimeoutMillis=*/3000,
@@ -1454,8 +1445,6 @@ public sealed class DefaultMQPushConsumer
             _mqClient.UnregisterFacadeProcessor(RequestCode.ConsumeMessageDirectly,
                 OnConsumeMessageDirectly);
 
-            // 归还引用（Java unregisterConsumer 之后那句 mQClientFactory.shutdown() 的等价物）：
-            // 计数归零才真正关停实例，先到的门面退出不能拖垮还在用的共享实例。
             MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
             _mqClient = null;
         }

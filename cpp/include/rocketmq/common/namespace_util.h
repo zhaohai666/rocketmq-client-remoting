@@ -1,5 +1,3 @@
-// 命名空间工具（对应 org.apache.rocketmq.remoting.protocol.NamespaceUtil）。
-//
 // 命名空间用于多租户隔离：客户端把 ``namespace`` 以 ``namespace%`` 前缀拼到
 // topic / group 上再发给 broker，从 broker 拿到的资源名在交给上层（listener、
 // admin 结果）之前再剥掉前缀。
@@ -21,7 +19,6 @@ namespace rocketmq {
 struct NamespaceUtil {
     static constexpr const char* NAMESPACE_SEPARATOR = "%";
 
-    // 摘掉 retry/DLQ 前缀（对应 Java withOutRetryAndDLQ）。
     static std::string withOutRetryAndDlq(const std::string& resource) {
         return MixAll::resetRetryAndDlqTopic(resource);
     }
@@ -47,9 +44,6 @@ struct NamespaceUtil {
         return plain.rfind(ns + NAMESPACE_SEPARATOR, 0) == 0;
     }
 
-    // 剥掉命名空间前缀（对应 Java withoutNamespace 的两个重载）。
-    //   "MQ_INST_XX%Topic" -> "Topic"；"%RETRY%MQ_INST_XX%GID" -> "%RETRY%GID"。
-    // 未带该命名空间时原样返回。
     static std::string withoutNamespace(const std::string& resourceWithNamespace,
                                          const std::string& ns = std::string()) {
         if (resourceWithNamespace.empty()) return resourceWithNamespace;
@@ -72,8 +66,6 @@ struct NamespaceUtil {
         return resourceWithNamespace;
     }
 
-    // 拼上命名空间前缀（对应 Java wrapNamespace）。
-    //   plain -> "NS%plain"；"%RETRY%GID" -> "%RETRY%NS%GID"。
     static std::string wrapNamespace(const std::string& ns,
                                      const std::string& resourceWithoutNamespace) {
         if (ns.empty() || resourceWithoutNamespace.empty()) return resourceWithoutNamespace;
@@ -86,14 +78,12 @@ struct NamespaceUtil {
         return prefix + ns + NAMESPACE_SEPARATOR + plain;
     }
 
-    // "%RETRY%<wrapNamespace(ns, group)>"（对应 Java wrapNamespaceAndRetry）。
     static std::string wrapNamespaceAndRetry(const std::string& ns,
                                              const std::string& consumerGroup) {
         if (consumerGroup.empty()) return consumerGroup;
         return std::string(MixAll::RETRY_GROUP_TOPIC_PREFIX) + wrapNamespace(ns, consumerGroup);
     }
 
-    // 从资源名里取出命名空间（对应 Java getNamespaceFromResource）。
     static std::string getNamespaceFromResource(const std::string& resource) {
         if (resource.empty() || isSystemResource(resource)) return std::string();
         std::string plain = withOutRetryAndDlq(resource);

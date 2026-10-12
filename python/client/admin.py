@@ -1,19 +1,4 @@
 # -*- coding: utf-8 -*-
-"""管理端（对应 org.apache.rocketmq.client.admin.DefaultMQAdminExt / MQAdminExt
-与 org.apache.rocketmq.tools.admin.DefaultMQAdminExtImpl）。
-
-覆盖：Topic 增删查/配置、Broker 集群信息与运行时信息/配置、NameServer KV 配置、
-订阅组管理、消费者/生产者连接、消费统计、offset 管理（含真实 broker 位点重置）、
-消息查询（key / uniqKey / msgId / ConsumeQueue）。
-
-对齐要点（均为 Java 5.x 探针 + 源码核对结论，勿凭记忆改）：
- - GET_BROKER_CONFIG 的 body 是 **properties 文本**（``k=v\\n``），不是 JSON。
- - UPDATE_AND_CREATE_SUBSCRIPTIONGROUP 的 body 是 SubscriptionGroupConfig **JSON**。
- - GET_TOPIC_CONFIG 请求头带 ``topic`` + ``lo``，响应体是 TopicConfigAndQueueMapping JSON。
- - GET_ALL_SUBSCRIPTIONGROUP_CONFIG 是**分页**接口（groupSeq / maxGroupNum / dataVersion）。
- - ResetOffsetBody.offsetTable 是 Map<MessageQueue, Long>。
- - KV 配置类请求打到 **NameServer**，且 PUT/DELETE 要广播到**每一个** NameServer。
-"""
 from __future__ import annotations
 
 import time
@@ -52,14 +37,12 @@ logger = get_logger()
 # 默认超时（对应 DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3）
 DEFAULT_TIMEOUT = 5000 * 3
 
-# org.apache.rocketmq.common.namesrv.NamesrvUtil#NAMESPACE_ORDER_TOPIC_CONFIG
 NAMESPACE_ORDER_TOPIC_CONFIG = "ORDER_TOPIC_CONFIG"
 
 
-# ---------------- 消息轨迹 DTO（org.apache.rocketmq.tools.admin.api） ----------------
 
 class TrackType:
-    """对应 Java `TrackType` 枚举（字符串值即枚举名）。"""
+    pass
 
     CONSUMED = "CONSUMED"
     CONSUMED_BUT_FILTERED = "CONSUMED_BUT_FILTERED"
@@ -71,7 +54,7 @@ class TrackType:
 
 
 class MessageTrack:
-    """对应 Java `MessageTrack`：一条消息在某消费组的投递判定。"""
+    pass
 
     def __init__(self, consumer_group: Optional[str] = None,
                  track_type: str = TrackType.UNKNOWN,
@@ -108,34 +91,21 @@ class MessageTrack:
 
 
 class DefaultMQAdminExt:
-    """管理客户端（对应 org.apache.rocketmq.client.admin.DefaultMQAdminExt）。"""
+    pass
 
     def __init__(self, rpc_hook: Optional[RPCHook] = None,
                  namespace: str = "", **kwargs):
         self.namespace = namespace
         self.instance_name = "ADMIN"
         self.client_id: Optional[str] = None
-        # Java 的 `DefaultMQAdminExt extends ClientConfig`，因此 unitName 与
-        # enableStreamRequestType 这两个只影响 clientId / 取址 URL / 请求扩展字段的
-        # 开关对 admin 同样有效。（unitMode 在这里没有落点：admin 不发消息，
-        # 也不注册消费者，Java 里它只是个继承来的字段。）
         self.unit_name: Optional[str] = None
         self.enable_stream_request_type = False
-        # namespaceV2（Java ClientConfig.namespaceV2，5.x 服务端命名空间）：非空时
-        # 每笔请求带 nsd=true / ns=<值>，见 remoting/rpchook.py 的 NamespaceRpcHook。
         self.namespace_v2 = ""
-        # Java `ClientConfig#vipChannelEnabled`（5.x 默认 false）：true 时 broker 请求
-        # 改走 VIP 端口（端口 - 2）。只对本 admin 的 broker 调用生效——admin 不发消息、
-        # 不注册消费者，Java 里普通收发路径的同一开关在本项目四端均未接线。
         self.vip_channel_enabled = False
-        # SOCKS 代理（对应 Java SocksProxyConfig + NettyRemotingClient 的代理接入）
         self.socks_proxy_config: Optional[SocksProxyConfig] = None
         self.name_server_addrs: List[str] = []
-        # 路由刷新周期（对应 Java ClientConfig.pollNameServerInterval 默认 30000ms）；
-        # 只在 start() 建 MQClientInstance 时透传一次。
         self.poll_name_server_interval = 30000
         self.rpc_hook = rpc_hook
-        # 删除 topic 时一并清理的 KV namespace（Java 的 kvNamespaceToDeleteList）
         self.kv_namespace_to_delete_list: List[str] = []
         self.timeout_millis = int(kwargs.get("timeout_millis", DEFAULT_TIMEOUT))
         self._mq_client: Optional[MQClientInstance] = None
@@ -152,36 +122,32 @@ class DefaultMQAdminExt:
         self.instance_name = name
 
     def set_unit_name(self, unit_name: Optional[str]) -> None:
-        """对应 Java `ClientConfig#setUnitName`：影响 clientId 后缀与动态取址 URL。"""
+        pass
         self.unit_name = unit_name
 
     def get_unit_name(self) -> Optional[str]:
         return self.unit_name
 
     def set_enable_stream_request_type(self, enable: bool) -> None:
-        """对应 Java `ClientConfig#setEnableStreamRequestType`。"""
+        pass
         self.enable_stream_request_type = bool(enable)
 
     def set_namespace_v2(self, namespace_v2: Optional[str]) -> None:
-        """对应 Java `ClientConfig#setNamespaceV2`：非空时每笔请求带 nsd=true / ns=<值>。"""
+        pass
         self.namespace_v2 = namespace_v2
 
     def get_namespace_v2(self) -> Optional[str]:
         return self.namespace_v2
 
     def set_socks_proxy_config(self, socks_proxy_config: Optional[SocksProxyConfig]) -> None:
-        """SOCKS 代理配置（对齐 Java SocksProxyConfig：类型/地址/端口/用户名/密码/enable）。
-
-        只在 ``start()`` 建 MQClientInstance 时取一次快照（与 unit_name 同口径）；
-        传 None 或 enable=False 即不走代理。
-        """
+        pass
         self.socks_proxy_config = socks_proxy_config
 
     def get_socks_proxy_config(self) -> Optional[SocksProxyConfig]:
         return self.socks_proxy_config
 
     def set_vip_channel_enabled(self, enable: bool) -> None:
-        """对应 Java `ClientConfig#setVipChannelEnabled`。"""
+        pass
         self.vip_channel_enabled = bool(enable)
 
     def get_name_server_addr(self) -> str:
@@ -198,18 +164,10 @@ class DefaultMQAdminExt:
             return
         if not self.name_server_addrs:
             raise MQClientException("name server address is not set")
-        # Java `DefaultMQAdminExtImpl#start`:161 无条件 `changeInstanceNameToPID`，
-        # clientId 再走 `ClientConfig#buildMQClientId` 的
-        # `<本机 IP>@<instanceName>[@<unitName>][@STREAM]`。
-        # 本客户端的 admin 默认 instanceName 是 "ADMIN"（不是 Java 的 "DEFAULT"，因为
-        # admin 用私有实例、不和其他客户端共用），所以这一步只在调用方显式设成
-        # "DEFAULT" 时才起作用。
         self.instance_name = MixAll.change_instance_name_to_pid(self.instance_name)
         if self.client_id is None:
             self.client_id = MixAll.client_id_for(self.instance_name, self.unit_name,
                                                   self.enable_stream_request_type)
-        # 对应 Java DefaultMQAdminExtImpl.start:165 → MQClientManager
-        # .getOrCreateMQClientInstance：同 clientId 复用同一份实例。
         def _create_instance() -> MQClientInstance:
             return MQClientInstance(self.client_id, self.name_server_addrs,
                                     socks_proxy_config=self.socks_proxy_config,
@@ -235,8 +193,6 @@ class DefaultMQAdminExt:
             return
         self._started = False
         if self._mq_client is not None:
-            # 引用计数语义：同 clientId 还有别的门面在用时实例继续存活，
-            # 归零才真正 shutdown（对应 Java adminExtTable 判空后的实例关闭）。
             MQClientManager.get_instance().unregister_client(
                 self.client_id or "", self._mq_client)
 
@@ -270,7 +226,7 @@ class DefaultMQAdminExt:
     def _invoke_namesrv_all(self, code: int,
                             ext_fields: Optional[Dict[str, str]] = None,
                             timeout_millis: Optional[int] = None) -> Optional[RemotingCommand]:
-        """广播到所有 NameServer（Java putKVConfigValue / deleteKVConfigValue 语义）。"""
+        pass
         client = self._require_client()
         request = RemotingCommand.create_request_command(code, None)
         if ext_fields:
@@ -290,7 +246,7 @@ class DefaultMQAdminExt:
     def _invoke_namesrv_one(self, code: int,
                             ext_fields: Optional[Dict[str, str]] = None,
                             timeout_millis: Optional[int] = None) -> RemotingCommand:
-        """发到第一个可用 NameServer（Java invokeSync(null, ...) 语义）。"""
+        pass
         client = self._require_client()
         request = RemotingCommand.create_request_command(code, None)
         if ext_fields:
@@ -326,7 +282,7 @@ class DefaultMQAdminExt:
         client.create_topic_in_route(new_topic, queue_num, queue_num, MixAll.READ_PERM_BY_DEFAULT)
 
     def create_and_update_topic_config(self, addr: str, config: TopicConfig) -> None:
-        """对应 Java DefaultMQAdminExtImpl.createAndUpdateTopicConfig（走 createTopicKey）。"""
+        pass
         client = self._require_client()
         client.create_topic_in_broker(addr, MixAll.DEFAULT_TOPIC, config.topic_name,
                                       config.read_queue_nums, config.write_queue_nums,
@@ -345,8 +301,6 @@ class DefaultMQAdminExt:
     def delete_topic_in_name_server(self, addrs: Optional[Set[str]], topic: str) -> None:
         client = self._require_client()
         targets = list(addrs) if addrs else list(client.name_server_addrs)
-        # NameServer 请求不能走 _invoke_broker：VIP 开关打开时它会把 NameServer
-        # 的端口也 -2（Java 的 deleteTopicInNameServer 同样直连 NameServer）。
         for ns_addr in targets:
             self._invoke_namesrv_addr(ns_addr, RequestCode.DELETE_TOPIC_IN_NAMESRV,
                                       {"topic": topic})
@@ -393,11 +347,7 @@ class DefaultMQAdminExt:
         return self._require_client().get_all_topic_list_from_name_server()
 
     def fetch_topics_by_cluster(self, cluster_name: str) -> Set[str]:
-        """对应 Java fetchTopicsByCLuster（GET_TOPICS_BY_CLUSTER 打到 NameServer）。
-
-        字段名必须是 Java GetTopicsByClusterRequestHeader 的 ``cluster``：早先写成
-        ``clusterName`` 时 NameServer 查不到集群（NPE 被吞），只回 SUCCESS + 空列表。
-        """
+        pass
         response = self._invoke_namesrv_one(RequestCode.GET_TOPICS_BY_CLUSTER,
                                             {"cluster": cluster_name})
         topics: Set[str] = set()
@@ -407,7 +357,7 @@ class DefaultMQAdminExt:
         return topics
 
     def get_cluster_list(self, topic: str) -> Set[str]:
-        """对应 Java getClusterList：包含该 topic 的路由 broker 所在集群名集合。"""
+        pass
         client = self._require_client()
         cluster_info = client.get_broker_cluster_info()
         route = self.examine_topic_route(topic)
@@ -443,7 +393,7 @@ class DefaultMQAdminExt:
         return route
 
     def examine_topic_config(self, addr: str, topic: str) -> TopicConfig:
-        """对应 Java examineTopicConfig（GET_TOPIC_CONFIG，body 为 TopicConfig JSON）。"""
+        pass
         response = self._invoke_broker(addr, RequestCode.GET_TOPIC_CONFIG,
                                        {"topic": topic, "lo": "true"})
         if not response.body:
@@ -461,7 +411,7 @@ class DefaultMQAdminExt:
 
     def get_user_topic_config(self, broker_addr: str, special_topic: bool = False,
                               timeout_millis: Optional[int] = None) -> TopicConfigSerializeWrapper:
-        """对应 Java getUserTopicConfig：剔除系统 topic 与 %RETRY%/%DLQ%。"""
+        pass
         wrapper = self.get_all_topic_config(broker_addr, timeout_millis)
         sys_topics = set(self.get_system_topic_list_from_broker(
             broker_addr, timeout_millis).get_topic_list())
@@ -486,7 +436,7 @@ class DefaultMQAdminExt:
         return TopicList.decode(response.body)
 
     def examine_topic_stats(self, topic: str) -> TopicStatsTable:
-        """对应 Java examineTopicStats：遍历该 topic 的所有 broker 合并统计。"""
+        pass
         route = self.examine_topic_route(topic)
         merged = TopicStatsTable()
         for bd in route.get_broker_datas():
@@ -528,17 +478,13 @@ class DefaultMQAdminExt:
             return KVTable()
         return KVTable.decode(response.body)
 
-    # Java 旧接口名：getBrokerRuntimeInfo
     def get_broker_runtime_info(self, broker_addr: str,
                                 timeout_millis: Optional[int] = None) -> KVTable:
         return self.fetch_broker_runtime_stats(broker_addr, timeout_millis)
 
     def get_broker_config(self, broker_addr: str,
                           timeout_millis: Optional[int] = None) -> Dict[str, str]:
-        """对应 Java getBrokerConfig：响应体是 **properties 文本**，不是 JSON/KVTable。
-
-        历史实现的 bug：把 body 当 KVTable JSON 解析，真实 broker 上必然失败。
-        """
+        pass
         response = self._invoke_broker(broker_addr, RequestCode.GET_BROKER_CONFIG,
                                        timeout_millis=timeout_millis)
         text = (response.body or b"").decode("utf-8")
@@ -546,7 +492,7 @@ class DefaultMQAdminExt:
 
     def update_broker_config(self, broker_addr: str, properties: Dict[str, str],
                              timeout_millis: Optional[int] = None) -> None:
-        """对应 Java updateBrokerConfig（含 Validators.checkBrokerConfig 的 brokerPermission 校验）。"""
+        pass
         broker_permission = (properties or {}).get("brokerPermission")
         if broker_permission is not None and not _perm_is_valid(broker_permission):
             raise MQClientException(
@@ -583,7 +529,7 @@ class DefaultMQAdminExt:
 
     def clean_unused_topic(self, cluster_name: Optional[str] = None,
                            topic: Optional[str] = None) -> bool:
-        """对应 Java cleanUnusedTopic：逐 broker 下发 CLEAN_UNUSED_TOPIC。"""
+        pass
         client = self._require_client()
         ok = True
         for addr in self._broker_addrs_of_cluster(client, cluster_name):
@@ -606,11 +552,10 @@ class DefaultMQAdminExt:
 
     # ---------------- NameServer KV 配置 ----------------
     def create_and_update_kv_config(self, namespace: str, key: str, value: str) -> None:
-        """对应 Java createAndUpdateKvConfig → putKVConfigValue（广播所有 NameServer）。"""
+        pass
         self._invoke_namesrv_all(RequestCode.PUT_KV_CONFIG,
                                  {"namespace": namespace, "key": key, "value": value})
 
-    # Java 接口名（DefaultMQAdminExtImpl.putKVConfig 为空实现，真正的实现在 createAndUpdateKvConfig）
     def put_kv_config(self, namespace: str, key: str, value: str) -> None:
         self.create_and_update_kv_config(namespace, key, value)
 
@@ -635,17 +580,17 @@ class DefaultMQAdminExt:
     # ---------------- 订阅组管理 ----------------
     def create_and_update_subscription_group_config(self, addr: str,
                                                     config: SubscriptionGroupConfig) -> None:
-        """对应 Java createAndUpdateSubscriptionGroupConfig：body 为 SubscriptionGroupConfig JSON。"""
+        pass
         self._invoke_broker(addr, RequestCode.UPDATE_AND_CREATE_SUBSCRIPTIONGROUP,
                             body=config.encode())
 
     def examine_subscription_group_config(self, addr: str, group: str) -> Optional[SubscriptionGroupConfig]:
-        """对应 Java examineSubscriptionGroupConfig：拉全部订阅组后取目标 group。"""
+        pass
         wrapper = self.get_all_subscription_group(addr)
         return wrapper.subscription_group_table.get(group)
 
     def get_subscription_group_config(self, addr: str, group: str) -> Optional[SubscriptionGroupConfig]:
-        """对应 Java getSubscriptionGroupConfig（GET_SUBSCRIPTIONGROUP_CONFIG 单查）。"""
+        pass
         response = self._invoke_broker(addr, RequestCode.GET_SUBSCRIPTIONGROUP_CONFIG,
                                        {"group": group})
         if not response.body:
@@ -654,10 +599,7 @@ class DefaultMQAdminExt:
 
     def get_all_subscription_group(self, broker_addr: str,
                                    timeout_millis: Optional[int] = None) -> SubscriptionGroupWrapper:
-        """对应 Java getAllSubscriptionGroup：**分页**累积，直到 groupSeq >= totalGroupNum-1。
-
-        老版本 broker 不带 totalGroupNum，此时一次性返回全部（单轮即结束）。
-        """
+        pass
         client = self._require_client()
         timeout = timeout_millis or self.timeout_millis
         current_data_version: Optional[dict] = None
@@ -773,27 +715,10 @@ class DefaultMQAdminExt:
         addr = broker_addr or self._find_first_broker_addr(client)
         return client.get_consumer_list_by_group(consumer_group, addr=addr)
 
-    # ---------------- 直连消费（Java DefaultMQAdminExtImpl.consumeMessageDirectly） ----------------
     def consume_message_directly(self, consumer_group: str, client_id: str, topic: str,
                                  msg_id: str,
                                  broker_addr: Optional[str] = None) -> ConsumeMessageDirectlyResult:
-        """对应 Java `DefaultMQAdminExtImpl.consumeMessageDirectly:1323-1332` →
-        `MQClientAPIImpl.consumeMessageDirectly:2741`：向**存储这条消息**的 broker
-        下发 CONSUME_MESSAGE_DIRECTLY(309)，broker 把消息原文推给 ``client_id``
-        指定的消费者实例真实消费一次，应答 body 是 ConsumeMessageDirectlyResult
-        （ Consumption 判定在消费者端产生，broker 只做转发）。
-
-        msgId 解析对齐 Java：先 viewMessage——offset msgId 直解出 broker 地址 +
-        commitLog 偏移，uniqKey 走索引查询兜底。msgId 带客户端 UNIQ_KEY 属性时
-        改发 **offsetMsgId**：broker 端 `AdminBrokerProcessor:2629` 拿 msgId 当
-        commitLog 偏移 `selectOneMessageByOffset`，客户端生成的 uniqKey 必然查空。
-        ``broker_addr`` 可显式指定 broker（Java 的 Address 形态重载没有公开入口，
-        这里仿照 examine_consumer_running_info 留作覆盖参数）。
-
-        brokerName 是 Java 头里的可空字段（Java 发起端从不设置）；这里在路由能
-        对上地址时尽量带上（broker 名下找主节点的归属信息），供消费端构造
-        MessageQueue 使用——本仓库自己的 309 接收端就用它，查不到不阻塞主流程。
-        """
+        pass
         if not consumer_group or not client_id:
             raise MQClientException("consumeMessageDirectly: consumerGroup/clientId required")
         from common.message_const import MessageConst
@@ -865,13 +790,10 @@ class DefaultMQAdminExt:
         obj = RemotingSerializable.decode_json(response.body)
         return set(obj.get("groupList", []))
 
-    # ---------------- 消息轨迹（Java DefaultMQAdminExtImpl.messageTrackDetail） ----------------
 
     def examine_consume_stats_group(self, consumer_group: str,
                                     topic: Optional[str] = None) -> ConsumeStats:
-        """对应 Java `examineConsumeStats(group[, topic])`（:389-424）：按
-        `%RETRY%<group>` 的路由扇出全部 broker，逐台取统计并合并（offsetTable
-        并入、consumeTps 累加）；全空时抛错（Java 的 MQClientException 同口径）。"""
+        pass
         route = self.examine_topic_route(MixAll.get_retry_topic(consumer_group))
         result = ConsumeStats()
         for bd in route.broker_datas:
@@ -885,8 +807,7 @@ class DefaultMQAdminExt:
         return result
 
     def consumed(self, msg: MessageExt, group: str) -> bool:
-        """对应 Java `DefaultMQAdminExtImpl.consumed:1533-1557`：该组在本队列的
-        consumerOffset 是否已越过这条消息的 queueOffset（位点越过 ⇒ 已消费）。"""
+        pass
         cstats = self.examine_consume_stats_group(group)
         ci = self.examine_broker_cluster_info()
         store_host = msg.get_store_host_string()
@@ -895,16 +816,13 @@ class DefaultMQAdminExt:
                 broker_addrs = ci.broker_addr_table.get(mq.broker_name)
                 if broker_addrs:
                     addr = broker_addrs.get(MixAll.MASTER_ID)
-                    # Java 先把 master 地址规范化成 ip:port 再比对（convert2IpString）；
-                    # 四端存的 broker 地址本来就是注册时的 ip:port 形态，直接比。
                     if addr and store_host and addr == store_host:
                         if wrapper.consumer_offset > msg.queue_offset:
                             return True
         return False
 
     def message_track_detail(self, msg: MessageExt) -> List[MessageTrack]:
-        """对应 Java `DefaultMQAdminExtImpl.messageTrackDetail:1349-1427`：查谁在消费
-        这个 topic，逐组判 CONSUMED / FILTERED / PULL / NOT_ONLINE / BROADCASTING…。"""
+        pass
         result: List[MessageTrack] = []
         route = self.examine_topic_route(msg.topic)
         broker_addr = None
@@ -915,7 +833,6 @@ class DefaultMQAdminExt:
         if broker_addr is None:
             return result
         groups = self.query_topic_consume_by_who(broker_addr, msg.topic)
-        # Java 按 broker 返回顺序遍历；python 侧这里拿到的是 set，排序让输出确定
         for group in sorted(groups):
             mt = MessageTrack(consumer_group=group)
             try:
@@ -952,9 +869,6 @@ class DefaultMQAdminExt:
 
                 if if_consumed:
                     mt.track_type = TrackType.CONSUMED
-                    # Java 遍历订阅表找本 topic：tagsSet 非空、既不含消息 tag 也不含
-                    # "*" ⇒ 订阅比消息窄，消息是被过滤掉的那部分（SQL92 订阅 tagsSet
-                    # 为空，同样落回 CONSUMED —— 忠实保留 Java 语义）。
                     sub = cc.subscription_table.get(msg.topic)
                     if sub:
                         tags_set = set(sub.get("tagsSet") or [])
@@ -966,12 +880,7 @@ class DefaultMQAdminExt:
         return result
 
     def query_topics_by_consumer_to_broker(self, broker_addr: str, group: str) -> TopicList:
-        """对应 Java `MQClientAPIImpl#queryTopicsByConsumer:2525`（343）的单 broker 原始调用。
-
-        broker 端走 `AdminBrokerProcessor#queryTopicsByConsumer:2421` →
-        `ConsumerOffsetManager#whichTopicByConsumer`：**从位点表**（`topic@group` 键）反查该组
-        消费过哪些 topic。所以组从没提交过位点时回空表，这是预期而不是 bug。
-        """
+        pass
         response = self._invoke_broker(broker_addr, RequestCode.QUERY_TOPICS_BY_CONSUMER,
                                        {"group": group})
         if not response.body:
@@ -979,11 +888,7 @@ class DefaultMQAdminExt:
         return TopicList.decode(response.body)
 
     def query_topics_by_consumer(self, group: str) -> TopicList:
-        """对应 Java `DefaultMQAdminExt#queryTopicsByConsumer`（`DefaultMQAdminExtImpl:1078`）。
-
-        Java 先按 `%RETRY%<group>` 查路由，再对路由里每个 broker 下发 343 并合并。
-        合并口径对齐 Java 的 `TopicList.topicList`（那是个 `Set<String>`），这里去重后回列表。
-        """
+        pass
         route = self.examine_topic_route(MixAll.get_retry_topic(group))
         result = TopicList()
         seen: Set[str] = set()
@@ -1029,28 +934,22 @@ class DefaultMQAdminExt:
         return self._require_client().get_min_offset(mq)
 
     def search_offset(self, mq: MessageQueue, timestamp: int) -> int:
-        """对应 Java MQAdminImpl#searchOffset(mq, ts)：显式下发 LOWER 边界。"""
+        pass
         return self._require_client().search_offset_by_timestamp(
             mq, timestamp, boundary_type=BoundaryType.LOWER)
 
     def search_lower_boundary_offset(self, mq: MessageQueue, timestamp: int) -> int:
-        """对应 Java DefaultMQAdminExt#searchLowerBoundaryOffset(:133)。"""
+        pass
         return self._require_client().search_offset_by_timestamp(
             mq, timestamp, boundary_type=BoundaryType.LOWER)
 
     def search_upper_boundary_offset(self, mq: MessageQueue, timestamp: int) -> int:
-        """对应 Java DefaultMQAdminExt#searchUpperBoundaryOffset(:137)。
-
-        与 LOWER 的差异只在多条消息共享 storeTime、或时间戳落在空档/队尾时可见：
-        队尾之后 UPPER 回最后一条自己的位点，LOWER 回它的下一个位点（maxOffset）。
-        """
+        pass
         return self._require_client().search_offset_by_timestamp(
             mq, timestamp, boundary_type=BoundaryType.UPPER)
 
     def earliest_msg_store_time(self, mq: MessageQueue) -> int:
         client = self._require_client()
-        # Java MQAdminImpl:250 的 earliestMsgStoreTime 与 max/min/search 同一个形状：
-        # 只认 master，刷一次路由重查，仍拿不到照 :264 抛「The broker[X] not exist」。
         addr = client._publish_addr_in_admin(mq)
         response = self._invoke_broker(addr, RequestCode.GET_EARLIEST_MSG_STORETIME,
                                        {"topic": mq.topic, "queueId": mq.queue_id,
@@ -1072,19 +971,7 @@ class DefaultMQAdminExt:
                                   is_force: bool = True,
                                   cluster_name: Optional[str] = None,
                                   is_cpp: bool = False) -> Dict[MessageQueue, int]:
-        """对应 Java resetOffsetByTimestamp：
-
-        逐 broker 下发 INVOKE_BROKER_TO_RESET_OFFSET（broker 端按 timestamp 计算新位点，
-        并同步在线消费者 + 更新 offset 表），汇总 ``Map<MessageQueue, Long>``。
-
-        ``is_cpp`` 只影响 broker 推给**在线消费者**的 220 报文形状：broker 按发起方
-        （也就是本请求）的 language 判断，CPP 回 ``ResetOffsetBodyForC``（JSON 数组），
-        其余回 ``ResetOffsetBody``（对象即键的 map）。Java 的管理端两个重载传的都是
-        ``false``（``MQClientAPIImpl:2408``），本端口同样默认 ``false``。
-
-        注意：这里**不再**走「逐队列 searchOffset + updateConsumerOffset」的旧本地实现——
-        那不会同步在线消费者，也不会做 broker 端一致性校验。
-        """
+        pass
         route_topic = topic
         if topic and (MixAll.is_lmq(topic) or
                       topic == MixAll.SYSTEM_TOPIC_PREFIX + "wheel_timer") and cluster_name:
@@ -1106,12 +993,7 @@ class DefaultMQAdminExt:
                                     timestamp: int, is_force: bool, is_cpp: bool,
                                     queue_id: Optional[int] = None,
                                     offset: Optional[int] = None) -> Dict[MessageQueue, int]:
-        """一笔 `INVOKE_BROKER_TO_RESET_OFFSET`(222)，回 broker 实际重置的队列表。
-
-        Java 在这里有**两个**重载：`invokeBrokerToResetOffset(..., isForce, ...)` 按时间戳
-        重置整个 topic，另一个带 `queueId` + `offset` 的只重置单个队列。`offset` 为 None
-        时按 Java 口径写 `-1`（broker 判成 null，转去按 timestamp 算位点）。
-        """
+        pass
         client = self._require_client()
         request = RemotingCommand.create_request_command(
             RequestCode.INVOKE_BROKER_TO_RESET_OFFSET, None)
@@ -1119,15 +1001,7 @@ class DefaultMQAdminExt:
             "topic": topic,
             "group": group,
             "timestamp": timestamp,
-            # 键名是 **isForce** 不是 force：Java `RemotingCommand.makeCustomHeaderToNet:437-450`
-            # 拿 requestHeader 的**字段名**做 ext key，而 `ResetOffsetRequestHeader` 声明的字段是
-            # `private boolean isForce`（getter `isForce()` 不参与命名）。写成 force 时 broker 侧
-            # isForce 恒为 false ⇒ `Broker2Client.resetOffset:152-158` 的分支退化成「取时间戳位点」，
-            # 前重（timestamp=-1）会把 consumerOffset 原样回显而不是跳到 maxOffset。
-            # 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
-            #               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
             "isForce": "true" if is_force else "false",
-            # Java：offset=-1 表示 offset 为空
             "offset": -1 if offset is None else offset,
         }
         if queue_id is not None:
@@ -1145,33 +1019,15 @@ class DefaultMQAdminExt:
 
     def reset_offset_by_queue_id(self, broker_addr: str, consumer_group: str, topic: str,
                                  queue_id: int, reset_offset: int) -> Dict[MessageQueue, int]:
-        """对应 Java `DefaultMQAdminExt#resetOffsetByQueueId`（`DefaultMQAdminExtImpl:1827`）。
-
-        Java 打**两笔** RPC，缺一不可：
-        1. `updateConsumerOffset`(25) 直接把 offsetTable 改成目标位点；
-        2. 带 `queueId` + `offset` 的 222 走 `AdminBrokerProcessor#resetOffsetInner`，
-           先按 `[min, max+1]` 校验目标位点（越界回 SYSTEM_ERROR
-           `Target offset N not in consume queue range [min-max]`），再
-           `ConsumerOffsetManager#assignResetOffset`——它同时写 `resetOffsetTable`（一次性，
-           下次 pull 用 `queryThenEraseResetOffset` 取走）和 `offsetTable`，并清掉该队列的
-           POP 在途计数。只做第 1 步的话在线消费者仍按自己内存里的位点继续拉。
-
-        Java 返回值是 void（只打日志），这里把 broker 报回的队列表返回，便于调用方核对。
-
-        ⚠ 实测（5.5.1 真机）这两笔 RPC **不是原子的**：`ConsumerOffsetManager#commitOffset`
-        只做覆盖写（连 offset 变小都只打 `[NOTIFYME]` warn，不做区间校验），所以第 2 笔
-        被 `resetOffsetInner` 以 `Target offset N not in consume queue range [min-max]` 拒绝时，
-        第 1 笔已经把非法位点落库。Java 同样如此，这里不做保护性回滚。
-        """
+        pass
         self.update_consumer_offset_to_broker(
             broker_addr, consumer_group, MessageQueue(topic, "", queue_id), reset_offset)
-        # Java 的单个队列重载不传 force（默认 false）、timestamp 传 0（offset 已给定，不参与算）
         return self._invoke_broker_reset_offset(
             broker_addr, topic, consumer_group, 0, False, False,
             queue_id=queue_id, offset=reset_offset)
 
     def reset_offset_new(self, consumer_group: str, topic: str, timestamp: int) -> None:
-        """对应 Java resetOffsetNew：先试新版（broker 端重置），失败再退化到旧版。"""
+        pass
         try:
             self.reset_offset_by_timestamp(topic, consumer_group, timestamp, True)
         except MQClientException as e:
@@ -1182,7 +1038,7 @@ class DefaultMQAdminExt:
 
     def reset_offset_by_timestamp_old(self, consumer_group: str, topic: str, timestamp: int,
                                       force: bool = True) -> Dict[MessageQueue, int]:
-        """对应 Java resetOffsetByTimestampOld：逐队列 searchOffset 后按 force 决策写回。"""
+        pass
         client = self._require_client()
         route = self.examine_topic_route(topic)
         result: Dict[MessageQueue, int] = {}
@@ -1213,18 +1069,14 @@ class DefaultMQAdminExt:
 
     # ---------------- 消息查询 ----------------
     def query_message(self, topic: str, key: str, max_num: int, begin: int, end: int):
-        """对应 Java MQAdminImpl.queryMessage(正常 key)：查所有 broker + 客户端侧 key 二次校验。"""
+        pass
         from common.message_const import MessageConst
         return self._require_client().query_message_all_brokers(
             topic, key, max_num, begin, end,
             index_type=MessageConst.INDEX_KEY_TYPE, uniq_key=False)
 
     def query_message_by_uniq_key(self, topic: str, uniq_key: str) -> Optional[MessageExt]:
-        """对应 Java queryMessageByUniqKey：indexType="U" + extFields["_UNIQUE_KEY_QUERY"]="true"。
-
-        注意：broker 侧 uniqKey 索引只有 RocksDB 索引实现支持（IndexRocksDBStore）；
-        默认的文件索引下该查询可能返回空，这属于 broker 配置差异而非客户端问题。
-        """
+        pass
         from common.message_const import MessageConst
         messages = self._require_client().query_message_all_brokers(
             topic, uniq_key, 32, 0, int(time.time() * 1000) + 60 * 60 * 1000,
@@ -1239,14 +1091,7 @@ class DefaultMQAdminExt:
             index_type=MessageConst.INDEX_KEY_TYPE, uniq_key=False)
 
     def view_message(self, topic: str, msg_id: str) -> MessageExt:
-        """对应 Java DefaultMQAdminExtImpl.viewMessage（:578-587）。
-
-        Java 先按 offsetMsgId 解出 broker 地址 + commitLog 偏移走 VIEW_MESSAGE_BY_ID，
-        **任何**失败都退回按 UNIQ_KEY 查索引。必须留这条兜底：5.x 客户端的 msgId 是
-        客户端生成的 uniqKey，同样是 32 位十六进制，硬解会拼出一个不存在的 ip:port
-        （Java 取 4 字节端口所以永远落在 uint16 内，Python 不校验就会把 OverflowError
-        抛到调用方手里，异常契约直接破掉）。
-        """
+        pass
         by_id_error: Optional[Exception] = None
         try:
             ip, port, offset = decode_message_id(msg_id)
@@ -1259,7 +1104,7 @@ class DefaultMQAdminExt:
                 return decode_message(response.body)
             by_id_error = MQBrokerException(ResponseCode.NO_MESSAGE,
                                             "message not found: %s" % msg_id)
-        except Exception as e:  # noqa: BLE001 — Java 同样只 warn 后走兜底
+        except Exception as e:
             by_id_error = e
 
         found = self.query_message_by_uniq_key(topic, msg_id)
@@ -1280,14 +1125,9 @@ class DefaultMQAdminExt:
             return QueryConsumeQueueResponseBody()
         return QueryConsumeQueueResponseBody.decode(response.body)
 
-    # ---------------- 批量配置（Java 有实现、此前 Python 侧缺失） ----------------
     def create_and_update_topic_config_list(self, broker_addr: str,
                                             configs: List[TopicConfig]) -> None:
-        """对应 Java createAndUpdateTopicConfigList → UPDATE_AND_CREATE_TOPIC_LIST(18)。
-
-        wire 事实：custom header 为**空**（topic 名在 body 里做授权资源），
-        body 是 CreateTopicListRequestBody JSON，即 {"topicConfigList": [...]}。
-        """
+        pass
         if not configs:
             raise MQClientException("createAndUpdateTopicConfigList: empty topicConfigList")
         body = RemotingSerializable.encode(
@@ -1297,11 +1137,7 @@ class DefaultMQAdminExt:
 
     def create_and_update_subscription_group_config_list(
             self, broker_addr: str, configs: List[SubscriptionGroupConfig]) -> None:
-        """对应 Java createAndUpdateSubscriptionGroupConfigList → 225。
-
-        与 topic-list 同形，但 body 的 key 是 ``groupConfigList``；
-        单组版（200）的 body 是裸 SubscriptionGroupConfig 对象，两处字段名不同。
-        """
+        pass
         if not configs:
             raise MQClientException(
                 "createAndUpdateSubscriptionGroupConfigList: empty groupConfigList")
@@ -1313,12 +1149,7 @@ class DefaultMQAdminExt:
     def create_static_topic(self, broker_addr: str, default_topic: str,
                             config: TopicConfig, mapping_detail: Dict,
                             force: bool = False) -> None:
-        """对应 Java createStaticTopic → UPDATE_AND_CREATE_STATIC_TOPIC(513)。
-
-        header 复用 CreateTopicRequestHeader 字段（topic/defaultTopic/队列数/perm/
-        topicFilterType/topicSysFlag/order/force），body 是 TopicQueueMappingDetail
-        的 JSON 编码（单元化静态 topic 的映射文档）。
-        """
+        pass
         if config is None:
             raise MQClientException("createStaticTopic: config must not be None")
         if not mapping_detail:
@@ -1341,10 +1172,7 @@ class DefaultMQAdminExt:
     def update_and_get_group_read_forbidden(self, broker_addr: str, group: str,
                                             topic: str,
                                             readable: Optional[bool] = None) -> Dict:
-        """对应 Java updateAndGetGroupReadForbidden → UPDATE_AND_GET_GROUP_FORBIDDEN(353)。
-
-        readable=None 表示仅查询（Java 不设该字段）；响应体是 GroupForbidden JSON。
-        """
+        pass
         if not group or not topic:
             raise MQClientException("updateAndGetGroupReadForbidden: group/topic required")
         ext = {"group": group, "topic": topic}
@@ -1358,12 +1186,7 @@ class DefaultMQAdminExt:
 
     def resume_check_half_message(self, broker_addr: str, topic: str,
                                   msg_id: str = "") -> bool:
-        """对应 Java resumeCheckHalfMessage → RESUME_CHECK_HALF_MESSAGE(323)。
-
-        Java（MQClientAPIImpl:3279）对非 SUCCESS **返回 False 而不抛错**——
-        网络层异常才上抛；broker 拒绝（如 msgId 不是半消息，SYSTEM_ERROR）
-        通过返回值表达。
-        """
+        pass
         if not topic:
             raise MQClientException("resumeCheckHalfMessage: topic required")
         ext = {"topic": topic}
@@ -1379,12 +1202,7 @@ class DefaultMQAdminExt:
 
     def create_or_update_order_conf(self, key: str, value: str,
                                     is_cluster: bool = False) -> None:
-        """对应 Java createOrUpdateOrderConf：**不是独立请求**，是 NameServer KV
-        namespace=ORDER_TOPIC_CONFIG 上的读改写。
-
-        集群模式把 value 原样写入；非集群模式把存储值当作 ";" 分隔的
-        "topic:conf" 列表，替换 key 匹配的条目后整体写回。
-        """
+        pass
         if not key or not value:
             raise MQClientException("createOrUpdateOrderConf: key/value required")
         if is_cluster:
@@ -1392,7 +1210,7 @@ class DefaultMQAdminExt:
             return
         try:
             old_confs = self.get_kv_config(NAMESPACE_ORDER_TOPIC_CONFIG, key) or ""
-        except Exception:  # noqa: BLE001 — Java 打印后按空表继续（首写是常态）
+        except Exception:
             old_confs = ""
         entries: Dict[str, str] = {}
         for entry in old_confs.split(";"):
@@ -1410,13 +1228,13 @@ class DefaultMQAdminExt:
 
     # ---------------- 运维清理类 ----------------
     def clean_expired_consumer_queue(self, broker_addr: str, time_hours: int) -> None:
-        """对应 Java cleanExpiredConsumerQueue → CLEAN_EXPIRED_CONSUMEQUEUE(306)。"""
+        pass
         self._invoke_broker(broker_addr, RequestCode.CLEAN_EXPIRED_CONSUMEQUEUE,
                             {"time": time_hours})
 
     def clean_expired_consumer_queue_by_addr(self, addrs: List[str],
                                              time_hours: int) -> List[str]:
-        """对应 Java 的 ByAddr 形态：逐个地址执行，返回**失败的地址**列表。"""
+        pass
         failed = []
         for addr in addrs:
             try:
@@ -1426,13 +1244,13 @@ class DefaultMQAdminExt:
         return failed
 
     def delete_expired_commit_log(self, broker_addr: str, time_hours: int) -> None:
-        """对应 Java deleteExpiredCommitLog → DELETE_EXPIRED_COMMITLOG(329)。"""
+        pass
         self._invoke_broker(broker_addr, RequestCode.DELETE_EXPIRED_COMMITLOG,
                             {"time": time_hours})
 
     def delete_expired_commit_log_by_addr(self, addrs: List[str],
                                           time_hours: int) -> List[str]:
-        """对应 Java 的 ByAddr 形态：逐个地址执行，返回**失败的地址**列表。"""
+        pass
         failed = []
         for addr in addrs:
             try:
@@ -1442,17 +1260,11 @@ class DefaultMQAdminExt:
         return failed
 
     def clean_unused_topic_by_addr(self, broker_addr: str) -> None:
-        """对应 Java cleanUnusedTopicByAddr → MQClientAPIImpl:2696：**单请求**
-        CLEAN_UNUSED_TOPIC(316)，由 broker 自行清理未使用 topic。
-
-        客户端不要遍历 topic 表逐个删——broker 自建的 BenchmarkTest、
-        重试/死信 topic 会被 broker 以 SYSTEM_ERROR 拒绝。
-        """
+        pass
         self._invoke_broker(broker_addr, RequestCode.CLEAN_UNUSED_TOPIC)
 
     def query_consume_time_span(self, topic: str, group: str) -> List[Dict]:
-        """对应 Java queryConsumeTimeSpan：按路由遍历 master，聚合各 broker 的
-        QUERY_CONSUME_TIME_SPAN(303) 结果（body 是 consumeTimeSpanSet JSON）。"""
+        pass
         route = self.examine_topic_route(topic)
         spans: List[Dict] = []
         for bd in route.broker_datas:
@@ -1470,9 +1282,7 @@ class DefaultMQAdminExt:
     # ---------------- NameServer 配置（318/319） ----------------
     def update_name_server_config(self, properties: Dict[str, str],
                                   timeout_millis: Optional[int] = None) -> None:
-        """对应 Java updateNameServerConfig → UPDATE_NAMESRV_CONFIG(318)：
-        properties 以 **k=v\\n 文本**进 body，广播到每个 NameServer，
-        任一失败即抛（Java 记 errResponse 最后统一抛）。"""
+        pass
         text = MixAll.properties2_string(properties or {})
         if not text:
             return
@@ -1492,8 +1302,7 @@ class DefaultMQAdminExt:
 
     def get_name_server_config(self, namesrv_addrs: Optional[List[str]] = None,
                                timeout_millis: Optional[int] = None) -> Dict[str, Dict[str, str]]:
-        """对应 Java getNameServerConfig → GET_NAMESRV_CONFIG(319)：逐个 NameServer
-        查询，body 是 properties 文本；返回 {地址: properties 字典}。"""
+        pass
         client = self._require_client()
         targets = namesrv_addrs or list(client.name_server_addrs)
         result: Dict[str, Dict[str, str]] = {}
@@ -1504,7 +1313,7 @@ class DefaultMQAdminExt:
             try:
                 response = client._invoke_sync(ns_addr, request,
                                                timeout_millis or self.timeout_millis)
-            except Exception as e:  # noqa: BLE001 — Java 收集后统一抛
+            except Exception as e:
                 last_exc = e
                 continue
             if response.code != ResponseCode.SUCCESS:
@@ -1520,8 +1329,7 @@ class DefaultMQAdminExt:
     def set_message_request_mode(self, broker_addr: str, topic: str,
                                  consumer_group: str, mode: str,
                                  pop_share_queue_num: int = 0) -> None:
-        """对应 Java setMessageRequestMode → SET_MESSAGE_REQUEST_MODE(401)：
-        在 POP 与 Pull 模式间切换消费组（单元化场景）。"""
+        pass
         ext = {"topic": topic, "consumerGroup": consumer_group, "mode": mode}
         if pop_share_queue_num > 0:
             ext["popShareQueueNum"] = pop_share_queue_num
@@ -1531,7 +1339,7 @@ class DefaultMQAdminExt:
 
 # ---------------------------------------------------------------- 辅助
 def _perm_is_valid(value) -> bool:
-    """对应 Java PermName.isValid(String)（数字解析失败等价于抛 NumberFormatException）。"""
+    pass
     try:
         return PermName.is_valid(value)
     except (TypeError, ValueError):

@@ -1,10 +1,3 @@
-// -*- coding: utf-8 -*-
-// ACL signature (org.apache.rocketmq.acl.common.AclSigner) + RPC hook.
-// Signing rule (verified against python/verify_acl_java_parity.py):
-//   content = concat(sorted extField values, excluding "Signature") + body
-//   Signature = Base64(HMAC-SHA1(secretKey, content))
-//   AccessKey / SecurityToken MUST be written into extFields BEFORE signing.
-//   The hook runs BEFORE cmd.encode() (sign over the exact bytes that go on the wire).
 import crypto from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { RemotingCommand } from './remotingCommand.ts';

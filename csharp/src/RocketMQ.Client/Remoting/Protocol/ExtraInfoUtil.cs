@@ -1,16 +1,8 @@
-// ExtraInfoUtil 的 C# 移植（对应 org.apache.rocketmq.remoting.protocol.header.ExtraInfoUtil）。
-//
 // POP 的 CK（checkpoint）串是 broker 与客户端交换消费进度的载体：
 //   ckQueueOffset popTime invisibleTime reviveQid retryFlag brokerName queueId [msgQueueOffset]
 //
 // ⚠ 普通 topic 直连 POP 时 broker **不在消息上写** POP_CK，它是客户端用响应头的
 //   startOffsetInfo/msgOffsetInfo 反构出来的（见 MqClient.StampPopCk）。没有它就发不了 ACK。
-//
-// 两个最容易错的细节：
-//   1) 分段符是**空格**（MessageConst.KEY_SEPARATOR = " "），不是逗号；";" 只用于分隔
-//      "多个队列" 的段。
-//   2) Java 的 String.split(" ") 会**丢弃末尾空串**（limit=0 语义），C# 的 Split(' ') 不会。
-//      这里必须显式丢弃，否则长度下限校验（如 GetQueueOffset 要求 ≥8 段）会与 Java 分歧。
 using System.Globalization;
 using RocketMQ.Common;
 
@@ -32,9 +24,6 @@ public static class ExtraInfoUtil
     /// <summary>KeyBuilder.POP_ORDER_REVIVE_QUEUE —— reviveQid 为它表示顺序消费。</summary>
     public const int PopOrderReviveQueue = 999;
 
-    /// <summary>
-    /// Java ExtraInfoUtil.split：按空格切分并**丢弃末尾空串**（String.split 的 limit=0 语义）。
-    /// </summary>
     public static string[] Split(string extraInfo)
     {
         if (extraInfo is null)
@@ -107,17 +96,12 @@ public static class ExtraInfoUtil
         return long.Parse(extraInfoStrs[7], CultureInfo.InvariantCulture);
     }
 
-    /// <summary>Java ExtraInfoUtil.getRealTopic(String[] extraInfoStrs, topic, cid)：按第 5 段判定。</summary>
     public static string GetRealTopic(string[] extraInfoStrs, string topic, string cid)
     {
         RequireLength(extraInfoStrs, 5, "getRealTopic");
         return GetRealTopic(topic, cid, extraInfoStrs[4]);
     }
 
-    /// <summary>
-    /// retryFlag → 真实 topic。拼接规则来自 Java KeyBuilder.buildPopRetryTopicV1/V2：
-    /// V1 = "%RETRY%{cid}_{topic}"，V2 = "%RETRY%{cid}+{topic}"。
-    /// </summary>
     public static string GetRealTopic(string topic, string cid, string retry)
     {
         if (retry == NormalTopic)
@@ -138,14 +122,9 @@ public static class ExtraInfoUtil
         throw new ArgumentException("getRetry fail, format is wrong");
     }
 
-    /// <summary>
-    /// Java KeyBuilder.buildPopRetryTopicV1：POP 的复活/重投 topic 是
-    /// "%RETRY%{cid}_{topic}"，**与 push 消费的 "%RETRY%{group}" 是两套不同的 topic**。
-    /// </summary>
     public static string BuildPopRetryTopicV1(string topic, string cid) =>
         MixAll.RetryGroupTopicPrefix + cid + "_" + topic;
 
-    /// <summary>Java KeyBuilder.buildPopRetryTopicV2（enableRetryTopicV2=true 时）。</summary>
     public static string BuildPopRetryTopicV2(string topic, string cid) =>
         MixAll.RetryGroupTopicPrefix + cid + "+" + topic;
 
@@ -169,10 +148,6 @@ public static class ExtraInfoUtil
             + KeySeparator + msgQueueOffset.ToString(CultureInfo.InvariantCulture);
     }
 
-    /// <summary>
-    /// Java ExtraInfoUtil.parseStartOffsetInfo。空/null → null；每段必须正好 3 列，
-    /// key = "{retry}@{queueId}"，重复 key 抛异常。
-    /// </summary>
     public static Dictionary<string, long>? ParseStartOffsetInfo(string? startOffsetInfo)
     {
         var map = new Dictionary<string, long>(4);
@@ -196,7 +171,6 @@ public static class ExtraInfoUtil
         return map;
     }
 
-    /// <summary>Java ExtraInfoUtil.parseMsgOffsetInfo：第 3 列是逗号分隔的 offset 列表。</summary>
     public static Dictionary<string, List<long>>? ParseMsgOffsetInfo(string? msgOffsetInfo)
     {
         var map = new Dictionary<string, List<long>>(4);
@@ -225,7 +199,6 @@ public static class ExtraInfoUtil
         return map;
     }
 
-    /// <summary>Java ExtraInfoUtil.parseOrderCountInfo：第 3 列是该队列顺序消费的计数。</summary>
     public static Dictionary<string, int>? ParseOrderCountInfo(string? orderCountInfo)
     {
         var map = new Dictionary<string, int>(4);
@@ -252,7 +225,6 @@ public static class ExtraInfoUtil
     public static string GetStartOffsetInfoMapKey(string topic, long key) =>
         RetryOfTopic(topic) + "@" + key.ToString(CultureInfo.InvariantCulture);
 
-    /// <summary>Java 的同名重载：popCk 非 null 时用 CK 的第 5 段当 retryFlag，否则退回按 topic 形状判定。</summary>
     public static string GetStartOffsetInfoMapKey(string topic, string? popCk, long key) =>
         (popCk is null ? RetryOfTopic(topic) : GetRetry(Split(popCk))) + "@"
             + key.ToString(CultureInfo.InvariantCulture);
@@ -264,13 +236,8 @@ public static class ExtraInfoUtil
     public static string GetQueueOffsetMapKey(string topic, long queueId, long queueOffset) =>
         RetryOfTopic(topic) + "@" + GetQueueOffsetKeyValueKey(queueId, queueOffset);
 
-    /// <summary>Java ExtraInfoUtil.isOrder：reviveQid == POP_ORDER_REVIVE_QUEUE(999) 即顺序消费。</summary>
     public static bool IsOrder(string[] extraInfo) => GetReviveQid(extraInfo) == PopOrderReviveQueue;
 
-    /// <summary>
-    /// Java ExtraInfoUtil.getRetry(topic)。判定顺序很重要：先判 V2（"%RETRY%" 且含 '+'），
-    /// 再判 "%RETRY%" 前缀（V1）。
-    /// </summary>
     public static string RetryOfTopic(string topic)
     {
         if (IsPopRetryTopicV2(topic))
@@ -283,7 +250,6 @@ public static class ExtraInfoUtil
             : NormalTopic;
     }
 
-    /// <summary>Java KeyBuilder.isPopRetryTopicV2。</summary>
     public static bool IsPopRetryTopicV2(string retryTopic) =>
         retryTopic.StartsWith(MixAll.RetryGroupTopicPrefix, StringComparison.Ordinal)
             && retryTopic.Contains('+', StringComparison.Ordinal);
@@ -297,10 +263,6 @@ public static class ExtraInfoUtil
         }
     }
 
-    /// <summary>
-    /// parseStartOffsetInfo / parseMsgOffsetInfo / parseOrderCountInfo 共用的切分：
-    /// 空输入 → false（对应 Java 返回 null）；否则每段必须正好 3 列。
-    /// </summary>
     private static bool ParseThreeColumnSegments(string? info, string errorPrefix, out string[][]? rows)
     {
         rows = null;
@@ -309,7 +271,6 @@ public static class ExtraInfoUtil
             return false;
         }
 
-        // Java 用 indexOf(";") < 0 判断是否需要切分：这决定 "a b c" 与 "a b c;" 的不同处理。
         string[] segs = info.IndexOf(QueueSplitter) < 0 ? new[] { info } : info.Split(QueueSplitter);
         var parsed = new string[segs.Length][];
         for (int i = 0; i < segs.Length; i++)
@@ -327,7 +288,6 @@ public static class ExtraInfoUtil
         return true;
     }
 
-    /// <summary>异常信息里的 map 文本（Java 直接 toString 一个空 map，这里复刻语义即可）。</summary>
     private static string ToDebugString<TKey, TValue>(Dictionary<TKey, TValue> map) where TKey : notnull =>
         "{" + string.Join(", ", map.Keys.Select(k => k.ToString())) + "}";
 }

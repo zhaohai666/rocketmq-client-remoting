@@ -328,7 +328,7 @@ def test_invoke_sync_over_socks5_no_auth():
 
 
 def test_socks5_domain_target_reaches_proxy_unresolved():
-    """目标写域名：本地不解析，原样交给代理（atyp=3），对齐 Java NoopAddressResolver。"""
+    pass
     proxy = FakeSocksProxy()
     try:
         client = RemotingClient(
@@ -489,7 +489,6 @@ def test_socks_proxy_disabled_falls_back_to_direct():
 # ---------------------------------------------------------------- 配置载体
 
 def test_socks_proxy_config_parsing_and_semantics():
-    # host:port 合写（Java SocksProxyConfig 的 addr 形状）
     cfg = SocksProxyConfig("127.0.0.1:1080")
     assert cfg.addr == "127.0.0.1" and cfg.port == 1080
     assert cfg.proxy_type == SOCKS5

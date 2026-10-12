@@ -1,6 +1,3 @@
-// POP **消费侧**真机验证（对齐 Java ConsumeMessagePopConcurrentlyService）。
-// 用法：rmq popc [namesrv]
-//
 // 与 rmq pop（协议管道）的区别：这里验证**消费循环** ——
 //   POP 弹出 → 投递 listener → 成功则 ack、失败则延长不可见时间 → 不重复投递。
 // 消费循环不查/不提交消费位点，进度完全由 broker 的 checkpoint 跟踪。
@@ -258,13 +255,6 @@ public static class LivePopConsumer
         c2.Shutdown();
         p2.Shutdown();
 
-        // ---------------- S5：POP 循环把 pullRT/pullTPS 写进 307 状态表 ----------------
-        // Java 的 popMessage 回调（DefaultMQPushConsumerImpl:556-563）与 pull 回调一样要把
-        // IncPullRT / IncPullTPS 记进状态表，307 应答的 statusTable 就靠这两格。POP 循环漏掉
-        // 它们是**静默**的：消息照弹照 ack、消费完全正常，只有运维看板上一片 0 —— 而看板上
-        // "这个消费者没在拉取"和"这个消费者压根没起来"是两种完全不同的处置。
-        // ⚠ 快照每 10s 采样一次、窗口取 minute 差分，所以必须**持续有流量**并跨过两个采样点，
-        //   否则 pullTPS 仍是 0，那是夹具不够长，不是判据错。
         Console.WriteLine("=== S5 POP 循环把 pullRT/pullTPS 写进 307 状态表 ===");
         var statsListener = new SuccessListener();
         var c5 = new DefaultMQPushConsumer(groupStats);

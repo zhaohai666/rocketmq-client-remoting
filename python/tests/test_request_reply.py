@@ -1,15 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Request-Reply（5.x）客户端侧单测。
-
-覆盖三层：
-1. 纯数据/等待槽逻辑（``RequestResponseFuture`` / ``RequestFutureHolder`` /
-   ``create_reply_message``）—— 不需要网络；
-2. 线上编码：应答消息必须选 ``SEND_REPLY_MESSAGE_V2(325)`` 而不是
-   ``SEND_MESSAGE_V2(310)``，否则 broker 不会走 ReplyMessageProcessor；批量消息选
-   ``SEND_BATCH_MESSAGE(320)``，与 Java ``msg instanceof MessageBatch`` 同判据。
-3. broker 回推入口 ``MQClientInstance._process_reply_message(326)`` —— 必须把应答
-   投进等待槽，并且**回一个响应**（broker 侧是 invokeSync，不回响应它那边会超时）。
-"""
 from __future__ import annotations
 
 import threading
@@ -47,7 +36,6 @@ def _request_msg() -> Message:
 # ---------------------------------------------------------------- 应答消息构造
 def test_create_reply_message_matches_the_wire_shape():
     reply = create_reply_message(_request_msg(), b"pong")
-    # topic 必须是 <cluster>_REPLY_TOPIC（Java MixAll.getReplyTopic）
     assert reply.topic == "DefaultCluster_REPLY_TOPIC"
     assert reply.get_body() == b"pong"
     # 四个属性一个都不能少，且 CORRELATION_ID/REPLY_TO_CLIENT/TTL 是原样带回
@@ -58,9 +46,6 @@ def test_create_reply_message_matches_the_wire_shape():
 
 
 def test_create_reply_message_requires_cluster():
-    # CLUSTER 由 broker 写入；没有它说明这条消息不是 broker 转来的，Java 同样抛错。
-    # 抛的是带 10007 的 MQClientException（MessageUtil:46/49），不是裸 ValueError：
-    # 应答方写在业务 listener 里时只能按 response_code 分流。
     m = Message(BASE_TOPIC, b"ping")
     m.put_property(MessageConst.PROPERTY_CORRELATION_ID, "corr-1")
     with pytest.raises(MQClientException) as ei:
@@ -77,7 +62,6 @@ def test_is_reply_message_flag():
     reply = create_reply_message(_request_msg(), b"pong")
     assert is_reply_message(reply) is True
     assert is_reply_message(Message(BASE_TOPIC, b"x")) is False
-    # 大小写敏感：Java 是 equals("reply")
     other = Message(BASE_TOPIC, b"x")
     other.put_property(MessageConst.PROPERTY_MESSAGE_TYPE, "Reply")
     assert is_reply_message(other) is False
@@ -98,8 +82,6 @@ def test_correlation_id_is_random():
 
 
 def test_future_wait_times_out_returns_none():
-    # 等待预算必须明显大于 future 的超时预算：is_timeout 用的是严格大于（同 Java），
-    # 而系统等待可能比截止时刻早一丁点返回，两者相等时忙机上这条断言会抖。
     f = RequestResponseFuture("c1", 20)
     assert f.wait_response_message(200) is None
     assert f.is_timeout() is True
@@ -114,7 +96,7 @@ def test_future_is_woken_by_put_response():
 
 
 def test_holder_put_response_removes_entry():
-    """Java 用 remove 抢所有权：应答到达与超时清理只能有一个生效。"""
+    pass
     holder = RequestFutureHolder()
     f = RequestResponseFuture("c1", 1000)
     holder.put_request("c1", f)
@@ -138,7 +120,6 @@ def test_global_holder_is_module_singleton():
 
 
 def test_request_timeout_exception_is_mq_client_exception():
-    # Java: RequestTimeoutException extends MQClientException
     assert issubclass(RequestTimeoutException, MQClientException)
 
 
@@ -166,15 +147,7 @@ def test_normal_send_still_uses_send_message_v2():
 
 
 def test_batch_send_uses_send_batch_message_code():
-    """对齐 Java MQClientAPIImpl.sendMessage:562 —— 判据是 msg instanceof MessageBatch，
-    批量走 SEND_BATCH_MESSAGE(320)。
-
-    同时断言 V2 头的单字母键 ``m``（Java 里 batch 映射到 m，
-    SendMessageRequestHeaderV2:127）必须是 true：broker 真正决定「按批量写入还是单条
-    写入」的是这个字段（SendMessageProcessor:117 读 requestHeader.isBatch()），
-    请求码只影响服务端按码做的统计/鉴权归类。两者不一致时 broker 会按单条解析批量
-    body，所以必须成对断言。
-    """
+    pass
     inst = _make_instance()
     batch = MessageBatch.generate_from_list(
         [Message(BASE_TOPIC, ("b-%d" % i).encode("utf-8")) for i in range(3)])
@@ -185,8 +158,7 @@ def test_batch_send_uses_send_batch_message_code():
 
 
 def test_reply_wins_over_batch_in_the_send_code():
-    """Java MQClientAPIImpl:552-563 先判 isReply 再判 instanceof MessageBatch，
-    所以「带 reply 属性的批量」仍然走 325 —— 判据顺序不能写反。"""
+    pass
     inst = _make_instance()
     batch = MessageBatch.generate_from_list([Message(BASE_TOPIC, b"r-0")])
     batch.put_property(MessageConst.PROPERTY_MESSAGE_TYPE, MixAll.REPLY_MESSAGE_FLAG)

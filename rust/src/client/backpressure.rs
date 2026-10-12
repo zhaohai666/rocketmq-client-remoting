@@ -1,11 +1,3 @@
-//! 异步发送背压（对应 Java `DefaultMQProducer:169/175/181` 的三个配置、
-//! `DefaultMQProducerImpl:122-153` 的两个公平信号量、`:635-682` 的
-//! `executeAsyncMessageSend` 闸门和 `:577-633` 的 `BackpressureSendCallBack`，
-//! 逐条对齐 `python/client/backpressure.py`）。
-//!
-//! Java 的开关默认是**关**的。开了之后，异步发送在把任务投进 `AsyncSenderExecutor`
-//! **之前**先按两个维度限流：
-//!
 //! * `semaphoreAsyncSendNum` —— 在途**条数**，`back_pressure_for_async_send_num` 默认 1024，
 //!   地板 10；
 //! * `semaphoreAsyncSendSize` —— 在途**字节数**，`back_pressure_for_async_send_size` 默认 100M，
@@ -16,19 +8,6 @@
 //! （第二个是 `...semaphoreAsyncSize timeout`），一次请求都不会发出去。
 //!
 //! # 与 Python/C++/C# 端口的两处结构差别
-//!
-//! 1. **等待是 async 的**：`try_acquire` 是 `async fn`，等不到许可时让出执行器而不是
-//!    占住线程。Java/Python/C++/C# 都在调用方线程上阻塞等，这里不能照做 —— 生产者
-//!    往往就跑在唯一的 tokio 工作线程上，把它 park 住会让**正要归还许可**的那个完成
-//!    永远得不到调度，单线程运行时直接锁死。闸门因此落在被 spawn 出去的发送任务里
-//!    （见 [`crate::client::producer::DefaultMQProducer::send_async`] 的文档）。
-//! 2. **取消安全**：阻塞式实现没有「等到一半被丢弃」这种状态，Rust 有（`select!`、
-//!    任务被 abort）。所以排队票据由 [`Ticket`] 的 `Drop` 负责摘除，future 半路被丢弃
-//!    不会在队列里留下幽灵票挡住后面的人。
-//!
-//! 其余语义与 Python 端口一致：只有**队首**能拿许可（公平的全部意义所在）、
-//! `set_total_permits` 在同一个对象上平移总量（Java 是 `new Semaphore(num - acquired)`
-//! 换对象，靠 `ReadWriteCASLock` 兜住丢等待者的问题）、`release` 不校验是否超过总量。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,9 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::rmq_info;
 
-/// Java `DefaultMQProducerImpl:141-153` 的两个地板值：在途条数最少 10 笔。
 pub const MIN_ASYNC_SEND_NUM: i64 = 10;
-/// Java 同上：在途字节数最少 1M。
 pub const MIN_ASYNC_SEND_SIZE: i64 = 1024 * 1024;
 
 /// 一个还在排队的许可申请（只为让队首能被稳定识别，不代表已拿到许可）。
@@ -60,25 +37,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 对应 Java `new Semaphore(permits, true)`：**公平**的计数信号量。
-///
-/// 公平是这套背压的全部意义所在 —— 非公平的话一个持续涌入的生产者能让早到的请求
-/// 无限插队，Java 正是为了不插队才显式传 `true`。所以这里只有**队首**能拿许可，
-/// 后面的请求即使空闲许可够它也不许插队（Java 公平模式下 `tryAcquire(permits,…)`
-/// 对多条待批请求同样只看队首）。
-///
-/// 另外支持 Java 没有直接提供的一件事：[`set_total_permits`](Self::set_total_permits)
-/// 在**同一个对象**上平移总量。Java 的运行时改容量
-/// （`DefaultMQProducer:1383-1391` → `setSemaphoreAsyncSendNum`）是
-/// `new Semaphore(num - acquired)` **换掉整个对象**，靠 `ReadWriteCASLock` 的写锁保证
-/// 换的瞬间没有线程正阻塞在旧对象上（否则那些等待者永远不会被新对象叫醒，只能等到自己
-/// 超时）。本实现把所有状态放在同一把锁里改，于是：
-///
 /// * 不需要那层自旋读写锁 —— 改容量与拿/还许可在对象内部天然互斥；
 /// * 改容量不会把等待者丢在旧对象上，改完它们会带着新容量继续等。
-///
-/// 可观察结果与 Java 一致：在途份数原样保留、空闲许可 = 新总量 - 在途份数
-/// （Java 的原测试断言的正是这个和，见 `DefaultMQProducerTest:593-595`）。
 pub struct FairSemaphore {
     state: Mutex<State>,
     /// 对应 Python 的 `threading.Condition`：这里「广播」= `notify_waiters`，
@@ -88,7 +48,6 @@ pub struct FairSemaphore {
 }
 
 impl FairSemaphore {
-    /// 对应 Java `new Semaphore(permits, true)`。
     pub fn new(permits: i64) -> FairSemaphore {
         FairSemaphore {
             state: Mutex::new(State {
@@ -101,9 +60,6 @@ impl FairSemaphore {
         }
     }
 
-    /// 对应 Java `tryAcquire(permits, timeout, MILLIS)`：拿不到就返回 `false`，
-    /// 不报错（Java 也只有被 interrupt 才抛）。
-    ///
     /// ⚠ 拿到许可和**放弃排队**这两个出口都必须再叫醒一次：公平模式下只有队首能拿，
     /// 队首一换人，后面的申请就可能从「轮不到我」变成「该我了」，而它的 `permits` 数量
     /// 未必被前一个人的动作影响（队首要 5 个、空闲 6 个时，队首拿走 5 个后剩下 1 个，
@@ -156,8 +112,6 @@ impl FairSemaphore {
         granted
     }
 
-    /// 对应 Java `release(permits)`：**可以超过总量**（Java 同样不做校验），
-    /// 所以一次改小容量的窗口里多还几次不会丢计数。
     pub fn release(&self, permits: i64) {
         if permits <= 0 {
             return;
@@ -178,21 +132,16 @@ impl FairSemaphore {
         lock(&self.state).total
     }
 
-    /// 正在等许可的任务数（Java `Semaphore#getQueueLength`）。观测/测试用 —— 公平性只有
-    /// 从这里才看得出，许可本身谁拿到了是看不出的。
     pub fn waiting_count(&self) -> usize {
         lock(&self.state).queue.len()
     }
 
-    /// 把总量平移到 `total`，在途份数原样保留（可能算出负的空闲许可 ——
-    /// Java `new Semaphore(负数)` 同样接受，归还许可会把它拉回正数）。
     pub fn set_total_permits(&self, total: i64) {
         {
             let mut state = lock(&self.state);
             state.free += total - state.total;
             state.total = total;
         }
-        // 改容量也要叫醒：Java 换对象时正等在旧对象上的人永远醒不过来，这里没那个问题
         self.wake.notify_waiters();
     }
 }
@@ -233,9 +182,6 @@ impl Drop for Ticket<'_> {
     }
 }
 
-/// 建信号量时对越界配置的兜底（Java `DefaultMQProducerImpl:141-153` 的
-/// `cfg > floor ? new Semaphore(max(cfg, floor)) : new Semaphore(floor)` 分支，
-/// 恰好等于地板值时也会打这条日志）。
 pub fn back_pressure_permits(configured: i64, floor: i64, name: &str) -> i64 {
     if configured > floor {
         return configured;
@@ -300,7 +246,6 @@ mod tests {
         assert_eq!(sem.available_permits(), 1);
         sem.release(2);
         assert_eq!(sem.available_permits(), 3);
-        // 超过总量的归还 Java 也不校验，照单收下
         sem.release(5);
         assert_eq!(sem.available_permits(), 8);
         assert_eq!(sem.total_permits(), 3);
@@ -362,7 +307,6 @@ mod tests {
         let sem = semaphore(10);
         assert!(sem.try_acquire(4, 0).await);
         assert_eq!(sem.available_permits(), 6);
-        // Java 的 `new Semaphore(num - acquired)`：空闲 = 新总量 - 在途
         sem.set_total_permits(7);
         assert_eq!(sem.available_permits(), 3);
         assert_eq!(sem.total_permits(), 7);

@@ -17,10 +17,6 @@
 //   S6 pull / lite 的组名门 + 合法 pull 组查队列与位点
 //   S7 CreateTopic 的本地拒（空白 / 非法字符 / 系统 topic）
 //   S8 寻址故障（10004 一个 name server 地址都没有）不能被说成"topic 没路由"（10005）
-//
-// 码值口径（四语言一致）：Java 的 MQClientException(String, Throwable) 用 responseCode=-1
-// 表示「纯客户端错误」；本工程（Python 先定、其余照抄）用 SystemError/UNKNOWN=1，
-// 只有 CheckMessage 的 body 档位与 LMQ 分隔符带 MessageIllegal(13)。
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -265,7 +261,6 @@ public static class LiveValidators
             }),
             "the message body length is zero", ResponseCode.MessageIllegal);
 
-        // 同质性检查在 Java 抛 IllegalArgumentException（不是 MQClientException）—— 码记 0
         Captured mixed = Capture(() => p.SendBatch(new List<Message>
         {
             new(topic, Bytes("ok-1")),
@@ -296,7 +291,6 @@ public static class LiveValidators
             ExpectStartReject(label, () => prod.IsStarted, () => prod.Start(), needle);
         }
 
-        // 等长边界：120 字符必须放行（Java 用 >，不是 >=）；这里真起起来再关掉
         var edge = new DefaultMQProducer(RepeatedChar('g', 120)) { NamesrvAddr = _namesrv };
         Captured c = Capture(edge.Start);
         Check("S3d 120 字符组名放行（长度判定是 > 而非 >=）",
@@ -513,13 +507,6 @@ public static class LiveValidators
 
     /// <summary>
     /// S8：寻址故障（10004）不能伪装成"topic 没路由"（10005）。
-    ///
-    /// Java <c>DefaultMQProducerImpl#validateNameServerSetting</c>（:729）在三条"拿不到路由"
-    /// 分支的最前面跑：一个 name server 地址都没有 → 10004「No name server address,
-    /// please set it.」；地址在、只是这个 topic 查不到 → 才是 10005。少了这一步，把地址
-    /// 服务器配错（或它返回空列表）的人看到的会是"这个 topic 不存在"，于是去查建 topic /
-    /// 查权限，而真正坏的是寻址 —— 错方向的排障能耗掉半小时。
-    /// </summary>
     private static void S8NameServerAddressing(string topic)
     {
         Console.WriteLine("== S8 10004（没配 name server）vs 10005（topic 没路由）的分界 ==");

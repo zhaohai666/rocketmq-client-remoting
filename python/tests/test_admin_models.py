@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""管理端 DTO / fastjson2 兼容解析的单元测试。
-
-这里的 JSON 样例**全部由真实 Java 探针产出**（fastjson2 2.0.64 + rocketmq 5.5.1
-的 classpath，`JSON.toJSONString(obj)`），不是手写猜测的。最关键的一条：
-TopicStatsTable / ConsumeStats / ResetOffsetBody 的 Map 键是 MessageQueue，
-fastjson2 会把键内联成 JSON 对象，产出**非法 JSON**，标准 json.loads 直接失败。
-"""
 from __future__ import annotations
 
 import json
@@ -23,25 +16,20 @@ from remoting.protocol.subscription import (GroupRetryPolicy, SubscriptionGroupC
                                                      SubscriptionGroupWrapper)
 
 
-# ---------------------------------------------------------------- fastjson2 解析器
-# Java 探针输出：JSON.toJSONString(new TopicStatsTable())，键为 MessageQueue
 FASTJSON_TOPIC_STATS = ('{"offsetTable":{{"brokerName":"broker-a","queueId":3,'
                     '"topic":"MyTopic"}:{"lastUpdateTimestamp":1700000000000,'
                     '"maxOffset":500,"minOffset":0}},"topicPutTps":0.0}')
 
-# Java 探针输出：JSON.toJSONString(new ConsumeStats())
 FASTJSON_CONSUME_STATS = ('{"consumeTps":1.5,"offsetTable":{{"brokerName":"broker-a",'
                       '"queueId":3,"topic":"MyTopic"}:{"brokerOffset":100,'
                       '"consumerOffset":90,"lastTimestamp":1700000000000,'
                       '"pullOffset":0}}}')
 
-# Java 探针输出：JSON.toJSONString(new TopicConfig("attr-topic"))
 FASTJSON_TOPIC_CONFIG = ('{"attributes":{"+fileReservedTime":"72","+deleteWhen":"04"},'
                      '"order":false,"perm":6,"readQueueNums":16,'
                      '"topicFilterType":"SINGLE_TAG","topicName":"attr-topic",'
                      '"topicSysFlag":0,"writeQueueNums":16}')
 
-# Java 探针输出：JSON.toJSONString(new SubscriptionGroupConfig())（groupName=MyGroup）
 FASTJSON_SUB_GROUP = ('{"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,'
                   '"consumeEnable":true,"consumeFromMinEnable":true,'
                   '"consumeMessageOrderly":false,"consumeTimeoutMinute":15,'
@@ -121,12 +109,12 @@ def test_consume_stats_decode_and_lag():
 
 
 def test_offset_wrapper_lag_is_broker_minus_consumer():
-    """Java OffsetWrapper.getLag() = brokerOffset - consumerOffset（可为负）。"""
+    pass
     assert OffsetWrapper(broker_offset=5, consumer_offset=9).lag == -4
 
 
 def test_reset_offset_body_is_mq_keyed():
-    """Java ResetOffsetBody.offsetTable 是 Map<MessageQueue, Long>。"""
+    pass
     raw = ('{"offsetTable":{{"brokerName":"b","queueId":0,"topic":"T"}:10,'
            '{"brokerName":"b","queueId":1,"topic":"T"}:20}}')
     body = ResetOffsetBody.decode(raw.encode("utf-8"))
@@ -137,12 +125,7 @@ def test_reset_offset_body_is_mq_keyed():
 
 
 def test_consume_stats_list_uses_the_server_field_name():
-    """Java `ConsumeStatsList` 的 JSON 键是 `consumeStatsList`，不是 `statsList`。
-
-    写错键名时真实 broker 的 341 响应会解析成空集合，看着像「这个 broker 没有积压」。
-    `totalDiff` / `totalInflightDiff` 是 Java 的 long 原语字段，恒出现在 JSON 里；
-    `brokerAddr` 是 String，走 NON_NULL 所以 None 时整键消失。
-    """
+    pass
     from remoting.protocol.body import ConsumeStatsList
 
     raw = (b'{"consumeStatsList":[{"G_BROKER":[{"offsetTable":{}}]}],'
@@ -164,7 +147,7 @@ def test_consume_stats_list_uses_the_server_field_name():
 
 
 def test_topic_config_server_side_defaults():
-    """Java: new TopicConfig("t") → 16/16 队列、perm=6、SINGLE_TAG、attributes={}。"""
+    pass
     cfg = TopicConfig("t")
     assert cfg.read_queue_nums == 16
     assert cfg.write_queue_nums == 16
@@ -225,7 +208,7 @@ def test_subscription_group_round_trip():
 
 # ---------------------------------------------------------------- MixAll properties
 def test_properties_text_round_trip_matches_the_server_format():
-    """Java Properties.load 语义：键去空白、值只去左空白、支持 \\ 续行。"""
+    pass
     from common.mix_all import MixAll
     text = "a = b\n  c : d  \nk=v\n#comment\n!c2\nempty=\ncont=first\\\n    second\n"
     props = MixAll.string2_properties(text)
@@ -241,11 +224,7 @@ def test_properties_text_round_trip_matches_the_server_format():
 
 
 def test_properties_whitespace_is_a_valid_separator():
-    """java.util.Properties.load 里**空白也是键值分隔符**（不只是 '=' / ':'）。
-
-    真实 broker 导出的配置永远是 "k=v"，所以这条不会在日常链路暴露；
-    但语义必须对齐 Java，否则遇到 "k v" 这类行会解析出错键。
-    """
+    pass
     from common.mix_all import MixAll
     props = MixAll.string2_properties("a b\nonlykey\nk=v\n")
     assert props["a"] == "b", props
@@ -260,7 +239,7 @@ def test_properties_whitespace_is_a_valid_separator():
 
 
 def test_perm_name_is_valid_matches_the_server_rule():
-    """Java PermName.isValid(perm) = perm >= 0 && perm < PERM_PRIORITY(8)。"""
+    pass
     from common.sysflag import PermName
     assert PermName.is_valid(0) is True
     assert PermName.is_valid(7) is True
@@ -279,7 +258,7 @@ def test_mix_all_group_helpers():
 
 
 def test_unique_msg_query_flag_is_extfield_name():
-    """Java MixAll.UNIQUE_MSG_QUERY_FLAG = "_UNIQUE_KEY_QUERY"（是键名，不是数字）。"""
+    pass
     from common.mix_all import MixAll, QueryMsgType
     assert MixAll.UNIQUE_MSG_QUERY_FLAG == "_UNIQUE_KEY_QUERY"
     assert QueryMsgType.UNIQUE_KEY == 1

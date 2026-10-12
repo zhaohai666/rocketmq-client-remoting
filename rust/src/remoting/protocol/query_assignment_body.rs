@@ -1,16 +1,3 @@
-//! `QUERY_ASSIGNMENT(400)` 报文（对应 Java `remoting.protocol.body` 的
-//! `QueryAssignmentRequestBody` / `QueryAssignmentResponseBody` 与 `common.message`
-//! 的 `MessageQueueAssignment`）。
-//!
-//! 与 `SET_MESSAGE_REQUEST_MODE(401)` 同款：**请求没有自定义头**，全部信息走 body，
-//! broker 按 Java 属性名反序列化，所以 JSON 键名必须逐字对齐
-//! （`topic` / `consumerGroup` / `clientId` / `strategyName` / `messageModel`）。
-//! 响应是 `QueryAssignmentResponseBody`，其 `messageQueueAssignments` 在 Java 侧是
-//! **Set**，fastjson2 序列化成对象数组（元素由 [`MessageQueueAssignment`] 解析）。
-//!
-//! ## null 与空集的语义分界（Java `QueryAssignmentProcessor#doLoadBalance` 的 javadoc，
-//! Java `RebalanceImpl#getRebalanceResultFromBroker` 照此执行）
-//!
 //! - `assignments == null`（body 为空 / 缺键 / 显式 null）→ 「无效结果」，客户端
 //!   **跳过本轮更新、保留上一次分配**；[`QueryAssignmentResponseBody::decode`] 回 `None`。
 //! - `assignments == 空数组` → 「清除我之前拿到的全部负载」；decode 回 `Some(vec![])`。
@@ -24,16 +11,11 @@ use super::heartbeat::MessageModel;
 use super::serialize::RemotingSerializable;
 use crate::error::{Error, Result};
 
-/// `MessageRequestMode.POP` 的枚举名（Java fastjson2 按枚举 name 序列化）。
 pub const MESSAGE_REQUEST_MODE_POP: &str = "POP";
-/// `MessageRequestMode.PULL` 的枚举名；Java `MessageQueueAssignment` 的 mode
-/// 字段初始值就是 `PULL`，缺省不得另造。
 pub const MESSAGE_REQUEST_MODE_PULL: &str = "PULL";
 
 // ---------------------------------------------------------------- 请求体
 
-/// Java `QueryAssignmentRequestBody`：broker 依此**在服务端跑负载均衡**
-/// （strategyName + messageModel 决定用哪个策略、按哪种模式分）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueryAssignmentRequestBody {
     pub topic: String,
@@ -65,7 +47,6 @@ impl QueryAssignmentRequestBody {
     }
 
     pub fn to_json_value(&self) -> Value {
-        // 键序 = Java 字段声明序（topic, consumerGroup, clientId, strategyName, messageModel）
         json_object(vec![
             ("topic", Value::String(self.topic.clone())),
             ("consumerGroup", Value::String(self.consumer_group.clone())),
@@ -82,8 +63,6 @@ impl QueryAssignmentRequestBody {
             consumer_group: jstring(value, "consumerGroup").unwrap_or_default(),
             client_id: jstring(value, "clientId").unwrap_or_default(),
             strategy_name: jstring(value, "strategyName").unwrap_or_default(),
-            // Java 侧 messageModel 为 null 时 broker 的 switch 走 default 分支回 null；
-            // 解码端容错回 CLUSTERING 与 Python/Go 口径一致（消费端绝大多数是集群模式）。
             message_model: jstring_or(value, "messageModel", MessageModel::CLUSTERING),
         })
     }
@@ -99,11 +78,6 @@ impl QueryAssignmentRequestBody {
 
 // ---------------------------------------------------------------- 单个分配项
 
-/// Java `MessageQueueAssignment`：一条队列 + broker 期望的消费模式（POP / PULL）。
-///
-/// `equals`/`hashCode` 在 Java 只看 `messageQueue` —— 消费端按队列去重即源于此。
-/// `attachments` Java 有字段但消费端从不读，这里保留透传读取以外的最简形态：
-/// 解码容忍缺省，编码不写（与 Go 端口一致，测试桩要造 attachments 可自行拼 JSON）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageQueueAssignment {
     pub message_queue: Option<MessageQueueKey>,
@@ -135,8 +109,6 @@ impl MessageQueueAssignment {
         json_object(pairs)
     }
 
-    /// 宽进：非对象报错；`messageQueue` 缺失/非对象回 `None`（Java 消费端会跳过
-    /// null 队列）；`mode` 缺失回 `PULL`（Java 字段初始值）。
     pub fn from_json_value(value: &Value) -> Result<MessageQueueAssignment> {
         expect_object(value, "MessageQueueAssignment")?;
         Ok(MessageQueueAssignment {
@@ -158,12 +130,9 @@ fn jraw_map_null(value: &Value, key: &str) -> Value {
 
 // ---------------------------------------------------------------- 响应体
 
-/// Java `QueryAssignmentResponseBody`：`Set<MessageQueueAssignment>`。
 pub struct QueryAssignmentResponseBody;
 
 impl QueryAssignmentResponseBody {
-    /// 写出分配数组（测试桩 / 对拍用）。`None` = Java 的 null 集：写出**不带键**，
-    /// 让对端解码回 `None`（保留上一次分配）。
     pub fn encode(assignments: Option<&[MessageQueueAssignment]>) -> Vec<u8> {
         let list = match assignments {
             Some(list) => list,
@@ -179,11 +148,6 @@ impl QueryAssignmentResponseBody {
     }
 
     /// 解析 400 响应 body。返回值的三态即语义：
-    ///
-    /// - `Ok(None)`：空 body / `"null"` / 缺键 / 显式 null —— Java 的
-    ///   「无效结果，跳过更新」，调用方保留上一次分配；
-    /// - `Ok(Some(vec![]))`：显式空数组 —— 「清除我之前的全部分配」；
-    /// - `Err`：报文不是对象、`messageQueueAssignments` 不是数组等脏数据。
     pub fn decode(data: &[u8]) -> Result<Option<Vec<MessageQueueAssignment>>> {
         if data.is_empty() {
             return Ok(None);
@@ -227,7 +191,6 @@ mod tests {
             "CLUSTERING",
         );
         let text = String::from_utf8(body.encode()).unwrap();
-        // 键名逐字对齐 Java 属性名（broker 按属性名反序列化，写错=分配永远拿不到）
         for key in [
             "\"topic\":\"T1\"",
             "\"consumerGroup\":\"GID_g\"",
@@ -260,7 +223,6 @@ mod tests {
 
     #[test]
     fn response_body_keeps_null_vs_empty_distinction() {
-        // 空 body / "null" / 缺键 / 显式 null 都是 Java 的 null 集：None（保留旧分配）
         assert_eq!(QueryAssignmentResponseBody::decode(b"").unwrap(), None);
         assert_eq!(QueryAssignmentResponseBody::decode(b"null").unwrap(), None);
         assert_eq!(QueryAssignmentResponseBody::decode(b"{}").unwrap(), None);
@@ -293,9 +255,7 @@ mod tests {
             Some(&mq("T1", "broker-a", 3))
         );
         assert_eq!(got[0].mode, MESSAGE_REQUEST_MODE_POP);
-        // 缺 mode 回 PULL（Java 字段初始值，不许另造）
         assert_eq!(got[1].mode, MESSAGE_REQUEST_MODE_PULL);
-        // messageQueue 缺失 → None（Java 消费端跳过 null 队列）
         assert_eq!(got[2].message_queue, None);
     }
 

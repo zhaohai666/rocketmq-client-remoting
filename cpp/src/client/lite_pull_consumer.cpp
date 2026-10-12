@@ -41,9 +41,6 @@ int64_t nowMillis() {
         .count();
 }
 
-// 对应 Java UtilAll.parseDate(ts, UtilAll.YYYYMMDDHHMMSS)：该字段**只**是 14 位本地墙钟日期。
-// 旧实现把任何纯数字串当 epoch 处理，"20230101000000" 会被解释成公元 2611 年，起点彻底错位；
-// 而它真正想做日期解析的分支用了 strptime/timegm——POSIX 专有，MSVC 下既不可达也编不过。
 int64_t parseConsumeTimestamp(const std::string& ts) {
     auto invalid = [&ts] {
         return MQClientException(
@@ -84,10 +81,7 @@ DefaultLitePullConsumer::DefaultLitePullConsumer(const std::string& consumerGrou
         throw MQClientException("consumerGroup is empty");
     }
     consumerGroup_ = consumerGroup;
-    // 对应 Java DefaultLitePullConsumer.consumeTimestamp 的字段初值：now - 30 分钟。
-    // 留空会让 CONSUME_FROM_TIMESTAMP 退化成「从当前时刻起消费」。
     consumeTimestamp_ = UtilAll::timeMillisToHumanString3(nowMillis() - 30 * 60 * 1000);
-    // 对应 Java DefaultLitePullConsumer 的字段初值 new AllocateMessageQueueAveragely()。
     allocateStrategy_ = std::make_shared<AllocateMessageQueueAveragely>();
 }
 
@@ -109,7 +103,6 @@ void DefaultLitePullConsumer::setNameServerAddresses(const std::vector<std::stri
 
 void DefaultLitePullConsumer::setAllocateMessageQueueStrategy(
     std::shared_ptr<AllocateMessageQueueStrategy> strategy) {
-    // 与 Java 一致：setter 不校验，null 由 start() 的 checkConfig 拒绝。
     allocateStrategy_ = std::move(strategy);
 }
 
@@ -133,8 +126,6 @@ void DefaultLitePullConsumer::subscribe(const std::string& topic, const std::str
 void DefaultLitePullConsumer::subscribe(const std::string& topic,
                                         const std::string& subExpression,
                                         std::shared_ptr<LiteMessageQueueListener> messageQueueListener) {
-    // 先做与两参版完全一致的登记（Java Impl:500 的前半段：buildSubscriptionData +
-    // subscriptionInner.put —— 本端口 rebalance 核心承担"分配更新"那一半）。
     subscribe(topic, subExpression);
     if (messageQueueListener != nullptr) {
         std::lock_guard<std::mutex> lk(topicListenerMutex_);
@@ -144,21 +135,16 @@ void DefaultLitePullConsumer::subscribe(const std::string& topic,
 
 void DefaultLitePullConsumer::registerTopicMessageQueueChangeListener(
     const std::string& topic, std::shared_ptr<TopicMessageQueueChangeListener> listener) {
-    // Java Impl:1268-1271：topic/listener 为 null 直接抛
-    // MQClientException("Topic or listener is null")。C++ 的 topic 用空串判。
     if (topic.empty() || listener == nullptr) {
         throw MQClientException("Topic or listener is null");
     }
     std::string ns = withNamespace(topic);
     std::lock_guard<std::mutex> lk(topicListenerMutex_);
     if (topicChangeListeners_.find(ns) != topicChangeListeners_.end()) {
-        // Java Impl:1272-1273：重复注册覆盖旧的，warn 一条
         logger_warn("Topic " + ns + " had been registered, new listener will overwrite the old one");
     }
     topicChangeListeners_[ns] = std::move(listener);
     if (started_.load()) {
-        // Java Impl:1275-1277：运行中注册立刻记一版快照，否则首轮比对会把"当前集合"
-        // 误判成"变化"。快照也用裸 topic 名（fetchMessageQueues 内部再套命名空间）。
         try {
             messageQueuesForTopic_[ns] = fetchMessageQueues(topic);
         } catch (const std::exception& e) {
@@ -168,8 +154,6 @@ void DefaultLitePullConsumer::registerTopicMessageQueueChangeListener(
 }
 
 void DefaultLitePullConsumer::fetchTopicMessageQueuesAndCompare() {
-    // 快照监听器表后逐 topic 比对（Java Impl:1230-1245）。fetch 是 RPC，绝不能抱着
-    // topicListenerMutex_ 做 —— 表可能中途被改，逐个重查即可。
     std::vector<std::pair<std::string, std::shared_ptr<TopicMessageQueueChangeListener>>> entries;
     {
         std::lock_guard<std::mutex> lk(topicListenerMutex_);
@@ -189,7 +173,6 @@ void DefaultLitePullConsumer::fetchTopicMessageQueuesAndCompare() {
                 if (it != messageQueuesForTopic_.end()) {
                     oldQueues = it->second;
                 }
-                // 集合相等判定（Java isSetEqual）：数量一致且每个元素都在旧集里。
                 std::set<MessageQueue> oldSet(oldQueues.begin(), oldQueues.end());
                 std::set<MessageQueue> newSet(newQueues.begin(), newQueues.end());
                 changed = !(oldSet == newSet);
@@ -201,10 +184,6 @@ void DefaultLitePullConsumer::fetchTopicMessageQueuesAndCompare() {
                 kv.second->onChanged(topic, newQueues);
             }
         } catch (const std::exception& e) {
-            // ⚠ 与 Java 的**有意差别**：Java 的 catch 在 startScheduleTask 的包装层
-            // （Impl:382-393），一个 topic 失败会放弃**本轮其余 topic**；本端口把 catch 收进
-            // 循环体，只跳过那一个 —— 免得一个长期无路由的 topic 把排在它后面的监听器永久饿死
-            // （Java 里 HashMap 顺序决定谁被饿死）。下一轮照常，两版都不打断调度。
             logger_warn("ScheduledTask fetchMessageQueuesAndCompare exception: " +
                         std::string(e.what()));
         }
@@ -212,8 +191,6 @@ void DefaultLitePullConsumer::fetchTopicMessageQueuesAndCompare() {
 }
 
 void DefaultLitePullConsumer::metadataLoop() {
-    // Java startScheduleTask（Impl:378-393）：启动后 10s 首查，此后每
-    // topicMetadataCheckIntervalMillis 一趟。
     auto next = std::chrono::steady_clock::now() + std::chrono::milliseconds(10000);
     while (running_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -245,10 +222,6 @@ void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQue
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
         assignMode_ = true;
-        // Java assignedMessageQueue.updateAssignedMessageQueue：撤掉的队列连着整份
-        // MessageQueueState 丢掉（拉取游标与已消费游标一起消失）。**不**动 offsetTable_——
-        // 那份清理挂在 rebalance 的 removeUnnecessaryMessageQueue 上，assign 模式不走
-        // rebalance，所以 persist 也发生在这里之外（Java 同）。
         for (const MessageQueue& mq : assigned_) {
             if (queues.find(mq) == queues.end()) {
                 nextOffset_.erase(mq);
@@ -283,8 +256,6 @@ void DefaultLitePullConsumer::start() {
     if (!namespace_.empty()) {
         consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
     }
-    // 对应 Java DefaultLitePullConsumerImpl.checkConfig(:415) / Python：组名合法性 +
-    // 挡掉 DEFAULT_CONSUMER。纯本地校验，排在地址/订阅检查之前，失败不碰网络。
     Validators::checkGroup(consumerGroup_);
     if (consumerGroup_ == MixAll::DEFAULT_CONSUMER_GROUP) {
         throw MQClientException(
@@ -293,39 +264,24 @@ void DefaultLitePullConsumer::start() {
     if (nameServerAddrs_.empty()) {
         throw MQClientException("name server address is not set");
     }
-    // 对应 Java DefaultLitePullConsumerImpl.checkConfig(:435)：策略为 null 直接拒绝启动，
-    // 而不是等 rebalance 解引用空指针（UB）。
     if (allocateStrategy_ == nullptr) {
         throw MQClientException("allocateMessageQueueStrategy is null");
     }
     if (subscription_.empty() && !assignMode_) {
         throw MQClientException("subscription is not set, call subscribe() or assign() first");
     }
-    // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验，
-    // 而不是等到算起点时抛出、被下面的 catch(...) 吞掉后静默退化成从 max offset 消费。
     parseConsumeTimestamp(consumeTimestamp_);
-    // Java `DefaultLitePullConsumerImpl#start`:287-289：CLUSTERING 才改写 instanceName，
-    // clientId 口径是 `ClientConfig#buildMQClientId` 的 `<本机 IP>@<instanceName>`。
     if (messageModel_ == MessageModel::CLUSTERING) {
         instanceName_ = changeInstanceNameToPID(instanceName_);
     }
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);
     }
-    // 轻量消费者默认开着 stream（Java `DefaultLitePullConsumer:213/228` 构造函数里置真），
-    // unitName 只影响动态取址 URL。
     mqClient_.reset(new MQClientInstance(clientId_, nameServerAddrs_,
                                         /*connectTimeoutMillis=*/3000,
                                         /*invokeTimeoutMillis=*/10000,
                                         MQClientInstance::tlsEnabledFromEnv(), unitName_,
                                         pollNameServerIntervalMillis_));
-    // 请求钩子（ACL 签名 / stream 的 `ReqT`）：lite 消费者在 Java 里**默认**开 stream
-    //（DefaultLitePullConsumer:213/228），所以这里必须走 composeRequestHooks 把
-    // StreamTypeRPCHook 排在用户钩子之前 —— 直接注册 rpcHook_ 会让 ReqT 漏发，
-    // 而且开 ACL 时签的内容与上线的字段不一致。
-    // 绑定位置也关键：Java 的 rpcHook 在 MQClientAPIImpl 构造时就传进去了，实例发出的
-    // 第一笔报文（下面的 start() 动态取址、路由刷新）就带着它；放到 start() 之后，
-    // 首包就是裸的。
     const std::shared_ptr<RPCHook> requestHook =
         composeRequestHooks(enableStreamRequestType_, rpcHook_,
                             [this] { return namespaceV2_; });
@@ -334,10 +290,6 @@ void DefaultLitePullConsumer::start() {
                     + clientId_ + ")");
     }
     mqClient_->start();
-    // 登记在用 topic，并**同步**把路由拉进来：心跳只发给「实例路由表里已知的 broker」，
-    // 自建实例此刻路由表还是空的，那一轮会发 0 份 → 订阅要等 5s 心跳循环第一轮才注册上
-    // broker，同组多实例时首轮 rebalance 会各自独占全部队列。
-    // （对应 Python `_refresh_route_for_heartbeat` / Java 注册心跳前的 updateTopicRouteInfo）
     std::set<std::string> routeTopics;
     for (const auto& kv : subscription_) {
         routeTopics.insert(kv.first);
@@ -372,8 +324,6 @@ void DefaultLitePullConsumer::start() {
     heartbeatThread_ = std::thread(&DefaultLitePullConsumer::heartbeatLoop, this);
     started_ = true;
     pullThread_ = std::thread(&DefaultLitePullConsumer::pullServiceLoop, this);
-    // 队列集合比对任务（Java startScheduleTask）：无条件起，无注册监听器时是空转。
-    // ⚠ 必须在 started_ 置位之后：首查用 fetchMessageQueues（要求 mqClient_ 在位）。
     metadataThread_ = std::thread(&DefaultLitePullConsumer::metadataLoop, this);
 }
 
@@ -381,10 +331,6 @@ void DefaultLitePullConsumer::shutdown() {
     if (!started_) return;
     started_ = false;
     running_ = false;
-    // Java 的 shutdown 走 persistConsumerOffset()：把内存位点表按当下持有的队列刷一遍，
-    // 与 autoCommit 无关（手动模式用 persist=false 攒下的值同样要落盘）。
-    // 自动提交模式再多走一步 commit()：本端口没有 Java 那份 5s 定时器，
-    // "poll 交出去但还没到截止时刻"的位点得在这里补上，否则重启后从上一格重投。
     try {
         if (autoCommit_) {
             commit();
@@ -485,10 +431,6 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
         }
     }
     std::string sub = subscriptionFor(mq.topic);
-    // 短轮询（suspend=false），位点由 auto-commit 单独提交（与 Java LitePull 一致）。
-    // litePull=true 置 FLAG_LITE_PULL_MESSAGE（Java `DefaultLitePullConsumerImpl
-    // #pullSyncImpl:1058` 的 buildSysFlag(false, block, true, false, true)），
-    // 下游 MQClientAPIImpl#pullMessage:816 据此把请求码切成 LITE_PULL_MESSAGE(361)
     const int32_t sysFlag = PullSysFlag::buildSysFlag(/*commitOffset=*/false,
                                                       /*suspend=*/false,
                                                       /*subscription=*/true,
@@ -504,15 +446,6 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
         logger_debug("lite pull_one failed for " + mq.topic + "@" + std::to_string(mq.queueId));
         return false;
     }
-    // Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：一轮拉取回来之后
-    // 无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都把拉取游标推进到
-    // broker 给的 nextBeginOffset —— NO_MATCHED_MSG 的已越过本轮扫过的整段不匹配区间
-    // （不跟就会每轮把同一段重扫一遍），OFFSET_ILLEGAL 的是 broker 的纠正位点
-    // （越界自愈也靠这一步）。
-    // 刹车只有一只：**在途请求的结果不许盖掉这轮里刚 seek / 刚被撤走的位点**
-    // （Java :808 的 seekOffset == -1 检查 + :979 的 isDropped 检查；本端 seek() 直接
-    // 改写 nextOffset_、撤队列直接 erase 掉条目，用「游标还是不是我发请求时的那个值」
-    // 做同一件事）。同一条刹车也管着 FOUND 分支的入缓冲（Java :986）。
     bool intact = false;
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
@@ -532,8 +465,6 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
         // 只是没有可交付的——不能像旧实现那样原地重拉同一窗口。
         return false;
     }
-    // 只推进**拉取游标**。「已消费游标」是 poll() 交付时才写的，两条线不是一条：
-    // 缓冲里压着没交出去的消息不能算已消费（Java processQueue.removeMessage 同口径）。
     enqueue(msgs);
     return true;
 }
@@ -569,15 +500,6 @@ void DefaultLitePullConsumer::enqueue(const std::vector<MessageExt>& msgs) {
 }
 
 void DefaultLitePullConsumer::maybeAutoCommit() {
-    // 对位 Java DefaultLitePullConsumerImpl#maybeAutoCommit：只有一道全局截止时刻，
-    // 到点提交**全部**已分配队列（Java 的 commitAll 也是遍历 assignedMessageQueue），
-    // 然后把截止时刻推到 now + autoCommitIntervalMillis_。初值 -1 ⇒ 第一次检查就提交一次，
-    // 那次手上还没有任何交付记录（游标是 -1），所发出去的仍是空操作。
-    //
-    // 调用点只有两个，和 Java 一致：poll() 开头，以及 shutdown()。Java 里空闲消费者
-    // 靠 MQClientInstance 每 5s 的 persistConsumerOffset 定时器兜底，本端口没挂那个定时器
-    // （见 commitOffsets 的偏离①），所以停 poll 之后到 shutdown 之前不会自动落位点。
-    // 拉取循环里**不**查这道闸：那会让本端口在没人 poll 时也往前提交，语义比 Java 激进。
     const int64_t now = nowMillis();
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
@@ -588,8 +510,6 @@ void DefaultLitePullConsumer::maybeAutoCommit() {
 }
 
 int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
-    // 未启动时 mqClient_ 为空：Java 允许 start 前 assign（位点推迟到 start 时再解析），
-    // 这里必须显式抛错而不是解引用空指针（调用方 assign/rebalance 均已兜住）。
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
@@ -598,9 +518,6 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
         auto sit = seekOffset_.find(mq);
         if (sit != seekOffset_.end()) return sit->second;
     }
-    // 与 Java RebalanceLitePullImpl.computePullFromWhereWithException 同序：先读已提交位点，
-    // 只有真正 QUERY_NOT_FOUND 时才按 consumeFromWhere 计算。broker 在 setZeroIfNotFound
-    // 未设置且队首仍在 commitlog 内时会直接回 0，此时 consumeFromWhere 不参与。
     try {
         int64_t off = 0;
         if (mqClient_->queryConsumerOffset(consumerGroup_, mq, off)) {
@@ -609,11 +526,6 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
     } catch (...) {
     }
     if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-        // Java RebalanceLitePullImpl 的 FIRST_OFFSET 分支与 push 同形（`result = 0L`），
-        // **不**发 minOffset 查询 —— minOffset 属于 MQAdminImpl 口径（只认 master），
-        // 主掉线期间会让新起的 lite-pull 一条都拉不到。位点非法时 broker 会在
-        // PULL_OFFSET_MOVED 里回 nextBeginOffset（Java 的 pull 循环每轮都拨，
-        // 见 DefaultLitePullConsumerImpl:998 updatePullOffset）。
         return 0;
     }
     if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
@@ -629,13 +541,8 @@ void DefaultLitePullConsumer::rebalance() {
     // 免得回调阶段再打一轮订阅信息 RPC。
     std::map<std::string, std::vector<MessageQueue>> mqAllByTopic;
     for (const auto& kv : subscription_) {
-        // 与 push 的 rebalance 同源：Java DefaultLitePullConsumerImpl 走的是同一个
-        // RebalanceImpl，mqAll 来自订阅信息（读位 + readQueueNums、不筛 master），
-        // 不是发布信息。
         std::vector<MessageQueue> mqAll = mqClient_->getTopicSubscribeInfo(kv.first);
         mqAllByTopic[kv.first] = mqAll;
-        // Java RebalanceImpl.rebalanceByTopic 在分配前 Collections.sort(mqAll) + sort(cidAll)：
-        // 顺序不一致会让同组不同实例算出冲突的分配（同一队列被两个实例同时消费）。
         std::sort(mqAll.begin(), mqAll.end());
         std::vector<std::string> cidAll =
             mqClient_->getConsumerIdListByGroup(kv.first, consumerGroup_);
@@ -644,9 +551,6 @@ void DefaultLitePullConsumer::rebalance() {
         }
         std::sort(cidAll.begin(), cidAll.end());
         std::vector<MessageQueue> allocated;
-        // Java RebalanceImpl#rebalanceByTopic 的 catch (Throwable) 直接 return，位置在
-        // updateProcessQueueTableInRebalance **之前** → 一次分配异常不该把队列撤走。
-        // 所以这里回退成「沿用本 topic 当前的分配」（Python / Rust 同口径）。
         try {
             allocated = allocateStrategy_->allocate(consumerGroup_, clientId_, mqAll, cidAll);
         } catch (const std::exception& e) {
@@ -674,9 +578,6 @@ void DefaultLitePullConsumer::rebalance() {
             }
             for (const MessageQueue& mq : old) {
                 if (newSet.find(mq) == newSet.end()) {
-                    // Java RebalanceLitePullImpl#removeUnnecessaryMessageQueue：先 persist(mq)
-                    // 再 removeOffset(mq)。persist 是 RPC，所以这里只把要补发的队列记下来，
-                    // 抱着锁做网络会把整条 poll/commit 路径卡住（下面统一发）。
                     auto ot = offsetTable_.find(mq);
                     if (ot != offsetTable_.end()) revoked.push_back(*ot);
                     nextOffset_.erase(mq);
@@ -717,9 +618,6 @@ void DefaultLitePullConsumer::rebalance() {
         } catch (...) {
         }
     }
-    // per-subscription 监听器（subscribe 三参重载，Java Impl:504-514 的包装器语义）：
-    // 分配更新已在上面的核心里做过，这里只补"该 topic 分到的队列有变"这一条 ——
-    // 没变的 topic 不回调（Java 的分配更新回调也只在 changed 时走 messageQueueChanged）。
     std::vector<std::pair<std::string, std::shared_ptr<LiteMessageQueueListener>>> topicListeners;
     {
         std::lock_guard<std::mutex> lk(topicListenerMutex_);
@@ -763,8 +661,6 @@ std::vector<MessageQueue> DefaultLitePullConsumer::newSetAsVector(const std::set
 // ---------------------------------------------------------------- poll / 位点
 std::vector<MessageExt> DefaultLitePullConsumer::poll(int32_t timeoutMillis) {
     int32_t timeout = timeoutMillis > 0 ? timeoutMillis : pollTimeoutMillis_;
-    // Java poll() 进来先按截止时刻试一次自动提交：拿缓冲锁之前做，提交要发 RPC，
-    // 抱着 bufferMutex_ 等网络会把 enqueue() 一起卡住。
     if (autoCommit_) maybeAutoCommit();
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
     std::vector<MessageExt> out;
@@ -789,10 +685,6 @@ std::vector<MessageExt> DefaultLitePullConsumer::poll(int32_t timeoutMillis) {
 void DefaultLitePullConsumer::advanceConsumeOffset(const std::vector<MessageExt>& msgs) {
     if (msgs.empty()) return;
     std::lock_guard<std::mutex> lk(stateMutex_);
-    // 对位 Java poll()：消息交到调用方手上才推进「已消费游标」
-    // （assignedMessageQueue.updateConsumeOffset(mq, processQueue.removeMessage(msgs))）。
-    // 只认当下还持有（有拉取游标）的队列——别的实例刚被分走的队列不归我们记账；
-    // 同一次交付里按 offset 最大的那条定游标（缓冲可能交错混着几条队列）。
     for (const MessageExt& m : msgs) {
         const MessageQueue mq(m.topic, m.brokerName, m.queueId);
         if (nextOffset_.find(mq) == nextOffset_.end()) continue;
@@ -807,8 +699,6 @@ void DefaultLitePullConsumer::seek(const MessageQueue& mq, int64_t offset) {
         std::lock_guard<std::mutex> lk(stateMutex_);
         seekOffset_[mq] = offset;
         nextOffset_[mq] = offset;
-        // Java nextPullOffset()：吃掉 seekOffset 时连同 consumeOffset 一起改写，
-        // 否则重放的那一段会被上一格的已提交位点盖过去（"跳回去"意味着"那里之前都还没消费"）。
         consumeOffset_[mq] = offset;
     }
     std::lock_guard<std::mutex> lk(bufferMutex_);
@@ -836,9 +726,6 @@ void DefaultLitePullConsumer::seekToEnd(const MessageQueue& mq) {
 }
 
 int64_t DefaultLitePullConsumer::committed(const MessageQueue& mq) {
-    // Java committed() 走 offsetStore.readOffset(mq, MEMORY_FIRST_THEN_STORE)：
-    // 先看内存位点表（persist=false 刚提交、还没发给 broker 的值也算数），
-    // 表里没有再问 broker，并把 broker 的值回填进表里（Java 同一处也回填）。
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
         auto it = offsetTable_.find(mq);
@@ -858,7 +745,6 @@ int64_t DefaultLitePullConsumer::committed(const MessageQueue& mq) {
 }
 
 void DefaultLitePullConsumer::persistOffset(const MessageQueue& mq) {
-    // Java OffsetStore#persist(mq)：只把这一条队列的内存位点发给 broker，不做清理。
     int64_t offset = 0;
     {
         std::lock_guard<std::mutex> lk(stateMutex_);
@@ -877,11 +763,6 @@ void DefaultLitePullConsumer::persistOffset(const MessageQueue& mq) {
 }
 
 void DefaultLitePullConsumer::persistOffsetTable(const std::set<MessageQueue>& mqs) {
-    // Java RemoteBrokerOffsetStore#persistAll(Set)：内存位点表里落在 mqs 上的那部分写给
-    // broker，**不在**其中的条目顺手从表里删掉（Java 日志里那句 remove unused mq）。
-    // 后半句是 Java 的真实行为：这张表只服务于当下持有的队列，撤走的队列留在表里没人再
-    // 提交，persistAll 一路扫过去就清掉。代价是 commit(部分队列, persist=true) 会把其余
-    // 队列**尚未落盘**的内存值一起丢掉——要提交谁就一次给全。
     if (mqs.empty()) return;
     std::vector<std::pair<MessageQueue, int64_t>> toSend;
     {
@@ -906,7 +787,6 @@ void DefaultLitePullConsumer::persistOffsetTable(const std::set<MessageQueue>& m
 }
 
 void DefaultLitePullConsumer::commit() {
-    // Java commit() → commitAll()：按「已消费游标」提交所有已分配队列。
     std::map<MessageQueue, int64_t> targets;
     std::set<MessageQueue> scope;
     {
@@ -923,8 +803,6 @@ void DefaultLitePullConsumer::commit() {
 void DefaultLitePullConsumer::commit(const std::map<MessageQueue, int64_t>& offsets,
                                     bool persist) {
     if (offsets.empty()) {
-        // Java commit(Map) 原文：空集合只记一条 warn 就 return，
-        // **不**碰 offsetStore，所以上一轮 persist=false 攒下的内存值也原样保留。
         logger_warn("MessageQueues is empty, Ignore this commit ");
         return;
     }
@@ -934,7 +812,6 @@ void DefaultLitePullConsumer::commit(const std::map<MessageQueue, int64_t>& offs
 }
 
 void DefaultLitePullConsumer::commit(const std::set<MessageQueue>& messageQueues, bool persist) {
-    // Java commit(Set, persist)：集合为空直接 return（连 warn 都没有）。
     if (messageQueues.empty()) return;
     std::map<MessageQueue, int64_t> targets;
     {
@@ -953,24 +830,15 @@ void DefaultLitePullConsumer::commitOffsets(const std::map<MessageQueue, int64_t
         std::lock_guard<std::mutex> lk(stateMutex_);
         for (const auto& kv : targets) {
             if (kv.second == -1) {
-                // Java commitAll 原文：这条队列还没消费过，记 error 并跳过，
-                // 绝不能把 -1 写进 broker（位点变 -1 会让下次消费从队首重投全量）。
                 logger_error("consumerOffset is -1 in messageQueue [" + kv.first.toString() + "].");
                 continue;
             }
             if (assigned_.find(kv.first) == assigned_.end()) {
-                // Java 的 processQueue != nullptr && !isDropped() 守卫：不是本实例持有的
-                // 队列一律不替它提交，静默跳过（Java 原文这里连日志都没有）。
                 continue;
             }
             offsetTable_[kv.first] = kv.second;
         }
     }
-    // persistAll 只认 scope 里的队列：表里其余条目会被清掉（Java 同一处）。
-    // 两处与 Java 的偏离：① Java 的 commitAll 只写内存表，真正发给 broker 靠 MQClientInstance
-    // 每 persistConsumerOffsetInterval(5s) 一次的定时器，本端口的 lite 消费者没挂那个定时器，
-    // 所以 persist=true（默认）就地发出去；② Java 的 persistAll 用 oneway、异常只记日志，
-    // 这里发同步带应答，坏位点当场就能从日志看到。
     if (persist) persistOffsetTable(scope);
 }
 
@@ -998,13 +866,6 @@ std::vector<MessageQueue> DefaultLitePullConsumer::fetchMessageQueues(const std:
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
-    // Java DefaultLitePullConsumerImpl.fetchMessageQueues:1224 →
-    // MQAdminImpl.fetchSubscribeMessageQueues:169-183（订阅信息：读位、不筛 master）。
-    // 两件事必须一起做对，否则队列变更监听静默失真：
-    // 1. Java :171 **每轮现问 nameserver**，不吃 30s 周期刷新的路由缓存；少了这一步，
-    //    扩容最快也要等一次路由轮询才看得见（监听回调比 Java 慢一个周期）。
-    // 2. Java :177 对空队列集是**抛异常**，不是返回空表 —— "查不到"≠"这个 topic 缩到 0 队列"，
-    //    后者会让监听器收到一次假缩容回调并把快照刷成空集。
     std::string fullTopic = withNamespace(topic);
     try {
         mqClient_->updateTopicRouteInfoFromNameServer(fullTopic);
@@ -1040,16 +901,8 @@ void DefaultLitePullConsumer::resume(const std::vector<MessageQueue>& messageQue
 // ---------------------------------------------------------------- 心跳
 HeartbeatData DefaultLitePullConsumer::buildHeartbeat() const {
     HeartbeatData hb(clientId_);
-    // consumeType 恒为 CONSUME_ACTIVELY：Java `DefaultLitePullConsumerImpl.consumeType():1111-1112`
-    // 直接 return CONSUME_ACTIVELY（**不是** PASSIVELY）。broker 侧读这个字段的地方：
-    // `ClientManageProcessor:87-92`（ACTIVELY 心跳不做订阅注册，订阅由自带标志的拉取补偿）、
-    // `PullMessageProcessor:493-505`（rejectPullConsumerEnabled 的 broker 据此拒拉）、
-    // `:516-521`（冷数据流控按 ACTIVELY 走另一支）、`AdminBrokerProcessor:1971`
-    // （consumerConnection 显示消费类型）。写成 PASSIVELY 会让 broker 把拉模式组当推送组看。
     ConsumerData cd(consumerGroup_, ConsumeType::CONSUME_ACTIVELY, messageModel_,
                     consumeFromWhere_);
-    // Java `MQClientInstance:1039`：心跳里的 ConsumerData.unitMode 决定 broker 建
-    // %RETRY% topic 时打不打 UNIT_SUB 位
     cd.unitMode = unitMode_;
     for (const auto& kv : subscriptionData_) {
         cd.subscriptionDataSet.push_back(kv.second);
@@ -1062,8 +915,6 @@ int32_t DefaultLitePullConsumer::sendHeartbeatToAllBroker() {
     if (mqClient_ == nullptr) return 0;
     HeartbeatData hb = buildHeartbeat();
     int32_t ok = 0;
-    // 每台都发（主 + 从）：与推送消费者 `DefaultMQPushConsumer::sendHeartbeatToAllBroker`
-    // 同一条 Java 依据（`sendHeartbeatToAllBroker`:732-750，consumerEmpty 才跳从节点）。
     for (const std::string& addr : mqClient_->getAllBrokerAddrs()) {
         try {
             mqClient_->sendHeartbeat(addr, hb, 5000);

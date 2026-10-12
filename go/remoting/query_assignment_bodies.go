@@ -1,16 +1,3 @@
-// QUERY_ASSIGNMENT(400) wire bodies (Java remoting.protocol.body
-// .QueryAssignmentRequestBody / .QueryAssignmentResponseBody).
-//
-// Like SET_MESSAGE_REQUEST_MODE(401), this code has NO request header — the
-// whole request rides the body, and the broker decodes it by Java property
-// name, so the JSON keys here must be exact. The reply is a
-// QueryAssignmentResponseBody whose messageQueueAssignments is a SET on the
-// Java side: fastjson2 serialises it as an array of MessageQueueAssignment
-// objects (parsed by the type in pop_bodies.go).
-//
-// Null vs empty semantics (Java QueryAssignmentProcessor#doLoadBalance javadoc,
-// honoured by RebalanceImpl#getRebalanceResultFromBroker):
-//
 //   - assignments == null   -> "invalid result", the client SKIPS the update
 //     and keeps its previous assignment. The Go decoder maps an empty body (or
 //     a body without the key) to a nil slice for this.
@@ -87,10 +74,6 @@ func (b *QueryAssignmentResponseBody) ToJSONValue() map[string]any {
 
 func (b *QueryAssignmentResponseBody) Encode() []byte { return EncodeJSON(b.ToJSONValue()) }
 
-// DecodeQueryAssignmentResponseBody parses a 400 reply body. nil assignments
-// with a nil error means "the broker sent no set at all" — Java's null case
-// ("invalid result, skip the update"); an empty non-nil slice means "clear my
-// assignment". A malformed body is an error.
 func DecodeQueryAssignmentResponseBody(data []byte) ([]*MessageQueueAssignment, error) {
 	if len(data) == 0 {
 		return nil, nil

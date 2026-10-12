@@ -117,8 +117,6 @@ pub const DEFAULT_POP_INVISIBLE_TIME: i64 = 60_000;
 /// 主动撤掉并重建（停摆判定用严格 `>`）。
 pub const PULL_MAX_IDLE_TIME: i64 = 120_000;
 
-/// Java `RebalanceImpl.QUERY_ASSIGNMENT_TIMEOUT`（3000ms）：POP 模式下每 topic 一笔
-/// `QUERY_ASSIGNMENT(400)` 的 RPC 超时。
 pub const QUERY_ASSIGNMENT_TIMEOUT_MILLIS: i64 = 3000;
 
 /// 停机收尾给「在途批次收完（含回投 RPC）」的预算。
@@ -397,8 +395,6 @@ pub struct ConsumerConfig {
     pub name_server_addrs: Vec<String>,
     /// TLS 开关；`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
     pub tls_enable: Option<bool>,
-    /// SOCKS 代理（对齐 Java `ClientConfig#socksProxyConfig`：addr / username /
-    /// password 三字段，见 [`SocksProxyConfig`]）。`None` = 直连（默认）。
     pub socks_proxy: Option<SocksProxyConfig>,
     /// Python `message_model`（[`MessageModel`] 里的常量）。
     pub message_model: String,
@@ -442,8 +438,6 @@ pub struct ConsumerConfig {
     pub suspend_current_queue_time_millis: i64,
     /// 消费超时（**分钟**，默认 15），只用于 `ConsumeReturnType::TimeOut` 判定。
     pub consume_timeout: i64,
-    /// Java `clientRebalance`：形状对齐字段，本实现不读取它决定是否走本地分配。
-    /// 分配来源由 `pop_mode` 门控：POP 恒走 broker 侧 QUERY_ASSIGNMENT，其余恒走本地 rebalance。
     pub client_rebalance: bool,
     /// broker 心跳周期（默认 30000ms）。
     pub heartbeat_interval_millis: i64,
@@ -634,7 +628,6 @@ fn check_config_ranges(cfg: &ConsumerConfig) -> Result<()> {
     {
         bail!("popInvisibleTime Out of range [{MIN_POP_INVISIBLE_TIME}, {MAX_POP_INVISIBLE_TIME}]");
     }
-    // popBatchNums（Java 写的就是 `<= 0`，不是 `< 1`）
     if cfg.pop_batch_nums <= 0 || cfg.pop_batch_nums > 32 {
         bail!("popBatchNums Out of range [1, 32]");
     }
@@ -1005,20 +998,14 @@ impl DefaultMQPushConsumer {
         self.config().namespace_v2
     }
 
-    /// Java `ClientConfig#setSocksProxyConfig`：SOCKS 代理（addr / username /
-    /// password，见 [`SocksProxyConfig`]）。`None` = 直连。`start()` 时透传给
-    /// `MQClientInstance` → 传输层，晚于 start 修改不影响已建实例。
-    /// 代理地址可带 `socks5://`（缺省）/ `socks4://` 前缀选协议版本。
     pub fn set_socks_proxy(&self, socks_proxy: Option<SocksProxyConfig>) {
         self.update_config(|c| c.socks_proxy = socks_proxy);
     }
 
-    /// Java `ClientConfig#getSocksProxyConfig`。
     pub fn get_socks_proxy(&self) -> Option<SocksProxyConfig> {
         self.config().socks_proxy
     }
 
-    /// Java `ClientConfig#setUnitMode`。
     pub fn set_unit_mode(&self, unit_mode: bool) {
         self.update_config(|c| c.unit_mode = unit_mode);
     }
@@ -1059,6 +1046,18 @@ impl DefaultMQPushConsumer {
         self.update_config(|c| c.persist_consumer_offset_interval_millis = millis);
     }
 
+    /// 只读访问共享的 [`MQClientInstance`]（node `consumer.mqClient`、python
+    /// `_mq_client` 同形）：静态主题腿用它读端点重写结果；未启动报错。
+    pub fn mq_client(&self) -> Result<MQClientInstance> {
+        if !self.inner.started.load(Ordering::Acquire) {
+            return Err(Error::client("consumer not started, call start() first"));
+        }
+        lock(&self.inner.client)
+            .clone()
+            .ok_or_else(|| Error::client("consumer not started, call start() first"))
+    }
+
+    /// 注册并发消费监听器。
     pub fn set_message_listener(&self, listener: MessageListener) {
         *lock(&self.inner.listener) = Some(listener);
     }
@@ -1283,17 +1282,11 @@ impl DefaultMQPushConsumer {
             return Ok(());
         }
         let cfg = self.config();
-        // 消费组拼命名空间必须在算重试主题之前（Java DefaultMQPushConsumer.start:763）。
         let group = if cfg.namespace.is_empty() {
             cfg.consumer_group.clone()
         } else {
             NamespaceUtil::wrap_namespace(&cfg.namespace, &cfg.consumer_group)
         };
-        // 对应 Java DefaultMQPushConsumerImpl.checkConfig(:1026)：先 Validators.check_group
-        // （blank / 120 长度 / 字符表），再挡 DEFAULT_CONSUMER —— 共用默认组会让 broker 侧
-        // 的订阅关系判定把两组混在一起，回投与重平衡都错乱。
-        // ⚠ checkConfig 是 Java start() 的第一步，所以这里领先于地址/订阅/监听器检查：
-        // 组名非法时既不碰网络，也不该被后面的错误盖掉真正原因。
         if let Err(e) = validators::check_group(&group) {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
@@ -1319,25 +1312,15 @@ impl DefaultMQPushConsumer {
             self.inner.started.store(false, Ordering::Release);
             bail!("message listener is not set");
         }
-        // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验起点
-        // 时间。放在这里是补一处真缺口 —— 原来只有 `compute_pull_from_where` 在拉到队列
-        // 之后才解析，格式写歪的后果是**那条队列**静默不消费，而不是启动失败。
         if let Err(e) = consume_timestamp_millis(&cfg.consume_timestamp) {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
         }
-        // 对应 Java DefaultMQPushConsumerImpl.checkConfig 的数值段（:1099-1209）。
-        // 必须排在所有 null 检查之后、建 MQClientInstance 之前：起了后台任务再抛错
-        // 就泄漏任务了。
         if let Err(e) = check_config_ranges(&cfg) {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
         }
 
-        // Java `DefaultMQPushConsumerImpl#start`:934-936：只有 CLUSTERING 才
-        // `changeInstanceNameToPID`（BROADCASTING 保持 "DEFAULT"，同进程多个广播消费者
-        // 因此共用一份实例），再由 `ClientConfig#buildMQClientId` 拼
-        // `<本机 IP>@<instanceName>`。
         let instance_name = MixAll::instance_name_for_model(
             &cfg.instance_name,
             cfg.message_model == MessageModel::CLUSTERING,
@@ -1391,11 +1374,8 @@ impl DefaultMQPushConsumer {
                 self.update_config(|c| c.name_server_addrs = addrs);
             }
         }
-        // 消费统计（Java MQClientFactory.getConsumerStatsManager，实例级共享）
         *lock(&self.inner.stats) = Some(client.consumer_stats_manager().clone());
 
-        // 集群模式自动订阅重试 topic（Java copySubscription）：SUB_ALL 下
-        // tagsSet/codeSet 均为**空**，见 heartbeat::FilterAPI。
         if self.config().message_model != MessageModel::BROADCASTING {
             let retry_topic = MixAll::get_retry_topic(&group);
             let exist = lock(&self.inner.state)
@@ -1419,8 +1399,6 @@ impl DefaultMQPushConsumer {
         let _ = self.inner.stop.send(false);
         client.register_consumer(&group, Arc::new(self.clone()));
 
-        // POP 的消费执行器必须在 rebalance 之前建好：重平衡会立刻起每队列 POP 循环，
-        // 循环拿到消息要投到这里（Java 的 consumeExecutor）。
         if self.config().pop_mode {
             let cfg = self.config();
             let executor = ConsumeExecutor::with_params(
@@ -1439,10 +1417,6 @@ impl DefaultMQPushConsumer {
 
         // 拉一次路由 → 同步首轮心跳 → 同步首轮重平衡 → 起循环（顺序照 Python）
         self.refresh_routes().await;
-        // 对应 Java DefaultMQPushConsumerImpl.start:1013-1020：路由到手之后、心跳之前，把
-        // 非 TAG 订阅发给 broker 校验（CHECK_CLIENT_CONFIG 46）。SQL92 写错时 broker 的过滤层
-        // 拿不到编译数据会**静默放行全部消息**，只有这一步能让它变成启动期错误；
-        // Java 在这一步失败时 shutdown() 并把异常抛给调用方。
         if let Err(e) = client.check_client_in_broker().await {
             self.shutdown();
             return Err(e);
@@ -1506,22 +1480,13 @@ impl DefaultMQPushConsumer {
         let dispatch_task = lock(&self.inner.dispatch_task).take();
         // POP 执行器同样挪进收尾任务：先停接收，再有界等已提交任务跑完。
         let pop_executor = lock(&self.inner.pop_executor).take();
-        // 退出前把已消费位点持久化一次（Java MQClientInstance.shutdown →
-        // persistAllConsumerOffset）。必须在 started=false 之后仍能取到 client，
-        // 所以这里直接用 client 引用而不是 require_client()。
         let client = lock(&self.inner.client).clone();
         if let Some(client) = client {
             let group = self.consumer_group();
             let broadcast = self.config().message_model == MessageModel::BROADCASTING;
-            // 顺序消费清退时解锁队列（Java ConsumeMessageOrderlyService.shutdown → unlockAll）
             let orderly = lock(&self.inner.listener)
                 .as_ref()
                 .is_some_and(MessageListener::is_orderly);
-            // 位点清单在收尾任务里排空之后现算（[`shutdown_persist_items`]）：
-            // 停机瞬间快照 consume_offsets 会把还没收尾的批次漏在旧值之外，
-            // 更重要的是要把位点钳到「仍未落定消息」之下。
-            // POP 顺序同样没有队列锁可解：Java unlockAll() 只遍历 processQueueTable，
-            // POP 的队列在 popProcessQueueTable 里，这张表是空的 ⇒ UNLOCK 一发不出。
             let locked_mqs: Vec<MessageQueue> = if orderly && !broadcast && !self.config().pop_mode
             {
                 lock(&self.inner.state).assigned.clone()
@@ -1533,9 +1498,6 @@ impl DefaultMQPushConsumer {
                     rmq_debug!("persist local offsets on shutdown failed: {e}");
                 }
             }
-            // 先从本地注册表摘掉自己：表里没有消费者时本实例就不会再发心跳
-            // （`send_heartbeat_to_all_broker` 空表直接返回 0）。Python 只在
-            // start() 里 register，少了 Java `MQClientInstance#unregisterConsumer`。
             client.unregister_consumer(&group);
             // 同生产者：注销 35 在 spawn 的任务里，登记表不能等任务 —— 立刻重启会
             // 复用回这份正要被拆的实例（见 `MQClientInstance` 上那段注释）。
@@ -1591,8 +1553,6 @@ impl DefaultMQPushConsumer {
                                 .await;
                         }
                     }
-                    // 优雅注销（Java MQClientInstance.unregisterClient），不必等心跳超时。
-                    // 超时用 Java 的 mqClientApiTimeout（3000ms），见 :1170。
                     client
                         .unregister_client_all_brokers(
                             &client_id,
@@ -1601,12 +1561,6 @@ impl DefaultMQPushConsumer {
                             MQ_CLIENT_API_TIMEOUT_MILLIS,
                         )
                         .await;
-                    // 被 abort 的心跳可能已经在线上（`JoinHandle::abort` 要到下一个让出点
-                    // 才生效），它落回 broker 会把本 clientId 重新塞进 ConsumerManager，同组
-                    // 其它实例就得等 broker 的通道扫描（默认 120s）才接管。Java 靠「先停心跳
-                    // 线程 → 注销 → 关连接」消掉这个窗口；这里连接可能和同 clientId 的其它
-                    // 客户端共用（关不关由实例的守卫判断，见 `MQClientInstance::shutdown`），
-                    // 那就等一拍再补偿性注销一次。
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     if client.find_consumer(&group).is_none() {
                         client
@@ -1618,9 +1572,6 @@ impl DefaultMQPushConsumer {
                             )
                             .await;
                     }
-                    // 清退 RPC 跑完了才关实例（Java `DefaultMQPushConsumerImpl#shutdown`
-                    // 的 `unregisterConsumer` → `mQClientFactory.shutdown()` 顺序）。
-                    // 守卫保证同 clientId 还有别人时这一句是 no-op。
                     client.shutdown();
                 };
                 let _ = run_finalize_blocking(
@@ -1641,7 +1592,6 @@ impl DefaultMQPushConsumer {
         }
         lock(&self.inner.client).take();
         self.inner.started.store(false, Ordering::Release);
-        // 轨迹分发器最后关（flush 剩余轨迹，Java DefaultMQPushConsumer.shutdown:794）
         if let Some(dispatcher) = self.trace_dispatcher() {
             dispatcher.shutdown();
         }
@@ -1764,18 +1714,12 @@ impl DefaultMQPushConsumer {
     }
 
     /// Python `_lock_ok`：`LOCK_BATCH_MQ` 真正拿到锁的队列（顺序消费才会填）。
-    ///
-    /// Java 里同一个事实是 `ProcessQueue.isLocked()`；四个移植版的
-    /// `consumerRunningInfo` 都不回填 `ProcessQueueInfo.locked`（Python
-    /// `consumer.py:1778-1783` 只写 commitOffset/cachedMsgCount/droped），
-    /// 所以这是唯一能观测锁定状态的入口。
     pub fn locked_queue_keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = lock(&self.inner.state).lock_ok.iter().cloned().collect();
         keys.sort();
         keys
     }
 
-    /// POP 顺序消费去重集的大小（单测/运维观测口；Java 骨架无对应查询，四端同加）。
     pub fn pop_orderly_request_count(&self) -> usize {
         lock(&self.inner.state).pop_orderly_requests.len()
     }
@@ -1786,7 +1730,6 @@ impl DefaultMQPushConsumer {
     // rebalance，再确认「停摆的队列被撤掉重建、消息一条不重不丢」。这些判据本身
     // 是内部状态，没有接缝就只能靠 sleep 120s 猜。
 
-    /// 该队列当前是否会被 rebalance 判成停摆（Java `isPullExpired`）。
     pub fn pull_stalled(&self, key: &str) -> bool {
         let state = lock(&self.inner.state);
         pull_stalled_locked(&state, key, current_time_millis())
@@ -1810,8 +1753,6 @@ impl DefaultMQPushConsumer {
     // 位点被冻结、缓冲里的旧消息整批作废」，这些都是内部状态，没有接缝就只能靠
     // 「消息有没有投过来」间接猜。
 
-    /// 该队列 ProcessQueue 的代号（Java `ProcessQueue.isDropped()` 的等价物）。
-    /// 撤销（rebalance 撤走 / OFFSET_ILLEGAL / 停摆自愈）时 +1。
     pub fn queue_epoch(&self, key: &str) -> u64 {
         lock(&self.inner.state)
             .queue_epoch
@@ -1820,14 +1761,10 @@ impl DefaultMQPushConsumer {
             .unwrap_or(0)
     }
 
-    /// 该队列的位点是否正被 OFFSET_ILLEGAL 纠错冻结（Java
-    /// `ControllableOffset.allowToUpdate == false`）。
     pub fn offset_frozen(&self, key: &str) -> bool {
         lock(&self.inner.state).frozen_offsets.contains(key)
     }
 
-    /// 该队列缓冲里「已取回、还没交给 listener」的消息条数
-    /// （Java `ProcessQueue.getMsgCount()` 的一半，另一半在途批次见 `inflight`）。
     pub fn cached_message_count(&self, key: &str) -> usize {
         lock(&self.inner.state)
             .pending
@@ -1841,14 +1778,11 @@ impl DefaultMQPushConsumer {
     // CONSUME_START_TIME）、清扫把它从视图里收走、回投消息停在哪条队列的缓冲里」，
     // 判据全是内部状态，没有接缝就只能靠「消息有没有来第二次」间接猜。
 
-    /// 「在册」视图 = 在途（已分发未落定）∪ 已拉未分发，即 Java
-    /// `ProcessQueue.msgTreeMap`（并集按 queueOffset 去重）。
     pub fn process_queue_entries(&self, key: &str) -> Vec<MessageExt> {
         let state = lock(&self.inner.state);
         process_queue_entries_locked(&state, key)
     }
 
-    /// 该队列「已拉未分发」的缓冲（Java `ProcessQueue.msgTreeMap` 里还没被取走的部分）。
     pub fn pending_messages(&self, key: &str) -> Vec<MessageExt> {
         lock(&self.inner.state)
             .pending
@@ -1867,12 +1801,6 @@ impl DefaultMQPushConsumer {
 
     // ---------------- 重平衡 ----------------
 
-    /// Python `_all_queues_of_topic`（Java `RebalanceImpl.topicSubscribeInfoTable`）。
-    ///
-    /// 取自**订阅信息**（`topicRouteData2TopicSubscribeInfo`：读位 + readQueueNums、
-    /// 不筛 master），不是发布信息 —— 两者在「perm=4 的只读 topic」与「master 掉线只剩
-    /// 从节点」两种路由上答案不同，消费侧必须用宽的这一份（Java 的 rebalance 队列集
-    /// 从来就是订阅信息，发布信息只服务生产者选队）。
     async fn all_queues_of_topic(&self, topic: &str) -> Vec<MessageQueue> {
         let Ok(client) = require_client(&self.inner) else {
             return Vec::new();
@@ -1884,16 +1812,9 @@ impl DefaultMQPushConsumer {
         queues
     }
 
-    /// Python `_do_rebalance`（Java `RebalanceImpl.rebalanceByTopic`）。
-    ///
     /// BROADCASTING 全部队列归自己；CLUSTERING 查 broker 上的消费者列表 → 排序 →
     /// 分配策略。**查不到消费者列表时保留现有分配**（绝不回退成「独占全部队列」，
     /// 否则同组多实例互相重复消费）。
-    ///
-    /// **POP 模式（集群 + 非顺序）改走 broker 侧分配**：每 topic 发一笔
-    /// `QUERY_ASSIGNMENT(400)`（Java `RebalanceImpl#getRebalanceResultFromBroker` →
-    /// `RebalancePushImpl#clientRebalance=false` 分支），返回的队列集**就是**分配，
-    /// 不再本地算 `cidAll`。失败/无效结果同样保留上一次分配，绝不退化成「全要」。
     pub async fn do_rebalance(&self) -> Result<()> {
         let client = require_client(&self.inner)?;
         let group = self.consumer_group();
@@ -1908,8 +1829,6 @@ impl DefaultMQPushConsumer {
             .iter()
             .map(|(k, _)| k.clone())
             .collect();
-        // Java `RebalancePushImpl#clientRebalance:138`：顺序消费与 BROADCASTING 恒走
-        // 本地路径；POP（并发、集群）改由 broker 决定队列集。
         let orderly = lock(&self.inner.listener)
             .as_ref()
             .is_some_and(MessageListener::is_orderly);
@@ -1928,8 +1847,6 @@ impl DefaultMQPushConsumer {
                     match self.assigned_from_broker(&group, topic).await {
                         Some(queues) => assigned.extend(queues),
                         None => {
-                            // 「保留上一次分配」（Java 的 return false：processQueueTable
-                            // 本轮不动）。按 topic 摘出来，别的 topic 照常更新。
                             let keep: Vec<MessageQueue> = lock(&self.inner.state)
                                 .assigned
                                 .iter()
@@ -2003,9 +1920,6 @@ impl DefaultMQPushConsumer {
                 assigned.len()
             );
         }
-        // 新分配的队列**立刻**解析初始位点（Java updateProcessQueueTableInRebalance →
-        // computePullFromWhereWithException）。留到首次拉取才惰性解析会漏掉
-        // 「分配之后、首拉之前」新产生的消息。
         for mq in &assigned {
             let key = mq_key(mq);
             if was.contains(&key) {
@@ -2025,24 +1939,6 @@ impl DefaultMQPushConsumer {
         Ok(())
     }
 
-    /// Java `RebalanceImpl#getRebalanceResultFromBroker:345`（POP 模式的
-    /// `QUERY_ASSIGNMENT(400)` 路径），含 `MQClientInstance#queryAssignment:1373` 的
-    /// broker 选址：路由缓存没有就补拉一次，再找不到 = 无效结果。
-    ///
-    /// 返回值三态（Java 语义逐条对应）：
-    ///
-    /// - `None`：**保留上一次分配**（调用方本轮不动这个 topic 的队列）。触发条件：
-    ///   RPC 传输失败、broker 非 SUCCESS 应答、找不到 broker 地址、SUCCESS 但 body
-    ///   不带分配集（Java 的 null 集）—— Java 的 `catch (Exception)` 与
-    ///   `assignments == null` 都只 `return false`，`processQueueTable` 原样留着；
-    /// - `Some(queues)`：有效分配（**空 Vec = 显式清除**，broker 说「你之前拿到的
-    ///   负载全部收回」）。
-    ///
-    /// 本端口相对 Java 的**有意偏差**：`TOPIC_NOT_EXIST(17)` 应答回 `Some(vec![])`
-    /// 而不是保留 —— topic 在 broker 侧已经不存在时，继续抱着旧队列只会让 POP 循环
-    /// 永远撞墙；本仓库对「路由/topic 消失」的既定口径是回空集收敛（与
-    /// `topicSubscribeInfoTable` 缺 topic 的行为一致）。
-    ///
     /// 分配项自带的 mode（POP / PULL）只**观察不服从**：本消费者的消费模式是启动前
     /// 定死的（`pop_mode`），rebalance 消费的是队列**集合**；混合应答只告警不拆分
     /// —— 那几乎总是 `SET_MESSAGE_REQUEST_MODE` 没有全量生效的形状。
@@ -2089,7 +1985,6 @@ impl DefaultMQPushConsumer {
         let assignments = match assignments {
             Some(list) => list,
             None => {
-                // Java: "null means invalid result, we should skip the update logic".
                 rmq_warn!(
                     "queryAssignment: no assignment set for topic {topic} group {group}, \
                      keep current assignment"
@@ -2097,8 +1992,6 @@ impl DefaultMQPushConsumer {
                 return None;
             }
         };
-        // Java 收进以 MessageQueue 为键的 HashSet（equals 只看 messageQueue）：
-        // 既去重又跳过 null 队列 —— 逐条照做。
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut out: Vec<MessageQueue> = Vec::with_capacity(assignments.len());
         let mut pop_cnt = 0usize;
@@ -2134,14 +2027,6 @@ impl DefaultMQPushConsumer {
     /// 队列被撤走时必须 ①持久化已消费位点 ②丢弃缓冲（在途消息不再消费）
     /// ③顺序消费还要 UNLOCK_BATCH_MQ —— 少任何一步，被撤销队列里的在途消息会被
     /// 旧实例继续消费，与新属主重复。
-    ///
-    /// 三步顺序（撤 → 收尾 → 建）是刻意的：把收尾放在**起新循环之前**，否则新循环
-    /// 可能从旧循环最后持久化的位点之前开始拉，把已消费的消息再拉一遍（Java 在同一趟
-    /// `updateProcessQueueTableInRebalance` 里也是先 remove 再 build）。
-    ///
-    /// 第二步除了「不再归本实例」的队列，还要自愈 Java `isPullExpired` 那一条：仍归
-    /// 本实例、但拉取停摆超过 [`PULL_MAX_IDLE_TIME`]（或循环已经退出）的队列，撤掉重建，
-    /// 并打 Java 原样的 `[BUG]doRebalance ...` 错误日志。
     async fn rebalance_pull_threads(&self) {
         let pop = self.config().pop_mode;
         let current: BTreeMap<String, MessageQueue> = lock(&self.inner.state)
@@ -2187,9 +2072,6 @@ impl DefaultMQPushConsumer {
                 if pop && !state.pop_queues.contains_key(key) {
                     state.pop_queues.insert(key.clone(), PopProcessQueue::new());
                 }
-                // 新 ProcessQueue 就位 ⇒ 解冻（Java `removeProcessQueue` 里的 `removeOffset`
-                // 取消冻结状态）：重建后的队列按修正位点重新开始推进。留在冻结集里会让队列
-                // 从此只拉不 ack —— 位点永久停在纠错值，重投也不会前移。
                 state.frozen_offsets.remove(key);
                 let token = self.inner.next_token.fetch_add(1, Ordering::SeqCst);
                 state.queue_owners.insert(key.clone(), token);
@@ -2202,8 +2084,6 @@ impl DefaultMQPushConsumer {
                 to_spawn.push((mq.clone(), token));
             }
         }
-        // ②收尾：网络 RPC 必须在锁外，但也必须在 spawn **之前**await 完 —— 新循环起的瞬间
-        // 就去 broker 读起始位点，持久化没先落地它就会从旧位点重拉（Java 的撤在建之前，同理）。
         if !revoked.is_empty() {
             self.on_queues_revoked(&revoked).await;
         }
@@ -2243,14 +2123,9 @@ impl DefaultMQPushConsumer {
     ) {
         state.queue_owners.remove(key); // 循环内下一轮 owns_queue 失效
         state.pending.remove(key);
-        // 在途登记一并作废：队列已从 processQueueTable 摘除，Java 的清扫（cleanExpireMsg
-        // 只遍历 processQueueTable）不会再碰它，这里也不能让旧批次的引用留在登记里。
         state.inflight_msgs.remove(key);
         state.lock_ok.remove(key);
         state.last_pull_at.remove(key); // 同名队列复用时不能继承旧时刻
-                                        // 代号 +1 ⇒ 在途批次的 ack 全部失效（Java `ProcessQueue.setDropped(true)`）。
-                                        // 冻结标记**保留**到队列重建为止（见 `rebalance_pull_threads` 的解冻分支），
-                                        // 否则纠错后的位点会被旧 ack 覆盖。
         *state.queue_epoch.entry(key.to_string()).or_insert(0) += 1;
         let off = state.consume_offsets.remove(key);
         state.offset_table.remove(key);
@@ -2265,7 +2140,6 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// Python `_on_queues_revoked`（Java `RebalanceImpl.removeUnnecessaryMessageQueue`）。
     async fn on_queues_revoked(&self, revoked: &[(MessageQueue, Option<i64>)]) {
         revoke_queues(&self.inner, revoked).await;
     }
@@ -2279,8 +2153,6 @@ impl DefaultMQPushConsumer {
 
 // ---------------- 位点解析 ----------------
 
-/// Python `_resolve_initial_offset`（Java `computePullFromWhere`）。
-///
 /// 自由函数：拉取循环只持有 `Arc<Inner>`（模块头差异 4），拿不到消费者句柄。
 async fn resolve_initial_offset(
     inner: &Inner,
@@ -2295,20 +2167,15 @@ async fn resolve_initial_offset(
     }
     let key = mq_key(mq);
     if cfg.message_model == MessageModel::BROADCASTING {
-        // 广播模式：offset 只存本地（Java LocalFileOffsetStore）
         let stored = load_local_offsets(inner);
         if let Some(off) = stored.get(&key) {
             return Ok(*off);
         }
         if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET {
-            // Java RebalancePushImpl:197-208：FIRST_OFFSET 且本地没有位点时直接给 0
-            // （本地文件与 broker 两条路径同一个分支），真正的起点由 OFFSET_ILLEGAL
-            // 纠错按 broker 回的 nextBeginOffset 落定。
             return Ok(0);
         }
         return client.get_max_offset(mq, 5000, None).await;
     }
-    // 集群模式：先查 broker 上已提交的位点（Java RemoteBrokerOffsetStore.readOffset）
     match client
         .query_consumer_offset(&cfg.consumer_group, mq, 5000, None, false)
         .await
@@ -2318,11 +2185,6 @@ async fn resolve_initial_offset(
         Err(e) => rmq_debug!("query consumer offset for {mq:?} not found: {e}"),
     }
     if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET {
-        // Java RebalancePushImpl:197-208（`//the offset will be fixed by the OFFSET_ILLEGAL
-        // process` → `result = 0L`）：**不**发 minOffset 查询。多打这一枪的代价不只是慢：
-        // minOffset 是 MQAdminImpl 口径（只认 master），主掉线期间恰好是「新起的消费者
-        // 一条都拉不到」——而从节点本来就能按 0 起拉、越界时由 broker 用
-        // PULL_OFFSET_MOVED 把位点纠回来（handle_offset_illegal）。
         return Ok(0);
     }
     if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP {
@@ -2330,8 +2192,6 @@ async fn resolve_initial_offset(
         return client.search_offset_by_timestamp(mq, ts, 5000, None).await;
     }
     if NamespaceUtil::is_retry_topic(&mq.topic) {
-        // Java RebalancePushImpl:181-182：%RETRY% 主题首次消费从 0 开始，
-        // 不能按 CONSUME_FROM_LAST_OFFSET 跳过（重试消息要全量重试）
         return Ok(0);
     }
     client.get_max_offset(mq, 5000, None).await
@@ -2339,9 +2199,6 @@ async fn resolve_initial_offset(
 
 // ---------------- 队列撤销与位点纠错 ----------------
 
-/// Python `_on_queues_revoked`（Java `RebalanceImpl.removeUnnecessaryMessageQueue`）：把
-/// 被撤销队列的已消费位点推到 broker（集群）/本地文件（广播），顺序消费再释放 broker 锁。
-///
 /// 自由函数（与下面的 `handle_offset_illegal` 同一理由）：拉取循环只持有 `Arc<Inner>`。
 async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>)]) {
     if revoked.is_empty() {
@@ -2349,8 +2206,6 @@ async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>
     }
     let cfg = read_cfg(inner);
     if cfg.message_model == MessageModel::BROADCASTING {
-        // 广播模式位点只存本地。撤下来的位点必须连同队列信息写回文件（Java persist 在前、
-        // removeOffset 在后），否则重建时读不到旧位点、按 consume_from_where 重扫。
         if let Err(e) = save_local_offsets_with(inner, revoked) {
             rmq_debug!("save local offsets failed: {e}");
         }
@@ -2373,9 +2228,6 @@ async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>
                 rmq_debug!("persist offset on revoke failed for {mq:?}: {e}");
             }
         }
-        // 顺序消费：释放 broker 队列锁，新属主才能立刻接上。POP 顺序例外：
-        // Java RebalancePushImpl.removeUnnecessaryMessageQueue:94-108 的撤销解锁
-        // 同样只看见 processQueueTable —— POP 队列不在里面 ⇒ UNLOCK 一发不出。
         if orderly && !cfg.pop_mode {
             let _ = client
                 .unlock_batch_mq(&group, &client_id, std::slice::from_ref(mq), 1000)
@@ -2385,19 +2237,12 @@ async fn revoke_queues(inner: &Arc<Inner>, revoked: &[(MessageQueue, Option<i64>
     rmq_info!("queues revoked, group={group} count={}", revoked.len());
 }
 
-/// Python `_offset_illegal_recover`（Java `DefaultMQPushConsumerImpl:402-427`）。
-///
 /// broker 说"你请求的位点非法"（队列被截断、commitlog 过期或被服务端重置，见
 /// `PullMessageProcessor` 对 OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE / OFFSET_RESET
 /// 一律回 `PULL_OFFSET_MOVED`），并把修正值放在 `nextBeginOffset` 里。纠错不只是把游标
 /// 拨过去：这条队列上**已经取回、还没消费/没 ack 的消息全部作废**（它们落在被跳过的区间
 /// 里，ack 它们会把位点推回非法值），然后按修正位点把队列重建。
 ///
-/// Java 的四步：`setNextOffset` → `ProcessQueue.setDropped(true)` →
-/// `{ updateAndFreezeOffset; persist; removeProcessQueue }` → `rebalanceImmediately`。
-/// 本端口：置位点 + 冻结（在拉取回调的临界区里，等价 updateAndFreezeOffset）→ 撤队列
-/// （`retire_queue_locked` 清缓冲/线程表并**代号 +1**，等价 setDropped）→ 锁外把修正位点
-/// 推给 broker（等价 persist）→ 叫醒 rebalance 重建（removeProcessQueue 之后由分配结果重建）。
 ///
 /// 须在锁外调用：里面要做网络 RPC。调用点在拉取回调持锁块之后。
 async fn handle_offset_illegal(inner: &Arc<Inner>, key: &str) {
@@ -2412,7 +2257,6 @@ async fn handle_offset_illegal(inner: &Arc<Inner>, key: &str) {
             read_cfg(inner).pop_mode,
         );
     }
-    // persist：把修正后的位点立刻写回 broker（Java 显式的一次 persist，不等周期落盘）
     revoke_queues(inner, &revoked).await;
     inner.rebalance_now.store(true, Ordering::SeqCst);
     inner.rebalance_signal.notify_waiters();
@@ -2466,10 +2310,6 @@ fn stamp_pull_at(inner: &Inner, key: &str, pop: bool) {
 }
 
 /// Python `_pull_stalled_locked`：仍归本实例、但拉取循环已经停摆的队列。
-///
-/// 三个判据，与 Java `isPullExpired` + Python 的线程存活检查一致：
-/// ① 从没盖过章（刚分配、还没跑到第一轮）不算停摆；② 哨兵 `0` = 循环已退出；
-/// ③ 超过 [`PULL_MAX_IDLE_TIME`] 才是停摆（严格 `>`，边界上不动）。
 fn pull_stalled_locked(state: &State, key: &str, now: i64) -> bool {
     match state.last_pull_at.get(key) {
         None => false,
@@ -2488,10 +2328,6 @@ fn mark_pull_loop_exited(inner: &Inner, key: &str, token: u64) {
     }
 }
 
-/// Java `DefaultMQPushConsumerImpl.pullMessage:458-468` 的订阅门控：
-/// 只有 `postSubscriptionWhenPull` 打开**且非**类过滤模式时才把订阅表达式随请求上送；
-/// 默认关闭（Java 5.x 默认 false），tag 过滤交给客户端
-/// [`filter_messages_for_delivery`] 兜底。
 fn pull_subscription_expression(cfg: &ConsumerConfig, sub: &SubscriptionData) -> Option<String> {
     if cfg.post_subscription_when_pull && !sub.class_filter_mode {
         Some(sub.sub_string.clone())
@@ -2500,8 +2336,6 @@ fn pull_subscription_expression(cfg: &ConsumerConfig, sub: &SubscriptionData) ->
     }
 }
 
-/// Java `PullAPIWrapper#recalculatePullFromWhichNode`：表里没有该队列时按
-/// `defaultBrokerId`（= `MixAll.MASTER_ID`）算，于是首轮总是打主节点。
 fn recalc_pull_from_which_node(state: &State, mq: &MessageQueue) -> i64 {
     state
         .pull_from_which_node
@@ -2510,10 +2344,6 @@ fn recalc_pull_from_which_node(state: &State, mq: &MessageQueue) -> i64 {
         .unwrap_or(MixAll::MASTER_ID as i64)
 }
 
-/// Java `PullAPIWrapper#updatePullFromWhichNode:157-164`：把应答头里的
-/// `suggestWhichBrokerId` 写回表。缺省（老 broker 不带该字段）按 master=0 记账 ——
-/// 与 Java 的 `PullResultExt.getSuggestWhichBrokerId()`（long 原语，默认 0）同口径，
-/// 所以**不能**把 `None` 当成「保留旧值」。
 fn update_pull_from_which_node(state: &mut State, mq: &MessageQueue, suggest: Option<i64>) {
     state
         .pull_from_which_node
@@ -2543,10 +2373,7 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         if !owns_queue(&inner, &key, token) {
             return;
         }
-        // Java DefaultMQPushConsumerImpl.pullMessage:253 —— 每次**发起**拉取就盖章，
-        // 在流控/订阅判定之前：判据是「这条循环还在跑」，不是「这轮真的打了网络」。
         stamp_pull_at(&inner, &key, false);
-        // Java pullMessage:263-268 —— pause 时把拉取请求推后 1s（不打网络）。
         if inner.pause.load(Ordering::SeqCst) {
             if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_SUSPEND).await {
                 return;
@@ -2567,7 +2394,6 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             continue;
         }
         if flow_control_hit(&inner, &mq, &key) {
-            // Java pullMessage:273 —— 缓存打满：PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL
             if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL).await {
                 return;
             }
@@ -2590,13 +2416,9 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 }
             },
         };
-        // Java DefaultMQPushConsumerImpl.pullMessage:458-468 —— subscription 位置位
-        // 与否完全由 subExpression 是否为 null 决定（见 helper 文档）。
         let sub_expression = pull_subscription_expression(&cfg, &sub);
         let sys_flag =
             PullSysFlag::build_sys_flag_basic(false, true, sub_expression.is_some(), false);
-        // Java PullAPIWrapper#pullKernelImpl:197-205：按 pullFromWhichNodeTable 里的
-        // brokerId 选主/从（缺省 MASTER_ID=0），应答后回写。
         let broker_id = {
             let state = lock(&inner.state);
             recalc_pull_from_which_node(&state, &mq)
@@ -2631,8 +2453,6 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                     rmq_debug!("pull long-poll timeout for {mq:?} (benign, will retry): {e}");
                     continue;
                 }
-                // Java pullCallback.onException:446-450 —— broker 回 FLOW_CONTROL(215)
-                // 时只退 20ms（broker 只是让客户端慢一点），其余异常退 3s。
                 let delay = match &e {
                     Error::Server {
                         response_code: response_code::FLOW_CONTROL,
@@ -2652,13 +2472,10 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 continue;
             }
         };
-        // Java PullAPIWrapper#processPullResult:77 —— 每轮应答都更新 pullFromWhichNodeTable
-        // （缺省按 master=0 记账，见 helper 文档）。
         {
             let mut state = lock(&inner.state);
             update_pull_from_which_node(&mut state, &mq, result.suggest_which_broker_id);
         }
-        // 消费统计（Java PullCallback.onSuccess：RT 恒记，TPS 只在有消息时记）
         if let Some(stats) = lock(&inner.stats).clone() {
             stats.inc_pull_rt(
                 &cfg.consumer_group,
@@ -2675,9 +2492,6 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         }
         let mut msgs = result.msg_found_list;
         if result.status == PullStatus::Found && !msgs.is_empty() {
-            // 投递前的客户端侧过滤（Java PullAPIWrapper.processPullResult:113-128）。
-            // 必须在拿锁之前做 —— 钩子是用户代码，可能阻塞。
-            // 拉取路径被摘掉的消息不 ack（Java 亦然）：位点照常推进 = 静默跳过。
             msgs = filter_messages_for_delivery(
                 &cfg.consumer_group,
                 &inner.filter_hooks,
@@ -2687,9 +2501,6 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 cfg.unit_mode,
             );
         }
-        // 入队与「是否仍持有该队列」必须同一把锁内完成：挂起期间被撤走的队列，
-        // 这批消息按 Java ProcessQueue.isDropped() 语义**直接丢弃**——不消费、不推进
-        // 位点，由新属主从最后持久化的位点重投，否则两实例重复消费。
         let mut illegal = false;
         {
             let mut state = lock(&inner.state);
@@ -2712,10 +2523,6 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 .offset_table
                 .insert(key.clone(), result.next_begin_offset);
             if result.status == PullStatus::OffsetIllegal {
-                // Java DefaultMQPushConsumerImpl:402-427 —— 位点被 broker 纠正，纠错 +
-                // 撤队列 + 落盘的整条链路见 handle_offset_illegal。
-                // 冻结位点要在锁内先落地（等价 updateAndFreezeOffset），
-                // 撤队列与落盘（要发 RPC）放锁外。
                 if result.next_begin_offset >= 0 {
                     state
                         .consume_offsets
@@ -2724,8 +2531,6 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 state.frozen_offsets.insert(key.clone());
                 illegal = true;
             } else {
-                // Java DefaultMQPushConsumerImpl:394-401 —— 空应答（NO_NEW_MSG /
-                // NO_MATCHED_MSG）时修正"已消费位点"，见 correct_tags_offset_locked
                 correct_tags_offset_locked(
                     &mut state,
                     &key,
@@ -2742,8 +2547,6 @@ async fn run_queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
     }
 }
 
-/// Java `ProcessQueue.putMessage` 里的 `msgAccCnt` 计算（`ProcessQueue.java:148-158`）：
-/// 取**本批最后一条**的 `MAX_OFFSET - queueOffset`，>0 才更新。
 fn update_msg_acc_cnt(inner: &Inner, key: &str, msgs: &[MessageExt]) {
     let Some(last) = msgs.last() else {
         return;
@@ -2762,7 +2565,6 @@ fn update_msg_acc_cnt(inner: &Inner, key: &str, msgs: &[MessageExt]) {
     }
 }
 
-/// Python `_flow_control_hit`（Java `ProcessQueue.putMessage` 的五个阈值）。
 fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
     let cfg = read_cfg(inner);
     let (count, size_mb, span, topic_pending) = {
@@ -2833,8 +2635,6 @@ fn flow_control_hit(inner: &Inner, mq: &MessageQueue, key: &str) -> bool {
 
 static EMPTY_DEQUE: VecDeque<MessageExt> = VecDeque::new();
 
-/// Python `_rebalance_loop`（Java `RebalanceService`，默认 20s；被 40 通知时立刻）。
-///
 /// 启动 60s 内且当前没有任何分配时缩短为 2s：消费者可能先于 topic 创建而启动
 /// （`autoCreateTopicEnable` 下 topic 由生产者首次发送时建），死等 20s 会长时间不消费。
 async fn rebalance_loop(consumer: DefaultMQPushConsumer, rx: watch::Receiver<bool>) {
@@ -2894,12 +2694,8 @@ async fn heartbeat_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     }
 }
 
-/// Python `_lock_loop`（Java `ConsumeMessageOrderlyService.lockMQ`：每 20s，启动即试一次）。
 async fn lock_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     loop {
-        // POP 顺序（Java ConsumeMessagePopOrderlyService.start:68-77）同样跑这个 20s
-        // 定时器，但 lockAll() 只遍历 processQueueTable（classic 拉取表）—— POP 模式下
-        // 队列登记在 popProcessQueueTable，这张表是空的 ⇒ 定时器在转、一次网络都不发。
         if !read_cfg(&inner).pop_mode {
             let mqs: Vec<MessageQueue> = lock(&inner.state).assigned.clone();
             if !mqs.is_empty() {
@@ -2963,8 +2759,6 @@ async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
                 // 与"取走批次"同一临界区登记在途：correct_tags_offset_locked 的闸门靠它
                 // 区分"消息还在缓冲里"和"消息在 listener 手里"——两个都不算空。
                 *state.inflight.entry(key.clone()).or_insert(0) += 1;
-                // 连同这批消息所属的 ProcessQueue 代号一起取走：消费/ack 前比对，
-                // 不一致整批作废（Java ConsumeMessageConcurrentlyService:339）
                 let epoch = state.queue_epoch.get(&key).copied().unwrap_or(0);
                 (mq, batch, epoch)
             };
@@ -3039,10 +2833,6 @@ impl DefaultMQPushConsumer {
         let rx = self.inner.stop.subscribe();
         tasks.push(handle.spawn(async move { rebalance_loop(consumer, rx).await }));
         *lock(&self.inner.dispatch_task) = Some(spawn_loop!(dispatch_loop));
-        // 挂起 listener 的清扫调度只在**经典并发**路径存在：Java 把它建在
-        // ConsumeMessageConcurrentlyService 的构造/start 里（:68-88），顺序消费的
-        // ProcessQueue.cleanExpiredMsg:76 本来就直接返回，POP 的
-        // ConsumeMessagePopConcurrentlyService 没有对应的调度。
         let orderly = lock(&self.inner.listener)
             .as_ref()
             .is_some_and(MessageListener::is_orderly);
@@ -3053,13 +2843,6 @@ impl DefaultMQPushConsumer {
 }
 
 /// 停机位点持久化清单：`consume_offsets` 与「仍未落定消息的最小 queueOffset」取小。
-///
-/// 落定 = 已 ack / 已成功回投 %RETRY%。没落定的消息此刻压在 `pending`
-/// （回投失败等重试、顺序挂起重试）或 `inflight_msgs`（listener 手里、排空超时的
-/// 残余）里 —— broker 侧的位点绝不能越过它们，否则 broker 永远不会再投递这些
-/// 消息：立即关闭时回投还没跑完的那几条就是**真丢失**。Java 的
-/// `persistAllConsumerOffset` 拿的是 `ProcessQueue` 剩余消息的最小 offset，天然
-/// 不会跳过；本端口位点「只前进」推进，停机时刻必须显式做这道钳制。
 fn shutdown_persist_items(inner: &Inner) -> Vec<(MessageQueue, i64)> {
     let state = lock(&inner.state);
     state
@@ -3081,12 +2864,6 @@ fn shutdown_persist_items(inner: &Inner) -> Vec<(MessageQueue, i64)> {
 }
 
 /// Python `_persist_offsets_once`（集群模式刷 broker / 广播模式刷本地）。
-///
-/// 周期驱动**不在消费者这边**：Java 只有 `MQClientInstance.startScheduledTask` 里的一个
-/// `scheduleAtFixedRate(persistAllConsumerOffset, 1000*10, persistConsumerOffsetInterval)`，
-/// 这里同样收敛到实例（模块头差异 4），逐个 `consumer_table` 成员调用本函数。
-/// 消费者自己再起一个循环会**双写**，而且那个循环的 5s 首跳会盖过 Java 的 initialDelay 10s
-/// （真机 `live_scheduled_intervals` 的 I2 实测：首笔落盘提前到 4.9s）。
 async fn persist_offsets_once(inner: &Arc<Inner>, client: &MQClientInstance) {
     let cfg = read_cfg(inner);
     if cfg.message_model == MessageModel::BROADCASTING {
@@ -3113,8 +2890,6 @@ async fn persist_offsets_once(inner: &Arc<Inner>, client: &MQClientInstance) {
     }
 }
 
-/// Python `_local_offset_path`（Java `LocalFileOffsetStore`：
-/// `$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json`）。
 fn local_offset_path(inner: &Inner) -> Option<std::path::PathBuf> {
     let cfg = read_cfg(inner);
     let home = crate::common::util_all::user_home()?;
@@ -3125,10 +2900,6 @@ fn local_offset_path(inner: &Inner) -> Option<std::path::PathBuf> {
     Some(base.join("offsets.json"))
 }
 
-/// Java `persistAll` + fastjson2 的落盘格式（用真实 rocketmq-client 5.5.0 jar 实测）：
-/// `{"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,...}}`
-/// —— MessageQueue 对象直接当 JSON key。没有队列信息（`mq_map` 查不到）的条目
-/// 跳过，与 Java `persistAll(mqs)` 只写仍持有队列一致。
 fn build_local_offsets_json(
     items: &BTreeMap<String, i64>,
     mq_map: &BTreeMap<String, MessageQueue>,
@@ -3156,9 +2927,6 @@ fn build_local_offsets_json(
     s
 }
 
-/// 与 Python `_parse_local_offsets_json` 同口径：先按严格 JSON 解析（旧版本端写过
-/// 的扁平 map），失败再扫 Java fastjson2 的「对象作 key」格式。都失败返回 `None`
-/// （上层继续找 `.bak`）。
 fn parse_local_offsets_text(text: &str) -> Option<BTreeMap<String, i64>> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -3341,17 +3109,11 @@ fn scan_offset_store_entries(text: &str) -> Option<Vec<(String, String, i32, i64
     Some(out)
 }
 
-/// Python `_save_local_offsets`：先写 `.tmp` 再 `os.replace`，避免半截文件；
-/// 旧内容先滚到 `.bak`（Java `MixAll.string2File` 语义）。
 fn save_local_offsets(inner: &Inner) -> Result<()> {
     save_local_offsets_with(inner, &[])
 }
 
 /// `save_local_offsets` 加"刚被撤下来、已不在 `consume_offsets`/`mq_map` 里的队列位点"。
-///
-/// Java 的广播撤销是 `persist(mq)` 在前、`removeOffset(mq)` 在后 —— 文件里的值要留着，
-/// 同名队列下次分回来才能从它续上（`load_local_offsets`）。少了 `extra`，撤销一笔就把
-/// 这条队列的本地位点从文件里抹掉，重建后会按 `consume_from_where` 从头/从尾重扫。
 fn save_local_offsets_with(inner: &Inner, extra: &[(MessageQueue, Option<i64>)]) -> Result<()> {
     let Some(path) = local_offset_path(inner) else {
         return Err(Error::client("HOME is not set, cannot store local offsets"));
@@ -3423,12 +3185,6 @@ fn load_local_offsets_at(path: &std::path::Path) -> BTreeMap<String, i64> {
 
 // ================================================================ POP 消费
 
-/// POP 路径的拉取统计（Java `popMessage` 的 `PopCallback.onSuccess:556-563`）。
-///
-/// Java 的 pull 回调每次都记 RT，POP 回调只在 `FOUND` 记，而且是在判空**之前**记；
-/// TPS 只按真正弹到的条数记。照抄这个不对称：POP 的空手而归是长轮询常态
-/// （`POLLING_NOT_FOUND`），把它算进 RT 等于用挂起时长稀释平均拉取耗时。
-///
 /// 独立成函数是因为漏记是**静默**故障：消息照弹照 ack、消费完全正常，只有 307
 /// 状态表（运维看板）上一片 0 —— 而"这个消费者没在拉取"和"压根没起来"是两种处置。
 fn record_pop_pull_stats(
@@ -3451,8 +3207,6 @@ fn record_pop_pull_stats(
     }
 }
 
-/// Python `_queue_pop_loop`（Java `DefaultMQPushConsumerImpl.popMessage` 回调部分）。
-///
 /// 与拉取路径的关键差别：**不查也不提交消费位点**（进度由 broker 侧 checkpoint
 /// 跟踪，确认只靠 ack）；弹出即投递给消费线程；`POLLING_NOT_FOUND` 是正常态。
 async fn queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
@@ -3469,11 +3223,8 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
     let cfg = read_cfg(&inner);
     let mut invisible = cfg.pop_invisible_time;
     if !(MIN_POP_INVISIBLE_TIME..=MAX_POP_INVISIBLE_TIME).contains(&invisible) {
-        // Java 的钳制：超出 [5s, 300s] 一律回落到 60s
         invisible = DEFAULT_POP_INVISIBLE_TIME;
     }
-    // Java PopRequest 默认 ConsumeInitMode.MAX；这里按 consume_from_where 映射，
-    // 让「从头消费」在 POP 模式下也成立。
     let init_mode = if cfg.consume_from_where == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET {
         ConsumeInitMode::MIN
     } else {
@@ -3491,9 +3242,7 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         if pq.is_dropped() {
             return;
         }
-        // Java DefaultMQPushConsumerImpl.popMessage:508 —— 发起弹出即盖章，在流控判定之前。
         stamp_pull_at(&inner, &key, true);
-        // Java popMessage:518-524 —— pause 时把弹出请求推后 1s（不打网络）。
         if inner.pause.load(Ordering::SeqCst) {
             if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_SUSPEND).await {
                 return;
@@ -3505,8 +3254,6 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
             None => return,
         };
         let cfg = read_cfg(&inner);
-        // 流控：已弹未 ack 太多就先缓一缓（Java popMessage:526-534，退避是
-        // PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL）
         if pq.wait_ack_count() > cfg.pop_threshold_for_queue {
             if wait_or_stop(&mut rx, PULL_TIME_DELAY_MILLS_WHEN_CACHE_FLOW_CONTROL).await {
                 return;
@@ -3543,7 +3290,6 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                     rmq_debug!("pop long-poll timeout for {mq:?} (benign, will retry)");
                     continue;
                 }
-                // Java popCallback.onException:514 —— FLOW_CONTROL 退 20ms，其余退 3s。
                 let delay = match &e {
                     Error::Server {
                         response_code: response_code::FLOW_CONTROL,
@@ -3562,8 +3308,6 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
                 continue;
             }
         };
-        // 弹出后队列被撤走：这一批**既不消费也不 ack**，交给 invisibleTime 到期后
-        // broker 自动复活重投给新属主（Java PopProcessQueue.isDropped() 分支）。
         if !owns_queue(&inner, &key, token) || pq.is_dropped() {
             rmq_debug!(
                 "queue {key} revoked during pop, discard {} messages un-acked",
@@ -3580,8 +3324,6 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
         }
         if result.status == PopStatus::Found && !result.msg_found_list.is_empty() {
             pq.inc_found_msg(i32::try_from(result.msg_found_list.len()).unwrap_or(i32::MAX));
-            // 投递前过滤（Java processPopResult:621-661）：POP 路径**必须 ack 被摘掉的**，
-            // 否则 invisibleTime 到期后 broker 会复活重投 —— 表现为「过滤没生效」。
             let kept = filter_messages_for_delivery(
                 &cfg.consumer_group,
                 &inner.filter_hooks,
@@ -3621,17 +3363,12 @@ async fn run_queue_pop_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
     }
 }
 
-/// Python `_submit_pop_consume_request`（Java
-/// `ConsumeMessagePopConcurrentlyService.submitPopConsumeRequest`）：
-/// 按 `consumeMessageBatchMaxSize` 切批后投给消费线程池。
 async fn submit_pop_consume_request(
     inner: &Arc<Inner>,
     msgs: Vec<MessageExt>,
     pq: Arc<PopProcessQueue>,
     mq: MessageQueue,
 ) {
-    // Java DefaultMQPushConsumerImpl:960-990 在 POP+顺序监听器时选的是
-    // ConsumeMessagePopOrderlyService（另一套 submit 语义），这里同一分流。
     let orderly = lock(&inner.listener)
         .as_ref()
         .is_some_and(MessageListener::is_orderly);
@@ -3670,12 +3407,6 @@ async fn submit_pop_consume_request(
     }
 }
 
-/// Java `ConsumeMessagePopOrderlyService.submitConsumeRequest`（5.5.0 未完成骨架）：
-/// 去重集里已有同 (pq, mq) 的请求且非 force 时直接丢弃；新增（或 force）才投递。
-/// 与并发路径不同，这里**不切批、不携带消息** —— Java 的 PopOrderly ConsumeRequest
-/// 只持有 pq 和 mq，msgs 被无视（:178-186）。提交失败只记日志，条目留在集合里
-/// （Java :185-188 的 RejectedExecutionException 同样不摘），消息靠 invisibleTime
-/// 到期由 broker 复活重投。
 async fn submit_pop_orderly_request(
     inner: &Arc<Inner>,
     pq: Arc<PopProcessQueue>,
@@ -3709,11 +3440,6 @@ async fn submit_pop_orderly_request(
     }
 }
 
-/// Java `ConsumeMessagePopOrderlyService$ConsumeRequest.run`（5.5.0 未完成骨架）：
-/// 队列已撤 → 记日志并出集（:228-235）；队列还活着 → **什么都不做**
-/// （`DefaultMQPushConsumerImpl:533` 的 POPTODO，等上游补齐再移植）。
-/// 消息不消费、不 ack，invisibleTime 到期后由 broker 复活重投 —— 与 Java 行为
-/// 完全一致（顺序 POP 在 5.5.0 就是停摆的）。
 async fn run_pop_orderly_request(inner: Arc<Inner>, pq: Arc<PopProcessQueue>, mq: MessageQueue) {
     if pq.is_dropped() {
         rmq_warn!("run, message queue not be able to consume, because it's dropped. {mq:?}");
@@ -3722,8 +3448,6 @@ async fn run_pop_orderly_request(inner: Arc<Inner>, pq: Arc<PopProcessQueue>, mq
     }
 }
 
-/// Python `_consume_pop_batch`（Java
-/// `ConsumeMessagePopConcurrentlyService$ConsumeRequest.run`）。
 async fn consume_pop_batch(
     inner: Arc<Inner>,
     msgs: Vec<MessageExt>,
@@ -3755,10 +3479,6 @@ async fn consume_pop_batch(
     let mut msgs = msgs;
     reset_retry_topic_and_namespace(&inner, &mut msgs);
     let mut context = ConsumeConcurrentlyContext::new(Some(mq.clone()));
-    // 对齐 Java `ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE`（本端口的默认值
-    // 已经是它，这里显式钳成 size-1 只是省掉一次 clamp）：CONSUME_SUCCESS 默认全部 ack。
-    // 若这里是 -1，一条都不会被 ack，消息在 invisibleTime 到期后复活重投 ——
-    // 短观测窗口下会伪装成通过。
     context.ack_index = i32::try_from(msgs.len()).unwrap_or(i32::MAX) - 1;
 
     let mut hook_ctx = if inner.consume_hooks.has_hooks() {
@@ -3770,17 +3490,11 @@ async fn consume_pop_batch(
         execute_consume_hook_before(&inner.consume_hooks, ctx);
     }
     let begin_ms = current_time_millis();
-    // Java ConsumeMessagePopConcurrentlyService:379-385 —— POP 路径同样在交给 listener
-    // 之前逐条盖 CONSUME_START_TIME。POP 没有清扫调度（Java 也没给 POP 建），盖章只为
-    // listener/轨迹可见性与经典路径保持一致。
     let pop_stamp_now = current_time_millis();
     for m in msgs.iter_mut() {
         m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &pop_stamp_now.to_string());
     }
     let (status, has_exception) = call_concurrently_listener(&inner, &msgs, &mut context).await;
-    // Java POP :396-405 —— listener 返回 null 同样按 RECONSUME_LATER 处理（与经典并发同一套
-    // ConsumeRequest.run）；归一化**前**的 status 留给 returnType（返回 null 记 RETURNNULL，
-    // 而不是 FAILED），TPS 与钩子上下文都用归一化**后**的值。
     let raw_status = status;
     let status = match status {
         Some(s) => s,
@@ -3816,7 +3530,6 @@ async fn consume_pop_batch(
     process_pop_consume_result(&inner, status, &context, &msgs, &pq).await;
 }
 
-/// Java `ConsumeRequest.isPopTimeout`：解不出 popTime/invisibleTime 时按超时处理。
 fn is_pop_timeout(msgs: &[MessageExt], pop_time: i64, invisible: i64) -> bool {
     if msgs.is_empty() || pop_time <= 0 || invisible <= 0 {
         return true;
@@ -3824,8 +3537,6 @@ fn is_pop_timeout(msgs: &[MessageExt], pop_time: i64, invisible: i64) -> bool {
     current_time_millis() - pop_time >= invisible
 }
 
-/// Python `_process_pop_consume_result`（Java
-/// `ConsumeMessagePopConcurrentlyService.processConsumeResult`）。
 async fn process_pop_consume_result(
     inner: &Arc<Inner>,
     status: ConsumeConcurrentlyStatus,
@@ -3858,8 +3569,6 @@ async fn process_pop_consume_result(
     let cfg = read_cfg(inner);
     for msg in msgs.iter().skip(acked) {
         pq.ack();
-        // 超过最大重试次数：Java checkNeedAckOrDelay（太老就直接 ack 丢弃，
-        // 否则按消息已存活时间选一个延迟档位）
         if cfg.max_reconsume_times >= 0 && msg.reconsume_times >= cfg.max_reconsume_times {
             check_need_ack_or_delay(inner, msg, &cfg);
             continue;
@@ -3921,8 +3630,6 @@ fn pop_ck_target(inner: &Inner, msg: &MessageExt) -> Option<(String, String, i32
     Some((topic, broker_name, queue_id, offset, ck.to_string()))
 }
 
-/// Python `_ack_pop_msg`（Java `DefaultMQPushConsumerImpl.ackAsync`）。
-///
 /// ⚠ ack 是 RPC，这里刻意保持**同步语义**的调用点（过滤摘除路径）由调用方在
 /// async 上下文里 `let _ =` 掉：ack 失败不致命，消息会在 invisibleTime 到期后复活重投。
 /// 为了让上层三种调用形状都能用，这里提供阻塞无关的「发任务」实现。
@@ -3944,10 +3651,6 @@ fn ack_pop_msg(inner: &Inner, msg: &MessageExt) {
         return;
     };
     handle.spawn(async move {
-        // Java ackAsync 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)：
-        // **只要主**，刷一次路由仍拿不到就抛「The broker[X] not exist」。
-        // 静态主题：mock broker 名先经 topicEndPointsTable 重写成真实承载者
-        // （用 checkpoint 自己的 queueId —— 各 globalId 可能落在不同 broker）。
         let addr = match client.pop_ack_addr(&broker_name, &topic, queue_id).await {
             Ok(addr) => addr,
             Err(e) => {
@@ -4013,8 +3716,6 @@ fn change_pop_invisible_time(
         return;
     };
     handle.spawn(async move {
-        // Java changePopInvisibleTimeAsync:869-876 同样是「只要主」+ 刷一次路由；
-        // 静态主题的 mock 名重写同 ack 路径。
         let addr = match client.pop_ack_addr(&broker_name, &topic, queue_id).await {
             Ok(addr) => addr,
             Err(e) => {
@@ -4044,9 +3745,6 @@ fn change_pop_invisible_time(
 
 // ================================================================ 消费与钩子
 
-/// Python `_reset_retry_topic_and_namespace`（Java
-/// `DefaultMQPushConsumerImpl.resetRetryAndNamespace`，交给 listener 之前调用）。
-///
 /// 重投消息实际存在 `%RETRY%<group>` 下，broker 把原始 topic 写进 `RETRY_TOPIC` 属性；
 /// 不还原的话用户按 topic 分支的代码会走错。
 fn reset_retry_topic_and_namespace(inner: &Inner, msgs: &mut [MessageExt]) {
@@ -4065,7 +3763,6 @@ fn reset_retry_topic_and_namespace(inner: &Inner, msgs: &mut [MessageExt]) {
     }
 }
 
-/// Python `_build_consume_hook_context`：Java 初值 success=False、props 为空。
 fn build_consume_hook_context(
     inner: &Inner,
     msgs: &[MessageExt],
@@ -4108,7 +3805,6 @@ fn consume_return_type(
     }
 }
 
-/// Python `_record_consume_stats`（Java ConsumeRequest.run：RT 恒记，OK/FAILED 按结果）。
 fn record_consume_stats(
     inner: &Inner,
     topic: &str,
@@ -4126,8 +3822,6 @@ fn record_consume_stats(
     if failed {
         stats.inc_consume_failed_tps(&group, topic, msgs);
     } else {
-        // Java processConsumeResult:217-220 —— ok = ackIndex + 1，尾巴算 failed。
-        // 不传 ack_count 时按整批认可算（顺序/POP 路径的旧口径）。
         let ok = ack_count.unwrap_or(msg_count);
         let ok64 = i64::try_from(ok).unwrap_or(0);
         stats.inc_consume_ok_tps(&group, topic, ok64);
@@ -4138,8 +3832,6 @@ fn record_consume_stats(
     stats.inc_consume_rt(&group, topic, rt);
 }
 
-/// Python `_record_consume_rt`（Java ConsumeRequest.run 里那条**无条件**的 incConsumeRT：
-/// 并发 `:414-415`、顺序 `:514-515`）。TPS 只在结果落进某个分支时才记，RT 每次都记。
 fn record_consume_rt(inner: &Inner, topic: &str, begin_ms: i64) {
     let Some(stats) = lock(&inner.stats).clone() else {
         return;
@@ -4149,11 +3841,6 @@ fn record_consume_rt(inner: &Inner, topic: &str, begin_ms: i64) {
 }
 
 /// Python `_finish_consume_hook`：把 returnType/status/success 写回上下文并触发 after 钩子。
-///
-/// `raw_status_name` 是决定 returnType 的那一个；`hook_status_name` 是写进上下文的那个 ——
-/// Java 里这两步用的**不是同一个值**：returnType 在 status 归一化（null →
-/// RECONSUME_LATER / 挂起）**之前**算好（并发 `:381-393`、顺序 `:483-496`），而
-/// `setStatus` 拿的是归一化**之后**的值（并发 `:399-410`、顺序 `:502-507`）。
 #[allow(clippy::too_many_arguments)]
 fn finish_consume_hook(
     inner: &Inner,
@@ -4254,11 +3941,6 @@ async fn call_orderly_listener(
 }
 
 /// Python `_consume_batch`：消费一个批次并处理回投/挂起，返回位点是否前进。
-///
-/// `epoch`：这批消息所属的 ProcessQueue 代号（见 `State::queue_epoch`）。队列在本批次
-/// 排队期间被丢弃（rebalance 撤走 / OFFSET_ILLEGAL 纠错 / 停摆自愈）时，这批消息
-/// **不能再消费也不能 ack** —— 符合 Java `ConsumeMessageConcurrentlyService:339`
-/// / `ConsumeMessageOrderlyService:391` 的 `isDropped()` 短路。
 async fn consume_batch(
     inner: &Arc<Inner>,
     key: &str,
@@ -4288,7 +3970,6 @@ async fn consume_batch(
         .is_some_and(MessageListener::is_orderly);
 
     if orderly {
-        // ---- 顺序消费（Java ConsumeMessageOrderlyService）----
         let mut ocontext = ConsumeOrderlyContext::new(Some(mq.clone()));
         let mut hook_ctx = if inner.consume_hooks.has_hooks() {
             Some(build_consume_hook_context(inner, &batch, mq))
@@ -4301,7 +3982,6 @@ async fn consume_batch(
         let begin_ms = current_time_millis();
         // `raw_status` 为 None 只可能是 listener 抛异常（call_orderly_listener 的 join 失败）
         let (raw_status, has_exception) = call_orderly_listener(inner, &batch, &mut ocontext).await;
-        // Java:474-481 —— null / ROLLBACK / 挂起都要留一条 warn
         if matches!(
             raw_status,
             None | Some(ConsumeOrderlyStatus::Rollback)
@@ -4313,7 +3993,6 @@ async fn consume_batch(
                 batch.len()
             );
         }
-        // Java:502-504 —— null 在钩子之前就按挂起处理：顺序消费没有「异常即 ack」这条路
         let status = raw_status.unwrap_or(ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
         let failed = status == ConsumeOrderlyStatus::SuspendCurrentQueueAMoment;
         let succeeded = matches!(
@@ -4321,8 +4000,6 @@ async fn consume_batch(
             ConsumeOrderlyStatus::Success | ConsumeOrderlyStatus::Commit
         );
         if let Some(ctx) = hook_ctx.as_mut() {
-            // 钩子拿归一化**后**的 status、success 判据是 SUCCESS||COMMIT（Java:506-511），
-            // 而 returnType 用归一化**前**的（Java:483-496）
             finish_consume_hook(
                 inner,
                 ctx,
@@ -4335,12 +4012,8 @@ async fn consume_batch(
             );
         }
         if ocontext.auto_commit {
-            // Java processConsumeResult:244-269
             let status = match status {
                 ConsumeOrderlyStatus::Commit | ConsumeOrderlyStatus::Rollback => {
-                    // Java:246-250 —— autoCommit=true 时 COMMIT/ROLLBACK 是非法用法（只给
-                    // binlog 消费用），Java 只警告、**不写 break**，顺势落进 SUCCESS 分支：
-                    // 消息照 ack，不当成回滚
                     rmq_warn!(
                         "the message queue consume result is illegal, \
                          we think you want to ack these message {mq:?}"
@@ -4351,10 +4024,6 @@ async fn consume_batch(
             };
             if status == ConsumeOrderlyStatus::SuspendCurrentQueueAMoment {
                 record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, true, None);
-                // Java:256-266：挂起之前要先过 checkReconsumeTimes。只有「还在重试次数内 /
-                // 回投失败」才把这一批塞回队首原地重试；已经交给 broker 的（回投成功）要
-                // 前进位点，否则一条毒消息永久占住这条队列（顺序消费的 head-of-line
-                // blocking 在真机上就是「这个组停在第 N 条不动」）。
                 if check_orderly_reconsume_times(inner, &mut batch).await {
                     requeue_pending(inner, key, &batch);
                     let suspend = orderly_suspend_millis(&cfg, &ocontext);
@@ -4367,16 +4036,13 @@ async fn consume_batch(
             advance_consume_offset(inner, key, &batch, None, epoch);
             return Ok(true);
         }
-        // ---- autoCommit=false（Java:270-300，binlog 消费场景）----
         match status {
             ConsumeOrderlyStatus::Commit => {
-                // Java:275-277 —— 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
                 record_consume_rt(inner, &mq.topic, begin_ms);
                 advance_consume_offset(inner, key, &batch, None, epoch);
                 return Ok(true);
             }
             ConsumeOrderlyStatus::Rollback => {
-                // Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试
                 record_consume_rt(inner, &mq.topic, begin_ms);
                 requeue_pending(inner, key, &batch);
                 let suspend = orderly_suspend_millis(&cfg, &ocontext);
@@ -4390,16 +4056,9 @@ async fn consume_batch(
                     let suspend = orderly_suspend_millis(&cfg, &ocontext);
                     tokio::time::sleep(Duration::from_millis(suspend)).await;
                 }
-                // Java:288-296 —— 与自动提交分支的差别：毒消息交给 broker 后**不 commit**，
-                // 位点前不前进由 binlog 消费方自己拿主意
                 return Ok(false);
             }
             ConsumeOrderlyStatus::Success => {
-                // Java:272-274 只记 OK TPS、不提交。有意偏差：Java 把消息留在
-                // ProcessQueue.consumingMsgOrderlyTreeMap 里等显式 commit()，而本端口没把
-                // ProcessQueue 交给 listener（没有 commit 的口子），照抄「什么都不做」会让
-                // 这批消息被分发线程吞掉而位点又没动。这里等价地塞回队首并等一个挂起周期：
-                // 位点同样不前进、消息不丢，也不会把消费线程变成忙等。
                 record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, false, None);
                 requeue_pending(inner, key, &batch);
                 let suspend = orderly_suspend_millis(&cfg, &ocontext);
@@ -4409,10 +4068,7 @@ async fn consume_batch(
         }
     }
 
-    // ---- 并发消费（Java ConsumeMessageConcurrentlyService$ConsumeRequest.run）----
     let hook_ctx = if inner.consume_hooks.has_hooks() {
-        // 顺序与 Java 一致：before 在 listener **之前**（生成 SubBefore 轨迹），
-        // after 在拿到 status 之后（生成 SubAfter，带 contextCode）
         let mut ctx = build_consume_hook_context(inner, &batch, mq);
         execute_consume_hook_before(&inner.consume_hooks, &mut ctx);
         Some(ctx)
@@ -4420,19 +4076,10 @@ async fn consume_batch(
         None
     };
     let begin_ms = current_time_millis();
-    // Java ConsumeRequest.run:366-370 —— 交给 listener **之前**逐条盖 CONSUME_START_TIME，
-    // 每次投递（含重试）重新盖；cleanExpiredMsg 的挂起逃生口靠它判「这条在手里挂了多久」。
-    // 登记紧随盖章：本端口的批次是值拷贝（Java/Python 是共享引用），登记早了表里躺的
-    // 就是未盖章的副本，清扫永远看不见它们。
     let stamp_now = current_time_millis();
     for m in batch.iter_mut() {
         m.put_property(PROPERTY_CONSUME_START_TIMESTAMP, &stamp_now.to_string());
     }
-    // 登记在途消息：Java 并发路径下消息被 ConsumeRequest 持有期间**仍留在**
-    // ProcessQueue.msgTreeMap 里（直到 processConsumeResult 的 removeMessage），
-    // cleanExpiredMsg 的「队首」清扫与 containsMessage 判据都看它。顺序路径相反
-    // （takeMessages 把它们挪进 consumingMsgOrderlyTreeMap，清扫对顺序直接早退），
-    // 所以只登记并发批次。
     register_inflight_msgs(inner, key, &batch);
     let result = consume_concurrent_batch(
         inner, key, mq, &batch, epoch, &cfg, broadcast, hook_ctx, begin_ms,
@@ -4444,8 +4091,6 @@ async fn consume_batch(
     result
 }
 
-/// 并发消费一个批次（对应 Java `ConsumeMessageConcurrentlyService$ConsumeRequest.run`）。
-///
 /// 从 [`consume_batch`] 拆出来只为把「登记在途 → 消费 → 注销在途」围成一段：
 /// 并发分支有一堆提前返回（整批认可、广播丢弃、回投失败……），登记表摘不干净的话
 /// 位点会被 `correct_tags_offset_locked` 的在途闸门永久挡停。before 钩子与
@@ -4465,7 +4110,6 @@ async fn consume_concurrent_batch(
     let mut context = ConsumeConcurrentlyContext::new(Some(mq.clone()));
     let (raw_status, has_exception) = call_concurrently_listener(inner, batch, &mut context).await;
     if raw_status.is_none() {
-        // Java:399-405 —— listener 返回 null 先告警再归一化，告警里带的是**原始**返回值
         rmq_warn!(
             "consumeMessage return null, Group: {} Msgs: {} MQ: {mq:?}",
             cfg.consumer_group,
@@ -4477,9 +4121,6 @@ async fn consume_concurrent_batch(
     let succeeded = matches!(raw_status, Some(ConsumeConcurrentlyStatus::ConsumeSuccess));
     // 钩子/统计仍看**原始**返回值（None 要记 RETURNNULL），ackIndex 判定才归一化。
     let status = raw_status.unwrap_or(ConsumeConcurrentlyStatus::ReconsumeLater);
-    // Java processConsumeResult:207-229 —— CONSUME_SUCCESS 用 listener 设的 ackIndex
-    // 划分「已认可前缀 / 待回投后缀」（默认 Integer.MAX_VALUE，钳到 size-1 即整批认可）；
-    // RECONSUME_LATER 强制 ackIndex=-1，整批回投。
     let batch_len = i32::try_from(batch.len()).unwrap_or(i32::MAX);
     let mut ack_index = context.ack_index;
     if status == ConsumeConcurrentlyStatus::ConsumeSuccess {
@@ -4494,11 +4135,8 @@ async fn consume_concurrent_batch(
     } else {
         0
     };
-    // 统计口径同 Java 的 ok/failed 计数（:217-225）：部分 ack 时尾巴算 failed
     record_consume_stats(inner, &mq.topic, batch.len(), begin_ms, failed, Some(acked));
     if let Some(ctx) = hook_ctx.as_mut() {
-        // returnType 用归一化前的 raw_status（None → RETURNNULL），写进上下文的 status 用
-        // 归一化后的（Java:399-410）
         finish_consume_hook(
             inner,
             ctx,
@@ -4511,8 +4149,6 @@ async fn consume_concurrent_batch(
         );
     }
     if broadcast {
-        // Java:232-237 —— 广播模式不回投：未认可的尾巴只 warn 后丢掉，
-        // 整批位点照样前进（:266 的 removeMessage 拿到的就是整批）
         let dropped = batch.len() - acked;
         if dropped > 0 {
             rmq_warn!(
@@ -4537,8 +4173,6 @@ async fn consume_concurrent_batch(
         context.delay_level_when_next_consume,
     )
     .await;
-    // Java:256-260 —— 回投失败的那几条从本批摘掉后 submitConsumeRequestLater 重投，
-    // 这里等价地塞回队首稍后再消费
     if !msg_back_failed.is_empty() {
         {
             let mut state = lock(&inner.state);
@@ -4550,8 +4184,6 @@ async fn consume_concurrent_batch(
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    // Java:266-269 —— 提交的是「本批已处理条目里最大的 queueOffset + 1」，且不能越过
-    // 仍留在队列里的那几条（removeMessage 这时返回它们的最小 offset）
     let floor = msg_back_failed.iter().map(|(_, m)| m.queue_offset).min();
     let handled: Vec<MessageExt> = batch
         .iter()
@@ -4563,10 +4195,6 @@ async fn consume_concurrent_batch(
     Ok(msg_back_failed.is_empty())
 }
 
-/// Python `_send_back_batch`（Java processConsumeResult:238-254）。
-///
-/// 返回 `(在整批里的下标, 消息)`：回投失败的那些，`reconsume_times` 已按 Java:251
-/// 就地 +1 —— broker 那边没记上这次数，客户端不补就永远进不了 DLQ。
 async fn send_back_batch(
     inner: &Arc<Inner>,
     key: &str,
@@ -4579,8 +4207,6 @@ async fn send_back_batch(
         {
             let state = lock(&inner.state);
             if !process_queue_contains_locked(&state, key, msg.queue_offset) {
-                // Java processConsumeResult:243-248 —— 已被 cleanExpiredMsg 清扫（或队列已
-                // 撤销）的条目跳过回投：它已经在回 broker 的路上了，再发一次就是重复消息
                 rmq_info!(
                     "Message is not found in its process queue; skip send-back-procedure, \
                      topic={}, brokerName={}, queueId={}, queueOffset={}",
@@ -4592,17 +4218,13 @@ async fn send_back_batch(
                 continue;
             }
         }
-        // 重投次数在 MessageExt 线上格式第 13 字段（Java msg.getReconsumeTimes()），
-        // broker 重投时 +1；不是 properties 键（PROPERTY_RECONSUME_TIME 是另一回事）。
         let mut delay_level = delay_level_from_context;
         if delay_level == 0 {
-            // Java：delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
             delay_level = 3 + msg.reconsume_times;
         }
         let mut msg = msg.clone();
         if let Err(e) = send_message_back(inner, &msg, delay_level, None).await {
             rmq_debug!("send message back failed: {e}");
-            // 与 Java 一样：次数在**要被重新消费的副本**上加，broker 没记成功
             msg.reconsume_times += 1;
             failed.push((base + i, msg));
         }
@@ -4612,10 +4234,6 @@ async fn send_back_batch(
 
 /// Python `_advance_consume_offset`：取本批最大 queueOffset + 1，且**不回退**。
 /// `floor` 是「不能越过的位点」（回投失败被塞回队首的那几条里最小的 offset）。
-///
-/// `epoch` 是取这批消息时那条 ProcessQueue 的代号：与当前代号不一致说明队列已被
-/// 撤销/重建（Java `ConsumeMessageConcurrentlyService:267` 的 `!processQueue.isDropped()`），
-/// **整批 ack 作废**。`frozen_offsets` 里的是被 OFFSET_ILLEGAL 纠错冻结的位点，同样不许改。
 fn advance_consume_offset(
     inner: &Inner,
     key: &str,
@@ -4645,13 +4263,6 @@ fn advance_consume_offset(
         .insert(key.to_string(), cur.max(next_off));
 }
 
-/// Python `_requeue_pending`：把这一批按原顺序塞回本地队列队首，等价 Java
-/// `makeMessageToConsumeAgain` / `rollback`。
-///
-/// 本端口的待消费缓冲是 `pending` 双端队列，批次在分发给 listener **之前**就被弹出队首了；
-/// 而拉取游标在拉取那一刻已经推到 `nextBeginOffset`，所以「位点不前进」并不会让 broker
-/// 把这几条再发一遍 —— 想让它们原地重试就必须显式放回去（Java 那边消息始终留在
-/// `ProcessQueue.consumingMsgOrderlyTreeMap` 里，不需要这一步）。
 fn requeue_pending(inner: &Inner, key: &str, batch: &[MessageExt]) {
     let mut state = lock(&inner.state);
     if let Some(dq) = state.pending.get_mut(key) {
@@ -4661,18 +4272,8 @@ fn requeue_pending(inner: &Inner, key: &str, batch: &[MessageExt]) {
     }
 }
 
-// ---------------- cleanExpiredMsg：挂起 listener 的逃生口 ----------------
-// 对应 Java ConsumeMessageConcurrentlyService（:68-88 建调度、:192-200 清扫入口）
-// ＋ ProcessQueue.cleanExpiredMsg（:75-127）。这是「listener 卡死不返回」时唯一的回收
-// 机制：把在手里超过 consumeTimeout 分钟的消息发回 broker（delayLevel=3），走 %RETRY%
-// 重新投递。少了它，一条卡住的消息会让该队列的位点永久停住，broker 侧只能等下一次
-// 客户端重启 —— 真机上表现为「消息明明投出去了却永远收不到第二次」，没有任何异常可看。
 
 /// 把这一批登记进「在 listener 手里」的视图（须与 [`deregister_inflight_msgs`] 成对）。
-///
-/// Python `_inflight_msgs`（Java 并发路径下消息在被 ConsumeRequest 持有期间仍留在
-/// `ProcessQueue.msgTreeMap` 上）。值拷贝语义：存的是这一份的克隆，身份按
-/// `queue_offset` 认（同一队列内位点唯一，与 Java 按位点建树同口径）。
 fn register_inflight_msgs(inner: &Inner, key: &str, batch: &[MessageExt]) {
     if batch.is_empty() {
         return;
@@ -4701,8 +4302,6 @@ fn deregister_inflight_msgs(inner: &Inner, key: &str, batch: &[MessageExt]) {
     }
 }
 
-/// Java `ProcessQueue.msgTreeMap` 的等价视图：在途（已分发未落定）∪ 已拉未分发。
-///
 /// 配对操作（登记/摘除、塞回缓冲）都在 `state` 锁内成对完成，一条消息在同一瞬间只会
 /// 出现在一边；这里按位点再去一次重只为防御未来新调用点写出重叠。
 fn process_queue_entries_locked(state: &State, key: &str) -> Vec<MessageExt> {
@@ -4722,15 +4321,12 @@ fn process_queue_entries_locked(state: &State, key: &str) -> Vec<MessageExt> {
     out
 }
 
-/// 队首 = 最小 `queueOffset` 的那条（Java `msgTreeMap.firstEntry()`）。
 fn process_queue_first_entry_locked(state: &State, key: &str) -> Option<MessageExt> {
     process_queue_entries_locked(state, key)
         .into_iter()
         .min_by_key(|m| m.queue_offset)
 }
 
-/// Java `ProcessQueue.containsMessage`（:341-357）：这条消息还挂在队列上吗。
-///
 /// 被 cleanExpiredMsg 清扫掉的不算（它已经在回 broker 的路上）。
 fn process_queue_contains_locked(state: &State, key: &str, queue_offset: i64) -> bool {
     state
@@ -4759,8 +4355,6 @@ fn remove_process_queue_entry_locked(state: &mut State, key: &str, queue_offset:
     }
 }
 
-/// Java `ProcessQueue:106-115` —— 只有它**仍是**队首时才摘除。返回是否真的摘了。
-///
 /// 「仍是队首」这一问不能省：listener 恰好在此期间正常收尾（消息已被
 /// `deregister_inflight_msgs` 摘掉），或前面冒出了更小的位点（回投失败塞回的条目），
 /// 都该让位给正常路径 —— 抢摘会把不该动的那条从视图里抹掉。须持 `state` 锁。
@@ -4773,9 +4367,6 @@ fn remove_expired_entry_if_still_head(state: &mut State, key: &str, queue_offset
     still_head
 }
 
-/// Java `ConsumeRequest.run:366-370` 盖章的解析：`StringUtils.isNotEmpty(...)` 且能
-/// 解析成整数才算「有戳」。没盖过章（还没进过 listener 的缓冲消息、老版本客户端）与
-/// 坏值一样按 [`is_consume_expired`] 的 `None` 处理。
 fn consume_start_timestamp(msg: &MessageExt) -> Option<i64> {
     let raw = msg.get_property(PROPERTY_CONSUME_START_TIMESTAMP)?;
     if raw.is_empty() {
@@ -4784,11 +4375,6 @@ fn consume_start_timestamp(msg: &MessageExt) -> Option<i64> {
     raw.parse::<i64>().ok()
 }
 
-/// Java `ProcessQueue.cleanExpiredMsg:88` 的过期判据：**严格**大于阈值。
-///
-/// 没有戳（`None`）不当过期（Java 的 `StringUtils.isNotEmpty` 短路）；等于阈值也不动手
-/// （严格 `>`）。这两个「差不多」的方向都错得安静：判松了会把刚投递的消息在下一轮周期
-/// 就抢走回投，判紧了卡死消息永远等不到清扫。
 fn is_consume_expired(stamp: Option<i64>, now_ms: i64, consume_timeout_minutes: i64) -> bool {
     match stamp {
         Some(ts) => now_ms - ts > consume_timeout_minutes * 60 * 1000,
@@ -4796,21 +4382,13 @@ fn is_consume_expired(stamp: Option<i64>, now_ms: i64, consume_timeout_minutes: 
     }
 }
 
-/// Java `scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)`：
-/// initialDelay 与 period 同值（都是 consumeTimeout 分钟）。0/负值按 Java 的
-/// `scheduleAtFixedRate` 语义会退化成「立刻且背靠背」，这里钳到 1 分钟避免忙等
-/// （Python `max(1, consume_timeout)` 同口径）。
 fn clean_expire_period_millis(consume_timeout_minutes: i64) -> u64 {
     let minutes = consume_timeout_minutes.max(1);
     u64::try_from(minutes).unwrap_or(u64::MAX / 60_000) * 60_000
 }
 
-/// 清理一条队列（Java `ProcessQueue.cleanExpiredMsg:80-127`），返回本轮实际发起回投的
-/// 次数（单测取证「队首才动、失败重试同一条、单轮上限 16」用）。
-///
 /// 语义三件套：只看队首（最小位点）、单条判定严格大于 consumeTimeout、每轮最多 16 条。
 async fn clean_expired_queue(inner: &Arc<Inner>, key: &str) -> usize {
-    // Java:76-78 —— 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）
     if lock(&inner.listener)
         .as_ref()
         .is_some_and(MessageListener::is_orderly)
@@ -4818,7 +4396,6 @@ async fn clean_expired_queue(inner: &Arc<Inner>, key: &str) -> usize {
         return 0;
     }
     let cfg = read_cfg(inner);
-    // Java:80 —— loop 在循环**之前**算一次（min(size, 16)）
     let loop_n = {
         let state = lock(&inner.state);
         process_queue_entries_locked(&state, key).len().min(16)
@@ -4829,21 +4406,18 @@ async fn clean_expired_queue(inner: &Arc<Inner>, key: &str) -> usize {
             let state = lock(&inner.state);
             match process_queue_first_entry_locked(&state, key) {
                 Some(m) => m,
-                None => break, // Java NoSuchElementException 分支
+                None => break,
             }
         };
-        // Java:87-90 —— 没盖过章的直接当成未过期；过期判据是**严格**大于
         if !is_consume_expired(
             consume_start_timestamp(&head),
             current_time_millis(),
             cfg.consume_timeout,
         ) {
-            break; // Java:97-99 —— 队首没过期，后面的更不可能过期
+            break;
         }
         attempts += 1;
         if let Err(e) = send_message_back(inner, &head, 3, None).await {
-            // Java:122-125 —— 回投失败只记日志：消息留在原地，下一轮（或本轮的下一圈）
-            // 再试；绝不摘除（摘了就真丢了）
             rmq_error!("send expired msg exception: {e}");
             continue;
         }
@@ -4855,18 +4429,12 @@ async fn clean_expired_queue(inner: &Arc<Inner>, key: &str) -> usize {
             head.queue_id,
             head.queue_offset
         );
-        // Java:106-115 —— 只有它**仍是**队首时才摘除：listener 恰好在此期间正常收尾
-        // （或前面冒出了更小的位点）就让位给正常路径，别抢
         let mut state = lock(&inner.state);
         remove_expired_entry_if_still_head(&mut state, key, head.queue_offset);
     }
     attempts
 }
 
-/// 对应 Java `cleanExpireMsg()`（:192-200）：遍历当前持有的队列逐个清扫。
-///
-/// 任一条队列抛出异常（如时间戳坏值）与 Java 一样让整轮中止 —— 调度壳子的
-/// `catch (Throwable)`（:77-81）兜住它，下一轮照常。
 async fn clean_expired_msg_once(inner: &Arc<Inner>) -> usize {
     let keys: Vec<String> = lock(&inner.state).mq_map.keys().cloned().collect();
     let mut attempts = 0;
@@ -4876,7 +4444,6 @@ async fn clean_expired_msg_once(inner: &Arc<Inner>) -> usize {
     attempts
 }
 
-/// Python `_clean_expire_loop`（Java `scheduleAtFixedRate` 的 initialDelay=period）。
 async fn clean_expire_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     // initialDelay 与 period 同值（都是 consumeTimeout 分钟），所以首轮清扫也要等满
     // 一个周期 —— 立刻扫会把刚开始消费、还没超时的消息全看一遍（虽不会误伤，但没必要）。
@@ -4895,31 +4462,16 @@ async fn clean_expire_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     }
 }
 
-/// Java `DefaultMQPushConsumerImpl#correctTagsOffset:713-717`（调用点在 `:394-401`）。
-/// 须持 `state` 锁调用。
-///
 /// 拉取应答是 `NO_NEW_MSG`（队列里真没消息）或 `NO_MATCHED_MSG`（broker 侧按订阅表达式
 /// 过完一轮、一条都没匹配上，见 `MQClientAPIImpl:1095-1097` 把 `PULL_RETRY_IMMEDIATELY`
 /// 映射成它）时，这条队列的「已消费位点」必须跟着拉取游标走，否则会**永久卡死**：
 /// 没人 ack 的消息不属于任何人（broker 侧被过滤掉的不在应答里，客户端二次 tag 过滤摘掉的
 /// 又明确不 ack），位点不动就永远停在原地，重投/重启后再把这批没人要的消息从头扫一遍。
-///
-/// Java 的更新是 `offsetStore.updateOffset(mq, nextOffset, increaseOnly=true)`（只前进
-/// 不回退），且有一道闸：`0L == processQueue.getMsgCount()`。`msgCount` 数的是**仍在
-/// ProcessQueue 里**的消息 —— 并发消费的 `removeMessage` 要等 listener 返回之后才调
-/// （`ConsumeMessageConcurrentlyService:266`），所以在途批次也算数；不等它落定就抬位点，
-/// 进程崩溃时这批消息会被静默跳过。本端口把 `pending` 为空与 `inflight` 为 0 合成同一
-/// 判据，后者的登记与「取走批次」在 `dispatch_loop` 的同一把锁里完成。
-///
-/// 与 Java 的唯一有意偏差是把状态判据也收进了本函数（Java 在回调的 switch 里），
-/// 这样离线单测一次就能锁死「哪些状态要修正 + 何时允许修正」两件事。
 fn correct_tags_offset_locked(state: &mut State, key: &str, status: PullStatus, next_off: i64) {
     if !matches!(status, PullStatus::NoNewMsg | PullStatus::NoMatchedMsg) {
         return;
     }
     if state.frozen_offsets.contains(key) {
-        // 位点已被 OFFSET_ILLEGAL 纠错冻结（Java ControllableOffset.update 在
-        // allowToUpdate=false 时直接丢弃更新），这条路径同样不许改
         return;
     }
     if !state.pending.get(key).is_none_or(|dq| dq.is_empty()) {
@@ -4928,11 +4480,6 @@ fn correct_tags_offset_locked(state: &mut State, key: &str, status: PullStatus, 
     if state.inflight.get(key).copied().unwrap_or(0) != 0 {
         return;
     }
-    // Java `RemoteBrokerOffsetStore.updateOffset:61-64`：表里没有这条记录时
-    // `putIfAbsent(mq, new ControllableOffset(offset))` —— **无条件建条目**，哪怕
-    // offset == 0。把「没有记录」与「记录是 0」合并成一个 0 会让空队列
-    // （nextBeginOffset == 0）的首次修正变成静默 no-op：broker 上永远查不到这条队列
-    // 的位点记录（Java/Python/C++ 都会留下 0）。
     match state.consume_offsets.get(key).copied() {
         None => {
             state.consume_offsets.insert(key.to_string(), next_off);
@@ -4944,12 +4491,6 @@ fn correct_tags_offset_locked(state: &mut State, key: &str, status: PullStatus, 
     }
 }
 
-/// Java `ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234`。
-///
-/// 先解析 `-1`（`ConsumeOrderlyContext.suspendCurrentQueueTimeMillis` 的默认值，意思是
-/// 「没指定」）→ 回落到消费者配置 `suspendCurrentQueueTimeMillis`（默认 1000），再把结果
-/// **钳到 [10, 30000]**。这个钳位不是装饰：listener 传 0 时 Java 仍然等 10ms（否则一个
-/// 返回挂起的 listener 会把消费线程变成忙等），传 1 小时也只等 30s。
 fn orderly_suspend_millis(cfg: &ConsumerConfig, ctx: &ConsumeOrderlyContext) -> u64 {
     let mut ms = ctx.suspend_current_queue_time_millis;
     if ms == -1 {
@@ -4959,12 +4500,6 @@ fn orderly_suspend_millis(cfg: &ConsumerConfig, ctx: &ConsumeOrderlyContext) -> 
 }
 
 /// Python `send_message_back`（CONSUMER_SEND_MSG_BACK=36）。
-///
-/// ⚠ **同步等应答**，不是发后即忘。Java `DefaultMQPushConsumerImpl#sendMessageBack`
-/// 是一次同步 RPC，成功与否由调用方处置（`processConsumeResult` 把失败的那些
-/// `reconsumeTimes+1` 塞回本地重投；`cleanExpiredMsg` 失败时条目原地保留）。旧实现
-/// `handle.spawn` 发后即忘 —— broker 拒收只留一行 debug 日志，位点照常推进，
-/// 消息**静默丢失**，且 `send_back_batch` 的失败重投分支成了死代码。
 async fn send_message_back(
     inner: &Arc<Inner>,
     msg: &MessageExt,
@@ -4980,13 +4515,11 @@ async fn send_message_back(
     let addr = client
         .find_broker_address_in_publish(&broker)
         .ok_or_else(|| Error::client(format!("Broker[{broker}] master node does not exist")))?;
-    // Java：maxReconsumeTimes == -1 时按 16 传给 broker（超限由 broker 转 %DLQ%）
     let max_reconsume = if cfg.max_reconsume_times == -1 {
         16
     } else {
         cfg.max_reconsume_times
     };
-    // Java `DefaultMQPushConsumerImpl#sendMessageBack` 的 RPC 超时是 3000。
     client
         .consumer_send_msg_back(
             &cfg.consumer_group,
@@ -5000,8 +4533,6 @@ async fn send_message_back(
         .await
 }
 
-/// Java `ConsumeMessageOrderlyService#getMaxReconsumeTimes:313-320`。
-///
 /// 顺序消费的消息一直停在本地队列里原地重试，broker 侧压根没有重投计数，所以默认就该
 /// 重试到成功为止 —— `-1` 在这里读成 `i32::MAX`。**不是**并发回投那条链路的 16
 ///（[`send_message_back`]，那边每轮都过一遍 broker，16 是 broker 默认的 retryMaxTimes）：
@@ -5014,13 +4545,6 @@ fn orderly_max_reconsume_times(cfg: &ConsumerConfig) -> i32 {
     }
 }
 
-/// Java `ConsumeMessageOrderlyService#checkReconsumeTimes:322-339`。
-///
-/// 返回「这一批是否还要原地挂起重试」。逐条两种走法：
-///   - 次数没用尽：本地 `reconsume_times + 1`（broker 没记这次失败，客户端不补就永远
-///     到不了阈值），继续挂起；
-///   - 次数已用尽：交给 broker 回投。**回投成功就不再挂起**（Java 这时 commit 位点，
-///     毒消息让路、队列继续往前），只有回投失败才 +1 并挂起。
 async fn check_orderly_reconsume_times(inner: &Arc<Inner>, batch: &mut [MessageExt]) -> bool {
     let cfg = read_cfg(inner);
     let max_times = orderly_max_reconsume_times(&cfg);
@@ -5039,14 +4563,6 @@ async fn check_orderly_reconsume_times(inner: &Arc<Inner>, batch: &mut [MessageE
     suspend
 }
 
-/// Java `ConsumeMessageOrderlyService#sendMessageBack:341-362`。
-///
-/// 拿实例自带的内部生产者，把这条消息**当普通消息**发到 `%RETRY%<group>`：broker 的
-/// `handleRetryAndDLQ`（`SendMessageProcessor:199-234`）见该组还持有未过期的队列锁
-///（正是顺序消费组的特征），直接把它改投 `%DLQ%<group>`。`RECONSUME_TIME` /
-/// `MAX_RECONSUME_TIMES` 会被发送侧抬进请求头（`MQClientInstance::build_send_request`，
-/// Java `sendKernelImpl:1004-1018`）。
-///
 /// 失败只返回 false、绝不抛：见 [`check_orderly_reconsume_times`]。
 async fn orderly_send_message_back(
     inner: &Arc<Inner>,
@@ -5061,8 +4577,6 @@ async fn orderly_send_message_back(
         let mq = publish
             .select_one_message_queue(&[])?
             .ok_or_else(|| Error::client(format!("no writable queue for {}", new_msg.topic)))?;
-        // unitMode 跟着消费者：Java 构造内部生产者时调过 resetClientConfig(clientConfig)，
-        // 不带的话重投出去的消息会丢单元标记。
         client
             .send_message(
                 MixAll::CLIENT_INNER_PRODUCER_GROUP,
@@ -5090,10 +4604,6 @@ async fn orderly_send_message_back(
     }
 }
 
-/// Java 两处 `sendMessageBack` 里那段 newMsg 构造体（并发侧
-/// `DefaultMQPushConsumerImpl#sendMessageBackAsNormalMessage:1148-1160` 与顺序侧
-/// `ConsumeMessageOrderlyService#sendMessageBack:344-353`）**逐行相同**，只有
-/// maxReconsumeTimes 各调各的 getter，所以抽成一个函数、把口径显式传进来。
 fn build_retry_message(cfg: &ConsumerConfig, msg: &MessageExt, max_times: i32) -> Message {
     let mut new_msg = Message::new(
         MixAll::get_retry_topic(&cfg.consumer_group).as_str(),
@@ -5159,7 +4669,6 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
     }
 
     fn is_unit_mode(&self) -> bool {
-        // Java `MQClientInstance:1039` `consumerData.setUnitMode(impl.isUnitMode())`
         self.config().unit_mode
     }
 
@@ -5175,17 +4684,11 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
         self.subscriptions()
     }
 
-    /// 实例收到 broker 的 `NOTIFY_CONSUMER_IDS_CHANGED(40)` 后扇出到这里
-    /// （Java `MQClientInstance#rebalanceImmediately` → `RebalanceService#wakeup`）。
     fn rebalance_immediately(&self) {
         self.inner.rebalance_now.store(true, Ordering::SeqCst);
         self.inner.rebalance_signal.notify_waiters();
     }
 
-    /// Python `adjust_thread_pool`：⚠ **Java 5.5.1 里这是 no-op**
-    /// （`AbstractConsumeMessageService:70-75` 的 inc/decCorePoolSize 是空方法体）。
-    /// 保留阈值比较与日志只为让 `msgAccCnt` 可观测，**不要「顺手修好」**；
-    /// 真正生效的是 [`DefaultMQPushConsumer::update_core_pool_size`]。
     fn adjust_thread_pool(&self) {
         let acc_total = self.compute_accumulation_total();
         let threshold = self.config().adjust_thread_pool_nums_threshold;
@@ -5226,8 +4729,6 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
                     })
                     .collect();
                 for (key, mq, off) in hits {
-                    // 新位点先落进表：撤销会把**它**交给 `revoke_queues` 落盘
-                    //（Java `updateConsumeOffset` 之后紧接着的那次 persist）
                     state.consume_offsets.insert(key.clone(), off);
                     DefaultMQPushConsumer::retire_queue_locked(
                         &mut state,
@@ -5241,8 +4742,6 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             if revoked.is_empty() {
                 return Ok(());
             }
-            // Java 用 `RESET_OFFSET_MAX_WAIT`（10 秒）等并发消费跑完再写位点；这里缩短以免
-            // 阻塞读线程（220 是 oneway）。代号已让在途 ack 全部失效，不靠"等"避竞争。
             tokio::time::sleep(Duration::from_millis(200)).await;
             self.on_queues_revoked(&revoked).await;
             if let Err(e) = self.do_rebalance().await {
@@ -5258,7 +4757,6 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
     }
 
     fn get_consumer_status(&self, topic: Option<&str>) -> Vec<(MessageQueue, i64)> {
-        // Java 返回 offsetStore.cloneOffsetTable(topic)，即**已消费位点**（不是拉取游标）
         let state = lock(&self.inner.state);
         let mut out: Vec<(MessageQueue, i64)> = state
             .consume_offsets
@@ -5312,10 +4810,6 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             ..Default::default()
         };
         let state = lock(&self.inner.state);
-        // POP 模式下弹出去 pop_queues（Java 的 popProcessQueueTable），classic 的
-        // processQueueTable 是空的 —— 两把表在 Java 里互斥，307 里也必须互斥：同一把队列
-        // 既进 mqTable 又进 mqPopTable 会让控制台把一路消费数成两路。mq_map 是"已分配"
-        // 注册表（自愈、位点持久化、220 重置都靠它），两种模式都写，所以按模式过滤而不是不写。
         for (key, mq) in &state.mq_map {
             if cfg.pop_mode && state.pop_queues.contains_key(key) {
                 continue;
@@ -5325,8 +4819,6 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
                 cached_msg_count: i32::try_from(state.pending.get(key).map_or(0, |dq| dq.len()))
                     .unwrap_or(i32::MAX),
                 droped: false,
-                // Java ProcessQueue.fillOutRunningInfo:456 —— 运维靠这个字段判断
-                // 「队列还在不在拉」，rebalance 的自愈判据用的就是同一个时刻。
                 last_pull_timestamp: state.last_pull_at.get(key).copied().unwrap_or(0),
                 ..Default::default()
             };
@@ -5336,11 +4828,6 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             ));
         }
         if cfg.pop_mode {
-            // Python `consumer.py:1785-1792` 用 `self._mq_map.get(key)` 反查队列，但
-            // pop 路径从不写 `_mq_map`（只有拉取入队时写），所以参考版的 mqPopTable
-            // 恒空。这里按 Java `DefaultMQPushConsumerImpl.consumerRunningInfo:1473`
-            // 的口径——popProcessQueueTable 本来就以 MessageQueue 为键——从当前分配
-            // 反查，使运维视图真的能看到弹出队列。
             let mut mq_of: BTreeMap<String, &MessageQueue> = BTreeMap::new();
             for mq in &state.assigned {
                 mq_of.insert(mq_key(mq), mq);
@@ -5355,8 +4842,6 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
                 let pqi = ProcessQueueInfo {
                     cached_msg_count: pq.wait_ack_count(),
                     droped: pq.is_dropped(),
-                    // Java 的 pop 视图本没有这个字段（PopProcessQueue 不填），但运维上
-                    // 「上次弹出时间」正是停摆判据本身，这里如实暴露（Python 同样）。
                     last_pull_timestamp: pq.last_pop_timestamp.load(Ordering::SeqCst),
                     ..Default::default()
                 };
@@ -5371,7 +4856,6 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             .iter()
             .map(|(_, sub)| sub.to_json_value())
             .collect();
-        // statusTable：Java consumeStatus(group, topic) 的 minute 快照
         let stats = lock(&self.inner.stats).clone();
         for (topic, _) in &state.subscription_data {
             let status = match &stats {
@@ -5384,14 +4868,11 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
         info
     }
 
-    /// Python `consume_message_directly`（Java
-    /// `ConsumeMessageConcurrentlyService.consumeMessageDirectly`，309）。
     fn consume_message_directly(
         &self,
         msg: MessageExt,
         broker_name: Option<String>,
     ) -> Result<ConsumeMessageDirectlyResult> {
-        // Default 已带上 Java 的初值（order=false、autoCommit=true）
         let mut result = ConsumeMessageDirectlyResult::default();
         let mq = MessageQueue::new(
             &msg.topic,
@@ -5416,9 +4897,6 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
             Some(MessageListener::Orderly(listener)) => {
                 let mut octx = ConsumeOrderlyContext::new(Some(mq));
                 let status = listener.consume_message(&msgs, &mut octx);
-                // Java 顺序 `consumeMessageDirectly`:103-161 —— order=true 且把上下文里的
-                // autoCommit 原样回给 broker（broker 按它决定这条直接消费算不算「已提交」），
-                // 映射比并发侧多两个成员：COMMIT → CR_COMMIT、ROLLBACK → CR_ROLLBACK
                 result.order = true;
                 result.auto_commit = octx.auto_commit;
                 match status {
@@ -5456,10 +4934,6 @@ impl DefaultMQPushConsumer {
     }
 
     /// Python `fetch_subscribe_message_queues`。
-    ///
-    /// Java `DefaultMQPushConsumerImpl.fetchSubscribeMessageQueues:198` 读的是
-    /// `rebalanceImpl.getSubscriptionInner()` 那条订阅信息链（读位、不筛 master），
-    /// 不是发布信息；与 rebalance 共用同一份口径。
     pub async fn fetch_subscribe_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = require_client(&self.inner)?;
         Ok(client.get_topic_subscribe_info(topic).await)
@@ -5479,45 +4953,27 @@ impl DefaultMQPushConsumer {
         self.msg_acc_cnt(None)
     }
 
-    // ---------------- 挂起 / 恢复（Java DefaultMQPushConsumer.java:890/898） ----------------
 
-    /// Java `DefaultMQPushConsumer#suspend()`（impl `DefaultMQPushConsumerImpl#suspend:1312`）：
-    /// 拉起暂停标志；两个拉取循环看到标志就不再发请求，按
-    /// [`PULL_TIME_DELAY_MILLS_WHEN_SUSPEND`](1000ms) 轮询等待恢复。
-    /// 只记一条 info 日志，与 Java 一样不抛错、可重复调用。
     pub fn suspend(&self) {
         self.inner.pause.store(true, Ordering::SeqCst);
         rmq_info!("suspend this consumer, {}", self.consumer_group());
     }
 
-    /// Java `DefaultMQPushConsumer#resume()`（impl `:741`）：清掉暂停标志并触发一次
-    /// 重平衡（Java 是同步 `doRebalance()`；这里复用 [`Self::rebalance_immediately`]
-    /// 的「标志位 + 唤醒」——后台重平衡循环几十毫秒内会跑完，语义等价且不阻塞调用方）。
     pub fn resume(&self) {
         self.inner.pause.store(false, Ordering::SeqCst);
         self.rebalance_immediately();
         rmq_info!("resume this consumer, {}", self.consumer_group());
     }
 
-    /// Java `DefaultMQPushConsumer#isPause()`。
     pub fn is_pause(&self) -> bool {
         self.inner.pause.load(Ordering::SeqCst)
     }
 
-    // ---------------- 消息回投（Java DefaultMQPushConsumer.java:722/745） ----------------
 
-    /// Java `DefaultMQPushConsumer#sendMessageBack(msg, delayLevel)`：回投给
-    /// **消息来源 broker**（`msg.getBrokerName()`），broker 之后重投。
-    ///
-    /// 与 Java 同为 **@Deprecated** 的公开口子（Java 注释说某版本后会移除/改可见性，
-    /// 但 5.x 仍公开），正常消费链路应交给消费结果语义（`ReconsumeLater` 等），
-    /// 这里供管理/运维脚本用。失败直接抛（Java 同）。
     pub async fn send_message_back(&self, msg: &MessageExt, delay_level: i32) -> Result<()> {
         send_message_back(&self.inner, msg, delay_level, None).await
     }
 
-    /// Java `DefaultMQPushConsumer#sendMessageBack(msg, delayLevel, brokerName)`：
-    /// 指定接收回投的 broker。
     pub async fn send_message_back_to_broker(
         &self,
         msg: &MessageExt,
@@ -5527,11 +4983,6 @@ impl DefaultMQPushConsumer {
         send_message_back(&self.inner, msg, delay_level, Some(broker_name)).await
     }
 
-    /// Python `update_core_pool_size`（Java `AbstractConsumeMessageService:63-71`）。
-    ///
-    /// Java 的守卫逐条照抄：`ownsConsumeExecutor && 0 < core <= Short.MAX_VALUE
-    /// && core < consumeThreadMax`，任一条不满足就**静默忽略**（Java 也不抛）。
-    /// 返回值只给单测断言「是否真的生效」，Java 侧无返回值。
     pub fn update_core_pool_size(&self, core_pool_size: i32) -> bool {
         if !self.inner.owns_consume_executor.load(Ordering::SeqCst) {
             return false;
@@ -5622,8 +5073,6 @@ mod tests {
 
     #[test]
     fn namespace_v2_setter_getter_round_trip() {
-        // Java `ClientConfig#setNamespaceV2/getNamespaceV2`：服务端命名空间
-        //（`NamespaceRpcHook` 的 `nsd`/`ns` 头），与 v1 `namespace` 互不影响。
         let c = DefaultMQPushConsumer::new("GID_nsv2").expect("合法组名不该构造失败");
         assert_eq!(c.get_namespace_v2(), None, "默认不设");
         c.set_namespace_v2(Some("NS_V2"));
@@ -5675,7 +5124,6 @@ mod tests {
             3
         );
 
-        // classFilterMode：Java 的守卫同样跳过二次过滤。
         let mut class_sub = sub("T", "TagA");
         class_sub.class_filter_mode = true;
         assert_eq!(
@@ -5718,8 +5166,6 @@ mod tests {
         assert_eq!(sql.sub_expression(), "a > 1");
     }
 
-    /// #73：`start()` 之后仍可 `subscribe()`（Java `DefaultMQPushConsumerImpl#subscribe:1265-1287`）。
-    ///
     /// 离线只能证明「不再拒绝 + 都落进活订阅表 + unsubscribe 不发心跳」：立即心跳是异步 RPC
     /// （`notify_subscription_changed` fire-and-forget 到 runtime），零 broker 时不发包。
     /// 真机报文与 broker 侧 topicGroupTable 的对照见 `examples/live_subscribe.rs`。
@@ -5748,7 +5194,6 @@ mod tests {
         assert!(topics.contains(&"T_B".to_string()));
         assert!(topics.contains(&"T_C".to_string()));
 
-        // Java :1317-1319 只删表项、不发心跳：计数器不动（这里本来就是 0，重点是"不发"）。
         let before = consumer.heartbeat_count();
         consumer.unsubscribe("T_B");
         assert_eq!(consumer.heartbeat_count(), before);
@@ -5774,22 +5219,19 @@ mod tests {
         assert_eq!(pq.last_pop_timestamp.load(Ordering::SeqCst), 1234);
     }
 
-    /// Java DefaultMQPushConsumer.java:890/898 —— suspend/resume/is_pause。
     #[test]
     fn suspend_and_resume_toggle_pause_and_trigger_rebalance() {
         let c = DefaultMQPushConsumer::new("G_suspend").unwrap();
         assert!(!c.is_pause());
         c.suspend();
         assert!(c.is_pause());
-        c.suspend(); // 幂等（Java 同样只是 set 标志）
+        c.suspend();
         assert!(c.is_pause());
         c.resume();
         assert!(!c.is_pause());
-        // resume 会请求一次重平衡（Java resume() 里同步 doRebalance；这里走标志位）
         assert!(c.inner.rebalance_now.load(Ordering::SeqCst));
     }
 
-    /// Java DefaultMQPushConsumerImpl.java:101-113 的四个流控常量一字不差。
     #[test]
     fn flow_control_constants_match_contract() {
         assert_eq!(PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION, 3000);
@@ -5852,7 +5294,6 @@ mod tests {
             ),
             (1000, 100)
         );
-        // 主题级阈值默认关闭（Java -1）
         assert_eq!(
             (
                 cfg.pull_threshold_for_topic,
@@ -5905,7 +5346,6 @@ mod tests {
             consume_timestamp_millis("20230101000000").unwrap(),
             expected.timestamp_millis()
         );
-        // 解析不了的字符串必须硬失败（Java checkConfig :1058），不能静默回落
         let err = consume_timestamp_millis("not-a-time").unwrap_err();
         assert!(
             format!("{err}").contains("consumeTimestamp is invalid"),
@@ -5925,12 +5365,6 @@ mod tests {
         assert!(DefaultMQPushConsumer::new("G").is_ok());
     }
 
-    /// `update_core_pool_size` 的三道守卫（Java `AbstractConsumeMessageService:63-71`）。
-    ///
-    /// ⚠ 默认 `consume_thread_max` 曾是照抄 4.x 的 64，于是 20~63 这些 Java 会**忽略**
-    /// 的值在本端口能生效（Java 5.x 两侧同为 20，`DefaultMQPushConsumer:162/:169`）。
-    /// 差异不报错，只表现为「同一个 `update_core_pool_size(30)`，本端口真的改了并发度、
-    /// Java 没改」，所以这五格必须钉住。
     #[test]
     fn update_core_pool_size_guards_match_contract() {
         let c = DefaultMQPushConsumer::new("G").unwrap();
@@ -5951,17 +5385,12 @@ mod tests {
         );
         assert!(c.update_core_pool_size(19), "刚好低于 max");
         assert_eq!(c.get_core_pool_size(), 19);
-        // 抬 max 之后区间重新打开（update_config 是裸赋值，与 Java 的 setter 一致）
         c.update_config(|x| x.consume_thread_max = 40_000);
         assert!(!c.update_core_pool_size(32768), "above Short.MAX_VALUE");
         assert!(c.update_core_pool_size(32767), "上界本身合法");
         assert_eq!(c.get_core_pool_size(), 32767);
     }
 
-    /// Java `DefaultMQPushConsumer:89`（字段默认 `new AllocateMessageQueueAveragely()`）
-    /// 与 `:196-202`（getter/setter）。
-    /// ⚠ Python/C++/C# 那条「置 null 后 checkConfig 拒绝启动」在这里由
-    /// `Arc<dyn ...>` 表达成「类型上不可表示」，所以没有对应的拒绝分支。
     #[test]
     fn push_consumer_exposes_the_allocate_strategy() {
         use crate::client::allocate_strategy::{
@@ -5987,7 +5416,6 @@ mod tests {
             "T", "broker-a", 1,
         )]));
         consumer.set_allocate_message_queue_strategy(by_config.clone());
-        // 存的是共享引用：换进消费者之后再改列表依然对所有 rebalance 生效（Java/Python 同）
         by_config.set_message_queue_list(vec![
             MessageQueue::new("T", "broker-a", 0),
             MessageQueue::new("T", "broker-a", 1),
@@ -6087,21 +5515,16 @@ mod tests {
         assert!(!consumer.is_started());
     }
 
-    // ---------------- checkConfig 数值段（Java :1099-1209）----------------
 
-    /// 一道数值闸门：合法域 `[lo, hi]`（两端都含），越界时 Java 的固定文案。
     struct RangeGate {
         field: &'static str,
         lo: i64,
         hi: i64,
         message: &'static str,
         set: fn(&mut ConsumerConfig, i64),
-        /// `-1` 是 Java 给 topic 级两道闸门留的「关闭」哨兵，其它字段没有这个豁免。
         minus_one_off: bool,
     }
 
-    /// 顺序与 Java `checkConfig` 逐字一致 —— 顺序本身就是判据：配错两项时用户要先看到
-    /// 排在前面的那条（Python `GATES` / C++ `kGates` 同一张表）。
     const RANGE_GATES: &[RangeGate] = &[
         RangeGate {
             field: "consume_thread_min",
@@ -6160,8 +5583,6 @@ mod tests {
             minus_one_off: true,
         },
         RangeGate {
-            // ⚠ 唯一一条下界是 **0** 的闸门（Java 原文如此）：pullInterval=0 是
-            // "不额外等待"，是正常用法，不能当越界拒掉。
             field: "pull_interval",
             lo: 0,
             hi: 65535,
@@ -6223,7 +5644,6 @@ mod tests {
         }
     }
 
-    /// Java 的比较是 `value < lo || value > hi`，两端都是**闭**区间。
     fn expect_rejected(gate: &RangeGate, value: i64) {
         let want = format!("MQClientException: {}", gate.message);
         assert_eq!(
@@ -6277,8 +5697,6 @@ mod tests {
         }
     }
 
-    /// `-1` 只在 topic 级两道闸门上是「关闭」；把它当成通用开关会让别的闸门静默失效
-    /// （`pull_threshold_for_queue = -1` 在 Java 里是启动错误，不是"不限制"）。
     #[test]
     fn minus_one_sentinel_only_closes_topic_gates() {
         for gate in RANGE_GATES {
@@ -6301,7 +5719,6 @@ mod tests {
             "MQClientException: consumeThreadMin (8) is larger than consumeThreadMax (4)"
         );
 
-        // Java 用的是严格大于：min == max 是合法的固定大小线程池
         check_config_ranges(&ConsumerConfig {
             consume_thread_min: 8,
             consume_thread_max: 8,
@@ -6320,7 +5737,6 @@ mod tests {
         );
     }
 
-    /// 命中顺序即 Java 的书写顺序：同时配坏两项时先报排在前面那道。
     #[test]
     fn gates_are_checked_in_contract_order() {
         assert_eq!(
@@ -6384,8 +5800,6 @@ mod tests {
         consumer.shutdown();
     }
 
-    /// Java 每条闸门的两个端点都要真能启动：端点写成开区间会让"贴着上限配"的
-    /// 运维配置（`pullThresholdForQueue=65535` 这类"实际不拦"的写法）被误拒。
     #[tokio::test]
     async fn start_accepts_every_gate_boundary() {
         for (label, at_max) in [("min", false), ("max", true)] {
@@ -6409,8 +5823,6 @@ mod tests {
         }
     }
 
-    /// Java `ClientConfig:58/:66` 的两个周期：推送消费者能改，且 `start()` 真的把它们
-    /// 透传到实例上（路由刷新周期 + 后台位点落盘周期，后者默认 5000ms 而不是 30s）。
     #[tokio::test]
     async fn scheduled_intervals_reach_the_instance() {
         let consumer = DefaultMQPushConsumer::new("CID_interval_probe_rust").unwrap();
@@ -6439,8 +5851,6 @@ mod tests {
         consumer.shutdown();
     }
 
-    /// 起点时间也在 checkConfig 里（Java :1058）。原来只在算拉取位点时才解析，
-    /// 格式写歪的后果是**那一条队列**静默不消费，而不是启动失败。
     #[tokio::test]
     async fn start_rejects_unparsable_consume_timestamp() {
         let consumer = DefaultMQPushConsumer::new("CID_check_config_ts_rust").unwrap();
@@ -6462,13 +5872,6 @@ mod tests {
         assert!(!consumer.is_started());
     }
 
-    /// clientId 口径对齐 Java（`DefaultMQPushConsumerImpl#start` 的
-    /// `changeInstanceNameToPID` + `ClientConfig#buildMQClientId`）：
-    /// `<本机 IP>@<instanceName>`，且 instanceName **只在 CLUSTERING 时**被改写成
-    /// `<pid>#<nanoTime>`。
-    ///
-    /// 后半段是有实际后果的那一条：广播模式保持 `DEFAULT`，于是同进程的两个广播消费者
-    /// 算出同一个 clientId、共用一份 `MQClientInstance`（Java 就是这么跑的）。
     #[tokio::test]
     async fn client_id_follows_buildmqclientid_contract() {
         let clustering = DefaultMQPushConsumer::new("CID-clientid-parity-clustering").unwrap();
@@ -6642,7 +6045,6 @@ mod tests {
         });
     }
 
-    /// Python `_flow_control_hit`（Java `ProcessQueue.putMessage` 的五个阈值）。
     #[test]
     fn flow_control_hits_each_threshold() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -6654,7 +6056,6 @@ mod tests {
         assert!(!flow_control_hit(&consumer.inner, &mq, &key));
         assert_eq!(triggered(), 0);
 
-        // 条数：>= pullThresholdForQueue；Java 的 max(1) 守卫配 0 也按 1 条算
         only(&consumer, |c| c.pull_threshold_for_queue = 3);
         stage(
             &consumer,
@@ -6674,7 +6075,6 @@ mod tests {
         );
         assert!(flow_control_hit(&consumer.inner, &mq, &key), "2MiB >= 1MiB");
 
-        // 跨度：严格大于 consumeConcurrentlyMaxSpan（Java 同）
         only(&consumer, |c| c.consume_concurrently_max_span = 10);
         stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 100)]);
         assert!(
@@ -6722,7 +6122,6 @@ mod tests {
         assert!(!flow_control_hit(&plain.inner, &mq, &key));
     }
 
-    /// Java `ProcessQueue.msgAccCnt`：只看**本批最后一条**，且只接受正数。
     #[test]
     fn msg_acc_cnt_uses_the_last_message_only() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -6761,8 +6160,6 @@ mod tests {
 
     // ---------------- 并发消费（classic 路径）的 ackIndex ----------------
 
-    /// Java `ConsumeMessageConcurrentlyService#processConsumeResult:202-270`。
-    ///
     /// 这些断言**只能**离线做：这个端口在没有 `start()` 过的实例上回投必然失败
     /// （`require_client` 直接 Err），于是「回投失败」那条分支的可见结果 ——
     /// 尾巴塞回队首、`reconsumeTimes+1`、位点不越过它 —— 恰好是最容易被写错的部分。
@@ -6880,7 +6277,6 @@ mod tests {
 
     #[tokio::test]
     async fn reconsume_later_overrides_a_wider_ack_index() {
-        // Java:222-226 —— RECONSUME_LATER 强制 ackIndex = -1，整批回投
         let h = AckHarness::new(false, Some(2), ConsumeConcurrentlyStatus::ReconsumeLater);
         assert!(!h.run(3).await);
         assert_eq!(h.pending(), vec![(0, 1), (1, 1), (2, 1)]);
@@ -6889,7 +6285,6 @@ mod tests {
 
     #[tokio::test]
     async fn broadcasting_drops_the_tail_without_send_back() {
-        // Java:232-237 —— 广播模式不回投，未认可的尾巴只 warn 后丢掉，位点整批前进
         let h = AckHarness::new(true, Some(0), ConsumeConcurrentlyStatus::ConsumeSuccess);
         assert!(h.run(3).await);
         assert_eq!(h.offset(), 3);
@@ -6906,16 +6301,12 @@ mod tests {
 
     // ---------------- 顺序消费的 checkReconsumeTimes ----------------
 
-    /// Java `ConsumeMessageOrderlyService#processConsumeResult:254-266` +
-    /// `#checkReconsumeTimes:322-339` + `#getMaxReconsumeTimes:313-320`。
-    ///
     /// 三处坏掉都是**静默**的：少 +1 永远到不了阈值（毒消息原地转到天荒地老）；`-1` 读成
     /// 16 会给顺序消费凭空造死信；回投成功后还挂起，则一条毒消息永久占住那条队列 ——
     /// 真机上看起来跟「消费者挂了」一模一样。所以判据全部离线锁死，只有「回投成功 →
     /// 位点前进」那一支（未 `start()` 时必然走不到）交给真机 `examples/live_consumer.rs`。
     struct OrderlyListener {
         status: ConsumeOrderlyStatus,
-        /// `Some(false)` 模拟 binlog 消费方关掉 autoCommit（Java 手动提交模式）。
         auto_commit: Option<bool>,
     }
 
@@ -6968,7 +6359,6 @@ mod tests {
             OrderlyHarness::build(max_reconsume_times, status, None)
         }
 
-        /// 关掉 autoCommit 的监听器（Java 手动提交 / binlog 用法）。
         fn new_manual(max_reconsume_times: i32, status: ConsumeOrderlyStatus) -> OrderlyHarness {
             OrderlyHarness::build(max_reconsume_times, status, Some(false))
         }
@@ -6981,8 +6371,6 @@ mod tests {
             let cfg = ConsumerConfig {
                 consumer_group: "G".to_string(),
                 max_reconsume_times,
-                // 配置侧 0 会被钳到 10ms（Java submitConsumeRequestLater 的下限），
-                // 单测因此只等 10ms 而不是默认的 1s
                 suspend_current_queue_time_millis: 0,
                 ..Default::default()
             };
@@ -7058,9 +6446,6 @@ mod tests {
 
     #[test]
     fn orderly_minus_one_means_unlimited_not_the_concurrent_sixteen() {
-        // 顺序侧 -1 → i32::MAX（Java:313-320）；并发侧同样写 -1 却是 16
-        //（`send_message_back` 里那份，Java DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890）。
-        // 并成一个常量 = 要么给顺序消费造死信，要么让并发消息无限重投。
         assert_eq!(orderly_max_reconsume_times(&cfg_with(-1)), i32::MAX);
         assert_eq!(orderly_max_reconsume_times(&cfg_with(3)), 3);
     }
@@ -7092,8 +6477,6 @@ mod tests {
 
     #[tokio::test]
     async fn at_cap_with_failed_send_back_still_suspends() {
-        // 未 start → require_client 失败 → 回投必败。Java :328-331 这时 suspend=true
-        // 并且再 +1，下一轮再来；写成「失败也前进位点」就等于把毒消息丢掉。
         let h = OrderlyHarness::new(2, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
         let inner = h.c.inner.clone();
         let mut batch = orderly_batch(7, &[2]);
@@ -7178,10 +6561,6 @@ mod tests {
 
     #[test]
     fn orderly_suspend_millis_resolves_then_clamps() {
-        // Java `ConsumeMessageOrderlyService#submitConsumeRequestLater:211-234`：
-        // 先解析 -1（`ConsumeOrderlyContext` 的默认值 = 「没指定」）→ 回落到消费者配置，
-        // 再把结果钳到 [10, 30000]。钳位不是装饰：listener 传 0 时 Java 仍然等 10ms
-        // （否则一个返回挂起的 listener 会把消费线程变成忙等），传 1 小时也只等 30s。
         let cfg = |ms: i64| ConsumerConfig {
             suspend_current_queue_time_millis: ms,
             ..Default::default()
@@ -7229,9 +6608,6 @@ mod tests {
 
     #[tokio::test]
     async fn illegal_commit_and_rollback_under_auto_commit_are_acked() {
-        // Java processConsumeResult:244-250 —— autoCommit=true 时 COMMIT/ROLLBACK 是非法用法
-        // （只给 binlog 消费用）：Java 只 warn 一句、**没写 break**，顺势落进 SUCCESS 分支
-        // 照常 ack。真把它当回滚，一个「返回 COMMIT 的监听器」会让这条队列原地卡死。
         for status in [ConsumeOrderlyStatus::Commit, ConsumeOrderlyStatus::Rollback] {
             let h = OrderlyHarness::new(0, status);
             assert!(
@@ -7243,7 +6619,6 @@ mod tests {
         }
     }
 
-    // ---------------- autoCommit=false：手动提交模式（Java:270-300）----------------
 
     #[tokio::test]
     async fn manual_commit_advances_without_requeueing() {
@@ -7255,7 +6630,6 @@ mod tests {
 
     #[tokio::test]
     async fn manual_rollback_requeues_and_holds_the_offset() {
-        // Java:278-285 —— rollback() 把消息退回 ProcessQueue 并延后重试，位点不动。
         let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Rollback);
         assert!(!h.run(orderly_batch(0, &[0])).await);
         assert_eq!(h.offset(), 0, "回滚不能提交位点");
@@ -7264,10 +6638,6 @@ mod tests {
 
     #[tokio::test]
     async fn manual_success_holds_the_batch_without_committing() {
-        // 有意偏差：Java 把消息留在 ProcessQueue.consumingMsgOrderlyTreeMap 里等显式
-        // commit()，本端口没把 ProcessQueue 交给 listener（没有 commit 的口子），照抄
-        // 「什么都不做」会让这批消息被分发线程吞掉而位点又没动。等价地塞回队首并等一个
-        // 挂起周期：位点同样不前进、消息不丢，也不会把消费线程变成忙等。
         let h = OrderlyHarness::new_manual(0, ConsumeOrderlyStatus::Success);
         // 两条都是 reconsumeTimes=0：手动模式下 SUCCESS 连本地计数都不该动
         assert!(!h.run(orderly_batch(0, &[0, 0])).await);
@@ -7277,8 +6647,6 @@ mod tests {
 
     #[tokio::test]
     async fn manual_suspend_never_commits_the_offset() {
-        // Java:288-296 —— 与自动提交分支的关键差别：毒消息交给 broker 之后**不 commit**，
-        // 位点前不前进由 binlog 消费方自己拿主意（自动提交那条会 commit 放行）。
         let h = OrderlyHarness::new_manual(2, ConsumeOrderlyStatus::SuspendCurrentQueueAMoment);
         assert!(!h.run(orderly_batch(7, &[2])).await);
         assert_eq!(h.offset(), 0, "手动模式挂了也不提交位点");
@@ -7286,9 +6654,6 @@ mod tests {
 
     #[tokio::test]
     async fn orderly_hook_gets_raw_status_and_normalized_success() {
-        // Java 顺序 `:502-511`：returnType 按归一化**前**的 status 算，`setStatus` 拿的是
-        // 归一化**后**的；success 判据是 `SUCCESS || COMMIT`（COMMIT 视为「这批算过了」，
-        // ROLLBACK 不是）。写反的话轨迹里的 contextCode 与业务分支对不上。
         let cases = [
             (ConsumeOrderlyStatus::Commit, "COMMIT", true),
             (ConsumeOrderlyStatus::Rollback, "ROLLBACK", false),
@@ -7314,11 +6679,6 @@ mod tests {
 
     // ---------------- 309 CONSUME_MESSAGE_DIRECTLY ----------------
 
-    /// Java 顺序 `consumeMessageDirectly:103-161` 与并发 `:309` 的映射差异：并发只有
-    /// SUCCESS/LATER 两档且 `order=false, autoCommit=true`（用默认值）；顺序多出
-    /// COMMIT → CR_COMMIT、ROLLBACK → CR_ROLLBACK，并且 `order=true`、`autoCommit`
-    /// 取 listener 在上下文里设的值（broker 按它决定这条直接消费算不算已提交）。
-    /// 映射写错是静默的：真机上只表现为某个队列的位点偶尔不回退或该挂起时被吞掉。
     #[test]
     fn direct_consume_maps_orderly_commit_rollback_and_auto_commit() {
         let cases = [
@@ -7351,7 +6711,6 @@ mod tests {
         }
     }
 
-    /// 并发侧：`order=false` 且 autoCommit 保持 Java 初值 `true`（顺序上下文才是可改的）。
     #[test]
     fn direct_consume_maps_concurrent_success_and_auto_commit_default() {
         let c = DefaultMQPushConsumer::with_config(cfg_with(0)).expect("consumer");
@@ -7369,9 +6728,6 @@ mod tests {
 
     // ---------------- POP ----------------
 
-    /// Java `PopCallback.onSuccess:556-563` 的那处不对称：RT 在 `FOUND` 分支入口就记
-    /// （**判空之前**），TPS 只按真正弹到的条数记。记错方向是静默故障 —— 消息照弹照
-    /// ack、消费完全正常，只有 307 状态表上一片 0，所以两条判据都要能离线锁死。
     #[test]
     fn pop_loop_records_pull_rt_even_when_the_pop_is_empty() {
         let group = "GID_PopStats";
@@ -7411,7 +6767,6 @@ mod tests {
         assert_eq!(tps().times(), 1);
         assert_eq!(tps().value(), 2);
 
-        // ② FOUND 但空列表：RT 照记（Java 在判空前记），TPS 不记（0 条不该拉高分子）
         record_pop_pull_stats(
             &stats,
             group,
@@ -7535,7 +6890,6 @@ mod tests {
         );
         let (topic, ..) = pop_ck_target(inner, &retry_v2).unwrap();
         assert_eq!(topic, "%RETRY%G+T");
-        // 只有 7 段：拿不到 offset ⇒ 无法 ack（Java 的 IllegalArgumentException 同口径）
         let mut seven = ok.clone();
         seven.put_property(PROPERTY_POP_CK, "1234 1700000000000 60000 0 0 broker-a 3");
         assert!(pop_ck_target(inner, &seven).is_none());
@@ -7548,7 +6902,6 @@ mod tests {
         assert!(pop_ck_target(inner, &bad_flag).is_none());
     }
 
-    // ---------------- POP 顺序消费（Java ConsumeMessagePopOrderlyService，5.5.0 骨架） ----------------
 
     struct CountingOrderlyListener(Arc<AtomicUsize>);
 
@@ -7594,10 +6947,6 @@ mod tests {
         m
     }
 
-    /// 忠实移植 Java 5.5.0 骨架（DefaultMQPushConsumerImpl:533 的 POPTODO）：顺序
-    /// 监听器分流的 POP 批次**不投监听器、不 ack** —— 消息靠 invisibleTime 到期由
-    /// broker 复活重投。「POP 模式下零 LOCK/UNLOCK_BATCH_MQ 报文」在离线环境注入
-    /// 不了反向验证，真机证据归 examples/live_* 收口（四端同一约定）。
     #[tokio::test]
     async fn pop_orderly_dispatch_never_invokes_the_listener() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7646,8 +6995,6 @@ mod tests {
         assert_eq!(pq.wait_ack_count(), 0);
     }
 
-    /// Java 的 ConsumeRequest 相等性 = shardingKeyIndex(0) + pq 引用 + mq：
-    /// 同 (pq, mq) 去重、mq 不同 / pq 不同都算新请求，force 不新增集合条目。
     #[tokio::test]
     async fn pop_orderly_requests_dedup_by_pq_and_queue() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7671,8 +7018,6 @@ mod tests {
         );
     }
 
-    /// Java :228-235：run 里发现队列已撤 → 记 warn 日志并把自己从集合里摘掉。
-    /// （入集之后才撤的场景要用 force 才能再进 run —— 非 force 的重复提交被去重挡住。）
     #[tokio::test]
     async fn pop_orderly_dropped_request_is_removed_from_the_set() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7696,7 +7041,6 @@ mod tests {
         assert_eq!(consumer.pop_orderly_request_count(), 0);
     }
 
-    /// 活队列上的 run 就是 POPTODO 本体：既不消费也不摘条目（等 Java 上游补齐再移植）。
     #[tokio::test]
     async fn pop_orderly_run_on_live_queue_is_noop() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7723,7 +7067,6 @@ mod tests {
             consume_return_type(None, false, 0, 15, false),
             ConsumeReturnType::ReturnNull
         );
-        // 超时判定**优先于**成功/失败（Java 同：先比 rt >= timeout）
         assert_eq!(
             consume_return_type(Some("CONSUME_SUCCESS"), false, 15 * 60 * 1000, 15, true),
             ConsumeReturnType::TimeOut
@@ -7740,7 +7083,6 @@ mod tests {
             consume_return_type(Some("CONSUME_SUCCESS"), false, 100, 15, false),
             ConsumeReturnType::Success
         );
-        // 枚举名进轨迹属性，必须与 Java `ConsumeReturnType` 逐字一致
         assert_eq!(ConsumeReturnType::Success.name(), "SUCCESS");
         assert_eq!(ConsumeReturnType::TimeOut.name(), "TIME_OUT");
         assert_eq!(ConsumeReturnType::Exception.name(), "EXCEPTION");
@@ -7808,10 +7150,6 @@ mod tests {
 
     // ---------------- runningInfo 的 pop 视图 ----------------
 
-    /// POP 模式下 `mqPopTable` 要能看到每个弹出队列。Python 版查 `_mq_map` 反解队列，
-    /// 而 pop 路径从不写它 → 恒空；Rust 按 Java
-    /// `DefaultMQPushConsumerImpl.consumerRunningInfo:1473-1481`（popProcessQueueTable
-    /// 本身以 MessageQueue 为键）从当前分配反查。
     #[test]
     fn pop_running_info_reports_every_popped_queue() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7870,7 +7208,6 @@ mod tests {
         );
     }
 
-    // ---------------- 拉取停摆自愈（Java `isPullExpired` / `PULL_MAX_IDLE_TIME`） ----------------
 
     /// 直接种盖章，绕开真循环（本模块没有 `MQClientInstance`，循环一上来就会退出）。
     fn stamp_at(consumer: &DefaultMQPushConsumer, key: &str, at: i64) {
@@ -7890,7 +7227,6 @@ mod tests {
         consumer.inner.started.store(true, Ordering::SeqCst);
     }
 
-    /// Java `ProcessQueue.PULL_MAX_IDLE_TIME` 默认值 + `isPullExpired` 的严格 `>` 边界。
     #[test]
     fn pull_idle_threshold_matches_contract_and_is_strictly_greater() {
         assert_eq!(PULL_MAX_IDLE_TIME, 120_000);
@@ -7902,7 +7238,6 @@ mod tests {
         assert!(!stalled(&consumer, &key, began + 10 * 60_000));
         stamp_at(&consumer, &key, began);
         assert!(!stalled(&consumer, &key, began + PULL_MAX_IDLE_TIME - 1));
-        // 正好等于阈值：Java 用 `>` 而不是 `>=`，边界上不撤
         assert!(!stalled(&consumer, &key, began + PULL_MAX_IDLE_TIME));
         assert!(stalled(&consumer, &key, began + PULL_MAX_IDLE_TIME + 1));
         // 哨兵 0 = 循环已退出（tokio 任务没有 `Thread.is_alive()` 可问）
@@ -7914,9 +7249,6 @@ mod tests {
         assert!(!stalled(&consumer, &other, began + 1000));
     }
 
-    /// 盖章发生在**发起**拉取的那一刻（Java `pullMessage:253` / `popMessage:508`），
-    /// 而 POP 模式还要同步 `PopProcessQueue.lastPopTimestamp` —— Java 的
-    /// `isPullExpired` 在 pop 路径上读的就是它。
     #[test]
     fn stamping_marks_both_pop_clocks() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7980,8 +7312,6 @@ mod tests {
             state.lock_ok.insert(key.clone());
             state.last_pull_at.insert(key.clone(), 123);
             state.pop_queues.insert(key.clone(), pq.clone());
-            // 在途批次的清扫视图：撤销后旧批次的引用不能留着（
-            // Java cleanExpireMsg 只遍历 processQueueTable，摘掉的队列扫不到）
             state
                 .inflight_msgs
                 .insert(key.clone(), vec![ext("T", None)]);
@@ -8059,8 +7389,6 @@ mod tests {
         assert!(items.contains(&(other, 7)), "items={items:?}");
     }
 
-    /// 停摆的队列在**同一趟** rebalance 里被撤掉并重建（Java
-    /// `updateProcessQueueTableInRebalance` 的 remove + put 同一个 pass）。
     #[tokio::test]
     async fn a_stalled_queue_is_dropped_and_rebuilt_in_one_pass() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -8150,8 +7478,6 @@ mod tests {
         );
     }
 
-    /// POP 模式：自愈要换新 `PopProcessQueue`（Java `popProcessQueueTable` 重建），
-    /// 旧的标 dropped —— 否则在途批次还会被 ack，和新属主的批次重复。
     #[tokio::test]
     async fn pop_mode_swaps_the_process_queue_when_self_healing() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -8181,8 +7507,6 @@ mod tests {
         assert_ne!(state.queue_owners.get(&key).copied(), Some(999));
     }
 
-    /// `ConsumerRunningInfo` 要如实报出 `lastPullTimestamp`（Java
-    /// `ProcessQueue.fillOutRunningInfo:456`），运维就是看这个字段判断停摆。
     #[test]
     fn running_info_publishes_the_pull_clock() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -8212,8 +7536,6 @@ mod tests {
         );
     }
 
-    /// POP 的运维视图暴露 `lastPopTimestamp`（Java 的 pop 视图本没有这个字段，
-    /// 与 Python 一致地补上）。
     #[test]
     fn pop_running_info_publishes_the_pop_clock() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -8247,7 +7569,6 @@ mod tests {
         assert!(lock(&consumer.inner.state).queue_owners.is_empty());
     }
 
-    // ---------------- 本地位点文件：对齐 Java LocalFileOffsetStore ----------------
 
     // 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
     const CONTRACT_OFFSETS_COMPACT: &str = concat!(
@@ -8349,7 +7670,6 @@ mod tests {
         save_local_offsets_at(&path, &items, &mq_map).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.starts_with("{\"offsetTable\":{"));
-        // 首次写不产生 .bak（Java string2File 只在已有旧内容时滚动）
         assert!(!path.with_file_name("offsets.json.bak").exists());
 
         save_local_offsets_at(
@@ -8358,7 +7678,6 @@ mod tests {
             &mq_map,
         )
         .unwrap();
-        // .bak = 上一代内容（Java MixAll.string2File 语义）
         assert_eq!(
             std::fs::read_to_string(path.with_file_name("offsets.json.bak")).unwrap(),
             raw
@@ -8379,7 +7698,6 @@ mod tests {
 
     #[test]
     fn local_offsets_load_reads_contract_written_file() {
-        // Java 写出的文件本端要能读（跨端互认的核心）
         let dir = std::env::temp_dir().join(format!(
             "rmq_rust_offsets_java_{}_{}",
             std::process::id(),
@@ -8405,9 +7723,6 @@ mod tests {
 
     const P5_TOPIC: &str = "P5PostSubscriptionTopic";
 
-    /// Java `DefaultMQPushConsumer.postSubscriptionWhenPull` 默认 false：默认**不上送**
-    /// 订阅表达式（SUBSCRIPTION 位清零），tag 过滤靠客户端
-    /// `filter_messages_for_delivery` 兜底；打开且非类过滤模式才上送。
     #[test]
     fn pull_subscription_expression_follows_contract_default() {
         let s = sub(P5_TOPIC, "TagA");
@@ -8431,9 +7746,6 @@ mod tests {
         assert_eq!(pull_subscription_expression(&cfg, &class_mode), None);
     }
 
-    /// Java `PullAPIWrapper#recalculatePullFromWhichNode` / `#updatePullFromWhichNode`：
-    /// 首轮无记录按主节点 0；应答缺 `suggestWhichBrokerId` 也按 0 记账（Java long 原语），
-    /// 有了 suggest 就按它选路；表按队列隔离。
     #[test]
     fn pull_from_which_node_defaults_to_master_and_round_trips() {
         let mut state = State::default();
@@ -8459,7 +7771,6 @@ mod tests {
         assert_eq!(recalc_pull_from_which_node(&state, &other), master);
     }
 
-    // ---------------- correctTagsOffset（Java `DefaultMQPushConsumerImpl:713-717`） ----------------
 
     const CTO_TOPIC: &str = "P6CorrectTagsOffsetTopic";
 
@@ -8512,13 +7823,6 @@ mod tests {
         }
     }
 
-    /// 表里没有记录时**无条件建条目**（Java `RemoteBrokerOffsetStore.updateOffset:61-64`
-    /// 的 `putIfAbsent`），哪怕应答位点就是 0。
-    ///
-    /// 把「没有记录」和「记录是 0」合并成一个 `unwrap_or(0)` 会让空队列
-    /// （`nextBeginOffset == 0`）的首次修正变成静默 no-op：broker 上永远查不到这条队列的
-    /// 位点记录（真机 S3 就是这么抓出来的），重启后 `consumerProgress` 也一直显示
-    /// 从未消费。Java/Python/C++ 三边都会留下这条 0。
     #[test]
     fn correct_tags_offset_creates_the_record_even_for_a_zero_offset() {
         let mut h = CtoHarness::new();
@@ -8542,10 +7846,6 @@ mod tests {
     }
 
     /// 闸门：`ProcessQueue` 里还有消息（缓冲里的 + listener 手里的）就一律不动位点。
-    ///
-    /// 在途也算数是因为 Java 的 `msgCount` 要等 listener 返回才减
-    /// （`ConsumeMessageConcurrentlyService:266` 的 `removeMessage`）；
-    /// 不等它落定就抬位点，进程崩溃时这批消息会被静默跳过。
     #[test]
     fn correct_tags_offset_respects_the_process_queue_guard() {
         // 缓冲里还有一条没消费
@@ -8610,9 +7910,6 @@ mod tests {
         }
     }
 
-    /// 接线取证：`dispatch_loop` 必须把"取走批次"与"登记 inflight"放在同一临界区，
-    /// 否则 listener 还没返回时修正就能抬位点（Java 那边 `msgCount` 此刻还 > 0）。
-    ///
     /// 真机链路（broker 过滤 → NO_MATCHED_MSG → broker 侧位点前移）见
     /// `examples/live_correct_tags_offset.rs`。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8694,20 +7991,7 @@ mod tests {
     }
 
     // ---------------- cleanExpiredMsg（挂起 listener 的逃生口） ----------------
-    //
-    // 对应 Java ConsumeMessageConcurrentlyService（:68-88 建调度、:192-200 清扫入口）
-    // ＋ ProcessQueue.cleanExpiredMsg（:75-127）。三条「错了很安静」的语义在这里钉死：
-    //   1. **只看队首**（最小位点）：非队首的过期消息不动手（Java:97-99 队首不过期就
-    //      直接 break）；
-    //   2. **严格大于** consumeTimeout：等于阈值不碰；
-    //   3. **单轮上限 16**，且 loop 在循环之前算一次（Java:80）——写松了会把整条队列
-    //      一次性全清空，位点/重投节奏全乱。
-    // 离线能锁死的只有「判定」与「回投失败后原地保留」两条分支（未 start 的消费者
-    // 回投必定失败）；真机链路（挂起 → 清扫 → %RETRY% 重投到达）见
-    // `examples/live_clean_expired_msg.rs`。
 
-    /// Java `scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)`：
-    /// initialDelay 与 period 同值，都是 consumeTimeout 分钟。
     #[test]
     fn clean_expire_period_equals_consume_timeout_minutes() {
         assert_eq!(clean_expire_period_millis(15), 900_000, "默认 15 分钟");
@@ -8720,8 +8004,6 @@ mod tests {
         assert_eq!(clean_expire_period_millis(-3), 60_000);
     }
 
-    /// 盖章解析对齐 Java 的 `StringUtils.isNotEmpty(...) && Long.parseLong(...)`：
-    /// 没有/空/坏值一律按「没盖过章」处理，不当成过期（判松了会抢走刚投递的消息）。
     #[test]
     fn consume_start_timestamp_reads_only_well_formed_stamps() {
         let mut m = ext("T", None);
@@ -8753,7 +8035,6 @@ mod tests {
         assert!(is_consume_expired(Some(now - 900_001), now, 15));
     }
 
-    /// 队首没过期 → 整条队列都不动（Java:97-99 的 break，不是 continue）。
     #[tokio::test]
     async fn clean_expired_queue_stops_at_a_fresh_head() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -8783,7 +8064,6 @@ mod tests {
         assert_eq!(state.pending.get(&key).unwrap().len(), 2, "一条都不许动");
     }
 
-    /// 没有盖章的消息即便在队首也绝不回投（Java `StringUtils.isNotEmpty` 短路）。
     #[tokio::test]
     async fn clean_expired_queue_leaves_unsigned_messages_alone() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -8802,8 +8082,6 @@ mod tests {
         );
     }
 
-    /// 回投失败（未 start 的消费者）→ 条目原地保留、下一轮还是它；单轮内 Java 会对
-    /// **同一条队首**重试到 loop 用尽（:80 的 loop 与循环体里的 continue）。
     #[tokio::test]
     async fn clean_expired_queue_keeps_the_entry_when_send_back_fails() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -8839,7 +8117,6 @@ mod tests {
         assert!(!state.consume_offsets.contains_key(&key), "位点不许动");
     }
 
-    /// 单轮上限 16：20 条过期条目一轮只发起 16 次回投（Java:80）。
     #[tokio::test]
     async fn clean_expired_queue_caps_one_round_at_sixteen() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -8957,7 +8234,6 @@ mod tests {
             assert!(process_queue_contains_locked(&state, &key, 2));
             assert!(!process_queue_contains_locked(&state, &key, 3));
         }
-        // 摘除后：两边都没有它了，containsMessage（Java:341-357）立刻翻 false
         {
             let mut state = lock(&consumer.inner.state);
             remove_process_queue_entry_locked(&mut state, &key, 1);
@@ -8967,9 +8243,6 @@ mod tests {
         }
     }
 
-    /// Java processConsumeResult:243-248：已被清扫的条目**跳过回投**（它已经在回
-    /// broker 的路上，再发一次就是重复消息）。这里用「未 start 的消费者回投必失败」
-    /// 把两条腿分开：没被清扫的那条落在 failed 里，被清扫的那条根本不进循环体。
     #[tokio::test]
     async fn send_back_batch_skips_entries_swept_away() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -9000,10 +8273,6 @@ mod tests {
         assert_eq!(batch[1].reconsume_times, 0, "被跳过的条目不许加次数");
     }
 
-    /// 停机排空窗口：`shutdown()` 已把 `started` 置 false，在途批次仍必须能取到实例把
-    /// 回投发出去（Java `sendMessageBack` 直接走 `mQClientFactory`，不看 serviceState）。
-    /// 旧口径下回投全被「consumer not started」快速失败掐掉，真机立即退进程测试里
-    /// `%RETRY%` 一直是空的（见 `examples/live_shutdown_race.rs`）。
     #[test]
     fn send_back_lookup_ignores_started_flag_until_instance_is_taken() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -9026,7 +8295,6 @@ mod tests {
             "排空窗口内回投必须还能取到实例"
         );
 
-        // shutdown 收尾的最后一步才摘实例：从此回投失败（等价 Java 侧工厂已拆）。
         lock(&consumer.inner.client).take();
         assert!(require_client_for_send_back(&consumer.inner).is_err());
     }
@@ -9100,8 +8368,6 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
-    /// 清扫入口只扫「当前持有」的队列（Java cleanExpireMsg:192-200 遍历
-    /// processQueueTable）；撤掉的队列连登记都一并没了（retire 的清理）。
     #[tokio::test]
     async fn clean_expired_msg_once_scans_held_queues_only() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -9136,8 +8402,6 @@ mod tests {
         );
     }
 
-    /// POP 路径同样在交给 listener 之前盖章（Java ConsumeMessagePopConcurrentlyService
-    /// :379-385）；POP 没有清扫调度，盖章只为 listener/轨迹可见性一致。
     #[tokio::test]
     async fn pop_dispatch_stamps_the_consume_start_time() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -9174,8 +8438,6 @@ mod tests {
         }
     }
 
-    // ---------------- OFFSET_ILLEGAL 纠错（Java `DefaultMQPushConsumerImpl:402-427`） ----------------
-    //
     // 这条路径错了是**静默**的两种极端 ——
     //
     //   * 只把拉取游标拨到 `nextBeginOffset` 而不丢队列/不冻结：broker 刚把位点纠正到合法
@@ -9186,12 +8448,6 @@ mod tests {
     //
     // 两个方向在真机短期窗口里都看不出差别（消息照消费、只是一直在弹/一次崩溃才暴露），
     // 所以断言全部放离线；真机另有一条链路证明（见 `examples/live_offset_illegal.rs`）。
-    //
-    // 判据来源：`PullMessageProcessor` 对 OFFSET_OVERFLOW_BADLY / NO_MESSAGE_IN_QUEUE /
-    // OFFSET_RESET / OFFSET_TOO_SMALL 一律回 `PULL_OFFSET_MOVED`，`MQClientAPIImpl:1099`
-    // 把它映射成 `PullStatus::OffsetIllegal`，修正值在应答头 `nextBeginOffset`。Java 的处理
-    // 是 `setNextOffset` → `ProcessQueue.setDropped(true)` → 异步
-    // `{ updateAndFreezeOffset; persist; removeProcessQueue; rebalanceImmediately }`。
 
     /// 模拟 listener 返回后的位点推进（`consume_batch` 收尾调的就是它）。
     fn ack_batch(c: &DefaultMQPushConsumer, key: &str, offsets: &[i64], epoch: u64) {
@@ -9362,8 +8618,6 @@ mod tests {
         let h = IllegalHarness::new(true, 0);
         h.freeze(0);
         assert!(!h.c.inner.rebalance_now.load(Ordering::SeqCst));
-        // 未 start()：persist 那步没有 client 可发，静默跳过（与 Java 落盘失败同一后果——
-        // 本地状态已经纠对，broker 侧的修正由周期落盘兜底）
         handle_offset_illegal(&h.c.inner, &h.key).await;
         assert_eq!(h.epoch(), 1);
         assert!(!lock(&h.c.inner.state).mq_map.contains_key(&h.key));
@@ -9377,7 +8631,6 @@ mod tests {
     fn frozen_offset_ignores_ack() {
         let h = IllegalHarness::new(true, 0);
         h.freeze(0);
-        // 旧批次（offset 0..2 已消费）迟到的 ack：把位点推回 3 就是 Java 的弹跳现场
         h.ack(&[0, 1, 2], 0);
         assert_eq!(h.offset(), Some(0));
     }
@@ -9395,8 +8648,6 @@ mod tests {
 
     #[test]
     fn freeze_survives_the_retire_until_the_queue_is_rebuilt() {
-        // 有意偏差：Java 在 removeOffset 时解冻、靠 ProcessQueue.isDropped() 兜底；
-        // 本端口没有 per-batch 的 ProcessQueue 对象，冻结一直留到队列重建（更严）
         let h = IllegalHarness::new(true, 0);
         h.freeze(0);
         h.retire();
@@ -9503,10 +8754,6 @@ mod tests {
 
     // ---------------- 220 RESET_CONSUMER_CLIENT_OFFSET 的处理 ----------------
     //
-    // Java `MQClientInstance.resetOffset:1403-1450`：命中的队列 `pq.setDropped(true);
-    // pq.clear()`（在途批次作废）→ 等并发消费结束 → `updateConsumeOffset(mq, offset)` ＋
-    // `removeUnnecessaryMessageQueue`（**先 persist 再 removeOffset**）→ 从
-    // processQueueTable 摘掉，rebalance 按新位点重建。
     //
     // 只把新位点写进内存表的做法是**静默**失效的：重置前取回、重置后才返回的批次一 ack
     // 就把位点推回原处，broker 上刚写下的新位点被盖掉，消费从重置前的位置继续 —— 而
@@ -9676,18 +8923,6 @@ mod tests {
     // ================================================================
     // POP 模式 broker 侧分配（QUERY_ASSIGNMENT(400)）—— 进程内假集群
     // ================================================================
-    //
-    // 对齐 Java `RebalancePushImpl#clientRebalance`（POP 集群并发走
-    // `RebalanceImpl#getRebalanceResultFromBroker:345`）与 Go 端同款改造。判据全部
-    // 落在 `assigned_queue_keys()` 与假 broker **捕获到的 400 请求体**上：
-    // - 正常分配：400 回的队列集直接成为分配（不是路由里的全部队列）；
-    // - 空数组：显式清除；
-    // - TOPIC_NOT_EXIST(17)：回空（本端口对「topic 已消失」的既定口径）；
-    // - RPC 失败 / null 集：**保留上一次分配**，绝不退化成「全要」（仓库硬规则）；
-    // - 分配变更：下一轮 do_rebalance 感知并切换队列集。
-    // 测试不起 start()（`started=false` 会让每队列 POP 循环立刻退出），分配断言全部
-    // 由手动调用的 do_rebalance 驱动 —— 周期感知由既有的 rebalance_loop（20s/2s）
-    // 承担，这里不拿真实墙钟去赌它的节拍。
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener, TcpStream};
@@ -9702,7 +8937,6 @@ mod tests {
     struct AssignFixture {
         /// 响应码（`response_code::SUCCESS` / `SYSTEM_ERROR` / `TOPIC_NOT_EXIST`…）。
         code: i32,
-        /// 响应 body；`None` = 空 body（Java 的 null 集：无效结果，保留旧分配）。
         body: Option<Vec<u8>>,
         /// true = 收到请求后**不回话直接关闭连接**：客户端拿到传输层错误
         /// （response_code 为 None 的 Err），走「保留上一次分配」分支。
@@ -9718,7 +8952,6 @@ mod tests {
                 silent_close: false,
             }
         }
-        /// SUCCESS 但不带 body / 不带集：Java 的 null（跳过更新）。
         fn null_set() -> AssignFixture {
             AssignFixture {
                 code: response_code::SUCCESS,
@@ -9963,9 +9196,6 @@ mod tests {
         keys
     }
 
-    /// 正常分配：400 回的队列集**就是**分配；同时逐项核对 400 请求体的 Java 字段
-    /// （broker 按属性名负载均衡，clientId/strategyName/messageModel 错了分配就永远
-    /// 不是本实例的形状）。
     #[tokio::test]
     async fn pop_assignment_comes_from_broker_query_assignment() {
         let cluster = AssignCluster::start().await;
@@ -10025,10 +9255,6 @@ mod tests {
         );
     }
 
-    /// RPC 失败一律保留上一次分配，**绝不**退化成「路由里全要」：
-    /// - broker 业务错误码（SYSTEM_ERROR）；
-    /// - SUCCESS 但 body 不带集（Java 的 null = 无效结果）；
-    /// - 传输层失败（连接被对面直接掐掉）。
     #[tokio::test]
     async fn pop_assignment_failure_keeps_previous_never_all() {
         let cluster = AssignCluster::start().await;
@@ -10082,8 +9308,6 @@ mod tests {
         assert_eq!(cluster.requests().len(), 2, "每轮 topic 各一笔 400");
     }
 
-    /// 去重与容错：Java 的 HashSet 按 MessageQueue 去重、跳过 null 队列；
-    /// mode 混合（POP+PULL）只告警不拆分（本消费者模式由 pop_mode 定死）。
     #[tokio::test]
     async fn pop_assignment_dedups_and_survives_mixed_modes() {
         let cluster = AssignCluster::start().await;
@@ -10093,7 +9317,7 @@ mod tests {
                 let mut items = assignment_items(&[("broker-a", 0, "POP")]);
                 items.extend(assignment_items(&[("broker-a", 0, "POP")])); // 重复项
                 items.push(crate::remoting::protocol::query_assignment_body::MessageQueueAssignment {
-                    message_queue: None, // null 队列：Java 跳过
+                    message_queue: None,
                     mode: "POP".to_string(),
                 });
                 items.push(crate::remoting::protocol::query_assignment_body::MessageQueueAssignment {

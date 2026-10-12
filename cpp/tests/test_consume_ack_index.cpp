@@ -1,14 +1,4 @@
 // classic 并发消费路径的 ackIndex 语义单测 —— 不需要集群。
-//
-// 为什么必须离线锁死：这条路径错了是**静默丢消息**。Java
-// ConsumeMessageConcurrentlyService#processConsumeResult:207-269 用 listener 写的
-// ackIndex 把本批切成「已认可前缀 / 待回投后缀」，而 RECONSUME_LATER 会强制 ackIndex=-1
-//（整批回投）。两个方向写错在真机短期窗口里都看不出差别：
-//   - 忽略 ackIndex：尾巴既没回投也没重投，直接丢；
-//   - 默认值写成 -1：CONSUME_SUCCESS 也把整批回投，消息无限重复。
-// 未 start 的消费者 sendMessageBack 必定失败，所以这里能锁的是「失败分支」
-//（回投失败 → 塞回队首 + 位点不越过它）；「回投成功 → 位点整批前进」只能靠真机
-//（examples/live_redelivery.cpp 的 S10）。与 Python/Rust 的同名测试一一对应。
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -61,7 +51,6 @@ std::vector<MessageExt> offsetBatch(size_t n) {
     return out;
 }
 
-// 按 Java listener 契约：可选地把 ackIndex 收窄，并返回指定状态或直接抛异常。
 class AckListener : public MessageListenerConcurrently {
 public:
     AckListener(ConsumeConcurrentlyStatus status, int32_t ackIndex, bool thrown)
@@ -146,8 +135,6 @@ void expectOffset(const Harness& h, int64_t want, const std::string& name) {
 }
 
 void testContextDefault() {
-    // Java ConsumeConcurrentlyContext.ackIndex = Integer.MAX_VALUE（= 整批认可）。
-    // 默认值写成 -1 会让每次 CONSUME_SUCCESS 都整批回投 —— 消息无限重复。
     ConsumeConcurrentlyContext ctx(queue0());
     expect(ctx.ackIndex == std::numeric_limits<int32_t>::max(), "default.maxValue",
            std::to_string(ctx.ackIndex));
@@ -168,7 +155,6 @@ void testConsumeSuccess() {
                std::to_string(h.consumedCount()));
     }
     {
-        // ackIndex 越界（listener 写了 99）：Java 钳到 size-1，等价整批认可
         Harness h;
         h.run(offsetBatch(3), ConsumeConcurrentlyStatus::CONSUME_SUCCESS, 99);
         expect(h.pendingShape().empty(), "success.clamp.noRequeue",
@@ -176,9 +162,6 @@ void testConsumeSuccess() {
         expectOffset(h, 3, "success.clamp.offset");
     }
     {
-        // 部分 ack（ackIndex=0 认可第 0 条）：尾巴 [1,2] 回投；离线回投必败 →
-        // 塞回队首（reconsumeTimes +1），位点钳在第 1 条不越过它（Java removeMessage
-        // 返回 firstKey），已认可的第 0 条计入消费量
         Harness h;
         const bool advanced = h.run(offsetBatch(3), ConsumeConcurrentlyStatus::CONSUME_SUCCESS, 0);
         expect(!advanced, "success.partial.notAdvanced");
@@ -207,7 +190,6 @@ void testConsumeSuccess() {
 
 void testReconsumeLater() {
     {
-        // RECONSUME_LATER 强制 ackIndex=-1（Java:210-212）：listener 写的宽 ackIndex 无效
         Harness h;
         const bool advanced = h.run(offsetBatch(3), ConsumeConcurrentlyStatus::RECONSUME_LATER, 1);
         expect(!advanced, "later.notAdvanced");
@@ -216,7 +198,6 @@ void testReconsumeLater() {
                h.offset() ? std::to_string(*h.offset()) : "none");
     }
     {
-        // 消费抛异常按 RECONSUME_LATER 处理（Java catch Throwable）
         Harness h;
         h.run(offsetBatch(2), ConsumeConcurrentlyStatus::CONSUME_SUCCESS, 5, true);
         expectShape(h, {{0, 1}, {1, 1}}, "exception.wholeBatch");
@@ -227,8 +208,6 @@ void testReconsumeLater() {
 
 void testBroadcasting() {
     {
-        // 广播模式没有 %RETRY% 可回投：未认可的尾巴只 warn 就丢掉，整批位点前进
-        //（Java:232-237，重启后不重投）
         Harness h(MessageModel::BROADCASTING);
         const bool advanced = h.run(offsetBatch(3), ConsumeConcurrentlyStatus::CONSUME_SUCCESS, 0);
         expect(advanced, "broadcast.advanced");

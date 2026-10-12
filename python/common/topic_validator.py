@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""topic / group 名字的合法性判定（对应 ``org.apache.rocketmq.common.topic.TopicValidator``）。
-
-Java 的字符表白名单是 ``^[%|a-zA-Z0-9_-]+$``，实现方式是一张 128 长的
-``VALID_CHAR_BIT_MAP``：**码点 >= 128 一律非法**。这里逐字节照抄，因为 broker 侧
-（``TopicConfigValidator``）用的是同一张表，客户端放行而 broker 拒绝只会把错误推迟到
-建 topic 那一刻，而名字是**发送路径**上就该定的东西。
-"""
 from typing import Set
 
 TOPIC_MAX_LENGTH = 127

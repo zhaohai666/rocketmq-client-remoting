@@ -1,6 +1,3 @@
-// cleanExpiredMsg（Java ConsumeMessageConcurrentlyService:68-88 建调度、:192-200 清扫入口
-// ＋ ProcessQueue.cleanExpiredMsg:75-127）单测 —— 不需要集群。
-//
 // 为什么必须离线锁死：这是唯一能把**卡死的 listener** 救出来的闸门，坏了全是静默的：
 //   - 判松了（不严格大于、没盖章也算过期、对非队首动手）：正在被消费的消息被抢走回投，
 //     重复投递；
@@ -73,7 +70,6 @@ public class CleanExpiredMsgTests
         public long? Offset() => _consumer.ConsumeOffsetForTest(Key);
     }
 
-    /// <summary>按 Java listener 契约回投尾巴。</summary>
     private sealed class ReconsumeListener : IMessageListenerConcurrently
     {
         public bool Orderly() => false;
@@ -91,8 +87,6 @@ public class CleanExpiredMsgTests
             => ConsumeOrderlyStatus.Success;
     }
 
-    /// <summary>Java scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)：
-    /// initialDelay 与 period 同值，都是 consumeTimeout 分钟。</summary>
     [Fact]
     public void PeriodEqualsConsumeTimeoutMinutes()
     {
@@ -102,8 +96,6 @@ public class CleanExpiredMsgTests
         Assert.Equal(60_000L, new Harness(-3).Consumer.CleanExpirePeriodMillisForTest());
     }
 
-    /// <summary>盖章解析对齐 Java 的 StringUtils.isNotEmpty(...) &amp;&amp; Long.parseLong(...)：
-    /// 没有/空/坏值一律按「没盖过章」处理，不当成过期（判松了会抢走刚投递的消息）。</summary>
     [Fact]
     public void ConsumeStartTimestampReadsOnlyWellFormedStamps()
     {
@@ -131,7 +123,6 @@ public class CleanExpiredMsgTests
         Assert.True(DefaultMQPushConsumer.IsConsumeExpiredForTest(now - 900_001, now, 15));
     }
 
-    /// <summary>队首没过期 → 整条队列都不动（Java:97-99 的 break，不是 continue）。</summary>
     [Fact]
     public void StopsAtAFreshHead()
     {
@@ -141,7 +132,6 @@ public class CleanExpiredMsgTests
         Assert.Equal(2, h.Entries().Count);
     }
 
-    /// <summary>没有盖章的消息即便在队首也绝不回投（Java StringUtils.isNotEmpty 短路）。</summary>
     [Fact]
     public void LeavesUnsignedMessagesAlone()
     {
@@ -163,8 +153,6 @@ public class CleanExpiredMsgTests
         Assert.Single(h.Entries());
     }
 
-    /// <summary>回投失败（未 start 的消费者）→ 条目原地保留；单轮内 Java 会对**同一条队首**
-    /// 重试到 loop 用尽（:80 的 loop 与循环体里的 continue）。</summary>
     [Fact]
     public void KeepsTheEntryWhenSendBackFails()
     {
@@ -175,7 +163,6 @@ public class CleanExpiredMsgTests
         Assert.Null(h.Offset());
     }
 
-    /// <summary>单轮上限 16：20 条过期条目一轮只发起 16 次回投（Java:80 的 loop 在循环之前算一次）。</summary>
     [Fact]
     public void CapsOneRoundAtSixteen()
     {
@@ -186,7 +173,6 @@ public class CleanExpiredMsgTests
         Assert.Equal(20, h.Entries().Count);
     }
 
-    /// <summary>顺序消费没有这条路径（Java ProcessQueue:76-78 直接早退）。</summary>
     [Fact]
     public void SkipsOrderlyConsumers()
     {
@@ -219,8 +205,6 @@ public class CleanExpiredMsgTests
         Assert.False(h3.Consumer.RemoveExpiredEntryIfStillHeadForTest(h3.Key, Ext(0)));
     }
 
-    /// <summary>在册视图 = 在途（已分发未落定）∪ 已拉未分发，即 Java msgTreeMap；
-    /// 取批后立刻可见，收尾后立刻不可见。</summary>
     [Fact]
     public void ProcessQueueViewSeesInFlightAndPending()
     {
@@ -234,9 +218,6 @@ public class CleanExpiredMsgTests
         Assert.Single(h.Entries());
     }
 
-    /// <summary>回投要跳过已被 cleanExpiredMsg 清扫的条目（Java processConsumeResult:243-248）：
-    /// 它已经在回 broker 的路上，再发一次就是重复消息。未 start 的消费者里，只有未被清扫的
-    /// 那条才会走到「回投失败 → 计数 +1 并塞回队首」的落点。</summary>
     [Fact]
     public void SendBackSkipsEntriesSweptAway()
     {

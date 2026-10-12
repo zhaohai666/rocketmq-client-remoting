@@ -3,30 +3,6 @@
 //
 // 与 cpp/examples/live_lite_pull.cpp、python/verify_lite_pull_live.py 完全同场景
 // （三语言对拍用同一套断言）。
-//
-// 场景（围绕 Lite 相对 Pull 的本质区别：调用方不用管位点，poll 从本地缓冲拿消息）：
-//   S1 建 topic + subscribe 模式等待 rebalance 分到位点（4/4 队列）
-//   S2 先起消费者、再发 12 条（交替 TagA/TagB）→ subscribe + poll 收全 12 条且内容一致
-//   S3 auto-commit：只读 committed()，继续 poll 过一整个自动提交周期后位点自己 > 0
-//   S4 assign 模式：显式 assign 全部队列 + seek 到队首 → poll 重新收全 12 条
-//   S5 订阅 TagA：Subscribe(T, "TagA") 只收 TagA 的 6 条（订阅级 tag 过滤）
-//   S6 CONSUME_FROM_TIMESTAMP：consumeTimestamp 按 Java 的 14 位本地墙钟解释
-//      S6a 新组 + 起点=30 分钟前 → 收全 12 条
-//      S6b 墙钟→队列位置映射：30 分钟前 → 各队列队首（Σ=0）；10 分钟后 → 越过全部消息（Σ=12）
-//   S7 可插拔分配策略（对应 Java setAllocateMessageQueueStrategy）
-//      S7a 默认策略名 AVG；置 null 由 Start() 按 Java checkConfig 拒绝
-//      S7b AVG_BY_CIRCLE：同组两实例把队列按下标取模交叉切开，不重不漏
-//      S7c CONFIG：只分配配置进去的队列 → assignment 恰为其一，且 Poll 到的消息
-//          全部来自配置队列、两半合起来覆盖全部 12 条且互不重叠
-//      S7d CONSISTENT_HASH：拿**真实 clientId** 建环，线上 assignment 必须收敛到
-//          「真实 mqAll/cidAll 离线跑同一策略」的预测；环可能一边 4 条一边 0 条，
-//          所以判定只看「不重不漏 + 等于预测」
-//      S7e MACHINE_ROOM_NEARBY：真实集群只有一个机房 ⇒ 装饰器必须原样透传内层策略；
-//          resolver 的调用记录同时证明 rebalance 真的逐个问过队列/客户端的机房
-//      S7f MACHINE_ROOM：真实 brokerName 不含 '@'，白名单再怎么写都筛不出队列 ——
-//          验的是「配错机房安静饿死」（分不到队列、poll 不到消息、不打崩重平衡）
-//   S8 三张位点表（对位 Java AssignedMessageQueue + OffsetStore）：1 队列 topic 灌 1200 条，
-//      把「拉取游标 / 已消费游标 / 提交落点」三个数字在真机各自数出来
 using System.Globalization;
 using System.Text;
 
@@ -199,18 +175,6 @@ public static class LiveLitePull
         return string.Join(" | ", parts);
     }
 
-    /// <summary>
-    /// 用**真实**输入（路由给的 mqAll + cidMembers 的真实 clientId 当 cidAll）离线跑策略，
-    /// 并**等线上 Assignment() 收敛到这份预测**。
-    /// </summary>
-    /// <remarks>
-    /// 为什么以预测为收敛条件，而不是「先等不重不漏、再比预测」：哈希环完全可能把 4 个
-    /// 队列全分给一个实例，另一边在首轮重平衡之前 Assignment() 本来就是空 —— 那种初始态
-    /// 同样满足「不重不漏」，比出来的其实是「一边还没算」的快照。（Rust 版第一版就在这里翻车。）
-    /// Java RebalanceImpl#rebalanceByTopic 调策略前会把 mqAll、cidAll 都 Collections.sort，
-    /// 所以这里也得自己排：mqAll 由调用方排好，clientId 按 Ordinal 序（同 String#compareTo）。
-    /// strategies 与 asserted 一一对应 —— S7f 要故意让两边配不同策略。
-    /// </remarks>
     private static (bool Converged, string Detail) WaitUntilPredictionConverged(
         string group, List<MessageQueue> mqAll, IEnumerable<DefaultLitePullConsumer> cidMembers,
         IReadOnlyList<DefaultLitePullConsumer> asserted, IReadOnlyList<IAllocateMessageQueueStrategy> strategies,
@@ -297,15 +261,6 @@ public static class LiveLitePull
     private static long BrokerOffset(DefaultMQPullConsumer probe, MessageQueue mq) =>
         probe.FetchConsumeOffset(mq, out long off) ? off : -1;
 
-    /// <summary>
-    /// S8 三张位点表（对位 Java AssignedMessageQueue.MessageQueueState + RemoteBrokerOffsetStore）：
-    /// 拉取游标 / 已消费游标 / 提交落点，在一队列 topic 上灌 1200 条，把三个数字在真机各自数出来。
-    /// </summary>
-    /// <remarks>
-    /// 单测锁得住表形状，锁不住「提交错一格在真机是静默丢消息」这条后果：把拉取游标当提交源，
-    /// 位点会跑到消费前面，重启后那段消息永远不再投；反过来提交得太保守只会重复投，肉眼看得见。
-    /// 与 C++ live_lite_pull.cpp 的 S8、Rust live_lite_pull_consumer.rs 的 L11 同场景同断言。
-    /// </remarks>
     private static void ThreeOffsetTable(string namesrv, IReadOnlyList<MessageQueue> foreignPool)
     {
         string offTopic = "LiteOffNet_" + Stamp;
@@ -476,10 +431,6 @@ public static class LiveLitePull
         Check("S8f seek 之后 commit 落到 60", brokerSeeked == 60, "brokerOffset=" + brokerSeeked);
         o.Resume(new[] { q0 });
 
-        // S8g Java RemoteBrokerOffsetStore#persistAll 的 "remove unused mq"：点名提交
-        // 只发被点名的队列，内存表里**其余**条目顺手删掉 —— 上一轮 persist=false 攒下、
-        // 还没落盘的内存值就此丢掉。这条在 broker 上可观测：清掉之后 Committed() 只能
-        // 回读到 broker 上那一格，再也读不到 300。
         if (foreignPool.Count < 2)
         {
             Check("S8g 需要主 topic 至少 2 条队列", false, "queues=" + foreignPool.Count);
@@ -493,7 +444,6 @@ public static class LiveLitePull
         o.Commit(new Dictionary<MessageQueue, long> { [q0] = 300 }, persist: false);
         Check("S8g 未落盘的内存值先看得见", o.PendingCommitOf(q0) == 300,
             "pending=" + o.PendingCommitOf(q0));
-        // 空集合：Java 的 commit(Set) 直接 return，表不动、消息也不发
         o.Commit(new List<MessageQueue>(), persist: true);
         Check("S8g 空集合不清表也不发消息", o.PendingCommitOf(q0) == 300,
             "pending=" + o.PendingCommitOf(q0));
@@ -639,9 +589,6 @@ public static class LiveLitePull
         Console.WriteLine();
         Console.WriteLine("S3 auto-commit 位点");
         {
-            // Java 的自动提交只在 poll() 开头按 nextAutoCommitDeadline 到点才跑（默认间隔 5s），
-            // 而第一次检查发生在交付之前（已消费游标还是 -1，提交不出东西）：
-            // 所以这里继续 poll 过一整个周期，位点才会自己落下去 —— 停掉 poll 就不该指望它动。
             bool allPositive = false;
             var detail = new StringBuilder();
             long spinDeadline = NowMs() + 20000;
@@ -760,9 +707,6 @@ public static class LiveLitePull
             c5.Subscribe(Topic, "*");
             c5.Start();
             List<MessageQueue> q5 = WaitAssignment(c5);
-            // 不断言「未来时间戳收不到消息」：Java 的 RebalanceLitePullImpl 先读已提交位点，
-            // 新组只要队首仍在 commitlog 内，broker 就直接回 0，consume_from_where 不参与。
-            // 墙钟真正影响的是「时间戳 → 队列位置」的映射，所以断言这个量。
             long sumPast = q5.Sum(mq => c5.OffsetForTimestamp(mq, wall - 30 * 60 * 1000));
             long sumFuture = q5.Sum(mq => c5.OffsetForTimestamp(mq, wall + 10 * 60 * 1000));
             Check("S6b 30 分钟前 → 各队列队首", sumPast == 0, "sumOffset=" + sumPast);
@@ -779,7 +723,6 @@ public static class LiveLitePull
             allQueues.Sort();
             int totalQueues = allQueues.Count;
 
-            // S7a 默认策略 / null 守卫（Java 在 checkConfig 里拒绝 null）
             var probe = new DefaultLitePullConsumer(group6);
             probe.SetNamesrvAddr(namesrv);
             Check("S7a 默认策略名 = AVG",
@@ -901,9 +844,6 @@ public static class LiveLitePull
             c6.Shutdown();
             c7.Shutdown();
 
-            // S7d CONSISTENT_HASH：用**真实 clientId** 建环，线上分配要收敛到离线预测。
-            // 判定只看「不重不漏」：环的落点由 clientId 的 MD5 决定，真实集群上完全可能
-            // 一边 4 条、另一边 0 条（Java 同款偏斜），所以不能要求两边都非空。
             {
                 var ch = new AllocateMessageQueueConsistentHash();
                 var d1 = new DefaultLitePullConsumer(group10);
@@ -974,16 +914,11 @@ public static class LiveLitePull
                 e2.Shutdown();
             }
 
-            // S7f MACHINE_ROOM：真实 brokerName 是 broker-a，Java 的 Split('@') 只切出 1 段
-            // ⇒ 白名单怎么写都筛不出队列。要验的是「配错机房安静饿死」，不是打崩 rebalance。
             {
                 var room = new AllocateMessageQueueByMachineRoom(new[] { OneRoom.Room });
                 Check("S7f 策略名 = MACHINE_ROOM 且白名单能读回",
                     room.GetName() == "MACHINE_ROOM" && room.GetConsumeridcs().Contains(OneRoom.Room),
                     "idcs=[" + KeySetText(room.GetConsumeridcs()) + "]");
-                // 对照组：同组另一个消费者用默认 AVG。两边各自算策略（Java 就是各算各的），
-                // 对照组能分到队列 ⇒ 这一组的心跳注册 + 重平衡确实跑起来了，
-                // 于是「f1 为空」只能归因于机房筛选，而不是链路没通。
                 var avg = new AllocateMessageQueueAveragely();
                 var f1 = new DefaultLitePullConsumer(group12);
                 var f2 = new DefaultLitePullConsumer(group12);
@@ -996,7 +931,6 @@ public static class LiveLitePull
                     "ctrl=[" + KeySetText(QueueKeys(ctrl)) + "]");
                 Check("S7f 机房不匹配真实 brokerName → 一条都不分（不报错也不误吃）",
                     f1.Assignment().Count == 0, "assignment=[" + KeySetText(QueueKeys(f1.Assignment())) + "]");
-                // 对照组按**两个** cid 算 AVG 只拿到自己那半边 —— 它没替配错的那位兜底（Java 同语义）。
                 (bool converged, string detail) = WaitUntilPredictionConverged(
                     group12, allQueues, new[] { f1, f2 }, new[] { f1, f2 },
                     new IAllocateMessageQueueStrategy[] { room, avg });

@@ -1,20 +1,3 @@
-//! SOCKS 代理支持（对应 Java `remoting/proxy/SocksProxyConfig` +
-//! `NettyRemotingClient#createBootstrap` 里挂的 Netty `Socks5ProxyHandler`）。
-//!
-//! Java 侧的口径：
-//! - `ClientConfig.socksProxyConfig` 是一段 JSON（`{"cidr": {"addr","username","password"}}`），
-//!   `NettyRemotingClient` 按 CIDR 匹配代理；本端口不做 CIDR 路由，一个客户端实例
-//!   至多配一个代理（`RemotingClientConfig::socks_proxy`），CIDR 里 `0.0.0.0/0` 的
-//!   语义等价于"全部出连接都走它"。
-//! - Netty 只挂了 `Socks5ProxyHandler`（SOCKS5，可选用户名/密码认证）；本端口额外
-//!   支持 SOCKS4/4a —— 由 `addr` 的 scheme 前缀选择（`socks4://`，缺省 `socks5://`），
-//!   配置字段与 Java 逐字对齐（addr / username / password）。
-//! - 走代理时 Java 换 `NoopAddressResolverGroup`：**目标主机名不由客户端解析**，
-//!   域名原样交给代理解析（SOCKS5 ATYP=domain / SOCKS4a）；本端口同口径。
-//! - TopAddressing 的动态取址 HTTP 请求**不走代理**（Java 同样只对 remoting 通道
-//!   加 handler）——它压根不经 `RemotingClient`，天然满足。
-//!
-//! 握手发生在 TCP 建连之后、TLS 握手之前（Java 是 pipeline 里 addFirst，同一位置）。
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
@@ -25,15 +8,12 @@ use tokio::net::TcpStream;
 use crate::error::{Error, Result};
 use crate::remoting::client::split_host_port;
 
-/// SOCKS 协议版本。缺省 SOCKS5（与 Java `Socks5ProxyHandler` 一致）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocksVersion {
     V4,
     V5,
 }
 
-/// Java `SocksProxyConfig` 的逐字段对齐：`addr` / `username` / `password`。
-///
 /// `addr` 支持 scheme 前缀选版本：`socks5://host:port`（缺省）与
 /// `socks4://host:port`；`username`/`password` 任一非空即认为要走认证
 /// （SOCKS5 的用户名/密码子协商；SOCKS4 的 username 是 userid，无密码字段）。
@@ -48,7 +28,6 @@ pub struct SocksProxyConfig {
 }
 
 impl SocksProxyConfig {
-    /// 无认证代理（Java `SocksProxyConfig(addr)`）。
     pub fn new(addr: impl Into<String>) -> SocksProxyConfig {
         SocksProxyConfig {
             addr: addr.into(),
@@ -57,7 +36,6 @@ impl SocksProxyConfig {
         }
     }
 
-    /// 带认证的代理（Java `SocksProxyConfig(addr, username, password)`）。
     pub fn with_auth(
         addr: impl Into<String>,
         username: impl Into<String>,
@@ -88,8 +66,6 @@ impl SocksProxyConfig {
         }
     }
 
-    /// `username`/`password` 任一非空即要求认证（Java 侧 `proxy.getUsername()`
-    /// 直接传给 `Socks5ProxyHandler`，null 与空串等价）。
     fn credentials(&self) -> Option<(&str, &str)> {
         let username = self.username.as_deref().filter(|u| !u.is_empty())?;
         Some((username, self.password.as_deref().unwrap_or("")))
@@ -105,10 +81,6 @@ const METHOD_NO_ACCEPTABLE: u8 = 0xFF;
 const SUBNEGOTIATION_VERSION: u8 = 0x01;
 
 /// 经代理建连到 `target_host:target_port`：TCP 连代理 + SOCKS 握手（CONNECT）。
-///
-/// `timeout` 覆盖**全程**（连代理 + 子协商 + CONNECT）；对应 Java 里
-/// `Bootstrap#connect` + pipeline 上 handler 的整体建连窗口。返回的
-/// `TcpStream` 已可直接承载 remoting 帧（或 TLS 握手）。
 pub(crate) async fn connect_via_proxy(
     proxy: &SocksProxyConfig,
     target_host: &str,
@@ -218,8 +190,6 @@ async fn socks5_handshake(
         }
     }
 
-    // CONNECT：域名不由本地解析（对齐 Java `NoopAddressResolverGroup`），
-    // 能解析成 IP 就按 ATYP=IP 上线，否则 ATYP=domain 交给代理解析。
     let mut request = vec![0x05u8, 0x01, 0x00];
     if let Ok(v4) = host.parse::<Ipv4Addr>() {
         request.push(0x01);

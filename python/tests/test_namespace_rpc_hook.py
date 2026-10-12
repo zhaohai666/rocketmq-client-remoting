@@ -1,28 +1,4 @@
 # -*- coding: utf-8 -*-
-"""NamespaceRpcHook（namespaceV2 请求头）与钩子组合顺序的单测。
-
-Java 语义锚点（5.5.1 逐条核对）：
-
-  * ``client/rpchook/NamespaceRpcHook#doBeforeRequest``：只在
-    ``StringUtils.isNotEmpty(clientConfig.getNamespaceV2())`` 时动作，且只加两个
-    扩展字段 ``nsd="true"``、``ns=<namespaceV2>``；``doAfterResponse`` 为空实现。
-  * ``common/MixAll.java:122-123``：
-    ``RPC_REQUEST_HEADER_NAMESPACED_FIELD = "nsd"``、
-    ``RPC_REQUEST_HEADER_NAMESPACE_FIELD = "ns"``。
-  * ``MQClientAPIImpl:329-335`` 的注册**顺序**：Namespace → Stream（仅
-    enableStreamRequestType 时）→ 用户 rpcHook（即 ACL 签名）→ DynamicalExtField。
-    Namespace 必须排在 ACL **之前**，nsd/ns 才会被算进签名内容（Go 端口
-    ``go/remoting/rpchooks.go`` 的同段注释解释过：顺序反了签名照样「看起来合法」，
-    只是 broker 验不过）。
-  * ``NamespaceRpcHookTest#testDoBeforeRequestWithoutNamespace``：未配置时
-    extFields 必须**原样不动**（Java 断言 ``getExtFields()`` 为 null；本端口的
-    ``RemotingCommand.ext_fields`` 默认是空 dict，等价断言即「仍为空、没被创建出
-    任何键」）。
-  * ``AsyncTraceDispatcher.start()``:155：``traceProducer.setNamespaceV2(namespaceV2)``
-    —— 分发器的 namespaceV2 要传给内部轨迹生产者；宿主 facade 在建分发器时
-    ``dispatcher.setNamespaceV2(...)``（Java DefaultMQProducer:384、
-    DefaultMQPushConsumer:769）。
-"""
 from __future__ import annotations
 
 import threading
@@ -43,7 +19,7 @@ NS_V2 = "MQ_TEST_INSTANCE_ID"
 
 
 def _request() -> RemotingCommand:
-    """与 Java 单测同款：一条 PULL_MESSAGE 请求，未做过 makeCustomHeaderToNet。"""
+    pass
     return RemotingCommand.create_request_command(RequestCode.PULL_MESSAGE)
 
 
@@ -62,13 +38,13 @@ def _drop(inst: MQClientInstance) -> None:
 
 # ---------------------------------------------------------------- 常量与钩子本体
 def test_ext_field_names_match_the_wire_keys():
-    """Java MixAll.java:122-123 的两个键名，一字都不能差。"""
+    pass
     assert MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD == "nsd"
     assert MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD == "ns"
 
 
 def test_hook_adds_nsd_true_and_ns_value():
-    """Java 的 doBeforeRequest 只有两行：nsd="true"、ns=<namespaceV2>。"""
+    pass
     req = _request()
     NamespaceRpcHook(NS_V2).do_before_request(ADDR, req)
     assert req.ext_fields[MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD] == "true"
@@ -82,11 +58,7 @@ def test_hook_adds_nothing_else():
 
 
 def test_empty_namespace_leaves_ext_fields_untouched():
-    """Java 的 isNotEmpty 守卫 + 单测「getExtFields() 仍为 null」的等价断言。
-
-    钩子绝不能因为「配置为空」就创建出扩展字段 —— 未配置 namespaceV2 的请求
-    必须与从未跑过该钩子完全一致。
-    """
+    pass
     for empty in (None, ""):
         req = _request()
         NamespaceRpcHook(empty).do_before_request(ADDR, req)
@@ -94,7 +66,7 @@ def test_empty_namespace_leaves_ext_fields_untouched():
 
 
 def test_do_after_response_is_noop():
-    """Java 的 doAfterResponse 是空实现。"""
+    pass
     hook = NamespaceRpcHook(NS_V2)
     req, resp = _request(), _request()
     hook.do_after_response(ADDR, req, resp)
@@ -129,7 +101,7 @@ def test_namespace_hook_registered_before_user_hook_without_stream():
 
 
 def test_namespace_hook_registered_even_without_namespace():
-    """Java 无条件注册该钩子（未配置时由钩子内部的守卫兜底）。"""
+    pass
     inst = _new_instance("ns_always_on")
     try:
         assert [type(h) for h in inst.remoting_client.rpc_hooks][0] is NamespaceRpcHook
@@ -183,12 +155,7 @@ def test_acl_signature_covers_namespace_fields():
 
 
 def test_wrong_hook_order_would_not_be_covered_by_signature():
-    """反例锚点：Namespace 排在 ACL 之后时，ns/nsd 不参与签名。
-
-    此时 extFields 带着没有签名背书的 nsd/ns —— broker 侧按「全部 extFields 的
-    value 排序拼接」重算签名就对不上（Java 注释 reserve field signature 所指的
-    正是这个坑），所以注册顺序是语义而不是风格。
-    """
+    pass
     wrong = _signed_request(NS_V2, ns_hook_first=False)
     right = _signed_request(NS_V2, ns_hook_first=True)
     # 错误顺序的签名 == 根本没配 namespace 的签名（ns/nsd 没进签名内容）
@@ -198,7 +165,7 @@ def test_wrong_hook_order_would_not_be_covered_by_signature():
 
 # ---------------------------------------------------------------- facade 配置面
 def test_setters_exist_on_every_facade():
-    """Java 五个 facade 都继承 ClientConfig，因此都有 set/getNamespaceV2。"""
+    pass
     for facade in (DefaultMQProducer("PID_ns_setter"),
                    DefaultMQPushConsumer("CID_ns_setter"),
                    DefaultMQPullConsumer("CID_ns_setter"),
@@ -214,7 +181,7 @@ def test_setters_exist_on_every_facade():
 
 
 def test_namespace_v2_defaults_empty_everywhere():
-    """Java ClientConfig.namespaceV2 默认 null；本端口用 "" 表达同样的「未配置」。"""
+    pass
     for facade in (DefaultMQProducer("PID_ns_default"),
                    DefaultMQPushConsumer("CID_ns_default"),
                    DefaultMQPullConsumer("CID_ns_default"),
@@ -257,7 +224,7 @@ class _FakeTraceProducer:
 
 
 def test_dispatcher_start_propagates_namespace_v2_to_trace_producer():
-    """对应 Java AsyncTraceDispatcher.start():155。"""
+    pass
     d = AsyncTraceDispatcher("GID_ns", TraceDispatcherType.PRODUCE, 10, None, None)
     fake = _FakeTraceProducer()
     d.trace_producer = fake
@@ -277,7 +244,7 @@ def test_dispatcher_defaults_to_no_namespace():
 
 
 def test_producer_wires_its_namespace_v2_into_dispatcher(monkeypatch):
-    """对应 Java DefaultMQProducer.start():384 的 dispatcher.setNamespaceV2。"""
+    pass
     started = []
     monkeypatch.setattr(AsyncTraceDispatcher, "start",
                         lambda self, *a, **kw: started.append(self))
@@ -291,7 +258,7 @@ def test_producer_wires_its_namespace_v2_into_dispatcher(monkeypatch):
 
 
 def test_push_consumer_wires_its_namespace_v2_into_dispatcher(monkeypatch):
-    """对应 Java DefaultMQPushConsumer.start():769 的 dispatcher.setNamespaceV2。"""
+    pass
     started = []
     monkeypatch.setattr(AsyncTraceDispatcher, "start",
                         lambda self, *a, **kw: started.append(self))

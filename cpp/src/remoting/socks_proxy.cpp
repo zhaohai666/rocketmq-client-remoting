@@ -5,10 +5,6 @@
 // 设成剩余预算，之后每个阶段一次 recv/send。任何一步不符预期都带着**阶段名 + 原因**
 // 返回 false —— 排障时最好能直接看出是「方法协商被拒」还是「认证失败」还是「CONNECT
 // 被 远端拒绝」。
-//
-// TopAddressing 的动态取址 HTTP（top_addressing.cpp 的 httpGet）不走这里：SOCKS 只挂在
-// RemotingClient 的建连路径上，与 Java 把 Socks5ProxyHandler 只加进 Netty bootstrap 的
-// 口径一致。
 #include "rocketmq/remoting/socks_proxy.h"
 
 #include <chrono>
@@ -323,7 +319,6 @@ bool socks4Connect(netcompat::socket_t sock, const std::string& targetHost,
 }  // namespace
 
 void SocksProxyConfig::resolveHostPort(std::string& host, std::string& portStr) const {
-    // addr 自带 ":port"（Java 口径，如 "10.0.0.1:1080"、IPv6 "[::1]:1080"）时覆盖 port 字段
     if (!addr.empty() && addr[0] == '[') {
         const size_t end = addr.find(']');
         if (end != std::string::npos) {

@@ -1,15 +1,4 @@
 // 拉取前流控判定的单测 —— 不需要集群。
-//
-// 为什么必须离线锁死：Java ProcessQueue 的五个阈值里只有**条数**那一条会在"消息小、拉得快"
-// 的场景里先命中，其余四条要等真出问题才看得见（队列级字节阈值失效 ⇒ 大消息把堆撑爆；
-// 位点跨度失效 ⇒ 队首一条卡住、后面无限堆；topic 级阈值失效 ⇒ 同 topic 多队列各自为政）。
-// 判据与 Python `_flow_control_hit` / Rust `flow_control_hit` 逐条同构：
-//   1) 条数   >= pullThresholdForQueue（Java 的 max(1, n) 守卫：配 0 也按 1 条算）
-//   2) 字节   >= pullThresholdSizeForQueue，单位 **MiB**（<=0 关闭）
-//   3) 跨度   **严格大于** consumeConcurrentlyMaxSpan（pending 里 queueOffset 的 max-min；<=0 关闭）
-//   4) topic 累计条数 >= pullThresholdForTopic（本实例该 topic **所有**队列合起来；-1 关闭）
-//   5) topic 累计字节 >= pullThresholdSizeForTopic，单位 MiB（-1 关闭，且不复用第 2 条的开关）
-// 命中一次只记一格 flowControlTriggered()。
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -102,7 +91,6 @@ void testCountGate() {
     expect(c.flowControlHit(mq, key), "count.atThreshold");
     expect(c.flowControlTriggered() == 1, "count.counterOnce",
            std::to_string(c.flowControlTriggered()));
-    // Java 的 Math.max(1, n) 守卫：配 0 不是"全放行"，而是"1 条就停"
     c.setPullThresholdForQueue(0);
     stage(c, mq, nSized(kTopic, 100, 1));
     expect(c.flowControlHit(mq, key), "count.zeroBehavesAsOne");
@@ -134,7 +122,6 @@ void testSpanGate() {
     c.setConsumeConcurrentlyMaxSpan(10);
     stage(c, mq, {sized(kTopic, 1, 0), sized(kTopic, 1, 100)});
     expect(c.flowControlHit(mq, key), "span.over");
-    // **严格大于**：跨度正好等于阈值不算（Java 同）
     c.setConsumeConcurrentlyMaxSpan(100);
     expect(!c.flowControlHit(mq, key), "span.exactlyAtThreshold");
     // 乱序缓冲也要量出真实跨度（min/max 而不是首尾差）

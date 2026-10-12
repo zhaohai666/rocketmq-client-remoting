@@ -1,6 +1,3 @@
-// 生产者（对应 org.apache.rocketmq.client.producer.DefaultMQProducer /
-// TransactionMQProducer 与 Python client/producer.py）。
-//
 // 能力覆盖：同步发送（轮询选队列 / 定点发送）、按选择器发送（顺序消息）、
 // 异步发送、单向发送、批量发送、事务消息（两阶段：半消息 + 回查）、
 // 按 Key 查询、offset 查询、建 topic。
@@ -15,10 +12,6 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
 
-/// <summary>
-/// 对应 org.apache.rocketmq.client.producer.DefaultMQProducer。
-/// 与 C++ DefaultMQProducer 逐字段、逐函数对齐。
-/// </summary>
 public class DefaultMQProducer
 {
     private readonly object _lock = new();
@@ -233,12 +226,6 @@ public class DefaultMQProducer
 
     private SocksProxyConfig? _socksProxyConfig;
 
-    /// <summary>
-    /// SOCKS 代理（对应 Java ClientConfig#socksProxyConfig / SocksProxyConfig 的
-    /// addr / username / password；Version 另支持 SOCKS4/4a）。只作用于传输层
-    /// remoting 长连接：TCP 直连代理、SOCKS 握手（CONNECT）之后才做 TLS 与发帧。
-    /// NameServer 的 HTTP 动态取址请求不走 SOCKS（与 Java 口径一致）。
-    /// </summary>
     public SocksProxyConfig? SocksProxyConfig
     {
         get => _socksProxyConfig;
@@ -775,8 +762,6 @@ public class DefaultMQProducer
             // 放在 Start() 之后，start 期间的动态取址/首包路由就是裸的。
             // RequestHooks.Compose 还原 Namespace → stream → 用户钩子顺序（单槽传输层）。
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
-            // 跨门面复用（Java MQClientManager.getOrCreateMQClientInstance）：同 clientId 命中
-            // 即复用已有实例，Start 交给下面的幂等调用；只有第一个到达者的实例级参数生效。
             _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
                 () => new MQClientInstance(_clientId, _nameServerAddrs,
                     tlsEnable: _tlsEnable, tlsOptions: _tlsOptions, socksProxy: _socksProxyConfig,
@@ -988,8 +973,6 @@ public class DefaultMQProducer
             // 门面继续复用时，broker 的回查还打向一个已退出的生产者。
             _mqClient.UnregisterFacadeProcessor(RequestCode.CheckTransactionState, CheckTransactionState);
 
-            // 归还引用（Java unregisterClient 之后那句 mQClientFactory.shutdown() 的等价物）：
-            // 计数归零才真正关停实例，先到的门面退出不能拖垮还在用的共享实例。
             MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
             _mqClient = null;
         }

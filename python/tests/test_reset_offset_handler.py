@@ -1,21 +1,4 @@
 # -*- coding: utf-8 -*-
-"""220 ``RESET_CONSUMER_CLIENT_OFFSET`` 处理逻辑单测（Java ``MQClientInstance:1403-1450``），
-不需要集群。
-
-为什么必须离线锁死：这条路径错了全是**静默**的三种表现 ——
-
-  - 只把缓冲与游标清掉、不撤队列（不 +1 代号）：在途批次的 ack 照样落地，把刚重置的
-    位点又推回旧位置（Java 靠 ``ProcessQueue.setDropped(true)`` 挡住，见
-    ``ConsumeMessageConcurrentlyService:267``）；长轮询在途的应答也会把重置前那一批
-    消息重新塞进缓冲，照常消费 + ack；
-  - 新位点没立刻落盘（撤销收尾里传 None）：进程在下一个周期落盘前崩掉，broker 上还是旧
-    位点 —— 「重置」只活到本次进程结束；
-  - 撤销收尾把队列从位点表里摘掉却没写回文件（广播模式）：重建后的队列读不到旧位点，
-    按 consumeFromWhere 从头/从尾重扫（Java 是 persist(mq) 在前、removeOffset(mq) 在后）。
-
-真机短期窗口里前两条最多表现为"重置后消息又冒出来一批"或"崩一次才暴露"，所以判据放离线；
-真机另有链路证明（见 README 的 ``verify_reset_offset_live`` 一节）。
-"""
 from __future__ import annotations
 
 import threading
@@ -62,7 +45,6 @@ class FakeClient:
         return FakePublishInfo([mq for mq in self.mqs if mq.topic == topic])
 
     def get_topic_subscribe_info(self, topic):
-        # rebalance 取的是订阅信息（Java RebalanceImpl.topicSubscribeInfoTable）
         return [mq for mq in self.mqs if mq.topic == topic]
 
     def get_consumer_id_list_by_group(self, topic, group):
@@ -205,7 +187,6 @@ class TestRetire:
 
 class TestPersistAndRebuild:
     def test_reset_persists_the_new_offset_immediately(self):
-        # Java 的显式 persist：不等周期落盘，重置当场写回 broker（写的是**新**值）
         h = Harness()
         h.reset([3])
         assert h.client.offsets == [(GROUP, h.mq, 3)]
@@ -216,8 +197,6 @@ class TestPersistAndRebuild:
         assert h.rebalances == 1
 
     def test_rebuilt_queue_repulls_from_the_new_offset(self):
-        # 撤销收尾落盘 → 重建时本地游标已被摘掉，新循环按 broker 上的（新）位点起拉：
-        # 这就是"重置真的生效"（Java computePullFromWhere 的 READ_FROM_STORE 一支）。
         h = Harness(cluster_offset=7)
         h.reset([3])
         h.rebuild()

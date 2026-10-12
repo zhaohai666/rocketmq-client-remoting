@@ -1,14 +1,3 @@
-// FIRST_OFFSET 的起点语义（Java RebalancePushImpl:197-208 / RebalanceLitePullImpl:114-124）
-// 离线单测：起点是**字面量 0**，一个 GET_MIN_OFFSET（31）都不发。
-//
-// 为什么必须离线锁死：这条分支原来是 `getMinOffset(mq)`，而 minOffset 属 MQAdminImpl 口径
-// ——只认 master（findBrokerAddressInPublish）。主节点掉线期间，新起的 FIRST_OFFSET 消费者
-// 会当场抛「The broker[X] not exist」，一条都拉不到；而 Java 的起点是字面量 0
-// （上游原话：`//the offset will be fixed by the OFFSET_ILLEGAL process`），从节点本来就能
-// 按 0 起拉，越界由 broker 用 `PULL_OFFSET_MOVED` 把位点纠回来（客户端的 OFFSET_ILLEGAL 分支）。
-// 多打这一枪的代价不只是慢：真机上没有任何一条断言会因此变红，只有"主挂着的窗口里消费者起不来"
-// 这一个现象——所以锁在离线的报文层。
-//
 // 报文层面不取巧：进程内假 namesrv/broker 在**真 socket** 上回路由、回"没有已提交位点"、
 // 回拉取应答；「这个 RPC 到底发没发」全部从 socket 上取证。负控腿（LAST_OFFSET 那一支必须
 // 发 GET_MAX_OFFSET）证明这份请求日志不是哑的。

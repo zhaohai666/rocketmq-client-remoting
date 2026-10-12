@@ -1,12 +1,6 @@
 //! Request-Reply（5.x）客户端侧支撑，逐条对齐 `python/client/request_reply.py`。
 //!
-//! 对应 Java 的这几个类：
-//! * `org.apache.rocketmq.client.producer.RequestResponseFuture`
-//! * `org.apache.rocketmq.client.producer.RequestFutureHolder`
-//! * `org.apache.rocketmq.client.utils.MessageUtil#createReplyMessage`
-//! * `org.apache.rocketmq.client.impl.ClientRemotingProcessor#receiveReplyMessage`
 //!
-//! 协议回顾（照 Java 逐字段复刻）：
 //!
 //! ```text
 //! 请求方 (producer.request)                        应答方 (push consumer)
@@ -50,14 +44,11 @@ use crate::common::util_all;
 use crate::error::{client_error_code, Error, Result};
 use crate::rmq_warn;
 
-/// Java `RequestCallback` 的默认超时（`DefaultMQProducer.request` 未显式给超时时用）。
 pub const DEFAULT_REQUEST_TIMEOUT_MILLIS: i64 = 3000;
 
 // ---------------------------------------------------------------- 回调
 
-/// 对应 Java `RequestCallback`：异步 `request` 的结果回调。
 pub trait RequestCallback: Send + Sync {
-    /// 拿到应答（`None` 表示 broker 回了空消息，Java 侧同样可能传 null）。
     fn on_success(&self, response_message: Option<MessageExt>);
     /// 请求或等待失败。
     fn on_exception(&self, cause: &Error);
@@ -65,23 +56,14 @@ pub trait RequestCallback: Send + Sync {
 
 // ---------------------------------------------------------------- 等待槽
 
-/// 一次 `request` 的等待槽（对应 Java `RequestResponseFuture`）。
-///
-/// 与 Java 的差异（有意，与 Python 一致）：Java `RequestResponseFuture` 之外还有
-/// 一个 `RequestFutureHolder` 单例负责超时清扫（本仓库同样实现了，见
-/// [`start_expired_request_scan`] / [`scan_expired_request`]）；`request()` 的收尾
-/// 路径与应答到达路径照常兜底移除，清扫任务只是 Java 同款的最后防线。
 pub struct RequestResponseFuture {
     pub correlation_id: String,
     pub timeout_millis: i64,
-    /// Java `beginTimestamp`（毫秒）。测试可直接改写它来构造超时场景。
     pub begin_timestamp: i64,
     request_callback: Option<std::sync::Arc<dyn RequestCallback>>,
-    /// 对应 Java `sendRequestOK`：发送阶段失败时置 false。
     send_request_ok: AtomicBool,
     /// 已投递过应答（对应 Python `_event` 的 sticky 语义）。
     responded: AtomicBool,
-    /// 回调只允许触发一次的守卫（对应 Java `executeRequestCallback` 的 compareAndSet）。
     callback_fired: AtomicBool,
     state: Mutex<FutureState>,
     notify: Notify,
@@ -119,8 +101,6 @@ impl RequestResponseFuture {
 
     // ---------------- 等待 / 投递 ----------------
 
-    /// 对应 Java `waitResponseMessage`：等应答，超时返回 `None`。
-    ///
     /// 先 `enable()` 出等待凭据再看当前值，保证「应答先于等待到达」不会丢唤醒
     /// （`Notify::notify_waiters` 只叫醒当时已在等的人）。
     pub async fn wait_response_message(&self, timeout_millis: i64) -> Option<MessageExt> {
@@ -140,7 +120,6 @@ impl RequestResponseFuture {
         }
     }
 
-    /// 对应 Java `putResponseMessage`：写入应答并唤醒等待方（允许多次调用）。
     pub fn put_response_message(&self, response_msg: Option<MessageExt>) {
         if let Ok(mut state) = self.state.lock() {
             state.response_msg = response_msg;
@@ -153,19 +132,10 @@ impl RequestResponseFuture {
         self.state.lock().ok().and_then(|s| s.response_msg.clone())
     }
 
-    /// 对应 Java `isTimeout`。
     pub fn is_timeout(&self) -> bool {
         util_all::current_time_millis() - self.begin_timestamp > self.timeout_millis
     }
 
-    /// 对应 Java `executeRequestCallback`：回调只允许触发一次。
-    ///
-    /// 判定与 Java `RequestResponseFuture:52-56` 一致：
-    /// `sendRequestOK && cause == null` → `onSuccess(responseMsg)`（可能为空），
-    /// 否则 `onException(cause)`。所以**置过 cause 就走异常回调**——超时清理
-    /// （[`scan_expired_request`]）正是靠这一条把 `RequestTimeoutException`
-    /// 交给用户的 `onException`，即使发送本身是成功的。
-    ///
     /// 没有回调时是 no-op（同步调用方靠 [`Self::wait_response_message`] 唤醒）。
     pub fn execute_request_callback(&self) {
         let Some(callback) = self.request_callback.as_ref() else {
@@ -180,7 +150,6 @@ impl RequestResponseFuture {
             None if self.send_request_ok.load(Ordering::Acquire) => {
                 callback.on_success(self.response_message())
             }
-            // sendRequestOK=false 但没有 cause：Java 会传 null，这里同样给 on_exception
             None => callback.on_exception(&Error::client(format!(
                 "request failed, correlationId={}",
                 self.correlation_id
@@ -188,7 +157,6 @@ impl RequestResponseFuture {
         }
     }
 
-    /// 标记发送阶段失败（对应 Java `setSendRequestOK(false)` + `setCause`）。
     pub fn set_failed(&self, cause: Error) {
         self.send_request_ok.store(false, Ordering::Release);
         if let Ok(mut state) = self.state.lock() {
@@ -198,11 +166,6 @@ impl RequestResponseFuture {
         self.notify.notify_waiters();
     }
 
-    /// 超时清理路径的 `setCause(cause)`（Java `RequestFutureHolder#scanExpiredRequest:66`）：
-    /// 只写 cause，**不动 `sendRequestOK`、不唤醒等待方** —— Java 的同步等待靠 latch
-    /// 自身超时（醒来后按 `isSendRequestOK()` 报 RequestTimeout），异步回调靠
-    /// [`Self::execute_request_callback`]；这里照原样拆开，避免同步等待方被提前叫醒
-    /// 后拿到「send request message fail」的错误文案。
     pub fn set_cause_only(&self, cause: Error) {
         if let Ok(mut state) = self.state.lock() {
             state.cause = Some(cause);
@@ -226,11 +189,6 @@ impl std::fmt::Debug for RequestResponseFuture {
 
 // ---------------------------------------------------------------- 等待槽表
 
-/// 对应 Java `RequestFutureHolder`：`correlationId -> 等待槽` 的表。
-///
-/// Java 里是**跨 producer 共享的单例**（`RequestFutureHolder.getInstance()`），
-/// 因为应答由 clientId 级别的 remoting 通道推回，与具体 producer 实例无关；
-/// 本仓库用进程内单例 [`request_future_holder()`] 对齐。
 #[derive(Default)]
 pub struct RequestFutureHolder {
     request_future_table: RwLock<HashMap<String, std::sync::Arc<RequestResponseFuture>>>,
@@ -241,7 +199,6 @@ impl RequestFutureHolder {
         RequestFutureHolder::default()
     }
 
-    /// 对应 Java `putRequest`（同名 key 直接覆盖，与 Python 一致）。
     pub fn put_request(&self, correlation_id: &str, future: std::sync::Arc<RequestResponseFuture>) {
         if let Ok(mut table) = self.request_future_table.write() {
             table.insert(correlation_id.to_string(), future);
@@ -258,7 +215,6 @@ impl RequestFutureHolder {
             .and_then(|t| t.get(correlation_id).cloned())
     }
 
-    /// 对应 Java `removeRequest`：不存在返回 `None`，重复调用幂等。
     pub fn remove_request(
         &self,
         correlation_id: &str,
@@ -269,11 +225,6 @@ impl RequestFutureHolder {
             .and_then(|mut t| t.remove(correlation_id))
     }
 
-    /// 接收侧入口（对齐 Java `processReplyMessage`）：投递应答。
-    ///
-    /// Java 在这里做的是 **`getRequestFutureTable().remove(correlationId)`** ——
-    /// 用「谁摘到谁负责」保证「应答到达」与「超时清理」两条路径只会有一个生效。
-    /// 返回被填充的 future；查不到（已超时 / 已移除 / 应答重复）时返回 `None`。
     pub fn put_response(
         &self,
         correlation_id: Option<&str>,
@@ -281,8 +232,6 @@ impl RequestFutureHolder {
     ) -> Option<std::sync::Arc<RequestResponseFuture>> {
         let future = self.remove_request(correlation_id?)?;
         future.put_response_message(Some(response_msg));
-        // 对齐 Java：成功路径也走 executeRequestCallback，让「只回调一次」的守卫生效；
-        // 同步调用方（callback 为空）靠 put_response_message 唤醒。
         future.execute_request_callback();
         Some(future)
     }
@@ -300,25 +249,13 @@ impl RequestFutureHolder {
     }
 }
 
-/// 进程内单例（对齐 Java 的 `INSTANCE` / Python 的 `REQUEST_FUTURE_HOLDER`）。
-/// 应答方与请求方在同一进程时也共用它。
 pub fn request_future_holder() -> &'static RequestFutureHolder {
     static HOLDER: OnceLock<RequestFutureHolder> = OnceLock::new();
     HOLDER.get_or_init(RequestFutureHolder::new)
 }
 
-/// Java `scanExpiredRequest` 的清理原因文案（`RequestFutureHolder.java:67`）。
 const SCAN_EXPIRED_REQUEST_TEXT: &str = "request timeout, no reply message.";
 
-/// 一轮超时清理（对应 Java `RequestFutureHolder#scanExpiredRequest:49-76`）：
-/// 摘出所有 `isTimeout()` 的等待槽，置上 `RequestTimeoutException`（码 10006，
-/// 文案照抄 Java）后触发回调。返回摘掉的条目数。
-///
-/// 两个「与 Java 逐行对齐」的点：
-/// * 「先摘再触发」与应答到达路径（[`RequestFutureHolder::put_response`] 的 remove
-///   抢所有权）互斥，两条路只会有一个生效 —— Java `:57-59` 的原子性论证原样成立；
-/// * 走 [`RequestResponseFuture::set_cause_only`]：Java `:70` 只 `setCause`，
-///   **不**唤醒同步等待方（`latch` 等它自己的超时），只有异步回调被触发。
 pub fn scan_expired_request(holder: &RequestFutureHolder) -> usize {
     let mut expired: Vec<std::sync::Arc<RequestResponseFuture>> = Vec::new();
     if let Ok(mut table) = holder.request_future_table.write() {
@@ -345,21 +282,10 @@ pub fn scan_expired_request(holder: &RequestFutureHolder) -> usize {
     removed
 }
 
-// ---------------- 后台清扫任务（Java `startScheduledTask` / `shutdown`） ----------------
 
-/// 在跑的清扫任务句柄（Java 的 `scheduledExecutorService`）。
 static SCAN_TASK: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
-/// 已调用 start 的 producer 个数（Java 的 `producerSet`）。
 static SCAN_PRODUCERS: AtomicUsize = AtomicUsize::new(0);
 
-/// 对应 Java `RequestFutureHolder#startScheduledTask:78-95`（线程名
-/// `RequestHouseKeepingService`）：首个调用者生成清扫任务 —— 首轮 3s 后、
-/// 此后每 1s 一轮 [`scan_expired_request`]；后续调用只把引用计数 +1。
-///
-/// 与 Java 的差异：Java 在单例构造后就起独立线程，本任务跑在 tokio runtime 里，
-/// 所以要在有 runtime 的上下文调用（producer/consumer 的 `start()` 正好满足）；
-/// 没有进位成功的调用不计入 [`SCAN_PRODUCERS`]，与 [`stop_expired_request_scan`]
-/// 保持收支相抵。
 pub fn start_expired_request_scan() {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
@@ -367,8 +293,6 @@ pub fn start_expired_request_scan() {
     start_scan(&SCAN_TASK, &SCAN_PRODUCERS, &handle);
 }
 
-/// 对应 Java `RequestFutureHolder#shutdown:97-104`：最后一个 producer 退出时停掉
-/// 清扫任务（引用计数归零才 abort，与 Java 的 `producerSet.size() <= 0` 一致）。
 pub fn stop_expired_request_scan() {
     stop_scan(&SCAN_TASK, &SCAN_PRODUCERS);
 }
@@ -386,7 +310,6 @@ fn start_scan(
         return;
     }
     *slot = Some(handle.spawn(async move {
-        // Java `scheduleAtFixedRate(..., 1000 * 3, 1000, MILLISECONDS)`
         tokio::time::sleep(Duration::from_secs(3)).await;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -413,8 +336,6 @@ static ID_SEED: AtomicU64 = AtomicU64::new(0);
 /// splitmix64 的黄金比例增量（`0x9E3779B97F4A7C15`，只对 u64 有意义）。
 const SPLITMIX_DELTA: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// 对应 Java `CorrelationIdUtil.createCorrelationId`（随机 UUID 字符串）。
-///
 /// 本 crate 不引 `uuid`/`rand`，用 splitmix64(nanos ^ pid ^ 自增) 造 128 bit，
 /// 再按 v4 的 version/variant 位排成标准 8-4-4-4-12 形态，长度与字符集和 UUID 一致。
 pub fn create_correlation_id() -> String {
@@ -428,8 +349,6 @@ pub fn create_correlation_id() -> String {
     let bits =
         ((splitmix64(base) as u128) << 64) | splitmix64(base.wrapping_add(SPLITMIX_DELTA)) as u128;
 
-    // 32 个 hex 字符里第 12 个（= bit 79..76）是 version，第 16 个的高 2 bit（= bit 63..62）
-    // 是 variant；写成 v4 形态后长度与字符集跟 Java 的 UUID 完全一致。
     let bits = (bits & !(0xFu128 << 76)) | (4u128 << 76);
     let bits = (bits & !(0b11u128 << 62)) | (0b10u128 << 62);
 
@@ -452,16 +371,6 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// 对应 Java `MessageUtil.createReplyMessage`：由请求消息派生出应答消息。
-///
-/// `CLUSTER` 属性由 **broker** 在投递时写入（`SendMessageProcessor`），拿不到就说明
-/// 这条消息不是经 broker 转发过来的（或 topic 配得不对），与 Java 一样直接报错，
-/// 而不是造一条投不出去的应答。
-///
-/// 码值是 Java 的 `ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION`(10007)：应答方通常
-/// 写在业务 listener 里，按 `response_code` 分流才能把「这条请求不能回话」和别的本地错误
-/// 分开。Java 还有一个 `requestMessage == null` 的分支（同样 10007），Rust 的入参是
-/// `&Message`，空引用编译不过，所以那一档由类型系统兜住。
 pub fn create_reply_message(request_message: &Message, body: &[u8]) -> Result<Message> {
     let cluster = request_message
         .get_property(PROPERTY_CLUSTER)
@@ -492,8 +401,6 @@ pub fn create_reply_message(request_message: &Message, body: &[u8]) -> Result<Me
 }
 
 /// `MSG_TYPE == "reply"` 的发送要走 `SEND_REPLY_MESSAGE_V2(325)`。
-///
-/// 大小写敏感：Java 是 `equals("reply")`。
 pub fn is_reply_message(msg: &Message) -> bool {
     msg.get_property(PROPERTY_MESSAGE_TYPE) == Some(MixAll::REPLY_MESSAGE_FLAG)
 }
@@ -516,7 +423,6 @@ mod tests {
     #[test]
     fn create_reply_message_matches_wire_shape() {
         let reply = create_reply_message(&request_msg(), b"pong").unwrap();
-        // topic 必须是 <cluster>_REPLY_TOPIC（Java MixAll.getReplyTopic）
         assert_eq!(reply.get_topic(), "DefaultCluster_REPLY_TOPIC");
         assert_eq!(reply.get_body(), b"pong");
         // 四个属性一个都不能少，且 CORRELATION_ID/REPLY_TO_CLIENT/TTL 是原样带回
@@ -533,8 +439,6 @@ mod tests {
     fn create_reply_message_requires_cluster() {
         let m = Message::new("RRUnitTopic", Some(b"ping"));
         let err = create_reply_message(&m, b"pong").unwrap_err();
-        // Java `MessageUtil:49` 抛的是带 10007 的 MQClientException，文案逐字一致：
-        // 应答 listener 在业务代码里，按码分流才能把「这条请求不能回话」和别的故障分开。
         assert_eq!(
             err.response_code(),
             Some(client_error_code::CREATE_REPLY_MESSAGE_EXCEPTION),
@@ -597,8 +501,6 @@ mod tests {
 
     #[tokio::test]
     async fn wait_times_out_and_is_timeout() {
-        // 等待预算必须明显大于 future 的超时预算：is_timeout 用的是严格大于（同 Java），
-        // 而定时器可能比截止时刻早一丁点触发，两者相等时忙机上这条断言会抖。
         let f = RequestResponseFuture::new("c1", 20);
         assert!(f.wait_response_message(200).await.is_none());
         assert!(f.is_timeout());
@@ -673,7 +575,6 @@ mod tests {
         let f = RequestResponseFuture::with_callback("c1", 1000, Some(recorder.clone()));
         assert_eq!(recorder.successes(), 0, "没投递前不能回调");
         f.execute_request_callback();
-        // 与 Java 一致：sendRequestOK 仍为 true、无 cause，但无应答也回调一次（success + 空消息）
         assert_eq!(recorder.successes(), 1);
         let mut msg = MessageExt::new();
         msg.set_body(Some(b"pong"));
@@ -707,7 +608,6 @@ mod tests {
 
     #[test]
     fn holder_put_response_removes_the_entry() {
-        // Java 用 remove 抢所有权：应答到达与超时清理只能有一个生效。
         let holder = RequestFutureHolder::new();
         let f = std::sync::Arc::new(RequestResponseFuture::new("c1", 1000));
         holder.put_request("c1", f.clone());
@@ -752,7 +652,6 @@ mod tests {
         ));
     }
 
-    // ---------------- 超时清扫（Java scanExpiredRequest / startScheduledTask） ----------------
 
     /// 计数回调（比 Recorder 更便于拿 Arc 共享计数）。
     struct SweepCounter {
@@ -784,7 +683,6 @@ mod tests {
         let removed = scan_expired_request(&holder);
         assert_eq!(removed, 1);
         assert!(holder.is_empty(), "超时项必须从表里摘除");
-        // Java :70 只 setCause：sendRequestOK 不变、同步等待方不被唤醒
         assert!(f.is_send_request_ok());
         assert_eq!(counter.failures.load(Ordering::SeqCst), 1);
         let logged = counter
@@ -831,7 +729,6 @@ mod tests {
         start_scan(&slot, &count, &handle);
         start_scan(&slot, &count, &handle);
         assert_eq!(count.load(Ordering::SeqCst), 2);
-        // 第二个调用者只计数，不再起第二个清扫任务（Java 的 producerSet 语义）
         assert!(slot.lock().unwrap_or_else(|e| e.into_inner()).is_some());
 
         stop_scan(&slot, &count);

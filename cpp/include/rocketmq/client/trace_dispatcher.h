@@ -1,16 +1,7 @@
-// 异步轨迹分发器（对应 org.apache.rocketmq.client.trace.AsyncTraceDispatcher）。
-//
 // 职责：钩子把 TraceContext 丢进内存队列（``append``），后台线程按
 // 「攒够 batchNum 条 或 距上次发送超过 5s」两个条件触发刷写，再把编码后的文本
 // 用**独立的内部生产者**发到轨迹 topic（默认 RMQ_SYS_TRACE_TOPIC）。
 //
-// 与 Java 的对应关系：
-//   * 内存队列           ← ArrayBlockingQueue<TraceContext>(2048)
-//   * _flushTraceContext ← flushTraceContext（含 force_flush 语义）
-//   * _sendTraceData     ← sendTraceData（按 topic@traceTopic 分组）
-//   * _flushData         ← flushData（按 maxMessageSize 128K 切块）
-//   * _sendTraceDataByMq ← sendTraceDataByMQ（用内部生产者发送）
-//   * 内部生产者组名      ← _INNER_TRACE_PRODUCER-<group>-<PRODUCE|CONSUME>-<N>
 //
 // ⚠ 防递归：内部生产者自身的 enableTrace 必须为 false，且 SendMessageTraceHook 会跳过
 //   topic 以轨迹 topic 开头的消息 —— 两道保险都要有，否则轨迹会自我复制到无限。
@@ -33,8 +24,6 @@ namespace rocketmq {
 class DefaultMQProducer;        // 仅前向声明：避免与 producer.h 形成包含环
 class DefaultMQPushConsumer;     // 同上
 
-// 轨迹分发器抽象接口（对应 Java org.apache.rocketmq.client.trace.TraceDispatcher）。
-// 钩子只依赖这个接口，便于单测用假实现（FakeDispatcher）替换真实分发器。
 class TraceDispatcher {
 public:
     virtual ~TraceDispatcher() = default;
@@ -44,7 +33,6 @@ public:
     virtual std::string clientId() const { return std::string(); }
 };
 
-// 对应 org.apache.rocketmq.client.trace.TraceDispatcher.Type
 enum class TraceDispatcherType {
     PRODUCE = 0,
     CONSUME = 1,
@@ -73,10 +61,7 @@ public:
                AccessChannel accessChannel = AccessChannel::LOCAL);
     void shutdown();
 
-    // ---------------- 入队 / 刷写 ----------------
-    // 把一个 TraceContext 入队。队列满时计数并丢弃（与 Java 一致，不阻塞业务）。
     bool append(const std::shared_ptr<TraceContext>& ctx);
-    // 强制刷空队列（Java flush()）。
     void flush();
 
     // ---------------- 访问 ----------------
@@ -85,10 +70,6 @@ public:
     void setHostConsumer(DefaultMQPushConsumer* host) { hostConsumer_ = host; }
     void setHostClientId(const std::string& id) { clientId_ = id; }
     std::string clientId() const { return clientId_; }
-    // 对应 Java `AsyncTraceDispatcher#namespaceV2`（字段 :79，setter :147）：宿主门面
-    // （生产者 / 推送消费者）把自己那份 5.x 命名空间传进来，start() 时 `traceProducer`
-    // 同步（Java `start():155` `traceProducer.setNamespaceV2(namespaceV2)`）。不传则轨迹
-    // 生产者裸奔 —— broker 按实例命名空间解析轨迹 topic，写错实例就查不到轨迹。
     void setNamespaceV2(const std::string& ns) { namespaceV2_ = ns; }
     const std::string& namespaceV2() const { return namespaceV2_; }
     int64_t discardCount() const { return discardCount_.load(); }
@@ -101,9 +82,7 @@ protected:
     virtual void sendTraceMessage(const std::string& traceTopic, const std::string& body,
                                   const std::string& keys);
 
-    // 按 (业务 topic, 轨迹 topic) 分组后逐组发送（对应 Java sendTraceData）。
     void sendTraceData(const std::vector<std::shared_ptr<TraceContext>>& contextList);
-    // 把一批 TraceTransferBean 按 maxMsgSize 切块发送（对应 Java flushData）。
     void flushData(const std::vector<TraceTransferBean>& transBeanList,
                    const std::string& topic, const std::string& traceTopic);
 
@@ -119,7 +98,6 @@ private:
     int32_t batchNum_;
     int32_t maxMsgSize_ = MAX_MSG_SIZE;
     std::string traceTopicName_;
-    // Java AsyncTraceDispatcher#namespaceV2：宿主设置，start() 传导给内部轨迹生产者
     std::string namespaceV2_;
     std::shared_ptr<void> rpcHook_;
     std::unique_ptr<DefaultMQProducer> traceProducer_;

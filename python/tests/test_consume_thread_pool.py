@@ -1,23 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消费线程弹性单测（对应 Java DefaultMQPushConsumer 的线程池配置与 updateCorePoolSize）。
-
-为什么需要它：Java 的 ``ThreadPoolExecutor`` 在 ``LinkedBlockingQueue``（无界）下，
-**真实并发度 == corePoolSize**（``max`` 永远用不到），所以 ``updateCorePoolSize`` 是
-"运行时真的能改并发度"的 API，而标准的 ``concurrent.futures.ThreadPoolExecutor``
-**没有 core 这个概念** —— 用它就等于把这个能力做没了。因此本项目自己实现
-``ConsumeExecutor``（core/max 两档），本文件把它的语义和 Java 守卫逐条钉住。
-
-另外钉住一个反直觉的事实：**Java 5.5.1 的自动弹性（inc/decCorePoolSize）是空实现**，
-``adjustThreadPool()`` 整套调度是 no-op。我们照抄 no-op，不允许"顺手修好"。
-
-覆盖：
-  - ConsumeExecutor：core 内建线程 / 超 core 入队 / 提升 core 补线程 /
-    超编线程空闲退出而 core 线程不退 / 任务异常不杀 worker / shutdown 语义
-  - 消费者：Java 默认值、update_core_pool_size 的五条守卫边界、get_core_pool_size
-  - msgAccCnt（MAX_OFFSET - queueOffset）与 compute_accumulation_total
-  - adjust_thread_pool 的 inc/dec 确实是 no-op（改阈值也不动 core）
-  - 307 运行信息里的 PROP_THREADPOOL_CORE_SIZE 取的是 core pool size
-"""
 from __future__ import annotations
 
 import threading
@@ -63,7 +44,7 @@ class TestConsumeExecutor:
             ex.shutdown(wait=True)
 
     def test_raising_core_spawns_for_queued_tasks(self):
-        """set_core_pool_size 变大且队列非空 → 立刻补足 worker（Java setCorePoolSize）。"""
+        pass
         ex = ConsumeExecutor(1, 8, keep_alive_seconds=30)
         release = threading.Event()
         first_started = threading.Event()
@@ -131,7 +112,7 @@ class TestConsumeExecutor:
             ex.submit(lambda: None)
 
     def test_shutdown_wait_drains_queued_tasks(self):
-        """Java shutdown() 不丢已提交任务：wait=True 要等队列跑完。"""
+        pass
         ex = ConsumeExecutor(1, 2, keep_alive_seconds=30)
         counter = {"n": 0}
         lock = threading.Lock()
@@ -162,13 +143,13 @@ class TestConsumeExecutor:
 class TestConsumerDefaultsAndGuards:
     def test_thread_pool_defaults(self):
         c = DefaultMQPushConsumer(GROUP)
-        assert c.get_consume_thread_min() == 20          # Java consumeThreadMin 默认 20 (:162)
-        assert c.get_consume_thread_max() == 20          # Java consumeThreadMax 默认 20 (:169)
+        assert c.get_consume_thread_min() == 20
+        assert c.get_consume_thread_max() == 20
         assert c.get_adjust_thread_pool_nums_threshold() == 100000
         assert c.get_core_pool_size() == 20              # = consumeThreadMin
 
     def test_update_core_pool_size_happy_path(self):
-        """Java 用无界队列 ⇒ 真实并发度 == core；默认配置下 core 只能往**下**调。"""
+        pass
         c = DefaultMQPushConsumer(GROUP)
         assert c.update_core_pool_size(15) is True
         assert c.get_core_pool_size() == 15
@@ -180,11 +161,7 @@ class TestConsumerDefaultsAndGuards:
         assert c.get_core_pool_size() == 20              # 未生效
 
     def test_update_core_pool_size_rejects_above_short_max(self):
-        """Java 守卫 corePoolSize <= Short.MAX_VALUE(32767)。
-
-        注意两道守卫是 **与** 关系：要让 Short.MAX_VALUE 成为实际卡点，必须先把
-        consumeThreadMax 抬到 32767 以上，否则先被 ``n < consumeThreadMax`` 拒掉。
-        """
+        pass
         c = DefaultMQPushConsumer(GROUP)
         c.set_consume_thread_max(40000)
         assert c.update_core_pool_size(32768) is False
@@ -192,25 +169,19 @@ class TestConsumerDefaultsAndGuards:
         assert c.get_core_pool_size() == 32767
 
     def test_update_core_pool_size_rejects_equal_to_consume_thread_max(self):
-        """Java 守卫 corePoolSize < consumeThreadMax —— **等于**也不行。"""
+        pass
         c = DefaultMQPushConsumer(GROUP)
         assert c.update_core_pool_size(20) is False      # == consumeThreadMax（5.x 默认）
         assert c.update_core_pool_size(19) is True
         assert c.get_core_pool_size() == 19
 
     def test_default_max_is_5x20_not_4x64(self):
-        """回归：默认 max 曾照抄 4.x 的 64，于是 20~63 这些 Java 会**忽略**的值能生效。
-
-        Java 5.5.1 的 consumeThreadMax 与 min 同为 20（DefaultMQPushConsumer:169），
-        守卫 ``n < consumeThreadMax`` 因此把默认配置下的上调全挡掉 —— 差异不会报错，
-        只表现为"同一个 update_core_pool_size(30)，本端口真的改了并发度、Java 没改"。
-        """
+        pass
         c = DefaultMQPushConsumer(GROUP)
         assert c.get_consume_thread_max() == 20
         assert c.update_core_pool_size(30) is False
         assert c.update_core_pool_size(21) is False
         assert c.get_core_pool_size() == 20              # 一个都没落下去
-        # 抬 max 之后区间重新打开（setter 与 Java 一样是裸赋值，只夹 >= 1）
         c.set_consume_thread_max(30)
         assert c.update_core_pool_size(25) is True
         assert c.get_core_pool_size() == 25
@@ -264,7 +235,7 @@ def _msg(queue_offset: int, max_offset=None) -> MessageExt:
 
 class TestMsgAccCnt:
     def test_acc_cnt_is_max_offset_minus_queue_offset(self):
-        """Java ProcessQueue:148-158 —— accTotal = MAX_OFFSET - queueOffset，取最后一条。"""
+        pass
         c = DefaultMQPushConsumer(GROUP)
         c._update_msg_acc_cnt("k1", [_msg(10, 100), _msg(12, 100)])
         assert c.msg_acc_cnt("k1") == 88                 # 100 - 12
@@ -304,7 +275,7 @@ class TestMsgAccCnt:
 
 class TestAdjustThreadPoolIsNoOp:
     def test_inc_branch_does_not_change_core_pool_size(self):
-        """acc >= 1.0 * threshold → Java 调 incCorePoolSize()，而它是空实现。"""
+        pass
         c = DefaultMQPushConsumer(GROUP)
         c.set_adjust_thread_pool_nums_threshold(100)
         c._update_msg_acc_cnt("a", [_msg(0, 500)])        # 500 >= 100
@@ -313,7 +284,7 @@ class TestAdjustThreadPoolIsNoOp:
         assert c.get_core_pool_size() == before           # no-op
 
     def test_dec_branch_does_not_change_core_pool_size(self):
-        """acc < 0.8 * threshold → Java 调 decCorePoolSize()，同样是空实现。"""
+        pass
         c = DefaultMQPushConsumer(GROUP)
         c.set_adjust_thread_pool_nums_threshold(1000)
         c._update_msg_acc_cnt("a", [_msg(0, 10)])         # 10 < 800

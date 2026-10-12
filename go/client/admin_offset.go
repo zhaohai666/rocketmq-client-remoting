@@ -1,5 +1,3 @@
-// Offset management and message query — the second half of the
-// DefaultMQAdminExt surface (Java MQAdminImpl / DefaultMQAdminExtImpl).
 package client
 
 import (
@@ -31,19 +29,14 @@ func (a *DefaultMQAdminExt) MinOffset(mq common.MessageQueue) (int64, error) {
 	return instance.GetMinOffset(mq, a.timeout(0))
 }
 
-// SearchOffset sends SEARCH_OFFSET_BY_TIMESTAMP(29) with the LOWER boundary,
-// matching Java MQAdminImpl#searchOffset.
 func (a *DefaultMQAdminExt) SearchOffset(mq common.MessageQueue, timestamp int64) (int64, error) {
 	return a.searchOffsetWithBoundary(mq, timestamp, remoting.BoundaryLower)
 }
 
-// SearchLowerBoundaryOffset is Java DefaultMQAdminExt#searchLowerBoundaryOffset.
 func (a *DefaultMQAdminExt) SearchLowerBoundaryOffset(mq common.MessageQueue, timestamp int64) (int64, error) {
 	return a.searchOffsetWithBoundary(mq, timestamp, remoting.BoundaryLower)
 }
 
-// SearchUpperBoundaryOffset is Java DefaultMQAdminExt#searchUpperBoundaryOffset.
-//
 // It differs from LOWER only when several messages share a store time, or the
 // timestamp falls in a gap or past the end of the queue: past the tail, UPPER
 // returns the last message's own offset while LOWER returns the next one
@@ -188,19 +181,6 @@ func (a *DefaultMQAdminExt) ResetOffsetByTimestamp(topic, group string, timestam
 // invokeBrokerResetOffset issues one 222 request and returns the queue table
 // the broker actually reset.
 //
-// Java has TWO overloads: the timestamp one resets the whole topic, and the
-// one carrying `queueId` + `offset` resets a single queue. A nil `offset`
-// renders as -1, which the broker reads as "null, compute it from the
-// timestamp".
-//
-// The force field is spelled **isForce**, not force: Java's
-// RemotingCommand.makeCustomHeaderToNet derives ext keys from the FIELD names,
-// and ResetOffsetRequestHeader declares `private boolean isForce` (the getter
-// `isForce()` does not participate in the naming). Sending `force` leaves the
-// broker's isForce false, so Broker2Client.resetOffset degrades to the
-// timestamp branch — with timestamp=-1 that echoes consumerOffset back instead
-// of jumping to maxOffset. Measured on 5.5.1:
-//
 //	{"force":"true", timestamp:-1}   -> target 3  (= consumerOffset)
 //	{"isForce":"true", timestamp:-1} -> target 10 (= maxOffset)
 func (a *DefaultMQAdminExt) invokeBrokerResetOffset(brokerAddr, topic, group string,
@@ -219,7 +199,6 @@ func (a *DefaultMQAdminExt) invokeBrokerResetOffset(brokerAddr, topic, group str
 		"group", group,
 		"timestamp", timestamp,
 		"isForce", isForce,
-		// Java: offset == -1 means "offset absent".
 		"offset", offsetValue,
 	)
 	if queueID != nil {
@@ -254,10 +233,6 @@ func (a *DefaultMQAdminExt) invokeBrokerResetOffset(brokerAddr, topic, group str
 	return out, nil
 }
 
-// ResetOffsetByQueueID mirrors Java DefaultMQAdminExt#resetOffsetByQueueId.
-//
-// Java issues TWO RPCs and both are required:
-//
 //  1. updateConsumerOffset(15) rewrites offsetTable to the target;
 //  2. the 222 with `queueId` + `offset` goes through
 //     AdminBrokerProcessor#resetOffsetInner, which validates the target against
@@ -267,16 +242,6 @@ func (a *DefaultMQAdminExt) invokeBrokerResetOffset(brokerAddr, topic, group str
 //     resetOffsetTable (one-shot, taken by the next pull via
 //     queryThenEraseResetOffset) and offsetTable, and clears the queue's POP
 //     in-flight count.
-//
-// Doing only step 1 leaves an online consumer pulling from its in-memory
-// offset. Java returns void; this port returns the broker's table so callers
-// can check.
-//
-// Measured on 5.5.1: the two RPCs are NOT atomic. ConsumerOffsetManager
-// #commitOffset is an unconditional overwrite (it only logs `[NOTIFYME]` when
-// the offset moves backwards, with no range check), so when step 2 is rejected
-// step 1 has already persisted the illegal offset. Java behaves identically;
-// no protective rollback is attempted here.
 func (a *DefaultMQAdminExt) ResetOffsetByQueueID(brokerAddr, consumerGroup, topic string,
 	queueID int32, resetOffset int64) (map[common.MessageQueue]int64, error) {
 
@@ -285,14 +250,10 @@ func (a *DefaultMQAdminExt) ResetOffsetByQueueID(brokerAddr, consumerGroup, topi
 	if err != nil {
 		return nil, err
 	}
-	// Java's single-queue overload passes no force (false) and timestamp 0
-	// (the offset is given, so the timestamp is not consulted).
 	return a.invokeBrokerResetOffset(brokerAddr, topic, consumerGroup, 0, false, false,
 		&queueID, &resetOffset)
 }
 
-// ResetOffsetNew mirrors Java resetOffsetNew: try the new (broker-side) path
-// first and fall back to the old local one only when the group is not online.
 func (a *DefaultMQAdminExt) ResetOffsetNew(consumerGroup, topic string, timestamp int64) error {
 	_, err := a.ResetOffsetByTimestamp(topic, consumerGroup, timestamp, true, "", false)
 	if err == nil {
@@ -305,8 +266,6 @@ func (a *DefaultMQAdminExt) ResetOffsetNew(consumerGroup, topic string, timestam
 	return err
 }
 
-// ResetOffsetByTimestampOld mirrors Java resetOffsetByTimestampOld: search each
-// queue's offset and write it back according to `force`.
 func (a *DefaultMQAdminExt) ResetOffsetByTimestampOld(consumerGroup, topic string, timestamp int64,
 	force bool) (map[common.MessageQueue]int64, error) {
 
@@ -386,10 +345,6 @@ func (a *DefaultMQAdminExt) QueryMessageByUniqKey(topic, uniqKey string) (*commo
 	return messages[0], nil
 }
 
-// queryMessageAllBrokers mirrors Java MQAdminImpl.queryMessage: ask EVERY
-// broker of the topic and merge, keeping only the records that survive the
-// client-side secondary check (uniqKey: msgId == key; plain key: one of the
-// message's KEYS equals the key AND the topic matches).
 func (a *DefaultMQAdminExt) queryMessageAllBrokers(topic, key string, maxNum int32,
 	beginTimestamp, endTimestamp int64, indexType string, uniqKey bool) ([]*common.MessageExt, error) {
 
@@ -436,7 +391,6 @@ func (a *DefaultMQAdminExt) queryMessageAllBrokers(topic, key string, maxNum int
 			}
 		}
 	}
-	// Java sorts by queueOffset (its MessageExt comparator) and truncates.
 	sortByQueueOffset(messages)
 	if maxNum > 0 && len(messages) > int(maxNum) {
 		messages = messages[:maxNum]
@@ -480,12 +434,6 @@ func (a *DefaultMQAdminExt) queryMessageOneBroker(addr, topic, key string, maxNu
 	return response.Body, nil
 }
 
-// ViewMessage mirrors Java DefaultMQAdminExtImpl.viewMessage (:578-587).
-//
-// Java first decodes the msgId into a broker address + commitLog offset and
-// sends VIEW_MESSAGE_BY_ID(33); ANY failure falls back to a UNIQ_KEY lookup.
-// That fallback is required: a 5.x client-generated msgId is a uniqKey that is
-// also 32 hex digits, so decoding it produces a non-existent ip:port.
 func (a *DefaultMQAdminExt) ViewMessage(topic, msgID string) (*common.MessageExt, error) {
 	msg, err := a.viewMessageByID(topic, msgID)
 	if err == nil && msg != nil {
@@ -549,18 +497,6 @@ func (a *DefaultMQAdminExt) QueryConsumeQueue(brokerAddr, topic string, queueID 
 	return remoting.DecodeQueryConsumeQueueResponseBody(response.Body)
 }
 
-// ConsumeMessageDirectly mirrors Java DefaultMQAdminExtImpl#consumeMessageDirectly
-// (CONSUME_MESSAGE_DIRECTLY(309) sent from the admin side): resolve the message
-// with viewMessage, send the request to the broker that STORES it, and that
-// broker relays the message to the named client, whose listener verdict comes
-// back as the ConsumeMessageDirectlyResult body.
-//
-// The msgId has two shapes (Java's two branches): a client uniq key cannot be
-// looked up by the receiving broker on its own — it needs the physical
-// commitLog offset to find the message body it forwards — so when the resolved
-// message carries a UNIQ_KEY property the OFFSET msgId travels instead
-// (Java MessageClientExt#getOffsetMsgId). An offset msgId passes through
-// untouched.
 func (a *DefaultMQAdminExt) ConsumeMessageDirectly(consumerGroup, clientID, topic, msgID string) (*remoting.ConsumeMessageDirectlyResult, error) {
 	msg, err := a.ViewMessage(topic, msgID)
 	if err != nil {
@@ -573,11 +509,6 @@ func (a *DefaultMQAdminExt) ConsumeMessageDirectly(consumerGroup, clientID, topi
 	return a.consumeMessageDirectlyTo(msg.StoreHostString(), consumerGroup, clientID, topic, outMsgID)
 }
 
-// consumeMessageDirectlyTo is Java MQClientAPIImpl#consumeMessageDirectly(addr,
-// ...): the wire half. brokerAddr is the store host the msgId resolution
-// produced (the admin tests also drive it directly, mirroring Java's addr
-// overload); the ext fields and the verdict body follow the 309 header
-// ConsumeMessageDirectlyResultRequestHeader.
 func (a *DefaultMQAdminExt) consumeMessageDirectlyTo(brokerAddr, consumerGroup, clientID, topic, msgID string) (*remoting.ConsumeMessageDirectlyResult, error) {
 	response, err := a.invokeBroker(brokerAddr, remoting.ReqConsumeMessageDirectly, adminExt(
 		"consumerGroup", consumerGroup,

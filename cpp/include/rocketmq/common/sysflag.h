@@ -1,15 +1,3 @@
-// org.apache.rocketmq.common.sysflag.* 的 C++ 对应：消息/拉取标志位与权限位。
-//
-// 位含义（低 -> 高），与 RocketMQ 4.9.x Java 实现逐位核对：
-//   bit0  COMPRESSED
-//   bit1  MULTI_TAGS
-//   bit2  TRANSACTION_PREPARED
-//   bit2~3 TRANSACTION_COMMIT(0x2<<2) / TRANSACTION_ROLLBACK(0x3<<2) 共用掩码
-//   bit4  BORNHOST_V6
-//   bit5  STOREHOSTADDRESS_V6
-//   bit6  NEED_UNWRAP
-//   bit7  INNER_BATCH
-//   bit8~10 COMPRESSION_TYPE（掩码 0x7<<8）
 #ifndef ROCKETMQ_COMMON_SYSFLAG_H
 #define ROCKETMQ_COMMON_SYSFLAG_H
 
@@ -42,7 +30,6 @@ struct MessageSysFlag {
     static constexpr int32_t ZLIB_TYPE = 3;
     static constexpr int32_t SNAPPY_TYPE = 4;
 
-    // Java: (flag & COMPRESSION_TYPE_COMPARATOR) >> 8
     static int32_t getCompressionType(int32_t sysFlag) {
         return (sysFlag & COMPRESSION_TYPE_COMPARATOR) >> COMPRESSION_TYPE_SHIFT;
     }
@@ -60,7 +47,6 @@ struct MessageSysFlag {
         return sysFlag & ~COMPRESSED_FLAG;
     }
 
-    // Java: flag & TRANSACTION_ROLLBACK_TYPE
     static int32_t getTransactionValue(int32_t flag) {
         return flag & TRANSACTION_ROLLBACK_TYPE;
     }
@@ -133,8 +119,6 @@ struct PermName {
     static constexpr int32_t PERM_INHERIT = 0x1;
     static constexpr int32_t PERM_OWNER = 0x1 << 4;
 
-    // 对应 Java PermName.permToString：三位标志 "RWX"，不满足的位写 '-'。
-    // （此前只声明未定义——是个"编译能过、一链接就炸"的坑，随 TopicConfig 一起补上。）
     static std::string permToString(int32_t perm) {
         std::string s;
         s += (perm & PERM_READ) == PERM_READ ? 'R' : '-';
@@ -147,9 +131,6 @@ struct PermName {
         return (perm & wantedPerm) == wantedPerm;
     }
 
-    // 对应 Java PermName.isValid(value)：合法区间为 [0, PERM_PRIORITY)。
-    // 管理端 UpdateBrokerConfig 会用它对 brokerPermission 做入参校验
-    // （Python 侧 PermName.is_valid 同样如此）。
     static bool isValid(int32_t value) { return value >= 0 && value < PERM_PRIORITY; }
 };
 

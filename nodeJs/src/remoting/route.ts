@@ -1,6 +1,3 @@
-// -*- coding: utf-8 -*-
-// Topic route data (org.apache.rocketmq.remoting.protocol.route.*).
-// Mirrors python/remoting/protocol/route.py.
 import { MessageQueue } from '../common/message.ts';
 import { MixAll } from '../common/mixAll.ts';
 import { PermName } from '../common/sysflag.ts';
@@ -105,11 +102,6 @@ export class TopicRouteData {
     this.filterServerTable = {};
     this.topicQueueMappingByBroker = null;
   }
-  // 组装发布侧全部可写 MessageQueue。
-  // Static-topic branch (Java MQClientInstance.topicRouteData2TopicPublishInfo):
-  // with orderTopicConf unset and a topicQueueMappingByBroker present, the
-  // publish set is the LOGICAL queue list derived from the mapping, sorted by
-  // queueId — NOT the physical queueDatas layout.
   getAllMessageQueue(topic = ''): MessageQueue[] {
     const hasMapping = this.topicQueueMappingByBroker != null
       && Object.keys(this.topicQueueMappingByBroker).length > 0;
@@ -148,9 +140,6 @@ export class TopicRouteData {
     }
     return mqs;
   }
-  // The logical -> real broker name map for this route, or null when the topic
-  // is not static. "__syslo__none__" values mean a logical queue no broker
-  // hosts yet (Java LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST).
   getStaticTopicEndPoints(topic: string): Map<MessageQueue, string> | null {
     const hasMapping = this.topicQueueMappingByBroker != null
       && Object.keys(this.topicQueueMappingByBroker).length > 0;

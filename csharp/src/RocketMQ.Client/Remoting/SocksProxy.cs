@@ -1,20 +1,3 @@
-// SOCKS 代理支持（对齐 Java org.apache.rocketmq.remoting.proxy.SocksProxyConfig 的
-// addr / username / password 三字段 + NettyRemotingClient#createBootstrap 挂
-// Socks5ProxyHandler 的语义）。
-//
-// 与 Java 的口径对齐与差异：
-//   - Java 用 NettyClientConfig#socksProxyConfig 装一份 JSON（cidr -> proxy），按目标
-//     地址做 CIDR 分流；C# 端简化为**单一**代理配置，不做 CIDR 分流。
-//   - Java 的代理只作用于 remoting 长连接（NoopAddressResolverGroup：目标主机名交给
-//     代理解析）；C# 同样只在传输层建连时走 SOCKS，TopAddressing 的 HTTP 路由请求
-//     不受影响。
-//   - Java 的 Socks5ProxyHandler 只支持 SOCKS5；这里按任务口径额外提供 SOCKS4/4a
-//     （Username 作 USERID，目标为主机名时走 4a 的 domain 扩展）。
-//
-// 时序：TCP 直连**代理** -> SOCKS 握手（含认证子协商） -> CONNECT 到目标 ->
-// （可选）TLS 握手 -> RocketMQ 帧。握手在本端建连线程上阻塞完成，预算复用
-// connectTimeoutMillis（对应 Java 的 CONNECT_TIMEOUT_MILLIS 盖住整段建连）。
-//
 // 零依赖手写握手：SOCKS5 走 RFC 1928（无认证 0x00 / 用户名密码 0x02，子协商 RFC
 // 1929），SOCKS4 走原协议、域名目标走 SOCKS4a 扩展（DSTIP = 0.0.0.x）。
 using System.Globalization;
@@ -34,9 +17,6 @@ public enum SocksProxyVersion
     V5,
 }
 
-/// <summary>
-/// SOCKS 代理配置（对齐 Java <c>SocksProxyConfig</c> 的 addr / username / password）。
-/// </summary>
 public sealed class SocksProxyConfig
 {
     /// <summary>代理地址 "host:port"（IPv6 字面量用 "[::1]:1080" 形式）。</summary>
@@ -51,12 +31,10 @@ public sealed class SocksProxyConfig
     /// <summary>认证密码（仅 SOCKS5 用户名密码子协商使用；SOCKS4 没有密码概念）。</summary>
     public string? Password { get; set; }
 
-    /// <summary>协议版本（默认 SOCKS5，对齐 Java 只支持 5 的口径）。</summary>
     public SocksProxyVersion Version { get; set; } = SocksProxyVersion.V5;
 
     public override string ToString()
     {
-        // 密码不打明文（Java 的 toString 原样打印 password，属已知瑕疵，这里刻意收口）
         return "SocksProxy address: " + Addr + ", username: " + Username + ", password: "
             + (string.IsNullOrEmpty(Password) ? (Password ?? "null") : "***");
     }
@@ -141,7 +119,6 @@ internal static class SocksProxy
                 + selected[1].ToString("X2", CultureInfo.InvariantCulture));
         }
 
-        // CONNECT：目标为主机名时原样交给代理解析（对应 Java NoopAddressResolverGroup）
         SendAll(sock, BuildConnect5(destHost, destPort), deadline);
 
         var head = new byte[4];

@@ -3,24 +3,6 @@
 //! 与 `python/verify_validators_live.py`、`cpp/examples/validators_live.cpp`、
 //! `csharp/examples/RocketMQ.Examples/LiveValidators.cs` 同一套断言（四语言对拍）。
 //!
-//! 为什么要在真集群上跑：单测只能证明「函数会抛」，证明不了它**拦在网络之前**。
-//! 而这条链路的真实代价是可重试码 —— `TOPIC_NOT_EXIST`(17) 在发送重试的可重试集合里，
-//! 名字写错时每条消息都会把重试次数与超时预算空转一遍才报出同一个原因。所以正反两条腿
-//! 都要跑：
-//! - V1 反腿：同一个**已启动**的生产者，非法字符 / 空 / 超长 topic、禁发 topic、超长 body、
-//!   空 body 全部亚毫秒本地失败；码值口径照抄 Java（名字类无 broker 码，body 类才是
-//!   `MESSAGE_ILLEGAL`(13)）。
-//! - V2 边界：恰好等于 `maxMessageSize` 放行（Java 判的是 `>`）。
-//! - V3 批量反腿：批内一条非法 ⇒ 整批本地失败；`INNER_MULTI_DISPATCH` 带路径分隔符也挡。
-//! - V4 组名反腿：producer / push / pull / lite 的 `start()` 都先查组名，地址齐也照样本地
-//!   失败，且失败后不留在 started。
-//! - V5 管理端反腿：`create_topic` 对非法/系统 topic 本地拒绝。
-//! - V6 正腿：合法 topic 建队列 + 发送 SEND_OK，lite 消费者 poll 收全、pull 查得到位点。
-//! - V7 对照腿：合法但**不存在**的 topic 本地放行、走完整集群链路，耗时比反腿高两个数量级
-//!   —— 差值就是本地校验省掉的空转。
-//! - V8 寻址故障：没配 name server（或地址服务器没返回地址）是 10004「No name server
-//!   address, please set it.」，地址配了只是连不上不算 —— 判的是**配置**，不是可达性。
-//!   把寻址坏说成「这个 topic 没路由」，排障方向会整个反过来。
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
 //! ```text
@@ -420,11 +402,6 @@ async fn v6_positive(ck: &mut Checker, p: &DefaultMQProducer, namesrv: &str, sta
         }
     };
     lite.set_namesrv_addr(namesrv);
-    // ⚠ 各自独立的 instanceName：MQClientInstance 按 clientId 复用（对齐 Java 的工厂表）。
-    // 现在 clientId 走 Java 口径（`<本机 IP>@<pid>#<nanoTime>`，见 `ClientConfig#buildMQClientId`），
-    // 默认名字各自不同，本不需要再命名；这里保留显式名字只是让失败日志更好认。
-    // 另外即便真的共用实例，先 shutdown 的那个也不会再拆掉还在用的那份
-    //（`MQClientInstance::shutdown` 按注册的租户数把关，对齐 Java）。
     lite.set_instance_name(&format!("lite-{stamp}"));
     lite.subscribe(&topic, "*");
     if let Err(e) = lite.start().await {
@@ -524,17 +501,9 @@ async fn v7_control_leg(ck: &mut Checker, p: &DefaultMQProducer, stamp: &str, lo
 // ---------------------------------------------------------------------- V8
 
 /// 寻址故障（10004）与「topic 没路由」（10005）的分界。
-///
-/// Java `DefaultMQProducerImpl#validateNameServerSetting`（:729）在三条「拿不到路由」
-/// 分支的最前面跑，读的是**配置**：一个 name server 地址都没有时报 10004「No name server
-/// address, please set it.」；地址在、只是这个 topic 查不到才是 10005。
-/// 少了这一步，把地址服务器配错（或它返回空列表）的人看到的会是「这个 topic 没路由」，
-/// 于是去查建 topic / 查权限，而真正坏的是寻址 —— 错方向的排障能耗掉半小时。
 async fn v8_name_server_addressing(ck: &mut Checker, p: &DefaultMQProducer, stamp: &str) {
     println!("== V8 寻址故障（10004）与「topic 没路由」（10005）的分界 ==");
 
-    // V8a：完全没配寻址 → start() 就地拦下（本端口比 Java 严格：Java 要等第一次发送
-    // 才由漏斗报 10004），码值同样是 10004 —— 同一个故障只能有一种码。
     if DefaultTopAddressing::is_configured() {
         println!("   (skip V8a：ROCKETMQ_NAMESRV_DOMAIN 已配，start() 允许静态地址为空)");
     } else {

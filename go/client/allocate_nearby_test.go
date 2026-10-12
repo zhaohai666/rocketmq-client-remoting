@@ -1,5 +1,3 @@
-// AllocateMachineRoomNearby tests (Java
-// org.apache.rocketmq.client.consumer.rebalance.AllocateMachineRoomNearBy).
 package client
 
 import (
@@ -69,9 +67,6 @@ func TestAllocateMachineRoomNearbyKeepsRoomsExclusive(t *testing.T) {
 	}
 }
 
-// An empty machine room from the resolver is a hard failure (Java
-// IllegalArgumentException): the error is reported through AllocateErrReporter
-// so the rebalance round can keep the previous assignment.
 func TestAllocateMachineRoomNearbyEmptyRoomIsReported(t *testing.T) {
 	s, _ := NewAllocateMachineRoomNearby(AllocateMessageQueueAveragely{}, testResolver{
 		brokerRooms: map[string]string{"room-a-broker": "room-a"},

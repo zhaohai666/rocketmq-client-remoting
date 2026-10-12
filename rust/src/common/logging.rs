@@ -1,8 +1,3 @@
-//! 轻量客户端日志（对应 `rocketmq/logging.py` 与 Java 的 `rocketmq_client.log`）。
-//!
-//! 落盘 `~/logs/rocketmqlogs/rocketmq_rs_client.log`，按天改名轮转，同时输出 stderr。
-//! 刻意不叫 Java 的 `rocketmq_client.log`：两者轮转策略不同，同机同文件会互相插行、
-//! 且改名会让对方写进已 unlink 的 inode 而静默丢日志。
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;

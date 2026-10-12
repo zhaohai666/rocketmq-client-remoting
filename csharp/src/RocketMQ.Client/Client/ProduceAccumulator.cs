@@ -1,37 +1,13 @@
-// 对应 org.apache.rocketmq.client.producer.ProduceAccumulator（Java 5.5.0）。
-//
 // 生产者打开 AutoBatch 之后，Send(Message) 不再一条一条直发，而是先按
 // AggregateKey(topic, mq, waitStoreMsgOK, tag) 归并进 MessageAccumulation，攒够
 // holdMs/holdSize（或被守卫线程唤醒）再合成**一个** MessageBatch 发出去，最后把 broker
 // 回的**批量** SendResult 拆回每条消息各自的 SendResult —— 调用方看到的东西与直发一致。
-//
-// 契约（逐条对齐 Java，别"顺手优化"）：
-//   1. AggregateKey 是 topic + mq + waitStoreMsgOK + tag 四元组：tag 不同不合并
-//      （一个 MessageBatch 只有一个 TAGS 属性）；指定 mq 与不指定 mq 也不合并。
-//   2. TryAddMessage 是全局字节闸门：currentlyHoldSize < totalHoldSize 才放行，放行时把
-//      本条 body 长度记进去；**批次真的发完**才扣回（同步版在 finally、异步版在回调里）。
-//      ⚠ 上游真实口径是「先记账，再判延时/重试」—— CanBatch 里因延时消息退回直发的那条
-//      消息，其字节数已被记进 currentlyHoldSize 且**永不归还**（Java 遗漏，照抄）。
-//   3. 批量应答拆条：broker 对批量消息回的 MsgId/OffsetMsgId 是**逗号分隔**的逐条 ID；
-//      含逗号才拆，条数对不上抛 IllegalArgumentException 对等的异常；不含逗号（老 broker /
-//      单条）时**所有**下标指向同一个 SendResult 实例（就地共享，不复制）。
-//   4. **同步 Add 收集 keys，异步 Add 不收集**（Java 的不对称行为，照抄）。
-//   5. Message.Keys 是 string.Join(" ", keys)：分隔符是**空格**（MessageConst.KEY_SEPARATOR），
-//      且**无条件**写属性 —— 空集合写出 KEYS=""。跨进程/跨语言 KEYS 顺序不保证。
-//   6. 守卫线程每轮 max(1, holdMs/2) ms：sync 版对每个批次 Wakeup()（叫醒正在 Add 里等阈值
-//      的调用方去自查 ReadyToSend），再把 MessagesSize == 0 的空批次置 closed 并摘表；
-//      async 版先 ReadyToSend 就 Send，再做同样的摘表。
-//      ⚠ 发完的批次 MessagesSize 仍 > 0（Send 只置 closed，不重置 MessagesSize），所以它
-//      会**留在表里**，直到下一次同键 Send 拿到它、Add 返回 -1 才被摘掉重取。
-//   7. IsBatch 必须置 true：本端发送侧用 msg.IsBatch 判断批量（对应 Java 的
-//      msg instanceof MessageBatch），不置就会走单条 SEND_MESSAGE。
 
 using System.Collections.Concurrent;
 using RocketMQ.Common;
 
 namespace RocketMQ.Client;
 
-/// <summary>归并键：topic + mq + waitStoreMsgOK + tag（Java ProduceAccumulator.AggregateKey）。</summary>
 public sealed class AggregateKey
 {
     public string Topic { get; }
@@ -53,7 +29,6 @@ public sealed class AggregateKey
     public static AggregateKey OfMessageWithMq(Message msg, MessageQueue mq) =>
         new(msg.Topic, mq, msg.WaitStoreMsgOk, TagOf(msg));
 
-    /// <summary>Java <c>Message.getTags()</c>：属性缺失返回 null（不是空串）。</summary>
     private static string? TagOf(Message msg) =>
         msg.Properties.TryGetValue(MessageConst.PropertyTags, out var tag) ? tag : null;
 
@@ -71,7 +46,6 @@ public sealed class AggregateKey
         + ", waitStoreMsgOK=" + WaitStoreMsgOk + ", tag=" + (Tag ?? "null") + ")";
 }
 
-/// <summary>一批待归并的消息（Java ProduceAccumulator.MessageAccumulation）。</summary>
 public sealed class MessageAccumulation
 {
     private readonly DefaultMQProducer _producer;
@@ -98,7 +72,6 @@ public sealed class MessageAccumulation
         CreateTime = UtilAll.CurrentTimeMillis();
     }
 
-    /// <summary>closed 既是状态位又是锁对象（Java 用 ``synchronized (this.closed)``）。</summary>
     internal object ClosedLock => _closedLock;
 
     /// <summary>本批是否已被关掉（关掉即"不再接受新消息"，且已经发过/正在发）。
@@ -122,12 +95,10 @@ public sealed class MessageAccumulation
         }
     }
 
-    /// <summary>Java <c>readyToSend()</c>：按**本批**字节数或本批存活时间（不是全局限额）。</summary>
     internal bool ReadyToSend() =>
         MessagesSize > _owner.HoldSize ||
         UtilAll.CurrentTimeMillis() >= CreateTime + _owner.HoldMs;
 
-    /// <summary>Java <c>wakeup()</c>：叫醒一个正在 Add 里等阈值的调用方。</summary>
     internal void Wakeup()
     {
         lock (this)
@@ -215,14 +186,9 @@ public sealed class MessageAccumulation
         return true;
     }
 
-    /// <summary>Java <c>Message.getKeys()</c>：缺属性返回 null；空串返回 ""。</summary>
     private static string? KeysOf(Message msg) =>
         msg.Properties.TryGetValue(MessageConst.PropertyKeys, out var keys) ? keys : null;
 
-    /// <summary>
-    /// <c>msg.getKeys().split(MessageConst.KEY_SEPARATOR)</c> 的 Java 等价物：Java 的
-    /// <c>String.split</c>（limit=0）**丢弃所有尾部空串**，C# 的 <c>Split</c> 会保留。
-    /// </summary>
     private static void SplitKeysInto(HashSet<string> target, string keys)
     {
         string[] parts = keys.Split(MessageConst.KeySeparator);
@@ -238,7 +204,6 @@ public sealed class MessageAccumulation
         }
     }
 
-    /// <summary>Java <c>batch()</c>：把本批组装成一个 MessageBatch。</summary>
     private MessageBatch Batch()
     {
         var batch = new MessageBatch(new List<Message>(Messages))
@@ -259,7 +224,6 @@ public sealed class MessageAccumulation
         return batch;
     }
 
-    /// <summary>Java <c>splitSendResults</c>：批量应答拆成逐条 SendResult。</summary>
     private void SplitSendResults(SendResult sendResult)
     {
         string msgId = sendResult.MsgId ?? string.Empty;
@@ -289,7 +253,6 @@ public sealed class MessageAccumulation
         }
         else
         {
-            // 不含逗号：老 broker / 单条应答，所有下标共享同一个实例（Java 同）
             for (int i = 0; i < Count; i++)
             {
                 SendResults[i] = sendResult;
@@ -297,12 +260,6 @@ public sealed class MessageAccumulation
         }
     }
 
-    /// <summary>
-    /// Java <c>MessageAccumulation.send()</c>（同步）。⚠ 只能在**持有 <c>lock (this)</c>** 时
-    /// 调用：Java 的 <c>notifyAll()</c> 靠调用方（Add 里的 <c>synchronized (this)</c>）提供的
-    /// 监视器，C# 的 Monitor 同样要求持有锁。测试也直接调它（Java 单测同款：手工触发一次发送，
-    /// 不等守卫线程的周期）。
-    /// </summary>
     public void Send()
     {
         lock (_closedLock)
@@ -318,24 +275,17 @@ public sealed class MessageAccumulation
         MessageBatch batch = Batch();
         try
         {
-            // sendCallback == null 的分支在 Java 里返回非 null；C# 侧签名是 SendResult?
-            // （异步分支返回 null），这里同步链路断言一次。
             SendResult result = _producer.SendDirect(batch, AggregateKey.Mq, null)
                                ?? throw new InvalidOperationException("sync send returned null");
             SplitSendResults(result);
         }
         finally
         {
-            // 无论成败都归还全局字节额度（Java：finally 里 currentlyHoldSize -= messagesSize）
             _owner.ReleaseHold(MessagesSize);
             Monitor.PulseAll(this);
         }
     }
 
-    /// <summary>
-    /// Java <c>MessageAccumulation.send(SendCallback)</c>（异步）。参数与 Java 一样**不参与**
-    /// 逻辑（回调来自 <see cref="SendCallbacks"/>）；守卫线程传的就是 <c>null</c>。
-    /// </summary>
     internal void Send(ISendCallback? sendCallback)
     {
         _ = sendCallback;
@@ -392,8 +342,6 @@ public sealed class MessageAccumulation
         }
         catch (Exception e)
         {
-            // ⚠ Java 在这里**没有**归还 currentlyHoldSize（只有回调路径会还）—— 即"异步发送在
-            // 发起阶段就抛异常"会漏掉一份字节额度。照抄，别修。
             foreach (ISendCallback cb in SendCallbacks)
             {
                 cb.OnException(e);
@@ -401,7 +349,6 @@ public sealed class MessageAccumulation
         }
     }
 
-    /// <summary>把两个回调函数包成 ISendCallback（对应 Java 的匿名内部类）。</summary>
     private sealed class InlineSendCallback : ISendCallback
     {
         private readonly Action<SendResult> _onSuccess;
@@ -419,7 +366,6 @@ public sealed class MessageAccumulation
     }
 }
 
-/// <summary>对应 Java ProduceAccumulator：按 clientId 复用的自动攒批器。</summary>
 public sealed class ProduceAccumulator
 {
     public const long DefaultTotalHoldSize = 32L * 1024 * 1024;
@@ -501,7 +447,6 @@ public sealed class ProduceAccumulator
         _guardThreadForAsyncSend.Shutdown();
     }
 
-    // ---------------- 参数（Java 的校验口径与文案逐字照抄）----------------
     public int GetBatchMaxDelayMs() => HoldMs;
 
     public void BatchMaxDelayMs(int holdMs)
@@ -528,7 +473,6 @@ public sealed class ProduceAccumulator
         Volatile.Write(ref _holdSize, holdSize);
     }
 
-    /// <summary>Java 这里也返回 holdSize（不是 totalHoldSize）—— 上游笔误，照抄。</summary>
     public long GetTotalBatchMaxBytes() => HoldSize;
 
     public void TotalBatchMaxBytes(long totalHoldSize)
@@ -542,8 +486,6 @@ public sealed class ProduceAccumulator
         Volatile.Write(ref _totalHoldSize, totalHoldSize);
     }
 
-    // ---------------- 全局字节闸门 ----------------
-    /// <summary>Java <c>tryAddMessage</c>：还有额度就记账放行，否则拒绝（调用方退回直发）。</summary>
     public bool TryAddMessage(Message message)
     {
         lock (_holdLock)
@@ -563,7 +505,6 @@ public sealed class ProduceAccumulator
         }
     }
 
-    /// <summary>批次发送完成后的归还（Java 直接 <c>currentlyHoldSize.addAndGet(-size)</c>）。</summary>
     public void ReleaseHold(int size)
     {
         lock (_holdLock)
@@ -581,15 +522,12 @@ public sealed class ProduceAccumulator
         DefaultMQProducer producer) =>
         _asyncSendBatchs.GetOrAdd(key, k => new MessageAccumulation(k, producer, this));
 
-    /// <summary>Java <c>syncSendBatchs.remove(key, batch)</c>：只在值仍是它时才摘。</summary>
     internal void RemoveSyncBatch(AggregateKey key, MessageAccumulation batch) =>
         _syncSendBatchs.TryRemove(new KeyValuePair<AggregateKey, MessageAccumulation>(key, batch));
 
     internal void RemoveAsyncBatch(AggregateKey key, MessageAccumulation batch) =>
         _asyncSendBatchs.TryRemove(new KeyValuePair<AggregateKey, MessageAccumulation>(key, batch));
 
-    // ---------------- 对外发送入口 ----------------
-    /// <summary>Java <c>send(Message, DefaultMQProducer)</c>：只返回本条消息自己的 SendResult。</summary>
     public SendResult Send(Message msg, DefaultMQProducer producer)
     {
         var key = AggregateKey.OfMessage(msg);
@@ -658,8 +596,6 @@ public sealed class ProduceAccumulator
         }
     }
 
-    // ---------------- 守卫线程 ----------------
-    /// <summary>对应 Java 的 <c>ServiceThread</c> 子类（两个：同步 / 异步）。</summary>
     private sealed class GuardService
     {
         private readonly ProduceAccumulator _owner;
@@ -691,8 +627,6 @@ public sealed class ProduceAccumulator
         {
             _stopped = true;
             _thread?.Join(5000);
-            // 摘掉句柄，让后续 Start() 能再拉一根新线程：累加器是**按 clientId 复用**的，
-            // 同一个实例会经历 start→shutdown→start（Java 的 ServiceThread 同样可重复 start）。
             _thread = null;
         }
 
@@ -713,7 +647,6 @@ public sealed class ProduceAccumulator
             }
             catch (Exception)
             {
-                // Java：日志告警后继续跑（这里静默续跑，与其它守卫线程同口径）
             }
         }
 
@@ -748,8 +681,6 @@ public sealed class ProduceAccumulator
                 {
                     if (v.ReadyToSend())
                     {
-                        // Java `v.send(null)`：异步版（参数不参与逻辑，回调来自本批自己收集的
-                        // 那一串）。写 `v.Send()` 会落到**同步**重载上 —— 那是另一个语义。
                         v.Send(null);
                     }
 
@@ -769,11 +700,6 @@ public sealed class ProduceAccumulator
     }
 }
 
-/// <summary>
-/// 进程级复用表：对应 Java <c>MQClientManager.getOrCreateProduceAccumulator</c> —— 按 clientId
-/// 缓存，所以同进程里两个 clientId 相同的 producer 共享同一个累加器与同一对守卫线程
-/// （这也是「阈值先记在 producer 上、Start() 时再同步下去」的原因）。
-/// </summary>
 public static class ProduceAccumulatorRegistry
 {
     private static readonly ConcurrentDictionary<string, ProduceAccumulator> Table = new();

@@ -1,4 +1,3 @@
-// 异常类型（对应 org.apache.rocketmq.remoting.exception.*）。
 namespace RocketMQ.Remoting;
 
 /// <summary>基础远程调用异常。</summary>

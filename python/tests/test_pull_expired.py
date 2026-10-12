@@ -1,15 +1,3 @@
-# ProcessQueue 停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME）单测 —— 不需要集群。
-#
-# 为什么必须离线锁死：这一条判据是**唯一**能把"死掉的拉取循环"救回来的机制。
-# Java RebalanceImpl.updateProcessQueueTableInRebalance:438-461 在同一趟 rebalance 里
-# 先撤（!mqSet.contains 或 pq.isPullExpired() → setDropped + removeUnnecessaryMessageQueue）
-# 再建（新 ProcessQueue）。少第一步，一条循环线程异常退出后那个队列就**永久不再消费**
-# ——真机上表现为"某个队列一直不涨位点"，而且没有任何异常；少第二步（撤了不重建），
-# 后果同样是永久停摆。两种错都不会让任何一次已完成的投递失败，所以只能靠断言锁住。
-#
-# 阈值本身也锁在这里：Java ProcessQueue:43 读 `rocketmq.client.pull.pullMaxIdleTime`，
-# 默认 **120000ms**（不是网传的 60s），POP 分支换成 lastPopTimestamp（PopProcessQueue:74）。
-#
 # 与 C++/Rust/C# 的 test_pull_expired 一一对应；真机恢复场景见 ../verify_pull_expired_live.py
 #（注入停摆 → 走生产 rebalance 路径重建 → 同一队列继续消费、位点不回退）。
 import threading
@@ -79,7 +67,7 @@ def _retire_log(c):
 # ---------------- 常量与判据 ----------------
 
 def test_pull_max_idle_time_matches_the_long_polling_default():
-    """Java ProcessQueue:43 的默认值是 120s；写错方向会静默误撤健康队列或永不自愈。"""
+    pass
     assert PULL_MAX_IDLE_TIME == 120.0
 
 
@@ -143,7 +131,7 @@ def test_stalled_queue_is_retired_and_rebuilt_in_one_pass():
 
 
 def test_thread_death_is_enough_to_rebuild():
-    """Java 的 [BUG] 分支防的就是这个：循环线程被异常打穿，队列还在本实例名下。"""
+    pass
     c, mq, key = _consumer()
     retired = _retire_log(c)
     try:
@@ -181,7 +169,7 @@ def test_healthy_queue_is_left_alone():
 
 
 def test_assignment_registers_in_mq_map_before_first_message():
-    """分配即登记 _mq_map（Java ProcessQueueTable 的键集），否则停摆时无 mq 可持久化位点。"""
+    pass
     c, mq, key = _consumer()
     _retire_log(c)
     try:
@@ -235,12 +223,7 @@ def test_stopped_consumer_is_not_swept():
 # ---------------- 盖章时机：发起即盖章 ----------------
 
 def test_pull_loop_stamps_before_lock_and_flow_control():
-    """盖章在流控/锁判定**之前**（Java pullMessage:253 的位置）：卡住的循环也要留下心跳。
-
-    若把盖章挪到流控之后，一次持续超 120s 的流控会让 rebalance 误判停摆并撤队列，
-    把"消费慢"处理成"重投一遍"。这里用必触发流控的消费者验证：一次网络都没打，
-    时刻却一直在前进。
-    """
+    pass
     c, mq, key = _consumer()
     pulls = []
 
@@ -309,10 +292,7 @@ def test_pop_loop_stamps_before_flow_control():
 # ---------------- 运行信息：307 要能看见时刻 ----------------
 
 def test_running_info_reports_real_last_pull_timestamp():
-    """Java ProcessQueue.fillOutRunningInfo:456 报 lastPullTimestamp。
-
-    写死 0 等于把停摆判据的现场证据全丢了：运维查 307 时看不到"这路多久没拉了"。
-    """
+    pass
     c, mq, key = _consumer()
     _retire_log(c)
     try:

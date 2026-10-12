@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-"""org.apache.rocketmq.common.message 的 Python 对应：消息模型与编解码。"""
 from __future__ import annotations
 
 import socket
@@ -11,14 +10,13 @@ from .mix_all import MixAll
 
 
 class MessageQueue:
-    """对应 org.apache.rocketmq.common.message.MessageQueue."""
+    pass
 
     def __init__(self, topic: str = "", broker_name: str = "", queue_id: int = 0):
         self.topic = topic
         self.broker_name = broker_name
         self.queue_id = queue_id
 
-    # ---- Java 风格 getter / setter（保证 JSON 字段名 camelCase）----
     def get_topic(self) -> str:
         return self.topic
 
@@ -41,7 +39,7 @@ class MessageQueue:
         return str(self.queue_id)
 
     def hashcode(self) -> int:
-        """与 Java hashCode 对齐：((31+bh)*31+qid)*31+th，结果按 32 位有符号回绕。"""
+        pass
         topic_hash = self._str_hash(self.topic)
         broker_hash = self._str_hash(self.broker_name)
         return c_int32(((31 + broker_hash) * 31 + self.queue_id) * 31 + topic_hash)
@@ -51,7 +49,6 @@ class MessageQueue:
         h = 0
         for ch in s:
             h = 31 * h + ord(ch)
-        # Java int 溢出：以 32 位有符号回绕
         return c_int32(h)
 
     def __hash__(self) -> int:
@@ -83,15 +80,7 @@ def c_int32(x: int) -> int:
 
 
 def is_wait_store_msg_ok(msg: "Message") -> bool:
-    """Java ``Message.isWaitStoreMsgOK()``：**属性缺省即 true**，其余走
-    ``Boolean.parseBoolean`` —— 只有忽略大小写的 ``"true"`` 为真。
-
-    ⚠ 别写成 ``msg.get_wait_store_msg_ok() == "true"``。本模块的 ``Message.__init__``
-    （与 Rust 的 ``Message::new`` 一样）**不**预写 ``WAIT``，所以"属性缺省"是**常态而不是
-    边角**：按 ``== "true"`` 判会让普通消息变成 ``WAIT=false``，``MessageBatch`` 就会以
-    ``WAIT=false`` 下发 —— broker 不等刷盘就回 ``SEND_OK``。
-    Rust / C# / C++ 三端同名函数用同一条判据。
-    """
+    pass
     value = msg.get_wait_store_msg_ok()
     if value is None:
         return True
@@ -99,7 +88,7 @@ def is_wait_store_msg_ok(msg: "Message") -> bool:
 
 
 class Message:
-    """对应 org.apache.rocketmq.common.message.Message."""
+    pass
 
     def __init__(self, topic: str = "", body: Optional[bytes] = None,
                  tags: Optional[str] = None, keys: Optional[str] = None,
@@ -159,7 +148,6 @@ class Message:
     def clear_property(self) -> None:
         self.properties.clear()
 
-    # ---- Java 风格 ----
     def get_topic(self) -> str:
         return self.topic
 
@@ -195,7 +183,7 @@ class Message:
 
 
 class MessageExt(Message):
-    """对应 org.apache.rocketmq.common.message.MessageExt（拉取到的消息）。"""
+    pass
 
     def __init__(self, topic: str = "", body: Optional[bytes] = None,
                  tags: Optional[str] = None, keys: Optional[str] = None, flag: int = 0):
@@ -331,18 +319,14 @@ class MessageExt(Message):
 
 
 class MessageBatch(Message):
-    """批量消息（对应 org.apache.rocketmq.common.message.MessageBatch）。
-
-    没有自己的序列化字段，body 由 ``encode()`` 生成：
-    ``MessageDecoder.encodeMessages(messages)`` 的拼接结果（每条为 6 段轻量格式）。
-    """
+    pass
 
     def __init__(self, messages: Optional[List[Message]] = None):
         super().__init__()
         self.messages: List[Message] = list(messages) if messages else []
 
     def encode(self) -> bytes:
-        """对应 Java MessageBatch.encode()。"""
+        pass
         from .message_decoder import encode_messages
         return encode_messages(self.messages)
 
@@ -354,12 +338,7 @@ class MessageBatch(Message):
 
     @staticmethod
     def generate_from_list(messages: List[Message]) -> "MessageBatch":
-        """对应 Java MessageBatch.generateFromList。
-
-        约束：非空；同一 topic；同一 waitStoreMsgOK；不允许延时消息；不允许重试 topic。
-        Java 抛 UnsupportedOperationException / IllegalArgumentException，
-        这里统一映射为 Python 的 ValueError。
-        """
+        pass
         if not messages:
             raise ValueError("messages must not be null or empty")
 
@@ -382,10 +361,6 @@ class MessageBatch(Message):
 
         batch = MessageBatch(message_list)
         batch.set_topic(first.get_topic())
-        # Java generateFromList:70 是 ``batch.setWaitStoreMsgOK(first.isWaitStoreMsgOK())``：
-        # **属性缺省即 true**。曾经写成 ``first.get_wait_store_msg_ok() == "true"`` ——
-        # 缺省（None）被判成 False，于是普通消息（``Message.__init__`` 不写 WAIT）组成的
-        # 批量会以 ``WAIT=false`` 下发：broker 不等刷盘就回 SEND_OK，持久性静默降级。
         batch.set_wait_store_msg_ok(is_wait_store_msg_ok(first))
         batch.set_body(batch.encode())
         return batch

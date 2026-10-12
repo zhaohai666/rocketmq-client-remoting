@@ -1,23 +1,4 @@
 # -*- coding: utf-8 -*-
-"""``correctTagsOffset`` 单测（Java ``DefaultMQPushConsumerImpl:713-717``），不需要集群。
-
-为什么必须离线锁死：这条路径错了是**静默**的两种极端 ——
-
-  - 漏了它：tag 长期不匹配 / 客户端二次过滤把一批全摘掉的队列，broker 侧"已消费位点"
-    原地不动，每次重投/重启都把这批没人要的消息从头再扫一遍；
-  - 闸门没守住（进程队列里还有消息就抬位点）：崩溃恢复时**静默跳过**在途的那批，消息真丢。
-
-两个方向在真机短期窗口里都看不出差别，所以断言全部放离线。
-
-判据来源：Java 在拉取回调里（``:394-401``）对 ``NO_NEW_MSG`` / ``NO_MATCHED_MSG`` 两态调
-``correctTagsOffset``。后者是 broker 侧按订阅表达式过滤后一条没匹配上
-（``MQClientAPIImpl:1095-1097`` 把 ``PULL_RETRY_IMMEDIATELY`` 映射成它），前者覆盖
-"客户端二次 tag 过滤把一批全摘掉之后，下一轮长轮询空手而归"。闸门是
-``0L == processQueue.getMsgCount()``，而 ``msgCount`` 数的是**仍在 ProcessQueue 里**的消息
-（在途批次要等 listener 返回之后才 ``removeMessage``，见
-``ConsumeMessageConcurrentlyService:266``），所以本端口的「进程队列为空」=
-``_pending`` 为空 **且** ``_msg_queue_inflight`` 为 0。
-"""
 from __future__ import annotations
 
 import threading
@@ -102,8 +83,6 @@ class TestAdvancesOnEmptyResponse:
 
 class TestIncreaseOnly:
     def test_never_regresses(self):
-        # Java updateOffset(..., increaseOnly=true)：应答里的 nextBeginOffset 比本地
-        # 已记录的还小（位点被别处置动过）时不动
         h = Harness()
         h.seed_consume_offset(200)
         h.correct(PullStatus.NO_NEW_MSG, 110)
@@ -121,15 +100,12 @@ class TestIncreaseOnly:
 
 class TestProcessQueueGuard:
     def test_pending_blocks(self):
-        # 还有消息躺在缓冲里（Java msgCount > 0）：这批迟早会消费，位点不能越过它
         h = Harness()
         h.seed_pending([7])
         h.correct(PullStatus.NO_NEW_MSG, 110)
         assert h.offset is None
 
     def test_in_flight_batch_blocks(self):
-        # 缓冲已被分发线程取走、listener 还在跑：Java 那边 removeMessage 尚未调用，
-        # msgCount 仍 > 0。不等它落定就抬位点 = 崩溃时静默跳过在途消息
         h = Harness()
         h.seed_inflight(1)
         h.correct(PullStatus.NO_MATCHED_MSG, 110)
@@ -158,7 +134,6 @@ class TestStatusGate:
         assert h.offset == 50
 
     def test_offset_illegal_is_ignored(self):
-        # OFFSET_ILLEGAL 是 Java 的另一条分支（drop + 冻结位点后重平衡），与这里无关
         h = Harness()
         h.seed_consume_offset(50)
         h.correct(PullStatus.OFFSET_ILLEGAL, 110)

@@ -13,12 +13,6 @@ declare(strict_types=1);
 // 判据是「**一笔都没拉过**的实例拿到非空份额」——算不动时本端口的设计是保留现有分配
 // （空集），所以非空只可能来自真算，不是兜底。
 //
-// 两个踩过的坑（不要"顺手优化"掉）：
-//   1. 心跳订阅集只从 registerTopics 来（Java subscriptions():357-385），所以必须在
-//      start() **之前** registerTopic()，否则 broker 数不出本组、38 回空列表（这是正确
-//      行为，但这条腿就没得测了）；
-//   2. 发完不能立刻读 maxOffset：broker 的 ConsumeQueue 是异步分发的，必须轮询到各队列
-//      max-min 之和到位（同 python 的 wait_offsets）。
 //
 // 收口行 `PASS=<n> FAIL=<n>`；任一 FAIL 非 0 退出。
 require __DIR__ . '/../bootstrap.php';

@@ -1,14 +1,7 @@
-// org.apache.rocketmq.common.topic.TopicValidator 的 C# 对应：topic / group 名字合法性判定。
 namespace RocketMQ.Common;
 
 /// <summary>
 /// topic / group 名字的字符表与保留名判定。
-///
-/// Java 的字符表白名单是 <c>^[%|a-zA-Z0-9_-]+$</c>，实现方式是一张 128 长的
-/// <c>VALID_CHAR_BIT_MAP</c>：<b>码点 &gt;= 128 一律非法</b>。这里逐字节照抄，因为 broker 侧
-/// （<c>TopicConfigValidator</c>）用的是同一张表，客户端放行而 broker 拒绝只会把错误推迟到
-/// 建 topic 那一刻，而名字是<b>发送路径</b>上就该定的东西。
-/// </summary>
 public static class TopicValidator
 {
     public const int TopicMaxLength = 127;
@@ -18,10 +11,8 @@ public static class TopicValidator
     /// </summary>
     public const int GroupMaxLength = 120;
 
-    /// <summary>仅 TopicValidator.ValidateTopic 使用，checkTopic 不用（Java 同）。</summary>
     public const int RetryOrDlqTopicMaxLength = 255;
 
-    /// <summary>Java 报错文案里引用的正则原文。</summary>
     public const string ValidCharPattern = "^[%|a-zA-Z0-9_-]+$";
 
     public const string AutoCreateTopicKeyTopic = "TBW102";
@@ -72,15 +63,10 @@ public static class TopicValidator
         RmqSysRocksdbTransOpHalfTopic,
     };
 
-    /// <summary>Java 的 VALID_CHAR_BIT_MAP 展开成集合：ASCII 数字、大小写字母和 % - _ |。</summary>
     private static bool AllowedChar(char c) =>
         c is >= '0' and <= '9' or >= 'a' and <= 'z' or >= 'A' and <= 'Z'
         or '%' or '-' or '_' or '|';
 
-    /// <summary>
-    /// 对应 <c>TopicValidator.isTopicOrGroupIllegal</c>。
-    /// 空串返回 false —— 空由 checkTopic/checkGroup 的 isBlank 那一步管，与 Java 一致。
-    /// </summary>
     public static bool IsTopicOrGroupIllegal(string? name)
     {
         if (string.IsNullOrEmpty(name))
@@ -90,7 +76,6 @@ public static class TopicValidator
 
         foreach (char c in name)
         {
-            // Java 的位图只有 128 位：非 ASCII 码点一律非法，不做 Unicode 归类。
             if (c >= 128 || !AllowedChar(c))
             {
                 return true;

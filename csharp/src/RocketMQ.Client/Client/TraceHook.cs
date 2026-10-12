@@ -1,10 +1,3 @@
-// 消息轨迹钩子（对应 org.apache.rocketmq.client.trace.hook 包）。
-//
-//   * SendMessageTraceHook        ← SendMessageTraceHookImpl
-//   * ConsumeMessageTraceHook     ← ConsumeMessageTraceHookImpl
-//   * EndTransactionTraceHook     ← EndTransactionTraceHookImpl
-//   * DefaultRecallMessageTraceHook ← 同名 Java 类（RPCHook 形态，见文件尾）
-//
 // 两条硬性约定：
 //   1. 轨迹消息本身不再被追踪：before/after 都先看 topic 是否以轨迹 topic 开头，是则直接
 //      return（否则轨迹会自我复制）。
@@ -76,7 +69,6 @@ public sealed class SendMessageTraceHook : ISendMessageHook
         }
 
         SendResult result = context.SendResult;
-        // broker 侧 traceOn=false 或没带回 region 时不落库（对齐 Java）。
         if (string.IsNullOrEmpty(result.RegionId) || !result.TraceOn)
         {
             return;
@@ -186,10 +178,6 @@ public sealed class ConsumeMessageTraceHook : IConsumeMessageHook
         _localDispatcher.Append(subAfter);
     }
 
-    /// <summary>ConsumeReturnType 名字 → ordinal（对齐 Java org.apache.rocketmq.client.consumer.listener.
-    /// ConsumeReturnType：SUCCESS=0、TIME_OUT=1、EXCEPTION=2、RETURNNULL=3、FAILED=4）。
-    /// ⚠ 这里**不是** ConsumeConcurrentlyStatus（CONSUME_SUCCESS/RECONSUME_LATER），写错会让
-    /// 控制台的 contextCode 整体错位。</summary>
     private static int ReturnTypeOrdinal(string name) => name switch
     {
         "SUCCESS" => 0,
@@ -249,9 +237,6 @@ public sealed class EndTransactionTraceHook : IEndTransactionHook
         _localDispatcher.Append(tuxeContext);
     }
 
-    /// <summary>把 LocalTransactionState 映射成 Java 枚举名（Java 写的是 name()，即
-    /// COMMIT_MESSAGE / ROLLBACK_MESSAGE / UNKNOW）。⚠ C# 枚举成员是 CommitMessage 这种
-    /// 帕斯卡命名，直接 ToString() 会写出 "CommitMessage"，控制台认不出来。</summary>
     private static string TransactionStateName(object? state) => state switch
     {
         null => string.Empty,
@@ -267,27 +252,8 @@ public sealed class EndTransactionTraceHook : IEndTransactionHook
     };
 }
 
-/// <summary>
-/// 撤回消息的轨迹钩子（对应 org.apache.rocketmq.client.trace.hook.DefaultRecallMessageTraceHook）。
-///
-/// 与发送/消费钩子不同，Java 把它实现成 <b>RPCHook</b>：RECALL_MESSAGE(370) 没有发送上下文
-/// 可挂，轨迹只能在 RPC 的响应侧记 —— DoAfterResponse 里按请求码过滤出 recall 这一笔，
-/// 解出句柄里的 topic / msgId，组装 TraceType.Recall 的轨迹丢给分发器（编码器见
-/// TraceDataEncoder 的 "Recall" 分支：时间戳/region/group/topic/msgId/成功与否 六段）。
-///
-/// 三道闸（Java 逐条对应，缺一就直接返回）：
-///   1. 请求码必须是 RECALL_MESSAGE；
-///   2. <see cref="EnableDefaultTrace"/> 为真 —— Java 读系统属性
-///      <c>com.rocketmq.recall.default.trace.enable</c>（默认 false），本端口读同名环境变量
-///      （"true"/"1"，与 ROCKETMQ_TLS_ENABLE 同一口径），也允许实例上直接赋值打开；
-///   3. 响应 ExtFields 里带 MSG_REGION（broker 没回 region 就不落轨迹）且分发器非空。
-///
-/// 解句柄/建轨迹的**任何异常都吞掉**（Java 同处 catch Exception 空处理）：
-/// 轨迹是旁路观测，绝不能让一条格式坏的句柄把撤回 RPC 本身搞挂。
-/// </summary>
 public sealed class DefaultRecallMessageTraceHook : IRpcHook
 {
-    /// <summary>Java 的 RECALL_TRACE_ENABLE_KEY。</summary>
     public const string RecallTraceEnableKey = "com.rocketmq.recall.default.trace.enable";
 
     private static readonly string? EnvEnabled = Environment.GetEnvironmentVariable(RecallTraceEnableKey);
@@ -306,7 +272,6 @@ public sealed class DefaultRecallMessageTraceHook : IRpcHook
 
     public void DoBeforeRequest(string remoteAddr, RemotingCommand request)
     {
-        // Java 同款空实现：轨迹记在响应侧
     }
 
     public void DoAfterResponse(string remoteAddr, RemotingCommand request, RemotingCommand? response)
@@ -349,7 +314,6 @@ public sealed class DefaultRecallMessageTraceHook : IRpcHook
         }
         catch (Exception)
         {
-            // Java 同处：吞掉一切异常（轨迹旁路，不影响撤回本身）
         }
     }
 }

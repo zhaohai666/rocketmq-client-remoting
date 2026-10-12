@@ -1,17 +1,7 @@
 // 自动压缩的**真实集群 + 跨客户端**联调工具（对应 python/verify_compression_live.py）。
 //
-// 为什么需要它：单元测试只能证明「zlib 往返正确」，证明不了
-//   1. producer 真的在超过 compressMsgBodyOverHowmuch(4096) 时压缩并置 COMPRESSED_FLAG；
-//   2. broker 存的是压缩体（storeSize 远小于原文）；
-//   3. 消费端真的解压并把 COMPRESSED_FLAG 清掉（对齐 Java MessageDecoder 第 520-523 行）；
-//   4. **别的客户端（Java）产生的压缩消息，我们能正确解压** —— 这是真机才暴露的静默数据损坏点。
 //
-// 载荷是**确定性**的（重复一行固定文本后截断），与 Java 探针 CompressProbe 完全相同，
-// 因此两端各自本地重建后比较 CRC32 即可，无需交换文件。
 //
-// ⚠ CRC32 显示值会不同，这不是 bug：Java `UtilAll.crc32` 返回 `(int)(value & 0x7FFFFFFF)`，
-// 砍掉了最高位；本工具用标准 CRC-32。所以 Java 打印 1785582993 对应本工具打印 3933066641
-// （差正好 2^31）。判定互通要看各自的 `match=` 字段，不要直接比两边打印的 CRC 数字。
 //
 // 用法：
 //   rmq_compression_live selftest <namesrv>
@@ -41,7 +31,6 @@ namespace {
 
 const char* kLine = "rocketmq-compress-interop-payload-line-0123456789\n";
 
-// Java CompressProbe.buildPayload 的等价实现（必须逐字节一致）
 std::string buildPayload(int size) {
     std::string s;
     s.reserve(static_cast<size_t>(size) + 64);
@@ -252,8 +241,6 @@ int main(int argc, char** argv) {
           "storeSize=" + std::to_string(m.storeSize) + " 原文=" + std::to_string(size)
           + " 压缩比=" + std::to_string(size / (m.storeSize > 0 ? m.storeSize : 1)) + ":1");
 
-    // 4) 解压后 COMPRESSED_FLAG 必须被清掉（对齐 Java MessageDecoder 第 523 行），
-    //    否则上层会误以为 body 还是压缩的。
     check("解压后 COMPRESSED_FLAG 已清除",
           !MessageSysFlag::isCompressed(m.sysFlag),
           "sysFlag=" + std::to_string(m.sysFlag));
@@ -310,10 +297,6 @@ int main(int argc, char** argv) {
               + std::to_string(restored.body.size()));
     }
 
-    // 7) 另外两个后端（LZ4 Frame / ZSTD）各过一遍真机闭环：生产端压缩 → broker 存压缩体
-    //    → 消费端解压还原。单测里有用 Java 那套库（lz4-java / zstd-jni）生成的硬编码夹具
-    //    证明**线上格式**互通，这里证明的是「自己的发送路径真的用上了这个后端」。
-    //    构建时没编入对应系统库的后端打 SKIP，不算失败。
     struct Backend {
         const char* name;
         int32_t type;

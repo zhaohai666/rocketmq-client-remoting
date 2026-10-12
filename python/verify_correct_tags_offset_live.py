@@ -1,25 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""correctTagsOffset 真机验证（Java DefaultMQPushConsumerImpl:713-717，调用点 :394-401）。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_correct_tags_offset_live.py 127.0.0.1:9876
-
-离线单测锁得住「哪些状态要修正 + 闸门何时放行」，锁不住「这条修正真的走到了 broker」：
-位点最终由 UPDATE_CONSUMER_OFFSET 落盘，只有真集群能证明 broker 上的已提交位点前移了、
-而且是在**一条消息都没投递**的前提下前移的。
-
-两条腿正好覆盖两个空应答状态（订阅表达式永不匹配 ⇒ broker 按组订阅过滤）：
-  S1 对照组：同 topic 用 TagA 订阅正常消费 5 条 —— 证明消息确实在队列里，且
-     "已提交位点 == 各队列 maxOffset" 这个数值口径本身就是常规消费的落点。
-  S2 NO_MATCHED_MSG：换成 TagB 订阅（永不匹配）。broker 侧过滤后应答是
-     PULL_RETRY_IMMEDIATELY（MQClientAPIImpl:1095-1097 → NO_MATCHED_MSG）。
-     断言：listener 一条都没收到，而每条队列的已提交位点仍等于该队列的 maxOffset。
-     没有这条修正时，位点永远停在未提交状态（broker 上查无此记录）。
-  S3 NO_NEW_MSG：同一个消费者启动时会自动补上 %RETRY%<group> 订阅，该队列是空的
-     → PULL_NOT_FOUND → NO_NEW_MSG。断言：broker 上出现值 == maxOffset(0) 的记录
-     （没有修正时这个 key 根本不会进 _consume_offsets，也就没有报文）。
-"""
 from __future__ import annotations
 
 import sys

@@ -1,7 +1,3 @@
-// 拉取前流控（Java ProcessQueue 的五个阈值）真机验证
-//（对应 python/verify_flow_control_live.py、cpp/examples/live_flow_control.cpp、
-//  rust/examples/live_flow_control.rs 的 S0–S5，判据逐条同构）。
-//
 // 离线单测（tests/FlowControlTests.cs）锁的是**判据本身**；这里锁真机上两件离线永远
 // 锁不住的事：
 //   A 闸门在真实 broker 上**确实会命中**。单位错一位、阈值读错一个字段，离线拿预置
@@ -11,15 +7,6 @@
 //     位点不许越过还没消费完的消息，恢复后同一个队列必须继续消费到末尾。写成"命中就
 //     丢批 / 退出循环"在十几秒窗口里完全看不出来，只有把全部消息数完才暴露。
 //
-// 场景：
-//   S0 默认闸门 + 快消费：不该命中（triggered==0），12 条全到 —— 防闸门误伤正常流量。
-//   S1 队列级字节闸门：条数/跨度放到不可能命中，size=1(MiB) + 400KB 不可压缩大消息 + 慢消费。
-//   S2 位点跨度闸门：条数/字节都关掉，只剩 consumeConcurrentlyMaxSpan=2。
-//   S3 topic 级条数闸门：队列级三条全关掉，只剩 pullThresholdForTopic=4 —— 必须跨队列累计。
-//   S4 命中之后恢复：复用 S1 的组与 topic 再来一批大消息，闸门仍命中且新消息照单全收
-//      （锁"暂停 100ms"被写成"退出拉取循环"的错误 —— S1 看不出差别）。
-//   S5 启动期数值闸门（Java checkConfig :1099-1209）：区间边界值真机能跑起来并收全消息，
-//      越界配置在本地就被拒，且 broker 侧查不到这个组（没留下僵尸 clientId 撑歪 cidAll）。
 //
 // ⚠ 大消息必须**不可压缩**：生产者对超过压缩阈值的 body 先试压，全同字节的 payload 会被
 //   压到几百字节，broker 落盘的 StoreSize 跟着变几百字节 —— "size 闸门永不命中"就成了
@@ -46,10 +33,6 @@ public static class LiveFlowControl
     private static int _pass;
     private static int _fail;
 
-    /// <summary>"把这道闸门压到不命中"的合法写法：Java checkConfig(:1099-1209) 给的
-    /// **上界**（pullThresholdForQueue / consumeConcurrentlyMaxSpan 都是 [1, 65535]），
-    /// <b>不是</b> int.MaxValue、也不是 0。两者都会在 Start() 被拒：0 越下界，
-    /// 20 亿越上界 —— 而校验是这次改动新加的，夹具必须跟着改成 Java 也认可的写法。</summary>
     private const int Huge = 65535;
 
     /// <summary>字节闸门"关闭"的写法同上：pullThresholdSizeForQueue 合法域 [1, 1024] MiB。</summary>
@@ -290,14 +273,6 @@ public static class LiveFlowControl
         Check("S4-恢复批次不重复", c.Sink.Distinct() == 6, "distinct=" + c.Sink.Distinct());
     }
 
-    // ---------------- S5 启动期数值闸门（Java checkConfig :1099-1209）----------------
-    // 离线单测（tests/ConsumerCheckConfigTests.cs）锁的是区间与文案；这里补两件只有
-    // 真集群能锁死的事：
-    //   1. 落在 Java 区间**边界**上的配置真能把消费者跑起来并收全消息 —— 闸门写歪最常
-    //      见的方式是"比 Java 还严"，把合法配置也拒了，用户直接起不来；
-    //   2. 越界的配置**没有打到 broker 上**。写成"先注册再校验"的话，broker 的
-    //      ConsumerManager 会留下一堆永不心跳的僵尸 clientId，把 rebalance 用的 cidAll
-    //      撑歪（真机表现为队列分配不均），而客户端日志里只有启动失败那一条。
     private static void S5CheckConfig(DefaultMQProducer producer)
     {
         string topic = Topic("Config");
@@ -305,8 +280,6 @@ public static class LiveFlowControl
         string goodGroup = Group("5");
         string badGroup = Group("6");
 
-        // 每条闸门都取 Java 区间的端点值：PullBatchSize=1024、PopInvisibleTime=300000
-        // 这类"贴着上限"的写法在生产里就是"实际不拦"，误拒等于把用户挡在门外。
         Case c = StartConsumer("5", topic, 0);
         c.Consumer.SetConsumeThreadMin(1);
         c.Consumer.SetConsumeThreadMax(2);
@@ -346,8 +319,6 @@ public static class LiveFlowControl
                 "got=" + c.Sink.Got() + " distinct=" + c.Sink.Distinct());
         }
 
-        // 越界配置：本地拒（文案逐字对 Java）+ 失败后不留半启动实例。
-        // 每条都取"刚刚越界"的值：差 1 就够，越界幅度大不代表更可信。
         (Action<DefaultMQPushConsumer> Break, string Want)[] bad =
         {
             (x => x.PullThresholdSizeForQueue = 0,

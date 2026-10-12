@@ -1,5 +1,3 @@
-// -*- coding: utf-8 -*-
-// Client-side unique message id generator (org.apache.rocketmq.common.message.MessageClientIDSetter).
 import { getHostIp, getPid, bytes2string } from './utilAll.ts';
 
 function ipToBytes(ip) {

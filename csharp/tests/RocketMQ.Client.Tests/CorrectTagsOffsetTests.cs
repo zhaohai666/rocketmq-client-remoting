@@ -1,18 +1,3 @@
-// correctTagsOffset（Java DefaultMQPushConsumerImpl:713-717，调用点 :394-401）单测 —— 不需要集群。
-//
-// 为什么必须离线锁死：拉取应答是 NO_NEW_MSG / NO_MATCHED_MSG 时，若 ProcessQueue 里没有消息，
-// Java 会把"已消费位点"抬到应答的 nextBeginOffset（increaseOnly=true）。漏了这件事是**静默**的：
-// broker 侧按 tags/表达式把这一段的每一条都滤掉时，客户端既收不到消息、位点也不动，
-// queryConsumerOffset 永远落后，重启后把这批没人要的消息从头再扫一遍。反过来，闸门写松
-//（不等在途批次落定就抬位点）同样是静默的：进程崩溃时那批消息被跳过。
-//
-// 闸门 = Java 的 `0L == processQueue.getMsgCount()`：msgCount 数的是**仍在 ProcessQueue 里**的
-// 消息，而并发消费的 removeMessage 要等 listener 返回才跑（ConsumeMessageConcurrentlyService:266），
-// 所以在途批次也算数。本端口把 _pending 为空与 _inFlight 为 0 合成同一判据；DispatchLoop
-// 的生产路径就是 TakeBatchForConsume + finally FinishBatchConsume（Consumer.cs:3304/3330），
-// 所以这两个门面（连同 InFlightForTest）与 ConsumeBatchForTest 同一理由开放给单测。
-// 与 python/tests/test_correct_tags_offset.py、rust/src/client/consumer.rs 的同名测试同题；
-// 真机证据（broker 过滤 → NO_MATCHED_MSG → broker 侧位点前移）见 examples 的对应场景。
 
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -91,7 +76,6 @@ public class CorrectTagsOffsetTests
         }
     }
 
-    /// <summary>Java 的 updateOffset(..., increaseOnly=true)：只前进不回退。</summary>
     [Fact]
     public void NeverRegresses()
     {
@@ -106,13 +90,6 @@ public class CorrectTagsOffsetTests
         Assert.Equal(101, h.Offset());
     }
 
-    /// <summary>
-    /// 表里没有记录时无条件建条目（Java <c>RemoteBrokerOffsetStore.updateOffset:61-64</c>
-    /// 的 <c>putIfAbsent</c>），哪怕应答位点就是 0。
-    /// 用 <c>TryGetValue</c> 的默认值 0 把「没有记录」与「记录是 0」混同，会让空队列
-    /// （nextBeginOffset == 0）的首次修正变成静默 no-op：broker 上永远查不到这条队列的
-    /// 位点记录（真机 S3 就是这么抓出来的）。
-    /// </summary>
     [Fact]
     public void CreatesTheRecordEvenForAZeroOffset()
     {

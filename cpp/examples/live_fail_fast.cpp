@@ -1,6 +1,3 @@
-// broker 真的死了：在途请求必须**立刻**有终态（Java ``failFast`` → ``requestFail``）真机验证。
-// 用法：rmq_live_fail_fast 127.0.0.1:9876
-//
 // 与 Python verify_fail_fast_live.py 同场景、同断言（三语言对拍共用一套口径）。
 //
 // 离线用例（tests/test_fail_fast.cpp）锁的是传输层契约：本机假对端读完就关，断言
@@ -323,7 +320,6 @@ int main(int argc, char** argv) {
             }
             worst = std::max(worst, p.costSeconds);
         }
-        // 报的是 RemotingSendRequestException（Java failFast 的口径）
         check("L3 报的是 RemotingSendRequestException（Java failFast 的口径）",
               sendRequest == kPARKED, "kinds=" + kinds);
         check("L3 一条都没被报成超时（类型错 = 重试决策错）", timeouts == 0,

@@ -1,7 +1,3 @@
-// RocketMQ 二进制读写工具：全部大端（network byte order），与 Java ByteBuffer 默认序一致。
-//
-// C++ 侧是「往 Bytes(std::string) 里 push」的函数式 API；C# 用 ByteWriter/ByteReader 两个类，
-// 语义一一对应（方法名保持 Java DataOutputStream 的 writeInt/Long/Short/Byte 风格）。
 using System.Buffers.Binary;
 using System.Globalization;
 
@@ -37,7 +33,6 @@ public sealed class ByteWriter
         _buf[_len++] = v;
     }
 
-    /// <summary>写一个有符号字节（Java writeByte）。C# 没有 signed byte 的独立存储，按位写。</summary>
     public void WriteInt8(sbyte v) => WriteUInt8(unchecked((byte)v));
 
     public void WriteInt16(short v)
@@ -47,7 +42,6 @@ public sealed class ByteWriter
         _len += 2;
     }
 
-    /// <summary>写 16 位无符号（Java writeShort 的位模式用途，如 int16 的「无符号」读法）。</summary>
     public void WriteUInt16(ushort v)
     {
         Ensure(2);
@@ -162,7 +156,6 @@ public sealed class ByteReader
         }
     }
 
-    /// <summary>不移动游标的读取（对应 Java ByteBuffer.get(index) 系列）。</summary>
     public int PeekInt32(int index) => GetInt32At(_data, index);
 
     public long PeekInt64(int index) => GetInt64At(_data, index);
@@ -173,14 +166,12 @@ public sealed class ByteReader
         return unchecked((sbyte)_data[_pos++]);
     }
 
-    /// <summary>读一个无符号字节，按 int 返回（Java readUnsignedByte）。</summary>
     public int ReadUnsignedInt8()
     {
         Require(1);
         return _data[_pos++];
     }
 
-    /// <summary>读 16 位，按**无符号**语义返回 int（Java readUnsignedShort）。</summary>
     public int ReadUnsignedInt16()
     {
         Require(2);
@@ -248,12 +239,6 @@ public sealed class ByteReader
 
 public static class LegacyHash
 {
-    /// <summary>
-    /// Java String.hashCode：逐 char（UTF-16 单元）累加，32 位有符号回绕。
-    /// C# 的 <see cref="string"/> 本来就是 UTF-16，所以直接迭代 char 即与 Java 逐位一致
-    /// （C++ 侧要先从 UTF-8 解码再拆代理对，这里天然不需要）。
-    /// unchecked 保证溢出回绕而不是抛异常。
-    /// </summary>
     public static int StringHash(string s)
     {
         unchecked
@@ -269,7 +254,6 @@ public static class LegacyHash
     }
 }
 
-/// <summary>Java 的 int/long 溢出语义：结果按 32/64 位有符号回绕（对应 C++ 的 toInt32）。</summary>
 public static class LegacyNumber
 {
     public static int ToInt32(long v) => unchecked((int)(v & 0xFFFFFFFFL));

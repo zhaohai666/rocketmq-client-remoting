@@ -487,10 +487,8 @@ func TestAdminCreateTopicSendsTopicFilterTypeAndDefaults(t *testing.T) {
 		"perm":           "6",
 		"topicSysFlag":   "0",
 		"order":          "false",
-		// Java's AttributeParser.parseToString(emptyMap) == "" and the field is
-		// still sent.
-		"attributes": "",
-		"force":      "false",
+		"attributes":     "",
+		"force":          "false",
 	}
 	for k, want := range checks {
 		if got := ext(t, req, k); got != want {
@@ -499,8 +497,6 @@ func TestAdminCreateTopicSendsTopicFilterTypeAndDefaults(t *testing.T) {
 	}
 }
 
-// A broker REJECTION is final — Java rethrows MQBrokerException out of the
-// retry loop instead of retrying five times.
 func TestAdminCreateTopicBrokerRejectionIsNotRetried(t *testing.T) {
 	c := newAdminCluster(t)
 	c.brokerAnswer[remoting.ReqUpdateAndCreateTopic] = func(*remoting.RemotingCommand) *remoting.RemotingCommand {
@@ -669,11 +665,6 @@ func TestAdminUpdateBrokerConfigSendsPropertiesText(t *testing.T) {
 	}
 }
 
-// 401 has NO request header at all: Java `MQClientAPIImpl:3304-3311` creates the
-// command with a null header and encodes all four fields into the body, which is
-// what `AdminBrokerProcessor` decodes. A header-only request leaves the broker
-// with a null body (NPE / silent no-op), so the shape is asserted both ways: the
-// body must carry everything, the ext fields must carry NOTHING.
 func TestAdminSetMessageRequestModeSendsBodyNotHeader(t *testing.T) {
 	c := newAdminCluster(t)
 	requireNoError(t, "setMessageRequestMode",
@@ -698,9 +689,6 @@ func TestAdminSetMessageRequestModeSendsBodyNotHeader(t *testing.T) {
 		}
 	}
 
-	// popShareQueueNum=0 still goes on the wire (Java sets the field unconditionally):
-	// a body that omits it decodes to 0, which is what the broker needs to clear a
-	// previously configured share-queue count.
 	requireNoError(t, "setMessageRequestMode pull",
 		c.admin.SetMessageRequestMode(c.brokerSrv.addr, "MyTopic", "G1",
 			remoting.MessageRequestModePull, 0))
@@ -714,13 +702,6 @@ func TestAdminSetMessageRequestModeSendsBodyNotHeader(t *testing.T) {
 	}
 }
 
-// ---------------- nameserver KV ----------------
-// KV puts/deletes are BROADCAST: one rejecting nameserver must fail the whole
-// call (Java's putKVConfigValue/deleteKVConfigValue semantics).
-//
-// The nameserver list has to be set BEFORE Start — the instance copies it once,
-// exactly like Java's MQClientInstance, so a later SetNameServerAddresses is
-// deliberately inert.
 func TestAdminKVConfigBroadcastsToEveryNameserver(t *testing.T) {
 	c := newAdminCluster(t)
 	failing := startMockServer(t, func(s *mockServer, req *remoting.RemotingCommand) *remoting.RemotingCommand {
@@ -778,11 +759,6 @@ func TestAdminGetAllSubscriptionGroupAccumulatesPages(t *testing.T) {
 	c := newAdminCluster(t)
 	wrapper, err := c.admin.GetAllSubscriptionGroup(c.brokerSrv.addr, 0)
 	requireNoError(t, "getAllSubscriptionGroup", err)
-	// Pages are handed out one group at a time, and Java (hence the Python and
-	// Go ports) stops once groupSeq >= totalGroupNum-1 — so with three groups
-	// it makes two requests. Annotated deliberately: the -1 looks like an
-	// off-by-one but is Java's actual condition, and deviating from it would
-	// make this port page differently from the reference implementation.
 	for _, name := range []string{"G1", "G2"} {
 		if wrapper.SubscriptionGroupTable[name] == nil {
 			t.Errorf("group %s missing; got %v", name, keysOfGroupTable(wrapper))

@@ -1,6 +1,3 @@
-// cleanExpiredMsg 挂起逃生口（Java ConsumeMessageConcurrentlyService:68-88/192-200
-// ＋ ProcessQueue.cleanExpiredMsg:75-127）单测 —— 不需要集群。
-//
 // 为什么必须离线锁死：这条清扫是"listener 卡死不返回"时唯一的回收路径。少了它，一条卡住
 // 的消息会让该队列位点永久停在原地，且没有任何异常、日志或超时可见 —— 真机上只能靠
 // "消息发了却永远不来第二次"这种间接现象暴露；而清扫本身的窗口是分钟级、每轮 16 条上限
@@ -9,14 +6,6 @@
 //   - 过期判据**严格大于** consumeTimeout：写成 >= 会把边界消息提前回投（凭空重投）；
 //   - 单轮 min(size,16) 且 loop 在进循环前算一次：写成 while 会一轮清空整条队列。
 //
-// Java 锚点（5.5.1 逐条核对）：
-//   * :70-81 scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)
-//     —— initialDelay 与 period 同值（默认 15 → 900s），调度壳子 catch (Throwable)；
-//   * :192-200 cleanExpireMsg 遍历 rebalance 的 processQueueTable（只扫**当前持有**的队列）；
-//   * :75-127 队首取 getConsumeStartTimeStamp、过期判据 `>`、sendMessageBack(msg, 3) 固定
-//     delayLevel 3、回投成功后**仍是队首**才 removeMessage、异常只记日志（消息留在原地）；
-//   * :341-357 containsMessage = msgTreeMap.containsKey(queueOffset)：listener 事后返回
-//     RECONSUME_LATER 时，回投前先查它在不在表上（被清扫摘除过的不能再投一次）。
 //
 // 离线能锁的是「回投失败」这一支：未 start 的消费者 sendMessageBack 必失败（函数按返回值
 // 表态、不抛异常），所以结算断言是"消息留在原地、位点不许动"；「回投成功 → 摘除 →
@@ -127,12 +116,9 @@ public:
 // ---------------------------------------------------------------- 判据与节奏
 
 void testExpiryArithmetic() {
-    // 空串 = 还没进过 listener 的缓冲消息（Java StringUtils.isNotEmpty 短路）——不算过期。
-    // 这一条同时把"还没被消费过的积压"整个挡在清扫之外。
     expect(!DefaultMQPushConsumer::isConsumeExpired(ext(0), 1, kNow),
            "expiry.emptyStamp.notExpired");
 
-    // 严格大于：恰好等于阈值不动手，多 1ms 才动手（Java:89 的 `>`）
     expect(!DefaultMQPushConsumer::isConsumeExpired(stamped(0, kNow - 60000), 1, kNow),
            "expiry.exactlyAtLimit.notExpired");
     expect(DefaultMQPushConsumer::isConsumeExpired(stamped(0, kNow - 60001), 1, kNow),
@@ -146,8 +132,6 @@ void testExpiryArithmetic() {
     expect(!DefaultMQPushConsumer::isConsumeExpired(stamped(0, kNow - 60001), 15, kNow),
            "expiry.default15.notExpired");
 
-    // 坏时间戳必须抛（Java 的 NumberFormatException 由调度壳子 catch(Throwable) 接住）。
-    // 调用方吞掉它就等于"这条队列静默不再清扫"。
     MessageExt bad = ext(0);
     bad.putProperty(MessageConst::PROPERTY_CONSUME_START_TIMESTAMP, "not-a-number");
     bool threw = false;
@@ -160,12 +144,9 @@ void testExpiryArithmetic() {
 }
 
 void testPeriodMatchesSchedule() {
-    // Java scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)：
-    // initialDelay == period == consumeTimeout 分钟（默认 15 → 900000ms）。
     expect(DefaultMQPushConsumer::cleanExpirePeriodMillis(15) == 900000,
            "period.default15", std::to_string(DefaultMQPushConsumer::cleanExpirePeriodMillis(15)));
     expect(DefaultMQPushConsumer::cleanExpirePeriodMillis(1) == 60000, "period.oneMinute");
-    // 0/负数按 1 分钟下限（Java 不校验；真按 0 分钟跑就是忙转）
     expect(DefaultMQPushConsumer::cleanExpirePeriodMillis(0) == 60000, "period.zeroClamps");
     expect(DefaultMQPushConsumer::cleanExpirePeriodMillis(-5) == 60000, "period.negativeClamps");
 }
@@ -173,7 +154,6 @@ void testPeriodMatchesSchedule() {
 // ---------------------------------------------------------------- 选条语义
 
 void testOnlyHeadIsConsideredAndExpiryIsStrict() {
-    // 只看队首：队首没盖章（还没进过 listener）就停，后面过期也轮不到（Java:87-99）
     Harness h;
     h.seedInflight({ext(0), stamped(1, kNow - 120000)});
     expect(h.sweep(kNow) == 0, "sweep.unstampedHead.noAttempt");
@@ -184,10 +164,6 @@ void testOnlyHeadIsConsideredAndExpiryIsStrict() {
     fresh.seedInflight({stamped(0, kNow - 1000)});
     expect(fresh.sweep(kNow) == 0, "sweep.fresh.notAttempted");
 
-    // 队首是**最小位点**（不是插入顺序）：把过期的那条排在后面也得先等前面的。
-    // 两条都在册时 loop=2，而回投失败后队首没动 → 同一队首被尝试两次（Java 的 for 循环
-    // 在 sendMessageBack 抛异常后照常进下一轮，队首还是它）。这正说明"单轮 16 条"数的是
-    // 尝试次数、不是不同消息数。
     Harness order;
     order.seedInflight({stamped(5, kNow - 1), stamped(3, kNow - 120000)});
     expect(order.sweep(kNow) == 2, "sweep.headIsMinOffset.notInsertionOrder");
@@ -195,8 +171,6 @@ void testOnlyHeadIsConsideredAndExpiryIsStrict() {
 }
 
 void testFailedSendBackKeepsTheEntry() {
-    // 未 start 的消费者回投必定失败。Java:122-125：失败只记日志、绝不摘除 —— 摘了就
-    // 真丢了；位点也不许推进（推了这条就被静默跳过）。
     Harness h;
     h.seedInflight({stamped(0, kNow - 120000)});
     expect(h.sweep(kNow) == 1, "fail.oneAttempt");
@@ -207,8 +181,6 @@ void testFailedSendBackKeepsTheEntry() {
 }
 
 void testSixteenCapPerPass() {
-    // Java:80 的 min(size, 16)：一轮最多 16 条。这里 20 条全过期、回投全失败（条目一条
-    // 都不会减少），attempt 数正好把上限钉死 —— 写成 while 会得到 20。
     Harness h;
     std::vector<MessageExt> msgs;
     for (int i = 0; i < 20; i++) msgs.push_back(stamped(i, kNow - 120000));
@@ -219,7 +191,6 @@ void testSixteenCapPerPass() {
 }
 
 void testRemoveOnlyWhenStillHead() {
-    // Java:106-115 —— 回投成功后只有它**仍是**队首才摘除；前面冒出更小位点就让位
     Harness h;
     h.seedPending({ext(5), ext(3)});
     const auto head = h.consumer().processQueueHead(h.key());
@@ -240,8 +211,6 @@ void testRemoveOnlyWhenStillHead() {
 }
 
 void testContainsMessageIsByQueueOffset() {
-    // Java ProcessQueue.containsMessage:341-357 —— **按 queueOffset**，不是对象身份：
-    // 本端口的批次是值拷贝，要的语义正是"这个位点还挂在表上吗"。
     Harness h;
     h.seedInflight({stamped(7, kNow - 120000)});
     h.seedPending({ext(8)});
@@ -252,7 +221,6 @@ void testContainsMessageIsByQueueOffset() {
 }
 
 void testEntriesViewIsUnionDeduped() {
-    // 在册视图 = 在途（已分发未落定）∪ 已拉未分发 = Java 的 msgTreeMap；同一位点只算一份
     Harness h;
     h.seedPending({ext(0), ext(1)});
     h.seedInflight({ext(1), ext(2)});
@@ -264,8 +232,6 @@ void testEntriesViewIsUnionDeduped() {
 // ---------------------------------------------------------------- 清扫范围与顺序消费
 
 void testSweepScopeIsHeldQueuesOnly() {
-    // Java cleanExpireMsg:192-200 遍历 rebalance 的 processQueueTable：只有**当前持有**的
-    // 队列被扫。撤走的队列登记一并清掉（否则新属主接手后旧表还在被扫）。
     DefaultMQPushConsumer c(kGroup);
     c.setConsumeTimeout(1);
     const std::string k0 = DefaultMQPushConsumer::offsetKey(queue0());
@@ -287,7 +253,6 @@ void testSweepScopeIsHeldQueuesOnly() {
 }
 
 void testOrderlyConsumerIsNeverSwept() {
-    // Java ProcessQueue.cleanExpiredMsg:76-78：顺序消费直接返回（回投会乱序）
     DefaultMQPushConsumer c(kGroup);
     c.setConsumeTimeout(1);
     c.setMessageListener(std::make_shared<NoopOrderlyListener>());
@@ -299,8 +264,6 @@ void testOrderlyConsumerIsNeverSwept() {
 
 // ---------------------------------------------------------------- 与消费路径的配合
 
-// listener 拿到批次的**同一瞬间**观察在册视图：Java 里这段时间消息还留在
-// ProcessQueue.msgTreeMap 里（removeMessage 要等 listener 返回），清扫正是靠它选队首。
 class ObservingListener : public MessageListenerConcurrently {
 public:
     ObservingListener(DefaultMQPushConsumer* c, std::string key, bool reclaim)
@@ -373,10 +336,6 @@ void testConcurrentBatchSeesItselfInTheProcessQueue() {
 }
 
 void testSendBackSkipsAMessageTheSweepAlreadyReclaimed() {
-    // Java processConsumeResult:243-248 的 containsMessage 闸门：listener 挂着期间被清扫
-    // 回投（并摘除）的消息，listener 事后返回 RECONSUME_LATER 时**不能再回投一次**。
-    // 闸门写漏的后果在离线也看得见：这条会被再投一次（这里退化成"回投失败塞回队首"，
-    // 位点也会被钳住不动），真机上就是同一个位点被投两次。
     DefaultMQPushConsumer c(kGroup);
     const std::string key = DefaultMQPushConsumer::offsetKey(queue0());
     auto listener = std::make_shared<ObservingListener>(&c, key, /*reclaim=*/true);

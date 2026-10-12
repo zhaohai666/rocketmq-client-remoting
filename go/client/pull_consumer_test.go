@@ -41,10 +41,6 @@ func pullTopicMQ(topic string) common.MessageQueue {
 
 // ---------------------------------------------------------------- config
 
-// TestPullConsumerStartValidatesConfig covers the four refusals in Java
-// DefaultMQPullConsumerImpl.checkConfig:772-817. The interesting one is the
-// long-poll invariant — a client that gives up before the broker is allowed to
-// hold the request can only ever time out.
 func TestPullConsumerStartValidatesConfig(t *testing.T) {
 	f := newClusterFixture(t, map[string]int{"PullCfgTopic": 1})
 
@@ -87,11 +83,6 @@ func TestPullConsumerStartValidatesConfig(t *testing.T) {
 	})
 
 	t.Run("an exactly equal suspend timeout is accepted", func(t *testing.T) {
-		// The Java guard is a strict `<` (DefaultMQPullConsumerImpl:811), so
-		// equality is legal — the client gives up at the same instant the
-		// broker's hold expires. Pinning it here keeps a future "cleanup" from
-		// tightening the comparison into `<=`, which would break every config
-		// that deliberately aligns the two clocks.
 		c := newPullConsumer(t, f, "GID_pull_cfg_suspend_eq")
 		c.SetBrokerSuspendMaxTimeMillis(20000)
 		c.SetConsumerTimeoutMillisWhenSuspend(20000)
@@ -106,8 +97,6 @@ func TestPullConsumerStartValidatesConfig(t *testing.T) {
 		if !c.IsStarted() {
 			t.Fatal("IsStarted = false after a successful Start")
 		}
-		// Java DefaultMQPullConsumer enables the STREAM request type in every
-		// constructor, so the clientId carries the @STREAM suffix.
 		if !strings.Contains(c.ClientID(), "@STREAM") {
 			t.Errorf("clientId = %q, want the @STREAM suffix", c.ClientID())
 		}
@@ -294,7 +283,6 @@ func TestPullConsumerOffsetRoundTrip(t *testing.T) {
 	if got != 3 {
 		t.Fatalf("FetchConsumeOffset = %d, want 3", got)
 	}
-	// A backwards seek is allowed (Java updateOffset(..., increaseOnly=false)).
 	requireNoError(t, "rewind", c.UpdateConsumeOffset(mq, 1))
 	if got, _ := c.FetchConsumeOffset(mq, false); got != 1 {
 		t.Errorf("after a rewind FetchConsumeOffset = %d, want 1", got)
@@ -316,14 +304,6 @@ func TestPullConsumerOffsetRoundTrip(t *testing.T) {
 	}
 }
 
-// TestPullConsumerPersistsOnlyPulledQueues pins the port's stand-in for Java's
-// process-queue table. RemoteBrokerOffsetStore.PersistAll DROPS the entries for
-// queues left out, so the set handed to it must cover everything the consumer
-// touched — and this test makes the two halves of that set differ on purpose:
-// q0 is pulled AND has a local offset, q1 only has a local offset. A pulled-only
-// set would drop q1 and silently lose the caller's progress; a local-only set
-// would be fine here but would lose an offset a pull recorded for a queue the
-// caller never updated.
 func TestPullConsumerPersistsOnlyPulledQueues(t *testing.T) {
 	const topic = "PullPersistSetTopic"
 	f := newClusterFixture(t, map[string]int{topic: 2})
@@ -366,12 +346,6 @@ func TestPullConsumerPersistsOnlyPulledQueues(t *testing.T) {
 	}
 }
 
-// TestPullConsumerSendMessageBackUsesThePullCeiling guards the value that is
-// easy to get wrong by copying the push consumer: Java's DefaultMQPullConsumer
-// defaults maxReconsumeTimes to 16 (:95), while the PUSH one defaults to -1.
-// The broker takes the field at face value for any client version >= V3_4_9 and
-// DLQs when reconsumeTimes(0) >= maxReconsumeTimes — so -1 would send every
-// bounced message straight to %DLQ%.
 func TestPullConsumerSendMessageBackUsesThePullCeiling(t *testing.T) {
 	const topic = "PullSendBackTopic"
 	const group = "GID_pull_sendback"
@@ -380,8 +354,6 @@ func TestPullConsumerSendMessageBackUsesThePullCeiling(t *testing.T) {
 	c := newPullConsumer(t, f, group)
 	startPullConsumer(t, c)
 
-	// The address comes from the PUBLISH table, so the consumer has to have
-	// looked the topic up first — the same constraint Java has.
 	if _, err := c.Pull(pullTopicMQ(topic), "*", 0, 32); err != nil {
 		t.Fatalf("Pull: %v", err)
 	}
@@ -520,9 +492,6 @@ func (h *droppingFilterHook) FilterMessage(ctx *FilterMessageContext) {
 
 func (h *droppingFilterHook) calls() int { return h.callCount }
 
-// TestPullConsumerConsumeHookPairRunsAroundThePull: the pull path has no consume
-// service, so Java hangs the pair off the pull result (pullSyncImpl:270-283)
-// with success already true.
 func TestPullConsumerConsumeHookPairRunsAroundThePull(t *testing.T) {
 	const topic = "PullConsumeHookTopic"
 	f := newClusterFixture(t, map[string]int{topic: 1})
@@ -627,8 +596,6 @@ func TestPullConsumerQueueLookups(t *testing.T) {
 // The request is also the only place the read/write queue counts and the filter
 // type are visible.
 func TestPullConsumerCreateTopic(t *testing.T) {
-	// TBW102 has to be routable: Java routes the create through the DEFAULT
-	// topic's route to find the masters to push to.
 	f := newClusterFixture(t, map[string]int{"PullCreateTopic": 1, common.DefaultTopic: 1})
 	c := newPullConsumer(t, f, "GID_pull_create")
 	startPullConsumer(t, c)
@@ -649,9 +616,7 @@ func TestPullConsumerCreateTopic(t *testing.T) {
 		"topicSysFlag":    "0",
 		"order":           "false",
 		"force":           "false",
-		// Java AttributeParser.parseToString(empty map) == "", NOT the key
-		// argument and NOT a JSON object.
-		"attributes": "",
+		"attributes":      "",
 		// The pull consumer enables enableStreamRequestType in EVERY constructor,
 		// so the hook writes ReqT on the admin path too (remoting/acl.go:237).
 		"ReqT": "0",
@@ -855,9 +820,6 @@ func TestPullConsumerConsumeTypeIsActive(t *testing.T) {
 	if _, err := NewDefaultMQPullConsumer(""); err == nil {
 		t.Error("NewDefaultMQPullConsumer(\"\") = nil error")
 	}
-	// The default strategies/timings are Java's. ConsumerPullTimeoutMillis and
-	// BrokerSuspendMaxTimeMillis are the pair covered by the long-poll
-	// invariant, so assert them together with MaxReconsumeTimes (16, not -1).
 	if got := c.ConsumerPullTimeoutMillis(); got != DefaultConsumerPullTimeoutMillis {
 		t.Errorf("consumerPullTimeoutMillis = %d, want %d", got, DefaultConsumerPullTimeoutMillis)
 	}
@@ -877,13 +839,6 @@ func TestPullConsumerConsumeTypeIsActive(t *testing.T) {
 }
 
 // ---------------------------------------------------------------- balance view
-//
-// Java MQPullConsumer:187 → DefaultMQPullConsumerImpl:120-135 (plus
-// parseSubscribeMessageQueues:153-161). example/simple/PullConsumer.java:62 is the
-// official caller: it pulls ONLY its own share. This port runs no pull-side
-// rebalance thread, so FetchMessageQueuesInBalance computes that share on demand
-// with Java's rebalanceByTopic formula — these tests pin the formula, the
-// "cannot compute" fallback and the isRunning() guard.
 
 func queueIDs(mqs []common.MessageQueue) []int32 {
 	out := make([]int32, 0, len(mqs))
@@ -924,10 +879,6 @@ func TestPullConsumerBalanceViewSplitsBetweenInstances(t *testing.T) {
 	b := newPullConsumer(t, f, "GID_pull_bal_split")
 	b.SetInstanceName(peerName)
 	startPullConsumer(t, b)
-	// Sorted before allocating (Java Collections.sort(cidAll)); the broker's
-	// answer order is not defined, so the peer id is what it is. Both consumers
-	// report their own clientId — the pull default (enableStreamRequestType)
-	// puts a @STREAM suffix on it, so it must be read back, not re-derived.
 	f.broker.setClientIDs(a.ClientID(), b.ClientID())
 
 	mine, err := a.FetchMessageQueuesInBalance(topic)
@@ -950,9 +901,6 @@ func TestPullConsumerBalanceViewSplitsBetweenInstances(t *testing.T) {
 	}
 }
 
-// No consumer list means "cannot compute", NOT "my share is empty": the current
-// assignment (Java's pullFromWhichNodeTable key set) is kept, and it must never
-// degrade into "I own every queue".
 func TestPullConsumerBalanceViewKeepsPulledQueuesWhenTheGroupIsUnknown(t *testing.T) {
 	const topic = "PullBalKeepTopic"
 	f := newClusterFixture(t, map[string]int{topic: 3})
@@ -987,7 +935,6 @@ func TestPullConsumerBalanceViewKeepsPulledQueuesWhenTheGroupIsUnknown(t *testin
 	}
 }
 
-// Java rebalanceByTopic never asks for the cid list under BROADCASTING.
 func TestPullConsumerBalanceViewBroadcastingIgnoresTheConsumerList(t *testing.T) {
 	const topic = "PullBalBcastTopic"
 	f := newClusterFixture(t, map[string]int{topic: 3})
@@ -1003,8 +950,6 @@ func TestPullConsumerBalanceViewBroadcastingIgnoresTheConsumerList(t *testing.T)
 	}
 }
 
-// Java isRunning(): a consumer that never started reports the error instead of
-// an empty slice, which a caller would read as "no queues for me" and stop pulling.
 func TestPullConsumerBalanceViewRequiresAStartedConsumer(t *testing.T) {
 	c := MustNewDefaultMQPullConsumer("GID_pull_bal_not_started")
 	if _, err := c.FetchMessageQueuesInBalance("PullBalGuardTopic"); err == nil ||

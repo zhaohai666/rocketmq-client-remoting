@@ -1,5 +1,3 @@
-// TopicValidator 实现（对应 Java org.apache.rocketmq.common.topic.TopicValidator
-// 与 Python common/topic_validator.py）。
 #include "rocketmq/common/topic_validator.h"
 
 #include <array>
@@ -9,8 +7,6 @@ namespace rocketmq {
 
 namespace {
 
-// 对应 Java 的 VALID_CHAR_BIT_MAP[128]：一张 256 的字节表，
-// 任意字节 >= 128 或不在此表内的字符都是非法（Java 判 char >= 128 同样拒绝非 ASCII）。
 const std::array<bool, 256>& validCharTable() {
     static const std::array<bool, 256> kTable = [] {
         std::array<bool, 256> table{};
@@ -29,8 +25,6 @@ const std::array<bool, 256>& validCharTable() {
 }  // namespace
 
 bool TopicValidator::isTopicOrGroupIllegal(const std::string& name) {
-    // 逐字节照抄 Java：ch >= 128 或 !VALID_CHAR_BIT_MAP[ch] → 非法。
-    // 空串自然返回 false——blankness 由调用方的 isBlank 一步负责。
     const std::array<bool, 256>& valid = validCharTable();
     for (char c : name) {
         const unsigned char ch = static_cast<unsigned char>(c);

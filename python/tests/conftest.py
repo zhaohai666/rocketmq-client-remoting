@@ -24,13 +24,7 @@ os.environ.setdefault(
 
 @pytest.fixture(autouse=True)
 def _reset_mq_client_manager():
-    """每个用例前后清空 MQClientManager 的实例缓存。
-
-    门面现在按 clientId 复用 MQClientInstance（Java MQClientManager 语义）：
-    不清缓存的话，前一个用例泄漏（start 后没 shutdown）的实例会被下一个用例
-    用同一个 clientId 拿到 —— 单测里那往往是各用例自带的替身/夹具配置，
-    复用等于串台。清表（不 shutdown）与旧版"每个门面各建各的"行为对齐。
-    """
+    pass
     from client.mq_client_manager import MQClientManager
 
     MQClientManager.get_instance().reset()

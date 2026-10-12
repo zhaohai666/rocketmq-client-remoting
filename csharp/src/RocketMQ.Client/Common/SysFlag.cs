@@ -1,15 +1,3 @@
-// org.apache.rocketmq.common.sysflag.* 的 C# 对应：消息/拉取标志位与权限位。
-//
-// 位含义（低 -> 高），与 RocketMQ 4.9.x Java 实现逐位核对：
-//   bit0  COMPRESSED
-//   bit1  MULTI_TAGS
-//   bit2  TRANSACTION_PREPARED
-//   bit2~3 TRANSACTION_COMMIT(0x2&lt;&lt;2) / TRANSACTION_ROLLBACK(0x3&lt;&lt;2) 共用掩码
-//   bit4  BORNHOST_V6
-//   bit5  STOREHOSTADDRESS_V6
-//   bit6  NEED_UNWRAP
-//   bit7  INNER_BATCH
-//   bit8~10 COMPRESSION_TYPE（掩码 0x7 &lt;&lt; 8）
 namespace RocketMQ.Common;
 
 public static class MessageSysFlag
@@ -37,7 +25,6 @@ public static class MessageSysFlag
     public const int ZlibType = 3;
     public const int SnappyType = 4;
 
-    /// <summary>Java: (flag &amp; COMPRESSION_TYPE_COMPARATOR) &gt;&gt; 8</summary>
     public static int GetCompressionType(int sysFlag) =>
         (sysFlag & CompressionTypeComparator) >> CompressionTypeShift;
 
@@ -49,7 +36,6 @@ public static class MessageSysFlag
 
     public static int ClearCompressedFlag(int sysFlag) => sysFlag & ~CompressedFlag;
 
-    /// <summary>Java: flag &amp; TRANSACTION_ROLLBACK_TYPE</summary>
     public static int GetTransactionValue(int flag) => flag & TransactionRollbackType;
 
     public static int ResetTransactionValue(int flag, int transactionType) =>
@@ -132,10 +118,6 @@ public static class PermName
     public const int PermInherit = 0x1;
     public const int PermOwner = 0x1 << 4;
 
-    /// <summary>
-    /// 对应 Java PermName.permToString：三位标志 "RWX"，不满足的位写 '-'。
-    /// （C++ 侧曾只声明未定义——「编译能过、一链接就炸」的坑。）
-    /// </summary>
     public static string PermToString(int perm)
     {
         string s = string.Empty;
@@ -147,10 +129,6 @@ public static class PermName
 
     public static bool CheckPerm(int perm, int wantedPerm) => (perm & wantedPerm) == wantedPerm;
 
-    /// <summary>
-    /// 对应 Java PermName.isValid(value)：合法区间为 [0, PERM_PRIORITY)。
-    /// 管理端 UpdateBrokerConfig 用它校验 brokerPermission。
-    /// </summary>
     public static bool IsValid(int value) => value >= 0 && value < PermPriority;
 }
 

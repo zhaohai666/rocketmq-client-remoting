@@ -1,23 +1,6 @@
-// 发送重试链路单测：本机起一个 mock（同时扮演 name server 与 broker），离线、确定性地
-// 锁死 Java DefaultMQProducerImpl#sendDefaultImpl 的重试分类语义。
-//
 // 这些分支真机集群给不了：真 broker 不会稳定返回 FLUSH_DISK_TIMEOUT / SYSTEM_ERROR，
 // 也不会刚好"路由里的 broker 地址连不上"。所以这里用脚本化的响应码驱动，
 // 走的是**真实的** DefaultMQProducer::send + 真实 socket。
-//
-// 覆盖：
-//   1. retryResponseCodes：可重试码换 broker 继续；非可重试码立即把 MQBrokerException 原样抛出；
-//   2. retryAnotherBrokerWhenNotStoreOK：FLUSH_DISK_TIMEOUT 默认原样返回，打开后才换 broker；
-//   3. 重试耗尽后仍有非 SEND_OK 结果 → 原样返回该结果（Java: if (sendResult != null) return）；
-//   4. sendMsgMaxTimeoutPerRequest：还剩重试机会时单次请求超时被压到该值（慢 broker 必须被换掉）；
-//   5. 总超时用尽 → RemotingTooMuchRequestException；
-//   6. 失败原因映射 ClientErrorCode：连不上→10001，broker 码→原码，无路由→10005；
-//   6b. 寻址故障与无路由的分界：一个 name server 地址都没有→10004（Java
-//       validateNameServerSetting），配了但连不上仍是 10005；
-//   7. 容错表分档：broker 错误码=隔离+不可达，传输异常=隔离但可达，成功=只记延迟。
-//   8. unitMode 上线：SEND_MESSAGE_V2 的单字母键 `k`。
-//   9. 请求钩子上线：stream 的 `ReqT=0`、ACL 的 AccessKey/Signature，以及
-//      「ReqT 必须在签名内容之内」这条顺序约束（broker 侧算法重放验签）。
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -510,7 +493,6 @@ void testRetryAnotherBrokerWhenNotStoreOK(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // 全程都不 OK：耗尽后把最后一次结果原样返回（Java if (sendResult != null) return）
         mock.scriptSend({{ResponseCode::FLUSH_SLAVE_TIMEOUT, 0},
                          {ResponseCode::SLAVE_NOT_AVAILABLE, 0},
                          {ResponseCode::FLUSH_DISK_TIMEOUT, 0}});
@@ -561,7 +543,6 @@ void testSendMsgMaxTimeoutPerRequest(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // cap 比总预算还大 = 不生效（Java 只在 curTimeout > max 时才压）
         mock.scriptSend({{ResponseCode::SUCCESS, 300}, {ResponseCode::SUCCESS, 0}});
         DefaultMQProducer p("PG_cap_big");
         p.setNamesrvAddr(mock.address());
@@ -576,8 +557,6 @@ void testSendMsgMaxTimeoutPerRequest(MockEndpoint& mock) {
     }
 }
 
-// 只拖慢第一次发送的钩子：Java 的 costTime 是"上一次尝试开始时"取的，钩子耗时算在
-// 这一次尝试里，所以第二次尝试一进门就会发现预算已经用完。
 class OneShotSlowHook : public SendMessageHook {
 public:
     explicit OneShotSlowHook(int32_t sleepMillis) : sleepMillis_(sleepMillis) {}
@@ -679,11 +658,6 @@ void testErrorCodeMapping(MockEndpoint& mock) {
 }
 
 // 6b. 寻址故障（10004）不能被说成"这个 topic 没路由"（10005）
-//
-// Java DefaultMQProducerImpl#validateNameServerSetting（:729）读的是
-// MQClientAPIImpl#getNameServerAddressList，空列表 → 10004。C++ 的 MQClientInstance
-// 一旦建好就没有"清空地址表"的公开口（updateNameServerAddressList 只接受非空，同 Java），
-// 所以这里直接把漏斗 topicPublishInfo 单独测：它是 protected，探针子类能拿到。
 namespace {
 struct RouteFunnelProbe : public DefaultMQProducer {
     RouteFunnelProbe() : DefaultMQProducer("PG_funnel_probe") {}
@@ -695,7 +669,6 @@ struct RouteFunnelProbe : public DefaultMQProducer {
 void testNoNameServerAddressQualifies10004(MockEndpoint& mock) {
     RouteFunnelProbe probe;
     {
-        // 一个地址都没有 → 10004，文案指向寻址（Java 原文）
         MQClientInstance empty("PG_funnel_probe_client", std::vector<std::string>{});
         int code = 0;
         std::string msg;
@@ -734,8 +707,6 @@ void testNoNameServerAddressQualifies10004(MockEndpoint& mock) {
                "no route keeps its own message", "msg=" + msg);
     }
     {
-        // 端到端：配了名字服务器但连不上 → 发送定性成 10005，不是 10004。
-        // Java 判的是"配置里有没有地址"，不是"地址能不能连通"，所以这一腿是 10004 的对照。
         DefaultMQProducer p("PG_dead_namesrv");
         p.setNamesrvAddr(deadAddress());
         p.setRetryTimesWhenSendFailed(0);
@@ -753,7 +724,6 @@ void testNoNameServerAddressQualifies10004(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // start() 那道闸（本端口比 Java 提前，Java 要等第一次发送才报）也带同一个码
         DefaultMQProducer p("PG_no_namesrv");
         p.setNamesrvAddr("");
         int code = 0;
@@ -769,7 +739,6 @@ void testNoNameServerAddressQualifies10004(MockEndpoint& mock) {
     (void)mock;
 }
 
-// 7. 容错表分档（Java updateFaultItem 的 isolation/reachable 组合）
 void testFaultItemFlags(MockEndpoint& mock) {
     const std::string deadTopic = "SendFaultConnect";
     mock.addRoute(deadTopic, makeRoute(deadAddress(), 1, 1));
@@ -845,10 +814,6 @@ void testFaultItemFlags(MockEndpoint& mock) {
     }
 }
 
-// 8. unitMode 上线：走的是 SendMessageRequestHeaderV2 的单字母键 `k`
-//（Java SendMessageRequestHeaderV2.java:62 `@CFNullable private Boolean k; // unitMode`，
-// 由 DefaultMQProducerImpl:1004 `requestHeader.setUnitMode(this.isUnitMode())` 填）。
-// 键名写错 broker 就读不到，单元化路由整条链路静默失效，故离线取证。
 void testUnitModeReachesWire(MockEndpoint& mock) {
     const std::string topic = "SendRetryUnitMode";
     mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
@@ -870,7 +835,6 @@ void testUnitModeReachesWire(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // 默认关闭时字段仍然存在（Java 的 Boolean 非 null ⇒ fastjson 会写出 false）
         mock.scriptSend({{ResponseCode::SUCCESS, 0}});
         DefaultMQProducer p("PG_unit_mode_off");
         p.setNamesrvAddr(mock.address());
@@ -885,19 +849,11 @@ void testUnitModeReachesWire(MockEndpoint& mock) {
 
 // 8a2. 发送头里那三个「跟着路由/配置走」的字段：n（brokerName）、c（defaultTopic）、
 // d（defaultTopicQueueNums）。
-//
-// Java `DefaultMQProducerImpl#sendKernelImpl`:996-997 把生产者的 createTopicKey /
-// defaultTopicQueueNums 写进 c/d，:1007 把**路由选中的 broker 名**写进 n
-// （`SendMessageRequestHeaderV2`:69 `@CFNullable private String n; // brokerName`，
-// `encode()` 用 writeIfNotNull 写字母键）。本端口原先把 c/d 写死成 TBW102/4、
-// 根本不写 n，于是 setCreateTopicKey / setDefaultTopicQueueNums 是假 setter，
-// 而且报文字段集与 Java 不一致。三者都只能在 socket 这头取证。
 void testSendHeaderFieldsReachWire(MockEndpoint& mock) {
     const std::string topic = "SendHeaderFields";
     mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
 
     {
-        // 默认配置：c/d 落回 Java 的 TBW102 / 4，n 取路由里的 broker 名
         mock.scriptSend({{ResponseCode::SUCCESS, 0}});
         DefaultMQProducer p("PG_hdr_default");
         p.setNamesrvAddr(mock.address());
@@ -958,9 +914,6 @@ void testSendHeaderFieldsReachWire(MockEndpoint& mock) {
     }
 }
 
-// 8b. 发送请求码的三级判据（Java `MQClientAPIImpl#sendMessage:550-563`）：先判
-// isReply ⇒ 325，再判「这条消息是不是批量」⇒ SEND_BATCH_MESSAGE(320)，否则 310。
-//
 // 请求码与 V2 头的单字母键 `m`（batch）是两件事：broker 按 `m` 选 sendBatchMessage
 // 还是单条写入（`SendMessageProcessor:117` 读 requestHeader.isBatch()），码只影响
 // 服务端按码归类（proxy `AbstractRemotingActivity:69` 与 auth
@@ -1023,8 +976,6 @@ void testRequestHooksReachWire(MockEndpoint& mock) {
     const std::string sk = "SK-wire-probe";
 
     {
-        // 生产者默认关 stream（Java DefaultMQProducer 从不置 enableStreamRequestType）：
-        // 只该看到 ACL 字段
         mock.scriptSend({{ResponseCode::SUCCESS, 0}});
         mock.clearRequests();
         DefaultMQProducer p("PG_reqt_off");
@@ -1040,10 +991,6 @@ void testRequestHooksReachWire(MockEndpoint& mock) {
         expect(rec.ext.count(std::string(MixAll::REQ_T)) == 0, "stream off -> no ReqT");
     }
     {
-        // 打开 stream：ReqT 与 ACL 字段并存，而且**在签进去的内容里**。判据用 broker 的
-        // 算法：拿上线的 extFields + body 重放一遍 HMAC-SHA1，等式成立才说明顺序是
-        // Stream → ACL（Java MQClientAPIImpl:329-332 "Inject stream rpc hook first to
-        // make reserve field signature"）；反了的话开鉴权的 broker 会直接验签失败。
         mock.scriptSend({{ResponseCode::SUCCESS, 0}});
         mock.clearRequests();
         DefaultMQProducer p("PG_reqt_on");
@@ -1070,8 +1017,6 @@ void testRequestHooksReachWire(MockEndpoint& mock) {
         expect(matches, "ReqT sits inside the signed content (broker-side replay matches)");
     }
     {
-        // lite 消费者默认开 stream（Java DefaultLitePullConsumer:213/228 构造里置真）：
-        // 路由 / 心跳这些**非 SEND** 报文也必须打标 —— 那次漏发的回归守卫。
         mock.clearRequests();
         DefaultLitePullConsumer c("PG_lite_reqt");
         c.setNamesrvAddr(mock.address());
@@ -1105,12 +1050,6 @@ void testRequestHooksReachWire(MockEndpoint& mock) {
     }
 }
 
-// 10. 定点发送的 topic 一致性守卫（Java `DefaultMQProducerImpl:1234-1236` 同步一处）：
-//     不符就拒、**一个 SEND 都不上线**；命名空间下比的是各自包装后的资源名（`wrapNamespace`
-//     幂等，已带前缀的队列 topic 不能被误拒）；跨命名空间的同名 topic 仍是不同资源。
-//     批量走的是同一处守卫（MessageBatch extends Message）；定点单向**故意没有**守卫
-//     （Java `DefaultMQProducer.sendOneway(Message, MessageQueue):660-663` → `:1303-1310`
-//     不判），报文按 msg 自己的 topic 落库 —— 这里把这条差异也钉在用例里。
 void testPinnedTopicGuard(MockEndpoint& mock) {
     const std::string topic = "PinnedGuardOk";
     mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
@@ -1176,10 +1115,6 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
         expectInt(rec.code, RequestCode::SEND_BATCH_MESSAGE, "the batch request code is used");
     }
     {
-        // ⑤ 定点单向（Java DefaultMQProducer.sendOneway(Message, MessageQueue):660-663）：
-        //    有意**没有**守卫（:1303-1310 的 sendOneway 不判）—— topic 不符照样发。
-        //    报文头里的 topic 取 msg 自己的（b）、只有 queueId 来自 mq（e），这正是「topic
-        //    写错会静默落进另一条 topic 的同号队列」的机制，所以两个字段都要取证。
         const std::string owTarget = "PinnedGuardOnewayTarget";
         mock.addRoute(owTarget, makeRoute(mock.address(), 4, 4));
         const int before = mock.sendCount();

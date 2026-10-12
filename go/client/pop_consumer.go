@@ -1,25 +1,5 @@
-// POP-mode consumption (Java
-// ConsumeMessagePopConcurrentlyService + DefaultMQPushConsumerImpl.popMessage /
-// ackAsync / changePopInvisibleTimeAsync / checkNeedAckOrDelay).
-//
 // POP differs from pull in ways that make a "just reuse the pull loop" port
 // wrong at every step:
-//
-//  1. There is no client-side offset. The broker hands out an INVISIBLE batch and
-//     the client either ACKs it or asks for more invisible time. A queue's
-//     "cursor" is the broker's revive queue, not a number we store.
-//  2. Flow control is on the ANSWER DEBT (waitAckCounter > popThresholdForQueue),
-//     not on buffered messages.
-//  3. A batch can expire WHILE the listener runs (invisibleTime is wall clock).
-//     Such a batch must not be acked — the broker has already taken it back and
-//     someone else may own it. Java checks this twice: before the listener and
-//     again after.
-//  4. Redelivery is "extend the invisibility window", never a send-back. The
-//     broker's revive logic re-pops the message once the window closes.
-//
-// Orderly POP exists in Java as a stub ("POPTODO think of pop mode orderly
-// implementation later") and is rejected here at config time rather than
-// half-implemented.
 package client
 
 import (
@@ -30,15 +10,12 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// POP timing constants (Java DefaultMQPushConsumerImpl:105-140).
 const (
 	// popBrokerSuspendMaxTimeMillis is BROKER_SUSPEND_MAX_TIME_MILLIS: the
 	// long-poll budget sent as pollTime.
 	popBrokerSuspendMaxTimeMillis int64 = 1000 * 15
 	// popAsyncTimeout is ASYNC_TIMEOUT, used for ACK and CHANGE_INVISIBLETIME.
-	popAsyncTimeoutMillis int64 = 3000
-	// popRequestExtraNetworkMillis is the "+10s" Java adds to the long-poll
-	// timeout so the client does not give up before the broker answers.
+	popAsyncTimeoutMillis        int64 = 3000
 	popRequestExtraNetworkMillis int64 = 10 * 1000
 
 	popMinInvisibleTime int64 = 5000
@@ -49,8 +26,6 @@ const (
 	popDelayWhenSuspend          = 1000
 	popDelayWhenException        = 3000
 
-	// popDefaultInvisibleTime is the fallback Java applies when the configured
-	// value is out of range — NOT an error at request time.
 	popDefaultInvisibleTime int64 = 60000
 )
 
@@ -81,8 +56,6 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 			}
 			continue
 		}
-		// Flow control on the outstanding-ACK debt. Java uses a strict ">"
-		// against popThresholdForQueue.
 		if pq.WaitAckMsgCount() > c.popThresholdForQueueValue() {
 			common.LogDebugf("pop flow control: queue %v waiting-ack=%d exceeds threshold %d",
 				mq, pq.WaitAckMsgCount(), c.popThresholdForQueueValue())
@@ -93,8 +66,6 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 		}
 
 		sub, _ := c.subscriptionFor(mq.Topic)
-		// Java:541 stamps beginTimestamp immediately before the POP request, so
-		// the POP round trip includes the broker's poll hold.
 		begin := common.CurrentTimeMillis()
 		result, err := c.popOnce(mq, sub)
 		if err != nil {
@@ -123,12 +94,8 @@ func (c *DefaultMQPushConsumer) queuePopLoop(mq common.MessageQueue, stop chan s
 		}
 		switch result.PopStatus {
 		case PopFound:
-			// Java DefaultMQPushConsumerImpl:555-563 — the RT counter is bumped
-			// for a FOUND answer even when the list is empty; only the TPS
-			// counter is conditioned on a non-empty list.
 			c.incPullRT(mq.Topic, common.CurrentTimeMillis()-begin)
 			if len(result.MsgFoundList) == 0 {
-				// Java: FOUND with an empty list retries immediately.
 				continue
 			}
 			c.incPullTPS(mq.Topic, int64(len(result.MsgFoundList)))
@@ -162,20 +129,10 @@ func (c *DefaultMQPushConsumer) popOnce(mq common.MessageQueue, sub *remoting.Su
 	if inst == nil {
 		return nil, common.ClientError("consumer not started")
 	}
-	// Java DefaultMQPushConsumerImpl:608-611 — an out-of-range configured value
-	// is replaced by 60s at REQUEST time; checkConfig has already rejected the
-	// startup, so this only bites when the setter runs mid-flight.
 	if invisibleTime < popMinInvisibleTime || invisibleTime > popMaxInvisibleTime {
 		invisibleTime = popDefaultInvisibleTime
 	}
 
-	// Static topics: like Java's PullAPIWrapper.popAsync (5.5.1), the POP
-	// request resolves its address by mq.BrokerName and carries that name +
-	// queueId in the header — NO mock-broker-name rewrite exists on this path
-	// in Java either, so a logical queue fails here with "The broker
-	// [__syslo__...] not exist" on both implementations. Only the ACK /
-	// CHANGE_INVISIBLE_TIME paths rewrite the mock name (see popAckAddress).
-	// This parity is deliberate: do NOT invent a rewrite here.
 	addr, _, found := inst.FindBrokerAddressInSubscribe(mq.BrokerName, int64(common.MasterID), true)
 	if !found {
 		if _, err := inst.UpdateTopicRouteInfoFromNameServer(mq.Topic, 5000, false); err != nil {
@@ -205,8 +162,6 @@ func (c *DefaultMQPushConsumer) popOnce(mq common.MessageQueue, sub *remoting.Su
 		header.ExpType = remoting.StrPtr(sub.ExpressionType)
 		header.Exp = remoting.StrPtr(sub.SubString)
 	}
-	// Java PullAPIWrapper.popAsync:386-392 — poll=true always here, and the
-	// network timeout gets +10s on top of the broker hold budget.
 	timeout := popBrokerSuspendMaxTimeMillis + popRequestExtraNetworkMillis
 	return inst.PopMessage(mq.BrokerName, addr, header, namespace, timeout)
 }
@@ -250,8 +205,6 @@ func (c *DefaultMQPushConsumer) submitPopConsume(mq common.MessageQueue, msgs []
 	}
 }
 
-// consumePopBatch is Java ConsumeMessagePopConcurrentlyService$ConsumeRequest
-// .run + processConsumeResult.
 func (c *DefaultMQPushConsumer) consumePopBatch(mq common.MessageQueue, batch []*common.MessageExt, pq *popProcessQueue) {
 	if len(batch) == 0 {
 		return
@@ -260,9 +213,6 @@ func (c *DefaultMQPushConsumer) consumePopBatch(mq common.MessageQueue, batch []
 		common.LogDebugf("pop batch dropped for %v (queue retired)", mq)
 		return
 	}
-	// The window can already have closed while this batch sat in the dispatch
-	// queue. Java aborts here without acking — the broker has revived the
-	// messages and another consumer may hold them.
 	if popBatchTimedOut(batch) {
 		common.LogDebugf("the pop message time out so abort consume, mq=%v", mq)
 		pq.DecFoundMsg(-len(batch))
@@ -305,13 +255,8 @@ func (c *DefaultMQPushConsumer) consumePopBatch(mq common.MessageQueue, batch []
 	}
 	invisibleTime := popInvisibleTimeOf(batch)
 	c.finishPopConsumeHook(hooks, hookCtx, rawStatus, panicked, status, consumeRT, invisibleTime)
-	// Java ConsumeMessagePopConcurrentlyService:424-425 — CONSUME_RT is bumped
-	// after the hook and before the validity re-check, so a batch that expired
-	// while the listener ran still contributes its RT (the listener DID run).
 	c.incConsumeRT(mq.Topic, consumeRT)
 
-	// Java checks the window AGAIN after the listener: a slow listener must not
-	// ACK messages the broker already owns.
 	if pq.IsDropped() || popBatchTimedOut(batch) {
 		common.LogWarnf("processQueue invalid or popTimeout, mq=%v", mq)
 		pq.DecFoundMsg(-len(batch))
@@ -354,9 +299,6 @@ func (c *DefaultMQPushConsumer) finishPopConsumeHook(hooks []ConsumeMessageHook,
 	executeConsumeHookAfter(hooks, ctx)
 }
 
-// processPopConsumeResult is Java
-// ConsumeMessagePopConcurrentlyService#processConsumeResult.
-//
 // Two loops, and EVERY message decrements the debt exactly once, so the counter
 // returns to zero whatever the outcome:
 //
@@ -375,9 +317,6 @@ func (c *DefaultMQPushConsumer) processPopConsumeResult(mq common.MessageQueue, 
 			ackIndex = len(batch) - 1
 		}
 	}
-	// Java ConsumeMessagePopConcurrentlyService:186-203 — the same OK/Failed
-	// accounting as the pull path, from the same clamped ackIndex the ACK loop
-	// below uses, and likewise before the loop.
 	if status == ConsumeSuccess {
 		c.recordConsumeSuccessTPS(mq.Topic, ackIndex, len(batch))
 	} else {
@@ -400,8 +339,6 @@ func (c *DefaultMQPushConsumer) processPopConsumeResult(mq common.MessageQueue, 
 	}
 }
 
-// ackIndexFor mirrors Java's pre-clamp, used only for the consume hook's ack
-// count so the trace shows what was actually acknowledged.
 func ackIndexFor(status ConsumeConcurrentlyStatus, ctxAckIndex, size int) int {
 	if status != ConsumeSuccess {
 		return -1
@@ -412,8 +349,6 @@ func ackIndexFor(status ConsumeConcurrentlyStatus, ctxAckIndex, size int) int {
 	return ctxAckIndex
 }
 
-// popMaxReconsumeTimes is Java DefaultMQPushConsumerImpl.getMaxReconsumeTimes
-// for the POP service: -1 means 16 (the concurrent rule), NOT Integer.MAX_VALUE.
 func (c *DefaultMQPushConsumer) popMaxReconsumeTimes() int32 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -423,8 +358,6 @@ func (c *DefaultMQPushConsumer) popMaxReconsumeTimes() int32 {
 	return c.maxReconsumeTimes
 }
 
-// ackMessagePop is Java DefaultMQPushConsumerImpl#ackAsync.
-//
 // The request fields are read back out of the checkpoint, with two exceptions:
 // the topic is re-derived through getRealTopic (so a retried message ACKs on
 // the pop-retry topic) and the offset is segment 7 — the message's own queue
@@ -451,8 +384,6 @@ func (c *DefaultMQPushConsumer) ackMessagePop(msg *common.MessageExt) {
 		common.LogWarnf("ack failed to parse POP_CK %q: %v", extraInfo, err)
 		return
 	}
-	// Java resolves the topic through the checkpoint's retry marker because the
-	// message's own topic has been rewritten to the request topic.
 	topic := common.GetRealTopic(parts, msg.Topic, c.consumerGroup)
 
 	addr, err := c.popAckAddress(brokerName, msg.Topic, int32(queueID))
@@ -473,14 +404,6 @@ func (c *DefaultMQPushConsumer) ackMessagePop(msg *common.MessageExt) {
 	}
 }
 
-// changePopInvisibleTime is Java
-// ConsumeMessagePopConcurrentlyService#changePopInvisibleTime.
-//
-// delayLevel 0 means "not chosen": it is replaced by the message's own
-// reconsume count, which is what makes the back-off grow with each retry. The
-// value is then looked up in the SECONDS table and sent as MILLISECONDS — the
-// unit flip is Java's, and sending seconds here would hold messages for
-// milliseconds.
 func (c *DefaultMQPushConsumer) changePopInvisibleTime(msg *common.MessageExt, delayLevel int) {
 	if delayLevel == 0 {
 		delayLevel = int(msg.ReconsumeTimes)
@@ -537,24 +460,9 @@ func (c *DefaultMQPushConsumer) changePopInvisibleTimeAtLevel(msg *common.Messag
 	}
 }
 
-// checkNeedAckOrDelay is Java
-// ConsumeMessagePopConcurrentlyService#checkNeedAckOrDelay.
-//
 // Called once the retry budget is spent. If the message has been bouncing for
 // longer than twice the longest back-off there is no point extending again — ACK
 // it and let it go. Otherwise extend by the next notch above the elapsed time.
-//
-// The Java loop can exit with delayLevel == -1 (the elapsed time is below the
-// first notch, i.e. 10s) and then index the table with -1, which throws
-// ArrayIndexOutOfBoundsException. This port clamps to the first notch instead:
-// the same "wait at least 10s" intent, without the crash.
-//
-// The clamp goes through changePopInvisibleTimeAtLevel rather than
-// changePopInvisibleTime on purpose: the latter treats 0 as "the caller did not
-// choose a level, use the reconsume count", which would turn this clamp into a
-// back-off of table[reconsumeTimes] seconds. Java never reaches that
-// substitution on this path (it crashes first), so 10s is the honest reading of
-// the clamp.
 func (c *DefaultMQPushConsumer) checkNeedAckOrDelay(msg *common.MessageExt) {
 	last := popDelayLevel[len(popDelayLevel)-1]
 	elapsed := common.CurrentTimeMillis() - msg.BornTimestamp
@@ -572,9 +480,6 @@ func (c *DefaultMQPushConsumer) checkNeedAckOrDelay(msg *common.MessageExt) {
 		elapsed, delayLevel, msgKeysOf(msg))
 }
 
-// popBatchTimedOut reports whether the batch's invisibility window has closed.
-// Java's ConsumeRequest.isPopTimeout also treats a missing/short checkpoint as
-// timed out, so a batch we cannot read is never acked.
 func popBatchTimedOut(batch []*common.MessageExt) bool {
 	if len(batch) == 0 {
 		return true
@@ -670,12 +575,6 @@ func (c *DefaultMQPushConsumer) retirePopQueueLocked(mq common.MessageQueue) {
 // SetMessageRequestModeOnBroker sends SET_MESSAGE_REQUEST_MODE(401) for every
 // subscribed business topic, telling each broker to serve this
 // (group, topic) pair in POP mode.
-//
-// This is an ADDITION to Java's client surface: there, the mode is set by the
-// operator (mqadmin / the console) and the client only reads it back from the
-// assignment. Without the call a client-side SetPopMode(true) would pop a
-// broker that still answers PULL requests, which looks like "POP returns
-// nothing" rather than an error.
 //
 // The %RETRY% topics are skipped: the POP retry topic is
 // %RETRY%<group>_<topic>, created by the broker, and its request mode follows

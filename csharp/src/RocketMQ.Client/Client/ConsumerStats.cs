@@ -1,15 +1,3 @@
-// 消费侧统计（对应 org.apache.rocketmq.client.stat.ConsumerStatsManager 与
-// org.apache.rocketmq.common.stats.{StatsItem,StatsItemSet,StatsSnapshot}）。
-//
-// Java 真实模型（5.5.1 源码逐条核对，Python 参考实现有完整注释）：
-// StatsItem 持有**累计值** value/times（只增不减），加两级采样快照链
-// （每 10s 采分钟点、每 10 分钟采小时点）。快照计算 computeStatsData（StatsItem.java:53-79）：
-//   sum   = last.value - first.value
-//   tps   = sum * 1000.0 / (last.ts - first.ts)     // 每秒
-//   avgpt = timesDiff > 0 ? sum / timesDiff : 0     // RT 项即平均耗时
-//
-// 实现差异（语义不变）：Java 给每个 StatsItem 单独排采样任务；这里由 manager 的
-// **一个**采样线程统一巡采（10s 一轮，60 轮做一次小时级）——精度相同，线程省。
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -18,7 +6,6 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
 
-/// <summary>对应 Java StatsSnapshot：sum / tps / avgpt / times。</summary>
 public sealed class StatsSnapshot
 {
     public long Sum { get; set; }
@@ -27,13 +14,8 @@ public sealed class StatsSnapshot
     public long Times { get; set; }
 }
 
-/// <summary>
-/// Java StatsItem.computeStatsData（StatsItem.java:53-79）逐条照抄。
-/// 采样点 = (timestampMs, 累计 value, 累计 times)。
-/// </summary>
 public static class StatsItems
 {
-    // 采样参数（Java StatsItem.init 的 scheduleAtFixedRate 参数）
     public const double SamplingIntervalSeconds = 10.0;
     public const int MinuteListMax = 60;   // ≈ 10 分钟窗口
     public const int HourListMax = 60;
@@ -162,7 +144,6 @@ public sealed class StatsItem
     }
 }
 
-/// <summary>key -&gt; StatsItem（对应 Java StatsItemSet；key = topic@group）。</summary>
 public sealed class StatsItemSet
 {
     private readonly object _lock = new();
@@ -227,11 +208,6 @@ public sealed class StatsItemSet
     }
 }
 
-/// <summary>
-/// 消费统计管理器（Java ConsumerStatsManager）。五个 StatsItemSet，key 一律 topic@group：
-/// PULL_RT / PULL_TPS / CONSUME_RT / CONSUME_OK_TPS / CONSUME_FAILED_TPS。
-/// Start() 起统一采样线程（10s 分钟级 + 每 60 轮即 10 分钟小时级）。
-/// </summary>
 public sealed class ConsumerStatsManager : IDisposable
 {
     private readonly object _lock = new();
@@ -262,8 +238,6 @@ public sealed class ConsumerStatsManager : IDisposable
 
     public void Start()
     {
-        // Java 的 Start() 是空实现（采样挂在每个 StatsItem 的调度器上）；这里收敛为
-        // 一个统一采样线程，精度不变（10s）。
         lock (_lock)
         {
             if (_started)
@@ -341,7 +315,6 @@ public sealed class ConsumerStatsManager : IDisposable
         }
     }
 
-    // ---------------- 记数（Java ConsumerStatsManager 同名方法，参数顺序一致）----------------
     private static string Key(string topic, string group) => topic + "@" + group;
 
     public void IncPullRT(string group, string topic, long rt)
@@ -369,11 +342,6 @@ public sealed class ConsumerStatsManager : IDisposable
         TopicAndGroupConsumeFailedTPS.AddValue(Key(topic, group), msgs, 1);
     }
 
-    // ---------------- 查询 ----------------
-    /// <summary>
-    /// Java ConsumerStatsManager.consumeStatus：全部取 minute 快照；
-    /// consumeFailedMsgs 取 failed 的 **hour** 窗口 sum（Java 特意跨窗口，照抄）。
-    /// </summary>
     public ConsumeStatus ConsumeStatus(string group, string topic)
     {
         var cs = new ConsumeStatus();

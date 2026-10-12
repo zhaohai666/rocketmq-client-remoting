@@ -1,31 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""broker 真的死了：在途请求必须**立刻**有终态（Java ``failFast`` → ``requestFail``）真机验证。
-
-用法（需本地 RocketMQ 5.5.1 集群；脚本会**停一次再拉起** broker，不删 store）：
-    .venv/bin/python verify_fail_fast_live.py 127.0.0.1:9876
-
-离线用例（``tests/test_fail_fast.py``）锁的是传输层契约：本机假对端读完就关，断言
-"毫秒级判死 + 报 RemotingSendRequestException 而不是超时 + 回调只投一次"。但这条路径
-存在的意义正是**真机上的 broker 重启 / 主备切换 / 网络抖动**，只有真集群能回答这几件事：
-
-  L1 基线：真 broker 上发送与长轮询都正常（先确认后面的失败不是环境造成的）。
-  L2 挂起：把三条**真的挂在 broker 上**的长轮询（suspend 20s、客户端超时 30s）钉在在途表里。
-  L3 收口：杀掉 broker（连接被关掉，客户端读线程见到 EOF）→ 长轮询必须立刻拿到
-      RemotingSendRequestException，而不是等满 30s 报一个 RemotingTimeoutException。
-      类型不能错：producer 的异步重试分类按异常**类型**分流（``client/producer.py``
-      ``_classify_async_failure``），报成超时等于换了一整套重试决策。
-  L4 范围：判死只针对死掉那条连接所在的地址；同一个传输实例上的 namesrv 连接照常服务
-      （``GET_ALL_TOPIC_LIST_FROM_NAMESERVER`` 仍返回 SUCCESS）。
-      ⚠ 这条只能证"按地址隔离"。"同地址换连接时旧连接的收尾不误伤新连接"那一层真机给不出
-      确定性的时间窗（一台 broker 一个地址一条连接），由离线用例
-      ``test_same_address_new_connection_survives_old_reader`` 负责。
-  L5 恢复：broker 拉起后同一个 producer 实例重新建连照常发送；**已经拿到 SEND_OK 的消息
-      一条都不能少**（快速失败不能把已经落地的说成丢了）。
-
-L3 的阈值（8s）远小于客户端超时（30s），也小于 broker 的 suspend 上限（20s）：少了
-failFast 这条断言必然失败，不是碰运气。
-"""
 from __future__ import annotations
 
 import os

@@ -1,54 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""顺序消费的重投闸门真机验证（Java ConsumeMessageOrderlyService#checkReconsumeTimes）。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_orderly_reconsume_live.py 127.0.0.1:9876
-
-为什么必须真机：闸门本身（本地 reconsumeTimes 计数 + 到点交给 broker）离线能测，
-但「交给 broker 之后发生了什么」离线一点都测不出来 —— 未 start 的消费者压根没有内部
-生产者，回投必定失败，于是只锁得住「失败分支」。而这条链路的三个真实故障全在成功分支
-上，并且**全都是静默的**：
-
-  - 抬进请求头：broker 判死信读的是 requestHeader.reconsumeTimes / maxReconsumeTimes
-    （SendMessageProcessor#handleRetryAndDLQ:197-210），不看报文属性。没抬就等于
-    消费者配的 maxReconsumeTimes 形同虚设。
-  - 回投成功后必须前进位点：Java :266-296 这时 commit 位点让毒消息走人。写错就是
-    一条毒消息永久占住整条队列，表现和「消费者死了」一模一样。
-  - 顺序组的锁没过期 ⇒ broker 直接把这条 %RETRY% 投递改投 %DLQ%
-    （handleRetryAndDLQ:202-207 `isLockAllExpired`）。这是顺序消费独有的终态，
-    只有真broker 会做。
-
-场景：
-  O1 到点交给 broker：maxReconsumeTimes=2 的顺序消费者遇毒消息 ⇒ 本地投递 3 次
-     （reconsumeTimes 0/1/2），第 3 次回投成功后业务队列**继续往前**（后面的正常消息
-     照样消费），且消息落在 %DLQ%<group>（reconsumeTimes=3、RETRY_TOPIC=业务 topic）。
-  O2 -1 是不设限：默认（-1）配置下同一条毒消息投递远超 3 次仍不进 %DLQ%
-     （Java OrderlyService#getMaxReconsumeTimes:313-320 把 -1 读成 Integer.MAX_VALUE，
-     与并发侧的 16 不是一套）。写错成 16 就会凭空造死信。
-  O3 挂起时长：context 上的 ``suspendCurrentQueueTimeMillis`` 优先于消费者配置，且解析
-     ``-1`` 回落到配置、结果钳到 [10, 30000]（Java submitConsumeRequestLater:211-234）。
-     配置 900ms / context 70ms 时中位间隔必须贴着 70ms（端到端），**并且**分发线程上客户端
-     请求的睡眠时长必须正好是 0.07s —— 后者没有计时噪声，钳位的两个边界也照此验证：
-     context 1ms / 配置 0 → 请求 0.01s；context 40s → 请求 30s。
-     为什么两个判据都要：分发循环在挂起之后还有 50ms 固定轮询节拍，10ms 与 1ms 的差别
-     落在间隔上根本分不出来（见 SleepRecorder 的注释）。
-  O4 autoCommit=false：SUCCESS 只记 TPS **不提交**（Java processConsumeResult:272-274），
-     本端口没有把 ProcessQueue 交给 listener，等价地塞回队首等一个挂起周期 —— 被持有的
-     那条要投递多次，后一条在「放行」（listener 把 autoCommit 拨回 true）之前不出现。
-     忽略 autoCommit 直接当成功 ack 的话，毒消息第一轮就被吞掉、后一条立刻被消费。
-  O5 autoCommit=false + COMMIT = 显式**批量 ack**（Java:275-277）：一批三条一次认可，
-     broker 位点从 0 直接跳到 3，同一批在整个观察窗口内不再投递。把 COMMIT 也当成
-     "不提交"（或漏掉这个分支）时这批会被按挂起节奏无限重投。
-  O6 autoCommit=false + ROLLBACK = 显式**回滚 + 立即重投**（Java:278-285）：这一批退回
-     队首、按（钳过的）挂起时长在**本地**重投 —— 不过 broker、不换 topic、reconsumeTimes
-     不动。判据落在间隔量级上：挂起 200ms ⇒ 相邻投递中位间隔百毫秒级；真走 %RETRY% 的
-     实现最快也只能等 broker 的第一个延迟档（delayLevel=3 即 10s），差一个量级。
-     同时验"回滚期间后面的消息不越位、显式提交后立刻放行"。
-  O7 autoCommit=true（默认）+ ROLLBACK 是**非法用法**：Java:246-250 只 warn、不写 break，
-     顺势落进 SUCCESS 分支（消息照 ack、不回滚）。同一个返回值在 O6/O7 行为相反，开关
-     只有 autoCommit 这一个布尔位 —— 任一边写反都必然在 O6 或 O7 上红。
-"""
 from __future__ import annotations
 
 import sys
@@ -263,11 +214,7 @@ class TimedSuspendListener(MessageListenerOrderly):
 
 
 class ManualHoldListener(MessageListenerOrderly):
-    """头 ``hold_calls`` 次把 autoCommit 关掉（模拟 binlog 消费方自己决定何时提交）。
-
-    状态一直返回 SUCCESS：关着的时候只该记 TPS 不提交（Java:272-274），所以这一条会被
-    反复投递；拨回 true 之后下一轮才提交位点、放行后面的消息。
-    """
+    pass
 
     def __init__(self, hold_calls: int):
         self.hold_calls = hold_calls
@@ -290,12 +237,7 @@ class ManualHoldListener(MessageListenerOrderly):
 
 
 class ExplicitCommitListener(MessageListenerOrderly):
-    """autoCommit=false + COMMIT：listener 拿提交权并**显式整批认可**（Java:275-277）。
-
-    与 O4 的差别只在返回值：O4 回 SUCCESS（不提交、反复投递），这里回 COMMIT（整批
-    ack、位点一次走到批尾）。把 COMMIT 当"不提交"处理时这批会被按挂起节奏无限重投，
-    ``batches`` 立刻不止一批。
-    """
+    pass
 
     def __init__(self):
         self.batches = []          # [[(body, reconsumeTimes, topic), ...], ...]
@@ -308,13 +250,7 @@ class ExplicitCommitListener(MessageListenerOrderly):
 
 
 class ExplicitRollbackListener(MessageListenerOrderly):
-    """autoCommit=false + ROLLBACK：头 ``rollback_calls`` 次显式回滚，之后显式提交。
-
-    Java:278-285 —— rollback() 把这一批退回 ProcessQueue，随后 submitConsumeRequestLater
-    按挂起时长重新派发：**本地重投**，不过 broker、不换 topic、reconsumeTimes 不动。
-    所以最硬的判据是**间隔量级**：挂起 200ms 时相邻投递应在一秒内，而任何"交给
-    broker 走 %RETRY%"的实现最快也要等 delayLevel=3 的 10s 档。
-    """
+    pass
 
     def __init__(self, rollback_calls: int, head: bytes):
         self.rollback_calls = rollback_calls
@@ -361,11 +297,7 @@ class ExplicitRollbackListener(MessageListenerOrderly):
 
 
 class IllegalRollbackListener(MessageListenerOrderly):
-    """autoCommit 保持默认 true，却返回 ROLLBACK（Java:246-250 的非法用法）。
-
-    期望行为：只 warn，随后**按 SUCCESS 处理**（消息照 ack）。真按回滚办的话这条会被
-    按挂起节奏反复投递、后面的消息永远不放行 —— 两种行为在真机上完全可分。
-    """
+    pass
 
     def __init__(self):
         self.records = []
@@ -446,10 +378,6 @@ def main() -> int:
           len(got1) == 1 and got1[0][2] == dlq1, "got=%s" % got1)
     print("O1: 原始 msgId=%s，DLQ 观测=%s" % (sent1.msg_id, got1))
 
-    # ---------- O2 -1 在顺序侧是「不设限」 ----------
-    # Java 顺序侧 -1 → Integer.MAX_VALUE（OrderlyService#getMaxReconsumeTimes:313-320），
-    # 并发侧 -1 → 16（DefaultMQPushConsumerImpl#getMaxReconsumeTimes:890）。并成一个常量
-    # 的话，这条用默认配置的正常路径会在第 16 次凭空造出一条死信。
     topic2 = PREFIX + "_OrdUnlimited"
     group2 = PREFIX + "_g2"
     prepare_topic(topic2)
@@ -477,10 +405,6 @@ def main() -> int:
     dlq2, got2 = read_dlq(group2, timeout=12)
     check("O2-没到阈值就不该有死信（%s 为空）" % dlq2, got2 == [], "got=%s" % got2)
 
-    # ---------- O3 挂起时长：context 优先 + 钳到 [10, 30000] ----------
-    # Java submitConsumeRequestLater:211-234：-1（默认）→ 消费者配置；给值就用给的值；
-    # 最后钳到 [10, 30000]。配置故意设 900ms：读错成配置时中位间隔会落到 0.9s。
-    # 两个判据：间隔（端到端真的等了这么久）+ 客户端请求的时长（精确，不受轮询节拍影响）。
     topic3 = PREFIX + "_OrdSuspendCtx"
     group3 = PREFIX + "_g3"
     prepare_topic(topic3)
@@ -517,7 +441,7 @@ def main() -> int:
     c3b.set_namesrv_addr(NAMESRV)
     c3b.set_message_listener(listener3b)
     c3b.consume_message_batch_max_size = 1
-    c3b.suspend_current_queue_time_millis = 0    # 配置侧非法值，Java 同样钳到 10ms
+    c3b.suspend_current_queue_time_millis = 0
     c3b.subscribe(topic3b, "*")
     rec3b = SleepRecorder()
     with rec3b:
@@ -561,10 +485,6 @@ def main() -> int:
           "n=%d requested=%s" % (len(listener3c.times), rec3c.others()))
     c3c.shutdown()
 
-    # ---------- O4 autoCommit=false 时 SUCCESS 不提交（Java:272-274）----------
-    # 前 3 次关着 autoCommit：那条消息必须被反复投递（位点不动、也没被 ack）；第 4 次
-    # 拨回 true 之后提交位点，后面那条才被消费。忽略 autoCommit 的实现会在第 1 次就
-    # 把它 ack 掉，于是「重复投递」和「后一条在前 3 次之内不出现」两条都不成立。
     topic4 = PREFIX + "_OrdManual"
     group4 = PREFIX + "_g4"
     prepare_topic(topic4)
@@ -682,10 +602,6 @@ def main() -> int:
           offs6 is not None and all(o == 2 for _, o in offs6),
           "offsets=%s" % [o for _, o in offs6] if offs6 else "routes=none")
 
-    # ---------- O7 autoCommit=true + ROLLBACK = 非法用法，按 ack 处理 ----------
-    # 与 O6 只差 autoCommit 这一个布尔位：listener 不碰它（默认 true）却返回 ROLLBACK。
-    # Java:246-250 只 warn、不写 break ⇒ 顺势落进 SUCCESS 分支（消息照 ack）。真按回滚
-    # 办的话 head 会被挂起节奏反复投递、next 永远不放行 —— 两种行为在真机上完全可分。
     topic7 = PREFIX + "_OrdIllegal"
     group7 = PREFIX + "_g7"
     prepare_topic(topic7)

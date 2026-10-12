@@ -1,16 +1,5 @@
 // NamespaceRpcHook（5.x 新命名空间 / Aliyun 实例 ID 形态）单测。
 //
-// 对应 Java：
-//   * client/src/main/java/org/apache/rocketmq/client/rpchook/NamespaceRpcHook.java
-//     （doBeforeRequest 只在 namespaceV2 非空时加 `nsd=true` / `ns=<namespaceV2>`，
-//      doAfterResponse 空；空命名空间时 extFields 一个键都不加）
-//   * common/src/main/java/org/apache/rocketmq/common/MixAll.java:122-123
-//     （RPC_REQUEST_HEADER_NAMESPACED_FIELD = "nsd" / _NAMESPACE_FIELD = "ns"）
-//   * client/src/main/java/org/apache/rocketmq/client/impl/MQClientAPIImpl.java:329-335
-//     （注册顺序 Namespace → Stream → 用户钩子（ACL）→ DynamicalExtField；
-//      Namespace 必须在 ACL **之前**，签名才覆盖 nsd/ns）
-//   * client/src/test/java/org/apache/rocketmq/client/rpchook/NamespaceRpcHookTest.java
-//     （无命名空间时请求的 extFields 保持原样）
 //
 // 覆盖四件事：
 //   (a) 钩子加 nsd=true / ns=<值>；
@@ -82,10 +71,6 @@ int g_fail = 0;
 const std::string kNsKey(MixAll::RPC_REQUEST_HEADER_NAMESPACE_FIELD);
 const std::string kNsdKey(MixAll::RPC_REQUEST_HEADER_NAMESPACED_FIELD);
 
-// 对应 Java NamespaceRpcHookTest 的建法：PULL_MESSAGE + PullMessageRequestHeader。
-// 本端口的 createRequestCommand 与 Java 一样不把 customHeader 预先展开进 extFields
-// （展开是签名/编码时 makeCustomHeaderToNet() 干的），所以刚建好的请求 extFields 为空，
-// 「无命名空间 ⇒ extFields 保持原样」在这里就是「仍然为空」。
 RemotingCommand pullRequest() {
     return RemotingCommand::createRequestCommand(
         RequestCode::PULL_MESSAGE, std::make_shared<PullMessageRequestHeader>());
@@ -132,7 +117,6 @@ void testHookAddsNamespaceFields() {
     CHECK(cmd.getExtField(kNsdKey) == "true", "nsd=true injected");
     CHECK(cmd.getExtField(kNsKey) == "MQINST-abc", "ns=<namespaceV2> injected");
     CHECK(cmd.extFields.size() == 2, "exactly the two namespace fields are added");
-    // Java MixAll.java:122-123 的两枚键名（写错 broker 直接读不到）
     CHECK(kNsdKey == "nsd", "MixAll nsd key spelling");
     CHECK(kNsKey == "ns", "MixAll ns key spelling");
 
@@ -146,14 +130,11 @@ void testHookAddsNamespaceFields() {
     hook.doBeforeRequest("127.0.0.1:9876", withExt);
     CHECK(withExt.extFields.size() == 3, "addExtField overwrite, not append");
 
-    // doAfterResponse：Java 是空实现（基类默认），响应不能被改写
     RemotingCommand resp = RemotingCommand::createResponseCommand(
         ResponseCode::SUCCESS, "ok");
     hook.doAfterResponse("127.0.0.1:9876", cmd, &resp);
     CHECK(resp.extFields.empty(), "doAfterResponse leaves the response untouched");
 
-    // 取值函数每笔请求实时读（Java 直接读 clientConfig.getNamespaceV2()）：
-    // 钩子建好之后再改配置，下一笔报文要跟着变。
     std::string live = "ns-before";
     NamespaceRpcHook liveHook([&live] { return live; });
     RemotingCommand first = pullRequest();
@@ -165,10 +146,6 @@ void testHookAddsNamespaceFields() {
     CHECK(second.getExtField(kNsKey) == "ns-after", "live getter: config change is picked up");
 }
 
-// ---------------------------------------------------------------- (b) 没配 namespaceV2
-// 对应 Java NamespaceRpcHookTest#testDoBeforeRequestWithoutNamespace：
-// extFields 必须**原样**（Java 断言 getExtFields() 为 null；本端口是 std::map，
-// 等价口径 = 一个键都不加、也不物化任何字段）。
 void testEmptyNamespaceLeavesExtFieldsUntouched() {
     RemotingCommand cmd = pullRequest();
     const size_t before = cmd.extFields.size();
@@ -198,7 +175,6 @@ void testCompositionOrderNamespaceThenStreamThenAcl() {
     auto acl = std::make_shared<AclClientRPCHook>(SessionCredentials("AK", "SK"));
     const std::function<std::string()> nsGetter = getterOf("MQINST-order");
 
-    // 三环齐活：Namespace → Stream → 用户（Java MQClientAPIImpl:329-335）
     std::shared_ptr<RPCHook> composed = composeRequestHooks(true, acl, nsGetter);
     auto chain = std::dynamic_pointer_cast<ChainedRPCHook>(composed);
     CHECK(chain != nullptr, "namespace + stream + user => chained");
@@ -254,8 +230,6 @@ void testCompositionOrderNamespaceThenStreamThenAcl() {
     CHECK(composeRequestHooks(false, acl) == acl,
           "two-arg overload still returns the user hook untouched");
 
-    // getter 接了线但当前为空：**照 Java 无条件装链**（钩子每笔请求现读，
-    // start() 之后才 setNamespaceV2 也能生效），空值时钩子自己退化成 no-op
     {
         std::string live;  // 此刻还没配 namespaceV2
         const std::shared_ptr<RPCHook> wrapped =
@@ -329,10 +303,6 @@ void testAclSignatureCoversNamespace() {
     CHECK(lateSig != chained.getExtField(SessionCredentials::SIGNATURE),
           "signing before nsd/ns produces a different (rejected) signature");
 
-    // 5) 签名的**内容**逐字节核对（拼接顺序 = extFields 键的字典序，只取值）：
-    //    AccessKey < ns < nsd < topic（std::map 字节序；Java TreeMap 同结论），
-    //    所以内容 = "AK_TEST" + "MQINST-sign" + "true" + "MyTopic" + body。
-    //    这一条把「nsd/ns 真的进了签名的字节」钉死，而不是只比对自己算出来的两个值。
     CHECK(AclClientRPCHook::buildRequestContent(chained)
               == Bytes("AK_TESTMQINST-signtrueMyTopic") + body,
           "signed content is AccessKey + ns + nsd + topic + body");
@@ -362,16 +332,12 @@ void testAclSignatureCoversNamespace() {
         CHECK(AclClientRPCHook::calcSignature(credentials.secretKey(), replay)
                   == three.getExtField(SessionCredentials::SIGNATURE),
               "namespace + stream + acl: replay verifies");
-        // extFields 按 key 字节序取**值**拼接：大写字母 < 大写下划线后的字母 < 小写，
-        // 故 AccessKey < ReqT < ns < nsd < topic（Java TreeMap 同结论）。
         CHECK(AclClientRPCHook::buildRequestContent(three)
                   == Bytes("AK_TEST0MQINST-signtrueMyTopic") + body,
               "content order is AccessKey, ReqT, ns, nsd, topic, body");
     }
 }
 
-// ---------------------------------------------------------------- 门面配置面
-// 五个门面的 setNamespaceV2/getNamespaceV2（对应 Java ClientConfig 的同一枚旋钮）。
 void testFacadeConfigSurface() {
     DefaultMQProducer p("PG_nsface");
     p.setNamespaceV2("inst-p");
@@ -400,7 +366,6 @@ void testFacadeConfigSurface() {
     CHECK(fresh.namespaceV2().empty() && fresh.namespaceOf() == "legacy",
           "namespaceV2 and legacy namespace are independent knobs");
 
-    // 轨迹分发器的传导缝（Java AsyncTraceDispatcher:79/147 + start():155）
     AsyncTraceDispatcher dispatcher("PG_nsface_trace", TraceDispatcherType::PRODUCE);
     CHECK(dispatcher.namespaceV2().empty(), "dispatcher namespaceV2 defaults to empty");
     dispatcher.setNamespaceV2("inst-trace");
@@ -651,8 +616,6 @@ Message plainMessage(const std::string& topic) {
     return m;
 }
 
-// 推送消费者的 start() 按 Java checkConfig:1067 要求 listener 就位（本文件只取报文，
-// 不关心消费结果）。
 class NoopListener : public MessageListenerConcurrently {
 public:
     ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>&,
@@ -713,7 +676,6 @@ void testFacadesPutNamespaceOnTheWire() {
         CHECK(AclClientRPCHook::calcSignature("SK-wire", replay)
                   == rec.ext.at(std::string(SessionCredentials::SIGNATURE)),
               "producer: broker-side replay verifies the namespaced signature");
-        // 生产者默认关 stream（Java DefaultMQProducer 从不置 enableStreamRequestType）
         checkAllRequestsMarked(mock, "producer", false);
         CHECK(mock.countRequestsWith(RequestCode::GET_ROUTEINFO_BY_TOPIC, MixAll::REQ_T, "0") == 0,
               "producer: stream off => no ReqT (namespace hook installed independently)");

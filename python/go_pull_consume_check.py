@@ -1,24 +1,4 @@
 # -*- coding: utf-8 -*-
-"""用**已验证的 Python 客户端**回读 Go 主动拉取消费者（DefaultMQPullConsumer）在真实
-broker 上留下的痕迹。
-
-为什么需要：go/examples/live_pull 里有一半断言是"自问自答" —— 它自己提交位点、自己读
-回来，报文里 key 拼错了照样可能自洽（尤其 UPDATE_CONSUMER_OFFSET 和
-CONSUMER_SEND_MSG_BACK 的头字段，写错了 broker 也可能回 SUCCESS）。真正能判定的是
-**另一个语言**的实现：
-  * 它用 Java 的属性名去问 broker「GID_xxx 在 <topic> 的 0 号队列上提交到哪儿了」，
-    拿到的必须是 Go 侧写进去的那个**故意只提交一部分**的位点（不是"全消费完"的巧合值）；
-  * 它用自己的拉取去读同一段 commitlog，读到的消息序列必须和 Go 侧列出的完全一致；
-  * Go 说"sendMessageBack 被 broker 接受"不算数，得看 %RETRY%<group> 里是否真的出现了
-    那条消息，并且 %DLQ%<group> 里**没有** —— maxReconsumeTimes 照抄 push 消费者的 -1
-    就会直奔 DLQ，这条只在真机上看得到。
-
-用法: python go_pull_consume_check.py <topic> <go_group> <committed> <total>
-
-committed / total 都从 Go 侧最后一行 `PASS=.. FAIL=.. COMMITTED=.. TOTAL=..` 取
-（见 scripts/run_go_pull_live.sh），别写死 —— 往 live_pull 里加一个检查就会让写死的
-期望值悄悄失准（少要几条 → 假绿）。
-"""
 import os
 import sys
 import time
@@ -100,9 +80,6 @@ def main():
         check("S2 max_offset == Go 报的总条数", hi == total, "max=%d want=%d" % (hi, total))
         check("S2 min_offset == 0", lo == 0, "min=%d" % lo)
 
-        # ---- S3 位点见证：broker 上 Go 那个组提交到哪儿了 ---------------------------
-        # 这是本脚本最重要的一条：Go 侧最后一个动作是 UpdateConsumeOffsetToBroker，
-        # 这里用**另一个进程、另一个语言**按 Java 的字段名去问 broker。
         got = admin.examine_consumer_offset(go_group, q0)
         check("S3 broker 上 Go 组的已提交位点 == COMMITTED", got == committed,
               "broker=%r committed=%d" % (got, committed))

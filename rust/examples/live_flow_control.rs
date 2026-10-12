@@ -1,5 +1,3 @@
-//! 拉取前流控（Java `ProcessQueue` 五个阈值）真机验证。
-//!
 //! 与 `python/verify_flow_control_live.py`（S0..S5）、`cpp/examples/live_flow_control.cpp`、
 //! `csharp/examples/RocketMQ.Examples/LiveFlowControl.cs` 同题、逐条对应。
 //!
@@ -12,15 +10,6 @@
 //!   位点不许越过还没消费完的消息，恢复后同一个队列必须继续消费到末尾。实现写成"命中就
 //!   丢批 / 退出循环"在十几秒窗口里完全看不出来，只有把全部消息数完才暴露。
 //!
-//! 场景：
-//! - S0 默认闸门 + 快消费：**不该**命中（triggered==0），消息全部到达 —— 防闸门误伤正常流量。
-//! - S1 队列级字节闸门：条数闸门放到不可能命中，`size=1MiB` + 400KB **不可压缩**大消息 + 慢消费。
-//! - S2 位点跨度闸门：条数/字节都关掉，只剩 `consumeConcurrentlyMaxSpan=2`。
-//! - S3 topic 级条数闸门：队列级三条全关掉，只剩 `pullThresholdForTopic=4` —— 必须跨队列累计才可能命中。
-//! - S4 命中之后恢复：同一组再来一批大消息，闸门仍会命中且新消息照单全收。
-//! - S5 启动期数值闸门（Java `checkConfig` :1099-1209）：区间**边界**配置在真集群上能
-//!   启动并收全消息；越界配置本地被拒（文案逐字对 Java）且**没打到 broker** ——
-//!   broker 侧查不到那个组，说明校验排在注册之前，没留下僵尸 clientId。
 //!
 //! ⚠ 大消息必须是**不可压缩**的伪随机字节：生产者对超过压缩阈值的 body 先试压，全同字节
 //!   的 payload 会被压到几百字节，broker 落盘的 `storeSize` 跟着变几百字节 —— "size 闸门
@@ -58,17 +47,10 @@ use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use tokio::task::JoinSet;
 
 /// 一条"远大于任何真机缓冲"的阈值，等价于把那道闸门关掉。
-///
-/// 不能写 `INT_MAX`（加法溢出），也不能写 `0`：`0` 曾经就是"关闭"的写法，但
-/// Java `DefaultMQPushConsumerImpl.checkConfig`（:1099-1209）把
-/// `pullThresholdForQueue` / `consumeConcurrentlyMaxSpan` 的下界定在 **1**，
-/// 我们在 `start()` 里照抄了这道闸门（见 S5），于是 0 会在启动时被拒。
-/// 65535 是 Java 给这几条字段的上界，语义上仍是"实际不可能命中"。
 const GATE_OFF: i32 = 65535;
 /// 字节闸门"关闭"的写法同上：`pullThresholdSizeForQueue` 合法域 [1, 1024]（单位 MiB），
 /// 0 已非法，用 1024 MiB 表示不拦。
 const GATE_OFF_SIZE_MIB: i32 = 1024;
-/// 字节闸门配 1 = **1 MiB**（Java pullThresholdSizeForQueue 的单位是 MiB，不是字节）。
 const GATE_ONE_MIB: i32 = 1;
 const BIG: usize = 400 * 1024;
 
@@ -345,11 +327,6 @@ struct Gates {
     span: Option<i64>,
     topic_count: Option<i32>,
     /// true 时把消费线程池钉成 1 线程。
-    ///
-    /// 慢 listener 是为了制造"已拉未消费"的堆积，而 Rust 的池默认 **20 线程**
-    /// （`consumeThreadMin=20`，对齐 Java）：8 条消息一轮就抽干了，缓冲永远堆不到
-    /// 1MiB —— 字节闸门于是"在真机上不命中"，纯属夹具与线程池大小的耦合。Python/C++
-    /// 的分发是单线程，同一条夹具天然就能堆积；这里显式钉成 1，让四语言用同一条判据。
     single_consumer: bool,
 }
 
@@ -626,14 +603,6 @@ async fn run(namesrv: &str) -> Checker {
         );
     }
 
-    // ---------------- S5 启动期数值闸门（Java checkConfig :1099-1209）----------------
-    // 离线单测（`src/client/consumer.rs` 的 `each_range_gate_*`）锁的是区间与文案；这里
-    // 补两件只有真集群能锁死的事：
-    //   1. 落在 Java 区间**边界**上的配置真能把消费者跑起来并收全消息 —— 闸门写歪最常
-    //      见的方式是"比 Java 还严"，把合法配置也拒了，用户直接起不来；
-    //   2. 越界的配置**没有打到 broker**。写成"先注册再校验"会在 broker 的 ConsumerManager
-    //      里留下一堆永不心跳的僵尸 clientId，把 rebalance 用的 cidAll 撑歪（表现为队列
-    //      分配不均），而客户端日志里只有启动失败那一条。
     let s5_topic = fx.topic_name("Boundary");
     let s5_group = fx.group_name("s5");
     let bad_group = fx.group_name("s5-rejected");

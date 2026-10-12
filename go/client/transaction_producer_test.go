@@ -168,8 +168,6 @@ func TestTransactionProducerRequiresListener(t *testing.T) {
 	if err == nil {
 		t.Fatal("a transaction send without a listener must fail")
 	}
-	// Java's wrapper uses this exact text, distinct from the "tranExecutor is
-	// null" the inner implementation raises.
 	if !strings.Contains(err.Error(), "TransactionListener is null") {
 		t.Errorf("error = %v, want Java's wrapper wording", err)
 	}
@@ -190,7 +188,6 @@ func TestTransactionProducerStartCreatesCheckExecutor(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected the built-in pool, got %T", svc)
 	}
-	// Java's defaults: min=1, max=1, queue=2000.
 	if got := pool.QueueCapacity(); got != DefaultCheckRequestHoldMax {
 		t.Errorf("queue capacity = %d, want %d", got, DefaultCheckRequestHoldMax)
 	}
@@ -213,9 +210,6 @@ func TestTransactionProducerHonoursExecutorServiceOverride(t *testing.T) {
 	const topic = "TxProdExecOverrideTopic"
 	p, broker := startTransactionFixture(t, topic, "GID_tx_exec_override")
 
-	// Replacing the pool after Start has no effect until the next Start — the
-	// same "configure before start" rule Java has. Start again with the
-	// override to prove it wins.
 	custom := &countingExecutorService{}
 	p.SetExecutorService(custom)
 	if err := p.Start(); err != nil {
@@ -248,8 +242,6 @@ func TestTransactionProducerHonoursExecutorServiceOverride(t *testing.T) {
 	})
 
 	p.Shutdown()
-	// Java's destroyTransactionEnv only shuts down the pool it built; a
-	// caller-supplied ExecutorService is merely detached.
 	if _, shutdown := custom.state(); shutdown {
 		t.Error("Shutdown must not close a caller-supplied ExecutorService")
 	}

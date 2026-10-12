@@ -1,22 +1,4 @@
 # -*- coding: utf-8 -*-
-"""同步发送重试链（对应 Java DefaultMQProducerImpl.sendDefaultImpl）的单测。
-
-对齐基准是 Java 5.5.1 的 ``sendDefaultImpl``，逐条盯这些语义：
-  * 路由只在重试循环**之外**取一次；取不到立刻抛 NOT_FOUND_TOPIC_EXCEPTION(10005)；
-  * timesTotal = 1 + retryTimesWhenSendFailed，times > 0 时 resetIndex=true；
-  * costTime > timeout 时不再发起请求，最终抛 RemotingTooMuchRequestException；
-  * sendMsgMaxTimeoutPerRequest 只压**还能再试**的那几次；
-  * 异常按类型分档写容错表：MQClientException 只记延迟不隔离，RemotingException
-    隔离但保持可达，MQBrokerException 隔离且标不可达；
-  * 只有 retryResponseCodes 里的 broker 响应码才换 broker，否则原样抛出
-    （已有 SendResult 时把它返回，而不是把错误吞掉）；
-  * 非 SEND_OK 只在 retryAnotherBrokerWhenNotStoreOK 打开时才重试；
-  * 重试耗尽后按最后异常类型映射 ClientErrorCode：10001 连不上 / 10002 等响应超时
-    / 10003 客户端自身问题 / broker 码原样带上。
-
-cpp 端用的是真 socket mock（`cpp/tests/test_send_retry.cpp`），这里走
-`_FakeClient` 缝在 `send_message` 上，语义同一套。
-"""
 from __future__ import annotations
 
 import time
@@ -131,7 +113,7 @@ def _ok(mq):
 
 # ---------------------------------------------------------------- 路由
 def test_missing_route_fails_fast_with_not_found_topic_code():
-    """Java：tryToFindTopicPublishInfo 拿不到 → 直接 10005，一次请求都不发。"""
+    pass
     p = _producer(outcomes=[MQClientException("boom")], retry=3, no_route=True)
     with pytest.raises(MQClientException) as ei:
         p.send(Message("TopicTest", b"x"))
@@ -148,11 +130,7 @@ def test_empty_publish_info_also_maps_to_not_found_topic():
 
 
 def test_no_name_server_address_reports_10004_not_missing_route():
-    """Java ``validateNameServerSetting``（DefaultMQProducerImpl:729）：一个地址都没有时报
-    10004，而不是把寻址故障说成"这个 topic 没路由"（10005）。
-
-    少了这一步，配错地址服务器的运维会去查 topic 存在不存在，方向完全错。
-    """
+    pass
     p = _producer(no_route=True, retry=2, namesrv_addrs=[])
     with pytest.raises(MQClientException) as ei:
         p.send(Message("TopicTest", b"x"))
@@ -256,7 +234,7 @@ def test_custom_retry_response_code_is_honoured():
 
 
 def test_non_retryable_failure_returns_earlier_send_result():
-    """Java：先拿到非 SEND_OK 的结果，后一轮抛了不可重试的码 → 返回那个结果，不吞成功。"""
+    pass
     p = _producer(outcomes=[SendResult(SendStatus.FLUSH_SLAVE_TIMEOUT, msg_id="1" * 32),
                             MQBrokerException(ResponseCode.MESSAGE_ILLEGAL)],
                   retry=2, retry_not_store_ok=True)
@@ -267,7 +245,7 @@ def test_non_retryable_failure_returns_earlier_send_result():
 
 # ---------------------------------------------------------------- 非 SEND_OK
 def test_not_store_ok_returned_as_is_by_default():
-    """Java 默认 retryAnotherBrokerWhenNotStoreOK=false：存了但没存好也原样返回。"""
+    pass
     p = _producer(outcomes=[SendResult(SendStatus.FLUSH_DISK_TIMEOUT, msg_id="2" * 32)],
                   retry=2)
     result = p.send(Message("TopicTest", b"x"))
@@ -287,7 +265,7 @@ def test_not_store_ok_retries_another_broker_when_enabled():
 
 # ---------------------------------------------------------------- 超时预算
 def test_send_msg_max_timeout_per_request_only_caps_retriable_attempts():
-    """Java：maxTimeoutPerRequest 只在「还能再试」时压缩 curTimeout，最后一次给满预算。"""
+    pass
     p = _producer(outcomes=[MQBrokerException(ResponseCode.SYSTEM_ERROR)] * 3,
                   retry=2, max_per_request=100)
     with pytest.raises(MQClientException):
@@ -318,7 +296,7 @@ def test_call_timeout_stops_retrying_and_raises_too_much_request():
 
 
 def test_existing_result_wins_over_call_timeout():
-    """Java 顺序是先 `if (sendResult != null) return`，再判 callTimeout。"""
+    pass
     p = _producer(outcomes=[SendResult(SendStatus.FLUSH_DISK_TIMEOUT, msg_id="4" * 32),
                             MQBrokerException(ResponseCode.SYSTEM_ERROR)],
                   retry=2, retry_not_store_ok=True, first_send_sleep_ms=60)
@@ -361,7 +339,7 @@ def test_client_failure_maps_to_broker_not_exist_exception():
 
 
 def test_plain_remoting_failure_leaves_response_code_unset():
-    """既不是连不上也不是等响应超时 → Java 不套任何 ClientErrorCode，code 留空。"""
+    pass
     p = _producer(outcomes=[RemotingException("network")], retry=0)
     with pytest.raises(MQClientException) as ei:
         p.send(Message("TopicTest", b"x"))
@@ -370,7 +348,7 @@ def test_plain_remoting_failure_leaves_response_code_unset():
 
 
 def test_unexpected_exception_propagates_unchanged():
-    """Java 只声明四类发送异常；其余异常不重试、不包装，原样抛出。"""
+    pass
     p = _producer(outcomes=[ValueError("unexpected"), _ok(_mq("broker-a"))], retry=2)
     with pytest.raises(ValueError):
         p.send(Message("TopicTest", b"x"))
@@ -402,7 +380,7 @@ def test_successful_send_records_positive_latency_without_isolation():
 
 
 def test_client_exception_records_latency_without_isolation():
-    """Java catch (MQClientException) → updateFaultItem(..., false, true)：只记延迟。"""
+    pass
     p = _producer(outcomes=[MQClientException("x")] * 2, retry=1, latency_fault=True)
     with pytest.raises(MQClientException):
         p.send(Message("TopicTest", b"x"))
@@ -412,7 +390,7 @@ def test_client_exception_records_latency_without_isolation():
 
 
 def test_remoting_exception_isolates_but_keeps_reachable():
-    """无后台探测线程 → Java 的 reachable = !isStartDetectorEnable() 恒为 true。"""
+    pass
     p = _producer(outcomes=[RemotingConnectException(ADDR)] * 2, retry=1, latency_fault=True)
     with pytest.raises(MQClientException):
         p.send(Message("TopicTest", b"x"))

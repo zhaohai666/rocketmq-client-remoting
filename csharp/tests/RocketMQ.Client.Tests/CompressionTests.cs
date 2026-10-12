@@ -42,8 +42,6 @@ public class CompressionTests
         04224d1868406004000000000000482b000000ff0d726f636b65746d712d636f6d707265737365642d7061796c
         6f61642d1c00ffffffff30506c6f61642d00000000";
 
-    // Rust `lz4_flex::frame::FrameEncoder`（纯 Rust）：59B。帧头 7 字节、FLG=0x60
-    // （不写 content-size）——与 Java LZ4FrameOutputStream 默认写法同形。
     private const string RS_LZ4_FRAME = @"
         04224d186040822c000000ff0d726f636b65746d712d636f6d707265737365642d7061796c6f61642d1c00ffff
         ffff2f60796c6f61642d00000000";
@@ -87,8 +85,6 @@ public class CompressionTests
         28b52ffd646003250100e0726f636b65746d712d636f6d707265737365642d7061796c6f61642d010004f1ff7402
         78aa9792";
 
-    // `zstd -3 --no-content-size` CLI：不带 content-size 的帧（49B）——
-    // Java zstd-jni `ZstdOutputStream` 流式写的就是这个形状，必须能解。
     private const string ZSTD_CLI_NO_SIZE = @"
         28b52ffd0408250100e0726f636b65746d712d636f6d707265737365642d7061796c6f61642d010004f1ff740278
         aa9792";
@@ -203,7 +199,6 @@ public class CompressionTests
     [Fact]
     public void Type_FindByValue_MatchesLegacy()
     {
-        // Java CompressionType.findByValue：0 与 3 都必须是 ZLIB（老客户端没有类型位）
         Assert.Equal(CompressionType.LZ4, CompressionType.FindByValue(1));
         Assert.Equal(CompressionType.ZSTD, CompressionType.FindByValue(2));
         Assert.Equal(CompressionType.ZLIB, CompressionType.FindByValue(3));
@@ -215,7 +210,6 @@ public class CompressionTests
     [Fact]
     public void Type_GetCompressionFlag_MatchesSysFlagBits8To10()
     {
-        // Java CompressionType.getCompressionFlag：sysFlag 的 bit8~10
         Assert.Equal(0x1 << 8, CompressionType.GetCompressionFlag(CompressionType.LZ4));
         Assert.Equal(0x2 << 8, CompressionType.GetCompressionFlag(CompressionType.ZSTD));
         Assert.Equal(0x3 << 8, CompressionType.GetCompressionFlag(CompressionType.ZLIB));
@@ -274,8 +268,6 @@ public class CompressionTests
         // magic 0x184D2204 按小端落盘 => 04 22 4D 18（不是 raw block 的必要条件之一）
         Assert.Equal(new byte[] { 0x04, 0x22, 0x4D, 0x18 }, compressed.Take(4).ToArray());
 
-        // 与 rust `lz4_flex` 的帧头**逐字节相同**：7 字节、FLG=0x60（独立块、不写 content-size）、
-        // BD=0x40（max64KB）。这正是 Java `LZ4FrameOutputStream` 的默认写法。
         Assert.Equal(Unhex(RS_LZ4_FRAME).Take(7).ToArray(), compressed.Take(7).ToArray());
         Assert.Equal(0x60, compressed[4]);
         Assert.Equal(0x40, compressed[5]);
@@ -373,7 +365,6 @@ public class CompressionTests
     public void Zstd_FrameMagicAndOutputBytes()
     {
         byte[] compressed = CompressorFactory.Compress(Payload(), CompressionType.ZSTD);
-        // Java `Zstd.compress(byte[])` 产出的是**标准 zstd 帧**（magic 0x28 B5 2F FD），不是 raw block
         Assert.Equal(new byte[] { 0x28, 0xB5, 0x2F, 0xFD }, compressed.Take(4).ToArray());
         Assert.Equal(Unhex(NET_ZSTD_FRAME), compressed); // 回归护栏
     }
@@ -381,8 +372,6 @@ public class CompressionTests
     [Fact]
     public void Zstd_Decompress_CliFrames_WithAndWithoutContentSize()
     {
-        // 带 content-size（FLG 的 FCS 字段非 0）与不带（Java ZstdOutputStream 流式写法）两种都要能解：
-        // 不带时 ZSTD_getFrameContentSize 返回 UNKNOWN，得靠扩容缓冲而不是按声明长度一次开到位。
         byte[] withSize = Unhex(ZSTD_CLI_WITH_SIZE);
         byte[] noSize = Unhex(ZSTD_CLI_NO_SIZE);
         Assert.Equal(50, withSize.Length);
@@ -410,8 +399,6 @@ public class CompressionTests
     [Fact]
     public void Zstd_ConcatenatedFrames_DecodeLikeLegacyInputStream()
     {
-        // Java ZstdInputStream 会读串接的多帧（Zstd_decompress 文档同样要求 compressedSize 是整帧总长）：
-        // 把两个帧拼起来必须解成两段明文的首尾相接。
         byte[] a = CompressorFactory.Compress(Payload(), CompressionType.ZSTD);
         byte[] b = CompressorFactory.Compress(Encoding.ASCII.GetBytes("tail-segment"), CompressionType.ZSTD);
         byte[] joined = new byte[a.Length + b.Length];
@@ -434,7 +421,6 @@ public class CompressionTests
     [Fact]
     public void Zstd_Levels_AllRoundTrip_AndClamped()
     {
-        // Java 把 compressLevel 透传给 ZstdOutputStream（Python 则忽略），这里跟随 Java。
         byte[] payload = LargePayload(200);
         foreach (int level in new[] { 0, 1, 5, 9, 19, 99, -3 })
         {
@@ -455,7 +441,6 @@ public class CompressionTests
             byte[] compressed = CompressorFactory.Compress(payload, t, 5);
             Assert.NotEqual(payload, compressed);
 
-            // 帧头必须对得上：t==0 走的是 ZLIB（Java findByValue 的兼容映射）
             byte[] magic = CompressionType.FindByValue(t) switch
             {
                 CompressionType.LZ4 => new byte[] { 0x04, 0x22, 0x4D, 0x18 },
@@ -500,7 +485,6 @@ public class CompressionTests
             };
             Assert.Equal(magic, wire.Body.Take(magic.Length).ToArray());
 
-            // 正常解码：拿到明文，并且 COMPRESSED_FLAG 被清掉（类型位保留），与 Java 一致
             Assert.True(MessageDecoder.DecodeMessage(raw, out MessageExt decoded, decompressBody: true), type.ToString());
             Assert.Equal(body, decoded.Body);
             Assert.False(MessageSysFlag.IsCompressed(decoded.SysFlag));
@@ -513,7 +497,6 @@ public class CompressionTests
     {
         byte[] payload = Payload();
 
-        // 1) 未知类型（SNAPPY=4 及 5/6/7）：Java findByValue 抛 RuntimeException
         foreach (int t in new[] { 4, 5, 6, 7, -1 })
         {
             Assert.Throws<InvalidOperationException>(() => CompressorFactory.Compress(payload, t, 5));
@@ -526,7 +509,6 @@ public class CompressionTests
         Assert.ThrowsAny<Exception>(() => { CompressorFactory.Decompress(garbage, CompressionType.ZSTD); });
         Assert.ThrowsAny<Exception>(() => { CompressorFactory.Decompress(Array.Empty<byte>(), CompressionType.LZ4); });
 
-        // 3) 截断帧：宁可抛错也不能交半截明文（Java ZstdInputStream/LZ4FrameInputStream 抛 IOException）
         foreach (int t in new[] { CompressionType.LZ4, CompressionType.ZSTD })
         {
             byte[] full = CompressorFactory.Compress(LargePayload(50), t);

@@ -7,13 +7,6 @@
 //! traceparent: 00-<trace-id 32hex>-<parent-id 16hex>-<flags 2hex>
 //! ```
 //!
-//! * trace-id / parent-id 不能全 0；version `00` 时 flags 为任意两位 hex；
-//! * 生产侧：消息没有 `traceparent` 属性时注入一个根 span 上下文（opt-in，
-//!   `enable_trace_context = true` 或环境变量 `ROCKETMQ_TRACE_CONTEXT_ENABLE`）——
-//!   Java 客户端把这类注入交给外部链路追踪的 `SendMessageHook`（SkyWalking/OTel），
-//!   本实现内建等价能力，键名沿用 W3C 的小写 `traceparent`；已有值**不覆盖**
-//!   （调用方传播的上下文优先）；
-//! * 消费侧：从 `MessageExt.properties` 里取出，供业务做父子 span 关联。
 //!
 //! 与本仓库 Python / C# 端一致的**有意差异**：Python 用 `secrets.token_hex`
 //! （CSPRNG），本 crate 不引第三方随机数依赖，改用「纳秒时间 + PID + 进程内自增

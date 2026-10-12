@@ -1,46 +1,4 @@
 # -*- coding: utf-8 -*-
-"""MQPullConsumerScheduleService 等价物（对应 Java
-``org.apache.rocketmq.client.consumer.MQPullConsumerScheduleService``，
-并结合 ``PullMessageService`` 的「到期取任务 → 执行 → 按回调决定下一轮延迟」调度形态）。
-
-Java 原型的分工：
-* ``MQPullConsumerScheduleService.registerPullTaskCallback(topic, callback)`` 按 topic
-  登记回调；rebalance 回调（``MessageQueueListenerImpl.messageQueueChanged``）把本实例
-  应得的队列展开成 ``taskTable``（queue → PullTaskImpl），经 ``putTask`` 增撤；
-* 每个 ``PullTaskImpl`` 在 ``ScheduledThreadPoolExecutor``（``pullThreadNums``，默认 20）
-  上运行：调 ``callback.doPullTask(mq, context)``，回调异常兜 1000ms，随后按
-  ``context.pullNextDelayTimeMillis`` 重排自己；
-* ``shutdown()`` 先关调度池、再关内部 consumer。
-
-本端与 Java 的两处**有意差别**（调度模型按任务规格收敛）：
-
-1. **拉取由服务发起，回调收 PullResult**。Java 里回调自己调
-   ``context.getPullConsumer().pullAsync(...)`` 再手动 ``pullMessageLater``；本端把
-   「pull_sync → 投递结果 → 按回调决定下一轮延迟」收进调度框架：服务按延迟到期取任务
-   → 调 ``PullConsumer.pull`` → 把 ``PullResult`` 交给 ``do_pull_task`` → 回调**返回
-   next_delay**（毫秒），或调用 ``context.set_pull_interval``（常驻间隔）/
-   ``context.pull_message_later``（一次性顺延）决定下一轮。优先级：显式返回值 >
-   一次性顺延 > 常驻间隔。
-2. **queue 维度串行**：同一 queue 同时只有一个在途 pull（``in_flight`` 闸门），上一轮
-   完成（含回调）才可能重排下一轮——Java 的原实现依赖回调自觉，本端直接结构性保证。
-
-队列展开的口径对齐 Java ``putTask``：topic 的队列集合变化时，撤销「不在新集合里」的
-任务（``cancelled`` 后不再重排），补上「新出现」的队列（0 延迟立即首拉）。队列视图的
-来源：CLUSTERING 用 ``fetch_message_queues_in_balance``（本实例应得的那份，本端公式与
-Java rebalanceByTopic 同源且带「路由拿不到保留现有分配」的兜底）；BROADCASTING 用
-``fetch_subscribe_message_queues``（全量）。
-
-consumer 生命周期（对齐「shutdown 时先停调度再关 consumer，或复用调用方 consumer」）：
-
-* ``PullConsumerScheduleService(consumer_group=...)``：服务自建 ``DefaultMQPullConsumer``
-  （等价 Java 内部 new DefaultMQPullConsumer），``start()`` 拉起、``shutdown()`` 关掉；
-* ``PullConsumerScheduleService(pull_consumer=已有实例)``：复用调用方的消费者——
-  本端消费者按 clientId 走 ``MQClientManager`` 引用计数，服务 ``start()`` 幂等地拉起它，
-  ``shutdown()`` **不**关它（所有权在调用方）。
-
-命名遵循本端 snake_case 风格；线程名与 Java 口径一致（``PullMsgThread_<group>_<N>``，
-即 ``ThreadFactoryImpl("PullMsgThread-" + group)`` 的产物）。
-"""
 from __future__ import annotations
 
 import heapq
@@ -60,30 +18,13 @@ from .exception import MQClientException
 
 logger = get_logger()
 
-# Java PullTaskContext.pullNextDelayTimeMillis 的默认值（200ms）。
 DEFAULT_PULL_NEXT_DELAY_MILLIS = 200
-# Java doPullTask 抛异常后的下一轮延迟（PullTaskImpl.run 的 catch 分支写 1000ms）。
 PULL_TASK_EXCEPTION_DELAY_MILLIS = 1000
-# Java DefaultMQPullConsumerImpl 的 rebalancePullInterval（队列视图复查周期）。
 DEFAULT_QUEUE_CHECK_INTERVAL_MILLIS = 20000
 
 
 class PullTaskContext:
-    """单个 queue 的拉取任务上下文（对应 Java ``PullTaskContext``，并按任务规格扩展：
-    订阅表达式、消费位点来源、下次拉取延迟都挂在它上面）。
-
-    * ``subscription_expression``：本轮之后每轮 pull 用的 tag 表达式（回调里改它，
-      下一轮生效——pull 发生在回调之前）。
-    * 位点游标 ``next_offset``：首轮拉取的起点由 ``offset`` 决定——
-      int（固定起点）、callable() → int（惰性求值，例如包 ``fetch_consume_offset``）、
-      None（服务首轮向 broker 问位点：``fetch_consume_offset``，查不到退到 ``max_offset``
-      ——CONSUME_FROM_LAST 语义）。此后每轮自动跟随 ``PullResult.next_begin_offset``
-      （OFFSET_ILLEGAL 时 broker 就在该字段里给建议位点），也可 ``seek()`` 手动改写。
-    * ``pull_next_delay_millis``：常驻的「下次拉取延迟」（Java 同名语义，默认 200ms），
-      ``set_pull_interval`` 改它。
-    * ``pull_message_later(millis)``：一次性顺延下一轮（用完即清，对齐本端推送消费者
-      suspend 场景里「只顺延一轮」的直觉），优先级低于回调显式返回值、高于常驻值。
-    """
+    pass
 
     def __init__(self, pull_consumer, message_queue: MessageQueue,
                  subscription_expression: str = "*",
@@ -137,7 +78,7 @@ class PullTaskContext:
 
     # ---------------- 下一轮延迟 ----------------
     def set_pull_interval(self, millis: int) -> None:
-        """设置常驻的下次拉取延迟（Java ``setPullNextDelayTimeMillis`` 同义）。"""
+        pass
         self.pull_next_delay_millis = int(millis)
 
     def pull_message_later(self, millis: int) -> None:
@@ -159,12 +100,7 @@ class PullTaskContext:
 
 
 class PullTaskCallback:
-    """queue 维度的拉取任务回调（对应 Java ``PullTaskCallback``）。
-
-    与 Java 的区别（见模块文档第 1 点）：服务已经替你把 ``pull_sync`` 做完了，
-    这里只处理结果。**返回值**决定下一轮延迟（毫秒，None 走 context 的规则）。
-    抛异常不会打断调度：本轮按 1000ms 顺延（Java PullTaskImpl 的 catch 分支）。
-    """
+    pass
 
     def do_pull_task(self, message_queue: MessageQueue, pull_result: PullResult,
                      context: PullTaskContext) -> Optional[int]:
@@ -196,7 +132,7 @@ class _TaskSpec:
 
 
 class _PullTask:
-    """queue 维度的任务记录（对应 Java PullTaskImpl）。"""
+    pass
 
     __slots__ = ("context", "cancelled", "in_flight")
 
@@ -208,16 +144,7 @@ class _PullTask:
 
 
 class PullConsumerScheduleService:
-    """按队列调度拉取、把结果交给回调并按回调指示重排下一轮的高层消费者服务。
-
-    用法（与 Java MQPullConsumerScheduleService 对照）::
-
-        service = PullConsumerScheduleService(consumer_group="PG_demo")
-        service.register_pull_task("TopicA", MyCallback(), sub_expression="TagA")
-        service.start()          # 自建/复用 PullConsumer 并拉起，展开队列，起调度线程
-        ...
-        service.shutdown()       # 先停调度（排空在途），再关自建 consumer（复用时不关）
-    """
+    pass
 
     def __init__(self, consumer_group: Optional[str] = None,
                  pull_consumer: Optional[DefaultMQPullConsumer] = None,
@@ -226,7 +153,6 @@ class PullConsumerScheduleService:
             if consumer_group is None or not str(consumer_group).strip():
                 raise MQClientException(
                     "consumer_group is required when pull_consumer is not given")
-            # 等价 Java：内部 new DefaultMQPullConsumer(group)，CLUSTERING 默认口径。
             self._pull_consumer = DefaultMQPullConsumer(
                 consumer_group, rpc_hook=rpc_hook, namespace=namespace,
                 socks_proxy_config=socks_proxy_config)
@@ -234,9 +160,7 @@ class PullConsumerScheduleService:
         else:
             self._pull_consumer = pull_consumer
             self._own_consumer = False
-        # Java pullThreadNums 默认 20（ScheduledThreadPoolExecutor 的池大小）。
         self.pull_thread_nums = 20
-        # 队列视图复查周期（Java rebalancePullInterval 的角色；测试里可调小）。
         self.queue_check_interval_millis = DEFAULT_QUEUE_CHECK_INTERVAL_MILLIS
         self._callback_table: Dict[str, _TaskSpec] = {}
         self._task_table: Dict[MessageQueue, _PullTask] = {}
@@ -252,7 +176,7 @@ class PullConsumerScheduleService:
 
     # ---------------- 对外 API ----------------
     def get_pull_consumer(self) -> DefaultMQPullConsumer:
-        """底层拉取消费者（对应 Java getDefaultMQPullConsumer()）。"""
+        pass
         return self._pull_consumer
 
     def register_pull_task(self, topic: str, callback: PullTaskCallback,
@@ -261,17 +185,7 @@ class PullConsumerScheduleService:
                            next_delay_millis: int = DEFAULT_PULL_NEXT_DELAY_MILLIS,
                            max_msg_nums: int = 32,
                            timeout_millis: Optional[int] = None) -> None:
-        """按 topic 登记回调；已启动时立即为本实例应得队列展开任务（0 延迟首拉）。
-
-        对应 Java ``registerPullTaskCallback(topic, callback)``（那边回调自己发起
-        pull；本端把 pull 收进服务，见模块文档）+ ``MessageQueueListenerImpl`` 的
-        队列展开。Java 还会 ``registerMessageQueueListener(topic, null)`` 把 topic 记
-        进 registerTopics（心跳订阅集 / 路由刷新的来源），这里同样登记进去。
-
-        ``offset`` 是消费位点来源：int / callable()→int / None（首轮问 broker 位点表，
-        查不到退到队尾）。``next_delay_millis`` 是常驻的下次拉取延迟，回调可在
-        ``do_pull_task`` 里返回值或用 context 方法逐轮改写。
-        """
+        pass
         if topic is None or not str(topic).strip():
             raise MQClientException("topic is empty")
         if callback is None:
@@ -281,9 +195,6 @@ class PullConsumerScheduleService:
         self._callback_table[topic] = spec
         self._pull_consumer.register_topics.add(topic)
         if self._started:
-            # Java 是等下一次 rebalance 才展开；本端队列视图要问消费者（没有推模式
-            # 的后台 rebalance 回调可挂），所以调用方线程当场展开一次，之后由
-            # 周期复查负责增撤。
             self._put_tasks_for_topic(topic)
 
     def start(self) -> None:
@@ -311,9 +222,7 @@ class PullConsumerScheduleService:
                     group, sorted(self._callback_table))
 
     def shutdown(self) -> None:
-        """先停调度（撤任务 + 停线程 + **排空在途 pull**），再按所有权决定是否
-        关闭消费者（自建 → 关；调用方复用 → 不关，Java 无条件关内部 consumer，
-        这里唯一的差别就是复用场景的所有权）。幂等。"""
+        pass
         if not self._started:
             return
         self._stop.set()
@@ -330,8 +239,6 @@ class PullConsumerScheduleService:
         workers = self._workers
         self._workers = None
         if workers is not None:
-            # 排空：已派发/排队的任务跑完（撤掉的在 _run_task 入口秒回），
-            # Java shutdown 调度池后靠 pull 自身超时约束排空时长，这里 join 等待。
             workers.shutdown(wait=True)
         if self._own_consumer:
             self._pull_consumer.shutdown()
@@ -340,17 +247,15 @@ class PullConsumerScheduleService:
 
     # ---------------- 观测（测试/排障） ----------------
     def task_table(self) -> Dict[MessageQueue, _PullTask]:
-        """当前任务表快照（queue → 任务），对应 Java getTaskTable。"""
+        pass
         with self._cond:
             return dict(self._task_table)
 
     def callback_topics(self) -> List[str]:
         return sorted(self._callback_table)
 
-    # ---------------- 队列展开（Java putTask 语义） ----------------
     def _queues_of_topic(self, topic: str) -> List[MessageQueue]:
         if self._pull_consumer.message_model == MessageModel.BROADCASTING:
-            # Java MessageQueueListenerImpl：BROADCASTING → mqAll（全量订阅信息）。
             return list(self._pull_consumer.fetch_subscribe_message_queues(topic))
         # CLUSTERING → mqDivided：本实例应得的那份（本端无后台 rebalance，
         # 用带「拿不到视图保留现有分配」兜底的当场分配公式）。
@@ -373,7 +278,6 @@ class PullConsumerScheduleService:
             for mq in list(self._task_table):
                 task = self._task_table[mq]
                 if mq.topic == topic and mq not in new_set:
-                    # Java putTask：不在新集合 → setCancelled(true) + remove。
                     task.cancelled = True
                     del self._task_table[mq]
             for mq in new_set:
@@ -465,7 +369,6 @@ class PullConsumerScheduleService:
             failed = True
             logger.error("pull schedule: pull %s failed: %s", mq, e)
         if task.cancelled:
-            # 在途期间被撤（shutdown / 队列变更）：不再重排（Java 同款告警语义）。
             task.in_flight = False
             logger.warning("The pull task is cancelled after doPullTask, %s", mq)
             return
@@ -473,7 +376,6 @@ class PullConsumerScheduleService:
             context.record_pull_result(result)
             spec = self._callback_table.get(mq.topic)
             if spec is None:
-                # Java run() 的「回调不存在」分支：丢任务不重排。
                 logger.warning("Pull task callback not exist, topic=%s", mq.topic)
                 with self._cond:
                     self._task_table.pop(mq, None)
@@ -481,11 +383,10 @@ class PullConsumerScheduleService:
                 return
             try:
                 returned_delay = spec.callback.do_pull_task(mq, result, context)
-            except BaseException as e:  # noqa: BLE001 —— Java catch(Throwable)→1000ms
+            except BaseException as e:
                 logger.error("do_pull_task exception, mq=%s: %s", mq, e)
                 returned_delay = PULL_TASK_EXCEPTION_DELAY_MILLIS
         else:
-            # 与 Java 的异常轮一致：兜 1000ms 再试（只影响本轮，不覆盖常驻间隔）。
             returned_delay = PULL_TASK_EXCEPTION_DELAY_MILLIS
         delay = context.consume_next_delay_millis(returned_delay)
         task.in_flight = False

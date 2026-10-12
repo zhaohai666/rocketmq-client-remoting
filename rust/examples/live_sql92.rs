@@ -10,14 +10,6 @@
 //! 离线单测（`src/client/mq_client.rs` 的 `mod tests`）锁得住协议形状，锁不住 broker
 //! 真的按属性过滤了。所以这里四段都验：
 //!
-//! - S1 线上取证：SQL92 订阅 ⇒ 启动时正好一笔 46（body 是 `CheckClientRequestBody`）；
-//!   纯 TAG 订阅 ⇒ 一笔都不发（Java `ExpressionType.isTagType` 短路）。
-//! - S2 真过滤：消费者**先起来再发消息**（新消费组 + `CONSUME_FROM_LAST_OFFSET` 会跳过
-//!   启动前的消息，先发消息这一段就是假绿）：SQL92 只订阅 red ⇒ 恰好那 3 条 red；
-//!   TAG `'*'` 对照组 ⇒ 6 条全收。
-//! - S3 空结果腿：订阅永不匹配的 `color = 'green'` ⇒ 一条都不收（排除「其实全放行了」）。
-//! - S4 反证：语法错的表达式让 `start()` 抛 `SUBSCRIPTION_PARSE_FAILED(23)`，且启动就地
-//!   回滚（同一个对象换成合法表达式能重新 start）。
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群，broker 需 `enablePropertyFilter=true`）：
 //! ```text

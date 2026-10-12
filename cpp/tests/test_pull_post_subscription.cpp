@@ -1,17 +1,5 @@
 // P5：postSubscriptionWhenPull + pullFromWhichNode / findBrokerAddressInSubscribe 离线单测。
 //
-// 对齐基准（Java 5.5.0，逐行读过；与 python/tests/test_pull_post_subscription.py、
-// rust/src/client/consumer.rs + mq_client.rs、csharp/Tests/PullPostSubscriptionTests.cs 同题）：
-//   * DefaultMQPushConsumer#postSubscriptionWhenPull 默认 false；
-//     DefaultMQPushConsumerImpl.pullMessage:458-468 里
-//     `subExpression = (postSubscriptionWhenPull && !sd.isClassFilterMode()) ? sd.getSubString() : null`，
-//     sysFlag 的 SUBSCRIPTION 位 = `subExpression != null`。默认关闭是安全的：tag 过滤由客户端
-//     filterMessagesForDelivery 兜底。
-//   * PullAPIWrapper#pullKernelImpl:197-205 用 recalculatePullFromWhichNode(mq) 调
-//     MQClientInstance#findBrokerAddressInSubscribe:1307-1336；命中从节点时
-//     PullSysFlag.clearCommitOffsetFlag(:219-221) —— 从节点不维护消费位点。
-//   * PullAPIWrapper#processPullResult:77 用应答头的 suggestWhichBrokerId 回写
-//     pullFromWhichNodeTable（:157-164 的 updatePullFromWhichNode）。
 //
 // 报文形状（SUBSCRIPTION 位、`subscription` 键是否上线、打给 master 还是 slave、
 // COMMIT_OFFSET 是否被清）用进程内假端点从 socket 上取证，不靠调用方自说自话。
@@ -326,8 +314,6 @@ std::unique_ptr<MQClientInstance> seeded(MockEndpoint& namesrv) {
 
 // ---------------------------------------------------------------- 1. findBrokerAddressInSubscribe
 
-// Java findBrokerAddressInSubscribe:1307-1336 的四个分支。isSlave 一律按**命中的 id** 判，
-// 不是传进来的 brokerId。
 void testFindBrokerAddressInSubscribeBranches() {
     std::map<int64_t, std::string> addrs;
     addrs[0] = "127.0.0.1:10911";
@@ -339,14 +325,12 @@ void testFindBrokerAddressInSubscribeBranches() {
     hit = MQClientInstance::findBrokerAddressInSubscribe(addrs, 1);
     expect(hit.first == "127.0.0.1:10921" && hit.second, "命中 slave=1：isSlave=true");
 
-    // 从节点 id 缺失：按 id+1 再试（Java 的从节点编号约定）
     std::map<int64_t, std::string> sparse;
     sparse[0] = "127.0.0.1:10911";
     sparse[2] = "127.0.0.1:10931";
     hit = MQClientInstance::findBrokerAddressInSubscribe(sparse, 1);
     expect(hit.first == "127.0.0.1:10931" && hit.second, "slave id 缺失按 id+1 再试");
 
-    // 都不命中且不限定时回退到 id 最小的（Java 取 map 首项，这里取确定性形态）
     hit = MQClientInstance::findBrokerAddressInSubscribe(addrs, 9);
     expect(hit.first == "127.0.0.1:10911" && !hit.second, "brokerId 超范围回退到 id 最小者（master）");
     std::map<int64_t, std::string> onlySlave;
@@ -363,8 +347,6 @@ void testFindBrokerAddressInSubscribeBranches() {
 
 // ---------------------------------------------------------------- 2. 线上报文：选从节点
 
-// brokerId=1（从节点）：请求打到 slave；COMMIT_OFFSET 位被清掉（Java :219-221）；
-// SUBSCRIPTION 位关闭时 `subscription` 键整个不上线（Java 的 subExpression=null → 丢字段）。
 void testPullToSlaveClearsCommitOffsetAndOmitsSubscription() {
     MockEndpoint namesrv;
     MockEndpoint master;
@@ -436,9 +418,6 @@ void testPullToMasterKeepsCommitOffsetAndPostsSubscription() {
 
 // ---------------------------------------------------------------- 4. 从节点缺席 → 回退主节点
 
-// Java 的 findBrokerAddressInSubscribe 在 onlyThisBroker=false 时会**回退到主节点**，
-// 所以 brokerId=3 而表里只有 master 时必须打到 master 而不是抛异常；且 isSlave 按命中的
-// id 判 → COMMIT_OFFSET 位**保留**。
 void testMissingSlaveFallsBackToMasterAndKeepsCommitOffset() {
     MockEndpoint namesrv;
     MockEndpoint master;
@@ -463,7 +442,6 @@ void testMissingSlaveFallsBackToMasterAndKeepsCommitOffset() {
 
 // ---------------------------------------------------------------- 5. push 侧订阅门控
 
-// Java DefaultMQPushConsumer#postSubscriptionWhenPull 默认 false；打开且非类过滤模式才上送。
 void testPullSubscriptionGatingFollowsDefault() {
     expect(!DefaultMQPushConsumer::shouldPostSubscriptionWhenPull(false, false),
            "默认关闭 → 不上送");
@@ -482,9 +460,6 @@ void testPullSubscriptionGatingFollowsDefault() {
 
 // ---------------------------------------------------------------- 6. 拉消费者的表读写
 
-// Java PullAPIWrapper#recalculatePullFromWhichNode / #updatePullFromWhichNode：无记录按
-// master=0；应答缺 suggestWhichBrokerId 也按 0 记账（Java long 原语，不是"保留旧值"）；
-// 表按队列隔离。
 void testPullFromWhichNodeRoundTrip() {
     DefaultMQPullConsumer pull(kGroup);
     MessageQueue mq(kTopic, kBroker, 0);

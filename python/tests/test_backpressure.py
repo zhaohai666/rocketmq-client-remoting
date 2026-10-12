@@ -1,13 +1,4 @@
 # -*- coding: utf-8 -*-
-"""``client.backpressure`` 的单测 —— 只测那个公平计数信号量本身。
-
-对端是 Java ``new Semaphore(permits, true)``：异步发送背压整套语义都压在它身上，
-所以这里盯的是**公平**（只有队首能拿）与**运行时改容量**（在途份数原样保留）两件事，
-而不是「能不能拿到许可」这种换谁都一样的部分。
-
-生产者那一侧怎么用它（拿不到就回调、还几次、队满就地跑）在
-``tests/test_producer_async.py`` 的「异步发送背压」一节。
-"""
 from __future__ import annotations
 
 import threading
@@ -25,7 +16,7 @@ def _wait_threads(threads, timeout: float = 5.0) -> None:
 
 
 def test_try_acquire_times_out_without_raising():
-    """Java ``tryAcquire(permits, timeout, MILLIS)`` 超时返回 false，只有 interrupt 才抛。"""
+    pass
     sem = FairSemaphore(1)
     assert sem.try_acquire(1, 0) is True
     began = time.monotonic()
@@ -90,7 +81,7 @@ def test_release_wakes_the_head_in_order():
 
 
 def test_set_total_permits_keeps_outstanding_work():
-    """改总量 = 「空闲 = 新总量 - 在途」，与 Java ``new Semaphore(num - acquired)`` 同解。"""
+    pass
     sem = FairSemaphore(10)
     assert sem.try_acquire(4, 0) is True          # 在途 4
     sem.set_total_permits(15)
@@ -101,7 +92,7 @@ def test_set_total_permits_keeps_outstanding_work():
 
 
 def test_shrinking_below_outstanding_gives_negative_free():
-    """Java 的 ``new Semaphore(负数)`` 是合法的，归还许可会把它拉回正数 —— 这里同样接受。"""
+    pass
     sem = FairSemaphore(10)
     assert sem.try_acquire(6, 0) is True
     sem.set_total_permits(2)
@@ -112,10 +103,7 @@ def test_shrinking_below_outstanding_gives_negative_free():
 
 
 def test_shrink_wakes_someone_blocked_on_the_old_capacity():
-    """这是本实现换掉 Java「整体换一个 Semaphore 对象」写法的理由：
-    调大容量时，正堵在等待队列里的人会被叫醒；Java 那些等待者挂在旧对象上，
-    只能等到自己的超时（Java 靠写锁排他避开了同一时刻的换对象，但被丢下的人照旧白等）。
-    """
+    pass
     sem = FairSemaphore(1)
     assert sem.try_acquire(1, 0) is True
     got = []
@@ -199,14 +187,14 @@ def test_a_timed_out_head_wakes_the_waiter_behind_it():
 
 
 def test_release_beyond_total_is_allowed():
-    """Java ``release()`` 不校验是否超过总量（信号量可以被"无中生有"地放大）。"""
+    pass
     sem = FairSemaphore(1)
     sem.release(3)
     assert sem.available_permits() == 4
 
 
 def test_zero_permits_acquire_is_satisfied_even_when_empty():
-    """Java ``tryAcquire(0, …)`` 恒真；批量消息为空时我们按 1 算，所以这里只锁住基元语义。"""
+    pass
     sem = FairSemaphore(0)
     assert sem.try_acquire(0, 0) is True
 

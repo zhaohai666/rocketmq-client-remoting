@@ -1,5 +1,3 @@
-//! 公共响应体（对应 `org.apache.rocketmq.remoting.protocol.body.*` 常用部分）。
-//!
 //! 移植 `python/remoting/protocol/body.py`（609 行）里的全部类：
 //! `KVTable` / `TopicList` / `LockBatchRequestBody` / `LockBatchResponseBody` /
 //! `UnlockBatchRequestBody` / `GetConsumerListByGroupResponseBody` / `ClusterInfo` /
@@ -9,25 +7,6 @@
 //! `ConsumeMessageDirectlyResult`。
 //!
 //! ## 三种「同一个 MessageQueue」的不同写法
-//!
-//! 1. **map 键**（`offsetTable` / `mqTable` / `messageQueueTable`）：fastjson2 把对象
-//!    键内联成 JSON，产出的是**非法 JSON**。这里全部复用 `admin_body` 的
-//!    [`message_queue_key`] / [`parse_message_queue_key`] /
-//!    [`decode_message_queue_map`] / [`encode_message_queue_map`]，键序固定为字母序
-//!    `brokerName,queueId,topic`。
-//! 2. **数组元素**（`mqSet` / `lockOKMQSet`）：走普通对象值，键序是 Java 的
-//!    **字段声明序** `topic,brokerName,queueId`（`MessageQueue.java:25-27`、
-//!    `mq_client.py:1140`），所以另用 [`message_queue_value`]，不能复用键文本。
-//! 3. **普通字符串键的 map**（`statusTable` / `subscriptionTable` / `consumerTable`
-//!    外层 / `brokerAddrTable`）：用 `jentries` 保序读写。
-//!
-//! ## 与 Python 的两处已知差异（都朝 Java 靠拢）
-//!
-//! - 浮点零值：Python 的默认值是 int `0`，`json.dumps` 写出 `0`；这里写 `0.0`，与
-//!   fastjson2 的 `Double` 输出一致（见 `ConsumeStatus` 测试）。
-//! - `Connection` / `ConsumeStatus` 在 Java 里不是 `RemotingSerializable`
-//!   （`body.py` 也没给它们 `encode`），故这两个类型只有 `to_json_value` /
-//!   `from_json_value`，不导出 body 编解码。
 
 use serde_json::{Map, Value};
 
@@ -150,7 +129,6 @@ fn message_queue_list(value: &Value, key: &str) -> Result<Vec<MessageQueueKey>> 
     Ok(out)
 }
 
-/// MessageQueue 数组字段的写出：键序 = Java 字段声明序。
 fn message_queue_array(list: &[MessageQueueKey]) -> Value {
     Value::Array(list.iter().map(message_queue_value).collect())
 }
@@ -167,7 +145,6 @@ pub fn message_queue_value(mq: &MessageQueueKey) -> Value {
 
 // ---------------------------------------------------------------- KVTable
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.KVTable`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KVTable {
     /// cluster → broker 给的 KV 串；顺序即 broker 返回顺序，故用 [`StringMap`]。
@@ -198,8 +175,6 @@ impl KVTable {
 
 // ---------------------------------------------------------------- TopicList
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.TopicList`。
-///
 /// `brokerAddr` 为 `None` 时**整个键不出现**（`body.py:41-45`），空串则要照写。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TopicList {
@@ -245,12 +220,10 @@ impl TopicList {
 
 // ---------------------------------------------------------------- 批量锁 / 解锁
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.LockBatchRequestBody`（235）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LockBatchRequestBody {
     pub consumer_group: Option<String>,
     pub client_id: Option<String>,
-    /// Java `Set<MessageQueue> mqSet`，写成对象数组。
     pub mq_set: Vec<MessageQueueKey>,
 }
 
@@ -281,9 +254,6 @@ impl LockBatchRequestBody {
     }
 }
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.UnlockBatchRequestBody`（236）。
-///
-/// 与 [`LockBatchRequestBody`] 字段同形，但 Java 是两个类、两个请求码，报文分开保留。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UnlockBatchRequestBody {
     pub consumer_group: Option<String>,
@@ -318,9 +288,6 @@ impl UnlockBatchRequestBody {
     }
 }
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.LockBatchResponseBody`。
-///
-/// 键名照抄 Java 的 `lockOKMQSet`（`OK`、`MQ` 都大写）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LockBatchResponseBody {
     pub lock_ok_mq_set: Vec<MessageQueueKey>,
@@ -350,7 +317,6 @@ impl LockBatchResponseBody {
     }
 }
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.GetConsumerListByGroupResponseBody`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GetConsumerListByGroupResponseBody {
     pub consumer_id_list: Vec<String>,
@@ -382,12 +348,6 @@ impl GetConsumerListByGroupResponseBody {
 
 // ---------------------------------------------------------------- CHECK_CLIENT_CONFIG
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.CheckClientRequestBody`（46）。
-///
-/// 只被 `CHECK_CLIENT_CONFIG(46)` 用到：broker 拿 clientId/group 记日志，真正被校验的只有
-/// `subscriptionData` 的 expressionType 与 subString（Java
-/// `ClientManageProcessor#checkClientConfig`）。`namespace` 字段 Java 5.5.1 里有但发送端
-/// 不填，这里同样保留字段而不写值。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckClientRequestBody {
     pub client_id: Option<String>,
@@ -435,9 +395,6 @@ impl CheckClientRequestBody {
 
 // ---------------------------------------------------------------- ClusterInfo
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ClusterInfo`
-/// （nameserver `GET_BROKER_CLUSTER_INFO(100)`）。
-///
 /// 内部只保留 `{brokerName: {brokerId: addr}}` 与 `{cluster: [brokerName]}` 两张表，
 /// `to_json_value` 再把前者包成 BrokerData 形状，其中 `cluster:""` 与
 /// `enableActingMaster:false` 是**恒定默认值**（`body.py:179-190`），
@@ -547,18 +504,8 @@ impl ClusterInfo {
 
 // ---------------------------------------------------------------- ConsumerRunningInfo
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo`（307 应答）。
-///
 /// 两端都用得到：admin 侧解析 broker 汇总的运行信息，客户端侧在应答
 /// `GET_CONSUMER_RUNNING_INFO(307)` 时编码自己的运行信息。
-///
-/// ⚠ `mq_table` / `mq_pop_table` 的键是 `MessageQueue`（Java 用 `TreeMap`），
-/// fastjson2 会把它内联成 JSON 对象，必须走 [`message_queue_key`] +
-/// [`decode_message_queue_map`]，不能当普通字符串键。
-///
-/// value 侧原样透传：`mqTable` 是 [`ProcessQueueInfo`]、`mqPopTable` 是 Java
-/// `PopProcessQueueInfo`（Python 与本文件都没有该类）、`statusTable` 是
-/// [`ConsumeStatus`]，由上层用各自的 `from_json_value` 解读。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConsumerRunningInfo {
     pub properties: StringMap,
@@ -573,7 +520,6 @@ pub struct ConsumerRunningInfo {
 impl ConsumerRunningInfo {
     pub const PROP_NAMESERVER_ADDR: &'static str = "PROP_NAMESERVER_ADDR";
     pub const PROP_THREADPOOL_CORE_SIZE: &'static str = "PROP_THREADPOOL_CORE_SIZE";
-    /// 注意 Java 常量**值**没有下划线：`PROP_CONSUMEORDERLY`（`ConsumerRunningInfo.java:33`）。
     pub const PROP_CONSUME_ORDERLY: &'static str = "PROP_CONSUMEORDERLY";
     pub const PROP_CONSUME_TYPE: &'static str = "PROP_CONSUME_TYPE";
     pub const PROP_CLIENT_VERSION: &'static str = "PROP_CLIENT_VERSION";
@@ -633,9 +579,6 @@ impl ConsumerRunningInfo {
 
 // ---------------------------------------------------------------- Connection / 连接类
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.Connection`。
-///
-/// `version` 是 Java 版本枚举的**序数**（int），不是版本字符串。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Connection {
     pub client_id: Option<String>,
@@ -685,10 +628,6 @@ fn connection_array(list: &[Connection]) -> Value {
     Value::Array(list.iter().map(|c| c.to_json_value()).collect())
 }
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ConsumerConnection`。
-///
-/// `consumeType` / `messageModel` / `consumeFromWhere` 在 Java 是枚举，broker
-/// 也可能回 null（老版本 / 广播组），所以三个键**恒出现**、值可为 null。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConsumerConnection {
     pub connection_set: Vec<Connection>,
@@ -733,7 +672,6 @@ impl ConsumerConnection {
     }
 }
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ProducerConnection`。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProducerConnection {
     pub connection_set: Vec<Connection>,
@@ -763,10 +701,6 @@ impl ProducerConnection {
     }
 }
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.QueryConsumeTimeSpanBody`。
-///
-/// 元素是 Java `ConsumeTimeSpan{topic, consumerGroup, consumeTimeStamp, latency}`；
-/// `body.py:353-371` 不解读，故原样透传。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QueryConsumeTimeSpanBody {
     pub consume_time_span_set: Vec<Value>,
@@ -798,8 +732,6 @@ impl QueryConsumeTimeSpanBody {
 
 // ---------------------------------------------------------------- ConsumeStatus
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ConsumeStatus`
-/// （`ConsumerRunningInfo.statusTable` 的 value；Java 不继承 `RemotingSerializable`）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConsumeStatus {
     pub pull_rt: f64,
@@ -837,15 +769,6 @@ impl ConsumeStatus {
 
 // ---------------------------------------------------------------- ConsumeStatsList
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ConsumeStatsList`。
-///
-/// ⚠ JSON 键是 Java 字段名 `consumeStatsList`，**不是** `statsList`：早期移植
-/// 猜错了键名，于是真机响应永远解析出空列表，看着像「这个 broker 没有积压」。
-///
-/// `stats_list` 元素是 `List<Map<groupName, List<ConsumeStats>>>` 的 JSON；
-/// `broker_addr` 为 None 时整键不出现（Java `RemotingSerializable` 用
-/// NON_NULL 序列化 String），`totalDiff` / `totalInflightDiff` 是 Java 的
-/// `long` 原语字段，恒出现在 JSON 里。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConsumeStatsList {
     pub stats_list: Vec<Value>,
@@ -897,11 +820,6 @@ impl ConsumeStatsList {
 
 // ---------------------------------------------------------------- 位点重置 / 状态上报
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ResetOffsetBody`（220 下发）。
-///
-/// ⚠ Java 字段是 `Map<MessageQueue, Long> offsetTable`，**不是**
-/// topic→queueId→offset 的嵌套 map（`body.py:431-437` 记录了早期实现的这个错误）；
-/// 键走 fastjson2 内联对象。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResetOffsetBody {
     pub offset_table: Vec<(MessageQueueKey, i64)>,
@@ -935,8 +853,6 @@ impl ResetOffsetBody {
 
 // ---------------------------------------------------------------- ResetOffsetBodyForC
 
-/// 对应 `org.apache.rocketmq.common.message.MessageQueueForC`（`ResetOffsetBodyForC`
-/// 数组的元素）。字段声明序即 Java 的 `topic,brokerName,queueId,offset`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessageQueueForC {
     pub topic: String,
@@ -966,13 +882,6 @@ impl MessageQueueForC {
     }
 }
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ResetOffsetBodyForC`：`offsetTable` 是
-/// **数组**（每条自带 offset），不是 map。
-///
-/// 只有 222 发起方的 `language=CPP` 时 broker 才推这种体（`Broker2Client.resetOffset:158-163`）
-/// —— Java 管理端恒发 JAVA，所以 Java 客户端永远收不到。本端口解析它是为了与 language=CPP 的
-/// 旧 C++ SDK 管理端互通：收到却解析不出等于整笔重置静默丢弃（与 C++
-/// `DefaultMQPushConsumer::parseResetOffsetBody` 同口径）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResetOffsetBodyForC {
     pub offset_table: Vec<MessageQueueForC>,
@@ -1011,10 +920,6 @@ impl ResetOffsetBodyForC {
     }
 }
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody`（42）。
-///
-/// 两个 map 的**内层**键都是 `MessageQueue`（fastjson2 内联对象）；外层
-/// `consumerTable` 的键是 clientId 字符串（Java 已废弃该字段，仍保留以兼容老 broker）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GetConsumerStatusBody {
     pub message_queue_table: Vec<(MessageQueueKey, i64)>,
@@ -1065,10 +970,6 @@ impl GetConsumerStatusBody {
 
 // ---------------------------------------------------------------- ProcessQueueInfo
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ProcessQueueInfo`。
-///
-/// 键序 = Java 字段声明序（`ProcessQueueInfo.java:25-40`）；注意 Java 的拼写
-/// `droped`（不是 `dropped`），改成正确拼写 broker 就读不到了。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcessQueueInfo {
     pub commit_offset: i64,
@@ -1082,7 +983,6 @@ pub struct ProcessQueueInfo {
     pub locked: bool,
     pub try_unlock_times: i64,
     pub last_lock_timestamp: i64,
-    /// Java 字段名就是 `droped`（拼写如此）。
     pub droped: bool,
     pub last_pull_timestamp: i64,
     pub last_consume_timestamp: i64,
@@ -1160,7 +1060,6 @@ impl ProcessQueueInfo {
 
 // ---------------------------------------------------------------- 309 单条消息试消费
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.CMResult`（Java 枚举名原文）。
 pub struct CMResult;
 
 impl CMResult {
@@ -1172,10 +1071,6 @@ impl CMResult {
     pub const CR_RETURN_NULL: &'static str = "CR_RETURN_NULL";
 }
 
-/// 对应 `org.apache.rocketmq.remoting.protocol.body.ConsumeMessageDirectlyResult`。
-///
-/// 309 的应答 body，字段全是标量 —— 这批 body 里唯一不涉及 MessageQueue 键的。
-/// `autoCommit` 的 Java 初值是 **true**，所以手写 `Default` 而不是 derive。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumeMessageDirectlyResult {
     pub order: bool,
@@ -1310,7 +1205,6 @@ mod tests {
                 MessageQueueKey::new("BodyGoldenTopic", "broker-a", 1),
             ],
         };
-        // 值对象键序 = Java 声明序 topic,brokerName,queueId（不是内联键的字母序）
         assert_eq!(
             json_of(&body.to_json_value()),
             concat!(
@@ -1412,8 +1306,6 @@ mod tests {
             )
         );
         assert_eq!(ConsumeStatsList::decode(&stats.encode()).unwrap(), stats);
-        // brokerAddr 为 None 时整键消失（Java String 字段走 NON_NULL），
-        // 两个 long 字段则恒在
         assert_eq!(
             json_of(&ConsumeStatsList::new().to_json_value()),
             r#"{"consumeStatsList":[],"totalDiff":0,"totalInflightDiff":0}"#
@@ -1680,7 +1572,6 @@ mod tests {
             r#"{"offsetTable":{"{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"BodyGoldenTopic\"}":10,"{\"brokerName\":\"broker-a\",\"queueId\":1,\"topic\":\"BodyGoldenTopic\"}":20}}"#
         );
         assert_eq!(ResetOffsetBody::decode(&body.encode()).unwrap(), body);
-        // Java 真机报文（裸内联对象键；位点写成字符串也认，对齐 Python 的 int(v)）
         let wire = concat!(
             r#"{"offsetTable":{{"brokerName":"broker-a","queueId":0,"topic":"BodyGoldenTopic"}:10,"#,
             r#"{"brokerName":"broker-a","queueId":1,"topic":"BodyGoldenTopic"}:"20"}}"#
@@ -1710,13 +1601,11 @@ mod tests {
                 },
             ],
         };
-        // 字段按 Java 声明序写（`MessageQueueForC` 的 topic,brokerName,queueId,offset）
         assert_eq!(
             json_of(&body.to_json_value()),
             r#"{"offsetTable":[{"topic":"BodyGoldenTopic","brokerName":"broker-a","queueId":0,"offset":10},{"topic":"BodyGoldenTopic","brokerName":"broker-a","queueId":1,"offset":20}]}"#
         );
         assert_eq!(ResetOffsetBodyForC::decode(&body.encode()).unwrap(), body);
-        // Java 真机报文：字段名 topic/brokerName/queueId/offset，位置与声明序无关
         let wire = concat!(
             r#"{"offsetTable":[{"offset":10,"brokerName":"broker-a","queueId":0,"topic":"BodyGoldenTopic"},"#,
             r#"{"topic":"BodyGoldenTopic","queueId":1,"brokerName":"broker-a","offset":20}]}"#
@@ -1910,8 +1799,6 @@ mod tests {
             ResetOffsetBody::decode(br#"{"offsetTable":[1]}"#),
             Err(Error::Decode(_))
         ));
-        // ForC 数组体裁：非对象的元素跳过（Java 侧 List<MessageQueueForC> 反序列化
-        // 逐元素建对象，坏元素同样进不了表），但 offsetTable 本身必须是数组
         assert_eq!(
             ResetOffsetBodyForC::decode(br#"{"offsetTable":[1,{"topic":"t"}]}"#)
                 .unwrap()

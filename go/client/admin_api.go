@@ -1,11 +1,3 @@
-// Instance-level management RPCs (the Java MQClientInstance / MQAdminImpl
-// helpers the DefaultMQAdminExt surface sits on): nameserver queries, topic
-// creation/deletion and the java.util.Properties broker-config codec.
-//
-// These live on Instance rather than on DefaultMQAdminExt because Java puts
-// them there too — `createTopicInRoute` walks the DEFAULT_TOPIC route and
-// `getBrokerClusterInfo` loops the nameserver list, both of which need the
-// instance's address book.
 package client
 
 import (
@@ -19,12 +11,6 @@ import (
 
 // ---------------- extFields helpers ----------------
 
-// adminExt builds an extFields map from an alternating key/value list. Values
-// are rendered the way Java's `RemotingCommand.makeCustomHeaderToNet` does it
-// (String.valueOf for ints, "true"/"false" for bools), and — importantly —
-// the keys written here are the Java FIELD names, because the broker reads
-// them back by reflection. That is exactly where the `isForce`-not-`force` and
-// `cluster`-not-`clusterName` traps live, so keep the names inline and visible.
 func adminExt(kv ...any) *common.StringMap {
 	out := common.NewStringMap()
 	for i := 0; i+1 < len(kv); i += 2 {
@@ -56,9 +42,6 @@ func adminExtValue(v any) string {
 	}
 }
 
-// adminRequest builds a request whose extFields are set directly (the Python
-// reference passes plain dicts; this port does the same so the Java field
-// names stay visible at the call site).
 func adminRequest(code int32, ext *common.StringMap) *remoting.RemotingCommand {
 	cmd := remoting.CreateRequestCommand(code, nil)
 	if ext != nil {
@@ -127,9 +110,6 @@ const AdminCreateTopicRetryTimes = 5
 // CreateTopicRequestHeader.checkFields() parses it into an enum and rejects a
 // null with `topicFilterType = [null] value invalid`, so even a plain topic
 // needs the field.
-//
-// Broker-business errors (a non-SUCCESS *response*) are raised immediately;
-// only transport errors are retried, matching Java.
 func (i *Instance) CreateTopicInBroker(addr, defaultTopic, topic string,
 	readQueueNums, writeQueueNums, perm, topicSysFlag int32,
 	topicFilterType string, order bool, attributes string,
@@ -152,8 +132,6 @@ func (i *Instance) CreateTopicInBroker(addr, defaultTopic, topic string,
 			"topicFilterType", topicFilterType,
 			"topicSysFlag", topicSysFlag,
 			"order", order,
-			// Java: AttributeParser.parseToString(map) — an empty map renders
-			// as "", not null.
 			"attributes", attributes,
 			"force", false,
 		))
@@ -163,8 +141,6 @@ func (i *Instance) CreateTopicInBroker(addr, defaultTopic, topic string,
 			continue
 		}
 		if err := i.checkResponse(response); err != nil {
-			// A broker rejection is final — Java rethrows MQBrokerException
-			// straight out of the retry loop.
 			return err
 		}
 		return nil
@@ -172,9 +148,6 @@ func (i *Instance) CreateTopicInBroker(addr, defaultTopic, topic string,
 	return lastErr
 }
 
-// CreateTopicInRoute mirrors Java MQAdminImpl.createTopic: push the topic to
-// every MASTER in the DEFAULT_TOPIC (TBW102) route. Succeeding on at least one
-// broker is enough; if every broker fails, the last error is reported.
 func (i *Instance) CreateTopicInRoute(topic string, readQueueNums, writeQueueNums, perm, topicSysFlag int32,
 	attributes string, timeoutMillis int64) error {
 
@@ -241,24 +214,8 @@ func (i *Instance) DeleteTopicInNameSrv(topic string, timeoutMillis int64) error
 
 // ---------------- java.util.Properties codec ----------------
 
-// String2Properties mirrors Java MixAll.string2Properties, i.e. the semantics
-// of `java.util.Properties.load`:
-//
-//   - blank lines and `#` / `!` comment lines are skipped;
-//   - an UNESCAPED trailing `\` continues onto the next line, whose leading
-//     whitespace is dropped;
-//   - the key ends at the first `=`, `:` or WHITESPACE (whitespace is a legal
-//     separator too);
-//   - whitespace around the separator is skipped; the value's TRAILING
-//     whitespace is preserved (Java does not trim it).
-//
 // This matters because GET_BROKER_CONFIG(26) returns properties TEXT, not
 // JSON — a client that parses it as a KVTable fails on every real broker.
-//
-// Java also expands `\t`, `\n`, `\uXXXX`; broker config exports never contain
-// them and getting the backslash semantics wrong would be worse than omitting
-// it, so it is deliberately not implemented here (the Python port makes the
-// same call).
 func String2Properties(text string) map[string]string {
 	result := map[string]string{}
 	if text == "" {
@@ -322,9 +279,6 @@ func String2Properties(text string) map[string]string {
 	return result
 }
 
-// splitLines mirrors Java's BufferedReader line splitting closely enough for
-// properties text: it splits on \n and drops a trailing \r, and never yields
-// the empty tail after a final newline.
 func splitLines(text string) []string {
 	if text == "" {
 		return nil
@@ -341,8 +295,6 @@ func splitLines(text string) []string {
 
 // ---------------- misc instance helpers used by the admin ----------------
 
-// FirstBrokerAddr is Java DefaultMQAdminExtImpl's "pick any broker" fallback:
-// the first address of the cluster info, else an error.
 func (i *Instance) FirstBrokerAddr() (string, error) {
 	cluster, err := i.GetBrokerClusterInfo(10_000)
 	if err == nil {

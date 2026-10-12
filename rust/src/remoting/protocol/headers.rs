@@ -1,38 +1,17 @@
-//! 全部请求/响应头（对应 `org.apache.rocketmq.remoting.protocol.header.*`）。
-//!
 //! 移植 `python/remoting/protocol/headers.py` 的 79 个
 //! `CommandCustomHeader` 实现：每个结构体都提供
 //!
-//! * `to_ext_fields` —— 只写**非 `None`** 字段，与 Java
-//!   `RemotingCommand.makeCustomHeaderToNet` 的反射过滤一致；`bool` 一律写成
-//!   Java `Boolean.toString` 的小写 `true`/`false`（Python 的 `str(False)` 是
-//!   `"False"`，直接落报文会和 Java 客户端不一致）。
-//! * `from_ext_fields` —— 把 extFields 还原回字段，缺键回 `None`/默认值。
 //!
 //! ## 长名 vs 短名
 //!
-//! 只有 `SendMessageRequestHeaderV2` 用单字母短键（`a`…`n`），配
-//! `request_code::SEND_MESSAGE_V2 = 310` 使用；其余 header 全部用 Java 的
-//! camelCase 长名。两套拼写在下面各自的结构体里逐字段固定，改一个字节 broker 就读不到。
 //!
 //! ## 与 Python 的两处刻意的差异
-//!
-//! 1. Python 的 `PopMessageRequestHeader` / `AckMessageRequestHeader` /
-//!    `ChangeInvisibleTimeRequestHeader` 没有 `from_ext_fields`（只用发送方向），
-//!    这里补齐以便回环测试与代理侧解析。
-//! 2. Python 的 `CreateTopicRequestHeader.from_ext_fields` 漏了 `attributes` 与
-//!    `force`，这里同样补齐。
-//! 3. Python 用 `bool(v)` 解析 `enableActingMaster` / `changed` /
-//!    `acceptStandardJsonOnly`，于是 `"false"` 会被判成 `True`；这里按 Java
-//!    `Boolean.parseBoolean` 的语义解析。
 
 use std::any::Any;
 use std::fmt;
 
 use super::ext_fields::{CustomHeader, ExtFields};
 
-/// Java `Boolean.toString`：broker 侧用 `Boolean.parseBoolean`，大小写不敏感，
-/// 但抓包对拍要求小写。
 pub fn bool_text(value: bool) -> String {
     if value {
         "true".to_string()
@@ -66,10 +45,6 @@ pub fn ext_bool(ext: &ExtFields, key: &str) -> Option<bool> {
 }
 
 /// 字段种类 -> Rust 类型。
-///
-/// `s` String，`i` Integer/int，`l` Long/long，`b` Boolean（可空），
-/// `B` Java 原始 `boolean`（恒有值，默认 false），`I` Java 有默认值的 `int`，
-/// `E` 枚举（入网写 `Enum.toString()`，如 `BoundaryType`）。
 macro_rules! field_ty {
     (s) => { Option<String> };
     (i) => { Option<i32> };
@@ -95,7 +70,6 @@ macro_rules! header_struct {
         impl CustomHeader for $name {
             fn to_ext_fields(&self, out: &mut ExtFields) {
                 $(header_struct!(@put $kind, out, $key, self.$field);)*
-                // 无字段 header（Java 里就是空类）会留下未使用形参，这里显式消费掉。
                 let _ = &out;
             }
 
@@ -119,10 +93,8 @@ macro_rules! header_struct {
     (@put b, $out:expr, $key:expr, $v:expr) => { $out.insert_opt($key, $v.map(bool_text)); };
     (@put B, $out:expr, $key:expr, $v:expr) => { $out.insert($key, bool_text($v)); };
     (@put I, $out:expr, $key:expr, $v:expr) => { $out.insert($key, $v.to_string()); };
-    // Java makeCustomHeaderToNet 写 value.toString()：枚举的入网文本是枚举名大写。
     (@put E, $out:expr, $key:expr, $v:expr) => { $out.insert_opt($key, $v.map(|x| x.name().to_string())); };
     (@get s, $ext:expr, $key:expr) => { ext_str($ext, $key) };
-    // 缺键回 None（读取端自行回落 LOWER）；有键则走 Java BoundaryType.getType 的宽松解析。
     (@get E, $ext:expr, $key:expr) => {
         ext_str($ext, $key).map(|s| crate::common::boundary_type::BoundaryType::get_type(&s))
     };
@@ -159,7 +131,6 @@ impl fmt::Debug for dyn CustomHeader + '_ {
 //   GetAllTopicConfigResponseHeader: java-only fields ["totalTopicNum"]
 //   GetConsumeStatsRequestHeader: java-only fields ["TOPIC_NAME_SEPARATOR", "topicList"]
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.SendMessageRequestHeader`
     SendMessageRequestHeader {
         producer_group: s => "producerGroup",
         topic: s => "topic",
@@ -179,9 +150,6 @@ header_struct! {
 }
 
 header_struct! {
-/// 短字段名编码（producerGroup->a ...），与 Java V2 严格一致。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.SendMessageRequestHeaderV2`
     SendMessageRequestHeaderV2 {
         producer_group: s => "a",
         topic: s => "b",
@@ -203,13 +171,6 @@ header_struct! {
 
 header_struct! {
 /// broker → 请求方 的 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 请求头。
-///
-/// 对应 Java ``org.apache.rocketmq.remoting.protocol.header.ReplyMessageRequestHeader``
-/// （字段与 ``SendMessageRequestHeader`` 高度重合，但多了 bornHost/storeHost/storeTimestamp，
-/// broker 的 ``ReplyMessageProcessor#pushReplyMessage`` 就是用它拼出来的）。
-/// 请求方收到后据此 + body 还原出真正的应答 MessageExt。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.ReplyMessageRequestHeader`
     ReplyMessageRequestHeader {
         producer_group: s => "producerGroup",
         topic: s => "topic",
@@ -230,15 +191,12 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.SendMessageResponseHeader`
     SendMessageResponseHeader {
         msg_id: s => "msgId",
         queue_id: i => "queueId",
         queue_offset: l => "queueOffset",
         transaction_id: s => "transactionId",
         batch_uniq_id: s => "batchUniqId",
-        // 只给定时/延迟消息（Java `SendMessageProcessor#attachRecallHandle`），
-        // 普通消息解出来是 `None`。见 `crate::common::recall_message_handle`。
         recall_handle: s => "recallHandle",
 
     }
@@ -246,12 +204,6 @@ header_struct! {
 
 header_struct! {
 /// 定时/延迟消息撤回请求（`RECALL_MESSAGE` 370）。
-///
-/// 对应 Java ``org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader``。
-/// ⚠ `broker_name` 走的是继承来的 `RpcRequestHeader.bname`，反射名是 ``bname`` 而不是
-/// ``brokerName``，写错 broker 侧静默丢字段。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader`
     RecallMessageRequestHeader {
         producer_group: s => "producerGroup",
         topic: s => "topic",
@@ -262,10 +214,6 @@ header_struct! {
 }
 
 header_struct! {
-/// `recallMessage` 的响应：撤回动作本身是一条写进定时队列的删除消息，
-/// Java 回填它的 uniqId（等于被撤回消息的 UNIQ_KEY），调用方拿它确认撤回生效。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.RecallMessageResponseHeader`
     RecallMessageResponseHeader {
         msg_id: s => "msgId",
 
@@ -273,7 +221,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.PullMessageRequestHeader`
     PullMessageRequestHeader {
         consumer_group: s => "consumerGroup",
         topic: s => "topic",
@@ -295,7 +242,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.PullMessageResponseHeader`
     PullMessageResponseHeader {
         next_begin_offset: l => "nextBeginOffset",
         min_offset: l => "minOffset",
@@ -310,7 +256,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.QueryConsumerOffsetRequestHeader`
     QueryConsumerOffsetRequestHeader {
         consumer_group: s => "consumerGroup",
         topic: s => "topic",
@@ -321,7 +266,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.QueryConsumerOffsetResponseHeader`
     QueryConsumerOffsetResponseHeader {
         offset: l => "offset",
 
@@ -329,7 +273,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.UpdateConsumerOffsetRequestHeader`
     UpdateConsumerOffsetRequestHeader {
         consumer_group: s => "consumerGroup",
         topic: s => "topic",
@@ -340,7 +283,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.UpdateConsumerOffsetResponseHeader`
     UpdateConsumerOffsetResponseHeader {
         offset: l => "offset",
 
@@ -348,7 +290,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetMaxOffsetRequestHeader`
     GetMaxOffsetRequestHeader {
         topic: s => "topic",
         queue_id: i => "queueId",
@@ -357,7 +298,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetMaxOffsetResponseHeader`
     GetMaxOffsetResponseHeader {
         offset: l => "offset",
 
@@ -365,7 +305,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetMinOffsetRequestHeader`
     GetMinOffsetRequestHeader {
         topic: s => "topic",
         queue_id: i => "queueId",
@@ -374,7 +313,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetMinOffsetResponseHeader`
     GetMinOffsetResponseHeader {
         offset: l => "offset",
 
@@ -382,20 +320,16 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.SearchOffsetRequestHeader`
     SearchOffsetRequestHeader {
         topic: s => "topic",
         queue_id: i => "queueId",
         timestamp: l => "timestamp",
-        // Java 该字段 @CFNullable：None 时整键不写（只有已废弃的 5 参
-        // MQClientAPIImpl#searchOffset 会这样发）。
         boundary_type: E => "boundaryType",
 
     }
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.SearchOffsetResponseHeader`
     SearchOffsetResponseHeader {
         offset: l => "offset",
 
@@ -403,7 +337,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetEarliestMsgStoretimeRequestHeader`
     GetEarliestMsgStoretimeRequestHeader {
         topic: s => "topic",
         queue_id: i => "queueId",
@@ -412,7 +345,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetEarliestMsgStoretimeResponseHeader`
     GetEarliestMsgStoretimeResponseHeader {
         timestamp: l => "timestamp",
 
@@ -420,12 +352,8 @@ header_struct! {
 }
 
 header_struct! {
-/// 对应 org.apache.rocketmq.remoting.protocol.header.QueryMessageRequestHeader。
-///
 /// ``index_type`` 取 MessageConst.INDEX_KEY_TYPE("K") / INDEX_UNIQUE_TYPE("U") /
 /// INDEX_TAG_TYPE("T")；broker 侧为空时默认按 "K"（普通 key 索引）查。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.QueryMessageRequestHeader`
     QueryMessageRequestHeader {
         topic: s => "topic",
         key: s => "key",
@@ -439,7 +367,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.QueryMessageResponseHeader`
     QueryMessageResponseHeader {
         index_last_update_timestamp: l => "indexLastUpdateTimestamp",
 
@@ -447,7 +374,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.ViewMessageRequestHeader`
     ViewMessageRequestHeader {
         offset: l => "offset",
 
@@ -455,14 +381,12 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.ViewMessageResponseHeader`
     ViewMessageResponseHeader {
 
     }
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.HeartbeatRequestHeader`
     HeartbeatRequestHeader {
         client_id: s => "clientID",
 
@@ -470,7 +394,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.UnregisterClientRequestHeader`
     UnregisterClientRequestHeader {
         client_id: s => "clientID",
         producer_group: s => "producerGroup",
@@ -480,7 +403,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.ConsumerSendMsgBackRequestHeader`
     ConsumerSendMsgBackRequestHeader {
         offset: l => "offset",
         group: s => "group",
@@ -494,7 +416,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetConsumerListByGroupRequestHeader`
     GetConsumerListByGroupRequestHeader {
         consumer_group: s => "consumerGroup",
 
@@ -502,14 +423,12 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetConsumerListByGroupResponseHeader`
     GetConsumerListByGroupResponseHeader {
 
     }
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.NotifyConsumerIdsChangedRequestHeader`
     NotifyConsumerIdsChangedRequestHeader {
         consumer_group: s => "consumerGroup",
 
@@ -517,7 +436,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetConsumerConnectionListRequestHeader`
     GetConsumerConnectionListRequestHeader {
         consumer_group: s => "consumerGroup",
 
@@ -526,8 +444,6 @@ header_struct! {
 
 header_struct! {
 /// GET_CONSUMER_STATUS_FROM_CLIENT(221) 的请求头。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetConsumerStatusRequestHeader`
     GetConsumerStatusRequestHeader {
         topic: s => "topic",
         group: s => "group",
@@ -537,7 +453,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetConsumerRunningInfoRequestHeader`
     GetConsumerRunningInfoRequestHeader {
         consumer_group: s => "consumerGroup",
         client_id: s => "clientId",
@@ -547,7 +462,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.ConsumeMessageDirectlyResultRequestHeader`
     ConsumeMessageDirectlyResultRequestHeader {
         consumer_group: s => "consumerGroup",
         client_id: s => "clientId",
@@ -558,7 +472,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.ResetOffsetRequestHeader`
     ResetOffsetRequestHeader {
         topic: s => "topic",
         group: s => "group",
@@ -569,7 +482,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.LockBatchMqRequestHeader`
     LockBatchMqRequestHeader {
         consumer_group: s => "consumerGroup",
         client_id: s => "clientId",
@@ -578,7 +490,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.UnlockBatchMqRequestHeader`
     UnlockBatchMqRequestHeader {
         consumer_group: s => "consumerGroup",
         client_id: s => "clientId",
@@ -587,15 +498,6 @@ header_struct! {
 }
 
 header_struct! {
-/// 对应 org.apache.rocketmq.remoting.protocol.header.EndTransactionRequestHeader。
-///
-/// ⚠ 继承 RpcRequestHeader 的 brokerName 字段在 Java 里**反射名是 ``bname``**
-/// （setter 为 setBrokerName，但字段声明名是 bname）。写错键 broker 会静默丢字段。
-/// 字段名严格与 Java 一致：topic / producerGroup / tranStateTableOffset /
-/// commitLogOffset / commitOrRollback / fromTransactionCheck / msgId /
-/// transactionId / bname。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.EndTransactionRequestHeader`
     EndTransactionRequestHeader {
         topic: s => "topic",
         producer_group: s => "producerGroup",
@@ -611,7 +513,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.EndTransactionResponseHeader`
     EndTransactionResponseHeader {
         msg_id: s => "msgId",
         transaction_id: s => "transactionId",
@@ -620,13 +521,6 @@ header_struct! {
 }
 
 header_struct! {
-/// 对应 org.apache.rocketmq.remoting.protocol.header.CheckTransactionStateRequestHeader。
-///
-/// ⚠ 同样继承 RpcRequestHeader：brokerName 反射名是 ``bname``。字段名严格与 Java
-/// 一致：topic / tranStateTableOffset / commitLogOffset / msgId / transactionId /
-/// offsetMsgId / bname。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.CheckTransactionStateRequestHeader`
     CheckTransactionStateRequestHeader {
         topic: s => "topic",
         tran_state_table_offset: l => "tranStateTableOffset",
@@ -640,7 +534,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.CheckTransactionStateResponseHeader`
     CheckTransactionStateResponseHeader {
         group_name: s => "groupName",
         transaction_state: i => "transactionState",
@@ -650,14 +543,12 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetAllTopicConfigRequestHeader`
     GetAllTopicConfigRequestHeader {
 
     }
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetAllTopicConfigResponseHeader`
     GetAllTopicConfigResponseHeader {
         data_version: s => "dataVersion",
 
@@ -665,7 +556,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetTopicConfigRequestHeader`
     GetTopicConfigRequestHeader {
         topic: s => "topic",
 
@@ -673,13 +563,9 @@ header_struct! {
 }
 
 header_struct! {
-/// 对应 org.apache.rocketmq.remoting.protocol.header.CreateTopicRequestHeader。
-///
 /// ⚠ broker 的 checkFields() 会把 ``topicFilterType`` 解析成枚举，**为空直接抛
 /// RemotingCommandException("topicFilterType = [null] value invalid")**，
 /// 所以哪怕只想建普通 topic，也必须显式下发 topicFilterType。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.CreateTopicRequestHeader`
     CreateTopicRequestHeader {
         topic: s => "topic",
         default_topic: s => "defaultTopic",
@@ -696,7 +582,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.DeleteTopicRequestHeader`
     DeleteTopicRequestHeader {
         topic: s => "topic",
 
@@ -704,7 +589,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetTopicStatsInfoRequestHeader`
     GetTopicStatsInfoRequestHeader {
         topic: s => "topic",
 
@@ -712,7 +596,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetConsumeStatsRequestHeader`
     GetConsumeStatsRequestHeader {
         consumer_group: s => "consumerGroup",
         topic: s => "topic",
@@ -728,7 +611,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetSubscriptionGroupConfigRequestHeader`
     GetSubscriptionGroupConfigRequestHeader {
         group: s => "group",
 
@@ -745,7 +627,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetTopicsByClusterRequestHeader`
     GetTopicsByClusterRequestHeader {
         cluster: s => "cluster",
 
@@ -753,7 +634,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetBrokerConfigResponseHeader`
     GetBrokerConfigResponseHeader {
         version: s => "version",
 
@@ -783,7 +663,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.RegisterBrokerRequestHeader`
     RegisterBrokerRequestHeader {
         broker_name: s => "brokerName",
         broker_addr: s => "brokerAddr",
@@ -799,7 +678,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.RegisterBrokerResponseHeader`
     RegisterBrokerResponseHeader {
         ha_server_addr: s => "haServerAddr",
         master_addr: s => "masterAddr",
@@ -808,7 +686,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.UnRegisterBrokerRequestHeader`
     UnRegisterBrokerRequestHeader {
         broker_name: s => "brokerName",
         broker_addr: s => "brokerAddr",
@@ -819,7 +696,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.GetRouteInfoRequestHeader`
     GetRouteInfoRequestHeader {
         topic: s => "topic",
         accept_standard_json_only: b => "acceptStandardJsonOnly",
@@ -828,7 +704,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.PutKVConfigRequestHeader`
     PutKVConfigRequestHeader {
         namespace: s => "namespace",
         key: s => "key",
@@ -838,7 +713,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.GetKVConfigRequestHeader`
     GetKVConfigRequestHeader {
         namespace: s => "namespace",
         key: s => "key",
@@ -847,7 +721,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.GetKVConfigResponseHeader`
     GetKVConfigResponseHeader {
         value: s => "value",
 
@@ -855,7 +728,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.DeleteKVConfigRequestHeader`
     DeleteKVConfigRequestHeader {
         namespace: s => "namespace",
         key: s => "key",
@@ -864,7 +736,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.GetKVListByNamespaceRequestHeader`
     GetKVListByNamespaceRequestHeader {
         namespace: s => "namespace",
 
@@ -872,7 +743,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.RegisterTopicRequestHeader`
     RegisterTopicRequestHeader {
         topic: s => "topic",
 
@@ -880,7 +750,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.RegisterOrderTopicRequestHeader`
     RegisterOrderTopicRequestHeader {
         topic: s => "topic",
         order_topic_string: s => "orderTopicString",
@@ -889,7 +758,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.DeleteTopicFromNamesrvRequestHeader`
     DeleteTopicFromNamesrvRequestHeader {
         topic: s => "topic",
         cluster_name: s => "clusterName",
@@ -898,7 +766,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.GetBrokerMemberGroupRequestHeader`
     GetBrokerMemberGroupRequestHeader {
         cluster_name: s => "clusterName",
         broker_name: s => "brokerName",
@@ -907,7 +774,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.WipeWritePermOfBrokerRequestHeader`
     WipeWritePermOfBrokerRequestHeader {
         broker_name: s => "brokerName",
 
@@ -915,7 +781,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.WipeWritePermOfBrokerResponseHeader`
     WipeWritePermOfBrokerResponseHeader {
         wipe_topic_count: i => "wipeTopicCount",
 
@@ -923,7 +788,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.AddWritePermOfBrokerRequestHeader`
     AddWritePermOfBrokerRequestHeader {
         broker_name: s => "brokerName",
 
@@ -931,7 +795,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.AddWritePermOfBrokerResponseHeader`
     AddWritePermOfBrokerResponseHeader {
         add_topic_count: i => "addTopicCount",
 
@@ -939,7 +802,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.BrokerHeartbeatRequestHeader`
     BrokerHeartbeatRequestHeader {
         cluster_name: s => "clusterName",
         broker_addr: s => "brokerAddr",
@@ -955,7 +817,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.QueryDataVersionRequestHeader`
     QueryDataVersionRequestHeader {
         broker_name: s => "brokerName",
         broker_addr: s => "brokerAddr",
@@ -966,7 +827,6 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.namesrv.QueryDataVersionResponseHeader`
     QueryDataVersionResponseHeader {
         changed: b => "changed",
 
@@ -974,9 +834,6 @@ header_struct! {
 }
 
 header_struct! {
-/// Java ``PopMessageRequestHeader``（RequestCode.POP_MESSAGE = 200050）。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.PopMessageRequestHeader`
     PopMessageRequestHeader {
         consumer_group: s => "consumerGroup",
         topic: s => "topic",
@@ -995,12 +852,8 @@ header_struct! {
 }
 
 header_struct! {
-/// Java ``PopMessageResponseHeader``。
-///
 /// ``start_offset_info`` / ``msg_offset_info`` / ``order_count_info`` 是编码过的
 /// 字符串（空格做字段分隔、分号做队列分隔），用 ``extra_info`` 模块解析。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.PopMessageResponseHeader`
     PopMessageResponseHeader {
         pop_time: l => "popTime",
         invisible_time: l => "invisibleTime",
@@ -1014,12 +867,8 @@ header_struct! {
 }
 
 header_struct! {
-/// Java ``AckMessageRequestHeader``（RequestCode.ACK_MESSAGE = 200051）。
-///
 /// ``offset`` 是 **consumeQueue offset**（即 CK 串第 8 段 / msgQueueOffset），
 /// 不是 commitlog offset —— 传错会被 broker 回 NO_MESSAGE。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.AckMessageRequestHeader`
     AckMessageRequestHeader {
         consumer_group: s => "consumerGroup",
         topic: s => "topic",
@@ -1032,9 +881,6 @@ header_struct! {
 }
 
 header_struct! {
-/// Java ``ChangeInvisibleTimeRequestHeader``（CHANGE_MESSAGE_INVISIBLETIME = 200053）。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.ChangeInvisibleTimeRequestHeader`
     ChangeInvisibleTimeRequestHeader {
         consumer_group: s => "consumerGroup",
         topic: s => "topic",
@@ -1049,12 +895,8 @@ header_struct! {
 }
 
 header_struct! {
-/// Java ``ChangeInvisibleTimeResponseHeader``。
-///
 /// 返回的是**新的** ``invisible_time`` / ``pop_time`` / ``revive_qid``；
 /// 客户端要用它们重建 extraInfo 供后续 ACK 使用。
-///
-/// extFields: `org.apache.rocketmq.remoting.protocol.header.ChangeInvisibleTimeResponseHeader`
     ChangeInvisibleTimeResponseHeader {
         pop_time: l => "popTime",
         invisible_time: l => "invisibleTime",
@@ -1063,10 +905,6 @@ header_struct! {
     }
 }
 
-/// 每个 header 的 extFields 键名快照，供 `test_header_field_names_match_protocol` 与 Java 源码对拍。
-///
-/// 与 `org.apache.rocketmq.remoting.protocol.header.*` 的字段名逐字对齐；
-/// `SendMessageRequestHeaderV2` 是唯一的短名例外（Java 侧字段名本身就是 `a`…`n`）。
 #[cfg(test)]
 const PROTOCOL_HEADER_FIELDS: &[(&str, &[&str])] = &[
     ("SendMessageRequestHeader", &["producerGroup", "topic", "defaultTopic", "defaultTopicQueueNums", "queueId", "sysFlag", "bornTimestamp", "flag", "properties", "reconsumeTimes", "unitMode", "maxReconsumeTimes", "batch", ]),
@@ -1216,7 +1054,6 @@ mod tests {
         assert_eq!(ext.get("bornTime"), Some("1789613086027"));
     }
 
-    /// Java 字段是 `Boolean order = Boolean.FALSE`（非 null），`encodeHeader` 不会跳过它。
     #[test]
     fn pop_message_order_is_always_serialized_as_lowercase() {
         let h = PopMessageRequestHeader {
@@ -1311,7 +1148,6 @@ mod tests {
                 "suspend",
             ]
         );
-        // Java 是 primitive boolean，所以总是出现，且是小写
         assert_eq!(ext.get("suspend"), Some("false"));
     }
 
@@ -1326,7 +1162,6 @@ mod tests {
         assert_eq!((h.pop_time, h.invisible_time, h.revive_qid), (Some(111), Some(222), Some(3)));
     }
 
-    /// `SEND_MESSAGE_V2 = 310` 依赖单字母短键；长短两套拼写都必须与 Java 一致。
     #[test]
     fn send_message_v2_uses_short_keys() {
         assert_eq!(request_code::SEND_MESSAGE_V2, 310);
@@ -1451,9 +1286,6 @@ mod tests {
     }
 
     /// `RECALL_MESSAGE`(370) 的三条字段名守卫。
-    ///
-    /// ⚠ `bname` 是从 `RpcRequestHeader` 继承下来的，反射名不是 `brokerName`；
-    /// 写成后者 broker 收不到值，而 Java 客户端会照写 `bname`。
     #[test]
     fn recall_message_headers_use_wire_keys() {
         let h = RecallMessageRequestHeader {
@@ -1521,10 +1353,6 @@ mod tests {
         assert_eq!(back, h);
     }
 
-    /// `SearchOffsetRequestHeader.boundaryType`（Java `DefaultMQAdminExt`:133/:137）。
-    ///
-    /// 入网文本是 `Enum.toString()` 的大写枚举名（不是 `getName()` 的小写名）；
-    /// 未设置时整键不写（@CFNullable）；回解走 Java `BoundaryType.getType` 的宽松语义。
     #[test]
     fn search_offset_request_header_carries_the_protocol_boundary_type() {
         let mut h = SearchOffsetRequestHeader {
@@ -1549,7 +1377,6 @@ mod tests {
         let mut back = SearchOffsetRequestHeader::default();
         back.from_ext_fields(&ext);
         assert_eq!(back.boundary_type, Some(BoundaryType::Upper));
-        // 未知值 / 小写名一律 LOWER（Java getType），缺键回 None
         for text in ["LOWER", "lower", "", "junk"] {
             let mut e = ExtFields::new();
             e.insert("boundaryType", text);
@@ -1562,7 +1389,6 @@ mod tests {
         assert_eq!(b.boundary_type, None);
     }
 
-    /// Java 的字段名是 `clientID`（ID 全大写），不是 `clientId`。
     #[test]
     fn client_id_key_spelling_is_capitalized_id() {
         let mut ext = ExtFields::new();
@@ -1582,8 +1408,6 @@ mod tests {
         assert_eq!(keys(&ext), vec!["clientID", "producerGroup", "consumerGroup"]);
     }
 
-    /// `RegisterBrokerRequestHeader` 的两个非空默认值（`compressed=false`、`bodyCrc32=0`）
-    /// 即使调用方不填也要落报文，与 Java 反射一致。
     #[test]
     fn register_broker_defaults_always_emitted() {
         let mut ext = ExtFields::new();
@@ -1604,13 +1428,11 @@ mod tests {
         assert_eq!(h.broker_name.as_deref(), Some(BROKER));
         assert_eq!(h.broker_id, Some(0));
         assert_eq!(h.heartbeat_timeout_millis, Some(30000));
-        // Python 用 bool(v) 解析，"false" 会被判真；这里按 Java parseBoolean。
         assert_eq!(h.enable_acting_master, Some(false));
         assert!(h.compressed);
         assert_eq!(h.body_crc32, 123);
     }
 
-    /// 无字段 header（Java 里就是空类）不能写出任何 extFields。
     #[test]
     fn fieldless_headers_write_nothing() {
         for ext in [
@@ -1666,9 +1488,6 @@ mod tests {
         assert_eq!(back.accept_standard_json_only, Some(true));
     }
 
-    /// 每个 header 的 extFields 键名必须仍然是 Java `protocol.header.*` 里的字段名。
-    ///
-    /// 只有设置 `ROCKETMQ_JAVA_SRC` 时才跑（指向 RocketMQ Java 仓库根目录），否则静默跳过。
     #[test]
     fn test_header_field_names_match_protocol() {
         let root = match std::env::var("ROCKETMQ_JAVA_SRC") {
@@ -1683,7 +1502,6 @@ mod tests {
         for (class, fields) in PROTOCOL_HEADER_FIELDS {
             let declared = java_declared_fields(&root, class, 0);
             if declared.is_empty() {
-                // Python 专有 header（Java 无对应类），不校验。
                 continue;
             }
             for field in *fields {

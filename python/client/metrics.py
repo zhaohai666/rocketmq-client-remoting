@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""客户端基础指标（对应 Java 的 RT/计数统计：send/consume 耗时与成功失败数）。
-
-本地只做最轻量的线程安全计数器与累加器，不引入导出格式；提供 getter 供外部采集。
-与 Java 的 ``MQClientAPIImpl`` / ``DefaultMQPushConsumer`` 内部的统计口径一致：
-发送维度统计 sendRT、sendCount、sendFailureCount；消费维度统计 consumeRT、
-consumeCount、consumeFailureCount。
-"""
 from __future__ import annotations
 
 import threading

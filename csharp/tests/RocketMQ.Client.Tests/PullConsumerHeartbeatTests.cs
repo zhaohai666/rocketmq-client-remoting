@@ -1,19 +1,5 @@
 // 拉模式 / 轻量拉取消费者的**心跳**离线单测 —— 不需要集群。
 //
-// 对齐基准（Java 5.5.1，逐行读过；与 python/tests/test_pull_consumer.py、
-// cpp/tests/test_pull_consumer_heartbeat.cpp、rust 的同名用例对拍）：
-//   * Java DefaultMQPullConsumerImpl.start():746 把本组注册进实例的 consumerTable，
-//     实例级周期任务（MQClientInstance#startScheduledTask）再替它逐台发心跳。心跳口径
-//     prepareHeartbeatData:1031-1045 = consumeType()（:348 恒 CONSUME_ACTIVELY）+
-//     consumeFromWhere()（:353 恒 CONSUME_FROM_LAST_OFFSET）+ messageModel() +
-//     subscriptions()（:357-385：逐条 buildSubscriptionData(topic, SUB_ALL) 后
-//     **setSubVersion(0L)**）。
-//   * Java DefaultLitePullConsumerImpl.consumeType():1111-1112 同样是 CONSUME_ACTIVELY。
-//   * shutdown():689-692 = unregisterConsumer → mQClientFactory.shutdown()：每台 broker
-//     发 UNREGISTER_CLIENT(35)。
-// 为什么值得单测：broker 的 ConsumerManager.consumerTable 按台各一份，缺心跳时
-// consumerConnection/38 看不到本组、isRejectPullConsumerEnabled 的 broker 会拒拉
-// （PullMessageProcessor:493-505），而拉取本身照样成功 —— 失效是静默的，只能靠抓帧锁死。
 //
 // 为什么自带假集群：心跳要「打到主从两台」，而 MockCluster 的路由是「一台 broker 一个
 // 名字、只有 master」，这条判据在它上面造不出来（与 ProducerUnregisterTests 同一理由）。
@@ -322,7 +308,6 @@ public class PullConsumerHeartbeatTests
             SubscriptionData sub = Assert.Single(cd.SubscriptionDataSet);
             Assert.Equal(Topic, sub.Topic);
             Assert.Equal("*", sub.SubString);
-            // Java 显式 setSubVersion(0L)：带默认时间戳会让 broker 每轮心跳都以为订阅变了
             Assert.Equal(0, sub.SubVersion);
         }
         finally
@@ -344,8 +329,6 @@ public class PullConsumerHeartbeatTests
         consumer.Start();
         try
         {
-            // Java sendHeartbeatToAllBroker:732-750 遍历每个 brokerId，仅对
-            // consumerEmpty && id != MASTER_ID 跳；消费者心跳必带 ConsumerData，故从节点不跳。
             Assert.True(WaitFor(() => cluster.CountAt(cluster.MasterAddr, RequestCode.HeartBeat) >= 1
                                       && cluster.CountAt(cluster.SlaveAddr, RequestCode.HeartBeat) >= 1),
                 "主从两台都收到心跳");
@@ -459,7 +442,6 @@ public class PullConsumerHeartbeatTests
             Frame hb = cluster.Frames(RequestCode.HeartBeat).First(f => f.Addr == cluster.MasterAddr);
             ConsumerData cd = DecodeFirstConsumerData(hb.Body);
             Assert.Equal(Group, cd.GroupName);
-            // Java DefaultLitePullConsumerImpl.consumeType():1111-1112
             Assert.Equal(ConsumeType.ConsumeActively, cd.ConsumeType);
         }
         finally

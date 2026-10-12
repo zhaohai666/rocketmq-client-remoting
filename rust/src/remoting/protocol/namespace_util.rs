@@ -1,6 +1,3 @@
-//! 命名空间工具（对应 Java `org.apache.rocketmq.remoting.protocol.NamespaceUtil`，
-//! 参考实现 `python/remoting/protocol/namespace_util.py`）。
-//!
 //! 命名空间用于多租户隔离：客户端把 `namespace` 以 `namespace%` 前缀拼到
 //! topic / group 上再发给 broker，从 broker 拿到的资源名在交给上层之前再剥掉前缀。
 //!
@@ -12,15 +9,12 @@
 
 use crate::common::mix_all::MixAll;
 
-/// 对应 Java `NamespaceUtil.NAMESPACE_SEPARATOR`。
 pub const NAMESPACE_SEPARATOR: char = '%';
 
-/// 对应 Java `NamespaceUtil`（纯静态类）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NamespaceUtil;
 
 impl NamespaceUtil {
-    /// 对应 Java `NamespaceUtil.withOutRetryAndDLQ`。
     pub fn with_out_retry_and_dlq(resource: &str) -> String {
         if resource.is_empty() {
             return String::new();
@@ -28,22 +22,14 @@ impl NamespaceUtil {
         MixAll::reset_retry_and_dlq_topic(Some(resource)).unwrap_or_default()
     }
 
-    /// 对应 Java `NamespaceUtil.isRetryTopic`。
     pub fn is_retry_topic(resource: &str) -> bool {
         MixAll::is_retry_topic(Some(resource))
     }
 
-    /// 对应 Java `NamespaceUtil.isDLQTopic`。
     pub fn is_dlq_topic(resource: &str) -> bool {
         MixAll::is_dlq_topic(Some(resource))
     }
 
-    /// 对应 Java `NamespaceUtil.isSystemResource`。
-    ///
-    /// ⚠ Python 与 Java 这里不一致：Java 用 `TopicValidator.isSystemTopic`
-    /// （固定系统 topic 名单 **或** `rmq_sys_` 前缀），Python 只看 `rmq_sys_` 前缀。
-    /// 本实现按 Python，即 `TBW102` / `SCHEDULE_TOPIC_XXXX` 等在 Java 里不加命名空间的
-    /// topic 在这里仍会被加上命名空间。
     pub fn is_system_resource(resource: &str) -> bool {
         if resource.is_empty() {
             return false;
@@ -51,7 +37,6 @@ impl NamespaceUtil {
         MixAll::is_sys_topic(Some(resource)) || MixAll::is_sys_consumer_group(Some(resource))
     }
 
-    /// 对应 Java `NamespaceUtil.isAlreadyWithNamespace`。
     pub fn is_already_with_namespace(resource: &str, namespace: &str) -> bool {
         if namespace.is_empty() || resource.is_empty() || Self::is_system_resource(resource) {
             return false;
@@ -59,9 +44,6 @@ impl NamespaceUtil {
         Self::with_out_retry_and_dlq(resource).starts_with(&format!("{namespace}{NAMESPACE_SEPARATOR}"))
     }
 
-    /// 对应 Java `NamespaceUtil.withoutNamespace` 的两个重载（`namespace` 传空串
-    /// 即 Java 的单参版本）。
-    ///
     /// `MQ_INST_XX%Topic` → `Topic`；`%RETRY%MQ_INST_XX%GID` → `%RETRY%GID`。
     /// 未带该命名空间时原样返回。
     pub fn without_namespace(resource_with_namespace: &str, namespace: &str) -> String {
@@ -96,7 +78,6 @@ impl NamespaceUtil {
         }
     }
 
-    /// 对应 Java `NamespaceUtil.wrapNamespace`。
     pub fn wrap_namespace(namespace: &str, resource_without_namespace: &str) -> String {
         if namespace.is_empty() || resource_without_namespace.is_empty() {
             return resource_without_namespace.to_string();
@@ -121,10 +102,6 @@ impl NamespaceUtil {
         prefix
     }
 
-    /// 对应 Java `NamespaceUtil.wrapNamespaceAndRetry`：
-    /// `%RETRY%<wrapNamespace(namespace, group)>`。
-    ///
-    /// ⚠ Java 在 group 为空时返回 `null`，Python 返回入参（空串）；这里跟 Python。
     pub fn wrap_namespace_and_retry(namespace: &str, consumer_group: &str) -> String {
         if consumer_group.is_empty() {
             return consumer_group.to_string();
@@ -136,7 +113,6 @@ impl NamespaceUtil {
         )
     }
 
-    /// 对应 Java `NamespaceUtil.getNamespaceFromResource`。
     pub fn get_namespace_from_resource(resource: &str) -> String {
         if resource.is_empty() || Self::is_system_resource(resource) {
             return String::new();
@@ -244,7 +220,6 @@ mod tests {
             "%RETRY%MQ_INST_XX%GID"
         );
         assert_eq!(NamespaceUtil::wrap_namespace_and_retry("", "GID"), "%RETRY%GID");
-        // Python: group 为空时原样返回（Java 返回 null）
         assert_eq!(NamespaceUtil::wrap_namespace_and_retry("NS", ""), "");
         // 传进来的 group 已带 %RETRY%：Python 同理会得到双前缀（调用方应传裸 group），
         // 这里把这个行为钉住，别让人「顺手优化」成去重。

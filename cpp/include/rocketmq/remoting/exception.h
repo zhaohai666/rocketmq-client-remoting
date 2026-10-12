@@ -1,4 +1,3 @@
-// 异常类型（对应 org.apache.rocketmq.remoting.exception.*）。
 #ifndef ROCKETMQ_REMOTING_EXCEPTION_H
 #define ROCKETMQ_REMOTING_EXCEPTION_H
 

@@ -1,29 +1,4 @@
 # -*- coding: utf-8 -*-
-"""自动压缩（zlib）真实集群 + 跨客户端联调。
-
-为什么需要它：单元测试只证明「zlib 往返正确」，证明不了
- 1. producer 真的在超过 compressMsgBodyOverHowmuch(4096) 时压缩并置 COMPRESSED_FLAG；
- 2. broker 存的是压缩体（storeSize 远小于原文）；
- 3. 消费端真的解压并把 COMPRESSED_FLAG 清掉（对齐 Java MessageDecoder 第 520-523 行）；
- 4. **别的客户端（Java）产生的压缩消息，我们能正确解压** —— 这是真机才暴露的静默数据损坏点。
-
-载荷是**确定性**的（重复一行固定文本后截断），与 Java 探针 CompressProbe 完全相同，
-因此两端各自本地重建后比较 CRC32 即可，无需交换文件。
-
-⚠ CRC32 显示值会不同，这不是 bug：Java ``UtilAll.crc32`` 返回
-``(int)(value & 0x7FFFFFFF)``，砍掉了最高位；本脚本用标准 CRC-32。
-所以 Java 打印 1785582993 对应本脚本打印 3933066641（差正好 2^31）。
-判定互通要看各自的 ``match=`` 字段，不要直接比两边打印的 CRC 数字。
-
-用法：
-    python verify_compression_live.py selftest
-    python verify_compression_live.py send   <topic> <group> <size> [codec]
-    python verify_compression_live.py recv   <topic> <group> <size>
-
-``codec`` = zlib（默认）| lz4 | zstd，只影响发送端；接收端按 sysFlag 的类型位自动解压。
-⚠ 本 venv 只装了 ``lz4``，没装 ``zstandard``：zstd 的收发会明确报错而不是静默透传
-（见 ``message_decoder._zstd``），所以跨语言 zstd 矩阵里 python 这一端要跳过。
-"""
 import os
 import sys
 import time
@@ -50,7 +25,7 @@ results = []
 
 
 def build_payload(size):
-    """与 Java CompressProbe.buildPayload 完全一致（必须逐字节相同）。"""
+    pass
     out = bytearray()
     while len(out) < size:
         out += LINE
@@ -63,7 +38,7 @@ def check(name, ok, detail=""):
 
 
 def crc32(data):
-    """与 Java UtilAll.crc32 同值（zlib.crc32 即标准 CRC-32）。"""
+    pass
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
@@ -168,7 +143,6 @@ def selftest():
           "storeSize=%d 原文=%d 压缩比=%d:1"
           % (store_size, size, size // (store_size if store_size else 1)))
 
-    # 4) 解压后 COMPRESSED_FLAG 必须被清掉（对齐 Java MessageDecoder 第 523 行）
     sys_flag = getattr(m, "sys_flag", 0)
     check("解压后 COMPRESSED_FLAG 已清除",
           not MessageSysFlag.is_compressed(sys_flag), "sysFlag=%d" % sys_flag)
@@ -240,11 +214,6 @@ def selftest():
               and not MessageSysFlag.is_compressed(getattr(bm, "sys_flag", 0)),
               "len=%d storeSize=%d sysFlag=%d" % (len(bbody), bstore, getattr(bm, "sys_flag", 0)))
 
-    # 8) 同一条 Message 复用两次（Java ``sendKernelImpl:1095-1096`` 的 finally）。
-    #    发送必须**还原调用方**那条消息：不还原时第一次发送就地把 body 换成压缩流，
-    #    第二次发出去的是压缩字节、长度已低于阈值不再压、COMPRESSED_FLAG 也不置位；
-    #    broker 照存、消费端照收（不解压），业务拿到的是 zlib 流 —— 全程零报错，
-    #    真机上表现为第二条消息 ``match=0``。这里两条都收回来逐字节比对。
     reuse_topic = "CompressLivePyReuse_%d" % stamp
     reuse_group = "CompressLivePyReuseGroup_%d" % stamp
     rp = DefaultMQProducer("CompressLivePyReuseProducer_%d" % stamp)

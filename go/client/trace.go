@@ -1,18 +1,3 @@
-// Message trace codec (Java org.apache.rocketmq.client.trace.*), the Go leg of
-// the trace stack. The encoded text is what the broker stores under
-// RMQ_SYS_TRACE_TOPIC and what the RocketMQ console reads back, so the field
-// order is a WIRE FORMAT, not an implementation detail: tests in trace_test.go
-// pin it against strings printed by the official Java encoder.
-//
-// Two Java split semantics are load-bearing and easy to get wrong:
-//
-//   - CONTENT_SPLITOR (\x01) separates fields inside one record,
-//     FIELD_SPLITOR (\x02) separates records and is appended after EVERY record
-//     (trailing separators included) — Java String.split drops trailing empty
-//     strings, which is exactly what makes the trailing separator harmless.
-//   - The decoder must therefore use Java's split rule, not Go's
-//     strings.Split: Go keeps the trailing empty part. splitWithoutTrailingEmpty below is the
-//     one and only entry point for that.
 package client
 
 import (
@@ -22,9 +7,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// Trace constants (Java org.apache.rocketmq.client.trace.TraceConstants). The
-// last two are wire literals too: the internal producer's group name and the
-// CLOUD trace topic prefix.
 const (
 	TraceGroupNamePrefix = "_INNER_TRACE_PRODUCER"
 	TraceContentSplitor  = "\u0001"
@@ -33,19 +15,8 @@ const (
 	TraceTopicPrefix     = "rmq_sys_TRACE_DATA_"
 )
 
-// AccessChannelCloud is Java AccessChannel.CLOUD. It is reachable only when a
-// caller explicitly runs a dispatcher in cloud mode; AccessChannelLocal ("LOCAL",
-// consume_service.go) is the only value this port produces on its own.
-//
-// It changes exactly two things: a CLOUD dispatch targets
-// "rmq_sys_TRACE_DATA_<region>" instead of RMQ_SYS_TRACE_TOPIC, and a SubAfter
-// record on a NON-cloud channel carries two extra trailing fields (timestamp +
-// groupName) — the Aliyun trace backend derives those from its envelope, so
-// Java omits them for CLOUD.
 const AccessChannelCloud = "CLOUD"
 
-// TraceType is Java org.apache.rocketmq.client.trace.TraceType. The string is
-// the first field of every encoded record, so these values are wire literals.
 type TraceType string
 
 const (
@@ -56,28 +27,20 @@ const (
 	TraceEndTransaction TraceType = "EndTransaction"
 )
 
-// traceLocalAddress is Java TraceBean's static LOCAL_ADDRESS: the default
-// storeHost/clientHost on a bean the encoder did not fill in.
 var traceLocalAddress = common.CachedIPStr()
 
-// TraceBean is Java org.apache.rocketmq.client.trace.TraceBean: the traced
-// message behind one record.
 type TraceBean struct {
-	Topic       string
-	MsgID       string
-	OffsetMsgID string
-	Tags        string
-	Keys        string
-	StoreHost   string
-	ClientHost  string
-	StoreTime   int64
-	RetryTimes  int32
-	BodyLength  int
-	// MsgType is written as the enum ORDINAL (see common.MessageType); the zero
-	// value is NormalMsg, which is also what Java encodes for a null msgType.
-	MsgType common.MessageType
-	// TransactionState holds the state NAME ("COMMIT_MESSAGE", ...) — Java writes
-	// transactionState.name() and the decoder reads the same string back.
+	Topic            string
+	MsgID            string
+	OffsetMsgID      string
+	Tags             string
+	Keys             string
+	StoreHost        string
+	ClientHost       string
+	StoreTime        int64
+	RetryTimes       int32
+	BodyLength       int
+	MsgType          common.MessageType
 	TransactionState string
 	TransactionID    string
 	// FromTransactionCheck is true when the broker's check-back produced the
@@ -89,13 +52,10 @@ func newTraceBean() *TraceBean {
 	return &TraceBean{StoreHost: traceLocalAddress, ClientHost: traceLocalAddress}
 }
 
-// TraceContext is Java org.apache.rocketmq.client.trace.TraceContext: one
-// trace event (a Pub, a SubBefore, ...).
 type TraceContext struct {
-	TraceType TraceType
-	TimeStamp int64
-	RegionID  string
-	// RegionName is decoded but never encoded by Java's client-side codec.
+	TraceType     TraceType
+	TimeStamp     int64
+	RegionID      string
 	RegionName    string
 	GroupName     string
 	CostTime      int64
@@ -106,10 +66,6 @@ type TraceContext struct {
 	TraceBeans    []*TraceBean
 }
 
-// NewTraceContext builds a context with Java's field defaults: isSuccess=true
-// and a fresh requestId (MessageClientIDSetter.createUniqID). The request id is
-// what lets a console join the SubBefore and SubAfter of one consume, so both
-// halves of a consume MUST reuse the same context object (see the hooks).
 func NewTraceContext() *TraceContext {
 	return &TraceContext{
 		TimeStamp: common.CurrentTimeMillis(),
@@ -118,8 +74,6 @@ func NewTraceContext() *TraceContext {
 	}
 }
 
-// TraceTransferBean is Java org.apache.rocketmq.client.trace.TraceTransferBean:
-// one encoded chunk plus the keys the receiver can look it up by.
 type TraceTransferBean struct {
 	TransData string
 	// TransKey is the set of business keys: every bean's msgId plus its KEYS
@@ -128,13 +82,6 @@ type TraceTransferBean struct {
 }
 
 // traceField reads one segment, defaulting to "" when it is missing.
-//
-// This is a DELIBERATE robustness deviation from Java, mirroring the Python
-// port: Java's decoderFromTraceDataString indexes line[7] directly, and a
-// SubBefore record of a message WITHOUT keys loses that segment to the trailing
-// split rule (Java drops the empty tail together with the record separator) —
-// so an AIOOBE kills the whole trace message. A trace reader should not die on
-// a legal record, so the missing segment reads as an empty string instead.
 func traceField(line []string, index int) string {
 	if index < len(line) {
 		return line[index]
@@ -142,8 +89,6 @@ func traceField(line []string, index int) string {
 	return ""
 }
 
-// traceMsgType parses an encoded ordinal back into a MessageType. Out-of-range
-// values reject the record, the way Java's enum valueOf would throw.
 func traceMsgType(text string) (common.MessageType, bool) {
 	n, err := strconv.Atoi(text)
 	if err != nil || n < 0 || n > int(common.OrderMsg) {
@@ -152,12 +97,6 @@ func traceMsgType(text string) (common.MessageType, bool) {
 	return common.MessageType(n), true
 }
 
-// EncodeTraceContext mirrors Java TraceDataEncoder.encoderFromContextBean. A nil
-// context encodes to nil (Java returns null).
-//
-// A context with no beans yields a nil-data transfer bean for the single-bean
-// types — the dispatcher already skips those, and Java would throw; returning
-// the empty bean keeps the boundary panic-free without changing any wire byte.
 func EncodeTraceContext(ctx *TraceContext) *TraceTransferBean {
 	if ctx == nil {
 		return nil
@@ -232,11 +171,6 @@ func EncodeTraceContext(ctx *TraceContext) *TraceTransferBean {
 	return tb
 }
 
-// DecodeTraceDataString mirrors Java decoderFromTraceDataString.
-//
-// Deviation, matching the Python port: a record that fails to decode is skipped
-// with a log line instead of aborting the whole payload. Java lets the exception
-// escape, which loses every record in the message because of one bad one.
 func DecodeTraceDataString(traceData string) []*TraceContext {
 	if traceData == "" {
 		return nil
@@ -287,8 +221,6 @@ func decodeTraceContext(record string) *TraceContext {
 		bean.BodyLength = bodyLen
 		ctx.CostTime = cost
 		bean.MsgType = msgType
-		// Version tolerance, same branches as Java/Python: 13 fields is the
-		// pre-offsetMsgId layout, 14 adds it, 15+ adds clientHost.
 		switch {
 		case len(line) == 13:
 			ctx.IsSuccess = line[12] == "true"

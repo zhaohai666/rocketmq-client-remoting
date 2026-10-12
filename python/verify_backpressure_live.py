@@ -1,26 +1,4 @@
 # -*- coding: utf-8 -*-
-"""异步发送背压（``enableBackpressureForAsyncMode`` 那一套信号量）真机验证。
-
-离线单测（``tests/test_producer_async.py`` 的「异步发送背压」一节 +
-``tests/test_backpressure.py``）锁的是语义；这个脚本锁的是**打到真 broker 时**的四件事：
-
-  B1  默认容量（1024 条 / 100M 字节）开着背压发一整轮异步消息：全部 SEND_OK，
-      且发完之后两个信号量**满额归还**（真机不泄配额 —— 泄了迟早把生产者自己锁死）。
-  B2  条数闸夹到地板值 10、用 ``SendMessageHook.before`` 睡 600ms 把在途占满：
-      第 11、12 笔在**调用方线程**上等不到许可，回调
-      ``send message tryAcquire semaphoreAsyncNum timeout``（Java :654-658 原文案），
-      而且 broker 上**一条都没多** —— 被拒的请求连路由都没查。
-  B3  运行时把容量从 10 调到 12：正卡在闸上的调用方被叫醒，broker 上多出那 1 条，
-      全部落地后空闲许可 = 新容量（这一轮在途睡 2s，留出足够的观察窗口）。
-  B4  字节闸（容量 1M 地板值 + 600KB body ⇒ 在途只能 1 笔）：第二笔回调
-      ``send message tryAcquire semaphoreAsyncSize timeout``（Java :667-671），
-      在途时空闲字节许可正好是 ``1M - 600K``，broker 上只落 1 条。
-  B5  关掉背压：同样的容量配置**完全不限流**，30 笔并发（含 300KB 大 body）全部落地。
-
-前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
-
-用法：.venv/bin/python verify_backpressure_live.py [127.0.0.1:9876]
-"""
 from __future__ import annotations
 
 import os

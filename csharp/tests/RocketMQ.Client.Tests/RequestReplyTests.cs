@@ -42,7 +42,6 @@ public class RequestReplyTests
     public void CreateReplyMessageMatchesLegacyShape()
     {
         Message reply = RequestReply.CreateReplyMessage(RequestMsg(), System.Text.Encoding.UTF8.GetBytes("pong"));
-        // topic 必须是 <cluster>_REPLY_TOPIC（Java MixAll.getReplyTopic）
         Assert.Equal("DefaultCluster_REPLY_TOPIC", reply.Topic);
         Assert.Equal("pong", System.Text.Encoding.UTF8.GetString(reply.Body));
         // 四个属性一个都不能少，且 CORRELATION_ID/REPLY_TO_CLIENT/TTL 是原样带回
@@ -55,9 +54,6 @@ public class RequestReplyTests
     [Fact]
     public void CreateReplyMessageRequiresCluster()
     {
-        // CLUSTER 由 broker 写入；没有它说明这条消息不是 broker 转来的，Java 同样抛错
-        // Java MessageUtil.createReplyMessage 两个分支都带 10007 CREATE_REPLY_MESSAGE_EXCEPTION：
-        // 应答方写在业务 listener 里，只能按 responseCode 分流。
         var noCluster = new Message(BaseTopic, System.Text.Encoding.UTF8.GetBytes("ping"));
         noCluster.PutProperty(MessageConst.PropertyCorrelationId, "corr-1");
         Assert.Equal(ClientErrorCode.CreateReplyMessageException,
@@ -76,7 +72,6 @@ public class RequestReplyTests
         Message reply = RequestReply.CreateReplyMessage(RequestMsg(), System.Text.Encoding.UTF8.GetBytes("pong"));
         Assert.True(RequestReply.IsReplyMessage(reply));
         Assert.False(RequestReply.IsReplyMessage(new Message(BaseTopic, System.Text.Encoding.UTF8.GetBytes("x"))));
-        // 大小写敏感：Java 是 equals("reply")
         var other = new Message(BaseTopic, System.Text.Encoding.UTF8.GetBytes("x"));
         other.PutProperty(MessageConst.PropertyMessageType, "Reply");
         Assert.False(RequestReply.IsReplyMessage(other));
@@ -112,8 +107,6 @@ public class RequestReplyTests
     [Fact]
     public void FutureWaitTimesOutReturnsNull()
     {
-        // 等待预算必须明显大于 future 的超时预算：IsTimeout 用的是严格大于（同 Java），
-        // 而系统等待可能比截止时刻早一丁点返回，两者相等时忙机上这条断言会抖。
         var f = new RequestResponseFuture("c1", 20);
         Assert.Null(f.WaitResponseMessage(200));
         Assert.True(f.IsTimeout());
@@ -136,7 +129,6 @@ public class RequestReplyTests
     [Fact]
     public void HolderPutResponseRemovesEntry()
     {
-        // Java 用 remove 抢所有权：应答到达与超时清理只能有一个生效。
         var holder = new RequestFutureHolder();
         var f = new RequestResponseFuture("c1", 1000);
         holder.PutRequest("c1", f);
@@ -166,9 +158,6 @@ public class RequestReplyTests
     [Fact]
     public void RequestTimeoutExceptionIsMQClientException()
     {
-        // Java: RequestTimeoutException extends MQClientException，
-        // 且 waitResponse 抛的是 RequestTimeoutException(10006, ...)：只有类型不够，
-        // 调用方按 ResponseCode 分流时要知道"消息已投出去、只是没等到应答"。
         var e = new RequestTimeoutException("x");
         Assert.IsAssignableFrom<MQClientException>(e);
         Assert.Equal(ClientErrorCode.RequestTimeoutException, e.ResponseCode);

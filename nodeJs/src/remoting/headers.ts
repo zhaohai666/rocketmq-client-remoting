@@ -26,8 +26,6 @@ function _b(v: any): boolean | null {
   return s === 'true' || s === '1';
 }
 
-// BoundaryType (org.apache.rocketmq.common.BoundaryType). Wire value is the
-// UPPER-CASE enum name; the lowercase name is only used for parsing tolerance.
 export class BoundaryType {
   static LOWER = { value: 'LOWER', lowercaseName: 'lower' };
   static UPPER = { value: 'UPPER', lowercaseName: 'upper' };

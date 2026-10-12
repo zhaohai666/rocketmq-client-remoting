@@ -1,58 +1,4 @@
-// MQPullConsumerScheduleService — the scheduled pull consumer (Java
-// org.apache.rocketmq.client.consumer.MQPullConsumerScheduleService, with the
-// queue-serial dispatch discipline of impl.consumer.PullMessageService /
-// PullRequest).
-//
-// It sits above DefaultMQPullConsumer and takes the manual loop out of the
-// caller's hands: register ONE callback per topic, and the service fans it
-// out to every MessageQueue this instance should own, pulls each queue on a
-// schedule and hands the result to the callback, which answers with the delay
-// until the next round. Per-queue it is exactly the Java PullTaskImpl chain
-// (schedule → run → re-schedule with context.getPullNextDelayTimeMillis()),
-// but pulled forward by the service rather than by the callback: the callback
-// never calls Pull itself, so the cursor, the OFFSET_ILLEGAL correction and
-// the offset bookkeeping stay in ONE place instead of in every user callback.
-//
 // The rules that make it behave:
-//
-//  1. Queue expansion follows the assignment, not the whole topic. The task
-//     set for a topic is computed with FetchMessageQueuesInBalance (the same
-//     on-demand rebalanceByTopic formula the pull consumer exposes): BROAD
-//     -CASTING takes every queue without consulting the group, CLUSTERING
-//     takes this clientId's slice — one task per owned queue, never two
-//     instances on one queue (example/simple/PullConsumer.java:62's point).
-//  2. One queue runs one round at a time. Java gets this from scheduling the
-//     SAME PullTaskImpl again only after its run() returned; here a queue's
-//     re-schedule likewise happens only after its round completed, and a
-//     per-queue mutex additionally serialises the handover window where an
-//     old cancelled task is still mid-round while an expansion already
-//     created its replacement (putTask's cancel-then-add, same race Java
-//     has — here it is closed).
-//  3. Three reschedule channels, in priority order (documented on
-//     resolveNextDelay): the callback's return value, the one-shot
-//     ctx.PullMessageLater (PullMessageService#executePullRequestLater's
-//     shape), and the per-round ctx.SetPullInterval (Java
-//     PullTaskContext.setPullNextDelayTimeMillis, default 200ms).
-//  4. The cursor follows nextBeginOffset after EVERY round whatever the
-//     status (DefaultLitePullConsumer's rule, and the OFFSET_ILLEGAL
-//     correction rides in that same field) and is parked into the offset
-//     store each round, so a queue revoked and re-assigned later resumes
-//     from the broker-committed position instead of restarting blind.
-//
-// Lifecycle: Start creates the dispatch scheduler (a Go goroutine per queue
-// plus a pullThreadNums-wide execution gate, Java's ScheduledThreadPoolExecutor
-// of 20), installs the queue listener on the consumer (Java start():90 —
-// any listener the caller set is replaced, same as Java), starts the consumer
-// and runs the first expansion; a 20s rebalance tick (Java's
-// RebalanceService period) re-expands every registered topic, and the broker's
-// NOTIFY_CONSUMER_IDS_CHANGED(40) push triggers one immediately through the
-// installed listener. Shutdown stops accepting rounds, cancels the queue
-// tasks, DRAINS the rounds already running (bounded by shutdownDrainBudget)
-// and only then shuts the consumer down — which persists the offsets,
-// unregisters the group and returns the instance reference (an instance is
-// only torn down when its last tenant leaves, see DetachFromRegistryIfLast
-// Tenant). A caller-supplied consumer is reused as-is; when the service built
-// its own it owns its whole lifecycle.
 package client
 
 import (
@@ -64,36 +10,19 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// Schedule-service defaults (Java MQPullConsumerScheduleService /
-// PullTaskContext 5.x).
 const (
 	// DefaultPullScheduleThreadNums is MQPullConsumerScheduleService.pullThread
 	// Nums:46 — the pool that runs PullTaskImpls.
 	DefaultPullScheduleThreadNums = 20
 	// DefaultPullTaskNextDelayMillis is PullTaskContext.pullNextDelayTimeMillis
 	// :24 — the gap between two rounds when the callback does not choose.
-	DefaultPullTaskNextDelayMillis = int64(200)
-	// DefaultPullScheduleRebalanceIntervalMillis is the queue-set re-expansion
-	// period (Java RebalanceService's 20s; the pull consumer has no rebalance
-	// loop of its own, so the service runs the one that drives putTask).
+	DefaultPullTaskNextDelayMillis             = int64(200)
 	DefaultPullScheduleRebalanceIntervalMillis = int64(20000)
-	// pullTaskPanicDelayMillis is the reschedule delay after a callback that
-	// threw (Java PullTaskImpl.run:183-184: setPullNextDelayTimeMillis(1000)).
-	// A var so a test can watch the retry without waiting a second.
-	pullTaskPanicDelayMillis = int64(1000)
+	pullTaskPanicDelayMillis                   = int64(1000)
 )
 
-// PullTaskCallback is the Java PullTaskCallback flipped to its Go shape: the
-// service has already pulled by the time it runs, and the callback answers
-// with the delay until THIS queue's next round. Returning <= 0 defers to the
-// context channels (PullMessageLater / SetPullInterval). When the pull failed
-// result is nil and context.PullError() carries the cause — the queue's
-// cursor is untouched in that case, the next round retries the same offset.
 type PullTaskCallback func(mq common.MessageQueue, result *PullResult, context *PullTaskContext) int64
 
-// PullTaskContext is Java's PullTaskContext (pullConsumer + the next-round
-// delay) plus the PullMessageService-style one-shot channel and the round's
-// pull error. Safe for use from the callback goroutine.
 type PullTaskContext struct {
 	mu           sync.Mutex
 	consumer     *DefaultMQPullConsumer
@@ -102,14 +31,8 @@ type PullTaskContext struct {
 	pullError    error
 }
 
-// PullConsumer exposes the consumer driving this round (Java
-// PullTaskContext#getPullConsumer — here read-only: pulls go through the
-// service, the context hands the consumer to callers that need offsets or
-// admin lookups inside the callback).
 func (x *PullTaskContext) PullConsumer() *DefaultMQPullConsumer { return x.consumer }
 
-// SetPullInterval is Java setPullNextDelayTimeMillis: the standing gap between
-// this queue's rounds. Durable — it applies to every later round until changed.
 func (x *PullTaskContext) SetPullInterval(millis int64) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -140,13 +63,6 @@ func (x *PullTaskContext) PullError() error {
 	return x.pullError
 }
 
-// resolveNextDelay folds the three reschedule channels into the delay until
-// the next round. Priority: (1) a positive value the callback returned,
-// (2) the one-shot PullMessageLater (consumed here), (3) the standing
-// SetPullInterval (default 200ms, Java's context initialiser). A
-// PullMessageLater that was overwritten by a newer round before being
-// consumed is simply the newer value — the three channels are one queue's
-// state, never shared.
 func (x *PullTaskContext) resolveNextDelay(returned int64) int64 {
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -197,9 +113,6 @@ type MQPullConsumerScheduleService struct {
 	rebalanceNow chan struct{}
 }
 
-// pullQueueTask is Java's PullTaskImpl: one queue's scheduling chain. The
-// chain runs on its own goroutine; cancellation is a closed channel plus the
-// cancelled flag Java checks after doPullTask (:187).
 type pullQueueTask struct {
 	mq         common.MessageQueue
 	service    *MQPullConsumerScheduleService
@@ -211,9 +124,6 @@ type pullQueueTask struct {
 	cursor atomic.Int64
 }
 
-// NewMQPullConsumerScheduleService mirrors Java's constructor: the group is
-// mandatory, and the internal pull consumer is CLUSTERING (MQPullConsumer
-// ScheduleService:53).
 func NewMQPullConsumerScheduleService(consumerGroup string) (*MQPullConsumerScheduleService, error) {
 	c, err := NewDefaultMQPullConsumer(consumerGroup)
 	if err != nil {
@@ -248,21 +158,12 @@ func newMQPullConsumerScheduleService(c *DefaultMQPullConsumer, owns bool) *MQPu
 
 // ---------------------------------------------------------------- configuration
 
-// PullConsumer exposes the underlying pull consumer (Java
-// getDefaultMQPullConsumer — configure nameservers, the model, the timeouts
-// and the allocate strategy through it before Start).
 func (s *MQPullConsumerScheduleService) PullConsumer() *DefaultMQPullConsumer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.consumer
 }
 
-// SetPullConsumer injects a caller-owned pull consumer (Java
-// setDefaultMQPullConsumer). It must run before Start; the service starts and
-// shuts down the injected consumer exactly as Java's start()/shutdown() do,
-// so a consumer the caller started itself is merely reused (Start and
-// Shutdown are idempotent). After Start it is refused with a warning: hot
-// swapping would leave the old consumer's instance reference unreturned.
 func (s *MQPullConsumerScheduleService) SetPullConsumer(c *DefaultMQPullConsumer) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -285,9 +186,6 @@ func (s *MQPullConsumerScheduleService) groupLocked() string {
 	return s.consumer.ConsumerGroup()
 }
 
-// SetPullThreadNums is Java setPullThreadNums:46. Read when Start builds the
-// execution gate; later changes need a restart. A non-positive value falls
-// back to the default rather than creating a gate that admits nothing.
 func (s *MQPullConsumerScheduleService) SetPullThreadNums(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -314,8 +212,6 @@ func (s *MQPullConsumerScheduleService) RebalanceIntervalMillis() int64 {
 	return s.rebalanceIntervalMillis
 }
 
-// SetPullBatchSize is the maxNums of every scheduled Pull (Java's examples
-// pass 32 by hand; DefaultPullMaxMsgNums is the shared default).
 func (s *MQPullConsumerScheduleService) SetPullBatchSize(n int32) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -330,8 +226,6 @@ func (s *MQPullConsumerScheduleService) PullBatchSize() int32 {
 	return s.pullBatchSize
 }
 
-// MessageModel forwards to the consumer (Java getMessageModel /
-// setMessageModel; putTask's mqAll-vs-mqDivided choice depends on it).
 func (s *MQPullConsumerScheduleService) SetMessageModel(model string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -349,13 +243,6 @@ func (s *MQPullConsumerScheduleService) MessageModel() string {
 	return s.consumer.MessageModel()
 }
 
-// RegisterPullTaskCallback is Java registerPullTaskCallback:98 — one callback
-// per topic. The topic is also subscribed (Java's
-// registerMessageQueueListener(topic, null) half: without the subscription
-// the heartbeat never carries it and the pull auto-registration does the
-// work late). A nil callback unregisters the topic and revokes its tasks.
-// Usable before AND after Start; after Start the queue expansion for the
-// topic runs immediately.
 func (s *MQPullConsumerScheduleService) RegisterPullTaskCallback(topic string, callback PullTaskCallback) error {
 	if err := common.CheckTopic(topic); err != nil {
 		return err
@@ -389,8 +276,6 @@ func (s *MQPullConsumerScheduleService) RegisterPullTaskCallback(topic string, c
 	return nil
 }
 
-// CallbackTopics snapshots the registered topics (Java getCallbackTable's key
-// set), sorted for stable callers.
 func (s *MQPullConsumerScheduleService) CallbackTopics() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -424,11 +309,6 @@ func (s *MQPullConsumerScheduleService) IsStarted() bool {
 
 // ---------------------------------------------------------------- lifecycle
 
-// Start mirrors Java start():83-96: build the scheduler, install the queue
-// listener (replacing any listener on the consumer — Java :90 does the same),
-// start the consumer and take the first expansion. The consumer's Start is
-// what puts the group on the instance registry; the service's Shutdown hands
-// that reference back.
 func (s *MQPullConsumerScheduleService) Start() error {
 	s.mu.Lock()
 	if s.started {
@@ -450,9 +330,6 @@ func (s *MQPullConsumerScheduleService) Start() error {
 	s.sem = make(chan struct{}, s.pullThreadNums)
 	s.stopped.Store(false)
 	s.started = true
-	// Java setMessageQueueListener(messageQueueListener) — the broker's 40
-	// push lands on the pull consumer, RebalanceImmediately notifies the
-	// listener, and the listener kicks an expansion of the affected topic.
 	consumer.SetMessageQueueListener(&pullScheduleQueueListener{service: s})
 	group := consumer.ConsumerGroup()
 	s.mu.Unlock()
@@ -469,10 +346,6 @@ func (s *MQPullConsumerScheduleService) Start() error {
 	return nil
 }
 
-// pullScheduleQueueListener is Java's MessageQueueListenerImpl: a queue-set
-// change for a registered topic kicks an expansion (the expansion itself
-// applies the BROADCASTING/CLUSTERING choice, same switch Java's listener
-// branches on).
 type pullScheduleQueueListener struct {
 	service *MQPullConsumerScheduleService
 }
@@ -494,12 +367,6 @@ func (s *MQPullConsumerScheduleService) requestRebalance() {
 	}
 }
 
-// rebalanceLoop is the pull-side stand-in for the rebalance service this port
-// deliberately does not run inside the consumer (see pull_consumer.go's file
-// header): one tick per interval, plus the coalesced immediate kicks. The
-// FIRST pass runs immediately — Java schedules a new task at delay 0 in
-// putTask, and an expansion that waited 20s would leave every queue idle for
-// a whole interval after start.
 func (s *MQPullConsumerScheduleService) rebalanceLoop() {
 	defer s.loopWG.Done()
 	s.doRebalance()
@@ -560,9 +427,6 @@ func (s *MQPullConsumerScheduleService) doRebalance() {
 	}
 }
 
-// putTask is Java putTask:61-81: revoke this topic's queues that are no
-// longer ours (cancel + drop), then start a task chain for every queue that
-// has none — an existing chain keeps its cursor and simply continues.
 func (s *MQPullConsumerScheduleService) putTask(topic string, queues []common.MessageQueue) {
 	sorted := append([]common.MessageQueue(nil), queues...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].CompareTo(sorted[j]) < 0 })
@@ -593,21 +457,14 @@ func (s *MQPullConsumerScheduleService) putTask(topic string, queues []common.Me
 	s.mu.Unlock()
 }
 
-// cancelTask is Java setCancelled(true) + the table removal, plus a closed
-// channel so a task sleeping between rounds notices immediately.
 func (t *pullQueueTask) cancelTask() {
 	t.cancelled.Store(true)
 	t.cancelOnce.Do(func() { close(t.cancel) })
 }
 
-// run is the PullTaskImpl chain: wait out the delay, run one round, take the
-// next delay from the channels, repeat until cancelled or the service stops.
-// One goroutine per queue is what makes the queue serial "for free" — the
-// next round is only ever scheduled after the current one returned, exactly
-// like Java re-scheduling the same Runnable from the end of run().
 func (t *pullQueueTask) run() {
 	s := t.service
-	delay := int64(0) // Java :77 schedules a new task with delay 0
+	delay := int64(0)
 	for {
 		if !t.waitDelay(delay) {
 			return
@@ -616,9 +473,6 @@ func (t *pullQueueTask) run() {
 			common.LogWarnf("The Pull Task is cancelled, %v", t.mq)
 			return
 		}
-		// The pullThreadNums gate (Java's fixed-size ScheduledThreadPool):
-		// more queues than workers makes the excess wait, never fan out
-		// unboundedly.
 		select {
 		case s.sem <- struct{}{}:
 		case <-s.stop:
@@ -644,8 +498,6 @@ func (t *pullQueueTask) run() {
 		l.Unlock()
 		<-s.sem
 		if t.cancelled.Load() {
-			// Java :191 — the revoke landed while doPullTask ran; its result
-			// is dropped and the chain dies here.
 			common.LogWarnf("The Pull Task is cancelled after doPullTask, %v", t.mq)
 			return
 		}
@@ -711,9 +563,6 @@ func (s *MQPullConsumerScheduleService) runRound(t *pullQueueTask) int64 {
 	return ctx.resolveNextDelay(returned)
 }
 
-// invokeCallback runs the user callback once. Java wraps doPullTask in
-// catch (Throwable) and reschedules at 1000ms — a panicking callback must
-// not kill the queue's chain nor the goroutine running it.
 func (s *MQPullConsumerScheduleService) invokeCallback(callback PullTaskCallback, t *pullQueueTask,
 	result *PullResult, ctx *PullTaskContext) (returned int64) {
 
@@ -776,15 +625,6 @@ func (s *MQPullConsumerScheduleService) pullForTask(t *pullQueueTask) (*PullResu
 	return result, nil
 }
 
-// resolveStartOffset picks a task's first position (the schedule service's
-// stand-in for Java's RebalancePullImpl + OffsetStore combination, which a
-// caller-driven pull consumer resolves by hand):
-//   - a committed offset (this port: the store, MEMORY_FIRST then the broker)
-//     wins — that is what makes a revoked-and-regranted queue resume;
-//   - a %RETRY% topic with nothing committed starts at 0, the push consumer's
-//     rule: retried messages must not be skipped by a max-offset tail read;
-//   - anything else tails the queue (CONSUME_FROM_LAST_OFFSET semantics,
-//     GET_MAX_OFFSET straight from the queue's own route).
 func (s *MQPullConsumerScheduleService) resolveStartOffset(mq common.MessageQueue) (int64, error) {
 	if committed, err := s.consumer.FetchConsumeOffset(mq, false); err == nil && committed >= 0 {
 		return committed, nil
@@ -795,14 +635,6 @@ func (s *MQPullConsumerScheduleService) resolveStartOffset(mq common.MessageQueu
 	return s.consumer.MaxOffset(mq)
 }
 
-// Shutdown mirrors Java shutdown():103-111 in the order Go needs: stop
-// accepting new work, cancel every task chain, WAIT for the rounds that are
-// already running (their Pulls ride on the consumer's instance — tearing the
-// instance down first would fail them mid-flight and lose the last offsets),
-// then shut the consumer down. The consumer's Shutdown is also what returns
-// the instance reference: with an injected consumer the caller still holds
-// their own tenancy; with a self-built one the instance detaches once this
-// was its last tenant.
 func (s *MQPullConsumerScheduleService) Shutdown() {
 	s.mu.Lock()
 	if !s.started {

@@ -1,38 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""cleanExpiredMsg 挂起逃生口真机验证（Java ConsumeMessageConcurrentlyService:68-88/192-200
-＋ ProcessQueue.cleanExpiredMsg:75-127）。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_clean_expired_msg_live.py 127.0.0.1:9876
-
-要验的东西：listener **挂着不返回**超过 ``consumeTimeout`` 分钟时，清扫线程必须把这条消息
-发回 broker（delayLevel 3）、由 %RETRY% 重新投递 —— 整条链路上客户端不能丢它、也不能投
-两次。这条路径坏掉的样子是静默的：卡住的消息把该队列位点与分发循环一起钉死，没有任何异常
-或超时可见；光靠"客户端不报错"什么都证明不了，必须真机跑出「挂起 → 清扫 → 重投到达」。
-
-场景（``consume_timeout=1``，清扫周期与阈值都是 1 分钟；Java 的过期判据是**严格大于**，
-所以清扫会在第二个 tick 命中，约 start+120s）：
-  A1 基线：1 队列 topic 投 1 条；listener 第一次拿到就挂住（不返回），客户端登记里能看到
-     这条消息在途、reconsumeTimes=0。
-  A2 清扫命中（**核心判据**）：listener 仍然挂着的同时，轮询在途登记 —— 一旦这条消息从
-     登记里消失（且 listener 还没放行），说明清扫线程把它回投并摘除了。距今必须 ≥60s，
-     否则说明是别的路径动的手。少了清扫，这里会一直等到超时。
-  A3 重投真的到了 broker 侧：清扫后 ≤40s 内，%RETRY% 队列的本地缓冲里必须出现这条消息
-     （拉取循环是每队列独立的，不受挂住的消费线程影响）——证明是真回投，不是本地假装。
-  A4 放行后被重新消费：恢复到第二次投递，reconsumeTimes=1（broker 侧的重投计数），
-     同一条 body 从头到尾**只到两次**（清扫一次回投，没有重复投递）。
-  A5 位点收尾：挂住的 listener 返回 CONSUME_SUCCESS 后，业务队列已提交位点走到 1
-     （Java removeMessage 的列表仍含这条已被清扫的消息）。
-
-已知副作用：``consume_timeout=1`` 会让 RT 判据（Java :387）把这次 120s+ 的消费记为
-TIME_OUT —— 与本用例无关，Java 同样如此。
-
-⚠ 本用例要跑约 4 分钟（等两个清扫周期）；负向对照：把 ``_start_clean_expire_loop()``
-的调用注释掉重跑 → 真机实测 ``PASS=6 FAIL=6``（A2 的第一条、A3、A4 四条全红；
-仍绿的是不依赖清扫的 A0/A1×3/A5 与 A2 的「收走时刻 >60s」——它只测挂起时长，
-清单详见 README 表格）。
-"""
 from __future__ import annotations
 
 import sys
@@ -154,7 +121,7 @@ def main() -> int:
     c = DefaultMQPushConsumer(group)
     c.set_namesrv_addr(NAMESRV)
     c.set_message_listener(listener)
-    c.consume_timeout = 1          # 清扫周期与阈值都变成 1 分钟（Java 同字段同语义）
+    c.consume_timeout = 1
     c.subscribe(topic, "*")
     body = b"ce-1"
     c.start()

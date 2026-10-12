@@ -229,7 +229,6 @@ async fn main() -> ExitCode {
         .resume_check_half_message(&master, &topic_a, "0A0F0000000000000000000000000000000000")
         .await
     {
-        // Java 语义：非半消息 → broker 拒绝（SYSTEM_ERROR）→ 返回 False 而非报错
         Ok(false) => ck.check("恢复半消息(323) 非半消息返回 false 而非报错", true, ""),
         Ok(true) => ck.check(
             "恢复半消息(323) 非半消息返回 false 而非报错",

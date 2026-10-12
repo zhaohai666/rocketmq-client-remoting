@@ -148,7 +148,6 @@ def test_invoke_async_timeout_fires_once_with_error():
         calls = []
         client.invoke_async(server.addr, req,
                             lambda resp, err: calls.append((resp, err)), 300)
-        # 清理线程与 Java scanResponseTable 同式：deadline + 1s 宽限才判超时
         assert _wait_until(lambda: len(calls) == 1), "超时后回调没有触发"
         resp, err = calls[0]
         assert resp is None

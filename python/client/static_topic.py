@@ -1,24 +1,3 @@
-"""静态主题（单元化主题）消费者侧路由支持，移植自 Java 客户端：
-
-- ``org.apache.rocketmq.remoting.rpc.ClientMetadata
-  .topicRouteData2EndpointsForStaticTopic``
-- ``org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingUtils
-  .getMockBrokerName``
-- ``org.apache.rocketmq.client.impl.factory.MQClientInstance
-  .getBrokerNameFromMessageQueue``（见 ``client/mq_client.py`` 同名方法）
-
-wire 事实（不得"简化"）：
-
-- 路由解码侧把 ``topicQueueMappingByBroker`` 保持为不透明的
-  ``Dict[brokerName, dict]``；**类型化视图在这里解析**，不动协议层透传。
-- ``TopicQueueMappingInfo.scope`` 缺省为 ``MixAll.METADATA_SCOPE_GLOBAL``
-  （``__global__``）；global scope 的 mock broker 名会剥掉开头两个下划线
-  （``__syslo__global__``）。
-- Java 的 ``maxTotalNumOfEpoch`` 读了但从不赋值（恒 -1），所以
-  ``epoch >= maxTotalNumOfEpoch`` 守卫恒真，``maxTotalNums`` 就是该 scope 的
-  ``totalQueues`` 最大值 —— 这个 quirk 照抄。
-- 同 epoch 的后到条目**覆盖**先到条目（Java ``oldEpoch <= epoch``）。
-"""
 
 from __future__ import annotations
 
@@ -35,7 +14,7 @@ LOGICAL_QUEUE_MOCK_NOT_EXIST = "__syslo__none__"
 
 
 def is_logical_queue_mock_broker_name(broker_name: str) -> bool:
-    """Java ``MixAll::isLogicalQueueMockBrokerName``（前缀判断）。"""
+    pass
     return broker_name.startswith(LOGICAL_QUEUE_MOCK_BROKER_PREFIX)
 
 
@@ -48,8 +27,7 @@ def get_mock_broker_name(scope: str) -> str:
 
 
 class TopicQueueMappingInfo:
-    """``topicQueueMappingByBroker[brokerName]`` 单条目的类型化视图
-    （Java ``TopicQueueMappingInfo``）。"""
+    pass
 
     __slots__ = ("scope", "total_queues", "bname", "epoch", "curr_id_map")
 
@@ -63,9 +41,7 @@ class TopicQueueMappingInfo:
 
 
 def parse_topic_queue_mapping_info(raw) -> Optional[TopicQueueMappingInfo]:
-    """从路由解码侧保留下来的原始 json 对象里解析类型化视图。
-    畸形条目丢弃（返回 ``None``）—— Java 遇到会 NPE；能抢救的部分映射
-    好过整个崩溃。"""
+    pass
     if not isinstance(raw, dict):
         return None
     info = TopicQueueMappingInfo()
@@ -103,7 +79,6 @@ def topic_route_data_2_endpoints_for_static_topic(
     if route is None or not route.topic_queue_mapping_by_broker:
         return None
 
-    # 按 scope 分组（Java 里没有 scope 的条目不参与，同此）。
     infos_by_scope: Dict[str, Dict[str, TopicQueueMappingInfo]] = {}
     for broker, raw in route.topic_queue_mapping_by_broker.items():
         info = parse_topic_queue_mapping_info(raw)
@@ -113,14 +88,10 @@ def topic_route_data_2_endpoints_for_static_topic(
 
     endpoints: Dict[MessageQueue, str] = {}
     for scope, infos in infos_by_scope.items():
-        # 先按 broker 名排序，再做稳定的 epoch 降序排序。Java 对
-        # ConcurrentHashMap 的 entrySet 做 epoch 降序排序，同 epoch 的覆盖顺序本就
-        # 未定义；钉死 broker 升序让结果可复现。
         ordered = sorted(infos.items(), key=lambda kv: kv[0])
         ordered.sort(key=lambda kv: kv[1].epoch, reverse=True)
 
         max_total_nums = 0
-        # Java 从不更新 max_total_num_of_epoch —— 守卫恒真，照抄。
         max_total_num_of_epoch = -1
         mock_name = get_mock_broker_name(scope)
         mq_end_points: Dict[MessageQueue, TopicQueueMappingInfo] = {}

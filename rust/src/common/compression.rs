@@ -1,13 +1,3 @@
-//! 消息体压缩（对应 Java `org.apache.rocketmq.common.compression.{Zlib,Lz4,Zstd}Compressor`
-//! 与 `CompressorFactory`，参考实现
-//! `python/common/message_decoder.py` 的 `_compress/_decompress`）。
-//!
-//! - ZLIB：Python `zlib.compress(data, level)` = RFC1950 zlib 流；Java 是
-//!   `new Deflater(level)` + `DeflaterOutputStream`，同一封装。
-//! - LZ4：两边都是 **LZ4 Frame** 格式（Java `LZ4FrameOutputStream`，Python
-//!   `lz4.frame`，Rust `lz4_flex::frame`），帧是自描述的，三端互通。
-//! - ZSTD：Java `ZstdOutputStream`，Rust `zstd` crate 的 frame 编解码。
-//!
 //! 未支持的压缩类型**必须报错**，不能原样透传：调用方解压后会清掉
 //! `COMPRESSED_FLAG`，透传等于把压缩字节流当正文交出去且事后无法识别。
 
@@ -16,16 +6,10 @@ use std::io::{Read as IoRead, Write as IoWrite};
 use crate::common::sysflag::MessageSysFlag;
 use crate::error::{Error, Result};
 
-/// 对应 Java `MessageDecoder#encode` 里硬编码的 `compressor.compress(body, 5)`
-/// 与 Python `_compress(..., level = 5)`。
 pub const DEFAULT_COMPRESS_LEVEL: i32 = 5;
 
-/// Python `zstandard.ZstdCompressor()` 的默认级别（Java 侧则由调用方传入 level）。
 pub const ZSTD_DEFAULT_LEVEL: i32 = 3;
 
-/// 对应 Java `CompressionType.findByValue` 的向后兼容映射：
-/// `1 -> LZ4`、`2 -> ZSTD`、`0`（老版本没有类型位）与 `3 -> ZLIB`。
-///
 /// 0 必须映射到 ZLIB：老客户端产的压缩消息类型位就是 0，不映射的话解压会失败，
 /// 而外层照样清掉 `COMPRESSED_FLAG`，结果就是静默返回压缩字节流。
 pub fn normalize_compression_type(compression_type: i32) -> i32 {
@@ -36,10 +20,6 @@ pub fn normalize_compression_type(compression_type: i32) -> i32 {
     }
 }
 
-/// 对应 Java `CompressionType.findByValue(int)`：未知值直接报错
-/// （Java 抛 `RuntimeException("Unknown compress type value: ...")`，这里以
-/// [`Error::Encode`] 表达同一语义），已知值归一成规范的算法号（0 → ZLIB）。
-///
 /// 给「配置落盘前」的入口用（如 [`crate::client::producer::DefaultMQProducer::set_compress_type`]）：
 /// 宁可在 set 时拒绝，也不要等到发送时才发现算法不认识（旧版是发送阶段静默降级不压缩，
 /// 用户拿不到任何信号）。
@@ -54,7 +34,6 @@ pub fn validate_compression_type(compression_type: i32) -> Result<i32> {
     }
 }
 
-/// 算法名，仅日志/报错用（对应 Java `CompressionType.name()`）。
 pub fn compression_type_name(compression_type: i32) -> Option<&'static str> {
     match normalize_compression_type(compression_type) {
         MessageSysFlag::LZ4_TYPE => Some("LZ4"),
@@ -64,19 +43,10 @@ pub fn compression_type_name(compression_type: i32) -> Option<&'static str> {
     }
 }
 
-/// 对应 Java `CompressorFactory.getCompressor` 对未知类型返回 null（调用方 NPE）
-/// 与 `CompressionType.findByValue` 的 `RuntimeException`；Python 抛
-/// `RuntimeError("unsupported compression type: %d")`。
 fn unsupported(compression_type: i32) -> Error {
     Error::Decode(format!("unsupported compression type: {compression_type}"))
 }
 
-/// 对应 Java `Compressor#compress(byte[], int level)` / Python `_compress`。
-///
-/// 与 Python 一致：`level` **只作用于 ZLIB**（`zlib.compress(data, level)`），
-/// LZ4 与 ZSTD 用各自默认参数。
-/// ⚠ Java 会把 level 透传给 `ZstdOutputStream`，ZSTD 的压缩级别因此可能与 Python 不同
-/// （LZ4 两边都忽略 level）。
 pub fn compress(data: &[u8], compression_type: i32, level: i32) -> Result<Vec<u8>> {
     match normalize_compression_type(compression_type) {
         MessageSysFlag::ZLIB_TYPE => zlib_compress(data, level),
@@ -86,7 +56,6 @@ pub fn compress(data: &[u8], compression_type: i32, level: i32) -> Result<Vec<u8
     }
 }
 
-/// 对应 Java `Compressor#decompress(byte[])` / Python `_decompress`。
 pub fn decompress(data: &[u8], compression_type: i32) -> Result<Vec<u8>> {
     match normalize_compression_type(compression_type) {
         MessageSysFlag::ZLIB_TYPE => zlib_decompress(data),
@@ -97,16 +66,10 @@ pub fn decompress(data: &[u8], compression_type: i32) -> Result<Vec<u8>> {
 }
 
 /// 对应 Python `decompress_body`：`decompress` 的公开入口。
-///
-/// 除消息解码路径外还有第二个调用方：Request-Reply 的应答是从
-/// `PUSH_REPLY_MESSAGE_TO_CLIENT(326)` 直接推过来的裸包，不走消息解码，
-/// 需要自己按 `sysFlag` 判断并解压（对齐 Java
-/// `ClientRemotingProcessor#receiveReplyMessage`）。
 pub fn decompress_body(data: &[u8], compression_type: i32) -> Result<Vec<u8>> {
     decompress(data, compression_type)
 }
 
-/// 对应 Java `ZlibCompressor`（`Deflater(level)` + `DeflaterOutputStream`）。
 pub fn zlib_compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
     if !(0..=9).contains(&level) {
         return Err(Error::Encode(format!("invalid zlib level: {level}")));
@@ -119,7 +82,6 @@ pub fn zlib_compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// 对应 Java `ZlibCompressor#decompress`（`InflaterInputStream`）。
 pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = flate2::read::ZlibDecoder::new(data);
     let mut out = Vec::new();
@@ -127,11 +89,9 @@ pub fn zlib_decompress(data: &[u8]) -> Result<Vec<u8>> {
         Ok(_) => return Ok(out),
         Err(e) => e,
     };
-    // Java 截断流时抛 IOException，这里同样报错（绝不返回半截数据）
     Err(Error::Decode(format!("zlib decompress failed: {err}")))
 }
 
-/// 对应 Java `Lz4Compressor`（`LZ4FrameOutputStream` 默认参数）。
 pub fn lz4_compress(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
     encoder
@@ -142,7 +102,6 @@ pub fn lz4_compress(data: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| Error::Encode(format!("lz4 compress failed: {e}")))
 }
 
-/// 对应 Java `Lz4Compressor#decompress`（`LZ4FrameInputStream`）。
 pub fn lz4_decompress(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = lz4_flex::frame::FrameDecoder::new(data);
     let mut out = Vec::new();
@@ -152,15 +111,10 @@ pub fn lz4_decompress(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// 对应 Java `ZstdCompressor`（`ZstdOutputStream(stream, level)`）。
 pub fn zstd_compress(data: &[u8], level: i32) -> Result<Vec<u8>> {
     zstd::encode_all(data, level).map_err(|e| Error::Encode(format!("zstd compress failed: {e}")))
 }
 
-/// 对应 Java `ZstdCompressor#decompress`（`ZstdInputStream`）。
-///
-/// 帧里没写 content-size 时也能解（Java `ZstdInputStream` 同语义，
-/// Python 为此特意改用 stream_reader）。
 pub fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>> {
     zstd::decode_all(data).map_err(|e| Error::Decode(format!("zstd decompress failed: {e}")))
 }
@@ -191,7 +145,6 @@ mod tests {
     const ZSTD_WITH_SIZE_HEX: &str = "28b52ffd646003250100e0726f636b65746d712d636f6d70726573736564\
                                       2d7061796c6f61642d010004f1ff740278aa9792";
 
-    /// `zstd -3` CLI 产出：不带 content-size 的帧（49B，Java zstd-jni 默认写法）。
     const ZSTD_NO_SIZE_HEX: &str = "28b52ffd0408250100e0726f636b65746d712d636f6d707265737365642d70\
                                     61796c6f61642d010004f1ff740278aa9792";
 
@@ -201,7 +154,6 @@ mod tests {
 
     #[test]
     fn compression_type_mapping() {
-        // Java CompressionType.findByValue
         assert_eq!(normalize_compression_type(0), MessageSysFlag::ZLIB_TYPE);
         assert_eq!(normalize_compression_type(3), MessageSysFlag::ZLIB_TYPE);
         assert_eq!(normalize_compression_type(1), MessageSysFlag::LZ4_TYPE);
@@ -214,7 +166,6 @@ mod tests {
         assert_eq!(ZSTD_DEFAULT_LEVEL, 3);
     }
 
-    /// Java `CompressionType.findByValue` 的 set 时校验：已知值归一，未知值报错。
     #[test]
     fn validate_compression_type_mirrors_find_by_value() {
         assert_eq!(
@@ -233,7 +184,6 @@ mod tests {
             validate_compression_type(2).unwrap(),
             MessageSysFlag::ZSTD_TYPE
         );
-        // Java 抛 RuntimeException("Unknown compress type value: 9")
         let err = validate_compression_type(9).unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -334,7 +284,6 @@ mod tests {
 
     #[test]
     fn unsupported_type_fails_loudly() {
-        // SNAPPY(4) 以及 5/6/7 在 Java 里 findByValue 直接抛 RuntimeException
         for ctype in [4, 5, 6, 7] {
             let err = compress(&payload(), ctype, 5).unwrap_err();
             assert!(

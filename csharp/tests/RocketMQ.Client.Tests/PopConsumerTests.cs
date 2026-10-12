@@ -4,13 +4,6 @@
 // 语义，而且错得**很安静** —— 比如 ackIndex 默认值不对，CONSUME_SUCCESS 会一条都不 ack，
 // 消息在 invisibleTime 到期后被 broker 复活重投；如果观测窗口比 invisibleTime 短，
 // 真机看起来还是"全过"。所以能离线锁的必须先锁死。
-//
-// 覆盖：
-//   - PopProcessQueue 计数与 dropped 语义
-//   - POP_CK → (topic, brokerName, queueId, offset) 的还原，含 retry topic 反解
-//   - isPopTimeout 判定
-//   - 默认值与 Java 对齐（关掉时走原路径、poll < timeout、batchNums ≤ 32）
-//   - 延迟档位表（单位秒）
 
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -57,7 +50,6 @@ public class PopConsumerTests
         pq.Ack();
         pq.Ack();
         Assert.Equal(1, pq.WaitAckCount());
-        // Java 传负数（decFoundMsg(-size)），这里按"减多少"理解
         pq.DecFoundMsg(-1);
         Assert.Equal(0, pq.WaitAckCount());
     }
@@ -84,7 +76,6 @@ public class PopConsumerTests
     public void PopDefaultsMatchLegacy()
     {
         var c = new DefaultMQPushConsumer(Group);
-        // Java popInvisibleTime=60000 / popBatchNums=32 / popThresholdForQueue=96
         Assert.Equal(60000, c.PopInvisibleTime);
         Assert.Equal(32, c.PopBatchNums);
         Assert.Equal(96, c.PopThresholdForQueue);
@@ -178,7 +169,6 @@ public class PopConsumerTests
     [Fact]
     public void UnparsableCkCountsAsTimeout()
     {
-        // Java isPopTimeout：解析不出 popTime/invisibleTime 就按超时处理
         Assert.True(DefaultMQPushConsumer.IsPopTimeout(0, 0));
         Assert.True(DefaultMQPushConsumer.IsPopTimeout(0, 60000));
         Assert.True(DefaultMQPushConsumer.IsPopTimeout(1000, 0));
@@ -193,11 +183,6 @@ public class PopConsumerTests
     }
 
     // ------------------------------------------------- POP 循环的 pullRT/pullTPS
-    //
-    // Java popMessage 的 PopCallback.onSuccess:556-563 有一处不对称：RT 在 FOUND 分支
-    // **判空之前**就记，TPS 只按真正弹到的条数记。漏记或记反方向都是静默故障 ——
-    // 消息照弹照 ack、消费完全正常，只有 307 的 statusTable（运维看板）一片 0，
-    // 而看板上"这个消费者没在拉取"和"压根没起来"是两种完全不同的处置。
 
     private static PopResult Popped(int n)
     {
@@ -231,7 +216,6 @@ public class PopConsumerTests
     [Fact]
     public void RecordPopPullStats_FoundWithEmptyListRecordsRtOnly()
     {
-        // Java 在判空**之前**记 RT：FOUND 但 0 条也是"这一次确实拉了一回"
         var stats = new ConsumerStatsManager();
         string key = Topic + "@" + Group;
         long began = UtilAll.CurrentTimeMillis() - 30;

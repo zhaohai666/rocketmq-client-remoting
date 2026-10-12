@@ -1,21 +1,3 @@
-// 静态主题（单元化主题）消费者侧路由支持，移植自 Java 客户端：
-//   - org.apache.rocketmq.remoting.rpc.ClientMetadata
-//     .topicRouteData2EndpointsForStaticTopic
-//   - org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingUtils
-//     .getMockBrokerName
-//   - org.apache.rocketmq.client.impl.factory.MQClientInstance
-//     .getBrokerNameFromMessageQueue（见 MqClient 同名方法）
-//
-// wire 事实（不得"简化"）：
-//   - 路由解码侧把 TopicQueueMappingByBroker 保持为不透明 JsonValue；类型化视图
-//     在这里解析，不动协议层透传。
-//   - TopicQueueMappingInfo.scope 缺省为 MixAll.METADATA_SCOPE_GLOBAL
-//     （"__global__"）；global scope 的 mock broker 名会剥掉开头两个下划线
-//     （"__syslo__global__"）。
-//   - Java 的 maxTotalNumOfEpoch 读了但从不赋值（恒 -1），所以
-//     epoch >= maxTotalNumOfEpoch 守卫恒真，maxTotalNums 就是该 scope 的
-//     totalQueues 最大值 —— 这个 quirk 照抄。
-//   - 同 epoch 的后到条目覆盖先到条目（Java `oldEpoch <= epoch`）。
 using System.Globalization;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -32,7 +14,6 @@ public static class StaticTopic
     public const string LogicalQueueMockBrokerPrefix = "__syslo__";
     public const string LogicalQueueMockNotExist = "__syslo__none__";
 
-    /// <summary>Java MixAll::isLogicalQueueMockBrokerName（前缀判断）。</summary>
     public static bool IsLogicalQueueMockBrokerName(string brokerName) =>
         brokerName.StartsWith(LogicalQueueMockBrokerPrefix, StringComparison.Ordinal);
 
@@ -49,8 +30,6 @@ public static class StaticTopic
         return LogicalQueueMockBrokerPrefix + scope;
     }
 
-    /// <summary>topicQueueMappingByBroker[brokerName] 单条目的类型化视图
-    /// （Java TopicQueueMappingInfo）。</summary>
     public sealed class TopicQueueMappingInfo
     {
         public string Scope = MetadataScopeGlobal;
@@ -61,10 +40,6 @@ public static class StaticTopic
         public readonly SortedDictionary<int, int> CurrIdMap = new();
     }
 
-    /// <summary>
-    /// 从路由解码侧保留下来的原始 json 对象里解析类型化视图。
-    /// 畸形条目返回 false —— Java 遇到会 NPE；能抢救的部分映射好过整个崩溃。
-    /// </summary>
     public static bool ParseTopicQueueMappingInfo(JsonValue raw,
         [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TopicQueueMappingInfo? info)
     {
@@ -129,7 +104,6 @@ public static class StaticTopic
             return false;
         }
 
-        // 按 scope 分组（Java 里没有 scope 的条目不参与，同此）。
         var infosByScope = new Dictionary<string, List<KeyValuePair<string, TopicQueueMappingInfo>>>(
             StringComparer.Ordinal);
         foreach (var entry in route.TopicQueueMappingByBroker.ObjectItems())
@@ -153,14 +127,10 @@ public static class StaticTopic
         {
             string scope = scopeEntry.Key;
             List<KeyValuePair<string, TopicQueueMappingInfo>> infos = scopeEntry.Value;
-            // 先按 broker 名排序，再做稳定的 epoch 降序排序。Java 对
-            // ConcurrentHashMap 的 entrySet 做 epoch 降序排序，同 epoch 的覆盖顺序本就
-            // 未定义；钉死 broker 升序让结果可复现。
             infos.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
             infos.Sort((a, b) => b.Value.Epoch.CompareTo(a.Value.Epoch));
 
             int maxTotalNums = 0;
-            // Java 从不更新 maxTotalNumOfEpoch —— 守卫恒真，照抄。
             const long maxTotalNumOfEpoch = -1;
             string mockName = GetMockBrokerName(scope);
             var mqEndPoints = new Dictionary<MessageQueue, (long Epoch, string Bname)>();

@@ -1,17 +1,4 @@
 // SEARCH_OFFSET_BY_TIMESTAMP(29) 的 boundaryType 字段（离线，无真实集群）。
-//
-// 镜像 python/tests/test_search_offset_boundary.py 与 C++ test_admin.cpp 的
-// testSearchOffsetRequestHeaderBoundaryType。Java 锚点（5.5.1 逐条核对）：
-//   * SearchOffsetRequestHeader:41 private BoundaryType boundaryType —— @CFNullable，
-//     不 set 就为 null；getBoundaryType():85 在 null 时回落 LOWER。
-//   * RemotingCommand.makeCustomHeaderToNet:430 fieldsMap.put(name, value.toString())
-//     ⇒ 枚举入网走 Enum.toString() = **大写枚举名** LOWER/UPPER（BoundaryType.getName()
-//     那个小写名 :33 只喂给 getType，不上报文）；值为 null 的字段**整键不写**。
-//   * MQClientAPIImpl#searchOffset(addr, mq, ts, timeout):1377 直接转 ...LOWER...:1381
-//     —— MQ 级入口一定带 LOWER；真正不带字段的只有已废弃的 5 参重载 :1352。
-//   * DefaultMQAdminExt:133/:137 对外给的是 searchLowerBoundaryOffset /
-//     searchUpperBoundaryOffset 两个方法名。
-//   * broker 侧解析：只有 equalsIgnoreCase("upper") 才是 UPPER，其余一律 LOWER。
 using System.Collections.Generic;
 using RocketMQ.Client;
 using RocketMQ.Common;
@@ -44,12 +31,6 @@ public class SearchOffsetBoundaryTests
 
     // ---------------------------------------------------------------- 报文形状
 
-    /// <summary>
-    /// 入网文本必须是 Enum.toString() 的大写枚举名。Java 的 BoundaryType 有
-    /// getName()（"lower"/"upper"）与枚举名两套写法，报文里出现哪一套 broker 都认
-    /// （getType 大小写不敏感），但对拍 Java 客户端时必须是大写名 —— 这条断言就是
-    /// 防止有人"顺手"写成小写。
-    /// </summary>
     [Fact]
     public void WireValueIsTheLegacyEnumNameNotTheLowercaseName()
     {
@@ -151,7 +132,6 @@ public class SearchOffsetBoundaryTests
         }
     }
 
-    /// <summary>Java 已废弃的 5 参重载 :1352 是唯一"不写字段"的路径，保留以对齐报文。</summary>
     [Fact]
     public void NullBoundaryKeepsTheFieldOffTheWire()
     {
@@ -171,7 +151,6 @@ public class SearchOffsetBoundaryTests
         }
     }
 
-    /// <summary>Java DefaultMQAdminExt:133/:137 的两个方法各自固定 LOWER / UPPER。</summary>
     [Fact]
     public void AdminExposesLegacyBoundaryMethodNames()
     {

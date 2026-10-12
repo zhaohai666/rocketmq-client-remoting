@@ -1,6 +1,3 @@
-// Route bean tests: Java-format decode (fastjson2 numeric-string broker ids),
-// master requirements of the two queue assemblies, route-change detection
-// exclusions and the publish-info ring cursor.
 package client
 
 import (
@@ -137,7 +134,6 @@ func TestTopicRouteDataChanged(t *testing.T) {
 	if sysFlip.TopicRouteDataChanged(old) {
 		t.Errorf("topicSysFlag flip must not look like a route change")
 	}
-	// zoneName / enableActingMaster are excluded (Java BrokerData.equals).
 	zoneMove := mustRoute(t, recordedRouteBody)
 	zoneMove.BrokerDatas[0].ZoneName = "zone-2"
 	if zoneMove.TopicRouteDataChanged(old) {
@@ -190,7 +186,6 @@ func TestTopicPublishInfoRing(t *testing.T) {
 			t.Errorf("select %d: queueId=%d want %d", i, mq.QueueID, want)
 		}
 	}
-	// The negative ringIndex (Java nextAddrAndIncrement overflow path).
 	info.ResetIndex()
 	mq, ok, err := info.SelectOneMessageQueue([]QueueFilter{
 		func(q *common.MessageQueue) bool { return q.BrokerName == "b1" },

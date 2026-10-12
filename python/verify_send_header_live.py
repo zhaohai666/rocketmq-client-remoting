@@ -1,28 +1,4 @@
 # -*- coding: utf-8 -*-
-"""发送头三个字段（``defaultTopic`` / ``defaultTopicQueueNums`` / ``brokerName``）真机验证。
-
-离线单测（``tests/test_send_header_fields.py``）锁的是**上线形状**：V2 头的单字母键
-``c`` / ``d`` / ``n`` 有没有真的写进 extFields、五种发送入口是不是带同一份值。但「字段
-上了线」和「broker 真拿它做了决定」是两件事，后者只有真集群能证：
-
-  H1  默认值：不带任何配置发到新 topic，broker 按 ``min(d=4, TBW102.writeQueueNums)``
-      建出队列数（``TopicConfigManager:289``），与 Java 客户端默认行为一致。
-  H2  ``set_default_topic_queue_nums(2)`` 真的生效：建出来的 topic 只有 2 条队列。
-      修之前写死 4，这条必然变成 4 —— 这是那个假 setter 唯一可观测的后果。
-  H3  ``set_create_topic_key(src)`` 真的生效：先建一个带 PERM_INHERIT、3 条队列的模板
-      topic，再以它为 ``c`` 发送 → 新 topic 继承模板的 3 条队列（而不是 TBW102 的）。
-      ``c`` 被写死时这里是 TBW102 的队列数，与 3 必然不同（H0 会先把这个前提断言掉）。
-  H4  补上这三个字段之后，五种发送入口（同步 / 定点 / 批量 320 / 单向 / 异步）在真 broker
-      上仍然逐条落地，条数一条不差。
-  H5  ``n``（brokerName）：落点就是路由选中的那台 broker 名，且带 ``n`` 的请求 broker
-      照单全收。⚠ 经典 broker 的发送链路里**没有** ``requestHeader.getBrokerName()``
-      的读者（5.5.1 源码 grep 过），所以 ``n`` 的线上存在只能由离线抓帧证明，
-      这里不假装能观测到它。
-
-前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
-
-用法：.venv/bin/python verify_send_header_live.py [127.0.0.1:9876]
-"""
 from __future__ import annotations
 
 import os

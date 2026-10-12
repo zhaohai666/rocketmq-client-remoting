@@ -1,21 +1,3 @@
-// 消息轨迹（对应 org.apache.rocketmq.client.trace 包 + client.AccessChannel）。
-//
-// 包含：
-//   * ``TraceConstants``     —— 常量（org.apache.rocketmq.client.trace.TraceConstants）
-//   * ``TraceType``          —— Pub / Recall / SubBefore / SubAfter / EndTransaction
-//   * ``AccessChannel``      —— LOCAL / CLOUD（org.apache.rocketmq.client.AccessChannel）
-//   * ``TraceBean``          —— 轨迹里被追踪的那条消息
-//   * ``TraceContext``       —— 一次追踪上下文（Pub/SubBefore/... 各一份）
-//   * ``TraceTransferBean``  —— 编码结果：trans_data + trans_key
-//   * ``TraceDataEncoder``   —— 文本编解码（与 Java 逐字节一致）
-//
-// ⚠ 两个必须保留的 Java 语义差异（否则编解码对不上）：
-//   1. CONTENT_SPLITOR = \x01、FIELD_SPLITOR = \x02，
-//      编码时**每条记录末尾补 FIELD_SPLITOR**；解码用 Java 的 String.split
-//      语义（**丢弃末尾空串**）切分 —— 见 ``TraceDataEncoder::javaSplit``。
-//   2. C++ 的 split/istream 实现很容易漏掉"丢弃末尾空串"，一旦漏掉就会多出一个空段、
-//      把字段整体错位。本模块一律走 ``javaSplit``，且对缺段做了安全取值（避免越界
-//      导致整条 trace data 解码失败）。
 #ifndef ROCKETMQ_CLIENT_TRACE_H
 #define ROCKETMQ_CLIENT_TRACE_H
 
@@ -55,7 +37,6 @@ struct TraceConstants {
     static constexpr const char* ROCKETMQ_IS_FROM_TRANSACTION_CHECK = "rocketmq.is_from_transaction_check";
     static constexpr const char* ROCKETMQ_RETRY_TIMERS = "rocketmq.retry_times";
 
-    // 与 JVM/Python 侧共享的全局常量
     static constexpr const char* DEFAULT_TRACE_REGION_ID = "DefaultRegion";
     static constexpr const char* KEY_SEPARATOR = " ";
     static constexpr const char* PROPERTY_MSG_REGION = "MSG_REGION";
@@ -84,7 +65,6 @@ inline const char* traceTypeName(TraceType t) {
     return "";
 }
 
-// 由第 1 段字符串解析（对应 Java 的 "Pub".equals(...) 判定）。
 inline TraceType traceTypeFromName(const std::string& name) {
     if (name == "Pub") return TraceType::PUB;
     if (name == "Recall") return TraceType::RECALL;
@@ -105,8 +85,6 @@ inline const char* accessChannelName(AccessChannel c) {
     return c == AccessChannel::CLOUD ? "CLOUD" : "LOCAL";
 }
 
-// 消息类型 ordinal（与 Java MessageType 严格一致：Normal=0, Trans=1, TransCommit=2,
-// Delay=3, Order=4）。TraceBean 直接存 int，编码时 std::to_string。
 enum class TraceMessageType {
     NORMAL = 0,
     TRANS = 1,
@@ -164,15 +142,10 @@ struct TraceTransferBean {
 // ---------------------------------------------------------------- 编解码
 class TraceDataEncoder {
 public:
-    // 复刻 Java String.split：**丢弃末尾的空串**（C++ 原生 split 不会丢弃，必须专门实现）。
     static std::vector<std::string> javaSplit(const std::string& value, const std::string& sep);
 
-    // 把 TraceContext 编成可发送的文本（对应 Java encoderFromContextBean）。
-    // 返回 nullopt 表示 ctx 为空（对应 Java 的 null 短路）。
     static std::optional<TraceTransferBean> encoderFromContextBean(const TraceContext* ctx);
 
-    // 把线上轨迹文本解回 TraceContext 列表（对应 Java decoderFromTraceDataString）。
-    // 单条记录解码失败时只跳过该条并记 warning，不会让整条 trace data 解码失败。
     static std::vector<TraceContext> decoderFromTraceDataString(const std::string& traceData);
 };
 

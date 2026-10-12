@@ -1,20 +1,4 @@
 # -*- coding: utf-8 -*-
-"""POP **消费侧**（DefaultMQPushConsumer.pop_mode）本地单测，不需要集群。
-
-为什么单独一个文件：协议管道（`test_pop.py`）过了 ≠ 消费循环对。消费侧有自己一套
-容易错的语义，而且错得**很安静** —— 比如 ackIndex 默认值不对，CONSUME_SUCCESS 会
-一条都不 ack，消息在 invisibleTime 到期后被 broker 复活重投；如果观测窗口比
-invisibleTime 短，真机看起来还是"全过"。所以这些必须离线锁死。
-
-覆盖：
-  - PopProcessQueue 计数与 dropped 语义
-  - ackIndex 语义（全 ack / 部分 ack / RECONSUME_LATER 不 ack）
-  - POP_CK → (topic, brokerName, queueId, offset) 的还原，含 retry topic 反解
-  - 延迟档位选择（Java checkNeedAckOrDelay / changePopInvisibleTime）
-  - isPopTimeout 判定
-  - 切批（consume_message_batch_max_size）
-  - POP 循环的 pullRT/pullTPS 上报（`consumerRunningInfo` 的唯一数据来源）
-"""
 from __future__ import annotations
 
 import threading
@@ -90,7 +74,6 @@ class TestDefaults:
 
     def test_pop_defaults_match_the_protocol_defaults(self):
         c = DefaultMQPushConsumer(GROUP)
-        # Java popInvisibleTime=60000 / popBatchNums=32 / popThresholdForQueue=96
         assert c.pop_invisible_time == 60000
         assert c.pop_batch_nums == 32
         assert c.pop_threshold_for_queue == 96
@@ -102,7 +85,6 @@ class TestDefaults:
         assert c.pop_poll_time_millis < c.pop_timeout_millis
 
     def test_delay_level_starts_at_10s(self):
-        # Java POP_DELAY_LEVEL 首档 10s（send 的延迟档位首档是 1s，别混）
         assert POP_DELAY_LEVEL[0] == 10
         assert list(POP_DELAY_LEVEL) == sorted(POP_DELAY_LEVEL)
 
@@ -125,7 +107,7 @@ class TestPopProcessQueue:
         assert pq.wait_ack_count() == 1
 
     def test_dec_found_msg_takes_a_negative_invisible_time(self):
-        """Java 是 decFoundMsg(-msgs.size())，这里按"减多少"理解。"""
+        pass
         pq = PopProcessQueue()
         pq.inc_found_msg(5)
         pq.dec_found_msg(-5)
@@ -143,11 +125,7 @@ class TestPopProcessQueue:
 
 class TestProcessPopConsumeResult:
     def test_success_acks_everything(self):
-        """回归守卫：Java ackIndex 默认 Integer.MAX_VALUE = 全 ack。
-
-        本项目 ConsumeConcurrentlyContext 默认 -1（push 回投语义），POP 路径若不改成
-        size-1，这里会一条都不 ack —— 真机上表现为 invisibleTime 后整批复活重投。
-        """
+        pass
         c = consumer()
         rec = Recording(c)
         msgs = [msg(queue_offset=i, pop_ck=ck(queue_id=0, offset=100 + i))
@@ -155,7 +133,7 @@ class TestProcessPopConsumeResult:
         pq = PopProcessQueue()
         pq.inc_found_msg(3)
         ctx = ConsumeConcurrentlyContext()
-        ctx.ack_index = len(msgs) - 1  # Java 默认 MAX_VALUE 钳到这里
+        ctx.ack_index = len(msgs) - 1
         c._process_pop_consume_result(ConsumeConcurrentlyStatus.CONSUME_SUCCESS,
                                       ctx, msgs, pq, None)
         assert len(rec.acked) == 3
@@ -301,8 +279,7 @@ class FakeClient:
         self.acks = []
 
     def pop_ack_addr(self, broker_name, topic, queue_id):
-        """POP 的 ack/改不可见时间也走「按 brokerName 只查主」那条（Java ackAsync）；
-        静态主题 mock 名在此经端点表重写（Go popAckAddress 同形）。"""
+        pass
         return "127.0.0.1:10911"
 
     def change_invisible_time(self, group, topic, queue_id, extra_info, offset,
@@ -330,7 +307,7 @@ class TestDelayLevel:
         assert c._mq_client.invisible_ms == [(TOPIC, 9, 120 * 1000)]
 
     def test_level_zero_falls_back_to_reconsume_times(self):
-        """Java changePopInvisibleTime：0 == delayLevel → 用 msg.reconsumeTimes。"""
+        pass
         c = wired()
         c._change_pop_invisible_time(msg(pop_ck=ck(offset=1), reconsume_times=3), 0)
         # delayLevel 0 → reconsumeTimes=3 → POP_DELAY_LEVEL[3] = 120 秒
@@ -360,10 +337,7 @@ class TestDelayLevel:
         assert c._mq_client.invisible_ms == [(TOPIC, 5, 60 * 1000)]
 
     def test_check_need_ack_or_delay_very_fresh_message_never_negative(self):
-        """存活时间小于首档时 Java 会算出 delayLevel=-1 并 ArrayIndexOutOfBounds。
-
-        这里钳到首档（10s），是**有意偏离 Java**：不为了"对齐"而去索引 table[-1]。
-        """
+        pass
         c = wired()
         c._check_need_ack_or_delay(
             msg(pop_ck=ck(offset=6), born_timestamp=int(time.time() * 1000)))
@@ -382,7 +356,7 @@ class TestDelayLevel:
 
 class TestIsPopTimeout:
     def test_unparsable_ck_counts_as_timeout(self):
-        """Java isPopTimeout：解析不出 popTime/invisibleTime 就按超时处理。"""
+        pass
         assert DefaultMQPushConsumer._is_pop_timeout([msg()], 0, 0) is True
         assert DefaultMQPushConsumer._is_pop_timeout([msg()], 0, 60000) is True
         assert DefaultMQPushConsumer._is_pop_timeout([msg()], 1000, 0) is True
@@ -472,13 +446,7 @@ class TestTimeoutBatchDropped:
 
 
 class TestPopLoopPullStats:
-    """POP 循环要把 pullRT/pullTPS 记进状态表（Java `DefaultMQPushConsumerImpl.popMessage`
-    的 `PopCallback.onSuccess:556-563`）。
-
-    漏掉这两格是**静默**的：消息照弹、照消费、照 ack，功能上一点看不出来，只有
-    `consumerRunningInfo()` 的 PULL_RT/PULL_TPS 永远是 0 —— 控制台上"这个 POP 消费者
-    没有在拉取"和"这个消费者压根没起来"就分不开了，排障方向直接被带偏。
-    """
+    pass
 
     @staticmethod
     def _run_rounds(results):
@@ -527,7 +495,7 @@ class TestPopLoopPullStats:
         assert tps is not None and tps.times == 1 and tps.value == 2, "TPS 按弹到的条数记"
 
     def test_found_with_empty_list_records_rt_only(self):
-        """Java 在**判空之前**记 RT、只在非空时记 TPS：这个不对称是刻意的，别"顺手"对齐。"""
+        pass
         c, delivered = self._run_rounds([PopResult(PopStatus.FOUND, [])])
         assert delivered == []
         rt, tps = self._items(c)

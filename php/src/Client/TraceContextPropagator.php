@@ -7,23 +7,6 @@ namespace RocketMQ\Client;
 use RocketMQ\Common\Message;
 use RocketMQ\Common\MessageExt;
 
-/**
- * W3C Trace Context（traceparent）透传，移植自 trace_context.py。
- *
- * 格式（W3C Trace Context）：``traceparent: 00-<trace-id 32hex>-<parent-id 16hex>-<flags 2hex>``
- *
- * * trace-id / parent-id 不能全 0；version 00 时 flags 任意两位 hex；
- * * 生产侧：消息没有 traceparent 属性时注入一个根 span 上下文（opt-in，
- *   enableTraceContext=true）——键名沿用 W3C 的小写 traceparent；已有值**不覆盖**；
- * * 消费侧：从 MessageExt.properties 里取出，供业务做父子 span 关联。
- *
- * Python 侧是模块级函数（``trace_context.py``），这里落成静态方法（autoload 友好）。
- *
- * ⚠ 命名：Python 的实现方式没有「类」这一层，所以模块名 ``trace_context`` 直译会是
- * ``TraceContext``；但 PHP 无模块隔离，而 Java 的 ``org.apache.rocketmq.client.trace.TraceContext``
- * 已占用该名字（见 Trace.php，消息轨迹上下文）。因此这里改名为
- * ``TraceContextPropagator``（传播器），语义上更准确且与轨迹上下文区分。
- */
 final class TraceContextPropagator
 {
     /** W3C 键名（小写，与 OTel / HTTP 头一致） */

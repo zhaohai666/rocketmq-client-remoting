@@ -1,26 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""``ackIndex``（部分 ack）真机验证 —— 并发消费 classic 路径。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_ack_index_live.py 127.0.0.1:9876
-
-为什么单独一个脚本：Java ``ConsumeMessageConcurrentlyService#processConsumeResult:207-254``
-里，``ConsumeConcurrentlyContext.ackIndex``（默认 ``Integer.MAX_VALUE``）是 listener
-表达「这批我只认可到第几条」的唯一手段：认可前缀提交位点，其后的条目逐条
-``sendMessageBack`` 回投 ``%RETRY%``。本端口过去只在 POP 路径用它，classic 路径整段忽略 ——
-listener 设了 ackIndex 之后尾巴**既不回投、位点又照样越过**，是静默丢消息。
-「丢了几条」这种错必须看 broker：光看客户端收到的条数，全 ack 和过度回投都能伪装成通过。
-
-场景：
-  A1 对照组（默认整批认可）：3 条各投一次，位点提交到 3，没有任何回投。
-  A2 部分 ack（ackIndex=0）：首批 3 条只认可第 1 条 →
-     第 1 条整个窗口只投一次；后 2 条经 %RETRY% 二次到达（reconsumeTimes>=1、
-     topic 还原成业务 topic）；业务队列位点仍提交到 3；3 条最终全部被消费，无丢失。
-  A3 RECONSUME_LATER 压过 ackIndex：listener 设 ackIndex=2 却返回 RECONSUME_LATER
-     → 3 条全部重投（Java:222-226 强制 ackIndex=-1）。
-  A4 广播模式：ackIndex=0 时尾巴不回投（%RETRY% 上不出现它），本地整批前进。
-"""
 from __future__ import annotations
 
 import sys

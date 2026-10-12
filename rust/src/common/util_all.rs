@@ -1,4 +1,3 @@
-//! 通用工具（对应 `org.apache.rocketmq.common.UtilAll`）。
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::OnceLock;
@@ -22,16 +21,10 @@ pub fn monotonic_millis() -> f64 {
     origin.elapsed().as_secs_f64() * 1000.0
 }
 
-/// 对应 Java `System.nanoTime()`：单调时钟的纳秒读数，原点任意，只能用来比大小。
-///
-/// 目前只有一个用处：Java 用它拼 `instanceName`（`<pid>#<nanoTime>`），保证同进程里
-/// 两个客户端算出不同的 clientId，从而不会意外共用一个 `MQClientInstance`。
 pub fn nano_time() -> u128 {
     MONOTONIC_ORIGIN.get_or_init(Instant::now).elapsed().as_nanos()
 }
 
-/// Java `String.hashCode()`：`h = 31*h + ch`，32 位有符号回绕。
-/// 对拍向量：`TagA`=2598919、`TagB`=2598920、`P`=80、`PA`=2545、`*`=42。
 pub fn java_string_hash(s: &str) -> i32 {
     let mut h: i32 = 0;
     for ch in s.chars() {
@@ -65,7 +58,6 @@ pub fn offset_2_filename(offset: i64) -> String {
     format!("{offset:020}")
 }
 
-/// 本地时区格式化；`ts <= 0` 时返回 `-`（与 Java / Python 一致）。
 pub fn time_to_human_string(ts: i64) -> String {
     if ts <= 0 {
         return "-".to_string();
@@ -94,8 +86,6 @@ pub fn get_pid() -> u32 {
     std::process::id()
 }
 
-/// Java `System.getProperty("user.home")`：Windows 下该目录在 `USERPROFILE` 里，
-/// 只读 `HOME` 会让日志与本地位点文件在 Windows 上静默落空。
 pub fn user_home() -> Option<String> {
     ["HOME", "USERPROFILE"]
         .iter()
@@ -134,7 +124,6 @@ pub fn crc32(data: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
-/// Java `UtilAll.bytes2string`：逐字节大写十六进制。
 pub fn bytes_2_string(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -144,7 +133,6 @@ pub fn bytes_2_string(bytes: &[u8]) -> String {
     out
 }
 
-/// Java `UtilAll.string2bytes`：十六进制文本 -> 字节（不是 UTF-8 解码）。
 pub fn string_2_bytes(hex: &str) -> Option<Vec<u8>> {
     if hex.is_empty() {
         return None;
@@ -192,7 +180,6 @@ pub fn parse_addr(addr: &str) -> (String, String) {
     }
 }
 
-/// 当日已过的毫秒数（Java `createUniqID` 里 4 字节那段：时分秒 + 毫秒）。
 pub fn current_day_millis() -> u32 {
     use chrono::Timelike as _;
     let now = chrono::Local::now();
@@ -200,13 +187,6 @@ pub fn current_day_millis() -> u32 {
     secs * 1000 + now.nanosecond() / 1_000_000
 }
 
-/// 消息唯一 ID 生成器（对应 Java `MessageClientIDSetter.createUniqID`，
-/// Python `util_all.InnerIdGenerator.create_uniq_id`）。
-///
-/// 布局：IP(4B；IPv6 16B) + PID(2B) + 类加载 hash(4B) + 当日毫秒(4B) + 自增(2B)，
-/// 再逐字节转**大写** hex（[`bytes_2_string`]，等价 Java `UtilAll.bytes2string`），
-/// 所以 IPv4 下长度恒为 32。
-///
 /// ⚠ 与 Python 的一处确定性差异：Python 的「类加载 hash」是
 /// `abs(hash("RocketMQClient"))`，受 `PYTHONHASHSEED` 影响每进程随机；这里换成跨进程
 /// 稳定的 [`java_string_hash`]。长度与字符集不变，唯一性仍由 IP/PID/时间/自增保证。

@@ -1,6 +1,3 @@
-// 220 RESET_CONSUMER_CLIENT_OFFSET（Java MQClientInstance.resetOffset:1403-1450）单测
-// —— 不需要集群。
-//
 // 为什么必须离线锁死：这条路径错了是**静默**的 —— 220 是 broker 单向推送
 // （Broker2Client.resetOffset 用 oneway 发给消费端，发起方 admin 拿到的是另一笔
 // INVOKE_BROKER_TO_RESET_OFFSET 的响应），管理端看到的响应完好无损，而消费端如果
@@ -13,16 +10,6 @@
 // 链路（examples/live_reset_offset.cpp 的 S1/S2：「撤下在途批次 + broker 上的位点
 // 0.0-0.5s 内跳到重置值」与「前跳位点不越界 + 恢复消费」）。
 //
-// 判据来源：Java ClientRemotingProcessor 的 RequestCode.RESET_CONSUMER_CLIENT_OFFSET
-// 分支 → MQClientInstance.resetOffset:1403-1450：按 group 找消费者 → consumer.suspend()
-// → 第一个循环对「topic 匹配且 offsetTable 里有这条」的队列 `pq.setDropped(true);
-// pq.clear()`（在途批次作废）→（非顺序消费）等 RESET_OFFSET_MAX_WAIT=10s → 第二个循环
-// `consumer.updateConsumeOffset(mq, offset)` ＋ `rebalanceImpl.removeUnnecessaryMessageQueue
-// (mq, pq)`（**先 persist 再 removeOffset**，持久化的是新位点）→ 从 processQueueTable 摘掉
-// → finally `consumer.resume()`，重建后从新位点起拉。
-// 本端口：新位点先落 consumeOffsetTable_ → retireQueueLocked（代号 +1 即 setDropped）→
-// 200ms 等并发消费收尾 → onQueuesRevoked 锁外持久化（等价 persist + removeOffset）→
-// doRebalance 重建。
 //
 // 与 python/tests/test_reset_offset_handler.py、rust/src/client/consumer.rs 的同名测试、
 // csharp/tests/RocketMQ.Client.Tests/ResetOffsetTests.cs 同题（四端同一判据）。
@@ -151,8 +138,6 @@ void expectOffset(Harness& h, std::optional<int64_t> want, const std::string& na
 // ------------------------------------------------- 220 请求体的两种形状
 
 void testParseMapForm() {
-    // Java 发起方（MQClientAPIImpl:2405/2408 恒传 language=JAVA）经 broker 的
-    // `resBody.encode()`（Broker2Client:232）回推的就是这种 map 形状。
     ResetOffsetBody body;
     body.offsetTable[queue0()] = 100;
     body.offsetTable[MessageQueue(kTopic, kBroker, 1)] = -1;  // timestamp=-1 ⇒ broker 算出的 maxOffset
@@ -165,11 +150,6 @@ void testParseMapForm() {
 }
 
 void testParseForCArrayForm() {
-    // language=CPP 的发起方（旧 C++ SDK 管理端）会让 broker 推 ResetOffsetBodyForC：
-    // 它的 `offsetTable` 字段是**数组**（每条自带 offset，Java
-    // Broker2Client.resetOffset 里 `convertOffsetTable2OffsetList` 产出），字段名是 Java
-    // 的驼峰。fastjson2 按字母序写出 ⇒ brokerName/offset/queueId/topic。本端口解析它
-    // 是为了与这类管理端互通；解析不出来 = 整笔重置在本消费者上静默丢弃。
     const std::string json =
         "{\"offsetTable\":["
         "{\"brokerName\":\"broker-a\",\"offset\":100,\"queueId\":0,"
@@ -213,12 +193,9 @@ void testResetRetiresQueueAndDropsPreResetBatch() {
 
     h.consumer().resetOffset(kTopic, {{queue0(), 100}});
 
-    // Java 第一个循环的 pq.setDropped(true); pq.clear()：缓冲与游标作废
     expect(h.consumer().pendingMessages(h.key()).empty(), "reset.pendingCleared");
     expect(h.consumer().lastPullAt(h.key()) == -1, "reset.ownershipDropped",
            std::to_string(h.consumer().lastPullAt(h.key())));
-    // Java 第二个循环的 updateConsumeOffset + removeOffset：新位点**不在**内存表里
-    //（在撤销尾巴上落盘），表里若留着旧值，下面这条 ack 就会把它盖回来
     expectOffset(h, std::nullopt, "reset.offsetTableCleared");
     expect(h.consumer().queueEpoch(h.key()) == 1, "reset.epochBumped",
            std::to_string(h.consumer().queueEpoch(h.key())));
@@ -268,10 +245,6 @@ void testResetOnlyTouchesMatchingTopicAndTableEntries() {
 }
 
 void testSecondResetKeepsEpochMonotonic() {
-    // 重置 → rebalance 重新分回 → 再重置：代号只能单调涨 —— 回落会让**第一次**重置丢掉的
-    // 旧批次"代号又对上"复活。第二次重置前必须先把队列分回来（Java 第二次推 220 时
-    // processQueueTable 里得有条目；队列没分回来时 broker 的第二次推送就是 no-op，
-    // 见 scope.unassignedNoop）。
     Harness h;
     h.consumer().resetOffset(kTopic, {{queue0(), 10}});
     expect(h.consumer().queueEpoch(h.key()) == 1, "twice.firstResetEpoch");
@@ -282,7 +255,6 @@ void testSecondResetKeepsEpochMonotonic() {
     expectOffset(h, std::nullopt, "twice.tableStillCleared");
 }
 
-// ------------------------------------------------- 广播：新位点必须当场落盘（Java persist 在前）
 
 void testResetPersistsNewOffsetInBroadcast() {
     // 广播模式位点只存本地：撤销尾巴就是这份文件的唯一写入口。先 persist 后 removeOffset
@@ -314,7 +286,6 @@ void testResetPersistsNewOffsetInBroadcast() {
 
         h.consumer().resetOffset(kTopic, {{queue0(), 100}});
 
-        // 未 start ⇒ clientId 为空，Java LocalFileOffsetStore 的路径回落 DEFAULT
         const std::string path = home + "/.rocketmq_offsets/DEFAULT/"
                                  + "GID_ResetOffsetCppUnitBroadcast/offsets.json";
         const std::map<std::string, int64_t> loaded =
@@ -326,7 +297,6 @@ void testResetPersistsNewOffsetInBroadcast() {
         // 同一次落盘是 merge 不是 replace：兄弟队列的旧位点还在
         expect(loaded.count(siblingKey) == 1 && loaded.at(siblingKey) == 7,
                "broadcast.siblingMerged");
-        // 内存表照旧清空（Java removeOffset）
         expectOffset(h, std::nullopt, "broadcast.tableCleared");
     }
 
@@ -384,15 +354,12 @@ void testResetOffsetExtFieldsNames() {
     expect(forw.count("force") == 0, "ext.noBareForce");
     expect(forw.at("topic") == kTopic && forw.at("group") == kGroup, "ext.topicGroup");
     expect(forw.at("timestamp") == "-1" && forw.at("offset") == "-1", "ext.timestampOffset");
-    // 整 topic 重载不带 queueId（Java 的 null 语义），单队列重载必须带
     expect(forw.count("queueId") == 0, "ext.noQueueIdForTopicReset");
 
     const PropertyMap single = DefaultMQAdminExt::buildResetOffsetExtFields(
         kTopic, kGroup, 0, /*isForce=*/false, 7, 103);
     expect(single.count("queueId") == 1 && single.at("queueId") == "7", "ext.queueIdPresent",
            single.count("queueId") ? single.at("queueId") : "(missing)");
-    // 假值也必须下发（不能"false 就省略"）：broker 的 isForce 默认值恰好也是 false，
-    // 省略与显式 false 在真机上等价 —— 但 Java 显式下发，端口照抄，缺了就是行为漂移。
     expect(single.count("isForce") == 1 && single.at("isForce") == "false", "ext.isForceFalse",
            single.count("isForce") ? single.at("isForce") : "(missing)");
     expect(single.at("offset") == "103", "ext.singleOffset", single.at("offset"));

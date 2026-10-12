@@ -55,7 +55,6 @@ public class AdminBodyTests
     [Fact]
     public void ResetOffsetBody_DecodeOffsetTable()
     {
-        // ⚠ Java 字段是 Map<MessageQueue, Long>，不是嵌套 map（早期 Python 实现写错）
         const string json = "{\"offsetTable\":{{\"brokerName\":\"b\",\"queueId\":2,\"topic\":\"T\"}:123456}}";
 
         Assert.True(ResetOffsetBody.Decode(Encoding.UTF8.GetBytes(json), out ResetOffsetBody b));
@@ -66,8 +65,6 @@ public class AdminBodyTests
     [Fact]
     public void ConsumeStatsList_DecodeUsesLegacyFieldName()
     {
-        // ⚠ JSON 键是 Java 字段名 consumeStatsList，不是 statsList：写错键名时真机
-        // 341 响应会解析成空集合，看着像「这个 broker 没有积压」
         const string json =
             "{\"consumeStatsList\":[{\"G_BROKER\":[{\"offsetTable\":{}}]}],"
             + "\"brokerAddr\":\"127.0.0.1:10911\",\"totalDiff\":7,\"totalInflightDiff\":2}";
@@ -139,7 +136,6 @@ public class AdminBodyTests
     {
         var c = new SubscriptionGroupConfig("MyGroup");
         string json = c.ToJson().Dump();
-        // Java 5.x 探针实测的字段集与默认值
         Assert.Contains("\"attributes\":{}", json);
         Assert.Contains("\"brokerId\":0", json);
         Assert.Contains("\"consumeBroadcastEnable\":true", json);

@@ -1,39 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""拉模式消费者（DefaultMQPullConsumer）的心跳必须把消费组注册进 broker（真机验证）。
-
-用法（需本地 RocketMQ 5.5.1 集群，broker-a 主 10911）：
-    .venv/bin/python verify_pull_consumer_heartbeat_live.py 127.0.0.1:9876 127.0.0.1:10911 [127.0.0.1:10931]
-
-第三个参数是从节点地址；给了就顺带断言心跳同样落到从节点（承 #96 的扇出规则）。
-
-Java 依据：``DefaultMQPullConsumerImpl.start``:746 把本组 ``registerConsumer`` 进
-``MQClientInstance``，实例的 ``sendHeartbeatToAllBrokerWithLock`` 周期任务据此发出一份
-``consumeType=CONSUME_ACTIVELY`` 的 ConsumerData（``MQClientInstance#prepareHeartbeatData``
-:1031-1045 遍历 consumerTable；``consumeType():348`` 与 ``consumeFromWhere():353`` 是拉模式的
-两个固定口径，订阅集来自 ``subscriptions():357-385`` 的 registerTopics）。
-
-为什么必须真机锁死：少了这份心跳，broker 的 ``ConsumerManager.consumerTable`` 里根本没有
-这个组（拉取本身仍能work —— 拉模式请求带 subscription 标志，走
-``PullMessageProcessor``:397-412 的补偿分支），于是：
-  * ``GET_CONSUMER_CONNECTION_LIST(203)``（mqadmin consumerConnection）看不到本组
-    —— Java 的拉模式消费者在管理端**可见**；
-  * ``GET_CONSUMER_LIST_BY_GROUP(38)`` 查不到本 clientId；
-  * ``rejectPullConsumerEnabled=true`` 的 broker 会把每次拉取回
-    ``SUBSCRIPTION_NOT_EXIST``（``PullMessageProcessor``:493-505）。
-这些全是**静默**的：消费照常、一条日志都不报。
-
-场景：
-  A0 建 topic（主节点一份配置）
-  A1 起拉模式消费者（register_topics 带上该 topic），拉一轮 → 拉取本身正常
-  A2 【核心】203 在**主节点**查到本组，且 consumeType=CONSUME_ACTIVELY、
-     messageModel=CLUSTERING、consumeFromWhere=CONSUME_FROM_LAST_OFFSET
-  A2b 203 的订阅表里带 registerTopics 那个 topic（subString="*"）
-  A3 38 在**主节点**查到本 clientId
-  A4 从节点上 203 也看得到本组（心跳扇出到每一台）
-  A5 对照：从未心跳过的幽灵组 → 203 报错、38 空列表（这条判据本身有效）
-  A6 shutdown() 立刻发 35 注销 → 203 随即查不到（不必等 ~120s 通道扫描）
-"""
 from __future__ import annotations
 
 import sys
@@ -120,7 +86,6 @@ def main() -> int:
               conn is not None and conn.message_model == "CLUSTERING",
               "messageModel=%s" % (conn.message_model if conn else None))
 
-        # ---- A2b 订阅集来自 registerTopics（Java subscriptions():357-385）----
         subs = (conn.subscription_table or {}) if conn else {}
         entry = subs.get(TOPIC)
         sub_string = None

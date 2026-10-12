@@ -1,39 +1,5 @@
-// 轻量客户端日志（对应 Java 的 rmq.client.logback.xml 与 Python 的 rocketmq/logging.py）。
-//
-// 设计目标：
-//   - 默认级别 INFO，因此**良性事件**（如长轮询超时）走 DEBUG 会被抑制，不污染运行日志；
-//   - 同时输出到 stderr 与文件，便于"日志是否干净"的可验证性；
-//   - **按大小轮转**（对齐 Java logback 的 SizeBasedTriggeringPolicy + FixedWindow），
-//     避免常驻进程把单个日志文件撑到无限大。
-//
-// 配置（环境变量）：
-//   ROCKETMQ_CLIENT_LOG_LEVEL          = DEBUG | INFO | WARN | ERROR | OFF      （默认 INFO）
-//   ROCKETMQ_CLIENT_LOG_FILE           = 日志文件绝对路径
-//                                     （默认 $HOME/logs/rocketmqlogs/rocketmq_cpp_client.log；
-//                                      设为 "OFF"/"NONE"/空串可关闭文件输出，只留 stderr）
-//   ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE  = 单文件上限字节数（默认 67108864 = 64MB，对齐 Java
-//                                     logback 的 <maxFileSize>64MB</maxFileSize>；0 = 不轮转）
-//   ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX = 保留的备份份数（默认 10，对齐 Java
-//                                     rocketmq.log.file.maxIndex；0 = 不保留备份）
-//
 // ⚠ 级别与文件路径在**首次写日志时**求值并缓存，因此必须在第一次日志输出前设置环境变量。
 //   程序内可用 setLogLevel() / setLogFile() 直接改（后者会重新打开文件）。
-//
-// 日志行格式（对齐 Java 的 `%d{...SSS} %-5p [%pid] [%t] [%logger#%M:%L] - %m`）：
-//   2026-09-14 16:57:21.123 INFO  [54606] [ConsumeMessageThread_0] [consumer.cpp:289] - ...
-//   Java 的 %logger#%M:%L 是"日志器名#方法:行"，本实现没有日志器层级，用**文件名:行号**替代，
-//   信息量等价且更直观。
-//   线程名：主线程落 [main]（对齐 Java），工作线程由客户端内部命名
-//   （ConsumeMessageThread_N / AsyncSenderThread_N / RemotingClientReader-<addr>），
-//   未命名线程回落 OS 线程名，再回落 [tid-xxxx]。
-//
-// 与 Java 的已知差异（在此显式记录，避免被当成 bug）：
-//   1. 备份文件**不压缩**（Java 会 gzip 成 other_days/rocketmq_client-%i.log.gz）；
-//      备份名是 `<file>.1` … `<file>.N`（FixedWindow 语义），仍是滚动窗口而不是按天归档。
-//   2. **同步写**（Java 走 AsyncAppender）。每行之后 fflush，所以 `tail -f` 实时可见。
-//   3. 连接关闭记为 DEBUG。"对端关闭连接"在 Java 里走 Netty 的 channelInactive 会打一行
-//      INFO/WARN，但正常 shutdown 也会命中同一条路径，在默认 INFO 级别下会变成退出时的
-//      假异常噪声。真正的协议异常（帧长非法、解码失败）仍按 WARN 记录。
 #ifndef ROCKETMQ_COMMON_LOGGING_H
 #define ROCKETMQ_COMMON_LOGGING_H
 
@@ -96,8 +62,6 @@ inline int logLevel() { return logLevelRef().load(std::memory_order_relaxed); }
 // 直接 `ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG ./app` 就能提高日志级别而不必改代码。
 inline bool logLevelSetFromEnv() { return std::getenv("ROCKETMQ_CLIENT_LOG_LEVEL") != nullptr; }
 
-// ---------------------------------------------------------------- 轮转参数
-// Java logback: <maxFileSize>64MB</maxFileSize> + maxIndex 默认 10
 inline std::uintmax_t resolveLogFileMaxSize() {
     const std::uintmax_t kDefault = 64ull * 1024 * 1024;
     const char* env = std::getenv("ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE");
@@ -158,10 +122,8 @@ inline std::string defaultLogFilePath() {
         return s;
     }
     const char* home = std::getenv("HOME");
-    if (home == nullptr || *home == '\0') home = std::getenv("USERPROFILE");  // Windows: Java user.home
+    if (home == nullptr || *home == '\0') home = std::getenv("USERPROFILE");
     if (home == nullptr || *home == '\0') return std::string();
-    // 文件名刻意与 Java 的 rocketmq_client.log 区分：同机同时跑 Java 客户端时
-    // 两边轮转策略不同，写同一文件会互相插行、互相截断。
     return std::string(home) + "/logs/rocketmqlogs/rocketmq_cpp_client.log";
 }
 
@@ -240,8 +202,6 @@ inline std::string& threadNameCache() {
 }
 
 namespace detail {
-// 在**动态初始化阶段**（main 之前，此时进程仍是单线程）捕获主线程 id。
-// 这样日志里的启动阶段会显示 [main]，与 Java 客户端一致，而不是不可读的 tid 哈希。
 struct MainThreadId {
     std::thread::id id;
     MainThreadId() : id(std::this_thread::get_id()) {}
@@ -259,7 +219,6 @@ inline std::string computeThreadName() {
         return std::string(buf);
     }
 #endif
-    // 回落到线程 id 的短哈希：稳定、可区分，但不可读（Java 侧总是有线程名）。
     const size_t h = std::hash<std::thread::id>{}(std::this_thread::get_id());
     char tmp[32];
     std::snprintf(tmp, sizeof(tmp), "tid-%04x", static_cast<unsigned>(h & 0xffffu));
@@ -272,8 +231,6 @@ inline std::string currentThreadName() {
     return cached;
 }
 
-// 命名当前线程：既更新日志用名，也尽力设置 OS 线程名（便于 gdb / ps -M 观察）。
-// 客户端内部的工作线程在启动时调用它，对应 Java 的 ThreadFactory 命名。
 inline void setThreadName(const std::string& name) {
     threadNameCache() = name;
 #if defined(__APPLE__)
@@ -305,7 +262,6 @@ inline const char* logBaseName(const char* path) {
     return base;
 }
 
-// file/line 是**调用点**（由 logger_* 宏传入），对应 Java 的 %M:%L。
 inline void writeLogLine(int level, const std::string& msg, const char* file = nullptr,
                          int line = 0) {
     if (level < logLevel()) return;
@@ -361,9 +317,6 @@ inline void writeLogLine(int level, const std::string& msg, const char* file = n
 
 }  // namespace rocketmq
 
-// ------------------------------------------------------------------ 入口宏
-// 用宏而不是函数，是为了捕获**调用点**的 __FILE__/__LINE__（对应 Java 日志里的 %M:%L）。
-// 这些宏目前都只接受**一个**实参，实参内部允许出现逗号（例如字符串拼接里的逗号）。
 #define logger_debug(msg) \
     ::rocketmq::writeLogLine(::rocketmq::LOG_DEBUG, (msg), __FILE__, __LINE__)
 #define logger_info(msg) \

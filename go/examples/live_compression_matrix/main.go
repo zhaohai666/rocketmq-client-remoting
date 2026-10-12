@@ -42,9 +42,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
-// payloadLine is the seed the matrix uses in every port — it must be byte
-// identical to Java's CompressProbe.buildPayload, otherwise the two sides compute
-// different CRCs of "the same" payload and every leg fails for no reason.
 const payloadLine = "rocketmq-compress-interop-payload-line-0123456789\n"
 
 func buildPayload(size int) []byte {
@@ -55,8 +52,6 @@ func buildPayload(size int) []byte {
 	return out[:size]
 }
 
-// crc is the standard CRC-32 (not Java's UtilAll.crc32, which masks the top
-// bit) — matching the other four ports. Only `match` is compared across ports.
 func crc(data []byte) uint32 { return crc32.ChecksumIEEE(data) }
 
 func main() {
@@ -93,10 +88,6 @@ const usage = `usage:
   live_compression_matrix send <topic> <group> <size> <namesrv> [codec]
   live_compression_matrix recv <topic> <group> <size> <namesrv>`
 
-// compressType maps the matrix codec name to the sysFlag type bits, using the
-// same values as Java CompressionType.findByValue (1=LZ4, 2=ZSTD, 3=ZLIB).
-// An unknown name is the only case that exits 2; a codec the port cannot encode
-// is caught by the pre-flight below.
 func compressType(codec string) (int32, bool) {
 	switch codec {
 	case "zlib":
@@ -116,12 +107,6 @@ func doSend(topic, group string, size int, ns, codec string) int {
 		return 2
 	}
 	payload := buildPayload(size)
-	// Pre-flight the codec — the producer must NOT be relied on to catch this.
-	// tryToCompressMessage swallows the error and sends the body UNCOMPRESSED
-	// (Go mirrors Java exactly; see client/producer.go), so a codec that fails to
-	// encode would still report SEND_OK and the leg would pass vacuously: the
-	// payload arrives intact and the CRC matches without anything being
-	// compressed. Reject it here instead, as exit 2 = bad codec.
 	if _, err := common.Compress(payload, ctype, common.DefaultCompressLevel); err != nil {
 		fmt.Printf("SEND_FAIL unsupported codec=%s: %v\n", codec, err)
 		return 2

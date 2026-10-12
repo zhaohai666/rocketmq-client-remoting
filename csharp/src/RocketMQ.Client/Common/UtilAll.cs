@@ -1,7 +1,3 @@
-// org.apache.rocketmq.common.UtilAll 的 C# 对应：通用工具。
-//
-// 关键点：Bytes2String 必须输出**大写**十六进制（Java HEX_ARRAY = "0123456789ABCDEF"），
-// msgId 依赖该大小写；String2Bytes 是十六进制解码，不是 UTF-8 编码。
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -37,11 +33,6 @@ public static class UtilAll
 
     private static readonly long _stopwatchStart = Stopwatch.GetTimestamp();
 
-    /// <summary>
-    /// 按strftime风格的模式格式化时间戳（本地时区，与 C++ localtime_r / Java SimpleDateFormat 默认一致）。
-    /// 支持 %Y %y %m %d %H %M %S 以及毫秒占位符 %03d；其余说明符直接抛异常（宁可 fail fast，
-    /// 也不能静默产出错误时间戳）。
-    /// </summary>
     public static string TimeToHumanString(long ts, string pattern = YyyyMmDdHhMmSs)
     {
         if (ts <= 0)
@@ -114,7 +105,6 @@ public static class UtilAll
         return sb.ToString();
     }
 
-    /// <summary>全空白（含空串）返回 true，对应 Java UtilAll.isBlank。</summary>
     public static bool IsBlank(string? s)
     {
         if (s is null)
@@ -167,7 +157,6 @@ public static class UtilAll
         return true;
     }
 
-    /// <summary>标准 CRC32（poly 0xEDB88320），与 Java/zlib 一致。</summary>
     public static uint Crc32(byte[] data)
     {
         uint crc = 0xFFFFFFFFu;
@@ -268,10 +257,6 @@ public static class UtilAll
         return outBuf;
     }
 
-    /// <summary>
-    /// 取本机出网 IP：建一个 UDP socket 去 connect 8.8.8.8:80（不发任何包），
-    /// 然后 getsockname —— 与 C++ / Java 实现同思路。失败回落 hostname / 127.0.0.1。
-    /// </summary>
     public static string LocalIp()
     {
         try
@@ -307,10 +292,6 @@ public static class UtilAll
     public static string NextMillisString() =>
         CurrentTimeMillis().ToString(CultureInfo.InvariantCulture);
 
-    /// <summary>
-    /// Java <c>System.getProperty("user.home")</c>：POSIX 取 HOME，Windows 取 USERPROFILE。
-    /// 只读 HOME 会让日志文件与本地位点快照在 Windows 上静默落空。
-    /// </summary>
     public static string UserHome()
     {
         string home = Environment.GetEnvironmentVariable("HOME") ?? string.Empty;
@@ -321,15 +302,10 @@ public static class UtilAll
         return home;
     }
 
-    /// <summary>Java UtilAll.timeMillisToHumanString3：本地时区的 14 位 "yyyyMMddHHmmss"。</summary>
     public static string TimeMillisToHumanString3(long ts) =>
         DateTimeOffset.FromUnixTimeMilliseconds(ts).LocalDateTime
             .ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
 
-    /// <summary>
-    /// 生成 32 位十六进制唯一 ID（对应 Java MessageClientIDSetter.createUniqID / setUniqID）。
-    /// 发送前写到消息属性 <c>UNIQ_KEY</c>，作为 SendResult.MsgId 与轨迹 msgId 的源头。
-    /// </summary>
     public static string CreateUniqId() => InnerIdGenerator.CreateUniqId();
 }
 
@@ -412,7 +388,6 @@ public static class InnerIdGenerator
         int pidv = UtilAll.Pid();
         writer.WriteInt16(unchecked((short)(pidv & 0xFFFF)));
 
-        // 类加载 hash（Java 为 abs(_classLoaderHash)）：用稳定的字符串哈希替代进程随机 hash
         int classHash = LegacyHash.StringHash("RocketMQClient");
         if (classHash < 0)
         {
@@ -421,7 +396,6 @@ public static class InnerIdGenerator
 
         writer.WriteUInt32(unchecked((uint)classHash));
 
-        // 当日毫秒（Java 用「当月毫秒」，Python 实现为当日毫秒，这里保持一致）
         var now = DateTimeOffset.Now;
         uint dayMs = unchecked(
             (uint)((((now.Hour * 60) + now.Minute) * 60 + now.Second) * 1000));

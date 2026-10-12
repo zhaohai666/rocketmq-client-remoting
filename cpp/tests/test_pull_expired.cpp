@@ -1,14 +1,3 @@
-// ProcessQueue 停摆自愈（Java isPullExpired / PULL_MAX_IDLE_TIME）单测 —— 不需要集群。
-//
-// 为什么必须离线锁死：这条判据失灵的两种形态都是**静默**的。
-//   - 不判（本端口改动前）：某队列的拉取循环一旦死掉或卡住，那个队列从此不再消费，
-//     客户端不报错、心跳照发、别的队列照常推进 —— 只能从"这个组的位点卡住不动"反推；
-//   - 阈值算错方向：判得太狠会把健康队列反复撤走重投，凭空造出重复消费。
-// Java 的口径量得很死：ProcessQueue.java:43 读 `rocketmq.client.pull.pullMaxIdleTime`，
-// 默认 **120000ms**（网上常写的 60s 是错的），盖章在发起处（pullMessage:253 /
-// popMessage:508，**早于**流控与锁判定），撤走+重建在同一趟 rebalance 里
-// （RebalanceImpl.updateProcessQueueTableInRebalance:438-461）。
-//
 // 这里锁阈值算术与逐队列时刻表；「撤掉之后真能重新消费」要起真线程、还要真 broker
 // 认位点，只能在真机验（examples/live_redelivery.cpp 的 S11 停摆自愈场景）。
 // 与 Python(tests/test_pull_expired.py)/Rust/C# 的同名测试一一对应。
@@ -43,8 +32,6 @@ std::string queueKey(int32_t queueId) {
 }
 
 void testStallThresholdDefault() {
-    // Java ProcessQueue:43 的默认值。写成 60s 会把健康队列提前撤走（凭空重投），
-    // 写成更大则停摆的队列要更久才复原。
     expect(kPullMaxIdleTime == 120000, "threshold.120s", std::to_string(kPullMaxIdleTime));
 }
 
@@ -65,8 +52,6 @@ void testFreshStampIsNotStalled() {
 }
 
 void testThresholdBoundaryIsStrict() {
-    // Java 用的是 `>`（(now - lastPullTimestamp) > PULL_MAX_IDLE_TIME）：
-    // 正好等于阈值不算停摆。判成 >= 会让边界队列每趟都被撤。
     DefaultMQPushConsumer c(kGroup);
     const std::string key = queueKey(0);
     const int64_t now = UtilAll::currentTimeMillis();

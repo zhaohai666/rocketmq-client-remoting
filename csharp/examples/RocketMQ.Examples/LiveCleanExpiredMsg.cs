@@ -1,6 +1,3 @@
-// cleanExpiredMsg 挂起逃生口真机验证（Java ConsumeMessageConcurrentlyService:68-88/192-200
-// ＋ ProcessQueue.cleanExpiredMsg:75-127）。
-//
 // 与 python/verify_clean_expired_msg_live.py、cpp/examples/live_clean_expired_msg.cpp、
 // rust/examples/live_clean_expired_msg.rs 的对应场景同题、逐条对应（A0–A5）。
 //
@@ -14,16 +11,6 @@
 // 这条路径坏掉的样子是**静默**的：卡住的消息把该队列位点与分发循环一起钉死，没有任何异常
 // 或超时可见，只能从「消息发了却永远不来第二次」反推。
 //
-// 场景（ConsumeTimeout=1，清扫周期与阈值都是 1 分钟；Java 的过期判据是**严格大于**，
-// 所以清扫在第二个 tick 命中，约 start+120s）：
-//   A0 业务队列已分配（排除自动订阅的 %RETRY%<group>）。
-//   A1 首投在 30s 内到达并挂住；ReconsumeTimes=0；期间在册视图里能看到这条消息
-//      且带 CONSUME_START_TIME（本轮盖章）。
-//   A2 清扫命中（**核心判据**）：listener 仍挂着时轮询在册视图 —— 消息从里面消失即清扫
-//      回投并摘除；距今必须 >60s（排除别的路径动手）。
-//   A3 重投真的到了 broker 侧：%RETRY% 队列的本地缓冲里出现这条消息（≤40s）。
-//   A4 放行后重新消费：ReconsumeTimes=1、同一条 body 全程只到两次、与首投相隔 >60s。
-//   A5 位点收尾：挂住的 listener 返回后业务队列已提交位点走到 1。
 //
 // 用法：rmq clean-expired-msg [namesrv]   （约 4 分钟，等两个清扫周期）
 using System.Globalization;
@@ -189,7 +176,7 @@ public static class LiveCleanExpiredMsg
                 InstanceName = "dotnet-live-ce-" + stamp,
                 ConsumeMessageBatchMaxSize = 3,
                 ConsumeFromWhere = ConsumeFromWhere.ConsumeFromFirstOffset,
-                ConsumeTimeout = 1,  // 清扫周期与阈值都变成 1 分钟（Java 同字段同语义）
+                ConsumeTimeout = 1,
             };
             consumer.SetNamesrvAddr(_namesrv);
             consumer.SetMessageListener(listener);

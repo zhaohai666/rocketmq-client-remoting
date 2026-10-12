@@ -158,9 +158,6 @@ struct SendMessageResponseHeader : public CommandCustomHeader {
     void fromExtFields(const PropertyMap& ext) override;
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.header.RecallMessageRequestHeader。
-// ⚠ 该头继承协议 RpcRequestHeader，父类字段序列化名就是 bname（不是 brokerName）：
-// 写成 brokerName 会被 broker 静默丢掉。
 struct RecallMessageRequestHeader : public CommandCustomHeader {
     std::optional<std::string> producerGroup;
     std::optional<std::string> topic;
@@ -431,8 +428,6 @@ struct CheckTransactionStateRequestHeader : public CommandCustomHeader {
     void fromExtFields(const PropertyMap& ext) override;
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.header.CreateTopicRequestHeader
-// 用于 UPDATE_AND_CREATE_TOPIC：在 broker 上按指定队列数/权限建 topic。
 struct CreateTopicRequestHeader : public CommandCustomHeader {
     std::optional<std::string> topic;
     std::optional<std::string> defaultTopic;

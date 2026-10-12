@@ -1,5 +1,3 @@
-// RemotingCommand：RocketMQ 远程命令（对应 org.apache.rocketmq.remoting.protocol.RemotingCommand）。
-//
 // 线格式：totalLength(4) | headerLength(高 8 位放序列化类型, 4) | header | body
 //
 //   header(JSON)      : {"code":..,"language":..,"version":..,"opaque":..,"flag":..,
@@ -17,14 +15,6 @@ public sealed class RemotingCommand
     public const int RpcType = 0;     // 0 -> REQUEST, 1 -> RESPONSE
     public const int RpcOneway = 1;
 
-    /// <summary>
-    /// Java <c>MQVersion.CURRENT_VERSION</c>（= <c>Version.V5_5_1</c>.ordinal()，本机 5.5.1 集群）。
-    /// broker 按心跳/请求里记录的客户端版本决定能否把管理请求回调到客户端：
-    /// <c>AdminBrokerProcessor#callConsumer</c>（307）低于 V3_1_8_SNAPSHOT（ordinal 62）时直接回
-    /// "The Consumer &lt;x&gt; Version &lt;0&gt; too low to finish"；<c>Broker2Client#getConsumeStatus</c>
-    /// （223 推 221）低于 V3_0_7_SNAPSHOT（ordinal 28）时回 "the client does not support this
-    /// feature. version=..."，resetOffset 的在线分支同样按 28 跳过。发 0 等于自降为不可回调。
-    /// </summary>
     public const int CurrentVersion = 515;
 
     private static readonly object SerializeTypeLock = new();
@@ -146,7 +136,6 @@ public sealed class RemotingCommand
 
     // ---------------- 帧工具 ----------------
 
-    /// <summary>Java getProtocolType：取首字节（这里按整型高 8 位同理）。</summary>
     public static byte GetProtocolType(int source) =>
         (byte)((unchecked((uint)source) >> 24) & 0xFF);
 
@@ -169,7 +158,6 @@ public sealed class RemotingCommand
 
     // ---------------- 编解码 ----------------
 
-    /// <summary>把 customHeader 的非空字段展开到 extFields（对应 Java 的反射行为）。</summary>
     public void MakeCustomHeaderToNet()
     {
         if (CustomHeader is null)
@@ -237,7 +225,6 @@ public sealed class RemotingCommand
         int length = 4;
         byte[] headerData = HeaderEncode();
         length += headerData.Length;
-        // body 存在判定：显式置 HasBody，或 body 非空（与 Java 的 body != null 语义对齐）
         bool withBody = HasBody || Body.Length > 0;
         if (withBody)
         {

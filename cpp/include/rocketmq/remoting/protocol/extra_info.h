@@ -1,6 +1,3 @@
-// POP 模式的 extraInfo（CK 串）编解码 —— 格式与 broker 侧协议
-// `org.apache.rocketmq.remoting.protocol.header.ExtraInfoUtil` 逐字段对应。
-//
 // CK 串是 POP 的核心凭据：broker 在普通 topic 的 POP 响应里**不写** `POP_CK`
 // 属性（只在 retry topic 重编码路径才写），客户端必须自己用响应头的
 // `startOffsetInfo` / `msgOffsetInfo` 反构出来，再作为 ACK /

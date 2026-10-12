@@ -86,8 +86,6 @@ public class RouteHeartbeatTests
     [Fact]
     public void TopicRouteData_GetAllMessageQueue_SkipsBrokerWithoutMaster()
     {
-        // Java MQClientInstance:301-303：brokerAddrs 里没有 MASTER_ID(0) 的 broker 整条跳过。
-        // 从节点也会注册进 namesrv 且默认写位还在，所以这条不能靠 perm 过滤替代。
         var route = new TopicRouteData
         {
             QueueDatas = new List<QueueData>
@@ -118,8 +116,6 @@ public class RouteHeartbeatTests
     [Fact]
     public void TopicRouteData_GetAllSubscribeMessageQueue_KeepsMasterlessBroker()
     {
-        // Java MQClientInstance.topicRouteData2TopicSubscribeInfo:318-332：消费侧只看读位与
-        // readQueueNums，**不查 brokerDatas、也不要求有 master**。
         var route = new TopicRouteData
         {
             QueueDatas = new List<QueueData>
@@ -207,7 +203,6 @@ public class RouteHeartbeatTests
         Assert.Contains("\"heartbeatFingerprint\":0", json);
         Assert.Contains("\"withoutSub\":false", json);
         Assert.Contains("\"groupName\":\"cg1\"", json);
-        // 与 Java/C++ 一致：SUB_ALL 的 tagsSet 与 codeSet **都为空**（Java setSubString("*") 后直接 return）
         Assert.Contains("\"subscriptionDataSet\":[{\"classFilterMode\":false,\"codeSet\":[],\"expressionType\":\"TAG\",\"subString\":\"*\",\"subVersion\":", json);
         Assert.DoesNotContain("consumeTimestamp", json);
         Assert.DoesNotContain("maxReconsumeTimes", json);
@@ -216,7 +211,6 @@ public class RouteHeartbeatTests
     [Fact]
     public void HeartbeatData_Decode_ToleratesIsWithoutSub()
     {
-        // 兼容 Java 字段名 isWithoutSub（bool getter 的 fastjson2 名）
         const string json = "{\"clientID\":\"c\",\"consumerDataSet\":[],\"heartbeatFingerprint\":7," +
                             "\"producerDataSet\":[{\"groupName\":\"g\"}],\"isWithoutSub\":true}";
         Assert.True(HeartbeatData.Decode(Encoding.UTF8.GetBytes(json), out HeartbeatData hb));
@@ -229,12 +223,6 @@ public class RouteHeartbeatTests
     [Fact]
     public void BuildSubscriptionData()
     {
-        // Java 对拍向量（探针 /tmp/subprobe/{SubProbe,BlankProbe,EdgeProbe}.java 实测）：
-        //   "TagA||TagB" → tagsSet={TagA,TagB}, codeSet={2598919,2598920}
-        //   "*" / ""     → subString 归一为 "*"，**两个集合都空**（Java 直接 return）
-        //   "   "        → 走 split 分支，集合空但 subString **原样保留**
-        //   "|||"        → Java-split 只丢末尾空串 → 字面量标签 "|"（hash 124）
-        //   "||"         → Java-split 结果数组长度为 0 → 抛 "subString split error"
         SubscriptionData sd = FilterAPI.BuildSubscriptionData("T", "TagA||TagB");
         Assert.Equal("T", sd.Topic);
         Assert.Equal("TagA||TagB", sd.SubString);
@@ -251,19 +239,15 @@ public class RouteHeartbeatTests
         Assert.Empty(wild.TagsSet);
         Assert.Empty(wild.CodeSet);
 
-        // 纯空白 ≠ 空串：Java StringUtils.isEmpty 只认 null/""，所以"   "走 split 分支，
-        // 标签被 trim 成空 ⇒ 集合仍空，但 subString 原样保留。
         SubscriptionData blank = FilterAPI.BuildSubscriptionData("T", "   ");
         Assert.Equal("   ", blank.SubString);
         Assert.Empty(blank.TagsSet);
         Assert.Empty(blank.CodeSet);
 
-        // "|||"：确认实现的是 Java-split（只丢末尾空串）而不是"丢所有空段"
         SubscriptionData pipes = FilterAPI.BuildSubscriptionData("T", "|||");
         Assert.Equal(new SortedSet<string> { "|" }, pipes.TagsSet);
         Assert.Equal(new SortedSet<long> { 124 }, pipes.CodeSet);
 
-        // "||" / "||||"：Java 抛 new Exception("subString split error")
         Assert.Throws<ArgumentException>(() => FilterAPI.BuildSubscriptionData("T", "||"));
         Assert.Throws<ArgumentException>(() => FilterAPI.BuildSubscriptionData("T", "||||"));
     }

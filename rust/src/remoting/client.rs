@@ -1,21 +1,5 @@
-//! socket 长连接客户端（对应 `org.apache.rocketmq.remoting.netty.NettyRemotingClient` 的核心能力）。
-//!
 //! 提供：惰性建连 + 复用、同步 / 异步 / oneway 调用、opaque 匹配、半包重组、
 //! broker 主动请求派发、超时控制、TLS、RPC 钩子。
-//!
-//! 每条连接一个读任务 + 一个写任务（TLS 因为 `native-tls` 是同步 API，跑在专用
-//! 阻塞线程上），在途请求按 opaque 全局登记，与 Java 的 `responseTable` 一致。
-//!
-//! 与 Java 的两处口径差异（都刻意如此，不是漏实现）：
-//! - Java `NettyRemotingAbstract#scanResponseTable` 的定时清理在这里由每个请求自己的
-//!   `tokio::time::timeout` 替代：请求超时即从在途表摘除，不需要常驻扫描线程。
-//! - Java `NettyRemotingClient#scanChannelTablesOfNameServer`（`channelNotActiveInterval`
-//!   = 60s）**在 Java 客户端里从未被调度**——grep 遍 client + remoting 全树只有一个调用点
-//!   都没有，属于死代码。所以这里不做空闲连接回收： broker 侧的 `connectionLivenessCheckMillis`
-//!   断开连接时，读任务会立刻见到 EOF，惰性清理已经覆盖真实场景。
-//!
-//! 对端断开时的在途请求收口（Java `failFast` → `requestFail`）按**连接身份**认领，
-//! 见 [`Connection::id`] 与 [`Pending::conn_id`]。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -50,11 +34,8 @@ fn next_conn_id() -> u64 {
 /// 同时保证 [`TlsStream`] 那把双向锁的持有时长只有一次 syscall 量级。
 const TLS_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
-/// 异步调用回调（对应 Java `InvokeCallback`）。
 pub type InvokeCallback = Box<dyn FnOnce(Result<RemotingCommand>) + Send + 'static>;
 
-/// broker 主动请求处理器（对应 Java `NettyRequestProcessor#processRequest`）。
-///
 /// 需要回包时调用 [`ResponseSink::respond`]（opaque 由框架回填）；oneway 请求直接返回。
 /// 实现内部可自行 spawn，不要长时间阻塞。
 pub trait RequestProcessor: Send + Sync + 'static {
@@ -67,7 +48,6 @@ pub struct ResponseSink {
     inner: Arc<Inner>,
     addr: String,
     opaque: i32,
-    /// 对端用 oneway 推请求时不能回包（Java `NettyRemotingServer#processRequest` 同规则）。
     wants_reply: bool,
 }
 
@@ -107,17 +87,8 @@ pub struct RemotingClientConfig {
     pub connect_timeout_millis: i64,
     pub invoke_timeout_millis: i32,
     pub tls_enable: bool,
-    /// 对应 Java `tls.test.mode.enable`（默认 true）：信任自签证书、不校验主机名。
     pub tls_test_mode: bool,
-    /// 对应 Java `NettyClientConfig.enableReconnectForGoAway`（默认 **true**）。
-    /// 收到 `ResponseCode.GO_AWAY(1500)` 时换一条连接重发一次；关掉则直接抛
-    /// `SendRequest`（Java 同口径）。
     pub enable_reconnect_for_go_away: bool,
-    /// SOCKS 代理（对齐 Java `ClientConfig#socksProxyConfig` →
-    /// `NettyClientConfig#setSocksProxyConfig` → `NettyRemotingClient` 挂
-    /// `Socks5ProxyHandler` 的那条链）。`None` = 直连（默认）。
-    /// 建连顺序：TCP 连代理 → SOCKS 握手（CONNECT，SOCKS5 含无认证 / 用户名密码
-    /// 两种子协商）→（TLS 开启时）TLS 握手。TopAddressing 的动态取址 HTTP 不走它。
     pub socks_proxy: Option<crate::remoting::socks::SocksProxyConfig>,
 }
 
@@ -148,8 +119,6 @@ struct Pending {
     sender: oneshot::Sender<RemotingCommand>,
     request: Option<RemotingCommand>,
     addr: String,
-    /// 请求真正写出去时所用的连接（对应 Java `ResponseFuture` 里的 `channel` 字段）。
-    /// `None` = 还没写出去，这条连接的收口不该牵连它。
     conn_id: Option<u64>,
 }
 
@@ -314,8 +283,6 @@ impl RemotingClient {
             .remove(&request_code)
     }
 
-    // ---------------- RPC ----------------
-    /// 同步 RPC，语义见 [`invoke_impl`]（对应 Java `NettyRemotingClient#invokeImpl`）。
     pub async fn invoke_sync(
         &self,
         addr: &str,
@@ -325,8 +292,6 @@ impl RemotingClient {
         invoke_impl(&self.inner, addr, request, timeout_millis).await
     }
 
-    /// 对应 Java `invokeAsync`：不阻塞调用方，结果交给回调。
-    ///
     /// 走的是与同步调用同一条 `invokeImpl`，所以异步路径同样有 GO_AWAY 重连语义。
     pub fn invoke_async(
         &self,
@@ -370,8 +335,6 @@ impl RemotingClient {
         state.pending.len()
     }
 
-    /// 对应 Java `NettyRemotingClient#start`（`MQClientInstance#start` 会调它）：
-    /// 把 `shutdown` 关掉的传输重新打开。连接本来就是按需建的，所以只需翻回 running 位。
     pub fn start(&self) {
         self.inner.running.store(true, Ordering::Release);
     }
@@ -439,9 +402,6 @@ impl Inner {
         );
     }
 
-    /// 请求真正写出去之后补上连接身份（对应 Java 在 `invokeAsync`/`invokeSync` 里
-    /// 把 `channel` 塞进 `ResponseFuture`）。只有这一步做过的请求才会被那条连接的
-    /// 收口牵连；还没写出去的请求不属于任何连接。
     fn attach_pending_conn(&self, opaque: i32, conn_id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pending) = state.pending.get_mut(&opaque) {
@@ -455,12 +415,6 @@ impl Inner {
     }
 }
 
-/// 对应 Java `NettyRemotingClient#invokeImpl:828-873`：一次 RPC，外加
-/// `GO_AWAY(1500)` 的换连接重发。
-///
-/// GO_AWAY 是 broker / proxy 优雅下线时主动回给在途请求的信令，语义是「这条连接
-/// 别再用了」，所以必须**换新连接**重发才算成功；Java 只重发一次，第二次仍是
-/// GO_AWAY 就抛 `RemotingSendRequestException`，避免在下线中的集群上无限打转。
 async fn invoke_impl(
     inner: &Arc<Inner>,
     addr: &str,
@@ -481,7 +435,6 @@ async fn invoke_impl(
     }
     rmq_warn!("remoting: receive GO_AWAY from {addr}, reconnect and retry once");
     close_channel(inner, addr);
-    // 重发只花剩余预算：Java 用同一个 Stopwatch 的 elapsed 扣减 timeoutMillis。
     let spent = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     let retry_timeout = (timeout - spent).max(1);
     let mut retry = request.clone();
@@ -532,9 +485,6 @@ async fn invoke_with_timeout(
     }
 }
 
-/// 对应 Java `doBeforeRpcHooks` + 写出：**必须在 encode 之前**跑钩子，
-/// ACL 签名覆盖的必须是真正上线的那份 extFields。返回所用连接的身份，供调用方
-/// 把请求绑到这条连接上（见 [`Inner::attach_pending_conn`]）。
 async fn send_request(
     inner: &Arc<Inner>,
     addr: &str,
@@ -578,11 +528,6 @@ fn close_channel(inner: &Arc<Inner>, addr: &str) {
     }
 }
 
-/// 对应 Java `NettyRemotingAbstract#failFast` + `#requestFail`：连接死亡时把它名下
-/// 还没响应的在途请求全部判为发送失败（丢掉 `sender` 即唤醒等待方，
-/// `invoke_with_timeout` 那侧翻成 `Error::SendRequest{ "connection closed" }`，
-/// 与 Java 的 `RemotingSendRequestException` 同一口径）。
-///
 /// 认领按 `conn_id` 而不是地址：同地址换连接是常见形状（EOF 后重连、GO_AWAY 重发），
 /// 旧连接的读任务收尾时若按地址收口，会把**新**连接上刚登记的请求一起判死。
 /// 还没写出去的请求 `conn_id` 为 `None`，同样不该被牵连。
@@ -756,8 +701,6 @@ fn existing(inner: &Arc<Inner>, addr: &str) -> Option<Arc<Connection>> {
 async fn connect(inner: &Arc<Inner>, addr: &str) -> Result<Arc<Connection>> {
     let (host, port) = split_host_port(addr)?;
     let timeout = Duration::from_millis(inner.config.connect_timeout_millis.max(1) as u64);
-    // SOCKS 代理路径：TCP 连的是代理，域名不经本地解析（对齐 Java 走代理时换
-    // `NoopAddressResolverGroup` —— 目标主机名原样进 CONNECT，由代理解析）。
     let stream = match inner.config.socks_proxy.as_ref() {
         Some(proxy) => {
             crate::remoting::socks::connect_via_proxy(proxy, &host, port, timeout).await?
@@ -1409,13 +1352,6 @@ mod tests {
         client.shutdown();
     }
 
-    // ------------------------------------------------ 断连收口（Java failFast）
-    //
-    // 对应 Java `NettyRemotingHandler#close` → `NettyRemotingAbstract#failFast` →
-    // `#requestFail`：连接死了，它名下的在途请求必须**立刻**判为发送失败。
-    // 少了这一步会错两件事：时机（等满 invoke 超时）和语义（报超时而非发送失败，
-    // 而异步发送的重试分类按错误类型分流）。用真 socket，被测的正是"读任务见到 EOF
-    // 之后做了什么"。
 
     /// 轮询等到条件成立，最多 5s；超时直接 panic（测试里可以 panic）。
     async fn wait_until(cond: impl Fn() -> bool, what: &str) {
@@ -1490,8 +1426,6 @@ mod tests {
             .unwrap_err();
         let cost = started.elapsed();
 
-        // 类型必须是 SendRequest（Java 的 RemotingSendRequestException），异步发送的
-        // 重试判定按错误类型分流，报成 Timeout 就是另一个决策。
         assert!(
             matches!(err, Error::SendRequest { .. }),
             "必须是发送失败，got {err}"

@@ -1,21 +1,4 @@
 # -*- coding: utf-8 -*-
-"""并发消费（非 POP 的 classic 路径）的 ``ackIndex`` 语义单测，不需要集群。
-
-为什么单独一个文件：``ConsumeConcurrentlyContext.ack_index`` 早在本端口实现出来了，
-但只在 **POP** 路径生效过；classic 路径（``_consume_batch``）整段把它忽略了 ——
-listener 设 ``ack_index=0`` 表达「这批只认可第一条」时，尾巴既不会回投 ``%RETRY%``，
-位点又照样越过它，等于**静默丢消息**。这类 bug 真机也很难看出来（收条数对得上），
-所以全部断言放离线锁死。
-
-对齐 Java ``ConsumeMessageConcurrentlyService#processConsumeResult:202-270``：
-
-  - ``ackIndex`` 默认 ``Integer.MAX_VALUE``（``ConsumeConcurrentlyContext:33``）
-  - CONSUME_SUCCESS 钳到 ``size-1``；RECONSUME_LATER 强制 ``-1``（:212-229）
-  - CLUSTERING 只回投 ``[ackIndex+1, size)``（:238-254），回投失败的 ``reconsumeTimes+1``
-    后重新提交消费（:250-260）
-  - BROADCASTING 不回投，未认可的尾巴打 warn 后丢弃（:232-237）
-  - 位点提交 = 已处理条目的最大 ``queueOffset+1``，且不越过仍在队列里的那条（:266-269）
-"""
 from __future__ import annotations
 
 from collections import deque
@@ -115,7 +98,6 @@ class Harness:
 class TestContextDefault:
     def test_default_is_the_int32_max_sentinel(self):
         from client.consumer_result import ConsumeConcurrentlyContext
-        # Java ConsumeConcurrentlyContext:33 —— 默认「整批认可」，不是「一条都不认可」
         assert ConsumeConcurrentlyContext().ack_index == (1 << 31) - 1
 
 
@@ -143,7 +125,6 @@ class TestConsumeSuccess:
         listener = FixedListener(ConsumeConcurrentlyStatus.CONSUME_SUCCESS, ack_index=0)
         assert h.consume([msg(0), msg(1), msg(2)], listener) is True
         assert h.backed_offsets == [1, 2]
-        # 尾巴已经交给 broker 重投，位点可以整批前进（Java:266 removeMessage(整批)）
         assert h.offset == 3
 
     def test_negative_ack_index_on_success_redelivers_everything(self):
@@ -154,14 +135,13 @@ class TestConsumeSuccess:
         assert h.offset == 2
 
     def test_send_back_uses_the_delay_level_gradient(self):
-        # Java sendMessageBack:277-283 —— delayLevel 为 0 时取 3 + reconsumeTimes
         h = Harness()
         batch = [msg(0), msg(1, reconsume_times=2), msg(2)]
         h.consume(batch, FixedListener(ConsumeConcurrentlyStatus.CONSUME_SUCCESS, ack_index=0))
         assert [(m.queue_offset, dl) for m, dl in h.backed] == [(1, 5), (2, 3)]
 
     def test_send_back_failure_requeues_that_message_only(self):
-        """回投失败的条目：reconsumeTimes+1、塞回队首、位点不能越过它（Java:250-260,266）。"""
+        pass
         h = Harness()
         h.fail_for = {1}
         batch = [msg(0), msg(1), msg(2)]
@@ -188,7 +168,6 @@ class TestConsumeSuccess:
 
 class TestReconsumeLater:
     def test_ignores_listener_ack_index_and_redelivers_whole_batch(self):
-        # Java:222-226 —— RECONSUME_LATER 把 ackIndex 强制成 -1
         h = Harness()
         listener = FixedListener(ConsumeConcurrentlyStatus.RECONSUME_LATER, ack_index=1)
         assert h.consume([msg(0), msg(1), msg(2)], listener) is True
@@ -206,11 +185,7 @@ class TestReconsumeLater:
         assert h.backed_offsets == [0, 1]
 
     def test_null_return_is_reconsume_later_not_a_silent_ack(self):
-        """Java:399-405 —— listener 返回 null 按 RECONSUME_LATER 处理。
-
-        钩子里的 ConsumeContextType 用的是归一化**前**的 status（null → RETURNNULL），
-        而写进上下文的 status 是归一化后的 RECONSUME_LATER —— 两个值在 Java 里就不同。
-        """
+        pass
         h = Harness()
         hook = _RecordingConsumeHook()
         h.c.register_consume_message_hook(hook)
@@ -220,12 +195,7 @@ class TestReconsumeLater:
             "status 的形态按 Java 的 Enum.toString()（裸成员名），不是 str(枚举) 那种带类名的")
 
     def test_hook_status_is_the_uppercase_enum_name_on_the_success_path_too(self):
-        """成功路径同样：``ConsumeConcurrentlyService:408`` 写的是 ``CONSUME_SUCCESS``。
-
-        反证「没写错形态」得同时钉住两件事：等于 Java 的裸成员名，且**不等于** Python
-        的 ``str(枚举)`` —— 只断言"以 C 开头"之类的模糊判据会让 `"ConsumeConcurrentlyStatus.CONSUME_SUCCESS"`
-        这种带类名的形态蒙过去。
-        """
+        pass
         h = Harness()
         hook = _RecordingConsumeHook()
         h.c.register_consume_message_hook(hook)
@@ -240,7 +210,7 @@ class TestReconsumeLater:
 
 class TestBroadcasting:
     def test_tail_is_dropped_without_send_back(self):
-        """Java:232-237 —— 广播模式一条都不回投，未认可的尾巴只 warn 后丢掉。"""
+        pass
         h = Harness(model=MessageModel.BROADCASTING)
         listener = FixedListener(ConsumeConcurrentlyStatus.CONSUME_SUCCESS, ack_index=0)
         assert h.consume([msg(0), msg(1), msg(2)], listener) is True

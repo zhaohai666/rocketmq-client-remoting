@@ -23,17 +23,6 @@
 //
 // TWO TRAPS, both of which produced bogus "FAIL"s before this file was fixed:
 //
-//  1. The consumer IMPLICITLY subscribes to %RETRY%<group> (Java
-//     copySubscription, and this port matches it). So "the queues I was
-//     assigned" = the main topic's slice PLUS the retry topic's slice, and the
-//     retry topic has ONE queue. Any bookkeeping keyed on queueID alone will
-//     see main#0 and retry#0 as a bogus "two consumers own the same queue",
-//     and the per-consumer totals come out as e.g. 3/2 rather than 2/2. Every
-//     count below is therefore per (topic, queueID).
-//  2. The queue count of the topic is NOT 4 by assumption — the feeder creates
-//     it explicitly, and these checks read the real count back through
-//     SubscribeQueuesOf rather than hardcoding a number.
-//
 // Every check prints PASS/FAIL and the process exits non-zero if any failed.
 package main
 
@@ -288,13 +277,6 @@ func runS1(ns, topic, group string, expect int) {
 
 	// Per-queue offset bookkeeping, keyed by (topic,queueId): the implicit
 	// %RETRY% topic restarts at offset 0 and would break a flat per-queue list.
-	//
-	// The assertion is "each queue's offsets form exactly 0..n-1", NOT "they
-	// arrived in ascending order". A concurrent listener runs on several threads
-	// (consumeThreadMin..Max) and two batches of the SAME queue can be dispatched
-	// to two of them at once, so arrival order is not monotonic — exactly as in
-	// Java's ConsumeMessageConcurrentlyService. What must hold is that no offset
-	// is skipped and none is delivered twice.
 	byQueue := map[string][]int64{}
 	for _, r := range coll.snapshot(topic) {
 		byQueue[fmt.Sprintf("q%d", r.queueID)] = append(byQueue[fmt.Sprintf("q%d", r.queueID)], r.offset)

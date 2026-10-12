@@ -1,4 +1,3 @@
-// org.apache.rocketmq.common.message 的 C++ 对应：消息模型。
 #ifndef ROCKETMQ_COMMON_MESSAGE_H
 #define ROCKETMQ_COMMON_MESSAGE_H
 
@@ -36,7 +35,6 @@ struct MessageQueue {
 
     std::string getQueueIdStr() const { return std::to_string(queueId); }
 
-    // 与 Java 对齐：((31 + brokerHash) * 31 + queueId) * 31 + topicHash，按 32 位有符号回绕
     int32_t hashCode() const;
 
     bool operator==(const MessageQueue& other) const {
@@ -90,8 +88,6 @@ struct Message {
         properties[MessageConst::PROPERTY_DELAY_TIME_LEVEL] = std::to_string(level);
     }
     int32_t getDelayTimeLevel() const;
-    // 5.x 定时消息（Message.java:238-267）：写对应 TIMER_* 属性；getter 属性缺失
-    // 返回 0，值非法时与 Java Long.parseLong 一样**直接抛**，不静默当 0。
     void setDelayTimeSec(int64_t sec) {
         properties[MessageConst::PROPERTY_TIMER_DELAY_SEC] = std::to_string(sec);
     }
@@ -117,7 +113,6 @@ struct Message {
     std::string getProperty(const std::string& name) const;
     void clearProperty() { properties.clear(); }
 
-    // ---- Java 风格 ----
     const std::string& getTopic() const { return topic; }
     void setTopic(const std::string& t) { topic = t; }
 
@@ -214,9 +209,6 @@ struct MessageExt : public Message {
     std::string toString() const;
 };
 
-// ---------------------------------------------------------------- MessageBatch
-// 对应 org.apache.rocketmq.common.message.MessageBatch：自身不新增序列化字段，
-// body 由 encode() 生成（MessageEncoder 的 6 段轻量格式拼接结果）。
 struct MessageBatch : public Message {
     std::vector<Message> messages;
 
@@ -227,8 +219,6 @@ struct MessageBatch : public Message {
 
     size_t size() const { return messages.size(); }
 
-    // 对应 Java MessageBatch.generateFromList：
-    // 非空 / 同 topic / 同 waitStoreMsgOK / 禁止延时 / 禁止重试 topic
     static MessageBatch generateFromList(const std::vector<Message>& msgs);
 };
 

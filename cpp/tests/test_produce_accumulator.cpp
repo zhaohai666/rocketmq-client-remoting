@@ -1,30 +1,6 @@
-// 生产者自动攒批单测（对应 Java `org.apache.rocketmq.client.producer.ProduceAccumulator`，
-// 526 行）—— 不需要集群，全部对着一个「只记账、按剧本回结果」的假生产者跑。
-//
 // 与 python/tests/test_produce_accumulator.py（18 例）、
 // csharp/tests/RocketMQ.Client.Tests/ProduceAccumulatorTests.cs（17 例）、
 // rust/src/client/produce_accumulator/tests.rs（16 例）同题。
-//
-// 覆盖 Java `ProduceAccumulatorTest` 的三个场景（同步 / 异步 / 指定 MessageQueue），另补：
-//   * 三档参数校验的边界值与 Java 原文案；
-//   * `tryAddMessage` 全局字节闸门（放行即记账 / 归还 / 拒绝后调用方退回直发）；
-//   * 批量应答**拆条**（逗号分隔 msgId/offsetMsgId → 每条各自的结果、queueOffset 递增）；
-//   * `AggregateKey` 四维分区（topic / mq / waitStoreMsgOK / tag）；
-//   * 批级四组属性（KEYS 空格并集、TAGS、WAIT）与「同步收集 keys、异步不收集」的不对称；
-//   * 守卫线程对「空批次」的清理、对「已发完但 size 仍 > 0」批次的**保留**；
-//   * 同步 / 异步失败路径（异常上抛 + 额度归还；回调各拿一份）；
-//   * `start → shutdown → start`（守卫线程可重建）；
-//   * sender 生命周期（cpp 结构性差异）：detach 后的同步 / 异步行为与 Java 的两条漏还路径。
-//
-// ⚠ 与 Java 单测一样，这里**直接调累加器**的 `send` / `sendAsync`，绕过了
-// `DefaultMQProducer::sendByAccumulator` 里的 `ensureUniqId` —— 所以子消息都没有 UNIQ_KEY，
-// `MessageBatch::encode()` 出来的 body 才与 `referenceBatchBody()` 可比
-// （`generateFromList` 本身**不**打 ID）。批级 KEYS / TAGS 不进 body，所以 `buildBatch`
-// 多写这两个属性不影响 body 相等。
-//
-// ⚠ 和 Java 一样，`sendSync` 会把 `currentlyHoldSize` 扣掉，而真实调用链里是
-// `canBatch` → `tryAddMessage` 先记的账。这里直接调累加器，所以每条消息都得先自己补一次
-// `tryAddMessage`，否则归还后额度会变成负数。
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -110,7 +86,6 @@ struct BatchSlot {
     bool hasCallback = false;
 };
 
-// 假的生产者（Java 单测里的 `MockMQProducer` 同款）：只记账 + 按剧本回结果。
 class FakeSender : public AccumulatorSender {
 public:
     void setResult(const SendResult& result) {
@@ -119,13 +94,11 @@ public:
         hasResult_ = true;
     }
 
-    // 设了之后：同步入口抛异常、异步入口把异常交给回调（两处都对齐 Java 的失败语义）
     void setError(const std::string& message) {
         std::lock_guard<std::mutex> lk(mutex_);
         error_ = message;
     }
 
-    // 异步入口**就地抛**（Java `send(cb)` 外层 catch 那一支：回调拿到异常但**不还额度**）
     void setThrowOnAsync(bool value) { throwOnAsync_ = value; }
 
     SendResult sendDirectBlocking(const MessageBatch& batch, const MessageQueue* mq) override {
@@ -257,7 +230,6 @@ std::shared_ptr<SendCallback> asCallback(const std::shared_ptr<CollectingCallbac
     return std::static_pointer_cast<SendCallback>(cb);
 }
 
-// 与 Java / Python / Rust 单测同款 body（1 / 2 / 3 / 4 / 5 字节）
 std::vector<Message> makeMessages(size_t n) {
     std::vector<Message> out;
     out.reserve(n);
@@ -339,7 +311,6 @@ void testDefaultParamsMatchContract() {
     expectInt(acc.getBatchMaxBytes(), PRODUCE_ACCUMULATOR_DEFAULT_HOLD_SIZE, "default holdSize const");
     expectInt(acc.totalHoldSize(), PRODUCE_ACCUMULATOR_DEFAULT_TOTAL_HOLD_SIZE,
               "default totalHoldSize const");
-    // Java 的 getTotalBatchMaxBytes 实际返回 holdSize（上游笔误，照抄）
     expectInt(acc.getTotalBatchMaxBytes(), PRODUCE_ACCUMULATOR_DEFAULT_HOLD_SIZE,
               "getTotalBatchMaxBytes copies the upstream bug (returns holdSize)");
     expectInt(acc.currentlyHoldSize(), 0, "currentlyHoldSize starts at 0");
@@ -375,7 +346,6 @@ void testParamGuardRanges() {
     expect(accepts([&] { acc.setTotalBatchMaxBytes(1); }), "totalHoldSize 1 accepted");
     expect(!accepts([&] { acc.setTotalBatchMaxBytes(0); }), "totalHoldSize 0 rejected");
 
-    // 文案逐字对齐 Java（Python / C# / Rust 三侧的断言同样比文案）
     std::string text;
     try {
         acc.setBatchMaxDelayMs(0);
@@ -398,7 +368,6 @@ void testParamGuardRanges() {
     }
     expectStr(text, "totalBatchMaxBytes must bigger then 0, but get 0!", "totalHoldSize error text");
 
-    // 越界的值**不**落地（Java 先校验再赋值）
     acc.setBatchMaxDelayMs(PRODUCE_ACCUMULATOR_DEFAULT_HOLD_MS);
     acc.setBatchMaxBytes(PRODUCE_ACCUMULATOR_DEFAULT_HOLD_SIZE);
     expect(!accepts([&] { acc.setBatchMaxDelayMs(31 * 1000); }), "holdMs 31s rejected again");
@@ -410,8 +379,6 @@ void testParamGuardRanges() {
 }
 
 void testRegistryReusesAccumulatorByClientId() {
-    // Java `MQClientManager.getOrCreateProduceAccumulator`：按 clientId 复用 ——
-    // 第二个 sender 被忽略，两边共享同一份阈值（以及同一对守卫线程）。
     FakeSender first;
     FakeSender second;
     auto a = getOrCreateProduceAccumulator("cpp-accum-shared", &first);
@@ -423,7 +390,6 @@ void testRegistryReusesAccumulatorByClientId() {
     expectInt(b->getBatchMaxDelayMs(), 1234, "params shared through the registry");
     a->setBatchMaxDelayMs(PRODUCE_ACCUMULATOR_DEFAULT_HOLD_MS);
 
-    // sender 还活着时 `attachSender` 是空操作（Java 只认第一个）
     expect(a->hasSender(), "sender still attached after a second getOrCreate");
 }
 
@@ -437,7 +403,6 @@ void testTryAddMessageGateAndRelease() {
 
     expect(acc.tryAddMessage(msg), "first message passes the gate");
     expectInt(acc.currentlyHoldSize(), 10, "gate records the body size");
-    // 额度已满（Java：`currentlyHoldSize < totalHoldSize` 才放行）
     expect(!acc.tryAddMessage(Message(TOPIC, std::string(1, 'b'))), "gate rejects when full");
     expectInt(acc.currentlyHoldSize(), 10, "rejected message does not change the hold size");
     acc.releaseHold(10);
@@ -474,7 +439,6 @@ void testAggregateKeyPartitionsByTopicMqWaitAndTag() {
     expect(!noWaitKey.waitStoreMsgOk, "explicit WAIT=false is keyed false");
     expect(!(base == noWaitKey), "waitStoreMsgOK partitions the key");
 
-    // 空串 tag 与「无 tag」不是一回事（Java 的 null）
     Message emptyTag(TOPIC, std::string(1, 'x'));
     emptyTag.setTags("");
     const AggregateKey emptyTagKey = AggregateKey::ofMessage(emptyTag);
@@ -619,8 +583,6 @@ void testSyncBatchMergesMessagesAndReturnsPerMessageResults() {
     expectInt(static_cast<long long>(sender.sentCount()), 1, "exactly one batch was sent");
     expect(!sender.at(0).hasMq, "no pinned mq → producer picks the queue");
     expect(!sender.at(0).hasCallback, "the sync path sends without a callback");
-    // 子消息集合与 reference 一致。⚠ 只比长度不比字节：5 条是**不同线程**并发 add 的，
-    // 批内顺序不确定（Java 的同步用例也因此只断言长度，只有单线程的异步用例才全等比较）。
     expectInt(static_cast<long long>(sender.at(0).batch.body.size()),
               static_cast<long long>(referenceBatchBody(makeMessages(5)).size()),
               "batch body length matches MessageBatch::generateFromList");
@@ -631,9 +593,6 @@ void testSyncBatchMergesMessagesAndReturnsPerMessageResults() {
         if (!call->outcome->ok) continue;
         ++okCount;
         const SendResult& result = call->outcome->result;
-        // 拆条结果按**批内位置**下发，而位置由 add 的先后决定 —— 并发 add 下「哪条消息拿哪个
-        // 下标」不确定（Java 单测同样只能断言"成套"）。所以验：同一条结果里 id-N ↔ off-N ↔
-        // 100+N 必须成套（串了就说明拆条下标算错了）。
         const std::string& id = result.msgId;
         expect(id.size() == 4 && id.compare(0, 3, "id-") == 0, "msgId is id-N", id);
         const int position = id.size() == 4 ? id[3] - '0' : -1;
@@ -647,7 +606,6 @@ void testSyncBatchMergesMessagesAndReturnsPerMessageResults() {
     expectInt(okCount, 5, "all 5 callers returned a result");
     // 发完归还全局额度
     expectInt(acc.currentlyHoldSize(), 0, "hold size refunded after the batch is sent");
-    // 发完的批次留在表里（Java 的真实行为：只置 closed，不清 messagesSize）
     expectInt(static_cast<long long>(acc.syncBatchCount()), 1, "sent batch stays in the table");
 }
 
@@ -709,7 +667,6 @@ void testAsyncBatchMergesAndFiresEveryCallback() {
     // 单线程依次 add → 批内顺序确定，可以逐字节比
     expectStr(sender.at(0).batch.encode(), referenceBatchBody(makeMessages(5)),
               "async batch body matches generateFromList byte for byte");
-    // 异步批次**不**收集 keys（Java 的不对称行为），所以 batch 级 KEYS 为空串
     expect(sender.at(0).batch.properties.count(MessageConst::PROPERTY_KEYS) == 1,
            "KEYS is written unconditionally");
     expectStr(sender.at(0).batch.getProperty(MessageConst::PROPERTY_KEYS), "",
@@ -754,8 +711,6 @@ void testSplitResultsAreSharedWhenMsgIdHasNoComma() {
         if (!call->outcome->ok) continue;
         ++okCount;
         const SendResult& result = call->outcome->result;
-        // Java 是同一个 `SendResult` 实例；这里按值拷贝（语言级差异），
-        // 所以断言"每一份内容都等于应答本身"而不是指针相等。
         expectStr(result.msgId, "single-id", "shared result keeps msgId");
         expectStr(result.offsetMsgId, "", "shared result keeps offsetMsgId");
         expectInt(result.queueOffset, 3, "shared result keeps queueOffset");
@@ -770,7 +725,6 @@ void testSplitResultsAreSharedWhenMsgIdHasNoComma() {
 // ================================================================ 定点队列
 
 void testSendWithMessageQueuePinsTheBatch() {
-    // 指定 mq（Java 的 `send(msg, mq, producer)`）：mq 原样透传给 sendDirect
     const MessageQueue mq(TOPIC, "broker-pinned", 2);
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-pinned", &sender);
@@ -852,17 +806,11 @@ void testBatchMergesKeysWithSpaceSeparator() {
     joinCall(c1);
     joinCall(c2);
 
-    // ⚠ 与 Java 有一处**可见**差异：Java 的 keys 是 `HashSet`，`String.join` 的顺序由哈希
-    // 决定（未定义）；cpp 侧在 `buildBatch` 里用 `std::set` 的字典序，所以顺序确定。
-    // 属性语义是"空格分隔的集合"，顺序无关（broker 只拿它做索引）。
     expectStr(sender.at(0).batch.getProperty(MessageConst::PROPERTY_KEYS), "k1 k2 k3",
               "batch KEYS is space joined");
 }
 
 void testBatchWaitStoreMsgOkFollowsAggregateKey() {
-    // 回归：Java `AggregateKey(message)` 用 `message.isWaitStoreMsgOK()` —— **缺省即 true**。
-    // 直接比 `getProperty("WAIT") == "true"` 会把普通消息（从没设过 WAIT）判成 false，
-    // 攒出来的批量就会以 WAIT=false 下发（broker 不等刷盘就回 SEND_OK，持久性静默降级）。
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-wait", &sender);
     acc.setBatchMaxDelayMs(3000);
@@ -901,8 +849,6 @@ void testBatchWaitStoreMsgOkFollowsAggregateKey() {
 // ================================================================ 守卫线程
 
 void testGuardKeepsClosedBatchUntilNextSend() {
-    // 发完的批次 messagesSize 仍 > 0，所以会**留在表里**；
-    // 下一次同键 send 拿到它、`add` 返回 -1 才被摘掉重取（Java 的真实行为）。
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-closed-batch", &sender);
     acc.setBatchMaxDelayMs(3000);
@@ -977,7 +923,6 @@ void testGuardRemovesEmptyBatchWithoutSending() {
 }
 
 void testGuardFlushesAsyncEmptyTableWithoutError() {
-    // 空表跑一轮守卫不该出事（Java 的 doWork 对空 values 就是只 sleep）
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-empty-table", &sender);
     acc.runGuardOnce(true);
@@ -987,8 +932,6 @@ void testGuardFlushesAsyncEmptyTableWithoutError() {
 }
 
 void testAccumulatorCanRestartAfterShutdown() {
-    // 累加器是**按 clientId 复用**的，生产者 stop → start 会再调一次 start()：
-    // 守卫线程必须能重建（Java ServiceThread 同样可重复 start）
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-restart", &sender);
     acc.setBatchMaxDelayMs(200);
@@ -1010,10 +953,6 @@ void testAccumulatorCanRestartAfterShutdown() {
 // ================================================================ 失败路径
 
 void testSyncSendFailureSurfacesAndReturnsHoldSize() {
-    // 发送失败：异常抛给**触发发送的那个调用方**，全局额度照还（Java 的 finally）。
-    // ⚠ 同一批里还在等的其他调用方拿不到 `sendResult`（本批没有结果可拆）——
-    // Java 那边是在 `batch.getSendResults()[index]` 上抛 NPE，这里收敛成
-    // `sendResult is illegal`。
     FakeSender sender;
     sender.setError("boom");
     ProduceAccumulator acc("cpp-accum-sync-fail", &sender);
@@ -1044,7 +983,6 @@ void testSyncSendFailureSurfacesAndReturnsHoldSize() {
 }
 
 void testAsyncSendFailureReachesEveryCallback() {
-    // 一批 3 条 → 每个回调恰好收到**一次**异常（Java 的 `onException` 逐个回调一次）。
     FakeSender sender;
     sender.setError("async boom");
     ProduceAccumulator acc("cpp-accum-async-fail", &sender);
@@ -1082,8 +1020,6 @@ void testAsyncSendFailureReachesEveryCallback() {
 }
 
 void testAsyncThrowLeaksHoldSize() {
-    // ⚠ Java 的漏还路径：异步发送在**发起阶段**就抛异常时，外层 catch 只通知回调，
-    // **不**执行 `currentlyHoldSize.addAndGet(-size)`。照抄（改掉就与 Java 对不上了）。
     FakeSender sender;
     sender.setThrowOnAsync(true);
     ProduceAccumulator acc("cpp-accum-async-throw", &sender);
@@ -1105,8 +1041,6 @@ void testAsyncThrowLeaksHoldSize() {
 // ================================================================ sender 生命周期（cpp 特有）
 
 void testDetachSenderBlocksSyncBatchSend() {
-    // cpp 结构性差异：Java 的累加器强引用生产者（永不为 null），这里生产者可能已析构。
-    // 同步路径行为对齐 Java 的 `else throw`：抛异常，且 `sendSync` 的 finally 仍归还额度。
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-detach-sync", &sender);
     acc.setBatchMaxDelayMs(3000);
@@ -1139,7 +1073,6 @@ void testDetachSenderBlocksSyncBatchSend() {
 }
 
 void testDetachSenderFailsAsyncBatchWithoutRefund() {
-    // 异步路径对齐 Java 的 `else throw` 支路：错误交给回调，额度**不**归还。
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-detach-async", &sender);
     acc.setBatchMaxBytes(1);  // 让 `add` 自己触发发送
@@ -1159,7 +1092,6 @@ void testDetachSenderFailsAsyncBatchWithoutRefund() {
 }
 
 void testAttachSenderRebindsOnlyWhenDetached() {
-    // `attachSender` 只在上一任已 detach 时重绑（Java 是"第一次记下的那个用到天荒地老"）
     FakeSender first;
     FakeSender second;
     ProduceAccumulator acc("cpp-accum-attach", &first);
@@ -1189,9 +1121,6 @@ void testAttachSenderRebindsOnlyWhenDetached() {
 // ================================================================ 守卫线程的服务名
 
 void testGuardServiceNamesMatchContract() {
-    // Java `String.format("Client_%s_GuardFor%sSend", clientInstanceName, "Sync"/"Async")`：
-    // 名字只在日志里出现，但它是"这个线程是谁"的唯一线索，值不值得断言见仁见智 ——
-    // 这里只断言 start/shutdown 可重复且不抛（上面的 restart 用例覆盖了功能面）。
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-names", &sender);
     acc.start();

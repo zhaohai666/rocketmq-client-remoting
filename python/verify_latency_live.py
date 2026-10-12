@@ -104,8 +104,6 @@ def main() -> int:
 
     # ---------------- S5 隔离到期恢复 ----------------
     print("\nS5 隔离到期恢复（remove 后注入 2000ms）")
-    # 注意：S4 注入的是隔离档位 10000ms，而 updateNotAvailableDuration **只延长不缩短**
-    # （Java 语义），必须先 remove 才能注入更短的 2000ms 档。
     p2._mq_fault_strategy.latency_fault_tolerance.remove(BROKER)
     p2._mq_fault_strategy.latency_fault_tolerance.update_fault_item(BROKER, 1.0, 2000, True)
     check("S5 隔离期内不可用", not p2._mq_fault_strategy.latency_fault_tolerance.is_available(BROKER))

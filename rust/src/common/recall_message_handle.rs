@@ -1,5 +1,3 @@
-//! 定时/延迟消息的 recall handle（对应 `org.apache.rocketmq.common.producer.RecallMessageHandle`）。
-//!
 //! handle 由 **broker** 在 SEND 响应的 `recallHandle` 字段里下发（只给定时消息，见
 //! `SendMessageProcessor#attachRecallHandle`），内容是 base64url 编码的
 //! `v1 <topic> <brokerName> <deliverMs> <uniqKey>`（空格分隔）。
@@ -10,17 +8,11 @@ use base64::Engine;
 
 use crate::error::{Error, Result};
 
-/// Java `RecallMessageHandle` 里的两个私有常量。
 const SEPARATOR: &str = " ";
 const VERSION_1: &str = "v1";
 
-/// Java `DecoderException("recall handle is invalid")` 的文案，broker 也原样回传。
 const INVALID_HANDLE: &str = "recall handle is invalid";
 
-/// Java `RecallMessageHandle.HandleV1`。
-///
-/// `timestamp_str` 保持字符串：Java 侧就是 `String`，broker 按
-/// `NumberUtils.toLong(..., -1)` 宽松解析，坏值该由 broker 判定，客户端不该抢跑。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HandleV1 {
     pub topic: String,
@@ -29,22 +21,11 @@ pub struct HandleV1 {
     pub message_id: String,
 }
 
-/// 对应 Java `HandleV1.buildHandle`（Java 只有 broker 调用；客户端带上它才可能在单测里
-/// 造出真 handle，同时也是这个格式的唯一权威定义）。
-///
-/// 编码照 Java `Base64.getUrlEncoder()` —— **含 `=` 填充**。
-/// 不做参数校验，与 Java 的 `// no param check` 一致。
 pub fn build_handle(topic: &str, broker_name: &str, timestamp_str: &str, message_id: &str) -> String {
     let raw = [VERSION_1, topic, broker_name, timestamp_str, message_id].join(SEPARATOR);
     base64::engine::general_purpose::URL_SAFE.encode(raw.as_bytes())
 }
 
-/// 对应 Java `RecallMessageHandle.decodeHandle`：空串、非法 base64、版本不是 `v1`、
-/// 段数不足 5 段都报 `recall handle is invalid`。
-///
-/// ⚠ Java 用 `Base64.getUrlDecoder()`，它既不要求也不拒绝 `=` 填充；Rust 的
-/// `URL_SAFE_NO_PAD` 遇到填充字符会直接报错，所以先剥掉尾部 `=` 再解 —— 这样
-/// Java broker 下发的带填充 handle 和其他客户端产出的无填充 handle 都能吃下。
 pub fn decode_handle(handle: &str) -> Result<HandleV1> {
     if handle.is_empty() {
         return Err(Error::client(INVALID_HANDLE));
@@ -72,7 +53,6 @@ mod tests {
 
     const UNIQ_KEY: &str = "0123456789ABCDEF0123456789abcdef";
 
-    /// 取出 `Error::Client` 里的原始文案（Java 的异常 message 要逐字对得上）。
     fn client_message(err: Error) -> String {
         match err {
             Error::Client { message, .. } => message,
@@ -135,8 +115,6 @@ mod tests {
         );
     }
 
-    /// Java `split(" ")` 只丢尾部空段，中间空段算一段 —— 载荷里多一段仍然合法，
-    /// 前 5 段之外的内容照 Java 被忽略。
     #[test]
     fn extra_segments_are_ignored_by_trailing_empty_split() {
         let raw = format!("v1 TopicA broker-a 1700000000000 {UNIQ_KEY} trailing");

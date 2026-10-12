@@ -1,15 +1,7 @@
-// -*- coding: utf-8 -*-
-// MessageAccessor (org.apache.rocketmq.common.message.MessageAccessor).
-// Faithful port of python/common/message_accessor.py, extended with the timer /
-// delivery / message-type helpers present in Java's MessageAccessor. Property keys reuse
-// MessageConst where available; timer/delivery keys not present in the foundation MessageConst
-// are declared locally with the exact Java MessageConst names.
 
 import { MessageConst } from './messageConst.ts';
 import { MessageType } from './messageType.ts';
 
-// Timer / delivery property keys (org.apache.rocketmq.common.message.MessageConst) not exposed
-// by the foundation MessageConst object — declared locally to keep behavior byte-exact.
 const PROPERTY_TIMER_DELIVER_MS = 'TIMER_DELIVER_MS';
 const PROPERTY_TIMER_DELAY_MS = 'TIMER_DELAY_MS';
 const PROPERTY_TIMER_DELAY_SEC = 'TIMER_DELAY_SEC';

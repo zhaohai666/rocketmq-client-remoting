@@ -62,9 +62,6 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def lite_flag() -> int:
-    # 与 Java DefaultLitePullConsumerImpl#pullSyncImpl:1058 的
-    # buildSysFlag(false /*commitOffset*/, block, true /*subscription*/,
-    #              false /*classFilter*/, true /*litePull*/) 对齐
     return PullSysFlag.build_sys_flag(commit_offset=False, suspend=False,
                                       subscription=True, class_filter=False,
                                       lite_pull=True)

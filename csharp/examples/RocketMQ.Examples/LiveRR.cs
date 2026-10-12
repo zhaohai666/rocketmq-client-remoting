@@ -12,19 +12,6 @@
 //   ◄── PUSH_REPLY_MESSAGE_TO_CLIENT(326) ────        producer.send(reply) → 325
 //        broker 按 REPLY_TO_CLIENT 找到请求方连接推回
 //
-// 场景（与 Python 逐条对应）：
-//   S1 只建请求 topic；断言客户端 **不能** 建 <cluster>_REPLY_TOPIC（broker 系统 topic），
-//      并确认请求方已心跳注册（REPLY_TO_CLIENT 要靠它反查 channel）
-//   S2 请求消息确实带 CORRELATION_ID / REPLY_TO_CLIENT / TTL
-//   S3 Request() 拿回应答：body 正确、topic 是 <cluster>_REPLY_TOPIC、带 REPLY_MESSAGE_ARRIVE_TIME
-//   S4 应答确实走了 SEND_REPLY_MESSAGE_V2(325)：第三个客户端订阅 <cluster>_REPLY_TOPIC 能看到
-//   S5 无应答方时 Request() 在 timeout 附近抛 RequestTimeoutException（不卡死/不静默返回），
-//      且异常带 10006 REQUEST_TIMEOUT_EXCEPTION（Java 抛的就是带码的那一个构造）
-//   S6 并发 3 个 request：每个拿到的都是自己的应答（CORRELATION_ID 不串台）
-//   S7 应答方（消费者）本身是普通 push 消费者：Reply 流量不影响后续普通消费
-//   S8 CLUSTER 属性由 broker 在存储时写入：投递到的那份有、客户端手里那份没有 ——
-//      这正是 MessageUtil.createReplyMessage 存在的意思；拿本地那份造应答必须撞上
-//      带 10007 CREATE_REPLY_MESSAGE_EXCEPTION 的 MQClientException，而不是别的错
 //
 // ⚠ 两个真机必踩点（与 Python 文档一致）：
 //   1) <cluster>_REPLY_TOPIC 是 broker 启动时注册的**系统 topic**，客户端 createTopic 会被
@@ -455,9 +442,6 @@ public static class LiveRR
             Check("S5 抛的是 RequestTimeoutException（不是静默返回/别的异常）",
                 raised is RequestTimeoutException,
                 "raised=" + (raised?.GetType().Name ?? "null") + ": " + raised?.Message);
-            // Java 抛的是 RequestTimeoutException(ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION, ...)：
-            // 光有类型不够，调用方按 ResponseCode 分流时要知道"请求已经投出去了，只是没等到应答"
-            // （对方可能只是慢），这跟发送本身失败是两类处置。
             Check("S5 异常带 10006 REQUEST_TIMEOUT_EXCEPTION",
                 raised is MQClientException mce
                 && mce.ResponseCode == ClientErrorCode.RequestTimeoutException,
@@ -524,12 +508,6 @@ public static class LiveRR
             Check("S7 后续普通消息仍被消费", plainOk,
                 "received=" + replier.ReceivedCount);
 
-            // ---------------- S8 CLUSTER 属性来自 broker；造不出应答时报 10007 ----------------
-            // Java MessageUtil.createReplyMessage（:46/49）抛的是
-            // MQClientException(ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION=10007, ...)。
-            // 这条既验"错误码带上了"，也验它**为什么**存在：CLUSTER 是 broker 存储时补的
-            // （SendMessageProcessor:318/614），客户端手里那份永远没有 ⇒ 应答必须建立在
-            // **投递到的**那条消息上，用错对象就撞上 10007。
             Console.WriteLine();
             Console.WriteLine("S8 CLUSTER 由 broker 写入；造不出应答时报 10007 而不是别的错");
             MessageExt? delivered = replier.DeliveredPing;

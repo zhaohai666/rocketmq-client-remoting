@@ -1,21 +1,5 @@
-// 推送消费者启动期数值闸门（Java DefaultMQPushConsumerImpl.checkConfig :1099-1209）的单测。
-//
-// 为什么必须离线锁死：这条闸门是"用户配错就别起"的前置检查，真机上只有把它**写严**才
-// 看得出来 —— 比 Java 多拒一个合法值，用户直接起不来；比 Java 少拒一个越界值，坏配置
-// 会带着僵尸 clientId 打到 broker 上，把 rebalance 用的 cidAll 撑歪。两种后果在真机上
-// 都表现为"消息偶尔不均"，排查成本极高，所以区间端点与文案逐字对 Java 锁死。
-//
 // 与 Python(tests/test_consumer_check_config.py)、C++(tests/test_consumer_check_config.cpp)、
 // Rust(consumer.rs 的 RANGE_GATES)一一对应：同一张闸门表、同一段检查顺序、同一条文案。
-//
-// ⚠ 本移植有三处与 Java 的**已知差异**，都在这里显式锁住而不是假装一致：
-//   1. SetConsumeThreadMin/Max 与 ConsumeMessageBatchMaxSize 的 setter 带 Math.Max(1, n)
-//      兜底，所以这三条闸门的**下界从公开 API 走不到**（写 0 会被抬成 1）。上界照常可测。
-//   2. Java :1058 的 consumeTimestamp 格式校验在这里是 no-op：本移植没有可配的
-//      ConsumeTimestamp 属性（CONSUME_FROM_TIMESTAMP 一律取"30 分钟前"），没有可写坏的
-//      字符串可拒。这是少一个可配项，不是漏了校验。
-//   3. 校验点在 Start() 里所有 null 检查之后、实例化 MQClientInstance 之前 —— 坏配置必须
-//      在建立任何网络连接之前失败（真机侧由 LiveFlowControl S5 反证 broker 查不到该组）。
 using RocketMQ.Client;
 using RocketMQ.Common;
 
@@ -27,8 +11,6 @@ public class ConsumerCheckConfigTests
 {
     private const string Group = "CID_net_check_config";
 
-    /// <summary>一条数值闸门：Java 里的字段名、闭区间、逐字文案、怎么写这个字段、
-    /// -1 是否是"关闭"哨兵、下界是否被 setter 抬掉（从公开 API 走不到）。</summary>
     private sealed record Gate(
         string Field,
         long Lo,
@@ -38,7 +20,6 @@ public class ConsumerCheckConfigTests
         bool MinusOneOff,
         bool LowerBoundClampedBySetter);
 
-    /// <summary>Java checkConfig 数值段的全部闸门，**数组顺序即检查顺序**。</summary>
     private static readonly Gate[] Gates =
     {
         new("consumeThreadMin", 1, 1000,
@@ -62,7 +43,6 @@ public class ConsumerCheckConfigTests
         new("pullThresholdSizeForTopic", 1, 102400,
             "pullThresholdSizeForTopic Out of range [1, 102400]",
             (c, v) => c.PullThresholdSizeForTopic = (int)v, true, false),
-        // pullInterval 的下界是 **0**（Java 原文如此，0 = 不间隔），别照抄邻居闸门的 1。
         new("pullInterval", 0, 65535,
             "pullInterval Out of range [0, 65535]",
             (c, v) => c.PullIntervalMillis = (int)v, false, false),
@@ -148,7 +128,6 @@ public class ConsumerCheckConfigTests
     [Fact]
     public void EveryGateRejectsBelowItsLowerBound()
     {
-        // Java 用严格 `lo <= x <= hi`（< lo || > hi 才拒），两端都是合法值。
         foreach (Gate gate in Gates)
         {
             if (gate.LowerBoundClampedBySetter)
@@ -165,8 +144,6 @@ public class ConsumerCheckConfigTests
     [Fact]
     public void EveryGateAcceptsBothEndsOfItsInterval()
     {
-        // 边界值被误拒是这条闸门最常见的写坏方式（比 Java 还严），真机上表现为"贴着
-        // 上限配就是不启动"，离线必须逐条锁住两端。
         foreach (Gate gate in Gates)
         {
             Assert.Equal(string.Empty, FirstMessageOf(Broke(gate, gate.Lo)));
@@ -177,8 +154,6 @@ public class ConsumerCheckConfigTests
     [Fact]
     public void OnlyTopicThresholdsTreatMinusOneAsSwitchOff()
     {
-        // Java 对 pullThresholdForTopic / pullThresholdSizeForTopic 写的是
-        // `if (x != -1) { 区间检查 }`，-1 是"关闭"哨兵；其余闸门没有这层豁免。
         foreach (Gate gate in Gates.Where(g => g.MinusOneOff))
         {
             Assert.Equal(string.Empty, FirstMessageOf(Broke(gate, -1)));
@@ -200,7 +175,6 @@ public class ConsumerCheckConfigTests
     [Fact]
     public void ThreadMinLargerThanThreadMaxIsRejectedWithBothNumbers()
     {
-        // 严格 >：min == max 合法（Java 允许单线程消费者）。
         ExpectAccepted(c =>
         {
             c.SetConsumeThreadMin(8);
@@ -216,9 +190,6 @@ public class ConsumerCheckConfigTests
     [Fact]
     public void SetterClampKeepsThreadAndBatchLowerBoundsReachable()
     {
-        // 与 Java 的差异（属性文档注释已声明）：setter 的 Math.Max(1, n) 把 0 抬成 1。
-        // 锁住这个兜底本身 —— 哪天删掉兜底，CheckConfigRanges 就是唯一防线，
-        // 而这张表的下界用例已经证明那条防线自己写对了。
         DefaultMQPushConsumer c = New();
         c.SetConsumeThreadMin(0);
         c.SetConsumeThreadMax(0);
@@ -232,8 +203,6 @@ public class ConsumerCheckConfigTests
     [Fact]
     public void GatesAreCheckedInLegacyOrder()
     {
-        // 多条同时越界时报哪一条取决于顺序 —— 与 Java 逐条同序才能保证用户看到的
-        // 第一句错一样。每段用"被测闸门 + 后面某条也越界"证明前者先命中。
         ExpectRejected(c =>
         {
             c.ConsumeConcurrentlyMaxSpan = 0;
@@ -268,7 +237,6 @@ public class ConsumerCheckConfigTests
     [Fact]
     public void PopBatchNumsFollowsLegacyLiteralLessOrEqualZero()
     {
-        // Java 原文是 `popBatchNums <= 0`，不是 `< 1`；0 与负数都拒，文案仍写 [1, 32]。
         ExpectRejected(c => c.PopBatchNums = 0, "popBatchNums Out of range [1, 32]");
         ExpectRejected(c => c.PopBatchNums = -7, "popBatchNums Out of range [1, 32]");
     }

@@ -1,18 +1,9 @@
-//! 订阅组模型（对应 `org.apache.rocketmq.remoting.protocol.subscription` 包）。
-//!
 //! 移植 `python/remoting/protocol/subscription.py`：
 //! [`SubscriptionGroupConfig`] / [`GroupRetryPolicy`] / [`SimpleSubscriptionData`] /
 //! [`SubscriptionGroupWrapper`]。admin（`examineSubscriptionGroupConfig` 等）与
 //! broker 侧返回体都走这里。
 //!
 //! ## 报文细节
-//!
-//! * Java 字段名 `type` 在 Rust 是关键字，字段用 `retry_policy_type`，**上线键仍是 `type`**。
-//! * fastjson2 跳过 null：`subscriptionDataSet` 为 `None` 时整个键不出现（探针实测），
-//!   `groupRetryPolicy` 的两个子策略同理，所以这里用 `Option` 而不是空容器。
-//! * 顶层键顺序按 Java 探针输出写出；本仓库 Python 的 `json.dumps` 带空格、
-//!   Java fastjson 不带，Rust 统一走紧凑形式（[`RemotingSerializable::encode`]）。
-//! * `attributes` 用 [`StringMap`] 保持插入顺序，避免签名/比对时抖动。
 
 use serde_json::{Map, Value};
 
@@ -26,13 +17,11 @@ use crate::remoting::protocol::ext_fields::StringMap;
 /// `MixAll.MASTER_ID`。
 pub const MASTER_ID: i32 = 0;
 
-/// 对应 Java `GroupRetryPolicyType`（枚举名直接作为 JSON 字符串写出）。
 pub mod group_retry_policy_type {
     pub const EXPONENTIAL: &str = "EXPONENTIAL";
     pub const CUSTOMIZED: &str = "CUSTOMIZED";
 }
 
-/// 对应 Java `SimpleSubscriptionData`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimpleSubscriptionData {
     pub topic: String,
@@ -82,14 +71,8 @@ impl SimpleSubscriptionData {
     }
 }
 
-/// 对应 Java `GroupRetryPolicy`。
-///
-/// 两个子策略保留 broker 原样 JSON：Java 侧类型是 `ExponentialRetryPolicy` /
-/// `CustomizedRetryPolicy`，字段较多且客户端只透传给 admin，解析成结构化字段
-/// 反而会在 broker 加字段时丢信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupRetryPolicy {
-    /// Java 字段名 `type`。
     pub retry_policy_type: String,
     pub exponential_retry_policy: Option<Value>,
     pub customized_retry_policy: Option<Value>,
@@ -118,7 +101,6 @@ impl GroupRetryPolicy {
     }
 
     pub fn from_json_value(value: &Value) -> Result<GroupRetryPolicy> {
-        // broker 可能整体不下发 groupRetryPolicy，Java 此时用默认实例。
         if value.is_null() {
             return Ok(GroupRetryPolicy::default());
         }
@@ -131,7 +113,6 @@ impl GroupRetryPolicy {
     }
 }
 
-/// 对应 Java `SubscriptionGroupConfig`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionGroupConfig {
     pub group_name: String,
@@ -147,7 +128,6 @@ pub struct SubscriptionGroupConfig {
     pub notify_consumer_ids_changed_enable: bool,
     pub group_sys_flag: i32,
     pub consume_timeout_minute: i32,
-    /// Java 默认 `null`：不出现该键，而不是空数组。
     pub subscription_data_set: Option<Vec<SimpleSubscriptionData>>,
     pub attributes: StringMap,
 }
@@ -269,15 +249,12 @@ impl SubscriptionGroupConfig {
     }
 }
 
-/// 对应 Java `SubscriptionGroupWrapper`（实际类在 `protocol.body` 包，
-/// Python 与本文件一并移植，因为二者总是成对出现）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SubscriptionGroupWrapper {
     /// 保序：`getAllSubscriptionGroup` 的返回表按 broker 顺序透传。
     pub subscription_group_table: Vec<(String, SubscriptionGroupConfig)>,
     /// broker 侧为 `ConcurrentHashMap<String, ?>`，客户端只原样带出。
     pub forbidden_table: Value,
-    /// 对应 Java `DataVersion`，同样只原样带出（admin 侧仅做展示）。
     pub data_version: Value,
 }
 
@@ -353,7 +330,6 @@ impl SubscriptionGroupWrapper {
     }
 }
 
-/// 对应 Java `TopicQueueCountTable`（`admin.topicQueueCount` 用的极简体）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TopicQueueCountTable {
     pub table: Vec<(String, i64)>,
@@ -458,7 +434,6 @@ mod tests {
             r#"{"type":"EXPONENTIAL","exponentialRetryPolicy":{"maxDeliveryAttempts":5}}"#
         );
         assert_eq!(GroupRetryPolicy::from_json_value(&value).unwrap(), policy);
-        // broker 整体省略该字段时回到默认实例（Java 的字段初始化行为）。
         assert_eq!(
             GroupRetryPolicy::from_json_value(&Value::Null).unwrap(),
             GroupRetryPolicy::default()

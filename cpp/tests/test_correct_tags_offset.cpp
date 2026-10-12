@@ -1,16 +1,3 @@
-// correctTagsOffset（Java DefaultMQPushConsumerImpl:713-717，调用点 :394-401）单测 —— 不需要集群。
-//
-// 为什么必须离线锁死：拉取应答是 NO_NEW_MSG / NO_MATCHED_MSG 时，若 ProcessQueue 里没有消息，
-// Java 会把"已消费位点"抬到应答的 nextBeginOffset（increaseOnly=true）。漏了这件事是**静默**的：
-// broker 侧按 tags/表达式把这一段的每一条都滤掉时，客户端既收不到消息、位点也不动，
-// queryConsumerOffset 永远落后，重启后把这批没人要的消息从头再扫一遍。反过来，闸门写松
-//（不等在途批次落定就抬位点）同样是静默的：进程崩溃时那批消息被跳过。
-//
-// 闸门 = Java 的 `0L == processQueue.getMsgCount()`：msgCount 数的是**仍在 ProcessQueue 里**的
-// 消息，而并发消费的 removeMessage 要等 listener 返回才跑（ConsumeMessageConcurrentlyService:266），
-// 所以在途批次也算数。本端口把 pending_ 为空与 inflightCount_ 为 0 合成同一判据。
-// 与 python/tests/test_correct_tags_offset.py、rust/src/client/consumer.rs 的同名测试同题；
-// 真机证据（broker 过滤 → NO_MATCHED_MSG → broker 侧位点前移）见 examples/live_correct_tags_offset.cpp。
 #include <cstdio>
 #include <optional>
 #include <string>
@@ -116,7 +103,6 @@ void testStatuses() {
 }
 
 void testIncreaseOnly() {
-    // Java 的 updateOffset(..., increaseOnly=true)：只前进不回退
     Harness h;
     h.seedPending({});
     h.correct(PullStatus::NO_NEW_MSG, 100);

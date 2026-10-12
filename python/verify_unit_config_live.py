@@ -41,7 +41,6 @@ from remoting.protocol.heartbeat import ConsumeFromWhere
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time())
 
-# Java org.apache.rocketmq.common.sysflag.TopicSysFlag
 FLAG_UNIT = 0x1 << 0
 FLAG_UNIT_SUB = 0x1 << 1
 
@@ -163,12 +162,6 @@ def main():
     g2 = "GID_unit_cfg_conn_%d" % STAMP
     topics.append(t2)
     groups.append(g2)
-    # ⚠ 与 U4 同一类顺序问题，而且是**两个**：
-    # 1) 订阅不存在的 topic 时客户端路由表为空 → 不发心跳、rebalance 也拿不到队列，
-    #    所以先由生产者发一条预热消息把 topic 建出来，并等它注册到 namesrv；
-    # 2) 新消费组默认 CONSUME_FROM_LAST_OFFSET（Java 同），首拉会把 offset 直接设成
-    #    max，即**消费者启动之前**的消息会被跳过。这里显式改成 FROM_FIRST_OFFSET，
-    #    再把待验消息发出去，两条都能对上。
     push = DefaultMQPushConsumer(g2)
     push.set_namesrv_addr(NAMESRV)
     push.set_instance_name("unitcfg-u2-%d" % STAMP)
@@ -237,12 +230,6 @@ def main():
           flag_off is not None and not (flag_off & FLAG_UNIT),
           "sysFlag=%s" % flag_off)
 
-    # ---------------- U4 unitMode 消费者心跳 → %RETRY% 带 UNIT_SUB 位 ----------------
-    # ⚠ 顺序必须是「先发消息，再起消费者」：Java 与本实现的心跳都只发给
-    # **路由表里出现过**的 broker（sendHeartbeatToAllBroker 遍历 topicRouteTable）。
-    # 订阅一个还不存在的 topic 时路由为空 → 一条心跳都发不出去 → retry topic
-    # 自然不会创建。先生产一条既建好 topic 又让路由可见（30s 内的 broker 注册），
-    # 心跳才有落点。
     g4 = "GID_unit_cfg_hb_%d" % STAMP
     t4 = "UnitCfgRetry_%d" % STAMP
     topics.append(t4)
@@ -271,9 +258,6 @@ def main():
     finally:
         push4.shutdown()
 
-    # ---------------- U5 ReqT=0 不影响普通 broker ----------------
-    # 轻量消费者默认 CONSUME_FROM_LAST_OFFSET（Java 同），所以先生产、再起消费者
-    # 会把预热消息跳过去；这里显式改成 FROM_FIRST_OFFSET 才能数到 3 条。
     t5 = "UnitCfgStream_%d" % STAMP
     g5 = "GID_unit_cfg_stream_%d" % STAMP
     topics.append(t5)

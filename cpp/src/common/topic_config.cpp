@@ -19,7 +19,6 @@ JsonValue TopicConfig::toJson() const {
     v.set("topicFilterType", JsonValue::makeString(topicFilterType));
     v.set("topicSysFlag", JsonValue::makeInt(topicSysFlag));
     v.set("order", JsonValue::makeBool(order));
-    // Java：attributes 没有 serialize=false，因此**始终序列化**（即使是空 map）
     JsonValue attrs = JsonValue::makeObject();
     for (const auto& kv : attributes) {
         attrs.set(kv.first, JsonValue::makeString(kv.second));

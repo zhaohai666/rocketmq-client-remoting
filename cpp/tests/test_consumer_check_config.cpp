@@ -1,17 +1,3 @@
-// 推送消费者配置数值闸门（Java DefaultMQPushConsumerImpl#checkConfig :1099-1209）单测
-// —— 不需要集群。与 Python 的 tests/test_consumer_check_config.py 逐条同构。
-//
-// 为什么必须离线锁死：这十三道闸门在 Java 里是**启动期拒绝**，而每条错法在运行期都是
-// 静默的：pullThreshold*=0 走 max(1,n) 兜底 ⇒ 每条都算超限、队列永久停拉；
-// consumeThreadMax 是 updateCorePoolSize 的上界守卫，写成 0 之后弹性调节永远返回 false；
-// popBatchNums>32 broker 直接回 INVALID_PARAMETER；巨值绕开流控判断直到 OOM。
-//
-// ⚠ 与 Python 的一处**可达性**差异（不是实现差异）：本端口的 setConsumeThreadMin /
-// setConsumeThreadMax / setConsumeMessageBatchMaxSize 在 setter 里就 max(1,n) 夹了一道
-// （Python/Rust/C# 的对应 setter 也夹，各自夹的字段集合不同）。Java 的 setter 是裸
-// 赋值，所以下界在 Java 一定由闸门拒；在这里那三个字段**无法从公开 API 喂进 0**，
-// 于是本文件对它们锁的是"setter 夹到 1"这一行为 + 上界由闸门拒，闸门本身的下界比较
-// 仍按 Java 完整实现（参考实现 Python 的用例逐格锁死）。
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -39,16 +25,13 @@ void expect(bool ok, const std::string& name, const std::string& detail = "") {
 
 std::string num(int64_t v) { return std::to_string(v); }
 
-// 一条闸门：字段名（只用于用例名）、Java 的闭区间、Java 的文案、setter。
 struct Gate {
     std::string field;
     int64_t lo;
     int64_t hi;
     std::string msg;
     std::function<void(DefaultMQPushConsumer&, int64_t)> set;
-    // setter 自己就把下界夹到 1（Java 是裸赋值），故本端口够不到下界，见文件头注释。
     bool lowClampedBySetter = false;
-    // 只有 -1 是"未设置"哨兵（Java 的 != -1 分支）：topic 级那两道才是 true。
     bool hasMinusOneSentinel = false;
 };
 
@@ -144,7 +127,6 @@ std::vector<Gate> gates() {
 void testDefaultsClearEveryGate() {
     DefaultMQPushConsumer c = fresh();
     expect(gateMessage(c).empty(), "defaults.pass", gateMessage(c));
-    // 默认值本身就是 Java 的那一组（改了会连带 #72 一起对不上）
     expect(c.getConsumeThreadMin() == 20 && c.getConsumeThreadMax() == 20, "defaults.threadNums",
            num(c.getConsumeThreadMin()) + "/" + num(c.getConsumeThreadMax()));
     expect(c.consumeConcurrentlyMaxSpan() == 2000, "defaults.maxSpan",
@@ -194,7 +176,6 @@ void testBoundsAndRejection() {
                        "want=[" + g.msg + "] got=[" + gateMessage(c) + "]");
             }
         }
-        // 0 不是"关闭"的写法（Java 只给两个 topic 级阈值留 -1 哨兵，pullInterval 的下界才是 0）
         if (!g.lowClampedBySetter && !g.hasMinusOneSentinel && g.lo != 0) {
             DefaultMQPushConsumer c = fresh();
             g.set(c, 0);
@@ -311,7 +292,6 @@ void testStartRejectsBeforeTouchingNetwork() {
         expect(!c.isStarted(), "start.notStarted." + kase.name);
     }
 
-    // 组名校验仍然排在数值闸门之前（Java 的 cheque 顺序）
     {
         DefaultMQPushConsumer c("bad group!!");
         c.setNamesrvAddr(dead);

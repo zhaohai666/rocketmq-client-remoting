@@ -1,8 +1,3 @@
-// 公共 body（对应 org.apache.rocketmq.remoting.protocol.body.* 常用部分）：
-//   KVTable / TopicList / GetConsumerListByGroupResponseBody / CheckClientRequestBody /
-//   ClusterInfo / Connection / ConsumerConnection /
-//   ProducerConnection / ConsumerRunningInfo / ConsumeStatsList / ResetOffsetBody
-//
 // 复合且管理端不需要解释内容的字段（subscriptionTable / mqTable / statsList 等）
 // 一律用 JsonValue 透传，避免过度建模导致字段丢失。
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_BODY_H
@@ -23,7 +18,6 @@
 
 namespace rocketmq {
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.KVTable
 struct KVTable {
     PropertyMap table;
 
@@ -34,7 +28,6 @@ struct KVTable {
     static bool decode(const Bytes& data, KVTable& out);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.TopicList
 struct TopicList {
     std::vector<std::string> topicList;
     std::string brokerAddr;
@@ -49,7 +42,6 @@ struct TopicList {
     bool contains(const std::string& topic) const;
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.GetConsumerListByGroupResponseBody
 struct GetConsumerListByGroupResponseBody {
     std::vector<std::string> consumerIdList;
 
@@ -60,8 +52,6 @@ struct GetConsumerListByGroupResponseBody {
     static bool decode(const Bytes& data, GetConsumerListByGroupResponseBody& out);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.CheckClientRequestBody
-//
 // 只被 CHECK_CLIENT_CONFIG(46) 用到：broker 侧 ClientManageProcessor#checkClientConfig
 // 拿 clientId/group 记日志，真正被校验的只有 subscriptionData 的 expressionType 与
 // subString。协议里定义了 namespace 字段但发送端不填，这里同样保留字段而不写值
@@ -80,8 +70,6 @@ struct CheckClientRequestBody {
     static bool decode(const Bytes& data, CheckClientRequestBody& out);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.ClusterInfo
-// brokerAddrTable 序列化为 Map<String, BrokerData>，这里直接复用 route.h 的 BrokerData。
 struct ClusterInfo {
     std::map<std::string, BrokerData> brokerAddrTable;
     std::map<std::string, std::vector<std::string>> clusterAddrTable;
@@ -109,7 +97,6 @@ struct Connection {
     static Connection fromJson(const JsonValue& v);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.ConsumerConnection
 struct ConsumerConnection {
     std::vector<Connection> connectionSet;
     JsonValue subscriptionTable;  // 透传（Map<String, SubscriptionData>）
@@ -124,7 +111,6 @@ struct ConsumerConnection {
     static bool decode(const Bytes& data, ConsumerConnection& out);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.ProducerConnection
 struct ProducerConnection {
     std::vector<Connection> connectionSet;
 
@@ -135,8 +121,6 @@ struct ProducerConnection {
     static bool decode(const Bytes& data, ProducerConnection& out);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.ConsumeStatus
-// （ConsumerRunningInfo.statusTable 的值，字段全部来自 ConsumerStatsManager 的快照）
 struct ConsumeStatus {
     double pullRT = 0.0;
     double pullTPS = 0.0;
@@ -149,7 +133,6 @@ struct ConsumeStatus {
     static ConsumeStatus fromJson(const JsonValue& v);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.ConsumerRunningInfo
 struct ConsumerRunningInfo {
     // ConsumerRunningInfo.properties 的固定键（键名由协议约定）
     static constexpr const char* PROP_NAMESERVER_ADDR = "PROP_NAMESERVER_ADDR";
@@ -175,10 +158,6 @@ struct ConsumerRunningInfo {
     static bool decode(const Bytes& data, ConsumerRunningInfo& out);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.ConsumeStatsList
-// （GET_BROKER_CONSUME_STATS 的响应：consumeStatsList 为
-//   <groupName, List<ConsumeStats>> 的列表）
-//
 // ⚠ JSON 键是协议字段名 consumeStatsList，不是 statsList：写错时真机响应会
 // 解析成空列表，看着像「这个 broker 没有积压」。
 struct ConsumeStatsList {
@@ -195,8 +174,6 @@ struct ConsumeStatsList {
     static bool decode(const Bytes& data, ConsumeStatsList& out);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBody
-//
 // ⚠ 协议字段 offsetTable 是 Map<MessageQueue, Long>，**不是** topic->queueId->offset
 // 的嵌套 map；写错时真实 broker 响应解析不出来。
 // broker 侧 fastjson 会把 MessageQueue 键内联成 JSON 对象，故用 admin_body 的键工具解析。
@@ -210,8 +187,6 @@ struct ResetOffsetBody {
     static bool decode(const Bytes& data, ResetOffsetBody& out);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.MessageQueueForC。
-// 字段名沿用协议的驼峰写法（brokerName / queueId），与 MessageQueue 的序列化形状不同。
 struct MessageQueueForC {
     std::string topic;
     std::string brokerName;
@@ -219,10 +194,6 @@ struct MessageQueueForC {
     int64_t offset = 0;
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.ResetOffsetBodyForC：offsetTable 是
-// **数组**（每条自带 offset），不是 map。broker 侧 Broker2Client#resetOffset 只有当 222
-// 发起方的 language=CPP 时才推这种体；本客户端声明的正是 language=CPP，收到后必须能解析，
-// 否则等于整笔重置静默丢弃。
 struct ResetOffsetBodyForC {
     std::vector<MessageQueueForC> offsetTable;
 
@@ -233,10 +204,6 @@ struct ResetOffsetBodyForC {
     static bool decode(const Bytes& data, ResetOffsetBodyForC& out);
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.GetConsumerStatusBody
-// （GET_CONSUMER_STATUS_FROM_CLIENT(221) 的应答体）。messageQueueTable 的键是
-// MessageQueue（broker 侧 fastjson 内联对象键）；consumerTable 是协议保留的废弃字段
-// （clientId -> 位点表），本客户端不填，序列化时按协议形状带空对象。
 struct GetConsumerStatusBody {
     std::map<MessageQueue, int64_t> messageQueueTable;
 
@@ -244,10 +211,6 @@ struct GetConsumerStatusBody {
     Bytes encode() const;
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.ConsumeMessageDirectlyResult
-// （CONSUME_MESSAGE_DIRECTLY(309) 的应答体）。字段全是标量——唯一不需要处理
-// MessageQueue 内联键的 body。consumeResult 取 CMResult 常量：
-// CR_SUCCESS / CR_LATER / CR_ROLLBACK / CR_COMMIT / CR_THROW_EXCEPTION / CR_RETURN_NULL。
 struct ConsumeMessageDirectlyResult {
     bool order = false;
     bool autoCommit = true;

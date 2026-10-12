@@ -1,10 +1,3 @@
-// Message-trace tests. The first group is the one that matters most: every
-// EXPECTED_* string below was printed by the OFFICIAL JAVA implementation
-// (TraceDataEncoder in Apache RocketMQ 5.5.1, run by the parity probe recorded
-// in python/tests/test_trace.py) with SOH/STX made readable. As long as the Go
-// encoder reproduces them byte for byte, this client and the RocketMQ console
-// (and the Java client) understand each other's traces.
-//
 // The second group is an in-process end-to-end pass: a real producer and a real
 // push consumer, both with tracing on, against the mock cluster from
 // instance_test.go — the trace topic is routed to the mock broker and the
@@ -52,7 +45,6 @@ var (
 		"GID_test", "TopicTest", referenceMsgID1, "true"}, traceSOH) + traceSTX
 )
 
-// referenceTraceBean fills every field the Java probe set on TraceBean.
 func referenceTraceBean(msgID, keys string, retryTimes int32) *TraceBean {
 	b := newTraceBean()
 	b.Topic = "TopicTest"
@@ -273,8 +265,6 @@ func TestTraceDecodePubRoundTrip(t *testing.T) {
 	if bean.BodyLength != 42 || bean.OffsetMsgID != referenceOffsetMsgID || bean.MsgType != common.NormalMsg {
 		t.Errorf("bean = %+v", bean)
 	}
-	// Java's encoder never writes clientHost; the decoder falls back to the
-	// local address.
 	if bean.ClientHost != traceLocalAddress {
 		t.Errorf("clientHost = %q, want the LOCAL_ADDRESS default %q", bean.ClientHost, traceLocalAddress)
 	}
@@ -357,9 +347,6 @@ func TestTraceDecodeEndTransactionFields(t *testing.T) {
 
 // ------------------------------------------------------- decoding robustness
 
-// A SubBefore record of a message WITHOUT keys loses its last segment to Java's
-// trailing-empty split rule. Java then throws AIOOBE and drops the whole trace
-// message; this decoder reads a missing segment as "".
 func TestTraceDecodeSubBeforeWithoutKeys(t *testing.T) {
 	raw := strings.Join([]string{"SubBefore", "1700000000000", "DefaultRegion", "GID_trace_live",
 		"REQ-001", referenceMsgID1, "0", ""}, traceSOH) + traceSTX
@@ -477,8 +464,6 @@ func TestTraceDispatcherDefaultsAndGroupName(t *testing.T) {
 	if d.batchNum != 10 || d.maxMsgSize != 128000 {
 		t.Errorf("batchNum/maxMsgSize = %d/%d", d.batchNum, d.maxMsgSize)
 	}
-	// Java caps batchNum at 20 (the extra records would overflow the broker's
-	// per-message limit anyway).
 	if got := newTestDispatcher("GID_test", TraceDispatcherProduce, 50, "").batchNum; got != 20 {
 		t.Errorf("batchNum cap = %d, want 20", got)
 	}
@@ -558,8 +543,6 @@ func TestSendTraceHookPublishesPubRecord(t *testing.T) {
 		if got.TraceBeans[0].MsgID != referenceMsgID1 || got.TraceBeans[0].OffsetMsgID != referenceOffsetMsgID {
 			t.Errorf("bean = %+v", got.TraceBeans[0])
 		}
-		// storeTime is the midpoint of the attempt (Java: timestamp + cost/2), so
-		// it can never precede the context timestamp.
 		if got.TraceBeans[0].StoreTime < got.TimeStamp {
 			t.Errorf("storeTime %d < timestamp %d", got.TraceBeans[0].StoreTime, got.TimeStamp)
 		}
@@ -761,8 +744,6 @@ func TestConsumeTraceHookSkipsTraceOffAndBeforeLessAfter(t *testing.T) {
 	}
 }
 
-// consumeReturnType decides the SubAfter contextCode; its Java shape is
-// null -> EXCEPTION/RETURNNULL, then the RT ceiling, then the outcome.
 func TestConsumeReturnTypeBranches(t *testing.T) {
 	c := MustNewDefaultMQPushConsumer("CID_test")
 	c.SetConsumeTimeout(15)
@@ -931,8 +912,6 @@ func TestConsumerTraceE2EWritesSubBeforeAndSubAfter(t *testing.T) {
 	// internal producer has nowhere to send the records.
 	f := newClusterFixture(t, map[string]int{topic: 1, common.TraceTopic: 1})
 	for _, m := range f.broker.add(topic, 0, "traced-consume") {
-		// The real broker stamps MSG_REGION on every stored message; without it
-		// the dispatcher drops the record (Java: no region, nothing to trace).
 		m.PutProperty(common.PropertyMsgRegion, common.DefaultTraceRegionID)
 	}
 
@@ -970,16 +949,10 @@ func TestConsumerTraceE2EWritesSubBeforeAndSubAfter(t *testing.T) {
 	if len(before.TraceBeans) != 1 || len(after.TraceBeans) != 1 {
 		t.Fatalf("beans = %d/%d, want 1/1", len(before.TraceBeans), len(after.TraceBeans))
 	}
-	// Neither record carries the topic on the wire (Java's encoder does not
-	// write it for the Sub pair); the msgId is what joins a trace to its
-	// message, so that is what must have survived the round trip.
 	if before.TraceBeans[0].MsgID == "" || before.TraceBeans[0].MsgID != after.TraceBeans[0].MsgID {
 		t.Errorf("bean msgIds = %q/%q, must be the same non-empty message id",
 			before.TraceBeans[0].MsgID, after.TraceBeans[0].MsgID)
 	}
-	// Consume-side msgId is the broker's store-address id (Java MessageDecoder
-	// builds it from storeHost + commitLogOffset), here the mock broker's
-	// 127.0.0.1:10911 and the injected commitLogOffset 1000.
 	if _, _, offset, err := common.DecodeMessageID(before.TraceBeans[0].MsgID); err != nil || offset != 1000 {
 		t.Errorf("bean msgId %q does not decode to commitLogOffset 1000 (err=%v)",
 			before.TraceBeans[0].MsgID, err)

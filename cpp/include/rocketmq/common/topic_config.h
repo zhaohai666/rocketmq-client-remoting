@@ -1,9 +1,3 @@
-// TopicConfig（对应 org.apache.rocketmq.common.TopicConfig）。
-//
-// 字段与默认值以 Java 5.x 为准（探针实测，勿凭记忆改）：
-//   new TopicConfig("t") -> readQueueNums=16, writeQueueNums=16, perm=6,
-//   topicFilterType=SINGLE_TAG, topicSysFlag=0, order=false, attributes={}。
-//   attributes **会被序列化**（Java 的 getAttributes() 没有 serialize=false）。
 #ifndef ROCKETMQ_COMMON_TOPIC_CONFIG_H
 #define ROCKETMQ_COMMON_TOPIC_CONFIG_H
 
@@ -16,7 +10,6 @@
 
 namespace rocketmq {
 
-// org.apache.rocketmq.common.TopicFilterType
 struct TopicFilterType {
     static constexpr const char* SINGLE_TAG = "SINGLE_TAG";
     static constexpr const char* MULTI_TAG = "MULTI_TAG";
@@ -41,7 +34,6 @@ struct TopicConfig {
     TopicConfig() = default;
     explicit TopicConfig(const std::string& name) : topicName(name) {}
 
-    // 对应 Java TopicConfig.getPerm() 的可读形式（PermName.permToString）
     std::string permString() const;
 
     JsonValue toJson() const;

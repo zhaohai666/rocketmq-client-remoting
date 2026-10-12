@@ -1,16 +1,3 @@
-// Admin 发起端 CONSUME_MESSAGE_DIRECTLY(309) 的离线单测（Java
-// DefaultMQAdminExtImpl#consumeMessageDirectly:1323 + MQClientAPIImpl#consumeMessageDirectly:2741）。
-//
-// 锁死的报文契约（全部对拍 Java 5.5.1）：
-//   * 309 打到 **存储该消息的 broker**（msg.storeHost），不是路由里随手挑的主节点 ——
-//     broker 要在本地 commitLog 里按 msgId 找到消息体才能转发给目标 clientId。
-//   * header 字段名 = Java ConsumeMessageDirectlyResultRequestHeader 的字段名：
-//     consumerGroup / clientId / msgId / topic（字段名做 ext key，makeCustomHeaderToNet）。
-//   * msgId 解出 UNIQ_KEY 时改传 **offset msgId**（Java MessageClientExt.getOffsetMsgId）。
-//   * 应答 body 是 ConsumeMessageDirectlyResult JSON；非 SUCCESS 由 InvokeSync 抛
-//     MQBrokerException（Java 的 MQClientException(code, remark) 同语义），空 body 抛
-//     MQClientException（nodeJs 端同口径）。
-//
 // 消费端（DefaultMQPushConsumer 的 309 处理器，Consumer.cs）由 ConsumerStatsTests 一线
 // 已有覆盖；这里锁发起端。与 nodeJs/src/client/admin.ts:1361 同题。
 using System;
@@ -46,10 +33,6 @@ public class ConsumeMessageDirectlyTests
         return MessageDecoder.CreateMessageId(MessageDecoder.IpAndPortToBytes(ip, port), offset);
     }
 
-    /// <summary>
-    /// 造一条存放在 mock broker 上的消息（17 段存储格式）。UNIQ_KEY 非空时消息带
-    /// 客户端 uniq 属性 —— 与 Java MessageClientExt 的形状一致。
-    /// </summary>
     private static byte[] EncodedViewBody(string brokerAddr, string? uniqKey)
     {
         int colon = brokerAddr.LastIndexOf(':');
@@ -88,10 +71,6 @@ public class ConsumeMessageDirectlyTests
 
     // ---------------------------------------------------------------- 报文形状 + 结果解码
 
-    /// <summary>
-    /// offset msgId 直查路径：先 VIEW(33) 定位消息，再对 storeHost 下发 309，
-    /// msgId **原样透传**（消息不带 UNIQ_KEY，Java 走第一个分支）。
-    /// </summary>
     [Fact]
     public void SendsTheJavaHeaderFieldsToTheStoreHostAndDecodesTheResult()
     {
@@ -125,12 +104,6 @@ public class ConsumeMessageDirectlyTests
         }
     }
 
-    /// <summary>
-    /// 消息带 UNIQ_KEY ⇒ 下发的 msgId 必须换成 **offset msgId**
-    /// （Java MessageClientExt.getOffsetMsgId:1329-1331）。用"入参 msgId 的位点 ≠
-    /// 消息真实 CommitLogOffset"让两个 ID 可区分：mock 对 VIEW 的应答固定返回
-    /// CommitLogOffset=4096 那条，入参 msgId 用位点 8192 造。
-    /// </summary>
     [Fact]
     public void SubstitutesTheOffsetMsgIdWhenTheMessageCarriesTheUniqKey()
     {
@@ -157,7 +130,6 @@ public class ConsumeMessageDirectlyTests
         }
     }
 
-    /// <summary>不带 UNIQ_KEY 时 msgId 原样透传（Java :1328 的第一分支）。</summary>
     [Fact]
     public void KeepsTheCallerMsgIdWhenTheMessageHasNoUniqKey()
     {

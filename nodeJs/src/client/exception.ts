@@ -1,7 +1,3 @@
-// -*- coding: utf-8 -*-
-// Client-level exception codes (org.apache.rocketmq.client.exception.ClientErrorCode)
-// plus re-exports of the shared exception hierarchy from the remoting layer.
-//
 // NOTE: the foundation remoting/exception.ts is the single source of truth for the exception
 // classes; this module only adds the client-specific error codes (mirroring python/
 // client/exception.py) and a thin RequestTimeoutException used by the request-reply path.

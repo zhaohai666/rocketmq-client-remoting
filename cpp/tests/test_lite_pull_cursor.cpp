@@ -1,12 +1,6 @@
 // 轻量拉取消费者的**拉取游标**（#105）离线单测 —— 假 namesrv + 假 broker（真 socket），
 // 不碰真集群。
 //
-// 对齐基准（Java 5.5.1）：DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998 —— 一轮
-// 拉取**成功返回**之后，无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都把
-// 拉取游标推进到 pullResult.getNextBeginOffset()（:998 updatePullOffset）；唯一的刹车是
-// 「这轮里刚 seek 过」（:808 的 getSeekOffset(mq) == -1 检查）与「队列已被撤走」
-// （AssignedMessageQueue.updatePullOffset:82-91 的 processQueue 身份比对），FOUND 分支的
-// 入缓冲（:986）挂的是同一只刹车。
 //
 // 为什么必须离线锁死：旧实现只在 FOUND 时用 `msgs.back().queueOffset + 1` 推进游标，于是
 // broker 回 NO_MATCHED_MSG（本轮扫过的整段都不匹配）时游标原地不动 —— 下一轮从同一位点
@@ -334,11 +328,6 @@ private:
         netcompat::closeSocket(sock);
     }
 
-    /// PULL_MESSAGE 的应答：排了脚本就按脚本回（挂了闸先等闸），否则按**空 broker** 的
-    /// 忠实形态回 PULL_NOT_FOUND + nextBeginOffset = 请求 queueOffset（Java
-    /// PullMessageProcessor#composeResponseHeader 对 NO_NEW_MSG 同样回填 nextBeginOffset；
-    /// min/max 为 0）。客户端每轮都信 nextBeginOffset，这里不忠实就会把游标推到 0。
-    ///
     /// 请求**先于**发车闸记账：闸把「应答还在路上」这段窗口拉长时，pullCount() 必须立刻
     /// 可见，否则「等第一笔到达」的用例会在闸前空等。pullCodes_ 记的是**应答**码。
     void answerPull(const RemotingCommand& req, RemotingCommand& resp) {
@@ -459,9 +448,6 @@ std::unique_ptr<DefaultLitePullConsumer> startedLite(const std::string& group,
 
 // ---------------------------------------------------------------- 1. NO_MATCHED_MSG
 
-// Java :982-998：NO_MATCHED_MSG 的 nextBeginOffset 已越过本轮扫过的整段不匹配区间，拉取
-// 游标必须跟过去 —— 旧实现只在 FOUND 时用 `msgs.back().queueOffset + 1` 推进，游标会永远
-// 卡在 0，每轮把同一段不匹配区间重扫一遍。
 void testCursorFollowsNextBeginOffsetOnNoMatchedMsg() {
     MockEndpoint cluster;
     cluster.addRoute(kTopic, routeMaster(cluster.address()));
@@ -474,7 +460,6 @@ void testCursorFollowsNextBeginOffsetOnNoMatchedMsg() {
     // 不是内存表里改了个数：下一笔 PULL_MESSAGE 真的从 5 起
     expect(waitFor([&] { return cluster.pullHasOffset(5); }),
            "下一笔 PULL_MESSAGE 从 5 开始（游标真的上了线）");
-    // #106：FIRST_OFFSET 的起点是字面量 0（Java RebalanceLitePullImpl 不发 minOffset 查询）
     expect(!cluster.sawRequest(RequestCode::GET_MIN_OFFSET),
            "FIRST_OFFSET 起点是字面量 0：一次 minOffset 都不该发");
     expect(waitFor([&] { return cluster.pullCode(0) == ResponseCode::PULL_RETRY_IMMEDIATELY; }),
@@ -503,10 +488,6 @@ void testCursorAdoptsTheBrokersOffsetCorrection() {
 
 // ---------------------------------------------------------------- 3. 在途 seek
 
-// 唯一一只刹车（Java :808 的 seekOffset == -1 + :979 的 isDropped）：在途应答回来时，这轮里
-// 刚 seek 过的位点不许被盖掉，也不许把应答里的消息塞进缓冲（seek 的语义就是「游标钉在这里、
-// 旧位点的消息全丢」）。发车闸把在途窗口拉成确定性的：请求已到 broker → seek → 放闸。
-// 旧实现没有刹车：FOUND + 一条 offset=2 的消息会把游标改成 3（last+1）并把消息入缓冲。
 void testInFlightSeekWinsOverThePullResult() {
     MockEndpoint cluster;
     cluster.addRoute(kTopic, routeMaster(cluster.address()));
@@ -535,13 +516,6 @@ void testInFlightSeekWinsOverThePullResult() {
 
 // ---------------------------------------------------------------- 4. lite 位 / 请求码（#107）
 
-// Java 把「置位」和「选码」拆在两处：DefaultLitePullConsumerImpl#pullSyncImpl:1058 以
-// buildSysFlag(false, block, true, false, /*litePull=*/true) 置 FLAG_LITE_PULL_MESSAGE
-// (0x10)；MQClientAPIImpl#pullMessage:816-820 随后据此把请求码切成
-// LITE_PULL_MESSAGE(361)。任一步漏掉，报文依然是一个完全合法的 pull（broker 照常回
-// 消息），但走普通 pull 线程池、且**不受 litePullMessageEnable 开关管辖**
-// （PullMessageProcessor:325 只拦 361）—— 假 broker 不看请求码也能测，所以要专门断言
-// 线上形状（请求码 + header.sysFlag），真机判别器见 examples/live_lite_pull_code.cpp。
 void testLitePullCarriesTheLiteCodeAndFlag() {
     MockEndpoint cluster;
     cluster.addRoute(kTopic, routeMaster(cluster.address()));
@@ -561,8 +535,6 @@ void testLitePullCarriesTheLiteCodeAndFlag() {
     }
     expect(n >= 1 && all361, "lite 拉取请求码全是 LITE_PULL_MESSAGE(361)");
     expect(n >= 1 && allFlag, "每笔拉取的 header.sysFlag 都置了 FLAG_LITE_PULL_MESSAGE(0x10)");
-    // 反向对照：lite 位不能是多置的 —— 与 Java :1058 的 (false, false, true, false, true)
-    // 逐位对齐（无 commitOffset / suspend / classFilter 位）。
     const PropertyMap ext0 = cluster.pullExt(0);
     const int32_t flag0 = static_cast<int32_t>(MockEndpoint::extInt(ext0, "sysFlag", -1));
     expect(!PullSysFlag::hasCommitOffsetFlag(flag0) && !PullSysFlag::hasSuspendFlag(flag0) &&

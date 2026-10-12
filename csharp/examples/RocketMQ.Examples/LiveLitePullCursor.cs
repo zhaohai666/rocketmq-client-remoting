@@ -1,7 +1,3 @@
-// lite-pull **拉取游标**（#105，Java DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998）
-// 真机验证。与 cpp/examples/live_lite_pull_cursor.cpp、python/verify_lite_pull_cursor_live.py、
-// rust/examples/live_lite_pull_cursor.rs 同题、逐条对应。
-//
 // 离线单测（tests/RocketMQ.Client.Tests/LitePullCursorTests.cs）只能证明「脚本回的
 // nextBeginOffset 被跟了」；真 broker 才能让下面两件事同时成立：那个 nextBeginOffset 是
 // **broker 自己算的**，而且跟过去以后**真的能收到消息**。

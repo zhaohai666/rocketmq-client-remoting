@@ -1,10 +1,5 @@
-// 请求码 / 响应码 / 语言码 / 序列化类型（对应 org.apache.rocketmq.remoting.protocol 枚举与常量）。
-//
-// 取值与 cpp/include/rocketmq/remoting/protocol/codes.h、python/.../codes.py 逐项对齐，
-// 并由 tests 里的 Java 对齐用例在 ROCKETMQ_JAVA_SRC 指向 Java 源码树时做回归守卫。
 namespace RocketMQ.Remoting.Protocol;
 
-/// <summary>org.apache.rocketmq.remoting.protocol.RequestCode（166 项，这里收录客户端用到的全集）。</summary>
 public static class RequestCode
 {
     public const int SendMessage = 10;
@@ -175,7 +170,6 @@ public static class RequestCode
     public const int BatchAckMessage = 200151;
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.RemotingSysResponseCode（5 项）。</summary>
 public static class RemotingSysResponseCode
 {
     public const int Success = 0;
@@ -185,7 +179,6 @@ public static class RemotingSysResponseCode
     public const int TransactionFailed = 4;
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.ResponseCode（含客户端侧 RPC_* 伪响应码）。</summary>
 public static class ResponseCode
 {
     // RemotingSysResponseCode
@@ -260,7 +253,6 @@ public static class ResponseCode
     public const int PolicyNotExist = 3002;
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.LanguageCode。</summary>
 public static class LanguageCode
 {
     public const byte Java = 0;
@@ -319,7 +311,6 @@ public static class LanguageCode
     };
 }
 
-/// <summary>org.apache.rocketmq.remoting.protocol.SerializeType。</summary>
 public static class SerializeType
 {
     public const byte Json = 0;

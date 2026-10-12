@@ -1,5 +1,3 @@
-//! 220 `RESET_CONSUMER_CLIENT_OFFSET`（Java `MQClientInstance.resetOffset:1403-1450`）真机验证。
-//!
 //! 与 `python/verify_reset_offset_live.py` 同题逐条对应，另三端（cpp/csharp）各有同名脚本。
 //!
 //! 220 是 broker 推给**消费端**的重置指令；管理端那笔 `INVOKE_BROKER_TO_RESET_OFFSET(222)`
@@ -427,9 +425,6 @@ fn all_committed(rows: &[(MessageQueue, i64, Option<i64>)], want: i64) -> bool {
 }
 
 /// 本端口内存里的「已消费位点」；`None` = 该队列在表里没有记录。
-///
-/// 220 的重置语义（Java `removeOffset`）就是「重置后表里没有旧位点」，所以 None 与 0 必须
-/// 能分开：只有 None 才能证明旧批次的 ack 没有把位点推回去。
 fn local_offset(c: &DefaultMQPushConsumer, topic: &str) -> Option<i64> {
     c.get_consumer_status(Some(topic))
         .into_iter()
@@ -555,8 +550,6 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
         return;
     }
 
-    // 等周期落盘的**首跳**过去（Java initialDelay = start 后 10s，之后才是 60s 周期）。
-    // 不等它，重置后那次 persist 会与首跳混在一起，「broker 位点之所以是 3」就说不清。
     let quiet = poll_until(|| t_start.elapsed() > Duration::from_secs(12), 15).await;
     let rows = fx.committed(&group, &topic).await;
     ck.check(

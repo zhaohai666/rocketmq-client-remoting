@@ -1,10 +1,4 @@
 # -*- coding: utf-8 -*-
-"""RemotingCommand 帧格式测试（对应 org.apache.rocketmq.remoting.protocol.RemotingCommand）。
-
-线格式（Java encode）：
-    totalLength(4) | headerLength(4, 高 8 位为序列化类型) | headerData | bodyData
-其中 totalLength = 4 + len(headerData) + len(bodyData)。
-"""
 from __future__ import annotations
 
 import json
@@ -101,7 +95,7 @@ class TestRoundTrip:
         assert got.ext_fields == {}
 
     def test_ext_field_roundtrip_preserves_strings(self):
-        """extFields 在网络上只能是字符串（Java Map<String, String>）。"""
+        pass
         cmd = make_request(ext={"queueId": "3", "batch": "true"})
         cmd.serialize_type_current_rpc = SerializeType.ROCKETMQ
         got = RemotingCommand.decode(cmd.encode())
@@ -162,7 +156,7 @@ class TestCustomHeader:
 
     @pytest.mark.parametrize("serialize_type", [SerializeType.JSON, SerializeType.ROCKETMQ])
     def test_v2_short_field_names(self, serialize_type):
-        """V2 使用 a..m 短字段名，必须与 Java SendMessageRequestHeaderV2 一致。"""
+        pass
         cmd = RemotingCommand.create_request_command(RequestCode.SEND_MESSAGE_V2, self._v2_header())
         cmd.serialize_type_current_rpc = serialize_type
         got = RemotingCommand.decode(cmd.encode())
@@ -210,8 +204,6 @@ class TestCustomHeader:
 
 
 def test_remoting_command_version_default():
-    # 出站请求带真实协议版本（对齐 Java MQVersion.CURRENT_VERSION）：
-    # 0 会让 broker 拒发 307/221 等回调型管理请求（见 remoting_command.CURRENT_VERSION）
     cmd = RemotingCommand.create_request_command(RequestCode.GET_ROUTEINFO_BY_TOPIC)
     assert cmd.version == CURRENT_VERSION
     assert RemotingCommand.decode(cmd.encode()).version == CURRENT_VERSION

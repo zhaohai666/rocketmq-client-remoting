@@ -32,15 +32,6 @@
 // sleep, not the contract — the goroutines it forgot to join simply finish
 // during the padding.
 //
-// A SECOND TRAP, and it cost a debugging round — this one is in the ASSERTIONS.
-// A message pulled from %RETRY%<group> is delivered with msg.Topic RESTORED to
-// the business topic (resetRetryTopicAndNamespace / Java resetRetryAndNamespace),
-// so counting the deliveries as "topic == retryTopic" reads ZERO even though
-// every single one arrived. %DLQ% messages are not restored for a probe group
-// whose name differs from the original one — which is exactly why the retry
-// probe below counts by BODY and the DLQ probes count by TOPIC. Each phase also
-// prints the topic distribution the listener saw, so a mismatch is visible.
-//
 // Scenarios and the discriminator each one uses:
 //
 //   - S1 concurrent, all RECONSUME_LATER, two rounds, immediate exit both
@@ -677,12 +668,6 @@ func phaseS1B(ns string, n names) {
 		fmt.Println("RESULT retry=0")
 		return
 	}
-	// TRAP, and it cost a debugging round: a message pulled from %RETRY%<group>
-	// is delivered with msg.Topic RESTORED to the business topic
-	// (resetRetryTopicAndNamespace / Java resetRetryAndNamespace). Counting
-	// deliveries as "topic == retryTopic" therefore sees ZERO even when every
-	// single one arrived — count by body, and print the topics the listener
-	// actually saw so the trap is visible if this ever breaks again.
 	box.waitDistinct("", msgCount, roundTripWindow)
 	got := box.distinct("")
 	fmt.Printf("RESULT retry=%d\n", got)

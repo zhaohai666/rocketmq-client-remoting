@@ -1,24 +1,5 @@
-// 异步发送背压（EnableBackpressureForAsyncMode 那一套公平信号量）真机验证
-// （对齐 Java DefaultMQProducerImpl.executeAsyncMessageSend:635-682，
-// 与 python/verify_backpressure_live.py、cpp/examples/live_backpressure.cpp 同套场景）。
-// 用法：rmq backpressure [namesrv]
-//
 // 前置：NameServer + Broker 已起，autoCreateTopicEnable=true。
 //
-// 离线单测（tests/RocketMQ.Client.Tests/BackPressureTests.cs）锁的是信号量语义；
-// 这个脚本锁的是**打到真 broker 时**的五件事：
-//   B1  默认容量（1024 条 / 100M 字节）开着背压发一整轮异步消息：全部 SEND_OK，
-//       且发完之后两个信号量**满额归还**（真机不泄配额 —— 泄了迟早把生产者自己锁死）。
-//   B2  条数闸夹到地板值 10、用 SendMessageBefore 钩子睡 600ms 把在途占满：
-//       第 11、12 笔在**调用方线程**上等不到许可，回调
-//       send message tryAcquire semaphoreAsyncNum timeout（Java :654-658 原文案），
-//       而且 broker 上**一条都没多** —— 被拒的请求连路由都没查。
-//   B3  运行时把容量从 10 调到 12：正卡在闸上的调用方被叫醒，broker 上多出那 1 条，
-//       全部落地后空闲许可 = 新容量（这一轮钩子睡 2s，留出足够的观察窗口）。
-//   B4  字节闸（容量 1M 地板值 + 600KB body ⇒ 在途只能 1 笔）：第二笔回调
-//       send message tryAcquire semaphoreAsyncSize timeout（Java :667-671），
-//       在途时空闲字节许可正好是 1M - 600K，broker 上只落 1 条。
-//   B5  关掉背压：同样的容量配置**完全不限流**，30 笔并发（含 300KB 大 body）全部落地。
 //
 // ⚠ 三条脚本纪律（Python 那一轮真机联调踩出来的）：
 //   ① topic 一律带 Stamp —— 三语言**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
@@ -111,7 +92,6 @@ public static class LiveBackPressure
             get { lock (_lk) return _errors.Count; }
         }
 
-        /// <summary>「每一条错误都带这句文案」—— Java 的文案是逐字对齐的，只查条数会放过内容漂移。</summary>
         public bool AllErrorsContain(string needle, int expected)
         {
             lock (_lk)
@@ -121,8 +101,6 @@ public static class LiveBackPressure
             }
         }
 
-        /// <summary>#78：背压闸拒绝在 Java 里是 RemotingTooMuchRequestException，
-        /// 不是 MQClientException（DefaultMQProducerImpl:660 就地回调）。</summary>
         public bool AllErrorsAre(Type type, int expected)
         {
             lock (_lk)
@@ -337,9 +315,6 @@ public static class LiveBackPressure
             Check("B2 超限的两笔回调 TooMuchRequest，文案与 Java 逐字一致",
                 rejected.AllErrorsContain("send message tryAcquire semaphoreAsyncNum timeout", 2),
                 rejected.Summary());
-            // #78：Java 在这条路径上回调的是 RemotingTooMuchRequestException 本身
-            // （DefaultMQProducerImpl:660），不是包装后的 MQClientException —— 类型错了，
-            // 调用方按类型分流（超限就地丢弃 vs 可重试）就会走错分支。
             Check("B2 超限回调的异常类型是 RemotingTooMuchRequestException（Java 原类型）",
                 rejected.AllErrorsAre(typeof(RemotingTooMuchRequestException), 2),
                 rejected.Summary());
@@ -433,8 +408,6 @@ public static class LiveBackPressure
                 two.Summary());
             Check("B4 字节闸拒绝的异常类型是 RemotingTooMuchRequestException（Java BackpressureSendCallBack 原类型）",
                 two.AllErrorsAre(typeof(RemotingTooMuchRequestException), 1), two.Summary());
-            // 字节闸没过时，先前拿到的条数许可必须原样还回去（Java BackpressureSendCallBack:599-610
-            // 的先 size 后 num 归还）
             Check("B4 字节闸没过时条数许可已经归还",
                 WaitUntil(() => NumPermits(p) == FairSemaphore.MinAsyncSendNum, 3000),
                 "available=" + N(NumPermits(p)));

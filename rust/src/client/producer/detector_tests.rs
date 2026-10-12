@@ -1,19 +1,7 @@
-//! 故障规避主动探活（Java 5.x `LatencyFaultToleranceImpl#startDetector` /
-//! `detectByOneRound` + `DefaultMQProducerImpl` 里那个匿名 `ServiceDetector`）的
-//! 离线对拍。
-//!
 //! 真集群造不出「探测超时」也观察不到「探测恢复放行」的时序，所以这里在进程内
 //! 起一个假集群（1 个 namesrv + 1 个 broker，只说 remoting 协议），broker 的
 //! `GET_MAX_OFFSET(30)` 应答可脚本化（即时 SUCCESS / 延迟超过 detectTimeout /
 //! 回业务错误码），探测是否真的发过请求靠请求计数断言。
-//!
-//! Java 语义基准（`MQFaultStrategy.java` / `LatencyFaultToleranceImpl.java` /
-//! `ClientConfig.java`）：
-//! - 调度固定 3s 一轮（`scheduleAtFixedRate(3, 3, SECONDS)`），轮内按
-//!   `detectInterval` 的 `checkStamp` 去重；
-//! - 探测**失败不写表**：可达性只由发送链路 `updateFaultItem(…, !startDetectorEnable)`
-//!   写坏，探测只负责把 broker 探回来；
-//! - 路由里解析不到地址 ⇒ 故障项连同清除。
 
 #![cfg(test)]
 
@@ -253,7 +241,6 @@ async fn wait_for(cond: impl Fn() -> bool, what: &str) {
 
 // ---------------------------------------------------------------- 用例
 
-/// 默认值对齐 Java `ClientConfig:82-83,100`；默认关闭（不 startDetector）。
 #[test]
 fn detector_config_defaults_match_java_client_config() {
     let cfg = ProducerConfig::default();
@@ -279,7 +266,6 @@ async fn detector_disabled_by_default_sends_no_probes() {
     let producer = started("detector_off", &cluster, false, 200, 300).await;
     seed_route(&producer).await;
 
-    // 模拟发送链路写坏可达性（探测关着时 Java 传 reachable=true，这里只为造表）
     producer.fault_strategy().update_fault_item("broker-0", 100, true, false);
     assert!(!producer
         .fault_strategy()
@@ -311,7 +297,6 @@ async fn detector_restores_unreachable_broker_and_keeps_probing() {
     producer.fault_strategy().update_fault_item("broker-0", 100, true, false);
     assert!(!tolerance.is_reachable("broker-0"));
 
-    // Java 首轮延迟 3s；给足预算等它探回来
     wait_for(
         || tolerance.is_reachable("broker-0"),
         "探测成功后 broker-0 应回到可达",
@@ -345,7 +330,6 @@ async fn detect_timeout_keeps_broker_unreachable_until_it_recovers() {
     producer.fault_strategy().update_fault_item("broker-0", 100, true, false);
     assert!(!tolerance.is_reachable("broker-0"));
 
-    // 至少两轮探测都超时：可达性不得被探测写好（Java：探测失败不写表）
     wait_for(
         || cluster.requests() >= 2,
         "12s 内应发生至少两轮探测（3s 首轮 + 3s 周期）",

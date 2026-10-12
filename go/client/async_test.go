@@ -16,9 +16,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// deadBrokerAddr is a syntactically valid address with nothing listening, so a
-// connection attempt fails fast with ECONNREFUSED — which the transport types as
-// KindConnect, the Go spelling of Java's RemotingConnectException.
 const deadBrokerAddr = "127.0.0.1:1"
 
 // ---------------------------------------------------------------- fixtures
@@ -200,7 +197,6 @@ func TestFairSemaphoreSetTotalPermitsPreservesInFlight(t *testing.T) {
 	if !s.tryAcquire(3, 100) {
 		t.Fatal("acquire failed")
 	}
-	// Java DefaultMQProducerTest:593-595 asserts exactly this sum.
 	if got := s.availablePermits(); got != 7 {
 		t.Fatalf("available = %d, want 7", got)
 	}
@@ -224,8 +220,6 @@ func TestFairSemaphoreShrinkMayGoNegative(t *testing.T) {
 	if !s.tryAcquire(10, 100) {
 		t.Fatal("acquire failed")
 	}
-	// Shrinking below what is in flight: Java's `new Semaphore(negative)` accepts
-	// this too, and the outstanding releases pull it back positive.
 	s.setTotalPermits(4)
 	if got := s.availablePermits(); got != -6 {
 		t.Fatalf("available = %d, want -6", got)
@@ -287,8 +281,6 @@ func TestAsyncConfigDefaultsAndFloors(t *testing.T) {
 		t.Errorf("size semaphore permits = %d, want 100M", got)
 	}
 
-	// The floors. Java writes the branch as `if (cfg > floor)`, so a value EQUAL
-	// to the floor also lands on the floor.
 	p.SetBackPressureForAsyncSendNum(3)
 	if got := p.BackPressureForAsyncSendNum(); got != MinAsyncSendNum {
 		t.Errorf("num floor: got %d, want %d", got, MinAsyncSendNum)
@@ -322,8 +314,6 @@ func TestAsyncConfigResizeKeepsInFlightCount(t *testing.T) {
 	if got := p.SemaphoreAsyncSendNumAvailablePermits(); got != 6 {
 		t.Fatalf("available = %d, want 6", got)
 	}
-	// Java's formula makes this the interesting case: acquired = 10 - 6 = 4, so
-	// the new semaphore is `new Semaphore(12 - 4)` = 8 free.
 	p.SetBackPressureForAsyncSendNum(12)
 	if got := p.SemaphoreAsyncSendNumAvailablePermits(); got != 8 {
 		t.Errorf("available = %d, want 8 (4 still in flight)", got)
@@ -359,11 +349,6 @@ func TestAsyncSendDeliversResultOffTheCallerGoroutine(t *testing.T) {
 	}
 }
 
-// TestAsyncSendHookPairFiresOnceWithTheRealResult pins down a deliberate
-// divergence: Java runs SendMessageHook.after TWICE for an async send — once with
-// a null SendResult straight after dispatch (sendKernelImpl:1087-1090, the ASYNC
-// branch never assigns sendResult) and once with the real outcome. This port, like
-// the Python/C++/C# ones, fires it once with the real outcome.
 func TestAsyncSendHookPairFiresOnceWithTheRealResult(t *testing.T) {
 	const topic = "AsyncHookTopic"
 	p, _, _ := startAsyncFixture(t, topic, "GID_async_hook", 0, nil)
@@ -498,9 +483,6 @@ func TestAsyncSendRetryBudgetIsHonoured(t *testing.T) {
 	}
 }
 
-// TestAsyncSendReportsSendRequestFailed checks the error the transport failure is
-// reported AS: Java wraps operationFail's RemotingSendRequestException into
-// MQClientException("send request failed") and the original stays reachable.
 func TestAsyncSendReportsSendRequestFailed(t *testing.T) {
 	const topic = "AsyncFailTextTopic"
 	p, broker, _ := startAsyncFixture(t, topic, "GID_async_failtext", 0,
@@ -676,12 +658,6 @@ func TestAsyncSendReturnsPermitsAfterSuccessAndFailure(t *testing.T) {
 	}
 }
 
-// TestAsyncSendChargesThePreCompressionBodyLength: Java computes msgLen on the
-// CALLER's thread, before the worker compresses, so the permits charged must be
-// the ORIGINAL body length. The test is discriminating rather than tautological:
-// the byte budget is left with 7 permits, which cannot cover a 4 KiB body but
-// easily covers its compressed form — charging the post-compression length would
-// let the send through.
 func TestAsyncSendChargesThePreCompressionBodyLength(t *testing.T) {
 	const topic = "AsyncPermitLenTopic"
 	p, broker, _ := startAsyncFixture(t, topic, "GID_async_permit_len", 0,
@@ -718,11 +694,6 @@ func TestAsyncSendChargesThePreCompressionBodyLength(t *testing.T) {
 	}
 }
 
-// TestAsyncSendCompressesOnTheWorkerAndRestoresTheCallerMessage mirrors Java's
-// sendKernelImpl: compression happens on the sender goroutine (:945) and its
-// finally (:1093-1096) puts the caller's body back once the request is on its
-// way. The wire body must be the compressed one while the caller's message ends
-// up byte-identical to what it was handed over as.
 func TestAsyncSendCompressesOnTheWorkerAndRestoresTheCallerMessage(t *testing.T) {
 	const topic = "AsyncRestoreTopic"
 	p, broker, _ := startAsyncFixture(t, topic, "GID_async_restore", 0,
@@ -778,9 +749,6 @@ func fillSenderQueue(t *testing.T, p *DefaultMQProducer) (release func()) {
 	return release
 }
 
-// TestAsyncSendExecutorRejectedWhenQueueFull: without back pressure a full sender
-// queue is reported to the CALLER, not through the callback — Java's
-// `MQClientException("executor rejected")` out of executeAsyncMessageSend.
 func TestAsyncSendExecutorRejectedWhenQueueFull(t *testing.T) {
 	const topic = "AsyncRejectTopic"
 	p, _, _ := startAsyncFixture(t, topic, "GID_async_reject", 0, nil)
@@ -800,9 +768,6 @@ func TestAsyncSendExecutorRejectedWhenQueueFull(t *testing.T) {
 	}
 }
 
-// TestAsyncSendRunsInlineWhenBackpressureIsOn covers Java :675-681: with the gate
-// armed the permits are already deducted, so a full queue makes the send run on
-// the CALLER's goroutine (blocking it — that is the point) instead of failing.
 func TestAsyncSendRunsInlineWhenBackpressureIsOn(t *testing.T) {
 	const topic = "AsyncInlineTopic"
 	p, broker, _ := startAsyncFixture(t, topic, "GID_async_inline", 0,
@@ -878,9 +843,6 @@ func TestAsyncSendPinnedQueueUsesTheAsyncWording(t *testing.T) {
 	const topic = "AsyncPinnedTopic"
 	p, _, _ := startAsyncFixture(t, topic, "GID_async_pinned", 0, nil)
 
-	// A queue whose topic differs from the message's: Java guards this with
-	// pinnedTopicMismatchAsync on the async kernel, pinnedTopicMismatchSync on the
-	// sync one, and the two texts differ on purpose.
 	mq := common.NewMessageQueue("AnotherTopic", "b1", 0)
 	cb := newCaptureCallback()
 	if err := p.SendAsyncToQueue(common.NewMessage(topic, []byte("x")), mq, cb); err != nil {
@@ -976,25 +938,18 @@ func TestAsyncSendBySelectorUsesTheSelectedQueue(t *testing.T) {
 	}
 }
 
-// emptySelector mirrors a selector that cannot decide; Java turns that into
-// "select message queue return null.".
 type emptySelector struct{}
 
 func (emptySelector) Select(_ []common.MessageQueue, _ *common.Message, _ any) (common.MessageQueue, error) {
 	return common.MessageQueue{}, nil
 }
 
-// throwingSelector mirrors a selector that blows up; Java wraps it as
-// "select message queue threw exception." rather than leaking the type.
 type throwingSelector struct{}
 
 func (throwingSelector) Select(_ []common.MessageQueue, _ *common.Message, _ any) (common.MessageQueue, error) {
 	panic("selector exploded")
 }
 
-// TestAsyncSendBySelectorSurfacesSelectorFailuresToTheCallback checks that a
-// selector which cannot decide, or which throws, is reported through the callback
-// with Java's wording rather than leaking its own error type.
 func TestAsyncSendBySelectorSurfacesSelectorFailuresToTheCallback(t *testing.T) {
 	const topic = "AsyncSelectorErrTopic"
 	p, _, _ := startAsyncFixture(t, topic, "GID_async_selector_err", 0, nil)

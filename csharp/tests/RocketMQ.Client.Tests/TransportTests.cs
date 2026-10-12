@@ -300,7 +300,6 @@ public class TransportTests
                 err = error;
             }, 300);
 
-            // 清理线程与 Java scanResponseTable 同式：deadline + 1s 宽限才判超时
             for (int i = 0; i < 300 && Volatile.Read(ref fired) == 0; i++)
             {
                 await Task.Delay(20);

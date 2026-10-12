@@ -293,9 +293,6 @@ fn consumer_config(
         // FIRST_OFFSET：新组首启要从队列头把预先发出的消息读回来；重投 topic 上
         // 没有本组位点时同理（from_where 只在无位点时生效）。
         consume_from_where: ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string(),
-        // 并发侧：rt=0 先回 %RETRY%（broker 延迟 10s），rt 到上限后 broker 直接改投
-        // %DLQ% —— 1 就是「一轮重投 + 一轮死信」，两轮都卡在「立即退进程」上。
-        // 顺序侧：本地挂起计数到上限后走顺序回投（Java checkReconsumeTimes）。
         max_reconsume_times,
         // S1 要整批一起在途：默认 1 条一批的话，关停那一刻只有 1 条 send-back 在飞，
         // 判别式被稀释成一个原子的时序巧合。

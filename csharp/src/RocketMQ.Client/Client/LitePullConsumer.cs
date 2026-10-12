@@ -1,25 +1,3 @@
-// 轻量拉取消费者（对齐 org.apache.rocketmq.client.consumer.DefaultLitePullConsumer 与
-// Python client/consumer.py 的 DefaultLitePullConsumer、C++ lite_pull_consumer）。
-//
-// 与 DefaultMQPullConsumer（C# PullConsumer.cs）的本质区别：
-// - DefaultMQPullConsumer：调用方自己 Pull(mq,offset) 逐队列拉、自己管位点；没有本地缓冲、
-//   没有后台拉取线程、不做 rebalance。
-// - DefaultLitePullConsumer：支持两种模式——
-//   * subscribe 模式：登记订阅后自动 rebalance 分配队列（与 push 一致），后台拉取线程把
-//     消息灌进**本地缓冲**；Poll() 只从本地缓冲取消息，不用调用方管位点；
-//   * assign 模式：调用方 Assign([mq...]) 显式指定队列，不走 rebalance，同样后台灌本地缓冲。
-// 两种模式都用 Poll(timeout) 取批量消息；位点默认 AutoCommit，但**提交的是"已消费游标"**
-// （Poll 交给调用方的那一格），不是后台的拉取游标 —— 与 Java
-// `AssignedMessageQueue.MessageQueueState{pullOffset, consumeOffset}` + `offsetStore` 的
-// 三张表同口径，详见 Commit() 的注释。
-//
-// 设计取舍（与 C++ / Python 参考实现一致）：
-// - 后台**单个**拉取线程顺序遍历所有已分配队列做短轮询（suspend=false），把消息塞进
-//   一个线程安全的本地缓冲 _localBuffer；Poll() 用 Monitor 等待并 drain 该缓冲。
-// - subscribe 模式的 rebalance 复用既有 GetConsumerIdListByGroup + 队列分配策略
-//   （AllocateStrategy.cs，默认 AllocateMessageQueueAveragely），与 push 消费者同一套分配算法；
-//   查询不到消费组列表时按 Java 语义「保留当前分配」，不回退独占。
-// - 不做 POP / 推模式；不做 broker 主动请求（309/313）处理（那是 push 消费者的职责）。
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -31,17 +9,12 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Client;
 
-/// <summary>队列分配变更监听器（对应 Java MessageQueueListener / Python MessageQueueListener）。</summary>
 public interface ILiteMessageQueueListener
 {
     // mqAll=当前订阅的全部队列；mqDivided=本次新分配给本实例的队列。
     void MessageQueueChanged(IReadOnlyList<MessageQueue> mqAll, IReadOnlyList<MessageQueue> mqDivided);
 }
 
-/// <summary>topic 队列集合变更监听器（对应 Java TopicMessageQueueChangeListener）。
-/// 后台任务按 TopicMetadataCheckIntervalMillis 比对该 topic 的订阅队列集合，**只在集合真的
-/// 变了**（扩容/缩容）时回调 OnChanged(topic, 新集合)；没变不回调。
-/// 与 <see cref="ILiteMessageQueueListener"/>（本实例分到了哪些队列）是两回事。</summary>
 public interface ITopicMessageQueueChangeListener
 {
     void OnChanged(string topic, IReadOnlyList<MessageQueue> messageQueues);
@@ -55,22 +28,15 @@ public sealed class DefaultLitePullConsumer
     private string _instanceName = MixAll.DefaultInstanceName;
     private string _clientId = string.Empty;
     private string _messageModel = MessageModel.Clustering;
-    // 队列分配策略，对应 Java DefaultLitePullConsumer.allocateMessageQueueStrategy
-    // （字段初值 new AllocateMessageQueueAveragely()）。
     private IAllocateMessageQueueStrategy? _allocateMessageQueueStrategy = new AllocateMessageQueueAveragely();
     private string _consumeFromWhere = ConsumeFromWhere.ConsumeFromLastOffset;
-    // Java DefaultLitePullConsumer.consumeTimestamp 的字段初值：now - 30 分钟。
-    // 留空会让 CONSUME_FROM_TIMESTAMP 退化成「从当前时刻起消费」。
     private string _consumeTimestamp =
         UtilAll.TimeMillisToHumanString3(UtilAll.CurrentTimeMillis() - 30 * 60 * 1000);
     private readonly List<string> _nameServerAddrs = new();
     private IRpcHook? _rpcHook;
-    // ClientConfig 的三个单元化/stream 开关。⚠ Java 的 DefaultLitePullConsumer 在构造
-    // 函数里就把 enableStreamRequestType 置真（:213/228），所以这里默认 **true**。
     private string _unitName = string.Empty;
     private bool _unitMode;
     private bool _enableStreamRequestType = true;
-    // Java ClientConfig#pollNameServerInterval 的默认值（:58）
     private int _pollNameServerIntervalMillis = 30000;
 
     // subscribe 模式的订阅表（topic -> sub_expression，已套命名空间）
@@ -92,31 +58,14 @@ public sealed class DefaultLitePullConsumer
 
     private readonly object _bufferLock = new();
     private readonly Queue<MessageExt> _localBuffer = new();
-    /// <summary>
-    /// **拉取游标**（Java <c>MessageQueueState.pullOffset</c>）：只回答"下一次从哪拉"，
-    /// 任何情况下都不是提交内容。
-    /// </summary>
     private readonly Dictionary<MessageQueue, long> _nextOffset = new();
-    /// <summary>
-    /// **已消费游标**（Java <c>MessageQueueState.consumeOffset</c>）：只有 Poll() 把消息交到
-    /// 调用方手上才前进，本地缓冲里压着的部分不算已消费。
-    /// </summary>
     private readonly Dictionary<MessageQueue, long> _consumeOffset = new();
-    /// <summary>
-    /// 内存位点表，对位 Java <c>RemoteBrokerOffsetStore.offsetTable</c>：提交的落点，
-    /// <c>persist=false</c> 的值就攒在这里。
-    /// </summary>
     private readonly Dictionary<MessageQueue, long> _offsetTable = new();
     private readonly Dictionary<MessageQueue, long> _seekOffset = new();
-    // Java DefaultLitePullConsumerImpl.nextAutoCommitDeadline 的初值：**-1** 而不是 0
-    // （0 是 epoch 起点，等价于"永远不到点"）⇒ 第一次检查就会提交一次。
     private long _nextAutoCommitDeadline = -1;
     private readonly HashSet<MessageQueue> _paused = new();
     private ILiteMessageQueueListener? _messageQueueListener;
-    // Java DefaultLitePullConsumer:160 topicMetadataCheckIntervalMillis 默认 30s。
     private int _topicMetadataCheckIntervalMillis = 30000;
-    // Java Impl:144/146：监听器表 + 每个 topic 上次看到的队列集合。
-    // 键取 withNamespace(topic)（Java :325-327 在入口就套好），回调收回来的也是它。
     private readonly Dictionary<string, ITopicMessageQueueChangeListener> _topicChangeListeners =
         new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<MessageQueue>> _messageQueuesForTopic =
@@ -155,11 +104,6 @@ public sealed class DefaultLitePullConsumer
 
     public void SetMessageModel(string model) => _messageModel = model;
 
-    /// <summary>
-    /// 队列分配策略（对应 Java DefaultLitePullConsumer.setAllocateMessageQueueStrategy）。
-    /// 与 Java 同款：setter 不校验，置 null 由 Start() 的 checkConfig 拒绝
-    /// （Java DefaultLitePullConsumerImpl.checkConfig:435 "allocateMessageQueueStrategy is null"）。
-    /// </summary>
     public void SetAllocateMessageQueueStrategy(IAllocateMessageQueueStrategy? strategy) =>
         _allocateMessageQueueStrategy = strategy;
 
@@ -167,41 +111,24 @@ public sealed class DefaultLitePullConsumer
 
     public void SetNamespace(string ns) => _namespace = ns ?? string.Empty;
 
-    // ---------------- unitName / unitMode / enableStreamRequestType ----------------
-    // 对应 Java ClientConfig 的三个同名开关。⚠ 必须在 Start() 之前设置。
-    /// <summary>单元名：进 clientId 的 <c>@&lt;unitName&gt;</c> 段，也拼进动态取址 URL。</summary>
     public string UnitName
     {
         get => _unitName;
         set => _unitName = value ?? string.Empty;
     }
 
-    /// <summary>
-    /// 对应 Java <c>ClientConfig#isUnitMode()</c>：lite 路径经 MQClientInstance:1039 进
-    /// 心跳的 ConsumerData.unitMode，决定 broker 侧 %RETRY% topic 的 UNIT_SUB(0x2) 标记。
-    /// （Java 还把它传进 PullAPIWrapper 用于过滤上下文，DefaultLitePullConsumerImpl:356-359；
-    /// 本端 lite 消费者没有 filter message hook，所以只有心跳这一处落地。）
-    /// </summary>
     public bool UnitMode
     {
         get => _unitMode;
         set => _unitMode = value;
     }
 
-    /// <summary>
-    /// 每笔请求带 <c>ReqT=0</c>、clientId 末尾多一段 <c>@STREAM</c>。
-    /// Java 的 DefaultLitePullConsumer 在构造里就置真，本端口默认值与之对齐。
-    /// </summary>
     public bool EnableStreamRequestType
     {
         get => _enableStreamRequestType;
         set => _enableStreamRequestType = value;
     }
 
-    /// <summary>
-    /// Java <c>ClientConfig#pollNameServerInterval</c>（:58，默认 30000ms）：在用 topic 的
-    /// 路由刷新周期，Start() 时透传给 MqClient（之后改不重排已启动的周期任务）。
-    /// </summary>
     public int PollNameServerIntervalMillis
     {
         get => _pollNameServerIntervalMillis;
@@ -210,11 +137,6 @@ public sealed class DefaultLitePullConsumer
 
     private SocksProxyConfig? _socksProxyConfig;
 
-    /// <summary>
-    /// SOCKS 代理（对应 Java ClientConfig#socksProxyConfig / SocksProxyConfig 的
-    /// addr / username / password；Version 另支持 SOCKS4/4a）。只作用于传输层
-    /// remoting 长连接，NameServer 的 HTTP 动态取址请求不走 SOCKS（与 Java 口径一致）。
-    /// </summary>
     public SocksProxyConfig? SocksProxyConfig
     {
         get => _socksProxyConfig;
@@ -236,9 +158,6 @@ public sealed class DefaultLitePullConsumer
         set => _namespace = value ?? string.Empty;
     }
 
-    /// <summary>对应 Java <c>ClientConfig#namespaceV2</c>（5.x 新命名空间）：非空时由
-    /// <see cref="NamespaceRpcHook"/>（钩子链首）给每笔请求加 <c>nsd=true</c> / <c>ns</c>
-    /// 扩展头。钩子每笔请求现读本属性（Java 同款），Start() 之后设置也从下一笔请求起生效。</summary>
     public string NamespaceV2
     {
         get => _namespaceV2;
@@ -255,7 +174,6 @@ public sealed class DefaultLitePullConsumer
 
     public void SetConsumeTimestamp(string ts) => _consumeTimestamp = ts;
 
-    /// <summary>对应 Java DefaultLitePullConsumer.getConsumeTimestamp：默认「now - 30 分钟」的 yyyyMMddHHmmss。</summary>
     public string ConsumeTimestamp => _consumeTimestamp;
 
     public void SetPullBatchSize(int n) => _pullBatchSize = Math.Max(1, n);
@@ -274,9 +192,6 @@ public sealed class DefaultLitePullConsumer
 
     public void SetMessageQueueListener(ILiteMessageQueueListener listener) => _messageQueueListener = listener;
 
-    /// <summary>Java DefaultLitePullConsumer#setTopicMetadataCheckIntervalMillis。
-    /// Java 本身不设下限，但 0 会让 scheduleAtFixedRate 直接抛 IllegalArgumentException，
-    /// 所以和 C++/Python/Go/Rust 一样夹到 1s。</summary>
     public void SetTopicMetadataCheckIntervalMillis(int ms) =>
         _topicMetadataCheckIntervalMillis = Math.Max(1000, ms);
 
@@ -324,9 +239,6 @@ public sealed class DefaultLitePullConsumer
         var set = new HashSet<MessageQueue>(messageQueues);
         lock (_lock)
         {
-            // Java assignedMessageQueue.updateAssignedMessageQueue：撤掉的队列连着整份
-            // MessageQueueState 丢掉（拉取游标与已消费游标一起消失）。**不**动内存位点表、
-            // 也不 persist —— 那份清理挂在 subscribe 模式的 rebalance 上，assign 不走 rebalance。
             foreach (MessageQueue mq in _assigned)
             {
                 if (set.Contains(mq)) continue;
@@ -364,8 +276,6 @@ public sealed class DefaultLitePullConsumer
                 _consumerGroup = NamespaceUtil.WrapNamespace(_namespace, _consumerGroup);
             }
 
-            // 对应 Java DefaultLitePullConsumerImpl.checkConfig（:415）：组名合法性 + 挡掉
-            // DEFAULT_CONSUMER。纯本地校验，排在地址/订阅检查之前。
             Validators.CheckGroup(_consumerGroup);
             if (_consumerGroup == MixAll.DefaultConsumerGroup)
             {
@@ -384,7 +294,6 @@ public sealed class DefaultLitePullConsumer
                 hasSub = _subscription.Count > 0;
             }
 
-            // 对应 Java DefaultLitePullConsumerImpl.checkConfig（:435）：策略为 null 直接拒绝启动。
             if (_allocateMessageQueueStrategy is null)
             {
                 throw new MQClientException("allocateMessageQueueStrategy is null");
@@ -395,12 +304,8 @@ public sealed class DefaultLitePullConsumer
                 throw new MQClientException("subscription is not set, call Subscribe() or Assign() first");
             }
 
-            // 对应 Java DefaultMQPushConsumerImpl.checkConfig（:1058）：启动即无条件校验，
-            // 而不是等到算起点时抛出、被下层 catch 吞掉后静默退化成从 max offset 消费。
             ParseConsumeTimestamp(_consumeTimestamp);
 
-            // 对应 Java DefaultLitePullConsumerImpl.start()（:289）：只有 CLUSTERING 才改写
-            // 默认 instanceName，clientId 统一走 buildMQClientId 的 <ip>@<instanceName>。
             if (_messageModel == MessageModel.Clustering)
             {
                 _instanceName = ClientIds.ChangeInstanceNameToPID(_instanceName);
@@ -410,13 +315,7 @@ public sealed class DefaultLitePullConsumer
                 _clientId = ClientIds.Build(_instanceName, _unitName, _enableStreamRequestType);
             }
 
-            // 请求钩子（ACL 签名 / stream 的 ReqT）：lite 消费者默认开 stream，必须走
-            // RequestHooks.Compose 把 StreamTypeRPCHook 排在用户钩子之前 —— 直接注册
-            // _rpcHook 会让 ReqT 漏发，开 ACL 时签的内容也与上线字段不一致。
-            // 绑定位置同样在 Start() **之前**（Java 的 rpcHook 随 MQClientAPIImpl 构造传入）。
             IRpcHook? requestHook = RequestHooks.Compose(_enableStreamRequestType, _rpcHook, () => _namespaceV2);
-            // 跨门面复用（Java MQClientManager.getOrCreateMQClientInstance）：同 clientId 命中
-            // 即复用已有实例，只有第一个到达者的实例级参数生效；Start 是幂等的。
             _mqClient = MQClientManager.Instance.GetOrCreateMQClientInstance(_clientId,
                 () => new MQClientInstance(_clientId, new List<string>(_nameServerAddrs),
                     /*connectTimeoutMillis=*/3000, /*invokeTimeoutMillis=*/10000,
@@ -447,23 +346,11 @@ public sealed class DefaultLitePullConsumer
                 }
             }
 
-            // 先把 tag 订阅注册给 broker（心跳），再启动后台拉取，避免首轮拉取因 broker 不认订阅而丢消息。
-            // 心跳只发给「实例路由表里已知的 broker」，而自建实例此刻路由表还是空的，
-            // 所以先同步把订阅/分配的 topic 路由拉进来（Python `_refresh_route_for_heartbeat`、
-            // Java 在注册心跳前先 updateTopicRouteInfoFromNameServer）。
-            // 少了这一步，订阅要等到 5s 心跳循环第一轮才注册上 broker，
-            // 同组多实例时首轮 rebalance 会各自独占全部队列。
             RefreshRouteForHeartbeat();
             SendHeartbeatToAllBroker();
             _running = true;
             _started = true;
 
-            // assign 模式的起点必须排在「实例已启动 + 路由已刷新」之后：查已提交位点既要过
-            // RequireClient() 的状态检查，又要按 brokerName 找 broker 地址，而本端口的
-            // MQClientInstance 不像 Java 的 admin 路径那样按需拉路由 —— 早一步算就是查不到，
-            // 异常被吞掉之后 Start() 返回时拉取游标还停在 -1。
-            // Java 的对应位置在 start() 把 serviceState 置成 RUNNING 之后的
-            // operateAfterRunning → updateAssignPullTask → computePullOffset。
             if (_assignMode)
             {
                 foreach (MessageQueue mq in _assigned)
@@ -484,8 +371,6 @@ public sealed class DefaultLitePullConsumer
             _heartbeatThread.Start();
             _pullThread = new Thread(PullServiceLoop) { IsBackground = true, Name = "rmq-lite-pull-" + _consumerId() };
             _pullThread.Start();
-            // Java startScheduleTask 无条件起这个定时任务（有没有注册监听器都起），
-            // 空表时一轮比对就是空转，成本可忽略。
             _metadataThread = new Thread(MetadataLoop)
                 { IsBackground = true, Name = "rmq-lite-meta-" + _consumerId() };
             _metadataThread.Start();
@@ -505,11 +390,6 @@ public sealed class DefaultLitePullConsumer
             scope = new List<MessageQueue>(_assigned);
         }
 
-        // Java 的 shutdown 走 persistConsumerOffset()：把内存位点表按当下持有的队列刷一遍，
-        // 与 auto_commit 无关（手动模式 persist=false 攒下的值同样要落盘）。自动提交模式再多
-        // 走一步 Commit()：本端口没有 Java 那份 5s 定时器，"poll 交出去但还没到截止时刻"的
-        // 位点得在这里补上，否则重启后从上一格重投。
-        // ⚠ 必须在 _lock 之外发：提交是 RPC，抱着锁做网络会把整条 poll/拉取路径卡住。
         try
         {
             if (autoCommit) Commit();
@@ -530,8 +410,6 @@ public sealed class DefaultLitePullConsumer
             if (_pullThread is { IsAlive: true }) _pullThread.Join(2000);
             if (_heartbeatThread is { IsAlive: true }) _heartbeatThread.Join(2000);
             if (_metadataThread is { IsAlive: true }) _metadataThread.Join(2000);
-            // 归还引用（Java DefaultLitePullConsumerImpl.shutdown 末句 mQClientFactory.shutdown()
-            // 的等价物）：计数归零才真正关停实例，先到的门面退出不能拖垮还在用的共享实例。
             if (_mqClient is not null)
             {
                 MQClientManager.Instance.UnregisterMQClient(_clientId, _mqClient);
@@ -607,10 +485,6 @@ public sealed class DefaultLitePullConsumer
         }
 
         string sub = SubscriptionFor(mq.Topic);
-        // 短轮询（suspend=false），位点由 auto-commit 单独提交（与 Java LitePull 一致）。
-        // litePull: true 置 FLAG_LITE_PULL_MESSAGE（Java `DefaultLitePullConsumerImpl
-        // #pullSyncImpl:1058` 的 buildSysFlag(false, block, true, false, true)），
-        // 下游 MqClient.PullMessage 据此把请求码切成 LITE_PULL_MESSAGE(361)。
         int sysFlag = PullSysFlag.BuildSysFlag(commitOffset: false, suspend: false,
             subscription: true, classFilter: false, litePull: true);
         PullResult result;
@@ -626,15 +500,6 @@ public sealed class DefaultLitePullConsumer
             return false;
         }
 
-        // Java `DefaultLitePullConsumerImpl#PullTaskImpl.run:982-998`：一轮拉取回来之后
-        // 无论 FOUND / NO_NEW_MSG / NO_MATCHED_MSG / OFFSET_ILLEGAL，都把拉取游标推进到
-        // broker 给的 nextBeginOffset —— NO_MATCHED_MSG 的已越过本轮扫过的整段不匹配区间
-        // （不跟就会每轮把同一段重扫一遍），OFFSET_ILLEGAL 的是 broker 的纠正位点
-        // （越界自愈也靠这一步）。
-        // 刹车只有一只：**在途请求的结果不许盖掉这轮里刚 seek / 刚被撤走的位点**
-        // （Java :808 的 seekOffset == -1 检查 + :979 的 isDropped 检查；本端 Seek() 直接
-        // 改写 _nextOffset、撤队列直接 Remove 掉条目，用「游标还是不是我发请求时的那个值」
-        // 做同一件事）。同一条刹车也管着 FOUND 分支的入缓冲（Java :986）。
         bool intact = false;
         lock (_lock)
         {
@@ -659,8 +524,6 @@ public sealed class DefaultLitePullConsumer
             return false;
         }
 
-        // 只推进**拉取游标**。「已消费游标」是 Poll() 交付时才写的，两条线不是一条：
-        // 缓冲里压着没交出去的消息不能算已消费（Java processQueue.removeMessage 同口径）。
         Enqueue(msgs);
         return true;
     }
@@ -691,15 +554,6 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    /// <summary>
-    /// 对位 Java <c>DefaultLitePullConsumerImpl#maybeAutoCommit</c>：只有一道全局截止时刻，
-    /// 到点走一次 <see cref="Commit()"/> 并把截止时刻推到 <c>now + autoCommitIntervalMillis</c>。
-    ///
-    /// 调用点与 Java 一致，只有 <see cref="Poll"/> 开头一处（外加 Shutdown 的兜底提交）。
-    /// Java 里空闲消费者靠 MQClientInstance 每 5s 的 persistConsumerOffset 定时器刷的是
-    /// **内存位点表**，而那张表也只有 commit 路径会写，所以停掉 poll 之后 Java 同样不会往前
-    /// 推进 broker 位点；这里若把它塞进拉取循环，就成了"没人 poll 也提交"，比 Java 激进。
-    /// </summary>
     private void MaybeAutoCommit()
     {
         long now = UtilAll.CurrentTimeMillis();
@@ -719,11 +573,6 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    /// <summary>
-    /// Java <c>poll()</c> 出口处的 <c>updateConsumeOffset(mq, processQueue.removeMessage(msgs))</c>：
-    /// 消息交到调用方手上才算已消费。只更新**本实例持有**（有拉取记录）的队列，
-    /// 取每种队列里最大的那一格 +1。
-    /// </summary>
     private void AdvanceConsumeOffset(IReadOnlyList<MessageExt> msgs)
     {
         if (msgs.Count == 0) return;
@@ -790,11 +639,6 @@ public sealed class DefaultLitePullConsumer
             if (_seekOffset.TryGetValue(mq, out long s)) return s;
         }
 
-        // Java 的 assign/seek 都先 checkServiceState()（没启动直接拒）。本端口允许先
-        // Assign 再 Start()，但不能在没问过 broker 的情况下给出起点 —— Assign 会把结果
-        // 存进 _nextOffset，存进去就不再解析（拉取循环只在缺值时补解析），起点会被永久
-        // 钉死在 0。状态检查必须排在下面的 try 之外：RequireClient() 那句「没启动」落进
-        // catch 就被吞了。真正的解析留给 Start() 之后的拉取循环。
         MQClientInstance client = RequireClient();
 
         try
@@ -810,10 +654,6 @@ public sealed class DefaultLitePullConsumer
 
         if (_consumeFromWhere == ConsumeFromWhere.ConsumeFromFirstOffset)
         {
-            // Java RebalanceLitePullImpl:114-124：FIRST_OFFSET 且没有已提交位点时直接给 0
-            // （`result = 0L`），**不**发 minOffset 查询 —— minOffset 属 MQAdminImpl 口径
-            // （只认 master），主掉线期间会让新起的 lite-pull 一条都拉不到；起点越界时由
-            // broker 的 PULL_OFFSET_MOVED 纠正。
             return 0;
         }
 
@@ -837,21 +677,13 @@ public sealed class DefaultLitePullConsumer
 
         foreach (string topic in topics)
         {
-            // 与 push 的 rebalance 同源：Java DefaultLitePullConsumerImpl 走的是同一个
-            // RebalanceImpl，mqAll 来自订阅信息（读位 + readQueueNums、不筛 master），
-            // 不是发布信息。
             List<MessageQueue> mqAll = RequireClient().GetTopicSubscribeInfo(topic);
 
             List<string>? cidAll = RequireClient().GetConsumerIdListByGroup(topic, _consumerGroup);
             if (cidAll is null) cidAll = new List<string>();
             if (!cidAll.Contains(_clientId)) cidAll.Add(_clientId);
-            // Java RebalanceImpl.rebalanceByTopic 在分配前 Collections.sort(mqAll) + sort(cidAll)：
-            // 顺序不一致会让同组不同实例算出冲突的分配（同一队列被两个实例同时消费）。
             mqAll.Sort();
             cidAll.Sort(StringComparer.Ordinal);
-            // Java RebalanceImpl#rebalanceByTopic 的 catch (Throwable) 直接 return，位置在
-            // updateProcessQueueTableInRebalance **之前** → 一次分配异常不该把队列撤走。
-            // 所以这里回退成「沿用本 topic 当前的分配」（Python / C++ / Rust 同口径）。
             List<MessageQueue> allocated;
             try
             {
@@ -906,10 +738,6 @@ public sealed class DefaultLitePullConsumer
                 foreach (MessageQueue mq in old)
                 {
                     if (newSet.Contains(mq)) continue;
-                    // Java RebalanceLitePullImpl#removeUnnecessaryMessageQueue：先 persist(mq)
-                    // 再 removeOffset(mq) —— 撤手之前把最后一次提交的位点补发出去。
-                    // persist 是 RPC，抱着锁做网络会把整条 poll/拉取路径卡住，所以这里只把
-                    // **该补发的队列**记下来，锁外再发；表里那一格也留到发完再清。
                     if (_offsetTable.ContainsKey(mq)) revoked.Add(mq);
                     _nextOffset.Remove(mq);
                     // 撤队列丢掉的是**整份 MessageQueueState**（pullOffset / consumeOffset /
@@ -921,7 +749,6 @@ public sealed class DefaultLitePullConsumer
             }
         }
 
-        // 锁外补发末次提交，发完再清掉内存位点表那一格（Java persist → removeOffset 的次序）。
         foreach (MessageQueue mq in revoked)
         {
             PersistOffset(mq);
@@ -965,8 +792,6 @@ public sealed class DefaultLitePullConsumer
     // ---------------- Poll / 位点 ----------------
     public List<MessageExt> Poll(int timeoutMillis = -1)
     {
-        // Java poll() 进来先按截止时刻试一次自动提交（拿锁之前做：提交要发 RPC，
-        // 抱着缓冲锁等网络会把 Enqueue 一起卡住）。
         if (_autoCommit) MaybeAutoCommit();
         int timeout = timeoutMillis > 0 ? timeoutMillis : _pollTimeoutMillis;
         long deadline = UtilAll.CurrentTimeMillis() + timeout;
@@ -987,7 +812,6 @@ public sealed class DefaultLitePullConsumer
             }
         }
 
-        // 消息交到调用方手上才推进已消费游标（Java 同一处 updateConsumeOffset）。
         AdvanceConsumeOffset(outMsgs);
         return outMsgs;
     }
@@ -998,8 +822,6 @@ public sealed class DefaultLitePullConsumer
         {
             _seekOffset[mq] = offset;
             _nextOffset[mq] = offset;
-            // Java 的 seek 只置 seekOffset，下一次拉取时 nextPullOffset() 才把它同时写进
-            // consumeOffset（"跳回去"意味着"那里之前都还没消费"，否则重放的消息会被旧位点跳过）。
             _consumeOffset[mq] = offset;
         }
 
@@ -1023,11 +845,6 @@ public sealed class DefaultLitePullConsumer
 
     public void SeekToEnd(MessageQueue mq) => Seek(mq, RequireClient().GetMaxOffset(mq));
 
-    /// <summary>
-    /// Java <c>committed()</c> 走 <c>offsetStore.readOffset(MEMORY_FIRST_THEN_STORE)</c>：
-    /// 先看内存位点表（<c>persist=false</c> 刚提交、还没发给 broker 的值也算数），
-    /// 再问 broker，并把 broker 的值回填进表里（Java 同一处也回填）。-1 表示 broker 无记录。
-    /// </summary>
     public long Committed(MessageQueue mq)
     {
         lock (_lock)
@@ -1055,9 +872,6 @@ public sealed class DefaultLitePullConsumer
         return off;
     }
 
-    /// <summary>
-    /// 对位 Java <c>commitAll()</c>：按**已消费游标**提交所有当下持有的队列。
-    ///
     /// 提交源绝不能是拉取游标：本地缓冲里压着没交出去的消息不算已消费，提前提交会让那段
     /// 消息在重启后永远不再投递（静默丢消息）。
     /// </summary>
@@ -1077,11 +891,6 @@ public sealed class DefaultLitePullConsumer
         CommitTargets(targets, scope, persist: true);
     }
 
-    /// <summary>
-    /// 对位 Java <c>commit(Map, persist)</c>：调用方指定位点，**只改提交落点，两条游标都不动**。
-    /// 空 map 与 Java 一样记一条 warn 就 return，连表都不碰（上一轮 persist=false 攒下的
-    /// 内存值原样保留）。
-    /// </summary>
     public void Commit(IReadOnlyDictionary<MessageQueue, long> offsets, bool persist = true)
     {
         if (offsets.Count == 0)
@@ -1095,10 +904,6 @@ public sealed class DefaultLitePullConsumer
         CommitTargets(targets, scope, persist);
     }
 
-    /// <summary>
-    /// 对位 Java <c>commit(Set, persist)</c>：只提交点名这几条队列，取的是它们当下的
-    /// **已消费游标**。空集合静默 return（Java 同）。
-    /// </summary>
     public void Commit(IReadOnlyCollection<MessageQueue> messageQueues, bool persist = true)
     {
         if (messageQueues.Count == 0) return;
@@ -1117,13 +922,6 @@ public sealed class DefaultLitePullConsumer
 
     /// <summary>
     /// 三个入口的共同部分：写内存位点表（两道守卫），<c>persist</c> 再把这一批刷给 broker。
-    ///
-    /// 两处已知的偏离，与 Python 逐字对应：
-    /// ① Java 的 commitAll() 只写内存表，真正发给 broker 靠 MQClientInstance 每
-    ///    persistConsumerOffsetInterval（5s）一次的定时器；本端口的 lite 消费者没挂那个定时器，
-    ///    所以 persist=true（默认）就地发出去。
-    /// ② Java 的 persistAll 用 oneway、异常只记日志；这里发同步带应答，坏位点当场可见。
-    /// </summary>
     private void CommitTargets(Dictionary<MessageQueue, long> targets, List<MessageQueue> scope,
         bool persist)
     {
@@ -1133,16 +931,12 @@ public sealed class DefaultLitePullConsumer
             {
                 if (kv.Value == -1)
                 {
-                    // Java 原文：这条队列还没消费过，记 error 并跳过。绝不能把 -1 写给 broker
-                    // —— 位点 -1 会让下次消费从队首重投全量。
                     ClientLog.Error("consumerOffset is -1 in messageQueue [" + kv.Key + "].");
                     continue;
                 }
 
                 if (!_assigned.Contains(kv.Key))
                 {
-                    // Java 的 processQueue != null && !isDropped() 守卫：不是本实例持有的队列
-                    // 一律不替它提交，静默跳过（Java 原文这里连日志都没有）。
                     continue;
                 }
 
@@ -1153,9 +947,6 @@ public sealed class DefaultLitePullConsumer
         if (persist) PersistOffsetTable(scope);
     }
 
-    /// <summary>
-    /// Java <c>OffsetStore#persist(mq)</c>：只把这一条队列的内存位点发给 broker，不做清理。
-    /// </summary>
     private void PersistOffset(MessageQueue mq)
     {
         long offset;
@@ -1176,15 +967,6 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    /// <summary>
-    /// Java <c>RemoteBrokerOffsetStore#persistAll(Set)</c>：内存位点表里落在 <c>mqs</c> 上的
-    /// 那部分写给 broker，**不在**其中的条目顺手从表里删掉（Java 日志里那句
-    /// <c>remove unused mq</c>）。
-    ///
-    /// 后半句是 Java 的真实行为：这张表只服务于当下持有的队列。代价是
-    /// <c>Commit(部分队列, persist: true)</c> 会把其余队列**尚未落盘**的内存值一起丢掉 ——
-    /// 要提交谁就一次给全。
-    /// </summary>
     private void PersistOffsetTable(ICollection<MessageQueue> mqs)
     {
         if (mqs.Count == 0) return;
@@ -1204,10 +986,6 @@ public sealed class DefaultLitePullConsumer
             }
         }
 
-        // 未启动时表照样写得进去、只是发不出去（Python/C++/Rust 同）：Java 在这里会先
-        // checkServiceState 抛错，本端口放宽这一步，好让表逻辑能离线单测。
-        // 直接读连接字段而不是 RequireClient()：Shutdown 已经翻掉 started 标记，
-        // 但末次提交仍要用这条还没关掉的连接。
         MQClientInstance? client = _mqClient;
         if (client is null) return;
         foreach (KeyValuePair<MessageQueue, long> kv in toSend)
@@ -1226,19 +1004,6 @@ public sealed class DefaultLitePullConsumer
     public long OffsetForTimestamp(MessageQueue mq, long timestamp) =>
         RequireClient().SearchOffsetByTimestamp(mq, timestamp);
 
-    // ---------------- 队列查询 / 控制 ----------------
-    /// <summary>Java DefaultLitePullConsumerImpl.fetchMessageQueues:1224 →
-    /// MQAdminImpl.fetchSubscribeMessageQueues:169-183（订阅信息：读位、不筛 master）。
-    /// ⚠ 入参是**已经套好命名空间**的 topic：Java 的 withNamespace 发生在外层
-    /// DefaultLitePullConsumer:325-327，Impl 这一层直接拿 map key 去查（:1234）。
-    /// 本端口的 WrapNamespace 与 Java 一样幂等（已带前缀原样返回），所以按全名取只是
-    /// 省掉一次无谓重拼，并把这层分工写清楚。
-    /// 调用方请用 <see cref="FetchMessageQueues"/>（裸 topic）或本方法（全名）。
-    /// 两条 Java 语义必须一起保住，否则队列变更监听静默失真：
-    /// 1. :171 **每轮现问 nameserver**，不吃 30s 周期刷新的路由缓存 —— 少了这一步，
-    ///    扩容最快也要等一次路由轮询才看得见，回调比 Java 滞后一个周期；
-    /// 2. :177 取到空队列集是**抛 MQClientException**，不是返回空表 —— "查不到"不等于
-    ///    "这个 topic 缩到 0 队列"，后者会让监听器收到一次假缩容回调并把快照刷成空集。</summary>
     private List<MessageQueue> FetchMessageQueuesFull(string fullTopic)
     {
         MQClientInstance client = RequireClient();
@@ -1262,7 +1027,6 @@ public sealed class DefaultLitePullConsumer
         return queues;
     }
 
-    /// <summary>Java DefaultLitePullConsumer#fetchMessageQueues：入口套命名空间。</summary>
     public List<MessageQueue> FetchMessageQueues(string topic) =>
         FetchMessageQueuesFull(WithNamespace(topic));
 
@@ -1290,16 +1054,6 @@ public sealed class DefaultLitePullConsumer
         }
     }
 
-    // ---------------- topic 队列集合变更监听 ----------------
-    /// <summary>对应 Java registerTopicMessageQueueChangeListener（DefaultLitePullConsumer:325 →
-    /// Impl:1267-1279），逐条对齐：
-    /// <list type="bullet">
-    /// <item>topic 为空 / listener 为 null → MQClientException("Topic or listener is null")；</item>
-    /// <item>同一 topic 重复注册 → warn 一条并覆盖旧监听器（Java :1272-1273）；</item>
-    /// <item>键取 withNamespace(topic)（Java :327 在入口就套好），回调收到的也是它；</item>
-    /// <item>只有**运行中**注册才立刻记一版快照，否则首轮会把"当下这套队列"当成变化。
-    /// 未启动时注册的调用方要记住：首轮一定回调一次，这是 Java 的语义，不是 bug。</item>
-    /// </list></summary>
     public void RegisterTopicMessageQueueChangeListener(string topic,
         ITopicMessageQueueChangeListener? listener)
     {
@@ -1364,7 +1118,6 @@ public sealed class DefaultLitePullConsumer
                 bool changed;
                 lock (_lock)
                 {
-                    // Java isSetEqual:1246-1260：没快照 ⇒ 永远不相等 ⇒ 首轮必回调。
                     changed = !messageQueuesForTopicTryEqual(key, newQueues);
                     if (changed)
                     {
@@ -1389,8 +1142,6 @@ public sealed class DefaultLitePullConsumer
         return fired;
     }
 
-    /// <summary>Java isSetEqual：两个都没快照视作相等（本端口取不到 null 快照，故只有
-    /// "从未记过快照"这一种不等）。抱着 _lock 调用。</summary>
     private bool messageQueuesForTopicTryEqual(string key, List<MessageQueue> newQueues)
     {
         if (!_messageQueuesForTopic.TryGetValue(key, out List<MessageQueue>? oldQueues))
@@ -1415,9 +1166,6 @@ public sealed class DefaultLitePullConsumer
         return true;
     }
 
-    /// <summary>Java startScheduleTask（Impl:382-393）：启动后 10s 首查，此后每
-    /// TopicMetadataCheckIntervalMillis 一趟。周期在起线程时读一次，与 Java 的
-    /// scheduleAtFixedRate 同语义。</summary>
     public void MetadataLoop(int firstDelayMillis, int periodMillis)
     {
         DateTime next = DateTime.UtcNow.AddMilliseconds(firstDelayMillis);
@@ -1454,16 +1202,8 @@ public sealed class DefaultLitePullConsumer
     private HeartbeatData BuildHeartbeat()
     {
         var hb = new HeartbeatData(_clientId);
-        // consumeType 恒为 CONSUME_ACTIVELY：Java DefaultLitePullConsumerImpl.consumeType():1111-1112
-        // 直接 return CONSUME_ACTIVELY（**不是** ConsumePassively）。broker 侧读这个字段的地方：
-        // ClientManageProcessor:87-92（ACTIVELY 心跳不做订阅注册，订阅由自带标志的拉取补偿）、
-        // PullMessageProcessor:493-505（isRejectPullConsumerEnabled 的 broker 据此拒拉）、
-        // :516-521（冷数据流控按 ACTIVELY 走另一支）、AdminBrokerProcessor:1971
-        // （consumerConnection 显示消费类型）。写成 Passively 会让 broker 把拉模式组当推送组看。
         var cd = new ConsumerData(_consumerGroup, ConsumeType.ConsumeActively, _messageModel, _consumeFromWhere)
         {
-            // Java MQClientInstance:1039：consumerData.setUnitMode(impl.isUnitMode())，
-            // broker 据此给 %RETRY%group 打 UNIT_SUB(0x2)（ClientManageProcessor:113-118）。
             UnitMode = _unitMode,
         };
         lock (_lock)
@@ -1518,8 +1258,6 @@ public sealed class DefaultLitePullConsumer
         if (_mqClient is null) return 0;
         HeartbeatData hb = BuildHeartbeat();
         int ok = 0;
-        // 每台都发（主 + 从）：与推送消费者 `DefaultMQPushConsumer.SendHeartbeatToAllBroker`
-        // 同一条 Java 依据（sendHeartbeatToAllBroker:732-750，consumerEmpty 才跳从节点）。
         foreach (string addr in _mqClient.GetAllBrokerAddrs())
         {
             try
@@ -1589,9 +1327,6 @@ public sealed class DefaultLitePullConsumer
         return outAddrs;
     }
 
-    // 对应 Java UtilAll.parseDate(ts, UtilAll.YYYYMMDDHHMMSS)：该字段**只**是 14 位本地墙钟日期。
-    // 旧实现完全不解析日期，把任何纯数字串当 epoch 秒/毫秒，"20230101000000" 会被解释成
-    // 公元 2611 年，起点彻底错位。
     private static long ParseConsumeTimestamp(string ts)
     {
         if (ts is { Length: 14 }

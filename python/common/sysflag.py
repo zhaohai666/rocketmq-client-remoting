@@ -1,21 +1,8 @@
 # -*- coding: utf-8 -*-
-"""消息系统标志位常量（对应 org.apache.rocketmq.common.sysflag.*）。"""
 
 
 class MessageSysFlag:
-    """对应 org.apache.rocketmq.common.sysflag.MessageSysFlag。
-
-    位含义（低 -> 高）：
-        bit0  COMPRESSED
-        bit1  MULTI_TAGS
-        bit2  TRANSACTION_PREPARED
-        bit3  TRANSACTION_COMMIT(0x2<<2) / TRANSACTION_ROLLBACK(0x3<<2) 共用掩码
-        bit4  BORNHOST_V6
-        bit5  STOREHOSTADDRESS_V6
-        bit6  NEED_UNWRAP
-        bit7  INNER_BATCH
-        bit8~10 COMPRESSION_TYPE（7 种取值，掩码 0x7<<8）
-    """
+    pass
 
     COMPRESSED_FLAG = 0x1
     MULTI_TAGS_FLAG = 0x1 << 1
@@ -44,7 +31,7 @@ class MessageSysFlag:
 
     @staticmethod
     def get_compression_type(sys_flag: int) -> int:
-        """Java: (flag & COMPRESSION_TYPE_COMPARATOR) >> 8。"""
+        pass
         return (sys_flag & MessageSysFlag.COMPRESSION_TYPE_COMPARATOR) >> MessageSysFlag.COMPRESSION_TYPE_SHIFT
 
     @staticmethod
@@ -62,7 +49,7 @@ class MessageSysFlag:
 
     @staticmethod
     def get_transaction_value(flag: int) -> int:
-        """Java: flag & TRANSACTION_ROLLBACK_TYPE。"""
+        pass
         return flag & MessageSysFlag.TRANSACTION_ROLLBACK_TYPE
 
     @staticmethod
@@ -144,11 +131,7 @@ class PermName:
 
     @staticmethod
     def is_valid(perm) -> bool:
-        """对应 Java PermName.isValid：``perm >= 0 && perm < PERM_PRIORITY``。
-
-        Java 的 ``isValid(String)`` 直接 ``Integer.parseInt``，非数字会抛
-        NumberFormatException；这里保持一致（抛 ValueError），调用方需自行捕获。
-        """
+        pass
         return 0 <= int(perm) < PermName.PERM_PRIORITY
 
     @staticmethod

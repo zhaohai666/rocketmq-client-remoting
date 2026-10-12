@@ -1,37 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""消费者心跳必须扇出到**从节点**（真机验证，Java sendHeartbeatToAllBroker 的分流规则）。
-
-用法（需本地 RocketMQ 5.5.1 集群，且 broker-a 有一台从节点）：
-    .venv/bin/python verify_consumer_heartbeat_slave_live.py 127.0.0.1:9876 127.0.0.1:10931
-
-从节点（brokerId=1）没起时本脚本 S0 就失败 —— 这是刻意的：本机默认集群只有一台 master，
-不满足前置条件时宁可红，也不要静默退化成"只测了 master"。
-
-Java 依据：``MQClientInstance#sendHeartbeatToAllBroker``:732-750 遍历 ``brokerAddrTable``
-的**每个 brokerId**，只在 ``consumerEmpty && MixAll.MASTER_ID != id`` 时跳过从节点。
-带 ConsumerData 的消费者心跳因此必须打到每一台；只带 ProducerData 的生产者心跳
-（``consumerEmpty=true``）仍然只打 master。
-
-为什么漏发从节点不是"少一发冗余"：broker 的 ``ConsumerManager`` 是**每台各自一份**状态，
-从节点没见过这个组时：
-  * ``GET_CONSUMER_LIST_BY_GROUP(38)`` 在从节点上查不到本组（本脚本 S2/S2b）；
-  * 指向从节点的拉取被 ``PullMessageProcessor``:420-427 回 ``SUBSCRIPTION_NOT_EXIST(24)``
-    —— push 消费者默认的拉取**不带**订阅标志（``postSubscriptionWhenPull=false``，
-    ``DefaultMQPushConsumerImpl.pullMessage``:458-468），走的正是那条 else 分支（S4/S4b）。
-
-场景：
-  S0 路由里 broker-a 有 {0: master, 1: slave}；client 侧 ``get_all_broker_addrs`` 两台、
-     ``get_route_of_all_brokers`` 只有 master（两个 helper 的分工）
-  S1 起 push consumer（订阅 topic）→ 等首轮心跳
-  S2 【核心】从节点上 38 查到本 clientId
-  S2b 对照：同一个从节点查一个**从未心跳过**的组 → 查不到（38 这条判据本身有效）
-  S3 主节点上 38 也查到本组（组确实注册进了集群）
-  S4 无订阅标志的拉取打**从节点** → 不再是 24
-  S4b 对照：同一个从节点的无标志拉取、未注册组 → 仍是 24（那道门真按每台自己的表判）
-  S5 生产者心跳仍只打 master：从节点 204 ``GET_PRODUCER_CONNECTION_LIST`` 查不到本组，
-     主节点查得到 —— 扇出只对消费者打开
-"""
 from __future__ import annotations
 
 import sys

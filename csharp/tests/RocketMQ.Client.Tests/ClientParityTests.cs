@@ -1,13 +1,5 @@
 // 2026-10 对齐批次的离线单测：namespaceV2 请求钩子 / VIP channel / 定时消息 setter /
 // ConsumeFromWhere 弃用值 / recall 轨迹钩子 / request 等待槽 TTL 扫描。
-//
-// 这些能力都只有「写错就静默」的失败模式，真机矩阵很难稳定命中，所以逐条离线锁死：
-//   * nsd/ns 必须在 ACL 签名**之前**写入 ExtFields，否则开鉴权的 broker 验签必失败
-//     （Java MQClientAPIImpl:329-332 的注册顺序就是为此）；
-//   * VIP 口是 port-2 的纯算术改写，改错就是把消息发到另一个进程；
-//   * 定时消息三个键的名字与类型必须与 Java Message 一致（拼错=定时器不生效，broker
-//     照收不误）；
-//   * 扫描线程的「谁摘到谁回调」如果写反，超时和应答到达两条路径会各回调一次。
 using System.Reflection;
 using System.Threading;
 using RocketMQ.Client;
@@ -80,8 +72,6 @@ public class ClientParityTests
     [Fact]
     public void NamespaceRpcHook_ReadsConfigPerRequest()
     {
-        // Java 每笔请求现读 clientConfig.getNamespaceV2()：配置改了要跟着走，
-        // 所以钩子持的是取值函数而不是字符串快照。
         string current = string.Empty;
         var hook = new NamespaceRpcHook(() => current);
 
@@ -123,12 +113,6 @@ public class ClientParityTests
         Assert.Null(RequestHooks.Compose(false, null));
     }
 
-    /// <summary>
-    /// Java 的 MQClientAPIImpl **无条件**注册 NamespaceRpcHook，命名空间为空时由钩子在
-    /// doBeforeRequest 里自己直接返回。所以装不装钩子取决于「facade 有没有给取值函数」，
-    /// 而不是「Start() 那一刻命名空间是不是空的」—— 后者会让
-    /// <c>consumer.NamespaceV2 = "ns"</c> 在 start() 之后静默失效。
-    /// </summary>
     [Fact]
     public void RequestHooks_NamespaceHookInstalledEvenWhileNamespaceIsEmpty()
     {
@@ -180,7 +164,6 @@ public class ClientParityTests
     [InlineData(true, "127.0.0.1:10911", "127.0.0.1:10909")]
     [InlineData(false, "127.0.0.1:10911", "127.0.0.1:10911")]
     [InlineData(true, "10.0.0.1:8091", "10.0.0.1:8089")]
-    // 没有冒号 / 端口非数字：与 Java 一样原样返回（不抛）
     [InlineData(true, "broker-no-port", "broker-no-port")]
     [InlineData(true, "host:abc", "host:abc")]
     public void BrokerVipChannel_RewritesPortMinusTwo(bool enable, string addr, string expected)
@@ -203,7 +186,6 @@ public class ClientParityTests
         Assert.True(p.StartDetectorEnable);
         Assert.Equal(NsV2, p.NamespaceV2);
 
-        // null 视同空（Java 的 setNamespaceV2 不做拼接，本端口归一成空串防 NRE）
         p.NamespaceV2 = null!;
         Assert.Equal(string.Empty, p.NamespaceV2);
     }
@@ -233,7 +215,6 @@ public class ClientParityTests
     [Fact]
     public void TimerGetter_ParsesLikeLegacyLongParseOrThrows()
     {
-        // Java 的 getter 就是 Long.parseLong：坏值直接抛，不能静默当 0
         var m = new Message("TopicTimer", System.Text.Encoding.UTF8.GetBytes("x"));
         m.Properties[MessageConst.PropertyTimerDelaySec] = "not-a-number";
         Assert.ThrowsAny<FormatException>(() => m.GetDelayTimeSec());
@@ -319,7 +300,7 @@ public class ClientParityTests
         string handle = RecallMessageHandle.BuildHandle("TopicRecall", "broker-a", "1700000000000", UniqKey);
 
         hook.DoBeforeRequest("127.0.0.1:10911", RecallRequest(handle));
-        Assert.Empty(Drain(dispatcher)); // Java 同款：轨迹只记在响应侧
+        Assert.Empty(Drain(dispatcher));
 
         hook.DoAfterResponse("127.0.0.1:10911", RecallRequest(handle),
             RecallResponse(ResponseCode.Success, "DefaultRegion"));
@@ -380,7 +361,6 @@ public class ClientParityTests
     [Fact]
     public void RecallTraceHook_SwallowsBadHandle()
     {
-        // 轨迹是旁路观测：句柄格式坏了不能让撤回 RPC 本身抛（Java 同处 catch Exception 空处理）
         var dispatcher = new AsyncTraceDispatcher("GID_ParityUnit", TraceDispatcherType.Produce);
         var hook = new DefaultRecallMessageTraceHook(dispatcher) { EnableDefaultTrace = true };
         RemotingCommand req = RecallRequest("not-a-handle");
@@ -407,7 +387,6 @@ public class ClientParityTests
     {
         var holder = new RequestFutureHolder();
         var cb = new RecordingCallback();
-        // isTimeout 是**严格**大于（Java 同口径：timeout - elapsed < 0），所以留一点真实流逝
         var future = new RequestResponseFuture("corr-scan-1", 1, cb);
         Thread.Sleep(30);
         holder.PutRequest("corr-scan-1", future);
@@ -457,8 +436,6 @@ public class ClientParityTests
     [Fact]
     public void ScanExpiredRequest_SyncCallerIsRemovedButNotWoken()
     {
-        // 同步调用（无回调）自己在 WaitResponseMessage 的 latch 上超时，与 Java 一致：
-        // 扫描只负责摘表，不能替它 set latch，否则同步方拿到 null 应答却分不清是超时还是空应答。
         var holder = new RequestFutureHolder();
         var future = new RequestResponseFuture("corr-sync", 1, null);
         holder.PutRequest("corr-sync", future);

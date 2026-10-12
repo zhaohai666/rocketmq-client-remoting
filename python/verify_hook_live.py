@@ -97,7 +97,7 @@ class _ForbidHook(CheckForbiddenHook):
 
 
 class _DropHook(FilterMessageHook):
-    """摘掉 body 以 drop- 开头的消息（可变 msg_list 的实现方式见 Java FilterMessageContext）。"""
+    pass
 
     def __init__(self, prefix: bytes = b"drop-") -> None:
         self.prefix = prefix

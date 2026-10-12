@@ -1,4 +1,3 @@
-// org.apache.rocketmq.common.MixAll 的 C# 对应：全局常量与静态工具。
 using System.Globalization;
 
 namespace RocketMQ.Common;
@@ -11,7 +10,6 @@ public static class MixAll
     public const string DefaultTopic = "TBW102";
     public const string BenchmarkTopic = "BenchmarkTest";
     public const string DefaultProducerGroup = "DEFAULT_PRODUCER";
-    /// <summary>Java <c>ClientConfig#instanceName</c> 的默认值（<c>System.getProperty("rocketmq.client.name", "DEFAULT")</c>）。</summary>
     public const string DefaultInstanceName = "DEFAULT";
     public const string DefaultConsumerGroup = "DEFAULT_CONSUMER";
     public const string ClientInnerProducerGroup = "CLIENT_INNER_PRODUCER";
@@ -26,12 +24,8 @@ public static class MixAll
     public const string DlqGroupTopicPrefix = "%DLQ%";
     public const string ReplyTopicPrefix = "%REPLY%";
 
-    // Request-Reply（5.x）：应答 topic = <cluster>_REPLY_TOPIC（Java MixAll.REPLY_TOPIC_POSTFIX）。
-    // 注意：它**不是**上面那个老的控制台前缀 "%REPLY%"，两者语义完全不同——
-    // GetReplyTopic 返回的是集群级系统 topic（broker 预注册，客户端切勿自建）。
     public const string REPLY_TOPIC_POSTFIX = "REPLY_TOPIC";
 
-    // 应答消息的 MSG_TYPE 属性值（Java MixAll.REPLY_MESSAGE_FLAG）。大小写敏感。
     public const string REPLY_MESSAGE_FLAG = "reply";
 
     public const string SystemTopicPrefix = "rmq_sys_";
@@ -47,41 +41,24 @@ public static class MixAll
     public const string CidOnsapiPullGroup = "CID_ONSAPI_PULL";
     public const string CidSysRmqTrans = "CID_SYS_RMQ_TRANS";
 
-    // ⚠ Java 的 MixAll.UNIQUE_MSG_QUERY_FLAG 是 extFields 里的**键名**（取值 "true"/"false"），
-    // 不是一个整数标志位。早期 C++ 实现把它当 1 用是错的：发给 broker 后 key 变成数字键，
-    // uniqKey 查询路由不到 RocksDB 索引分支。按 key 查消息的三种模式见 QueryMsgType。
     public const string UniqueMsgQueryFlag = "_UNIQUE_KEY_QUERY";
     public const string ScheduleTopic = "SCHEDULE_TOPIC_XXXX";
     public const string LmqPrefix = "%LMQ%";
     public const int LmqQueueId = 0;
     public const string TraceTopic = "RMQ_SYS_TRACE_TOPIC";
     public const string RealTraceTopic = "rmq_sys_TRACE_DATA";
-    /// <summary>轨迹 region 缺省值（对应 Java MixAll.DEFAULT_TRACE_REGION_ID）。</summary>
     public const string DefaultTraceRegionId = "DefaultRegion";
     public const string RmqSysTransHalfTopic = "RMQ_SYS_TRANS_HALF_TOPIC";
     public const string RmqSysTransOpHalfTopic = "RMQ_SYS_TRANS_OP_HALF_TOPIC";
     public const int TransCheckMaxTime = 15;
     public const string UnitPrefix = "unit_";
 
-    /// <summary>
-    /// 对应 org.apache.rocketmq.common.namesrv.NamesrvUtil#NAMESPACE_ORDER_TOPIC_CONFIG
-    /// （顺序消息配置的 KV namespace，CreateOrUpdateOrderConf 读改写的落点）。
-    /// </summary>
     public const string NamespaceOrderTopicConfig = "ORDER_TOPIC_CONFIG";
 
-    /// <summary>
-    /// 对应 Java <c>MixAll.REQ_T</c>：请求类型标记的 ExtFields 键，由 stream 请求钩子
-    /// （<c>StreamTypeRPCHook</c>）写入，取值是 <c>RequestType.STREAM.getCode()</c>
-    /// 即 <c>"0"</c>（不是枚举名 —— clientId 的后缀才用枚举名 <c>@STREAM</c>）。
-    /// </summary>
     public const string ReqT = "ReqT";
 
-    /// <summary>对应 Java <c>MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD</c>：
-    /// namespaceV2 非空时由 <c>NamespaceRpcHook</c> 置 <c>"true"</c>。</summary>
     public const string RpcNamespacedField = "nsd";
 
-    /// <summary>对应 Java <c>MixAll.RPC_REQUEST_HEADER_NAMESPACE_FIELD</c>：
-    /// namespaceV2 的取值走这个键（5.x 新命名空间，与 topic 前缀式的 namespace 不同源）。</summary>
     public const string RpcNamespaceField = "ns";
 
     public const int DefaultTopicQueueNums = 4;
@@ -120,10 +97,6 @@ public static class MixAll
 
     public static bool IsDlqTopic(string topic) => topic.StartsWith(DlqGroupTopicPrefix, StringComparison.Ordinal);
 
-    /// <summary>
-    /// Java <c>MixAll.brokerVIPChannel</c>：VIP 通道 = 端口 - 2。
-    /// 端口不可解析时原样返回（Java 会抛 NumberFormatException，这里不让调用方崩）。
-    /// </summary>
     public static string BrokerVipChannel(bool isChange, string brokerAddr)
     {
         if (!isChange) return brokerAddr;
@@ -135,24 +108,16 @@ public static class MixAll
         return host + ":" + (portNum - 2).ToString(CultureInfo.InvariantCulture);
     }
 
-    /// <summary>
-    /// 应答 topic = &lt;cluster&gt;_REPLY_TOPIC（Java MixAll.getReplyTopic）。
-    /// 对应 Python 的 <c>cluster_name + "_" + REPLY_TOPIC_POSTFIX</c>。
-    /// broker 预注册该系统 topic，客户端只发不建。
-    /// </summary>
     public static string GetReplyTopic(string clusterName) => clusterName + "_" + REPLY_TOPIC_POSTFIX;
 
     public static bool IsSysTopic(string topic) => topic.StartsWith(SystemTopicPrefix, StringComparison.Ordinal);
 
-    /// <summary>对应 Java MixAll.isLmq（LMQ topic 以 %LMQ% 开头）。</summary>
     public static bool IsLmq(string lmqMetaData) =>
         lmqMetaData.StartsWith(LmqPrefix, StringComparison.Ordinal);
 
-    /// <summary>对应 Java MixAll.isSysConsumerGroup（CID_RMQ_SYS_ 前缀）。</summary>
     public static bool IsSysConsumerGroup(string consumerGroup) =>
         consumerGroup.StartsWith(CidRmqSysPrefix, StringComparison.Ordinal);
 
-    /// <summary>对应 Java MixAll.isPredefinedGroup（PREDEFINE_GROUP_SET 命中）。</summary>
     public static bool IsPredefinedGroup(string consumerGroup)
     {
         foreach (string g in PredefineGroups)
@@ -184,27 +149,16 @@ public static class MixAll
     /// <summary>本机出口 IP（UDP connect 探测，无外网回落 hostname -> 127.0.0.1）。</summary>
     public static string GetIpStr() => UtilAll.LocalIp();
 
-    /// <summary>
-    /// 进程内只探测一次的本机 IP。对应 Java <c>ClientConfig#clientIP</c>：它在 ClientConfig
-    /// 构造时就定下来，同一个客户端的 clientId 因此稳定（每次重新探测既慢，又可能在换网卡
-    /// 后让重启的客户端换一个 clientId）。
-    /// </summary>
     public static string CachedIpStr() => _cachedIpStr ??= UtilAll.LocalIp();
 
     private static string? _cachedIpStr;
 
     public static int Pid() => UtilAll.Pid();
 
-    // ---------------- Properties <-> String ----------------
-    // 对应 Java MixAll.properties2String / string2Properties。
-    //
     // 这是管理端最容易踩的坑：**GET_BROKER_CONFIG 的响应体是 properties 文本**
     // （每行 "key=value"），不是 JSON、也不是 KVTable。用 JSON 解析器去解必然失败。
     public static string Properties2String(PropertyMap properties)
     {
-        // Java: 每条 "key=value\n"（Properties.store 风格用 "=" 作分隔符），null 值跳过。
-        // 这里 PropertyMap 的值是 string，没有 null 概念，故不做过滤；
-        // 调用方若想跳过某键，不要放进 map 即可。
         var sb = new System.Text.StringBuilder();
         foreach (var kv in properties)
         {
@@ -216,14 +170,6 @@ public static class MixAll
 
     public static PropertyMap String2Properties(string text)
     {
-        // 语义对齐 Java MixAll.string2Properties -> java.util.Properties.load：
-        //   1) 行尾未转义的 '\' 表示续行（下一行前导空白被丢弃）；
-        //   2) 空行、以 '#' 或 '!' 开头的行是注释；
-        //   3) 键与值以**第一个** '='、':' 或**空白**分隔（空白也是合法分隔符！）；
-        //   4) 分隔符前后的空白被跳过；值的**尾部**空白保留（Java 不去尾空白）。
-        //
-        // 注：Java 还会处理 \t \n \uXXXX 等转义，broker 配置导出里不出现，
-        // 这里不实现（把反斜杠语义做错反而更不一致）。
         var result = new PropertyMap();
 
         // 先把续行合并成逻辑行
@@ -378,10 +324,6 @@ public static class MixAll
     }
 }
 
-/// <summary>
-/// 对应 Java QueryMsgByKeySubCommand.QueryMsgType：按 key 查消息的三种模式。
-/// 与 MixAll.UniqueMsgQueryFlag（extFields 键名）不是一回事。
-/// </summary>
 public static class QueryMsgType
 {
     public const int AllMessage = 0;

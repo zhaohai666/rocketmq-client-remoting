@@ -1,12 +1,3 @@
-// 定时任务的 initialDelay / 周期语义单测（Java MQClientInstance#startScheduledTask:389-432）。
-//
-// 为什么必须离线锁死：Java 一律用
-//   scheduleAtFixedRate(work, initialDelay, period)
-// ——**首跳落在 initialDelay 这一刻**，不是 initialDelay + period；周期在调度时定型，
-// 之后改配置不重排。旧实现是「先睡 initialDelay，再在循环头睡一个整周期」，于是路由刷新
-// 的首跳晚了整整一个周期（30.03s 才刷第一次），周期还写死 30s，
-// ClientConfig#pollNameServerInterval（:58）形同虚设。
-//
 // 这两个偏差在真机上都只表现为「慢」：没有异常、没有缺字段，只有「新 topic 的路由要等
 // 半分钟才刷新」这种没人会去计时的现象。所以这里用 MockCluster 记录
 // GET_ROUTEINFO_BY_TOPIC 的**到达时刻**（WireRecord.ArrivalMs），把节奏钉死。
@@ -21,10 +12,6 @@ namespace RocketMQ.Client.Tests;
 
 public class ScheduledIntervalsTests
 {
-    /// <summary>
-    /// Java ClientConfig:58 / :66 的默认值落在**门面**上（不只是实例上）：
-    /// pollNameServerInterval=30000、persistConsumerOffsetInterval=5000。
-    /// </summary>
     [Fact]
     public void FacadeDefaultsMatchLegacyClientConfig()
     {
@@ -59,10 +46,6 @@ public class ScheduledIntervalsTests
         Assert.Equal(1100, admin.PollNameServerIntervalMillis);
     }
 
-    /// <summary>
-    /// 门面透传：Start() 时把门面上的值交给 MQClientInstance（Java 的实例级副本），
-    /// 非正数回落到 Java 默认 30000（而不是退化成忙转）。
-    /// </summary>
     [Fact]
     public void FacadeIntervalReachesTheInstance()
     {
@@ -99,7 +82,6 @@ public class ScheduledIntervalsTests
             consumer.Shutdown();
         }
 
-        // 非正数回落（Java ClientConfig:58 的默认值），不是 0 也不是负周期
         var bad = new MQClientInstance("sched_bad_period", new List<string> { "127.0.0.1:1" },
             pollNameServerIntervalMillis: 0);
         Assert.Equal(30000, bad.PollNameServerIntervalMillis);
@@ -143,10 +125,6 @@ public class ScheduledIntervalsTests
             $"third tick must follow the configured period {periodMillis}ms, gap={gap2}ms");
     }
 
-    /// <summary>
-    /// 消费位点落盘：首笔在 Java 的 10s initialDelay 处（不是立刻、也不是 10s+周期），
-    /// 之后按 persistConsumerOffsetInterval 重复。
-    ///
     /// 这条只能在真集群上验「位点真的写到了 broker 且节奏正确」（examples/LiveScheduledIntervals），
     /// 离线这一层只能锁「周期字段被读到」——循环体本身要先把位点表喂上数据才会发请求。
     /// </summary>

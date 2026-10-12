@@ -34,7 +34,6 @@ func TestIllegalTopicAndGroupNames(t *testing.T) {
 			t.Fatalf("%q must be illegal", name)
 		}
 	}
-	// 空串在这里放行：blank 由上层 checkTopic 的 is_blank 档先拦（Java 同顺序）
 	if IsTopicOrGroupIllegal("") {
 		t.Fatal("empty is checked by the blank step, not the charset")
 	}

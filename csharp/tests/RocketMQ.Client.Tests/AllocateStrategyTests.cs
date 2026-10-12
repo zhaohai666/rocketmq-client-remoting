@@ -1,5 +1,3 @@
-// 队列分配策略单测（对应 Java client/test 的 AllocateMessageQueue*Test）。
-//
 // 与 rust/src/client/allocate_strategy.rs 的 AVERAGELY_CASES / CIRCLE_CASES、
 // cpp/tests/test_allocate_strategy.cpp、python/tests/test_allocate_strategy.py 同一张表，
 // 四语言逐格对拍。
@@ -13,11 +11,9 @@ namespace RocketMQ.Client.Tests;
 
 public class AllocateStrategyTests
 {
-    // Java 测试里的 createMessageQueueList(size)：new MessageQueue("topic", "brokerName", i)
     private static List<MessageQueue> QueuesOf(int size) =>
         Enumerable.Range(0, size).Select(i => new MessageQueue("topic", "brokerName", i)).ToList();
 
-    // Java 测试里的 createConsumerIdList(size)："CID_PREFIX" + i
     private static List<string> CidsOf(int size) =>
         Enumerable.Range(0, size).Select(i => "CID_PREFIX" + i).ToList();
 
@@ -25,7 +21,6 @@ public class AllocateStrategyTests
 
     public static IEnumerable<object[]> AveragelyCases()
     {
-        // (队列数, 消费者数, 逐个消费者期望的 queueId；与 Java 10×4 → {3,3,2,2} 同表)
         yield return new object[] { 10, 4, new[] { new[] { 0, 1, 2 }, new[] { 3, 4, 5 }, new[] { 6, 7 }, new[] { 8, 9 } } };
         yield return new object[] { 8, 3, new[] { new[] { 0, 1, 2 }, new[] { 3, 4, 5 }, new[] { 6, 7 } } };
         yield return new object[] { 9, 3, new[] { new[] { 0, 1, 2 }, new[] { 3, 4, 5 }, new[] { 6, 7, 8 } } };
@@ -40,7 +35,6 @@ public class AllocateStrategyTests
 
     public static IEnumerable<object[]> CircleCases()
     {
-        // Java AllocateMessageQueueAveragelyByCircleTest：10 / 4 → {0,4,8} {1,5,9} {2,6} {3,7}
         yield return new object[] { 10, 4, new[] { new[] { 0, 4, 8 }, new[] { 1, 5, 9 }, new[] { 2, 6 }, new[] { 3, 7 } } };
         yield return new object[] { 8, 3, new[] { new[] { 0, 3, 6 }, new[] { 1, 4, 7 }, new[] { 2, 5 } } };
         yield return new object[] { 9, 3, new[] { new[] { 0, 3, 6 }, new[] { 1, 4, 7 }, new[] { 2, 5, 8 } } };
@@ -79,7 +73,6 @@ public class AllocateStrategyTests
         }
     }
 
-    /// Java AllocateMessageQueueAveragelyTest 原样对拍：只断言 size。
     [Fact]
     public void Averagely_matches_java_unit_test_sizes()
     {
@@ -90,7 +83,6 @@ public class AllocateStrategyTests
             cidAll.Select(cid => strategy.Allocate("G", cid, mqAll, cidAll).Count).ToArray());
     }
 
-    /// Java AllocateMessageQueueAveragelyByCircleTest 第一段断言：currentCID 不在 cidAll → 空。
     [Fact]
     public void Circle_returns_nothing_when_cid_not_in_list()
     {
@@ -98,7 +90,6 @@ public class AllocateStrategyTests
             .Allocate("G", "CID_PREFIX", QueuesOf(10), CidsOf(4)));
     }
 
-    /// 守卫：与 Python/Rust 一致返回空列表，而不是像 Java check() 那样抛 IllegalArgumentException。
     [Theory]
     [InlineData("", 4, 2)]              // 空 currentCid
     [InlineData("CID_PREFIX0", 0, 2)]   // 空 mqAll
@@ -112,7 +103,6 @@ public class AllocateStrategyTests
         Assert.Empty(new AllocateMessageQueueAveragelyByCircle().Allocate("G", currentCid, mqAll, cidAll));
     }
 
-    /// Java AllocateMessageQueueByConfigTest：配 4 个队列，2 个消费者都拿到 [0,1,2,3]。
     [Fact]
     public void ByConfig_matches_java_unit_test()
     {
@@ -128,7 +118,6 @@ public class AllocateStrategyTests
         Assert.Equal(new[] { 0, 1, 2, 3 }, Ids(strategy.GetMessageQueueList()));
     }
 
-    /// Java / Python 的 ByConfig.allocate 都不调 check：守卫场景照样返回配置值。
     [Fact]
     public void ByConfig_ignores_all_guards()
     {
@@ -151,7 +140,6 @@ public class AllocateStrategyTests
             Ids(strategy.Allocate("G", "CID0", new List<MessageQueue>(), new List<string>())));
     }
 
-    /// Java getName() 的字面值（六个策略齐全）。
     [Fact]
     public void Names_match_java()
     {
@@ -278,7 +266,6 @@ public class AllocateStrategyTests
         Assert.Equal(1, second[0].QueueId);
     }
 
-    /// 消费者默认策略 = AVG，可替换；置 null 由 Start() 拒绝（Java checkConfig）。
     [Fact]
     public void Consumers_expose_strategy()
     {
@@ -306,8 +293,6 @@ public class AllocateStrategyTests
         MQClientException e = Assert.Throws<MQClientException>(() => lite.Start());
         Assert.Contains("allocateMessageQueueStrategy is null", e.Message);
 
-        // 拉模式消费者同样带这份配置（Java DefaultMQPullConsumer:89 字段 + :196-202 读写口，
-        // checkConfig:803 拒绝 null）；本端口拉模式不做 rebalance，所以它是配置面。
         var pull = new DefaultMQPullConsumer("G_test");
         Assert.Equal("AVG", pull.AllocateMessageQueueStrategy!.GetName());
         pull.SetAllocateMessageQueueStrategy(new AllocateMessageQueueByConfig(QueuesOf(2)));
@@ -321,8 +306,6 @@ public class AllocateStrategyTests
 
     // ============================================================ CONSISTENT_HASH
 
-    // Java `AllocateMessageQueueConsitentHashTest` 的 createConsumerIdList：`CID-i`。
-    // 与 CidsOf() 的 "CID_PREFIX i" **刻意不同名** —— clientId 参与哈希，改一个字符整张表就废了。
     private static List<string> ChCids(int size) =>
         Enumerable.Range(0, size).Select(i => "CID-" + i).ToList();
 
@@ -332,9 +315,6 @@ public class AllocateStrategyTests
 
     public static IEnumerable<object[]> ConsistentHashCases()
     {
-        // 落点表（virtualNodeCnt = 3）。期望值来自**真实 Java 5.5.1 客户端**，与 Rust /
-        // Python / C++ 的表逐值相同：四语言 + Java 必须算出同一个环，否则混跑时全体队列换主
-        // （重复 / 漏消费），而不是"分得稍有不均"。
         yield return new object[] { 6, 2, new[] { new[] { 2 }, new[] { 0, 1, 3, 4, 5 } } };
         yield return new object[] { 6, 3, new[] { new[] { 2 }, new[] { 1, 5 }, new[] { 0, 3, 4 } } };
         yield return new object[]
@@ -363,7 +343,6 @@ public class AllocateStrategyTests
 
     public static IEnumerable<object[]> ConsistentHashDefaultVcCases()
     {
-        // 同一算法、默认 virtualNodeCnt = 10（Java 无参构造）
         yield return new object[] { 4, 2, new[] { new[] { 0, 2 }, new[] { 1, 3 } } };
         yield return new object[] { 8, 3, new[] { new[] { 0, 2, 4 }, new[] { 3, 5, 6, 7 }, new[] { 1 } } };
     }
@@ -397,7 +376,6 @@ public class AllocateStrategyTests
         Assert.Equal(10, new AllocateMessageQueueConsistentHash().VirtualNodeCnt);
     }
 
-    /// Java verifyAllocateAll：任意规模下每条队列恰好分给一个消费者（不重不漏）。
     [Fact]
     public void Consistent_hash_covers_every_queue_once()
     {
@@ -464,8 +442,6 @@ public class AllocateStrategyTests
         }
     }
 
-    /// Java 构造函数就抛 IllegalArgumentException("illegal virtualNodeCnt :")；
-    /// 0 合法（Java 只挡 <0）⇒ 环上没有虚拟节点 ⇒ 一条都分不到。
     [Fact]
     public void Consistent_hash_rejects_negative_virtual_node_count()
     {
@@ -476,8 +452,6 @@ public class AllocateStrategyTests
             QueuesOf(4), ChCids(2)));
     }
 
-    /// Java 探针场景：两个 cid 的虚拟节点 key（"CID-0-0"…）首字符都是 'C' ⇒ 哈希相同
-    /// ⇒ Java TreeMap.put 后者覆盖前者，环上只剩 CID-1 ⇒ 队列全归它。
     private sealed class FirstCharHash : IHashFunction
     {
         public int Calls { get; private set; }
@@ -518,9 +492,6 @@ public class AllocateStrategyTests
     private static List<MessageQueue> RoomQueuesOf(string brokerName, int from, int to) =>
         Enumerable.Range(from, to - from).Select(i => new MessageQueue("topic", brokerName, i)).ToList();
 
-    /// Java AllocateMessageQueueByMachineRoomTest：10 队列（0..4 在 room1）+ 白名单 {room1}
-    /// + 2 消费者 → [0,1,4] / [2,3]（真实 Java 客户端复核）。
-    /// 余数队列给**前 rem 个**消费者（rem > currentIndex），与 AVG 的切法不同。
     [Fact]
     public void ByMachineRoom_matches_java_unit_test()
     {
@@ -536,9 +507,8 @@ public class AllocateStrategyTests
 
     public static IEnumerable<object[]> LegacySplitCases()
     {
-        // (broker 名, Java `String#split("@")` 的真实段数（JDK 17 实测）, 是否参与分配)
         yield return new object[] { "room1@broker-a", 2, true };
-        yield return new object[] { "room1@", 1, false };      // 尾空段被 Java 丢掉
+        yield return new object[] { "room1@", 1, false };
         yield return new object[] { "room1@b@", 2, true };     // 裁尾后仍是 2 段
         yield return new object[] { "@room1", 2, false };       // 2 段，但机房是空串、不在白名单
         yield return new object[] { "room1@broker@a", 3, false };
@@ -547,7 +517,6 @@ public class AllocateStrategyTests
         yield return new object[] { "", 1, false };
     }
 
-    /// broker 名必须是 `机房@名字`（且切分按 Java 的裁尾口径）。
     [Theory]
     [MemberData(nameof(LegacySplitCases))]
     public void ByMachineRoom_uses_java_split_on_the_broker_name(string broker, int javaParts,
@@ -565,12 +534,11 @@ public class AllocateStrategyTests
     {
         List<string> cidAll = CidsOf(1);
         var unset = new AllocateMessageQueueByMachineRoom();
-        // 没配机房 = 一条都不分（Java 此处是 NPE，本端口按"守卫返回空"口径）
         Assert.Empty(unset.Allocate("G", cidAll[0], RoomQueuesOf("room1@b", 0, 1), cidAll));
 
         var strategy = new AllocateMessageQueueByMachineRoom(new[] { "room1" });
         Assert.NotEmpty(strategy.Allocate("G", cidAll[0], RoomQueuesOf("room1@broker-a", 0, 1), cidAll));
-        strategy.SetConsumeridcs(new[] { "room2" });  // Java setter：换完立刻对后续 rebalance 生效
+        strategy.SetConsumeridcs(new[] { "room2" });
         Assert.Contains("room2", strategy.GetConsumeridcs());
         Assert.Empty(strategy.Allocate("G", cidAll[0], RoomQueuesOf("room1@broker-a", 0, 1), cidAll));
     }
@@ -589,7 +557,6 @@ public class AllocateStrategyTests
 
     // ========================================================= MACHINE_ROOM_NEARBY
 
-    /// Java 测试同款 resolver：broker `IDCx-brokerName` / 消费者 `IDCx-CID-i` 取 '-' 前段。
     private sealed class DashRoom : IMachineRoomResolver
     {
         public string BrokerDeployIn(MessageQueue messageQueue) =>
@@ -612,8 +579,6 @@ public class AllocateStrategyTests
             .SelectMany(i => Enumerable.Range(0, consumerSize).Select(q => "IDC" + i + "-CID-" + q))
             .ToList();
 
-    /// Java testWhenIDCSizeEquals：机房数相等时每个消费者只拿到**同机房**的队列，
-    /// 且全员并集恰好是全集（不重不漏）。四组规模与 Java 参数化用例一致。
     [Theory]
     [InlineData(10)]
     [InlineData(20)]
@@ -640,13 +605,10 @@ public class AllocateStrategyTests
             flat.OrderBy(x => x, StringComparer.Ordinal).ToList());
     }
 
-    /// Java testWhenConsumerIDCIsLess：broker 机房多于消费者机房时，**没有活消费者**的机房
-    /// 要交给全部消费者共享（否则没人消费），有消费者的机房仍然只给自己的消费者。
     [Fact]
     public void Nearby_shares_rooms_that_have_no_consumer()
     {
         var strategy = new AllocateMachineRoomNearby(new AllocateMessageQueueAveragely(), new DashRoom());
-        // 真实 Java 客户端：mqs = IDC2×4 + IDC1×2，cids = IDC1 的两个消费者
         List<MessageQueue> mqAll = RoomQueuesOf("IDC2-brokerName", 0, 4)
             .Concat(RoomQueuesOf("IDC1-brokerName", 0, 2)).ToList();
         List<string> cidAll = new() { "IDC1-CID-0", "IDC1-CID-1" };
@@ -655,7 +617,6 @@ public class AllocateStrategyTests
             mqs.Select(mq => mq.BrokerName + "#" + mq.QueueId).ToList();
 
         Assert.Equal(new[] { 0, 0, 1 }, Ids(strategy.Allocate("G", "IDC1-CID-0", mqAll, cidAll)));
-        // 顺序也是 Java 的口径：先收同机房队列，再补空机房的共享队列
         Assert.Equal(new[] { "IDC1-brokerName#0", "IDC2-brokerName#0", "IDC2-brokerName#1" },
             Describe(strategy.Allocate("G", "IDC1-CID-0", mqAll, cidAll)));
         Assert.Equal(new[] { "IDC1-brokerName#1", "IDC2-brokerName#2", "IDC2-brokerName#3" },
@@ -682,7 +643,6 @@ public class AllocateStrategyTests
         Assert.Equal(manyMq.Count, claimed);
     }
 
-    /// `getName()` = `MACHINE_ROOM_NEARBY-<内层策略名>`（Java 复核）。
     [Fact]
     public void Nearby_name_exposes_the_inner_strategy()
     {
@@ -709,8 +669,6 @@ public class AllocateStrategyTests
         public string ConsumerDeployIn(string clientId) => string.Empty;
     }
 
-    /// resolver 给出空机房 ⇒ Java 抛 IllegalArgumentException。这里照抛而不返回空：
-    /// 静默返回空等于把整个 topic 的队列撤走，而 rebalance 抓住错误会保住现有分配。
     [Fact]
     public void Nearby_throws_when_a_room_is_unknown()
     {
@@ -719,7 +677,6 @@ public class AllocateStrategyTests
         MQClientException e = Assert.Throws<MQClientException>(
             () => new AllocateMachineRoomNearby(new AllocateMessageQueueAveragely(), new BlankBrokerRoom())
                 .Allocate("G", "CID-0", mqAll, cidAll));
-        // 文案带 Java 的 MessageQueue#toString
         Assert.Contains("Machine room is null for mq MessageQueue [topic=topic, brokerName=brokerName, " +
                         "queueId=0]", e.Message);
 
@@ -733,7 +690,6 @@ public class AllocateStrategyTests
             .Allocate("G", "CID-0", mqAll, new List<string>()));
     }
 
-    /// Java 构造器对 null 参数抛 NullPointerException，文案照抄。
     [Fact]
     public void Nearby_rejects_null_arguments()
     {

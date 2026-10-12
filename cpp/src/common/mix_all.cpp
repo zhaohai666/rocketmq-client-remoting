@@ -10,7 +10,6 @@ namespace rocketmq {
 
 namespace {
 
-// 对应 Java MixAll.PREDEFINE_GROUP_SET
 const char* const kPredefineGroups[] = {
     MixAll::DEFAULT_CONSUMER_GROUP,
     MixAll::DEFAULT_PRODUCER_GROUP,
@@ -85,9 +84,6 @@ const std::string& MixAll::cachedIpStr() {
 int32_t MixAll::pid() { return UtilAll::pid(); }
 
 std::string MixAll::properties2String(const PropertyMap& properties) {
-    // Java: 每条 "key=value\n"（Properties.store 风格用 "=" 作分隔符），null 值跳过。
-    // 这里 PropertyMap 的值是 std::string，没有 null 概念，故不做过滤；
-    // 调用方若想跳过某键，不要放进 map 即可。
     std::string out;
     for (const auto& kv : properties) {
         out += kv.first;
@@ -99,14 +95,6 @@ std::string MixAll::properties2String(const PropertyMap& properties) {
 }
 
 PropertyMap MixAll::string2Properties(const std::string& text) {
-    // 语义对齐 Java MixAll.string2Properties -> java.util.Properties.load：
-    //   1) 行尾未转义的 '\' 表示续行（下一行前导空白被丢弃）；
-    //   2) 空行、以 '#' 或 '!' 开头的行是注释；
-    //   3) 键与值以**第一个** '='、':' 或**空白**分隔（空白也是合法分隔符！）；
-    //   4) 分隔符前后的空白被跳过；值的**尾部**空白保留（Java 不去尾空白）。
-    //
-    // 注：Java 还会处理 \t \n \uXXXX 等转义，broker 配置导出里不出现，
-    // 这里不实现（把反斜杠语义做错反而更不一致）。
     PropertyMap result;
 
     // 先把续行合并成逻辑行

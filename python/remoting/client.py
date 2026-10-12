@@ -201,11 +201,6 @@ class RemotingClient:
         #   clientCert/clientKey: mTLS 客户端证书与私钥路径。
         #   serverName: 主机名/SNI 覆盖（缺省用连接 host）。
         self.tls_options: Dict[str, str] = dict(tls_options or {})
-        # SOCKS 代理（对应 Java NettyRemotingClient 的 proxyMap / Socks5ProxyHandler）。
-        # Java 按 CIDR 分流；本端口配置了（且 enable 语义判定开启）就是全部 remoting
-        # 连接统一走代理，等价 Java 的 CIDR 0.0.0.0/0。握手在 TCP 连上代理之后、
-        # TLS 包裹之前做（Java 的 pipeline.addFirst(Socks5ProxyHandler) 在
-        # sslHandler 之前，同一时序），见 _create_conn。
         self.socks_proxy_config = socks_proxy_config
         self._lock = threading.RLock()
         self._conns: Dict[str, socket.socket] = {}
@@ -276,11 +271,6 @@ class RemotingClient:
         sock.settimeout(self.connect_timeout_millis / 1000.0)
         try:
             if use_proxy:
-                # 对应 Java fetchBootstrap → createBootstrap(proxy)：先连代理，
-                # 再由 Socks5ProxyHandler（此处为 socks_handshake，SOCKS4/5 皆可）
-                # 发 CONNECT 到真正的目标 host:port。目标域名不在本地解析，
-                # 交给代理（SOCKS5 atyp=3 / SOCKS4a），与 Java
-                # bootstrap.resolver(NoopAddressResolverGroup) 的口径一致。
                 proxy_host, proxy_port = proxy.endpoint()
                 sock.connect((proxy_host, int(proxy_port)))
                 socks_handshake(sock, host, int(port), proxy)

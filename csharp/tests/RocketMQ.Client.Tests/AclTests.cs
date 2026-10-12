@@ -1,8 +1,3 @@
-// ACL 鉴权单测：AclClientRPCHook 的签名内容与签名值**逐字节对拍 Java 官方实现**。
-//
-// 下面各向量的 content / signature 全部由 Java 官方
-// org.apache.rocketmq.acl.common.AclClientRPCHook#doBeforeRequest 跑出来：
-//
 //   RemotingCommand cmd = RemotingCommand.createRequestCommand(310, null);
 //   cmd.setExtFields(...); cmd.setBody(...);
 //   new AclClientRPCHook(new SessionCredentials(ak, sk[, token])).doBeforeRequest(addr, cmd);
@@ -217,7 +212,6 @@ public class AclTests
         RemotingCommand cmd = MakeRequest(V1Ext(), V1Body());
         composed.DoBeforeRequest("127.0.0.1:9876", cmd);
 
-        // Java StreamTypeRPCHook 写的是 code 的字符串形式 "0"（clientId 才用枚举名 STREAM）。
         Assert.Equal("0", cmd.GetExtField(MixAll.ReqT));
         Assert.Equal(
             AclClientRPCHook.CalcSignature(SecretKey, cmd),
@@ -239,7 +233,6 @@ public class AclTests
             cmd.GetExtField(SessionCredentials.SignatureField));
     }
 
-    /// 组合钩子的 doAfterResponse 要逐个转发（Java 的 rpcHooks 列表就是这个语义）。
     [Fact]
     public void ChainedHookForwardsAfterResponse()
     {

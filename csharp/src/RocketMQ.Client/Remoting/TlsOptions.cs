@@ -1,9 +1,3 @@
-// TLS 细项（对齐 PHP RemotingClient $tlsOptions / Java TlsSystemConfig certPath 族）。
-//
-//   - CaCert 给出 → **严格校验**（Java tls.test.mode.enable=false 口径）：broker 证书
-//     必须链到该 CA 且主机名/SAN 匹配（默认用连接 host 校验，ServerName 可覆盖）；
-//     不给 → test-mode：信任自签（历史行为）。
-//   - ClientCert/ClientKey → mTLS 客户端证书与私钥（PEM；cert 内含私钥时 key 可省）。
 namespace RocketMQ.Remoting;
 
 public sealed class TlsOptions

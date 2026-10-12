@@ -569,11 +569,7 @@ class GetEarliestMsgStoretimeResponseHeader(CommandCustomHeader):
 
 
 class QueryMessageRequestHeader(CommandCustomHeader):
-    """对应 org.apache.rocketmq.remoting.protocol.header.QueryMessageRequestHeader。
-
-    ``index_type`` 取 MessageConst.INDEX_KEY_TYPE("K") / INDEX_UNIQUE_TYPE("U") /
-    INDEX_TAG_TYPE("T")；broker 侧为空时默认按 "K"（普通 key 索引）查。
-    """
+    pass
 
     def __init__(self):
         self.topic: Optional[str] = None
@@ -778,12 +774,7 @@ class GetConsumerRunningInfoRequestHeader(CommandCustomHeader):
 
 
 class ConsumeMessageDirectlyResultRequestHeader(CommandCustomHeader):
-    """对应 Java `ConsumeMessageDirectlyResultRequestHeader`（309）。
-
-    Java 头里还有可空的 brokerName / topicSysFlag / groupSysFlag；Java 发起端
-    （DefaultMQAdminExtImpl → MQClientAPIImpl）从不设后两者，brokerName 也不设，
-    这里同样只在拿到 broker 名时才带上。
-    """
+    pass
 
     def __init__(self):
         self.consumer_group: Optional[str] = None
@@ -1011,12 +1002,7 @@ class GetTopicConfigRequestHeader(CommandCustomHeader):
 
 
 class CreateTopicRequestHeader(CommandCustomHeader):
-    """对应 org.apache.rocketmq.remoting.protocol.header.CreateTopicRequestHeader。
-
-    ⚠ broker 的 checkFields() 会把 ``topicFilterType`` 解析成枚举，**为空直接抛
-    RemotingCommandException("topicFilterType = [null] value invalid")**，
-    所以哪怕只想建普通 topic，也必须显式下发 topicFilterType。
-    """
+    pass
 
     def __init__(self):
         self.topic: Optional[str] = None

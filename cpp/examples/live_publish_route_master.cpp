@@ -1,50 +1,15 @@
-// 发布路由必须跳过「没有 master 的 broker」真机验证（Java MQClientInstance:294-303），
-// 以及同一条分界线的**地址侧**（#100：findBrokerAddressInPublish:1295-1305，发送只认主）。
-//
 // 与 `python/verify_publish_route_master_live.py`、`rust/examples/live_publish_route_master.rs`、
 // `csharp/examples/RocketMQ.Examples/LivePublishRouteMaster.cs` 同场景、逐条同断言。
 //
 // 前置：namesrv + master + slave 都在跑（按本地集群 runbook）；脚本自己**只停一次 master**
 // （scripts/rmq_test_broker.sh 只认 master 的 java 进程），收尾块保证 master 一定回来。
 //
-// Java 依据：MQClientInstance.topicRouteData2TopicPublishInfo:294-303 组装发布信息时，brokerDatas
-// 里没有同名 broker、或它的 brokerAddrs 没有 MASTER_ID，整条 QueueData 跳过。从节点自己也注册
-// 进 namesrv，且默认配置下照样带写位（RouteInfoManager 只在「prime slave 且 enableActingMaster」
-// 时才抹掉 WRITE，本机 broker.conf 是 false），所以 master 一掉线，路由里同一个 brokerName 只剩
-// brokerId=1 —— 漏判这条，生产者就会把消息发到从节点上，而从节点对发送请求一律 reject
-// （SendMessageProcessor ⇒ SYSTEM_BUSY(2)，**还是可重试码**），白烧重试。消费侧是另一份口径
-// （topicRouteData2TopicSubscribeInfo:318-332：读位 + readQueueNums、**不要求有 master**），
-// 停窗口内消费者仍要看得见队列、还得能从从节点拉。
 //
-// **地址侧**也是同一条分界线：Java sendKernelImpl:919-924 从 brokerAddrTable 里取
-// brokerId=0（findBrokerAddressInPublish:1295-1305），拿不到按 topic 刷一次路由再查，
-// 仍拿不到就本端抛 MQClientException("The broker[X] not exist") —— 定点发送（调用方给了 mq）
-// 走的正是这条，**不会**退到从节点地址上让 broker 回 SYSTEM_BUSY(2) 白烧一轮。
 //
 // 离线单测：tests/test_route_heartbeat.cpp 的发布/订阅信息组锁「队列集判据」，
 // tests/test_publish_route_master.cpp 锁「地址判据」；真机锁的是判据作用在真实路由形状上的
 // 结果 —— 名字服务里 broker-a 真的只剩 {1: slave}。
 //
-// 场景（同一停窗口里做完）：
-//   S0 控制腿（master 在）：路由 {0: master, 1: slave}；发布队列 4、订阅队列 4。
-//   S1 预埋：每队列定点一条共 4 条，等从节点 store 追上（不然 S6 无从消费）。
-//   S2 停 master → 刷新路由直到 broker-a 只剩 {1: slave}。
-//   S3 (A) 发布队列 == 0；访问器本端抛「选不到队列」。
-//   S4 (C) 订阅队列仍是 4（消费侧不看 master）。
-//   S5 发送快速失败、报错里没有从节点地址（旧缓存腿打的是死掉的 master；周期刷新恰好已跑过
-//      则是本端 10005）；再显式把发送实例刷成停后形状：(A) 生效 —— 发送本端 10005 且
-//      **一条 wire 都不发**。
-//   S5d (B) 对照：定点发到该队列 → 地址侧只认 master，本端同样立刻报
-//       「The broker[broker-a] not exist」，也无 wire（漏掉 (B) 这条对照时的旧行为：
-//       请求打到从节点上，broker 回 SYSTEM_BUSY(2)，一个可重试码 —— 白烧一整轮重试，
-//       错误类型也和 Java 不一样）。两条腿合起来是「无 wire」，落库与否由 S7b 钉死。
-//   S5e (D) 订阅口径：顺序锁整台跳过（RebalanceImpl#lock:153/lockAll:195 只认主、不刷路由；
-//       对照腿直接点名从节点，证明从节点**本来**发得出锁 —— 空集是客户端没去，不是 broker 拒绝）。
-//   S5f (E) 订阅口径：POP 本端报「broker 不存在」（PullAPIWrapper#popAsync:369-373），不发 wire。
-//   S5g (F) 位点读取：冷实例（缓存里没这个 topic）刷一次路由后**放宽**到从节点
-//       （RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241）。
-//   S6 (C 端到端) 停窗口内新起的 push 消费者仍看到 4 条队列，并从**从节点**把 S1 的 4 条收齐。
-//   S7 负控：master 拉回 → 发布队列恢复 4、两条失败发送都没在 broker 上留下消息、发送 SEND_OK。
 //
 // 用法：./rmq_live_publish_route_master 127.0.0.1:9876 [127.0.0.1:10911] [127.0.0.1:10931]
 #include <algorithm>
@@ -478,10 +443,6 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
           std::to_string(static_cast<int>(freshMs)) + "ms code=" + std::to_string(freshCode) +
               ": " + freshText);
 
-    // ---------------- S5d (B) 对照：定点发送的地址解析 ----------------
-    // 定点发送不经过发布信息（调用方直接给了 mq），地址侧若还按「主优先、没主退一台」去解析，
-    // 请求就会落到从节点上换来一个 SYSTEM_BUSY(2)。Java 的 findBrokerAddressInPublish
-    // 只认 brokerId=0，本端应当直接报「broker 不存在」，一条 wire 都不发。
     std::printf("\nS5d (B) 对照：定点发到该队列 → 本端报 broker 不存在（不发 wire）\n");
     const double pinnedBegin = monotonicSeconds();
     std::string pinnedText;
@@ -508,12 +469,6 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
               pinnedMs < kLocalBudgetMs,
           std::to_string(static_cast<int>(pinnedMs)) + "ms " + pinnedText);
 
-    // ---------------- S5e (D) 订阅口径：顺序锁只认主 ----------------
-    // Java RebalanceImpl#lock:153 / lockAll:195 走 findBrokerAddressInSubscribe(brokerName,
-    // MASTER_ID, true)：只认主、**不刷路由**，拿不到就整台跳过。退到从节点上锁等于锁在
-    // 从节点的锁管理器里，master 不知情，顺序消费的互斥静默失效。此刻 admin 实例的路由
-    // 缓存已被 S2 刷成 masterless 形状，任何"退让"口径都会落到从节点上并拿回非空锁集，
-    // 所以空集 + S5e2 对照腿足以说明客户端压根没去。
     std::printf("\nS5e (D) 顺序锁：停窗口内整台跳过（不刷路由、不发 wire）\n");
     const std::string group = "GID_PrMasterCpp_" + fx.stamp;
     const std::string clientId = "pr_master_cpp_lock_" + fx.stamp;
@@ -579,10 +534,6 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
     check("S5e3 解锁同样安静跳过（不抛、不发）", unlockMs < kLocalBudgetMs,
           std::to_string(static_cast<int>(unlockMs)) + "ms");
 
-    // ---------------- S5f (E) 订阅口径：POP 只认主 ----------------
-    // Java PullAPIWrapper#popAsync:369-373：只认主 → 刷一次路由 → 仍没有就本端抛。从节点
-    // 不接 POP 这族写请求（ack / 延长不可见时间要落在 broker 侧 revive 表上），退过去只会
-    // 换一个可重试的 SYSTEM_BUSY(2)，白烧一轮。
     std::printf("\nS5f (E) POP 拉取：本端报「The broker[broker-a] not exist」（不发 wire）\n");
     const double popBegin = monotonicSeconds();
     std::string popText;
@@ -606,11 +557,6 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
               popMs < kLocalBudgetMs,
           std::to_string(static_cast<int>(popMs)) + "ms " + popText);
 
-    // ---------------- S5g (F) 位点读取：刷一次路由后放宽到从节点 ----------------
-    // Java RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241：只认主 → 刷一次
-    // 路由 → 重查**放宽**（onlyThisBroker=false，位点是 HA 复制来的同一份数据，可以从从
-    // 节点读）。冷实例（路由缓存里没有这个 topic）是这条路径最纯的形状：旧口径在此直接报
-    // 「No route info of this topic」，连刷新都没有。
     std::printf("\nS5g (F) 位点读取：冷实例刷一次路由后放宽到从节点\n");
     {
         MQClientInstance cold("pr_master_cpp_cold_" + fx.stamp,

@@ -1,16 +1,5 @@
-// 220 RESET_CONSUMER_CLIENT_OFFSET 单测（Java MQClientInstance:1403-1450 + ClientRemotingProcessor:144-158），
-// 不需要集群。
-//
 // 为什么必须离线锁死：这条路径错了全是**静默**的三种表现 ——
 //
-//   - 只把缓冲与游标清掉、不撤队列（不 +1 代号）：在途批次的 ack 照样落地，把刚重置的
-//     位点又推回旧位置（Java 靠 ProcessQueue.setDropped(true) 挡住，见
-//     ConsumeMessageConcurrentlyService:267）；长轮询在途的应答也会把重置前那一批
-//     消息重新塞进缓冲，照常消费 + ack；
-//   - 新位点没交出去落盘：进程在下一个周期落盘（默认 5s）之前崩掉，broker 上还是旧位点 ——
-//     「重置」只活到本次进程结束；
-//   - 入站 body 只认 map 形状：发起方 language=CPP（旧 C++ SDK 管理端）时 broker 推的是
-//     数组形状 (ResetOffsetBodyForC)，解析不出就等于整笔重置**静默**丢弃。
 //
 // 真机短期窗口里前两条最多表现为"重置后消息又冒出来一批"或"崩一次才暴露"，第三条根本
 // 看不出来，所以判据全部放离线；真机另有链路证明（examples 的 live-reset-offset 子命令）。
@@ -121,7 +110,6 @@ public class ResetOffsetTests
         Assert.Null(h.C.PopQueueForTest(h.Key));
     }
 
-    /// <summary>代号 +1 是「旧批次作废」的依据（Java setDropped(true)）。</summary>
     [Fact]
     public void Reset_BumpsTheQueueEpoch()
     {
@@ -133,11 +121,6 @@ public class ResetOffsetTests
         Assert.Equal(1L, h.Epoch());
     }
 
-    /// <summary>
-    /// Java 的显式 persist：不等周期落盘，重置当场写回 broker（写的是**新**值）。
-    /// 离线只能断言"交给持久化路径的材料"；真机上 broker 侧位点被 `admin resetOffsetByTimestamp`
-    /// 读回核对，见 examples 的 live-reset-offset。
-    /// </summary>
     [Fact]
     public void Reset_HandsTheNewOffsetToPersist()
     {
@@ -273,7 +256,7 @@ public class ResetOffsetTests
         RemotingCommand? resp = h.C.ProcessResetConsumerOffset(
             ResetCmd(Group, Topic, body.Encode()));
 
-        Assert.Null(resp);   // Java 返回 null ⇒ 不回包
+        Assert.Null(resp);
         Assert.True(WaitFor(() => h.C.RetiredQueuesForTest().Count == 1),
             "map 形状的 220 没落到重置路径");
         DefaultMQPushConsumer.RetiredForTest record = Assert.Single(h.C.RetiredQueuesForTest());
@@ -282,11 +265,6 @@ public class ResetOffsetTests
 
     /// <summary>
     /// 发起方 language=CPP 时 broker 推**数组**形状（ResetOffsetBodyForC）：必须解析出来。
-    ///
-    /// Java 处理器（ClientRemotingProcessor.resetOffset:153）只认 map 形状 —— Java 管理端
-    /// 恒发 JAVA，故 Java 侧碰不到该形状；本端口兜底是为了与 language=CPP 的旧 C++ SDK
-    /// 管理端互通，不兜底等于整笔重置**静默**丢弃（map 解析器对数组只得空表）。
-    /// </summary>
     [Fact]
     public void ProcessReset_ArrayBodyForCIsNotDropped()
     {
@@ -325,8 +303,6 @@ public class ResetOffsetTests
         Assert.Equal(7L, h.Offset());
     }
 
-    /// <summary>负向对照：两种形状都解析不出（垃圾 body）→ 与 Java 一致地整笔丢弃（空表 ⇒
-    /// ResetOffset 直接返回），本地位点一根手指都不许碰。</summary>
     [Fact]
     public void ProcessReset_GarbageBodyIsIgnored()
     {
@@ -353,14 +329,6 @@ public class ResetOffsetTests
 
     /// <summary>
     /// 222 的 force 标志在 extFields 里叫 **isForce**，不是 force。
-    ///
-    /// Java RemotingCommand.makeCustomHeaderToNet:437-450 拿 requestHeader 的**字段名**做 key，
-    /// 而 ResetOffsetRequestHeader 声明的字段是 private boolean isForce。写成 force 时 broker 侧
-    /// isForce 恒为 false ⇒ Broker2Client.resetOffset:152-158 的分支退化成"取时间戳位点"：
-    /// 前重（timestamp=-1）会把 consumerOffset 原样回显而不是跳到 maxOffset。
-    /// 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
-    ///               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
-    /// </summary>
     [Fact]
     public void AdminReset_SendsTheLegacyIsForceKey()
     {
@@ -394,7 +362,6 @@ public class ResetOffsetTests
         }
     }
 
-    /// <summary>负向对照：单队列重载（Java 不传 force、timestamp 传 0）。</summary>
     [Fact]
     public void AdminResetByQueueId_KeepsTheIsForceKeyAndAddsTheQueue()
     {
@@ -424,12 +391,6 @@ public class ResetOffsetTests
         }
     }
 
-    /// <summary>
-    /// language 默认**不**覆盖成 CPP：broker 只在发起方是 C 系时推数组形状的
-    /// ResetOffsetBodyForC（AdminBrokerProcessor.resetOffset:2263），而 map 形状才是
-    /// 所有客户端都能解析的口径（Java 管理端两个重载传的 isC 都是 false，
-    /// MQClientAPIImpl:2405/2408）。
-    /// </summary>
     [Fact]
     public void AdminReset_KeepsTheClientsOwnLanguage()
     {

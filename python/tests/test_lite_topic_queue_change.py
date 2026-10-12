@@ -1,20 +1,4 @@
 # -*- coding: utf-8 -*-
-"""LitePull 的 topic 队列集合变更监听器（Java registerTopicMessageQueueChangeListener）。
-
-为什么存在：Java ``DefaultLitePullConsumer:325`` → ``DefaultLitePullConsumerImpl:1267``
-给调用方一个"topic 扩缩容感知"入口——后台按 ``topicMetadataCheckIntervalMillis`` 拉订阅
-队列集合、与上一次快照做集合相等比对，只有真的变了才回调 ``onChanged``。本端口此前完全没有
-这条能力（六个语言里只有 cpp 有），这份单测先把契约钉住：
-
-1. 入参守卫与覆盖语义（Java :1268-1273：null 抛、重复注册 warn 并覆盖）；
-2. 快照时机（Java :1275-1277：只有 RUNNING 才记快照，未启动注册要靠首轮比对）；
-3. 集合相等判定 ``isSetEqual``（Java :1246-1260）的四个分支；
-4. 变化才回调 + 回调后快照更新、未变化不重复打扰；
-5. 单个 topic 取路由失败只跳过它，本轮其余 topic 继续比对（**本端口的有意偏差**：Java 的
-   catch 在 startScheduleTask 的包装层（Impl:382-393），一个 topic 失败会放弃本轮其余）；
-6. 周期下限（本端口与 cpp 同款 1s，Java 无下限）与回调键的命名空间口径；
-7. 每轮现查路由（Java :171 不吃缓存），见 test_listener_refreshes_the_route...。
-"""
 from __future__ import annotations
 
 import threading
@@ -42,8 +26,6 @@ class FakeInstance:
             raise RuntimeError("route query failed")
         return list(self.queues.get(topic, []))
 
-    # Java MQAdminImpl#fetchSubscribeMessageQueues:171 每轮都现查路由，不吃 30s
-    # 周期刷新的缓存 —— 记下调用，好让单测钉住"监听真的强制刷新了路由"。
     def update_topic_route_info_from_name_server(self, topic, timeout_millis=5000,
                                                  is_default=False):
         self.route_refreshes.append(topic)
@@ -103,7 +85,6 @@ def test_snapshot_only_taken_when_started():
     c, fake = _consumer()
     fake.set("T", [("broker-a", 0), ("broker-a", 1)])
     c.register_topic_message_queue_change_listener("T", Recorder())
-    # 未启动：Java :1275 的 if (serviceState == RUNNING) 不成立 ⇒ 没有快照
     assert "T" not in c._message_queues_for_topic
     c._started = True
     rec = Recorder()
@@ -163,17 +144,12 @@ def test_listener_key_is_namespaced_and_reported_back():
     c.register_topic_message_queue_change_listener("T", rec)
     assert list(c._topic_change_listeners) == ["ns1%T"]
     assert c.fetch_topic_message_queues_and_compare() == 1
-    # Java :327 在入口就 withNamespace，onChanged 收到的就是这个键
     assert rec.events == [("ns1%T", [3])]
     assert fake.calls and fake.calls[0] == "ns1%T"
 
 
 def test_listener_refreshes_the_route_from_the_nameserver_every_round():
-    """Java MQAdminImpl#fetchSubscribeMessageQueues:171 是"每轮现查路由"，不是读缓存。
-
-    读缓存的话扩容要等满一次路由轮询（默认 30s）才看得见，监听回调比 Java 慢一整周期。
-    同时钉住 wrapNamespace 的幂等：监听器表的键已带命名空间，再取一次不会变成 ns1%ns1%T。
-    """
+    pass
     c, fake = _consumer(namespace="ns1")
     fake.set("ns1%T", [("broker-a", 0)])
     c._started = True
@@ -198,7 +174,7 @@ def test_check_interval_floor_and_default():
 
 
 def test_metadata_loop_periodically_compares():
-    """后台循环真的在比对：首查延迟用参数缩短（默认仍是 Java 的 10s）。"""
+    pass
     c, fake = _consumer()
     fake.set("T", [("broker-a", 0)])
     rec = Recorder()

@@ -128,11 +128,6 @@ func main() {
 	defer c.Shutdown()
 	check("消费者 clientId 带 @STREAM", strings.Contains(c.ClientID(), "@STREAM"), "clientId="+c.ClientID())
 
-	// ---- 1. create the topic with ONE queue so the offsets are exact ---------------
-	// The key is the default topic (TBW102) whose route names the brokers to push
-	// the new topic to — Java's MQAdminImpl.createTopic(key, ...) contract. It is
-	// NOT an attributes field: sending a topic name there makes the broker answer
-	// "kv string format wrong".
 	if err := c.CreateTopic(common.DefaultTopic, topicName, 1, 0); err != nil {
 		check("建 Topic", false, err.Error())
 	} else {
@@ -167,17 +162,6 @@ func main() {
 			fmt.Sprintf("queue=%v", published[0]))
 	}
 
-	// ---- 1b. the balanced view, BEFORE pulling anything -----------------------------
-	// FetchMessageQueuesInBalance is Java DefaultMQPullConsumerImpl:120-135. Asking
-	// for it while the instance has pulled no queue is the whole point: when the
-	// route or GET_CONSUMER_LIST_BY_GROUP(38) cannot be had, this port keeps the
-	// CURRENT assignment — which here is the empty set. So a non-empty answer can
-	// only come from the real route + the real broker-side member list, i.e. the
-	// group actually landed in the broker's consumerTable via the heartbeat.
-	//
-	// The beat rides the instance's scheduled task, whose first tick is
-	// initialDelay=1s (Java MQClientInstance:260 — same anchor), so retry until the
-	// broker answers with this clientId instead of failing on a 0-cid first round.
 	var balanced []common.MessageQueue
 	deadline = time.Now().Add(20 * time.Second)
 	for {

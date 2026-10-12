@@ -1,5 +1,3 @@
-// correctTagsOffset（Java `DefaultMQPushConsumerImpl:713-717`，调用点 `:394-401`）真机验证。
-//
 // 与 `python/verify_correct_tags_offset_live.py`、`rust/examples/live_correct_tags_offset.rs`、
 // C# 的对应场景同题、逐条对应（S1–S4）。
 //

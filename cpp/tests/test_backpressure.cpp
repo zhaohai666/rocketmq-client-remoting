@@ -1,5 +1,3 @@
-// 异步发送背压基元单测：FairSemaphore 本身（对端是 Java new Semaphore(permits, true)）。
-//
 // 为什么单独一个文件：整套背压语义都压在这个基元上，而它有两处**不是**随便一个信号量都
 // 满足的行为 —— 「公平」（只有队首能拿，后来者不许插队）和「运行时原地改容量」（在途份数
 // 保留、并且把卡住的等待者叫醒）。生产者那一侧怎么用（拿不到就回调、只还一次、队满就地跑）
@@ -52,7 +50,6 @@ int64_t sinceMs(const std::chrono::steady_clock::time_point& from) {
         .count();
 }
 
-// 1. 超时返回 false 而不抛（Java tryAcquire(permits, timeout, MILLIS) 只有 interrupt 才抛）
 void testTryAcquireTimesOutWithoutThrowing() {
     FairSemaphore sem(1);
     expect(sem.tryAcquire(1, 0), "the first acquire succeeds");
@@ -188,7 +185,6 @@ void testTimedOutHeadWakesTheWaiterBehindIt() {
            "waited=" + std::to_string(static_cast<long long>(secondWaitedMs.load())) + "ms");
 }
 
-// 7. 改总量 = 「空闲 = 新总量 - 在途」，与 Java 的 new Semaphore(num - acquired) 同解
 void testSetTotalKeepsOutstandingWork() {
     FairSemaphore sem(10);
     expect(sem.tryAcquire(4, 0), "four permits are in flight");
@@ -199,7 +195,6 @@ void testSetTotalKeepsOutstandingWork() {
     expectEq(sem.availablePermits(), 15, "releasing the in-flight part fills the new total");
 }
 
-// 8. Java 的 new Semaphore(负数) 合法，归还许可会把它拉回正数 —— 这里同样接受
 void testShrinkBelowOutstandingGivesNegativeFree() {
     FairSemaphore sem(10);
     expect(sem.tryAcquire(6, 0), "six permits are in flight");
@@ -217,7 +212,7 @@ void testGrowWakesSomeoneBlockedOnTheOldCapacity() {
     std::vector<bool> got;
     std::thread waiter([&] { got.push_back(sem.tryAcquire(1, 5000)); });
     expect(waitFor([&] { return sem.waitingCount() == 1; }), "the waiter is blocked on the gate");
-    sem.setTotalPermits(5);  // 扩容：Java 此刻换的是**另一个** Semaphore 对象，等待者白等
+    sem.setTotalPermits(5);
     sem.release(1);          // 在途的那份还回去
     waiter.join();
     expect(!got.empty() && got[0], "the resize wakes the blocked sender",
@@ -225,7 +220,6 @@ void testGrowWakesSomeoneBlockedOnTheOldCapacity() {
     expectEq(sem.availablePermits(), 4, "the woken permit is consumed, the rest is free");
 }
 
-// 10. Java 的 release() 不校验是否超过总量（信号量可以被"无中生有"地放大）
 void testReleaseBeyondTotalIsAllowed() {
     FairSemaphore sem(1);
     sem.release(3);
@@ -242,7 +236,6 @@ void testNonPositiveRequestsAreBenign() {
     expectEq(sem.availablePermits(), 0, "a non-positive release adds nothing");
 }
 
-// 12. 地板值与 Java 逐字对齐（DefaultMQProducer:1386 / :1402）
 void testFloorsMatchDefaults() {
     expectEq(kMinAsyncSendNum, 10, "backPressureForAsyncSendNum floor");
     expectEq(kMinAsyncSendSize, 1024 * 1024, "backPressureForAsyncSendSize floor");

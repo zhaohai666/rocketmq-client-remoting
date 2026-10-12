@@ -4,28 +4,13 @@ declare(strict_types=1);
 
 namespace RocketMQ\Client;
 
-/**
- * 动态 name server 取址（对应 org.apache.rocketmq.common.namesrv.TopAddressing /
- * DefaultTopAddressing 与 MixAll.getWSAddr），移植自 top_addressing.py。
- *
- * Java 语义（5.5.1 源码逐条核对）：
- * 1. ``MixAll.getWSAddr()``：domain 含 ':'（自带端口）时不追加默认 :8080；
- * 2. ``fetchNSAddr(true, 3000)``：HTTP GET（超时 3000ms），unitName 非空白则 URL 追加
- *    ``-<unitName>?nofix=1``；para 非空则 ``?k=v&...``（末尾 & 去掉）。**code==200** 时对
- *    响应体做 ``clearNewLine`` 作为 NS 地址串；否则返回 null。
- * 3. ``MQClientAPIImpl.fetchNameServerAddr()``：取到的串与上次**不同**才应用。
- *
- * 与本仓库的有意差异：domain 必须显式给出（构造参数或环境变量
- * ``ROCKETMQ_NAMESRV_DOMAIN``），未配置 = 动态取址关闭，``fetchNsAddr()`` 直接返回 null。
- */
 class DefaultTopAddressing
 {
-    public const DEFAULT_NAMESRV_ADDR_LOOKUP = 'jmenv.tbsite.net'; // Java MixAll.DEFAULT_NAMESRV_ADDR_LOOKUP
-    public const DEFAULT_DOMAIN_SUBGROUP = 'nsaddr';               // Java 默认 subgroup
+    public const DEFAULT_NAMESRV_ADDR_LOOKUP = 'jmenv.tbsite.net';
+    public const DEFAULT_DOMAIN_SUBGROUP = 'nsaddr';
 
     public string $wsAddr;
 
-    /** Java 的 nameSrvAddr 缓存：上次成功应用到客户端的地址串 */
     public ?string $nsAddr = null;
 
     private int $timeoutMillis;
@@ -118,7 +103,6 @@ class DefaultTopAddressing
 
     // ---------------- 取址 ----------------
 
-    /** 取一次 NS 地址串；不可用 / 非 200 / 网络失败都返回 null（Java 语义）。 */
     public function fetchNsAddr(bool $verbose = true): ?string
     {
         if ($this->wsAddr === '') {
@@ -134,7 +118,6 @@ class DefaultTopAddressing
                 Logger::error(sprintf('fetch nameserver address failed, statusCode!=200 url=%s', $url));
             }
         } catch (\Throwable $e) {
-            // Java catch (IOException) 后返回 null
             if ($verbose) {
                 Logger::debug(sprintf('fetch name server address exception url=%s: %s', $url, $e->getMessage()));
             }
@@ -142,7 +125,6 @@ class DefaultTopAddressing
         return null;
     }
 
-    /** Java ``MQClientAPIImpl.fetchNameServerAddr``：**地址变化才返回并应用**。 */
     public function fetchAndApply(): ?string
     {
         $addrs = $this->fetchNsAddr();
@@ -158,14 +140,6 @@ class DefaultTopAddressing
 
     // ---------------- 传输 ----------------
 
-    /**
-     * HTTP GET（Java HttpTinyClient.httpGet 的零依赖等价物）。
-     *
-     * 返回响应体文本；非 200 抛异常（由 fetchNsAddr 统一按失败处理）。
-     * 单测通过子类覆写本方法注入 mock，不真正联网 —— 因此类本身非 final、本方法可覆写。
-     *
-     * @throws \RuntimeException 网络失败或非 200
-     */
     public function httpGet(string $url, float $timeoutSeconds): ?string
     {
         $timeoutMs = max(1, (int) round($timeoutSeconds * 1000));

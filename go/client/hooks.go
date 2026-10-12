@@ -1,28 +1,6 @@
-// Client-side hook SPIs (Java org.apache.rocketmq.client.hook.*).
-//
 // Send-side (producer):
 //
-//   - CheckForbiddenHook: the odd one out. Its error is NOT swallowed and
-//     propagates up the send retry chain, so it is called once per send
-//     ATTEMPT (Java hasCheckForbiddenHook is re-evaluated every pass). It runs
-//     inside sendKernelImpl AFTER compression and the sysFlag are computed and
-//     AFTER the broker address is resolved.
-//   - SendMessageHook: before/after around the actual RPC. Panics/errors are
-//     swallowed (Java catches Throwable) and the next hook still runs.
-//   - EndTransactionHook: fires once per endTransaction, on both the caller
-//     path and the broker's check-back path.
-//
 // Consume-side (consumer):
-//
-//   - FilterMessageHook: runs on every batch taken from a pull response,
-//     BEFORE it is queued. Exceptions are SWALLOWED and the remaining hooks
-//     still run (Java PullAPIWrapper.executeHook:171-178). MsgList is mutable:
-//     a hook that removes entries makes the caller drop them, and a dropped
-//     entry is NOT acked — the consumed offset keeps advancing, i.e. a silent
-//     skip.
-//   - ConsumeMessageHook: before/after around the listener. Exceptions are
-//     logged only — a broken hook must never change the consume outcome
-//     (Java's executeHookBefore/After both catch Throwable).
 package client
 
 import (
@@ -30,10 +8,6 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// CommunicationMode mirrors Java
-// org.apache.rocketmq.client.impl.CommunicationMode. Every hook context is
-// tagged with the mode of the send that produced it, because hooks (trace in
-// particular) render it into their payload.
 type CommunicationMode string
 
 const (
@@ -44,20 +18,12 @@ const (
 
 // ------------------------------------------------------------------ send
 
-// SendMessageContext is one send's payload
-// (Java org.apache.rocketmq.client.hook.SendMessageContext).
-//
-// MQTraceContext is opaque to this package: a hook stores its own state in
-// before and reads it back in after. Nothing else may depend on its type
-// (Java declares it Object for exactly that reason).
 type SendMessageContext struct {
-	Producer      *DefaultMQProducer
-	ProducerGroup string
-	Message       *common.Message
-	MQ            common.MessageQueue
-	BrokerAddr    string
-	// BornHost is the local address the client would send from
-	// (Java context.setBornHost(defaultMQProducer.getClientIP())).
+	Producer          *DefaultMQProducer
+	ProducerGroup     string
+	Message           *common.Message
+	MQ                common.MessageQueue
+	BrokerAddr        string
 	BornHost          string
 	CommunicationMode CommunicationMode
 	// SendResult is set before SendMessageAfter on the success path.
@@ -75,14 +41,11 @@ type SendMessageContext struct {
 
 // SendMessageHook is the send aspect SPI.
 type SendMessageHook interface {
-	// HookName is the hook entry point name (Java hookName()).
 	HookName() string
 	SendMessageBefore(ctx *SendMessageContext)
 	SendMessageAfter(ctx *SendMessageContext)
 }
 
-// executeSendMessageHooksBefore runs the hooks in order. A panic is swallowed
-// and the NEXT hook still runs — Java catches Throwable here (line 1159).
 func executeSendMessageHooksBefore(hooks []SendMessageHook, ctx *SendMessageContext) {
 	for _, hook := range hooks {
 		func() {
@@ -96,8 +59,6 @@ func executeSendMessageHooksBefore(hooks []SendMessageHook, ctx *SendMessageCont
 	}
 }
 
-// executeSendMessageHooksAfter is the mirror image of the before call and
-// swallows panics the same way (Java line 1172).
 func executeSendMessageHooksAfter(hooks []SendMessageHook, ctx *SendMessageContext) {
 	for _, hook := range hooks {
 		func() {
@@ -113,8 +74,6 @@ func executeSendMessageHooksAfter(hooks []SendMessageHook, ctx *SendMessageConte
 
 // ------------------------------------------------------- end transaction
 
-// EndTransactionContext is one endTransaction's payload
-// (Java org.apache.rocketmq.client.hook.EndTransactionContext).
 type EndTransactionContext struct {
 	ProducerGroup string
 	Message       *common.Message
@@ -122,9 +81,7 @@ type EndTransactionContext struct {
 	MsgID         string
 	TransactionID string
 	// TransactionState is the verdict the hook should record.
-	TransactionState LocalTransactionState
-	// FromTransactionCheck is true when the broker's check-back produced this
-	// endTransaction (Java endTransaction vs processTransactionState).
+	TransactionState     LocalTransactionState
 	FromTransactionCheck bool
 	Namespace            string
 }
@@ -136,7 +93,6 @@ type EndTransactionHook interface {
 	EndTransaction(ctx *EndTransactionContext)
 }
 
-// executeEndTransactionHooks swallows panics (Java line 1188).
 func executeEndTransactionHooks(hooks []EndTransactionHook, ctx *EndTransactionContext) {
 	for _, hook := range hooks {
 		func() {
@@ -152,8 +108,6 @@ func executeEndTransactionHooks(hooks []EndTransactionHook, ctx *EndTransactionC
 
 // ------------------------------------------------------------------ filter
 
-// FilterMessageContext is one hook invocation's payload
-// (Java org.apache.rocketmq.client.hook.FilterMessageContext).
 type FilterMessageContext struct {
 	ConsumerGroup string
 	MsgList       []*common.MessageExt
@@ -165,14 +119,11 @@ type FilterMessageContext struct {
 
 // FilterMessageHook is the pre-delivery filter SPI.
 type FilterMessageHook interface {
-	// HookName is the Lua hook entry point name (Java hookName()).
 	HookName() string
 	// FilterMessage may mutate MsgList in place (see the package comment).
 	FilterMessage(ctx *FilterMessageContext)
 }
 
-// executeFilterHooks runs the hooks in order. An exception is swallowed and
-// the NEXT hook still runs — the Java rule.
 func executeFilterHooks(hooks []FilterMessageHook, ctx *FilterMessageContext) {
 	for _, hook := range hooks {
 		func() {
@@ -195,11 +146,6 @@ func safeHookName(hook any) string {
 	return "unknown"
 }
 
-// clientSideTagFilter is Java PullAPIWrapper.processPullResult:113-122 — the
-// second, string-level tag check. The broker filters by the hash of the tag
-// (codeSet), so a collision can let a non-matching message through; the client
-// re-checks by exact string.
-//
 // The guard `!tagsSet.isEmpty() && !isClassFilterMode` is why FilterAPI's
 // SUB_ALL path must keep tagsSet EMPTY: subscribing to "*" turns the filter
 // off entirely rather than filtering everything out.
@@ -226,18 +172,13 @@ func clientSideTagFilter(sub *remoting.SubscriptionData, msgs []*common.MessageE
 
 // ------------------------------------------------------------------ consume
 
-// ConsumeMessageContext is the consume hook payload
-// (Java org.apache.rocketmq.client.hook.ConsumeMessageContext).
 type ConsumeMessageContext struct {
 	ConsumerGroup string
 	MsgList       []*common.MessageExt
 	MQ            common.MessageQueue
 	// Success starts false and is set by the caller once the outcome is known.
-	Success bool
-	// Status is the string form of the consume result (Java hookStatus.name()).
-	Status string
-	// MQTraceContext carries the trace hook's private state from before to
-	// after (Java getMqTraceContext()).
+	Success        bool
+	Status         string
 	MQTraceContext any
 	Props          map[string]string
 	Namespace      string
@@ -279,14 +220,6 @@ func executeConsumeHookAfter(hooks []ConsumeMessageHook, ctx *ConsumeMessageCont
 
 // ------------------------------------------------------------ forbidden send
 
-// CheckForbiddenContext is one send-attempt payload
-// (Java org.apache.rocketmq.client.hook.CheckForbiddenContext).
-//
-// Unlike SendMessageContext it has NO SendResult — at this point nothing has
-// been sent yet. Arg carries the business argument of
-// send(msg, selector, arg, ...), which Java's 5.x sendKernelImpl does not
-// populate (it only exists on the context class); the field is kept so a
-// caller that goes through the selector path can supply it.
 type CheckForbiddenContext struct {
 	NameServerAddr    string
 	ProducerGroup     string
@@ -300,19 +233,11 @@ type CheckForbiddenContext struct {
 }
 
 // CheckForbiddenHook lets a client reject a message before it goes out.
-//
-// Unlike the other hook kinds its error PROPAGATES: Java declares
-// `checkForbidden(context) throws MQClientException` and sendKernelImpl does
-// not catch it, so the send fails with the hook's error. Go returns it as a
-// plain error for the same effect — a panic is deliberately NOT recovered
-// here either, matching Java's "nothing catches you".
 type CheckForbiddenHook interface {
 	HookName() string
 	CheckForbidden(ctx *CheckForbiddenContext) error
 }
 
-// executeCheckForbiddenHooks runs the hooks in order and returns the first
-// error. No recover(): Java does not swallow, so neither do we.
 func executeCheckForbiddenHooks(hooks []CheckForbiddenHook, ctx *CheckForbiddenContext) error {
 	for _, hook := range hooks {
 		if err := hook.CheckForbidden(ctx); err != nil {

@@ -1,28 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 真机验证（本地 RocketMQ 5.5.1 集群）。
-
-用法：
-    .venv/bin/python verify_sql92_live.py 127.0.0.1:9876
-
-前置条件：broker 必须 ``enablePropertyFilter=true``（本仓库的 dev broker 配置已开）。
-
-为什么必须在真集群上测：SQL92 这条链路最容易「静默失效」。broker 的
-``ExpressionMessageFilter`` 拿不到编译好的过滤数据时**直接放行全部消息**（``return true``），
-于是两种错都表现为「消费者正常启动、消息也都收到了」：
-  1. broker 没开 enablePropertyFilter ⇒ 表达式根本没被编译；
-  2. 表达式语法错 ⇒ 同上；只有 Java 的 ``checkClientConfig`` 会把它变成启动错误。
-离线单测（tests/test_check_client_config.py）锁得住协议形状，锁不住 broker 真的按属性
-过滤了。这里四段都验：
-  S1 线上取证：SQL92 订阅 ⇒ 启动时正好一笔 46（body 是 CheckClientRequestBody）；
-     纯 TAG 订阅 ⇒ 一笔都不发（Java ``ExpressionType.isTagType`` 短路）
-  S2 真过滤：消费者**先起来再发消息**（新消费组的 CONSUME_FROM_LAST_OFFSET 会跳过启动
-     前的消息，先发消息这一段就是假绿）：SQL92 只订阅 red ⇒ 恰好 3 条 red；
-     TAG '*' 对照组 ⇒ 6 条全收
-  S3 空结果腿：订阅永不匹配的 color='green' ⇒ 一条都不收（排除"其实全放行了"的假绿）
-  S4 反证：语法错的表达式让 start() 抛 SUBSCRIPTION_PARSE_FAILED(23)，且启动就地回滚
-     （同一个对象换成合法表达式能重新 start）
-"""
 from __future__ import annotations
 
 import json

@@ -1,5 +1,3 @@
-// -*- coding: utf-8 -*-
-// MessageType enum (org.apache.rocketmq.common.message.MessageType / MessageConst.MSG_TYPE).
 export const MessageType = {
   NORMAL: 'Normal_Msg',
   ORDERLY: 'Order_Msg',

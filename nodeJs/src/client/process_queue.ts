@@ -1,15 +1,3 @@
-// ProcessQueue — the per-queue buffer and bookkeeping
-// (Java org.apache.rocketmq.client.impl.consumer.ProcessQueue).
-//
-// Java keeps ONE ConcurrentSkipListMap<queueOffset, MessageExt> holding both
-// "pulled, not yet dispatched" and "dispatched, not yet acked" messages, plus a
-// separate consumingMsgOrderlyTreeMap for the orderly path. This port keeps the
-// single sorted map and marks dispatched entries with a flag instead: the
-// observables that matter (msgCount, msgSize, maxSpan, "is this message still
-// mine", removeMessage's floor) are identical, and the same model is used by
-// the Python/C++/C#/Go ports, which keeps cross-language behaviour
-// comparable.
-//
 // Two flags carry the rebalance contract:
 //
 //   - dropped: the queue was revoked (rebalance, OFFSET_ILLEGAL recovery,
@@ -38,25 +26,17 @@ export class ProcessQueue {
 
   private msgAccCnt = 0;
 
-  // queueOffsetMax is Java ProcessQueue#queueOffsetMax: the highest offset
-  // ever put into the buffer (cleared by clear()). Java's removeMessage falls
-  // back to it when the buffer drains, which is how a batch that completes out
-  // of order still lets the cursor reach the end of the queue.
   private queueOffsetMax = 0;
 
   lastPullTimestamp = 0; // unix millis
   lastConsumeTimestamp = 0; // unix millis of the last completion
 
-  // consumeOrderly mirrors the consumer's mode at creation time (Java reads
-  // the consumer's flag inside cleanExpiredMsg).
   consumeOrderly: boolean;
 
   constructor(consumeOrderly = false) {
     this.consumeOrderly = consumeOrderly;
   }
 
-  // PutMessage mirrors Java ProcessQueue#putMessage. Returns true when the
-  // queue went from empty to non-empty, i.e. "there is something to dispatch".
   putMessage(msgs: MessageExt[]): boolean {
     const wasEmpty = this.msgs.size === 0;
     for (const msg of msgs) {
@@ -71,10 +51,6 @@ export class ProcessQueue {
     return wasEmpty && this.msgs.size > 0;
   }
 
-  // QueueOffsetMax is Java ProcessQueue#queueOffsetMax, kept as a running max
-  // rather than "the last offset of the last put": a re-pulled batch always
-  // moves forwards on a consume queue, so the two agree there, and the running
-  // max cannot be dragged backwards by an out-of-order put.
   queueOffsetMaxValue(): number {
     return this.queueOffsetMax;
   }
@@ -86,12 +62,6 @@ export class ProcessQueue {
 
   // PendingStats is the flow-control triple (count, size in MB, offset span)
   // computed over the NOT-yet-dispatched entries only.
-  //
-  // Java measures msgCount/msgSize/maxSpan over the whole msgTreeMap, which
-  // also holds messages a listener is currently chewing on. Measuring only the
-  // pending buffer is what the Python/C++/C#/Go ports do, and it is the more
-  // useful signal: a slow listener must not look like a backlog and stall the
-  // pull. Kept consistent across the ports so the numbers are comparable.
   pendingStats(): [number, number, number] {
     let count = 0;
     let size = 0;
@@ -113,8 +83,6 @@ export class ProcessQueue {
     return [count, size / (1024.0 * 1024.0), span];
   }
 
-  // MsgCount is Java ProcessQueue#getMsgCount: everything pulled but not
-  // acked, dispatched included.
   msgCount(): number {
     return this.msgs.size;
   }
@@ -126,8 +94,6 @@ export class ProcessQueue {
     return this.msgs.size - this.dispatched.size;
   }
 
-  // MsgSizeMB is Java ProcessQueue#getMsgSize expressed in MB (the threshold
-  // the consumer compares against is in MB too).
   msgSizeMB(): number {
     let total = 0;
     for (const msg of this.msgs.values()) {
@@ -137,9 +103,6 @@ export class ProcessQueue {
     return total / (1024.0 * 1024.0);
   }
 
-  // MaxSpan is Java ProcessQueue#getMaxSpan: lastOffset - firstOffset. It
-  // exists so one message that keeps failing cannot let the offset span run
-  // away.
   maxSpan(): number {
     if (this.order.length === 0) return 0;
     return this.order[this.order.length - 1] - this.order[0];
@@ -157,9 +120,6 @@ export class ProcessQueue {
     return this.msgs.get(this.order[0]) || null;
   }
 
-  // Contains reports whether the offset is still buffered. Java uses
-  // msgTreeMap.containsValue(msg); identity does not survive a redelivery, so
-  // the offset key is the honest test.
   contains(offset: number): boolean {
     return this.msgs.has(offset);
   }
@@ -215,12 +175,6 @@ export class ProcessQueue {
     return this.order.length > 0 ? this.order[0] : -1;
   }
 
-  // MinRemainingExcept is Java ProcessQueue#removeMessage's first half: the
-  // smallest buffered offset that is NOT in `skip`, i.e. what the head of the
-  // buffer WILL be once the entries about to be acked are gone; -1 when
-  // nothing would be left. `skip` must therefore be the ACKED set. Passing the
-  // FAILED set instead inverts the guard — the floor would step over exactly
-  // the entries that have to hold the cursor.
   minRemainingExcept(skip: MessageExt[]): number {
     const skipSet = new Set<number>();
     for (const msg of skip) skipSet.add(msg.getQueueOffset());
@@ -231,8 +185,6 @@ export class ProcessQueue {
     return -1;
   }
 
-  // Clear empties the buffer (Java ProcessQueue#clear, which also zeroes
-  // queueOffsetMax).
   clear(): void {
     this.msgs.clear();
     this.dispatched.clear();
@@ -245,7 +197,6 @@ export class ProcessQueue {
     this.order.sort((a, b) => a - b);
   }
 
-  // SetDropped marks the queue revoked. Irreversible, same as Java.
   setDropped(): void { this.dropped = true; }
   isDropped(): boolean { return this.dropped; }
 
@@ -257,8 +208,6 @@ export class ProcessQueue {
   touchPull(): void { this.lastPullTimestamp = Date.now(); }
   lastPullTimestampValue(): number { return this.lastPullTimestamp; }
 
-  // IsPullExpired is Java ProcessQueue#isPullExpired: no pull started within
-  // PULL_MAX_IDLE_TIME. A queue that never pulled does not count as expired.
   isPullExpired(): boolean {
     if (this.lastPullTimestamp === 0) return false;
     return Date.now() - this.lastPullTimestamp > PULL_MAX_IDLE_TIME_MS;
@@ -283,9 +232,6 @@ function insertOffset(sorted: number[], v: number): void {
   sorted.splice(lo, 0, v);
 }
 
-// computeMsgAccCnt is Java ProcessQueue#putMessage's tail: backlog size taken
-// from the LAST message of the batch, as MAX_OFFSET - queueOffset, only when
-// positive.
 function computeMsgAccCnt(current: number, msgs: MessageExt[]): number {
   if (msgs.length === 0) return current;
   const last = msgs[msgs.length - 1];

@@ -168,15 +168,6 @@ func (i *Instance) SetMessageRequestMode(addr, topic, consumerGroup, mode string
 	return nil
 }
 
-// QueryAssignment sends QUERY_ASSIGNMENT(400) — Java MQClientAPIImpl
-// #queryAssignment:405 + MQClientInstance#queryAssignment:1373. The broker runs
-// the load balance itself (strategyName + messageModel ride the body) and
-// answers the queue set this instance should own, each stamped with the request
-// mode (POP / PULL) the broker serves the (group, topic) pair in.
-//
-// Decoding keeps Java's null/empty distinction (see
-// remoting.DecodeQueryAssignmentResponseBody): a nil slice is "invalid result,
-// skip the update", an empty non-nil slice is "you own nothing now".
 func (i *Instance) QueryAssignment(addr, topic, consumerGroup, clientID, strategyName, messageModel string, timeoutMillis int64) ([]*remoting.MessageQueueAssignment, error) {
 	body := &remoting.QueryAssignmentRequestBody{
 		Topic:         topic,
@@ -290,9 +281,6 @@ func (i *Instance) processPopResponse(brokerName string, response *remoting.Remo
 			ckOffset, okCk := startOffsetInfo[queueIDKey]
 			msgOffsets, okMsg := msgOffsetInfo[queueIDKey]
 			if !okCk || !okMsg {
-				// The broker's tables do not cover this message. Java lets the
-				// index lookup miss and keeps the previous (armoured) value, so
-				// the message ends up with whatever POP_CK it arrived with.
 				continue
 			}
 			index := indexOfI64(sortMap[queueIDKey], msg.QueueOffset)
@@ -330,18 +318,6 @@ func (i *Instance) processPopResponse(brokerName string, response *remoting.Remo
 	return result, nil
 }
 
-// buildQueueOffsetSortedMap is Java MQClientAPIImpl#buildQueueOffsetSortedMap:
-// one list of queue offsets per "<retry>@<queueId>", in the order the messages
-// arrived. It is the index space that msgOffsetInfo is parallel to, which is why
-// the lookup is indexOf rather than a search by value.
-//
-// The name says "sorted" but Java never sorts; the broker's msgOffsetInfo is
-// built against the same arrival order.
-//
-// Java builds the key with the checkpoint-carrying overload, which prefers the
-// marker inside POP_CK when the broker already stamped one. On the classic POP
-// path the broker does not, so this falls back to the topic's own marker — and
-// the lookup site uses the plain two-argument form so the two agree.
 func buildQueueOffsetSortedMap(msgs []*common.MessageExt) map[string][]int64 {
 	out := make(map[string][]int64, len(msgs))
 	for _, msg := range msgs {
@@ -353,15 +329,10 @@ func buildQueueOffsetSortedMap(msgs []*common.MessageExt) map[string][]int64 {
 
 // ---------------------------------------------------------------- delay levels
 
-// popDelayLevel is Java DefaultMQPushConsumerImpl.popDelayLevel, in SECONDS.
-// Used only by changePopInvisibleTime (retry back-off), never as a broker
-// delay-level.
 var popDelayLevel = []int64{
 	10, 30, 60, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1200, 1800, 3600, 7200,
 }
 
-// popDelayLevelSeconds picks the table entry for a delay level, clamping to the
-// last entry — Java does exactly this instead of erroring.
 func popDelayLevelSeconds(level int) int64 {
 	if level < 0 {
 		level = 0
@@ -372,19 +343,7 @@ func popDelayLevelSeconds(level int) int64 {
 	return popDelayLevel[level]
 }
 
-// popDelayLevelForElapsed is the search half of Java's checkNeedAckOrDelay,
-// reproduced exactly: scan DOWNWARD from the longest notch for the first delay
-// that has ALREADY elapsed, then return the notch above it (the one to wait
-// for now).
-//
 // Two sentinels are part of the contract, not accidents:
-//
-//   - Below the shortest notch (elapsed < 10s) nothing has elapsed and the loop
-//     falls off the end with -1. Java then indexes the table with -1 and throws
-//     ArrayIndexOutOfBoundsException; checkNeedAckOrDelay clamps this to 0,
-//     i.e. wait the 10s notch.
-//   - At or above the longest notch the result is len(table), which
-//     popDelayLevelSeconds clamps to the last entry.
 func popDelayLevelForElapsed(elapsedMillis int64) int {
 	level := len(popDelayLevel) - 1
 	for ; level >= 0; level-- {
@@ -398,17 +357,6 @@ func popDelayLevelForElapsed(elapsedMillis int64) int {
 
 // ---------------------------------------------------------------- helpers
 
-// popAckAddress resolves the broker address an ACK/CHANGE_INVISIBLETIME
-// belongs to. Java finds it by the broker name from checkpoint segment 5
-// against the master, refreshing the route once.
-//
-// Static topics (Java ackAsync/changePopInvisibleTimeAsync): a checkpoint from
-// a LOGICAL queue carries the MOCK broker name ("__syslo__<scope>"); the REAL
-// hosting broker is resolved through the instance's topicEndPointsTable with
-// the checkpoint's OWN queueId — globalIds of one static topic may map to
-// DIFFERENT real brokers, so queueId 0 would resolve the wrong host. The
-// request header keeps the ORIGINAL (mock) name either way; only the address
-// lookup goes through the real one.
 func (c *DefaultMQPushConsumer) popAckAddress(brokerName, topic string, queueID int32) (string, error) {
 	inst := c.instance
 	if inst == nil {
@@ -424,8 +372,6 @@ func (c *DefaultMQPushConsumer) popAckAddress(brokerName, topic string, queueID 
 		if _, err := inst.UpdateTopicRouteInfoFromNameServer(topic, 5000, false); err != nil {
 			return "", err
 		}
-		// Java re-resolves desBrokerName after the route refresh — the
-		// refreshed mapping may host this logical queue on a new broker.
 		if isLogicalQueueMockBrokerName(brokerName) {
 			desBrokerName = inst.GetBrokerNameFromMessageQueue(
 				common.NewMessageQueue(topic, brokerName, queueID))

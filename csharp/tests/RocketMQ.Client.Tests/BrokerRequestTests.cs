@@ -4,12 +4,6 @@
 // 真机用例注入不了（live 工具只能正向往 broker 发请求），所以能离线锁死的部分必须
 // 先锁死。否则「处理器根本没注册」这种错只会在生产上表现为「成员变了却要等 20s
 // 定时重平衡」，安静得几乎不可见。
-//
-// 对齐 Java：
-//   - MQClientAPIImpl 构造函数把 40 注册在**实例级**的 clientRemotingProcessor
-//     （不是每个消费者各注册一份：一个 code 只有一个处理器，各自注册会互相覆盖）
-//   - ClientRemotingProcessor#notifyConsumerIdsChanged → rebalanceImmediately()，
-//     返回 null ⇒ 不回包
 using System;
 using System.Collections.Generic;
 using RocketMQ.Remoting.Protocol;
@@ -37,7 +31,6 @@ public class BrokerRequestTests
 
         Assert.Null(instance.ProcessNotifyConsumerIdsChanged(NotifyCmd("GID_A"), "127.0.0.1:10911"));
         Assert.Equal(1, instance.ConsumerIdsChangedCount);
-        // 整组一起唤醒：Java 不读 consumerGroup 来决定叫醒谁
         Assert.Equal(1, wakeA);
         Assert.Equal(1, wakeB);
 
@@ -77,8 +70,6 @@ public class BrokerRequestTests
     [Fact]
     public void RebalanceImmediately_SwallowsConsumerExceptions()
     {
-        // Java 的 notifyConsumerIdsChanged 整段包在 try/catch：一个消费者炸了不能
-        // 影响其它消费者，更不能把异常抛回收包线程。
         var instance = new MQClientInstance("dotnet-unit-40@3", new List<string> { "127.0.0.1:9876" });
         int second = 0;
         instance.RegisterRebalanceWakeup("GID_A", () => throw new InvalidOperationException("boom"));

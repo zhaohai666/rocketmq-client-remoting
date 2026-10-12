@@ -1,32 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""TLS 真机验证：整条客户端链路（取路由 → 发送 → 消费）都跑在 TLS 上。
-
-用法（需本地 RocketMQ 5.5.1 集群）：
-    .venv/bin/python verify_tls_live.py 127.0.0.1:9876 [--leg plain|ca_verify|mtls \
-        --caCert PATH --serverName 127.0.0.1 --clientCert PATH --clientKey PATH]
-
-三腿（对齐 php/examples/live_tls.php / nodeJs/examples/live_tls.ts）：
-  plain     tls_enable=True —— test mode（信任 broker 自签证书）
-  ca_verify + tls_options={'caCert':...} —— **严格 CA 校验**（证书链 + 主机名 SAN，
-             Java tls.test.mode.enable=false 口径），CA 不对/主机名不符直接握手失败
-  mtls      ca_verify + 客户端证书（broker -Dtls.server.authClient=true 双向认证）
-
-为什么要有这个脚本（以及它守的是哪一段）：
-5.5.1 的 broker/nameServer 在 ``tls.test.mode.enable``（默认 true）下按**首字节**嗅探
-TLS 还是明文，所以同一个端口两种协议都收 —— 真机 TLS 链路不需要改集群配置就能验。
-Java 侧的 TLS 栈与本机的 CPython ``ssl`` 不完全同形：本机实测首包丢失（约 3~5%，读线程
-起得太早所致，见 ``_write``）只在对端是 CPython ``ssl`` 时稳定复现，对**真集群**逐轮新建
-TLS 连接打首包（nameServer 与 broker 各 60 轮）两种读线程时序都是 0 丢。所以这个脚本
-证明的是"整个客户端跑在 TLS 上能取路由、能收发、没退回明文、关掉不留线程"，
-而首包时序那条回归判据由 ``tests/test_tls_trace.py`` 用对端为 CPython ``ssl`` 的
-mock server 守住 —— 那里才是本机真正会炸的地方。
-
-场景：
-  S1 nameServer/broker 都是真 TLS：逐轮新建连接查路由，首包必须在超时预算内回来
-  S2 端到端收发：producer + push consumer 全程 TLS，发 8 条收齐 8 条
-  S3 全程确认真的在用 TLS（不是悄悄退回明文），且连接关闭后不留读线程
-"""
 from __future__ import annotations
 
 import ssl

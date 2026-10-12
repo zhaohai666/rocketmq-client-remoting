@@ -1,12 +1,5 @@
-// 订阅数据（对应 org.apache.rocketmq.remoting.protocol.heartbeat.SubscriptionData
-// 与 org.apache.rocketmq.common.filter.ExpressionType / FilterAPI）。
-//
 // 用途：Consumer 注册到 broker 的心跳里携带 SubscriptionData，broker 依据
 // tagsSet / codeSet 做 TAG 过滤；subString 为 "||" 分隔的 tag 表达式。
-//
-// JSON 字段（与 fastjson2 序列化结果一致，键按字母序）：
-//   classFilterMode | codeSet | expressionType | subString | subVersion | tagsSet | topic
-// 注意：Java 的 filterClassSource 标注了 @JSONField(serialize = false)，**不参与**序列化。
 #ifndef ROCKETMQ_COMMON_SUBSCRIPTION_DATA_H
 #define ROCKETMQ_COMMON_SUBSCRIPTION_DATA_H
 
@@ -18,7 +11,6 @@
 
 namespace rocketmq {
 
-// org.apache.rocketmq.common.filter.ExpressionType
 struct ExpressionType {
     static const char* const TAG;           // "TAG"
     static const char* const SQL92;         // "SQL92"
@@ -34,13 +26,11 @@ public:
     std::set<int64_t> codeSet;
     int64_t subVersion = 0;  // 默认取当前毫秒时间戳（见构造函数）
     std::string expressionType = ExpressionType::TAG;
-    // 仅本地使用，不参与 JSON（对齐 Java @JSONField(serialize = false)）
     std::string filterClassSource;
 
     SubscriptionData();
     SubscriptionData(const std::string& topic, const std::string& subString);
 
-    // ---- Java 风格访问器 ----
     const std::string& getTopic() const { return topic; }
     void setTopic(const std::string& t) { topic = t; }
 
@@ -69,12 +59,9 @@ public:
     JsonValue toJson() const;
     static SubscriptionData fromJson(const JsonValue& v);
 
-    // Java equals 语义：比较 classFilterMode/codeSet/subString/subVersion/tagsSet/
-    // topic/expressionType（**含** subVersion；不含 filterClassSource）。
     bool operator==(const SubscriptionData& o) const;
     bool operator!=(const SubscriptionData& o) const { return !(*this == o); }
 
-    // Java compareTo：按 "topic@subString" 字符串序
     int compareTo(const SubscriptionData& o) const;
 
     int hashCode() const;
@@ -82,15 +69,7 @@ public:
     std::string toString() const;
 };
 
-// org.apache.rocketmq.common.filter.FilterAPI
 struct FilterAPI {
-    // 对齐 Java FilterAPI.buildSubscriptionData（探针实测向量）：
-    //   null / "" / "*"   → subString 归一为 "*"，**tagsSet 与 codeSet 都保持空**
-    //   "TagA"            → tagsSet={TagA}, codeSet={2598919}
-    //   "TagA||TagB"      → tagsSet={TagA,TagB}, codeSet={2598919,2598920}
-    //   " TagA || TagB "  → subString 原样保留空格，标签各自 trim
-    //   "   "（纯空白）    → tagsSet 空、subString 原样保留（isEmpty 只认 null/""）
-    //   "||" / "||||"     → 抛 std::invalid_argument("subString split error")
     static SubscriptionData buildSubscriptionData(const std::string& topic,
                                                   const std::string& subString);
 };

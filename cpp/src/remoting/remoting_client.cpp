@@ -149,19 +149,11 @@ struct RemotingClient::Impl {
         bool hasResponse = false;
         RemotingCommand response;
         InvokeCallback callback;
-        // 异步请求的超时账目（对应 Java ResponseFuture 的 timeoutMillis + beginTimestamp）。
-        // addr/deadlineMs 只在登记时写入；callbackFired 由 notifyExpired 与 dispatch 竞争设置。
         std::string addr;
         int64_t deadlineMs = 0;
         int64_t timeoutMs = 0;
         bool callbackFired = false;
-        // 请求真正写出去时所用的连接（对应 Java ResponseFuture 的 channel 字段）。
-        // 连接断开时按**对象身份**认领在途请求，见 failFast()。空指针 = 还没写出去，
-        // 这条连接的断连不该牵连它（写失败时调用方会就地拿到异常并自己摘掉条目）。
         std::shared_ptr<Connection> conn;
-        // 失败原因（对应 Java 的 cause + ResponseFuture#executeInvokeCallback 的类型判定）：
-        // 断连时由 failFast 填成 SEND_REQUEST，同步等待方据此抛 RemotingSendRequestException
-        // 而不是等满超时抛 RemotingTimeoutException。
         InvokeError failure;
 
         static int64_t monoNowMs() {
@@ -174,16 +166,11 @@ struct RemotingClient::Impl {
     std::atomic<bool> running{true};
     int32_t connectTimeout = 3000;
     int32_t invokeTimeout = 15000;
-    // 对应 Java NettyClientConfig.enableReconnectForGoAway（默认 **true**）。
     bool enableReconnectForGoAway = true;
-    // TLS（对应 Java NettyRemotingClient 的 isUseTLS + 构造期 buildSslContext）。
-    // tlsCtx 持有 SSL_CTX*；setTlsEnable(true) 时创建（caCert 非空 → 严格校验 ctx）。
     bool tlsEnable = false;
     std::shared_ptr<void> tlsCtx;
     TlsOptions tlsOptions;
 
-    // SOCKS 代理（对应 Java NettyRemotingClient 的 proxyMap；这里只保留一个全局配置，
-    // 不做 Java 的 CIDR -> proxy 映射 —— 本端口按地址串直连，CIDR 分流没有落点）。
     SocksProxyConfig socksProxy;
 
     mutable std::mutex connMutex;
@@ -250,9 +237,6 @@ struct RemotingClient::Impl {
         std::string port;
         RemotingClient::parseAddress(addr, host, port);
         std::string err;
-        // SOCKS 代理开启时 TCP 要连的是**代理**（对应 Java bootstrap.connect 前先挂
-        // Socks5ProxyHandler）；目标 host:port 留给握手阶段的 CONNECT 请求。host 原样
-        // 保留（TLS 的 SNI / 主机名校验仍按目标主机算）。
         std::string proxyHost;
         std::string proxyPort;
         const bool viaProxy = !socksProxy.empty();
@@ -269,9 +253,6 @@ struct RemotingClient::Impl {
             throw RemotingConnectException(err);
         }
 
-        // SOCKS 握手（CONNECT）：必须在任何 RocketMQ 帧 / TLS 握手之前把隧道建好
-        //（对应 Java pipeline.addFirst(Socks5ProxyHandler) —— proxy handler 排在
-        // sslHandler 之前）。失败按建连失败处理，异常信息带握手阶段原因。
         if (viaProxy) {
             std::string socksErr;
             if (!socksConnect(sock, socksProxy, host, port, connectTimeout, socksErr)) {
@@ -285,8 +266,6 @@ struct RemotingClient::Impl {
         conn->addr = addr;
         conn->sock = sock;
 
-        // TLS：在任何 RocketMQ 帧之前完成握手（对应 Java pipeline.addFirst(SslHandler)）。
-        // 失败按建连失败处理，异常信息带握手原因（严格模式下含证书链/主机名校验失败原因）。
         if (tlsEnable) {
             std::string tlsErr;
             auto session = std::make_unique<TlsSession>(tlsCtx, tlsOptions.serverName);
@@ -310,8 +289,6 @@ struct RemotingClient::Impl {
             conns[addr] = conn;
         }
 
-        // 每连接一个读线程，命名后日志里能直接看出是哪条链路（对应 Java 的
-        // NettyClientWorkerThread；Java 用线程池复用，这里是一连接一线程，故带上地址）。
         const std::string connAddr = conn->addr;
         std::thread reader([this, conn, connAddr]() {
             setThreadName("RemotingClientReader-" + connAddr);
@@ -360,8 +337,6 @@ struct RemotingClient::Impl {
                 n = static_cast<int>(::recv(sock, chunk, sizeof(chunk), 0));
             }
             if (n <= 0) {
-                // n == 0 对端正常关闭，n < 0 读错误。Java 侧 Netty 的 channelInactive 会打一行，
-                // 但正常 shutdown 也会走到这里，为免默认 INFO 下变成噪声同样降到 DEBUG。
                 logger_debug("remoting reader: connection " + conn->addr + " closed, recv=" +
                              std::to_string(n));
                 break;
@@ -374,8 +349,6 @@ struct RemotingClient::Impl {
                 }
                 int32_t totalLen = ByteReader::getInt32At(buf, 0);
                 if (totalLen <= 0 || totalLen > RemotingClient::MAX_FRAME_LENGTH) {
-                    // 真正的协议异常（对应 Java NettyRemotingAbstract 的 "decode message length error"）：
-                    // 必须可见，否则会表现为"请求莫名超时"而没人知道原因。
                     logger_warn("remoting reader: illegal frame length " + std::to_string(totalLen) +
                                 " from " + conn->addr + ", dropping " +
                                 std::to_string(buf.size()) + " buffered bytes");
@@ -390,9 +363,6 @@ struct RemotingClient::Impl {
                 dispatch(frame, conn->addr);
             }
         }
-        // ---- 连接生命周期收口，顺序照 Java 的 NettyRemotingHandler#close ----
-        // 先 closeChannel（摘出连接表 + 关掉 fd），再 failFast。反过来会白丢一次重试：
-        // 条目还挂在表里时投递回调，回调里的重发会拿到这条已死的连接继续写。
         {
             std::lock_guard<std::mutex> lk(connMutex);
             auto it = conns.find(conn->addr);
@@ -420,18 +390,6 @@ struct RemotingClient::Impl {
         }
     }
 
-    // ---- 连接断开时立刻失败在途请求（对应 Java NettyRemotingAbstract#failFast + #requestFail）----
-    /// 把 `conn` 这条连接上还没收到响应的在途请求全部判为**发送失败**：置 done 唤醒同步
-    /// 等待方、异步回调恰好投递一次（Java requestFail 的四步：setSendRequestOK(false)
-    /// -> putResponse(null) -> executeInvokeCallback -> release；本端口没有传输层反压
-    /// 许可，release 那步在客户端层的回调里）。返回被判死的条数，只为日志与测试断言服务。
-    ///
-    /// 不这么做会错两件事，都不只是"慢一点"：
-    ///   1. 时机——同步调用要等满 invoke 超时、异步回调要等 timeout + 1s（清理线程的宽限
-    ///      口径）才发现对端早就断了；broker 重启 / 主备切换 / 网络抖动时这段空等压在发送链路上。
-    ///   2. 语义——报的是 TIMEOUT，Java 报的是 SEND_REQUEST。异步发送的重试判据按类型分流
-    ///      （见 MQClientAPIImpl 的 operationFail 三个 instanceof 分支），错类型等于错决策。
-    ///
     /// 按 Connection **对象身份**认领，不按地址串：地址相同但连接已换新是常见形状
     /// （GO_AWAY 换连接重发、写失败后关连接），旧读线程收尾时不能把新连接的请求一起误杀。
     int failFast(const std::shared_ptr<Connection>& conn) {
@@ -456,7 +414,7 @@ struct RemotingClient::Impl {
             {
                 std::lock_guard<std::mutex> flk(f->m);
                 f->failure = error;
-                f->done = true;  // 对应 Java 的 putResponse(null)：同步等待方立刻醒
+                f->done = true;
                 if (!f->callbackFired) {
                     f->callbackFired = true;
                     mine = true;
@@ -478,7 +436,6 @@ struct RemotingClient::Impl {
     void dispatch(const Bytes& frame, const std::string& from) {
         RemotingCommand cmd;
         if (!RemotingCommand::tryDecode(frame, cmd, nullptr)) {
-            // Java 侧这里同样是 warn（解码失败意味着这条响应永久丢失，调用方只会看到超时）。
             logger_warn("remoting reader: drop undecodable frame (" + std::to_string(frame.size()) +
                         " bytes) from " + from);
             return;  // 解不出的帧直接丢，不影响其它请求
@@ -521,9 +478,6 @@ struct RemotingClient::Impl {
                         resp = RemotingCommand::createResponseCommand(
                             ResponseCode::SYSTEM_ERROR, "process request fail");
                     }
-                    // 有返回值就回写（opaque 必须原样带回，broker 侧 invokeSync 靠它对上号）；
-                    // oneway 请求不回响应，与 Java NettyRemotingAbstract 的
-                    // `if (!cmd.isOnewayRpc()) { ... writeResponse ... }` 一致。
                     if (resp.has_value() && !cmd.isOnewayRpc()) {
                         resp->opaque = cmd.opaque;
                         sendResponseByAddr(from, *resp);
@@ -542,8 +496,6 @@ struct RemotingClient::Impl {
             future->response = cmd;
             future->hasResponse = true;
             future->done = true;
-            // 与超时清理线程抢同一个回调：谁先置位谁投递，另一个只能放弃（Java 用
-            // ResponseFuture 上的 executeOnceCallback 表达同一约束）。
             if (!future->callbackFired) {
                 future->callbackFired = true;
                 cb = future->callback;
@@ -556,12 +508,6 @@ struct RemotingClient::Impl {
     }
 
     // 取得一个**在途请求中唯一**的 opaque，并在同一把锁内登记 future。
-    //
-    // 为什么不能简单用 "opaque == 0 就重分配"：RemotingCommand 的 opaque 计数器从 0
-    // 开始，所以 createRequestCommand() 产出的**第一个**请求 opaque 就是 0，把 0 当
-    // "未设置"会把它改掉，导致调用方与服务端回填的 opaque 不一致（调用方拿不到响应）。
-    // 这里只在**真的与在途请求冲突**时才重分配，其余情况原样保留（含 0），与 Java
-    // NettyRemotingClient 从不改写调用方 opaque 的行为一致。
     std::shared_ptr<Future> registerFutureAcquiringOpaque(RemotingCommand& request,
                                                           InvokeCallback cb,
                                                           const std::string& addr = std::string(),
@@ -590,9 +536,6 @@ struct RemotingClient::Impl {
         respTable.erase(opaque);
     }
 
-    // ---- GO_AWAY 换连接重发（对应 Java NettyRemotingClient#invokeImpl:828-873）----
-    // 单次请求-应答：不含 GO_AWAY 判定，重发与首发都走这里。
-    // 返回的连接挂在在途表项上（Future::conn），断连时靠它认领该失败哪几条请求。
     RemotingCommand invokeOnce(const std::string& addr, RemotingCommand& request,
                                int32_t timeoutMillis) {
         // timeoutMillis 传 0：同步路径自己等、自己摘，不交给清理线程重复判超时。
@@ -617,9 +560,6 @@ struct RemotingClient::Impl {
         if (!future->hasResponse) {
             lk.unlock();
             unregisterFuture(opaque);
-            // done 却没有响应 = 连接断开时被 failFast 判死（Java 的 invokeSyncImpl 把这条
-            // 路径上的 ExecutionException 翻成 RemotingSendRequestException）。类型必须是
-            // 发送失败：上层按它决定"换一台 broker 重试"，按超时会走成另一条决策。
             throw RemotingSendRequestException(future->failure.message);
         }
         return future->response;
@@ -641,9 +581,6 @@ struct RemotingClient::Impl {
         closeConnectionSocket(conn);
     }
 
-    /// GO_AWAY 的收口：开关关掉直接报错；否则换连接重发一次，第二次还是 GO_AWAY 就抛。
-    /// `deadlineMs` 是本次调用（含首发）的绝对截止时间，重发只花剩余预算 ——
-    /// Java 用同一个 Stopwatch 扣减 timeoutMillis。
     RemotingCommand retryAfterGoAway(const std::string& addr, const RemotingCommand& request,
                                      int64_t deadlineMs) {
         if (!enableReconnectForGoAway) {
@@ -667,9 +604,6 @@ struct RemotingClient::Impl {
         return response;
     }
 
-    // ---- 异步请求的超时清理（对应 Java NettyRemotingAbstract.scanResponseTable）----
-    // 没有它，invokeAsync 的 timeoutMillis 就无处生效：对端不回包时回调永远不触发，
-    // 在途表项也永久留在 respTable 里（长连接复用久了就是内存泄漏 + 悬挂的发送请求）。
     std::mutex sweepMutex;
     std::condition_variable sweepCv;
     std::thread sweeper;
@@ -702,8 +636,6 @@ struct RemotingClient::Impl {
             jobs.swap(retryQueue);
         }
         for (auto& job : jobs) {
-            // 异常类型必须带到回调里：Java 的 operationFail(Throwable) 就是按类型决定
-            // 文案和是否重试（MQClientAPIImpl:680-693），压成字符串等于丢掉判据。
             try {
                 const RemotingCommand response =
                     retryAfterGoAway(job.addr, job.request, job.deadlineMs);
@@ -776,9 +708,6 @@ struct RemotingClient::Impl {
     }
 
     void sweepExpired() {
-        // 与 Java scanResponseTable 同式：beginTimestamp + timeoutMillis + 1000 <= now。
-        // 这 1s 宽限是给"响应已经在路上"留的余量——超时后 1s 内到达的响应仍按成功投递，
-        // 避免清理线程把刚好赶上末班的响应抢成一次超时失败。
         constexpr int64_t kSweepGraceMs = 1000;
         const int64_t now = Future::monoNowMs();
         std::vector<std::pair<std::shared_ptr<Future>, int32_t>> expired;
@@ -970,9 +899,6 @@ void RemotingClient::invokeAsync(const std::string& addr, RemotingCommand& reque
     impl_->ensureSweeper();
     const int64_t deadline = Impl::Future::monoNowMs() + timeout;
     InvokeCallback user = std::move(callback);
-    // 与同步路径同一套 GO_AWAY 语义（Java 里两者共用 invokeImpl）。请求在这里拷一份，
-    // 只有真收到 GO_AWAY 才用得上 —— 传输层不为每次调用都留请求副本（见头文件说明），
-    // 而重发必须能拿到原始报文。
     RemotingCommand original = request;
     auto future = impl_->registerFutureAcquiringOpaque(
         request,
@@ -1017,7 +943,7 @@ void RemotingClient::unregisterProcessor(int32_t requestCode) {
 bool RemotingClient::registerRPCHook(std::shared_ptr<RPCHook> hook) {
     std::lock_guard<std::mutex> lk(impl_->hookMutex);
     if (impl_->rpcHook) {
-        return false;  // first-wins：已有钩子，保留旧的（与 Java 绑定时机一致）
+        return false;
     }
     impl_->rpcHook = std::move(hook);
     return true;
@@ -1034,7 +960,6 @@ void RemotingClient::setTlsEnable(bool enable) {
         impl_->tlsCtx.reset();
         return;
     }
-    // 只创建一次 SSL_CTX（对应 Java 构造期 buildSslContext(true)）；caCert 非空走严格校验
     if (!impl_->tlsCtx) {
         std::string err;
         std::shared_ptr<void> ctx;
@@ -1043,7 +968,6 @@ void RemotingClient::setTlsEnable(bool enable) {
                                                impl_->tlsOptions.clientCert,
                                                impl_->tlsOptions.clientKey, err);
         } else {
-            // test mode：客户端证书仍可带（与 caCert 独立，Java tls.client.certPath 同）
             ctx = createClientSslContext(err, impl_->tlsOptions.clientCert,
                                          impl_->tlsOptions.clientKey);
         }

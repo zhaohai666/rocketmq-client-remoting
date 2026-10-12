@@ -4,16 +4,6 @@
 //! 场景与 `python/verify_pull_consumer_heartbeat_live.py`、`cpp/examples/live_pull_heartbeat.cpp`
 //! 和 `csharp/examples/RocketMQ.Examples/LivePullHeartbeat.cs` 一致（四语言同一套断言）：
 //!
-//! - A0 建 topic（主节点一份配置）。
-//! - A1 起拉模式消费者 + 拉一轮：拉取本身正常。
-//! - A2 【核心】主节点 203 查到本组，`consumeType=CONSUME_ACTIVELY`
-//!   （Java `DefaultMQPullConsumerImpl:348`）、`messageModel=CLUSTERING`、
-//!   `consumeFromWhere=CONSUME_FROM_LAST_OFFSET`（:353）。
-//! - A2b 203 的订阅表带 registerTopics 的 topic 且 `subString="*"`（`subscriptions():357-385`）。
-//! - A3 主节点 38（GET_CONSUMER_LIST_BY_GROUP）查到本 clientId。
-//! - A4 从节点 203/38 同样看得到：心跳扇出到每一台（ConsumerManager 每台一份状态）。
-//! - A5 对照：从未心跳过的幽灵组 → 203 报错、38 空列表（判据本身有效）。
-//! - A6 shutdown → 35 注销 → 203 随即查不到（不必等 ~120s 通道扫描）。
 //!
 //! 为什么必须真机：离线单测只能证明报文形状（`pull_heartbeat_matches_the_java_shape` 等），
 //! 证明不了 broker 的 `ConsumerManager.consumerTable` 真的登记了本组，也证明不了 35 之后

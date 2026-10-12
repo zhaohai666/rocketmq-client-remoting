@@ -544,7 +544,6 @@ impl RocketMQSerializable {
     }
 }
 
-/// header 长度低 24 位 + 序列化类型高 8 位（对应 Java `markProtocolType`）。
 pub fn mark_protocol_type(source: i32, stype: i32) -> i32 {
     ((stype & 0xFF) << 24) | (source & 0x00FF_FFFF)
 }

@@ -1,17 +1,4 @@
 # -*- coding: utf-8 -*-
-"""Validators / TopicValidator 测试（对应 Java ``client.Validators`` + ``common.topic.TopicValidator``）。
-
-这层校验的意义在于**失败得足够早**：topic/group 名字非法时 broker 也会拒，但
-``TOPIC_NOT_EXIST`` 属于发送重试的可重试码集合，于是每条必然失败的消息都会把重试次数
-和超时预算空转一遍。所以本地必须先把关，而且把关的位置要在任何网络动作之前。
-
-码值口径照抄 Java，别凭直觉（详见 ``rocketmq/client/validators.py`` 的模块注释）：
-  * ``check_group`` / ``check_topic`` / ``is_system_topic`` / ``is_not_allowed_send_topic``
-    走 ``MQClientException(String, Throwable)``，Java 里是 -1，本项目用 ``None`` 表达
-    同一件事（"纯客户端错误，没有 broker 码"）。
-  * 只有 ``check_message`` 的五条分支带 ``MESSAGE_ILLEGAL``(13)：null message、null body、
-    zero-length body、超长 body、INNER_MULTI_DISPATCH 含文件分隔符。
-"""
 from __future__ import annotations
 
 import os
@@ -45,7 +32,6 @@ from common.topic_validator import (
 )
 from remoting.protocol.codes import ResponseCode
 
-# Java 用查表实现字符白名单，这里用注释里的那条正则当独立参照，防止两边一起写错。
 RESOURCE_NAME_PATTERN = re.compile(r"^[%|a-zA-Z0-9_-]+$")
 
 
@@ -71,7 +57,6 @@ class TestTopicOrGroupCharset:
 
     @pytest.mark.parametrize("ch", ["\u0080", "中", "\u00e9", "\uff01", "\U0001f600"])
     def test_non_ascii_is_illegal(self, ch):
-        # Java 的 VALID_CHAR_BIT_MAP 只有 128 位：码点 >= 128 一律非法，不做 Unicode 归类
         assert is_topic_or_group_illegal("topic" + ch) is True
 
     def test_empty_name_is_not_illegal(self):
@@ -106,7 +91,6 @@ class TestSystemTopicSet:
         assert is_not_allowed_send_topic("%RETRY%GID_any") is False
 
     def test_tbw102_is_not_forbidden(self):
-        # 自动建 topic 的 key topic：在系统名单里，但允许直接发（Java 同款差异）
         assert is_not_allowed_send_topic("TBW102") is False
 
     @pytest.mark.parametrize("topic", sorted(NOT_ALLOWED_SEND_TOPIC_SET))
@@ -138,7 +122,6 @@ class TestCheckGroup:
             % VALID_CHAR_PATTERN)
 
     def test_blank_wins_over_length_and_charset(self):
-        # 校验顺序：blank → 长度 → 字符表（照抄 Java）
         with pytest.raises(MQClientException) as ei:
             validators.check_group(" ")
         assert "blank" in str(ei.value)
@@ -175,8 +158,6 @@ class TestNamingGuards:
         assert ei.value.response_code is None
 
     def test_forbidden_send_topic_raises_without_a_broker_code(self):
-        # Java 在这里用的是 (String, Throwable) 构造器 ⇒ -1，而不是 MESSAGE_ILLEGAL。
-        # 看着别扭，但上层按 response_code 分支时必须知道，四语言保持一致。
         with pytest.raises(MQClientException) as ei:
             validators.is_not_allowed_send_topic("SCHEDULE_TOPIC_XXXX")
         assert str(ei.value) == "Sending message to topic[SCHEDULE_TOPIC_XXXX] is forbidden."
@@ -211,7 +192,6 @@ class TestCheckMessage:
             validators.check_message(m, 4)
         assert str(ei.value) == "the message body size over max value, MAX: 4"
         assert ei.value.response_code == ResponseCode.MESSAGE_ILLEGAL
-        # Java 用的是 `>`，等于上限放行
         validators.check_message(msg("T1", b"1" * 4), 4)
 
     def test_lmq_path_with_file_separator(self):
@@ -229,7 +209,6 @@ class TestCheckMessage:
         validators.check_message(m, 1024)
 
     def test_topic_is_checked_before_body(self):
-        # 顺序照抄 Java：checkTopic → 禁发 topic → body。空 topic + 空 body 时报的是 topic
         m = Message("")
         m.body = b""
         with pytest.raises(MQClientException) as ei:
@@ -266,7 +245,6 @@ class TestProducerWiring:
         assert not p._started, "失败的 start 不能留在已启动状态"
 
     def test_group_is_validated_after_the_namespace_wrap(self):
-        # Java 的 start 先 withNamespace 再 impl.start()，所以按包装后的形状校验
         p = DefaultMQProducer("g" * 110)
         p.namespace = "ns" * 30
         p.name_server_addrs = list(self.PROBE_ADDR)
@@ -286,10 +264,7 @@ class TestProducerWiring:
 
 
 class TestConsumerWiring:
-    """三种消费者的 checkConfig 都排在地址/订阅/监听器校验之前（Java 同款顺序）。
-
-    用 127.0.0.1:1 兜底：万一顺序被改坏，测试会连不上而失败，不会打到真集群。
-    """
+    pass
 
     @pytest.mark.parametrize(
         "group,needle",

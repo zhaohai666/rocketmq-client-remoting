@@ -1,19 +1,8 @@
-// 消息轨迹真机验证（对齐 Java client.trace，与 cpp/examples/live_trace.cpp、
-// python/verify_trace_live.py 同套场景）。
-// 用法：rmq trace [namesrv]
-//
 // 前置：NameServer + Broker 已起，且 broker 配置 **traceTopicEnable=true**
 //（否则 RMQ_SYS_TRACE_TOPIC 不会被预建，也用 admin 建不出来 —— 它是系统 topic，
 // validateSystemTopicWhenUpdateTopic 默认 true 会拒绝创建）。
 //
 // 场景 S1–S17 与 Check() 一一对应，全部命中才返回 0。
-//
-// ⚠ 两条真机踩出来的硬约定（改脚本时勿回退）：
-//   1. 业务消费者必须 ConsumeFromLastOffset：S1 的预热消息**没有 keys**，用
-//      ConsumeFromFirstOffset 会被一起吃掉，既脏了计数断言，又会多出一条 keys 为空的 SubBefore；
-//   2. 消费侧 MessageExt.MsgId 是 **offset 基 ID**（Java MessageDecoder:557-561 先 setMsgId
-//      再 setOffsetMsgId，同值），所以它能对齐的是 SendResult.OffsetMsgId，
-//      **不是** SendResult.MsgId（UNIQ_KEY）。
 using System.Globalization;
 using System.Text;
 

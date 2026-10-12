@@ -3,9 +3,6 @@
 // that answers the consumer RPC family from an in-memory topic store and
 // records every request it saw.
 //
-// The assertions are deliberately about the WIRE and about OFFSET bookkeeping —
-// the two places a port silently diverges from Java:
-//
 //   - the pull header's sysFlag bits (suspend / subscription / commitOffset),
 //     the presence-or-absence of the `subscription` extField, and the timeout
 //     fields;
@@ -96,10 +93,6 @@ type consumerBroker struct {
 	requestModes    []*remoting.SetMessageRequestModeRequestBody
 	popFixture      *popFixture
 
-	// ---- QUERY_ASSIGNMENT bookkeeping (see pop_assignment_test.go) ----
-	// assignmentsByTopic keys the canned 400 answer by requested topic; a
-	// topic with no entry gets the "success, no set" default (which the
-	// client reads as Java's null = keep current).
 	queryAssignments   []*remoting.QueryAssignmentRequestBody
 	assignmentsByTopic map[string]*assignmentFixture
 }
@@ -804,11 +797,6 @@ func consumerForQueue(c *DefaultMQPushConsumer, topic, brokerName string, queueI
 
 // ---------------------------------------------------------------- tests
 
-// The pull request must carry suspend=1, the tag expression type, the batch
-// limits, and — with postSubscriptionWhenPull off (the Java default) — NO
-// `subscription` extField at all. Getting the bit/field pairing wrong makes the
-// broker either ignore the subscription (over-delivery) or filter on an
-// expression the client never intended to send.
 func TestConsumerPullRequestShape(t *testing.T) {
 	topic := uniqueTopic("GoConsumerPullShape", t)
 	const group = "GID_go_pull_shape"
@@ -868,8 +856,6 @@ func TestConsumerPullRequestShape(t *testing.T) {
 	if common.HasLitePullFlag(sysFlag) {
 		t.Errorf("sysFlag %d: LITE_PULL bit must be clear", sysFlag)
 	}
-	// Java's makeCustomHeaderToNet drops a null field, so the key must be
-	// ABSENT rather than present-and-empty.
 	if pull.Subscription != nil {
 		t.Errorf("subscription = %q, want the key absent when the SUBSCRIPTION bit is off", *pull.Subscription)
 	}
@@ -878,10 +864,6 @@ func TestConsumerPullRequestShape(t *testing.T) {
 	}
 }
 
-// Suspend()/Resume() mirror Java DefaultMQPushConsumerImpl.suspend (:1312-1315,
-// just raise the flag) and .resume (:741-745, clear it and rebalance at once);
-// the pull loop honors the flag the way pullMessage:263-266 does — keep the
-// assignment, send nothing, re-check after 1000ms.
 func TestConsumerSuspendStopsPullsAndResumeRestartsThem(t *testing.T) {
 	topic := uniqueTopic("GoConsumerSuspend", t)
 	const group = "GID_go_suspend"
@@ -897,7 +879,7 @@ func TestConsumerSuspendStopsPullsAndResumeRestartsThem(t *testing.T) {
 	if !c.IsPaused() {
 		t.Fatal("Suspend() must raise the pause flag")
 	}
-	c.Suspend() // idempotent and never fails, exactly like Java's setter
+	c.Suspend()
 
 	c.mu.Lock()
 	ownedBefore := len(c.processQueueTable)
@@ -921,10 +903,6 @@ func TestConsumerSuspendStopsPullsAndResumeRestartsThem(t *testing.T) {
 	if got := f.broker.pullCount(); got != before {
 		t.Errorf("pull count moved %d -> %d while suspended, want the loops to stop sending", before, got)
 	}
-	// The ordering invariant: TouchPull happens BEFORE the pause gate (Java
-	// pullMessage:253 vs :263-266). Stamp after the gate and a merely-suspended
-	// consumer looks like a dead loop, so the 120s stall detector tears the
-	// assignment down — silent, and only visible after two minutes of pause.
 	if pq.LastPullTimestamp() <= stampBefore {
 		t.Errorf("lastPullTimestamp froze while suspended (%d -> %d), the pause gate must sit after the stamp",
 			stampBefore, pq.LastPullTimestamp())
@@ -1111,8 +1089,6 @@ func TestConsumerReconsumeLaterSendsBackAndHoldsOffset(t *testing.T) {
 	if got := deref(back.OriginTopic); got != topic {
 		t.Errorf("send-back originTopic = %q, want %q", got, topic)
 	}
-	// Java substitutes the broker's retryMaxTimes default (16) when the
-	// consumer's maxReconsumeTimes is left at -1.
 	if got := derefI32(back.MaxReconsumeTimes); got != 16 {
 		t.Errorf("send-back maxReconsumeTimes = %d, want 16", got)
 	}
@@ -1125,16 +1101,6 @@ func TestConsumerReconsumeLaterSendsBackAndHoldsOffset(t *testing.T) {
 	}
 }
 
-// ackIndex truncates the ack to a PREFIX of the batch: everything after it is
-// handed back to the broker, and the committed offset must still move past the
-// whole batch. Java's processConsumeResult calls
-// `removeMessage(consumeRequest.getMsgs())` — the ACKED list — so with all three
-// messages in one batch the buffer empties and the commit is
-// `queueOffsetMax + 1` = 3. Deriving the floor from the FAILED set instead
-// inverts the guard: offset 0 is still buffered and is not in that set, so the
-// floor clamps the commit to 0 and a restart replays messages that were already
-// acknowledged.
-//
 // The batch is taken by hand rather than by the dispatcher because the pull loop
 // would overwrite the answer: with the buffer empty the next pull is NO_NEW_MSG
 // and correctTagsOffset moves the offset onto the pull cursor within the same
@@ -1226,18 +1192,11 @@ func TestConsumerAckFloorCountsFailedSendBack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read offset: %v", err)
 	}
-	// Java: removeMessage([f0]) leaves {f1,f2} buffered -> commit 1, NOT 3.
 	if offset != 1 {
 		t.Errorf("consumed offset = %d, want 1 (the smallest FAILED offset still buffered pins the commit)", offset)
 	}
 }
 
-// Batches of one queue are consumed in parallel, so the batch that finishes
-// second is not necessarily the one with the higher offsets. Java's
-// removeMessage returns the smallest offset still buffered, which for the
-// higher batch that finishes FIRST is the lower batch's head (0) — NOT its own
-// end. Committing 6 there means a crash before the lower batch is done skips
-// offsets 0..2 for good.
 func TestConsumerAckFloorHoldsForOutOfOrderBatches(t *testing.T) {
 	topic := uniqueTopic("GoConsumerAckOrder", t)
 	const group = "GID_go_ack_order"
@@ -1290,9 +1249,6 @@ func TestConsumerAckFloorHoldsForOutOfOrderBatches(t *testing.T) {
 	}
 }
 
-// NO_NEW_MSG with an empty buffer must move the consumed offset onto the pull
-// cursor (Java correctTagsOffset); otherwise a queue whose messages the broker
-// filtered parks forever with nobody to ack it.
 func TestConsumerCorrectTagsOffsetOnNoNewMsg(t *testing.T) {
 	topic := uniqueTopic("GoConsumerTagsOffset", t)
 
@@ -1348,9 +1304,6 @@ func TestConsumerOffsetIllegalRebuildsQueue(t *testing.T) {
 	}
 }
 
-// CONSUME_FROM_TIMESTAMP resolves the start point with
-// SEARCH_OFFSET_BY_TIMESTAMP(29), interpreting consumeTimestamp as a 14-digit
-// LOCAL wall clock (Java UtilAll.parseDate).
 func TestConsumerTimestampOffsetUsesSearchOffset(t *testing.T) {
 	topic := uniqueTopic("GoConsumerTimestamp", t)
 
@@ -1368,9 +1321,6 @@ func TestConsumerTimestampOffsetUsesSearchOffset(t *testing.T) {
 	}
 }
 
-// The %RETRY% exception for CONSUME_FROM_TIMESTAMP: Java answers maxOffset (not
-// a searched offset, and not 0) because a retry topic with no committed offset
-// has nothing to retry yet.
 func TestConsumerRetryTopicTimestampUsesMaxOffset(t *testing.T) {
 	const group = "GID_go_retry_ts"
 	retryTopic := common.GetRetryTopic(group)
@@ -1754,8 +1704,6 @@ func TestShutdownRequeuesFrozenBatch(t *testing.T) {
 	}
 }
 
-// The pool size gate mirrors Java's guard:
-// `n <= 0 || n > Short.MAX_VALUE || n >= consumeThreadMax`.
 func TestConsumerUpdateCorePoolSizeGuard(t *testing.T) {
 	c := MustNewDefaultMQPushConsumer("GID_go_pool")
 	c.SetConsumeThreadMin(2)

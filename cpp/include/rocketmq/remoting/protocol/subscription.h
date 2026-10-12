@@ -1,7 +1,3 @@
-// 订阅组模型（对应 org.apache.rocketmq.remoting.protocol.subscription 包）：
-// SubscriptionGroupConfig / GroupRetryPolicy / SimpleSubscriptionData /
-// SubscriptionGroupWrapper。
-//
 // 字段名与默认值以 broker 侧序列化探针实测为准：
 //   JSON.toJSONString(new SubscriptionGroupConfig("MyGroup")) ->
 //   {"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,"consumeEnable":true,
@@ -25,7 +21,6 @@
 
 namespace rocketmq {
 
-// org.apache.rocketmq.remoting.protocol.subscription.GroupRetryPolicyType
 struct GroupRetryPolicyType {
     static constexpr const char* EXPONENTIAL = "EXPONENTIAL";
     static constexpr const char* CUSTOMIZED = "CUSTOMIZED";
@@ -89,8 +84,6 @@ struct SubscriptionGroupConfig {
     std::string toString() const;
 };
 
-// 对应 org.apache.rocketmq.remoting.protocol.body.SubscriptionGroupWrapper
-// 探针输出：{"dataVersion":{...},"forbiddenTable":{},"subscriptionGroupTable":{...}}
 struct SubscriptionGroupWrapper {
     std::map<std::string, SubscriptionGroupConfig> subscriptionGroupTable;
     JsonValue forbiddenTable;  // 透传（本实现不解释其内容）

@@ -41,9 +41,6 @@ async function main(): Promise<void> {
   const consumer = new DefaultLitePullConsumer(GROUP);
   consumer.setNamesrvAddr(NS);
   consumer.subscribe(TOPIC, '*');
-  // The messages are sent BEFORE the consumer starts: with the Java default
-  // CONSUME_FROM_LAST_OFFSET the initial offset is maxOffset and everything
-  // pre-sent would be skipped. FIRST_OFFSET makes the read deterministic.
   consumer.setConsumeFromWhere('CONSUME_FROM_FIRST_OFFSET');
   consumer.setAutoCommit(false);
   await consumer.start();

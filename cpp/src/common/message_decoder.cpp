@@ -1,14 +1,7 @@
-// 消息二进制编解码实现（对应 org.apache.rocketmq.common.message.MessageDecoder）。
-//
 // 严格对齐 python/common/message_decoder.py（已对真实 5.5.1 集群验证），
 // 两条**互不可混用**的路径：
 //   1) 17 段存储格式：encodeMessageExt / decodeMessage / decodeMessages（broker 写入与 pull 返回）；
 //   2) 6 段轻量格式：encodeMessage / encodeMessages / decodeBatchMessage / decodeBatchMessages（批量 body）。
-//
-// 压缩说明：与 Java/Python 对齐——消息体压缩用 **zlib 流格式**（RFC1950），
-// 压缩类型取自 sysFlag 的 bit8~10；类型位为 0 的老版本消息按 ZLIB 解。
-// 编解码统一走 CompressorFactory（见 common/compression.h），
-// 失败或不支持的类型会抛异常，而不是静默透传压缩字节。
 #include "rocketmq/common/message_decoder.h"
 
 #include "rocketmq/common/compression.h"
@@ -19,8 +12,6 @@ namespace rocketmq {
 
 namespace {
 
-// 压缩：仅在 needCompress 且 sysFlag 已置 COMPRESSED_FLAG 时执行。
-// 与 Java MessageDecoder.encode 一致，压缩类型取自 sysFlag 的 bit8~10。
 Bytes maybeCompress(const Bytes& body, bool needCompress, int32_t sysFlag) {
     if (!needCompress) return body;
     if (!MessageSysFlag::isCompressed(sysFlag)) return body;
@@ -28,10 +19,6 @@ Bytes maybeCompress(const Bytes& body, bool needCompress, int32_t sysFlag) {
     return CompressorFactory::compress(body, type, 5);
 }
 
-// 解压：与 Java MessageDecoder.decode 一致，压缩类型取自 sysFlag 的 bit8~10。
-// 类型位为 0 的老版本压缩消息由 CompressionType::findByValue 映射到 ZLIB。
-// **失败或不支持的类型会抛异常**，绝不返回压缩字节——否则上层会把压缩流当正文，
-// 属静默数据损坏（Java 同样是抛 IOException / RuntimeException）。
 Bytes maybeDecompress(const Bytes& body, bool decompressBody, int32_t sysFlag) {
     if (!decompressBody) return body;
     if (!MessageSysFlag::isCompressed(sysFlag)) return body;
@@ -188,7 +175,7 @@ bool decodeMessage(const Bytes& raw, MessageExt& out, bool readBody, bool decomp
         int32_t storeSize = r.readInt32();
         int32_t magicCode = r.readInt32();
         if (magicCode != MESSAGE_MAGIC_CODE && magicCode != MESSAGE_MAGIC_CODE_V2) {
-            return false;  // 未知魔数 -> 解码失败（对应 Java 返回 null）
+            return false;
         }
         bool useV2 = (magicCode == MESSAGE_MAGIC_CODE_V2);
 
@@ -239,8 +226,6 @@ bool decodeMessage(const Bytes& raw, MessageExt& out, bool readBody, bool decomp
                 body = maybeDecompress(body, decompressBody, sysFlag);
                 out.body = body;
                 out.hasBody = true;
-                // 对齐 Java：解压成功后清掉 COMPRESSED_FLAG（保留 bit8~10 的类型位）。
-                // 条件与 Java `if (deCompressBody && isCompressed(sysFlag))` 完全相同。
                 if (decompressBody && MessageSysFlag::isCompressed(sysFlag)) {
                     out.sysFlag = MessageSysFlag::clearCompressedFlag(sysFlag);
                 }

@@ -4,25 +4,7 @@ declare(strict_types=1);
 
 namespace RocketMQ\Client\Exceptions;
 
-/**
- * 客户端异常体系（对应 org.apache.rocketmq.client.exception.* 与 remoting exception，
- * 按 php/PORTING.md 约定集中在 src/Client/Exceptions.php 一个文件多类）。
- *
- * 命名空间取 `RocketMQ\Client\Exceptions`：与文件名 `Exceptions.php` 对应，且被
- * bootstrap.php 的 classmap fallback（token 扫描）自动加载，无需调用方 require。
- */
 
-/**
- * 对应 org.apache.rocketmq.client.common.ClientErrorCode（七个常量，逐个齐全）。
- *
- * sendDefaultImpl 重试耗尽后用它给最终的 MQClientException 定性：
- * 连不上 broker→10001，等响应超时→10002，客户端自身问题→10003，
- * 地址服务器没给地址→10004，路由查不到→10005。
- * 另两个不在重试定性里，各有各的抛出点：
- * * 10006 —— request-reply 等到点没等到应答（``DefaultMQProducerImpl#waitResponse``，
- *   以及 Java ``RequestFutureHolder#scanExpiredRequest`` 的清理路径）。
- * * 10007 —— 由请求消息造应答消息失败（``MessageUtil#createReplyMessage``）。
- */
 final class ClientErrorCode
 {
     public const CONNECT_BROKER_EXCEPTION = 10001;
@@ -70,18 +52,10 @@ class MQQueueException extends MQClientException
 {
 }
 
-/**
- * 对应 Java ``RequestTimeoutException extends MQClientException``。
- *
- * Request-Reply 专用语义：请求消息**已经发成功**，但在超时窗口内没等到应答。
- * 与「发送本身失败」（会抛 MQClientException / RemotingException）区分开 ——
- * 前者可能只是应答方没回，消息其实已经投递；后者连 broker 都没收到。
- */
 class RequestTimeoutException extends MQClientException
 {
 }
 
-// ---------------- Remoting 异常（对应 org.apache.rocketmq.remoting.exception）----------------
 
 class RemotingException extends MQException
 {
@@ -138,7 +112,6 @@ class RemotingServerException extends RemotingException
 {
 }
 
-/** 对应 Java UnsupportedOperationException（客户端层的"不支持"信号）。 */
 class UnsupportedOperationException extends MQException
 {
 }

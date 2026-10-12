@@ -1,17 +1,4 @@
 # -*- coding: utf-8 -*-
-"""POP 模式（5.x 轻量消费）本地单测 —— 不需要集群。
-
-覆盖三块最容易出错、且真机上很难定位的契约：
-
-1. ``extra_info``（CK 串）编解码：**空格**做段分隔、Java ``String.split`` 的
-   "丢弃末尾空串"语义、段数校验、重复 key 拒绝、retryFlag 判定。
-2. 请求头的 extFields **键名逐字等于 Java 字段名** —— broker 用 fastjson2 按 Java
-   属性名反序列化，错一个字母就**静默丢字段**（不报错、行为静默退化），
-   所以这里逐键断言，把它当回归守卫。
-3. ``POP_CK`` 反构：普通 topic 直连 POP 时 broker **不写** POP_CK 属性，
-   必须由客户端用响应头的 startOffsetInfo/msgOffsetInfo 拼出 8 段 CK 串，
-   否则后续 ACK 无从下手。这是整个 POP 实现最容易踩的坑。
-"""
 from __future__ import annotations
 
 import pytest
@@ -105,7 +92,6 @@ class TestExtraInfoBuildSplit:
         assert len(ei.split(ck)) == 7
 
     def test_pop_split_drops_trailing_empty(self):
-        # Java "1 2 3 ".split(" ") -> ["1","2","3"]；Python 原生会留一个 ""
         assert ei.split("1 2 3 ") == ["1", "2", "3"]
         assert ei.split("1 2 3  ") == ["1", "2", "3"]
 
@@ -240,7 +226,6 @@ class TestPopRequestHeader:
         assert ext["bornTime"] == 1789613086027
 
     def test_order_always_serialized_as_lowercase(self):
-        # Java 字段是 Boolean order = Boolean.FALSE（非 null），encodeHeader 不会跳过它
         h = PopMessageRequestHeader()
         h.topic = TOPIC
         ext = h.to_ext_fields()
@@ -299,7 +284,6 @@ class TestAckAndChangeHeaders:
             "consumerGroup", "topic", "queueId", "extraInfo", "offset",
             "invisibleTime", "suspend",
         }
-        # Java 是 primitive boolean，所以总是出现，且是小写
         assert ext["suspend"] == "false"
 
     def test_change_invisible_response_parse(self):
@@ -411,8 +395,6 @@ class TestStampPopCk:
         assert got == [10, 11, 12]
 
     def test_fallback_when_start_offset_info_missing(self):
-        # Java 的 startOffsetInfo == null 分支：用自己的 queueOffset 当 ckOffset，
-        # 再手工补一段凑成 8 段
         h = self._header()
         h.start_offset_info = None
         msgs = [_msg(queue_id=3, queue_offset=42)]
@@ -438,7 +420,6 @@ class TestPopMessagePostProcess:
         fake = _FakeClient([_resp(ResponseCode.SUCCESS, _pop_ext(0), body=b"x")])
         res = _client(fake).pop_message(GROUP, TOPIC, queue_id=0,
                                         addr=ADDR, broker_name=BROKER)
-        # Java processPopResponse 收尾会统一盖 brokerName / topic
         assert res.msg_found_list[0].broker_name == BROKER
         assert res.msg_found_list[0].topic == TOPIC
 
@@ -467,7 +448,6 @@ class TestAckMessage:
         assert code == ResponseCode.NO_MESSAGE
 
     def test_broker_name_taken_from_extra_info(self):
-        # 不显式给 brokerName 时，从 CK 串第 6 段取（Java 也是这么找地址的）
         fake = _FakeClient([_resp(ResponseCode.SUCCESS, {})])
         ck = ei.build_extra_info(0, 1, 60000, 0, TOPIC, "broker-from-ck", 3, 7)
         _client(fake).ack_message(GROUP, TOPIC, 3, ck, 7, addr=ADDR)

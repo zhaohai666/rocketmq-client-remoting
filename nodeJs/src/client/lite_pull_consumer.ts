@@ -170,14 +170,10 @@ export class DefaultLitePullConsumer {
     }
     this.clientID = MixAll.clientIdFor(
       this.instanceName, this.unitName || null, this.enableStreamRequestType);
-    // 跨 facade 复用（Java MQClientManager.factoryTable）：同 clientId 的门面共享
-    // 一个实例，引用计数归零才真关闭；hook 链只由创建者注册（first-wins 快照）。
     const manager = MQClientManager.getInstance();
     const { instance: client, created } = manager.getOrCreateMQClientInstance(
       this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
     if (created) {
-      // Java MQClientAPIImpl:329 — NamespaceRpcHook first on the remoting
-      // client, then StreamTypeRPCHook, before any user hook (none today).
       registerRpcHooks(client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
         enableStreamRequestType: this.enableStreamRequestType,

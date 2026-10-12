@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""消息轨迹单测（对齐 Java client.trace 包）。
-
-最有价值的是第一组：**EXPECTED_* 里的字符串是 Java 官方实现直接打印出来的**
-（探针 /tmp/TraceParity.java，用真实 TraceDataEncoder.encoderFromContextBean 输出，
-SOH=\\x01 / STX=\\x02 做了可读化）。只要三语言的编码器与这些常量逐字节一致，
-就能与 RocketMQ 控制台 / Java 客户端互认。
-"""
 import time
 
 from client.consumer_result import ConsumeConcurrentlyStatus
@@ -33,7 +26,6 @@ MSG_ID_2 = "AC1400A1F0A018B4AAC2A1B2C3D4E5F7"
 OFFSET_MSG_ID = "AC1400A1000027100000000000000001"
 BODY = b"x" * 42
 
-# ---- Java 官方实现的编码结果（勿手改；改了就与 Java/控制台不兼容）----
 EXPECTED_PUB = (SOH.join(["Pub", "1700000000000", "DefaultRegion", "GID_test", "TopicTest",
                           MSG_ID_1, "TagA", "KeyA KeyB", "127.0.0.1:10911", "42", "7", "0",
                           OFFSET_MSG_ID, "true"]) + STX)
@@ -69,7 +61,6 @@ def _bean(msg_id=MSG_ID_1, keys="KeyA KeyB", retry_times=2):
     return b
 
 
-# ---------------- 编码：与 Java 逐字节一致 ----------------
 def test_encode_pub_matches_the_wire_vector():
     ctx = TraceContext()
     ctx.trace_type = TraceType.PUB
@@ -113,7 +104,7 @@ def test_encode_sub_after_matches_the_wire_vector():
 
 
 def test_encode_sub_after_cloud_drops_timestamp_and_group():
-    """CLOUD 通道下 Java 不追加 timestamp/groupName 两段。"""
+    pass
     ctx = TraceContext()
     ctx.trace_type = TraceType.SUB_AFTER
     ctx.time_stamp = 1700000000000
@@ -152,7 +143,6 @@ def test_encode_null_returns_none():
     assert TraceDataEncoder.encoder_from_context_bean(None) is None
 
 
-# ---------------- 解码：Java split 语义 + 字段还原 ----------------
 def test_trace_split_drops_trailing_empty():
     assert split_dropping_trailing_empty("a" + STX, STX) == ["a"]
     assert split_dropping_trailing_empty(STX, STX) == []
@@ -188,7 +178,6 @@ def test_decode_pub_round_trip():
     assert bean.body_length == 42
     assert bean.offset_msg_id == OFFSET_MSG_ID
     assert bean.msg_type == MessageType.NORMAL_MSG
-    # Java 编码不写 clientHost，解码时落到 LOCAL_ADDRESS 默认值
     assert bean.client_host == LOCAL_ADDRESS
 
 
@@ -324,7 +313,6 @@ def test_dispatcher_group_name_and_defaults():
     assert d.trace_topic_name == "RMQ_SYS_TRACE_TOPIC"
     assert d.batch_num == 10
     assert d.max_msg_size == 128000
-    # Java：batchNum 上限 20
     d2 = AsyncTraceDispatcher("GID_test", TraceDispatcherType.PRODUCE, 50, None, None)
     d2.trace_producer = _FakeTraceProducer()
     assert d2.batch_num == 20
@@ -658,11 +646,7 @@ def test_consume_concurrently_status_names_used_by_hook():
 # 解码健壮性回归（真机踩到的两个坑，勿删）
 # ---------------------------------------------------------------------------
 def test_decode_sub_before_without_keys():
-    """无 keys 的消息，SubBefore 末段会被 Java split 丢掉 → 缺一段，必须当空串。
-
-    Java 原生实现在这里会抛 ArrayIndexOutOfBoundsException（line[7]），
-    我们的解码器有意兜成空串，否则控制台/验证脚本读轨迹时会崩。
-    """
+    pass
     raw = SOH.join(["SubBefore", "1700000000000", "DefaultRegion", "GID_trace_live",
                     "REQ-001", MSG_ID_1, "0", ""]) + STX
     records = TraceDataEncoder.decoder_from_trace_data_string(raw)

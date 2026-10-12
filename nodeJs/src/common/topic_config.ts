@@ -1,10 +1,6 @@
-// -*- coding: utf-8 -*-
-// TopicConfig (org.apache.rocketmq.common.TopicConfig).
-// Faithful port of python/common/topic_config.py.
 
 import { PermName } from './sysflag.ts';
 
-// org.apache.rocketmq.common.TopicConfig.defaultReadQueueNums / defaultWriteQueueNums
 export const DEFAULT_READ_QUEUE_NUMS = 16;
 export const DEFAULT_WRITE_QUEUE_NUMS = 16;
 // PermName.PERM_READ | PermName.PERM_WRITE

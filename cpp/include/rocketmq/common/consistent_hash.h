@@ -1,5 +1,3 @@
-// 一致性哈希环（对应 rocketmq 服务端 `org.apache.rocketmq.common.consistenthash` 包）。
-//
 // 实现 `ConsistentHashRouter` / `Node` / `VirtualNode` / `HashFunction` 四个类型加
 // 默认 `MD5Hash`；目前唯一的用户是队列分配策略 `AllocateMessageQueueConsistentHash`。
 //

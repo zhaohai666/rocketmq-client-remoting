@@ -232,7 +232,6 @@ func TestRequestResponseFutureSetFailed(t *testing.T) {
 		t.Fatal("SetFailed must wake and fire the callback")
 	}
 
-	// A nil cause still records something (Java throws NPE-free generic).
 	f2 := newRequestResponseFuture("corr2", 1000, nil)
 	f2.SetFailed(nil)
 	if f2.Cause() == nil {
@@ -394,8 +393,6 @@ func TestProducerRequestSendFailureSurfaces(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the send failure to surface")
 	}
-	// A failed send is NOT a request timeout: Java wraps it as
-	// "send request message to <topic> fail" with the cause attached.
 	if !strings.Contains(err.Error(), "send request message to <"+topic+"> fail") {
 		t.Fatalf("error = %v, want the send-request wrapper", err)
 	}

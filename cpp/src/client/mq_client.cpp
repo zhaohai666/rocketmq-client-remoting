@@ -188,24 +188,12 @@ MQClientInstance::MQClientInstance(const std::string& clientId,
       pollNameServerIntervalMillis_(pollNameServerIntervalMillis > 0 ? pollNameServerIntervalMillis
                                                                     : 30000),
       tlsEnable_(tlsEnable) {
-    // 动态取址（对应 Java MQClientAPIImpl 构造里的 DefaultTopAddressing(unitName)）：
-    // 配了 ROCKETMQ_NAMESRV_DOMAIN 才生效，wsAddr + unitName 一起决定 URL。
-    // 未配置时 configureFromEnv 是 no-op，行为与不接这个入参完全一致。
     topAddressing_.configureFromEnv(unitName);
-    // Request-Reply：broker 用 PUSH_REPLY_MESSAGE_TO_CLIENT(326) 把应答推回来。
-    // 对应 Java MQClientAPIImpl 构造函数里的
-    // registerProcessor(PUSH_REPLY_MESSAGE_TO_CLIENT, clientRemotingProcessor, null)
-    // —— 它是**客户端实例级**的（与具体 producer 无关，应答按 clientId 推回），
-    // 所以注册在构造函数里。处理器绝不能在回调里同步发请求（回调在读线程上执行）。
     remotingClient_->registerProcessor(
         RequestCode::PUSH_REPLY_MESSAGE_TO_CLIENT,
         [](const RemotingCommand& cmd, const std::string& addr) {
             return processReplyMessage(cmd, addr);
         });
-    // NOTIFY_CONSUMER_IDS_CHANGED(40)：消费组成员变化时 broker 沿长连接反向推过来。
-    // 同样注册在**实例**上（Java 的 `MQClientAPIImpl` 构造函数），处理器只做
-    // rebalanceImmediately()，且 broker 用 oneway 发的 ⇒ 不回包（返回 nullopt）。
-    // ⚠ 回调在读线程上执行，只做置位/计数，不发任何 RPC。
     remotingClient_->registerProcessor(
         RequestCode::NOTIFY_CONSUMER_IDS_CHANGED,
         [this](const RemotingCommand& cmd, const std::string& addr) {
@@ -222,21 +210,14 @@ void MQClientInstance::start() {
     if (tlsEnable_) {
         remotingClient_->setTlsEnable(true);
     }
-    // 消费统计采样线程（Java 挂在每个 StatsItem 的调度器上，这里收敛为实例级一个）
     consumerStats_.start();
-    // 动态 name server（Java MQClientInstance.start:344-348）：**当且仅当**没配置
-    // 静态地址时先 fetch 一次；取不到直接报错（比 Java 更严格——Java 会让运行期各处
-    // 各自失败，这里在 start 时给一个明确错误）。
     if (nameServerAddrs_.empty() && !topAddressing_.wsAddr().empty()) {
         fetchNameServerAddr();
         if (nameServerAddrs_.empty()) {
-            // 码值用 Java 的 10004（validateNameServerSetting 对同一故障给的码）：本端口比
-            // Java 严格，在 start() 就拦下来，但不能让调用方看到两种不同的码。
             throw MQClientException("name server address is not set and address server ("
                                     + topAddressing_.wsAddr() + ") returned none",
                                     ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
         }
-        // 周期刷新（Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)）
         if (!namesrvRefreshThread_.joinable()) {
             namesrvRefreshStop_ = false;
             namesrvRefreshThread_ = std::thread([this]() {
@@ -251,9 +232,6 @@ void MQClientInstance::start() {
         ns += nameServerAddrs_[i];
     }
     logger_info("MQClientInstance[" + clientId_ + "] started, namesrv=" + ns);
-    // 周期刷新在用 topic 路由（对应 Java MQClientInstance.startScheduledTask 用
-    // pollNameServerInterval，默认 30s）。没有它，新 topic 被 broker 创建、队列扩容等
-    // 变化只能等消费者自己的 rebalance 轮次或生产者的下次发送才被发现。
     if (!routeRefreshThread_.joinable()) {
         routeRefreshStop_ = false;
         routeRefreshThread_ = std::thread([this]() {
@@ -271,10 +249,6 @@ void MQClientInstance::registerTopicInUse(const std::string& topic) {
 }
 
 void MQClientInstance::routeRefreshLoop() {
-    // Java `scheduleAtFixedRate(updateTopicRouteInfoFromNameServer, 10, pollNameServerInterval)`：
-    // 首跳落在 initialDelay（10ms）**这一刻**，之后每跳锚定在 initialDelay + n×周期（固定速率，
-    // 见 schedule_util.h），不是 initialDelay + 一个周期后（旧写法要等 10ms + 30s 才刷新第一次）。
-    // 周期取构造时定型的 pollNameServerIntervalMillis_。
     auto next = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
     while (!routeRefreshStop_.load()) {
         if (!started_) return;
@@ -331,9 +305,6 @@ void MQClientInstance::unregisterRebalanceWakeup(const std::string& group) {
 }
 
 void MQClientInstance::rebalanceImmediately() {
-    // Java 是一行 rebalanceService.wakeup()：唤醒那个共享的重平衡线程，由它
-    // doRebalance() 逐个 tryRebalance()。这里没有实例级重平衡线程（每个消费者跑自己
-    // 那份循环），所以改成逐个点名。异常照 Java 吞掉：一个消费者叫醒失败不影响其它。
     std::map<std::string, std::function<void()>> snapshot;
     {
         std::lock_guard<std::mutex> lk(rebalanceWakeupLock_);
@@ -344,15 +315,12 @@ void MQClientInstance::rebalanceImmediately() {
         try {
             entry.second();
         } catch (...) {
-            // Java: catch (Exception ignored)
         }
     }
 }
 
 void MQClientInstance::processNotifyConsumerIdsChanged(const RemotingCommand& cmd,
                                                       const std::string& addr) {
-    // 对应 Java ClientRemotingProcessor#notifyConsumerIdsChanged：日志文案照抄。
-    // consumerGroup 只用于日志 —— Java 不读它来决定叫醒谁，整组一起唤醒。
     auto it = cmd.extFields.find("consumerGroup");
     const std::string group = it == cmd.extFields.end() ? std::string() : it->second;
     consumerIdsChangedCount_.fetch_add(1);
@@ -362,7 +330,6 @@ void MQClientInstance::processNotifyConsumerIdsChanged(const RemotingCommand& cm
 }
 
 void MQClientInstance::fetchNameServerAddr() {
-    // Java MQClientAPIImpl.fetchNameServerAddr：地址**变化才应用**（按 ';' 切分）
     std::string changed = topAddressing_.fetchAndApply();
     if (changed.empty()) return;
     std::vector<std::string> addrs;
@@ -376,7 +343,6 @@ void MQClientInstance::fetchNameServerAddr() {
 }
 
 void MQClientInstance::namesrvRefreshLoop() {
-    // Java scheduleAtFixedRate(fetchNameServerAddr, 10s, 2min)：首跳 10s，之后固定速率 2min。
     auto next = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (!namesrvRefreshStop_.load()) {
         if (!started_) return;
@@ -417,9 +383,6 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
                                                          int32_t timeoutMillis,
                                                          bool isDefault) {
     if (nameServerAddrs_.empty()) {
-        // Java 这里只 log.warn 并返回 false，故障最终由生产者的 validateNameServerSetting
-        // 以 10004 报出；本端口的路由拉取是拉不到就抛，所以直接把同一个码带上 ——
-        // 一个地址都没有时不能报成"这个 topic 没路由"(10005)。
         throw MQClientException("name server address list is empty",
                                 ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
     }
@@ -459,14 +422,6 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
     TopicRouteData route;
     bool ok = fetch(topic, route);
     if (!ok && isDefault && topic != MixAll::DEFAULT_TOPIC) {
-        // 5.x nameServer 不为未知 topic 合成默认路由（返回 TOPIC_NOT_EXIST），
-        // **生产者**需要像 Java 客户端那样回退到默认 topic（TBW102）来为该 topic
-        // 构造发布信息。isDefault=false 时（消费者路径）不做这个兜底。
-        // 新 topic 由 broker 用 defaultTopicQueueNums 创建队列，而默认 topic 自身
-        // 可能配置了更多队列，这里按 broker 实际创建数裁剪，避免选中非法 queueId。
-        // 注意：默认 topic 的兜底结果不覆盖 lastRouteError —— 真实 topic 拉取的
-        // 失败原因才是要透给上层的（fetch 成功时提前 return，不会写它；只有
-        // 默认 topic 也全 NS 不可达时才会覆盖成默认 topic 的失败原因）。
         TopicRouteData defaultRoute;
         if (fetch(MixAll::DEFAULT_TOPIC, defaultRoute)) {
             for (QueueData& qd : defaultRoute.queueDatas) {
@@ -487,15 +442,9 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
 
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
     topicRouteTable_[topic] = route;
-    // Java 只在路由"变了"时覆盖（`if (changed)`），但 route 是刚解码出来的新对象，
-    // 这里一律覆盖 —— Java 的 brokerAddrTable 条目本身就是**共享引用**
-    // （`put(bd.getBrokerName(), bd.getBrokerAddrs())` 存的是 route 里那张 map），
-    // 所以它那边的"没变就不覆盖"并不会留下旧值，两边等价。
     for (const BrokerData& bd : route.brokerDatas) {
         brokerAddrTable_[bd.brokerName] = bd.brokerAddrs;
     }
-    // 静态主题：同一路由落库块里刷新「逻辑队列 -> 真实 broker」端点表
-    // （Java 在同处构建 topicEndPointsTable）；非静态路由清掉旧条目。
     {
         std::map<MessageQueue, std::string> endpoints;
         if (static_topic::topicRouteData2EndpointsForStaticTopic(topic, route, endpoints)) {
@@ -606,7 +555,6 @@ std::pair<std::string, bool> MQClientInstance::findBrokerAddressInSubscribe(
         }
     }
     if (!onlyThisBroker) {
-        // Java 取 map 首个 entry（HashMap 序不确定）；这里取 id 最小者，确定化。
         const auto& first = *brokerAddrs.begin();
         return {first.second, first.first != masterId};
     }
@@ -638,8 +586,6 @@ std::string MQClientInstance::brokerAddrOf(const std::string& brokerName) {
 }
 
 std::string MQClientInstance::findBrokerAddressInPublish(const std::string& brokerName) {
-    // Java `MQClientInstance#findBrokerAddressInPublish:1295-1305`：
-    // `brokerAddrTable.get(brokerName).get(MixAll.MASTER_ID)`，任何一步拿不到就 null。
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
     auto it = brokerAddrTable_.find(brokerName);
     if (it == brokerAddrTable_.end()) {
@@ -656,13 +602,10 @@ std::string MQClientInstance::publishAddrFor(const std::string& brokerName,
                                              const std::string& topic) {
     std::string addr = findBrokerAddressInPublish(brokerName);
     if (addr.empty()) {
-        // Java `sendKernelImpl:919-924`：缓存里没有就按 topic 补一次路由再查。
         updateTopicRouteInfoFromNameServer(topic, 5000, false);
         addr = findBrokerAddressInPublish(brokerName);
     }
     if (addr.empty()) {
-        // Java `sendKernelImpl:1100` 抛在 try 之外 → 拦截器不跑；码用 Java 双参构造器的 -1
-        // （「不是 broker 回的码」）。
         throw MQClientException("The broker[" + brokerName + "] not exist", -1);
     }
     return addr;
@@ -676,16 +619,7 @@ std::string MQClientInstance::publishAddrInAdmin(const MessageQueue& mq) {
 
 std::string MQClientInstance::resolvePopAddr(const std::string& topic, std::string& brokerName,
                                              const std::string& addrIn) {
-    // Java 的 POP 三兄弟共用同一条地址口径：`PullAPIWrapper#popAsync:369-373`、
-    // `DefaultMQPushConsumerImpl#ackAsync:820-825` / `changePopInvisibleTimeAsync:869-876`
-    // 全是 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) —— **只认主**，
-    // 查不到按 topic 刷一次路由再查，仍查不到抛「The broker[X] not exist」。
-    // 不能退到从节点：从节点不接 POP 这族写请求（ack / 延长不可见时间都要落在 broker
-    // 侧的 revive 表上），退过去只会换一个可重试的 SYSTEM_BUSY(2)。
     if (brokerName.empty()) {
-        // 调用方连 brokerName 都没给（admin 式的「认该 topic 的任意队列」）：先按路由挑
-        // 一台，挑完照样只认它的 master。Java 那边 ack 的 brokerName 来自 CK 串第 6 段，
-        // POP 的来自调用方给的队列，都有值；只有本端这个便利口径会走到这里。
         auto route = getTopicRouteData(topic);
         if (route == nullptr) {
             throw MQClientNoRouteException(topic);
@@ -742,24 +676,16 @@ std::string MQClientInstance::popAckAddrFor(const std::string& topic,
     std::string addr = findBrokerAddressInPublish(des);
     if (addr.empty()) {
         updateTopicRouteInfoFromNameServer(topic, 5000, false);
-        // Java 在路由刷新之后重新解析 —— 刷新后的映射可能把这个逻辑队列搬到了
-        // 新 broker 上。
         des = resolveDes();
         addr = findBrokerAddressInPublish(des);
     }
     if (addr.empty()) {
-        // Java DefaultMQPushConsumerImpl:771 的报错原文（ack 只要主）。
         throw MQClientException("Broker[" + des + "] master node does not exist", -1);
     }
     return addr;
 }
 
 std::string MQClientInstance::consumerOffsetAddr(const MessageQueue& mq) {
-    // Java `RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241` 的地址口径：
-    // 先**只认主**（findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)）→ 查不到
-    // 按 topic 刷一次路由 → 重查时**放宽**（onlyThisBroker=false，可以落到从节点：位点是
-    // HA 复制来的同一份数据，Java 允许从从节点读）→ 仍没有才抛「The broker[X] not exist」。
-    //
     // 与 publishAddrInAdmin 的差别只在最后那一步：管理侧的 offset 查询一律打主、主没了就
     // 报错；位点读取允许退到从节点。
     std::string addr = findBrokerAddressInPublish(mq.brokerName);
@@ -806,13 +732,7 @@ std::vector<std::string> MQClientInstance::getAllBrokerAddrs() {
     return addrs;
 }
 
-// ---------------------------------------------------------------- 消息发送
-// 建请求 / 解析应答 / 发送三件事分开，是为了让异步发送能跨重试复用同一个请求对象
-// （Java MQClientAPIImpl#onExceptionImpl 只换 opaque，不换队列也不重建头）。
-// 请求属性里的重试次数抬进请求头（Java sendKernelImpl:1004-1018）
 namespace {
-// Java 侧属性值是字符串，抬进请求头时走 Integer.valueOf。这里遇到非法值按「没带这个
-// 属性」处理（返回 nullopt）而不是抛：建头在发送线程上，一个坏属性不该把整次发送打断。
 std::optional<int32_t> propertyAsInt(const Message& msg, const char* key) {
     const std::string value = msg.getProperty(key);
     if (value.empty()) {
@@ -839,8 +759,6 @@ RemotingCommand MQClientInstance::buildSendRequest(const std::string& producerGr
     auto header = std::make_shared<SendMessageRequestHeaderV2>();
     header->producerGroup = producerGroup;
     header->topic = msg.topic;
-    // c/d 来自生产者配置（Java sendKernelImpl:996-997），空/未传才是 Java 默认值。
-    // ⚠ 0 是 defaultTopicQueueNums 的合法值，不能拿「等于默认值」当「没传」。
     header->defaultTopic = (createTopicKey && !createTopicKey->empty())
                                ? createTopicKey
                                : std::optional<std::string>(MixAll::DEFAULT_TOPIC);
@@ -853,20 +771,7 @@ RemotingCommand MQClientInstance::buildSendRequest(const std::string& producerGr
     header->properties = messagePropertiesToString(msg.properties);
     header->reconsumeTimes = 0;
     header->unitMode = unitMode;
-    // Java `sendKernelImpl:1003-1018`：只有发往 %RETRY% 且消息带 MAX_RECONSUME_TIMES
-    // 属性时才设这个字段。客户端版本 ≥ V3_4_9 后 broker 无条件采信它
-    // （`AbstractSendMessageProcessor:172-179`），固定发 0 会让重试消息直接进 %DLQ%。
     header->maxReconsumeTimes = std::nullopt;
-    // Java sendKernelImpl:1004-1018：发往 %RETRY% 时把这两个属性「抬进」请求头。
-    // broker 判死信（SendMessageProcessor handleRetryAndDLQ:197-210）读的是
-    // requestHeader.reconsumeTimes / maxReconsumeTimes，**不是**报文里的属性；不抬的话
-    // 它退回订阅组默认的 retryMaxTimes(16)，客户端配的 maxReconsumeTimes 形同虚设，
-    // 而这条静默差别只有在真机上数死信条数才看得出来。
-    // ⚠ 必须放在上面的 header->properties 序列化**之后**：线上属性里 RECONSUME_TIME
-    //    仍然保留（Java 也是先 setProperties 再 clearProperty），消费端要靠它还原次数。
-    // 有意偏离 Java：Java 抬完 clearProperty 改本地对象，本端口 buildSendRequest 收的是
-    // const Message&，不回写。线上报文完全一致，而两个调用方（顺序/并发回投）发出去的都是
-    // 一次性 newMsg，本地清不清都无人再读。
     if (MixAll::isRetryTopic(msg.topic)) {
         const std::optional<int32_t> reconsumeTimes =
             propertyAsInt(msg, MessageConst::PROPERTY_RECONSUME_TIME);
@@ -876,10 +781,6 @@ RemotingCommand MQClientInstance::buildSendRequest(const std::string& producerGr
         header->maxReconsumeTimes = propertyAsInt(msg, MessageConst::PROPERTY_MAX_RECONSUME_TIMES);
     }
     header->batch = msg.isBatch;
-    // Java `sendKernelImpl:1007` `requestHeader.setBrokerName(brokerName)` —— V2 的键是
-    // 单字母 `n`（`SendMessageRequestHeaderV2:69`，`encode()` 用 writeIfNotNull）。
-    // 值就是路由选中的那台 broker 的名字，所以跟着 mq 走：异步链跨重试复用同一个请求时，
-    // 它保持第一次建头时的值（Java 同样只建一次）。
     header->brokerName =
         mq.brokerName.empty() ? std::nullopt : std::optional<std::string>(mq.brokerName);
 
@@ -907,14 +808,6 @@ SendResult MQClientInstance::parseSendResponse(const RemotingCommand& response, 
     respHeader.fromExtFields(response.extFields);
     SendResult result;
     result.sendStatus = status;
-    // msgId 对齐 Java processSendResponse:785-793：客户端 UNIQ_KEY；批量消息取的是**批量自身**
-    // 那条消息的 ID（inner-batch 时 broker 把它原样回在 batchUniqId 里，客户端没带 ID 时用它兜底）。
-    // ⚠ 有意偏离 Java：Java 在**非** inner-batch（普通 topic 上的客户端批量）时把 msgId 换成
-    // 「逐条子消息 UNIQ_KEY 的逗号串」，本端口不跟随 —— Message 不是多态类型（见 message.h
-    // 的 isBatch 注释：没有虚函数、RTTI 不可用），这里拿不到子消息列表；而且四种语言要能互相
-    // 比对，Python/Rust/C# 同样取批量自身的 ID。真正要紧的那一半已经对齐：每条子消息的
-    // UNIQ_KEY 在编码前就写好（sendBatchKernel），broker 拆开后消费端与轨迹看到的逐条 ID
-    // 和 Java 一致。
     const std::string clientUniqId =
         msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
     result.msgId = !clientUniqId.empty()
@@ -925,10 +818,7 @@ SendResult MQClientInstance::parseSendResponse(const RemotingCommand& response, 
                                        respHeader.queueId.value_or(mq.queueId));
     result.queueOffset = respHeader.queueOffset.value_or(0);
     result.transactionId = respHeader.transactionId.value_or("");
-    // 定时/延迟消息才有；普通消息恒为 nullopt（对齐 Java processSendResponse:798）。
     result.recallHandle = respHeader.recallHandle;
-    // MSG_REGION / TRACE_ON 来自响应头 extFields（对齐 Java processSendResponse）。
-    // 缺省 region=DefaultRegion，traceOn=true（Java: !"false".equals(TRACE_ON)）。
     auto regionIt = response.extFields.find(MessageConst::PROPERTY_MSG_REGION);
     std::string region = (regionIt != response.extFields.end()) ? regionIt->second : std::string();
     result.regionId = region.empty() ? std::string(TraceConstants::DEFAULT_TRACE_REGION_ID) : region;
@@ -944,8 +834,6 @@ SendResult MQClientInstance::sendMessage(const std::string& producerGroup, const
                                         int32_t sysFlag, bool unitMode,
                                         const std::optional<std::string>& createTopicKey,
                                         const std::optional<int32_t>& defaultTopicQueueNums) {
-    // Java `sendKernelImpl:919-924`：发送走**发布地址**（只认 master），不是
-    // brokerAddr(mq) 那条「主优先、没主退任意一台」的宽容口径。
     const std::string addr = publishAddrFor(mq.brokerName, mq.topic);
     RemotingCommand request =
         buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode, createTopicKey,
@@ -959,11 +847,6 @@ void MQClientInstance::sendMessageAsync(const std::string& addr, RemotingCommand
                                        int32_t timeoutMillis,
                                        std::function<void(const SendResult&, const InvokeError&)>
                                            onComplete) {
-    // 解析异常必须转成 error 交给回调，不能抛到读线程/清理线程上去（那里没有 catch）。
-    // kind=RESPONSE_FAILED 表示"响应已经到达、只是处理失败"（broker 回了失败码，或响应体
-    // 解不出来）。Java 的 operationSucceed 用一个 catch(Exception) 同时兜住这两种
-    // （``MQClientAPIImpl:669-673``），走 onExceptionImpl(needRetry=false) —— 既不重试也
-    // 不换 broker，所以这里**所有**解析异常都归同一个类型，别按异常子类去区分。
     remotingClient_->invokeAsync(
         addr, request,
         [onComplete, msg, mq](const RemotingCommand& response, const InvokeError& error) {
@@ -974,8 +857,6 @@ void MQClientInstance::sendMessageAsync(const std::string& addr, RemotingCommand
             try {
                 onComplete(parseSendResponse(response, msg, mq), InvokeError());
             } catch (const MQBrokerException& e) {
-                // 带上 broker 那个码：回调里要还原成 MQBrokerException(code, msg)，
-                // 调用方按码分流（Java 的 processSendResponse 抛的就是它）。
                 onComplete(SendResult(), InvokeError(InvokeError::Kind::RESPONSE_FAILED,
                                                      e.what(), e.responseCode));
             } catch (const std::exception& e) {
@@ -992,10 +873,6 @@ void MQClientInstance::sendMessageAsync(const std::string& addr, RemotingCommand
 std::string MQClientInstance::recallMessage(const std::string& addr,
                                             const RecallMessageRequestHeader& header,
                                             int32_t timeoutMillis) {
-    // 对应 Java MQClientAPIImpl#recallMessage(:3749-3767)：只有 SUCCESS 才读响应头的
-    // msgId（= 被撤回那条消息的 UNIQ_KEY，broker 的 RecallMessageProcessor 直接回填
-    // handle.messageId），其余码原样抛 MQBrokerException 让调用方看到 ILLEGAL_OPERATION
-    // 之类的真实原因。
     RemotingCommand request = RemotingCommand::createRequestCommand(
         RequestCode::RECALL_MESSAGE, std::make_shared<RecallMessageRequestHeader>(header));
     RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
@@ -1013,8 +890,6 @@ void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const
                                         int32_t sysFlag, bool unitMode,
                                         const std::optional<std::string>& createTopicKey,
                                         const std::optional<int32_t>& defaultTopicQueueNums) {
-    // Java `sendKernelImpl:919-924`：发送走**发布地址**（只认 master），不是
-    // brokerAddr(mq) 那条「主优先、没主退任意一台」的宽容口径。
     const std::string addr = publishAddrFor(mq.brokerName, mq.topic);
     (void)timeoutMillis;
 
@@ -1040,9 +915,6 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
         if (!brokerId.has_value()) {
             addr = brokerAddr(mq);
         } else {
-            // 对应 Java pullKernelImpl:197-205 的
-            // findBrokerAddressInSubscribe(brokerName, recalculatePullFromWhichNode(mq), false)：
-            // 按 brokerId 选主/从，而不是 findBrokerAddrInRoute 的「有 master 就用 master」。
             auto route = getTopicRouteData(mq.topic);
             if (route == nullptr) {
                 throw MQClientNoRouteException(mq.topic);
@@ -1064,7 +936,6 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
             }
             addr = chosen;
             if (slave) {
-                // Java pullKernelImpl:219-221：从节点上位点提交没有意义，清 COMMIT_OFFSET 位
                 sysFlag = PullSysFlag::clearCommitOffsetFlag(sysFlag);
             }
         }
@@ -1079,10 +950,6 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
     header->sysFlag = sysFlag;
     header->commitOffset = commitOffset;
     header->suspendTimeoutMillis = suspendTimeoutMillis;
-    // Java `pullKernelImpl` 写的是 subExpression，push 侧未开 postSubscriptionWhenPull
-    // （或类过滤模式）时它是 null，makeCustomHeaderToNet 跳过 null 字段 —— 于是
-    // `subscription` 键根本不进 extFields。这里按 SUBSCRIPTION 位还原该形状
-    // （broker 也只在该位置位时才读它）。
     header->subscription =
         PullSysFlag::hasSubscriptionFlag(sysFlag) ? std::optional<std::string>(subscription)
                                                   : std::nullopt;
@@ -1091,9 +958,6 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
     header->maxMsgBytes = maxMsgBytes;
     header->requestSource = requestSource;
 
-    // Java MQClientAPIImpl#pullMessage:816-820：lite pull 位决定请求码
-    // LITE_PULL_MESSAGE(361) vs PULL_MESSAGE(11)；broker 用 361 走独立线程池
-    // 并被 litePullMessageEnable 开关单独管辖（PullMessageProcessor:325）
     const int32_t code = PullSysFlag::hasLitePullFlag(sysFlag) ? RequestCode::LITE_PULL_MESSAGE
                                                                : RequestCode::PULL_MESSAGE;
     RemotingCommand request = RemotingCommand::createRequestCommand(code, header);
@@ -1127,10 +991,6 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
 
 // 给 POP 出来的消息反构 POP_CK 与 1ST_POP_TIME。
 //
-// **这是 POP 最容易踩的坑**：普通 topic 直连 POP 时 broker **不写** POP_CK 属性
-// （只在 retry topic 重编码路径才写），必须由客户端用响应头的 startOffsetInfo /
-// msgOffsetInfo 反构 —— 没有它就无法发 ACK。逐条对齐 Java
-// MQClientAPIImpl.processPopResponse。
 //
 // 注意调用时机：必须在**改写消息 topic 之前**调用，因为 retryFlag 是从消息的
 // 原始 topic 推出来的（broker 可能改写 topic）。
@@ -1144,8 +1004,6 @@ void MQClientInstance::stampPopCk(std::vector<MessageExt>& msgs, const std::stri
     const std::string startOffsetInfo = respHeader.startOffsetInfo.value_or("");
     const std::string msgOffsetInfo = respHeader.msgOffsetInfo.value_or("");
 
-    // Java 的查表 key：消息已带 POP_CK（= retry 消息）时 retryFlag 取自 POP_CK 第 5 段，
-    // 否则由消息 topic 推断。
     auto queueMapKey = [](const MessageExt& m) -> std::string {
         auto it = m.properties.find(MessageConst::PROPERTY_POP_CK);
         if (it != m.properties.end() && !it->second.empty()) {
@@ -1155,8 +1013,6 @@ void MQClientInstance::stampPopCk(std::vector<MessageExt>& msgs, const std::stri
     };
 
     if (startOffsetInfo.empty()) {
-        // Java 的 startOffsetInfo == null 分支：用消息自身 queueOffset 当 ckQueueOffset
-        // 拼 7 段，再手工补一段凑成 8 段。
         std::map<std::string, std::string> perQueue;
         for (MessageExt& m : msgs) {
             std::string key = m.topic + std::to_string(m.queueId);
@@ -1173,8 +1029,6 @@ void MQClientInstance::stampPopCk(std::vector<MessageExt>& msgs, const std::stri
         auto startMap = parseStartOffsetInfo(startOffsetInfo);
         auto msgMap = parseMsgOffsetInfo(msgOffsetInfo);
 
-        // Java 先按队列收集 queueOffset 并排序，再用 indexOf 求下标去取
-        // msgOffsetInfo 里对应的 msgQueueOffset。
         std::map<std::string, std::vector<int64_t>> sortedOffsets;
         for (const MessageExt& m : msgs) {
             sortedOffsets[queueMapKey(m)].push_back(m.queueOffset);
@@ -1216,7 +1070,6 @@ void MQClientInstance::stampPopCk(std::vector<MessageExt>& msgs, const std::stri
         }
     }
 
-    // Java 用 computeIfAbsent：只在缺失时补。
     for (MessageExt& m : msgs) {
         if (m.properties.find(MessageConst::PROPERTY_FIRST_POP_TIME) == m.properties.end()) {
             m.properties[MessageConst::PROPERTY_FIRST_POP_TIME] = std::to_string(popTime);
@@ -1283,7 +1136,6 @@ PopResult MQClientInstance::popMessage(const std::string& consumerGroup, const s
         result.msgFoundList = decodeMessages(response.body);
         stampPopCk(result.msgFoundList, brokerName, respHeader);
     }
-    // Java processPopResponse 收尾：统一盖 brokerName，并把 topic 还原成请求的 topic
     for (MessageExt& m : result.msgFoundList) {
         m.brokerName = brokerName;
         m.topic = topic;
@@ -1297,10 +1149,8 @@ int32_t MQClientInstance::ackMessage(const std::string& consumerGroup, const std
                                      const std::string& addrIn) {
     std::string brokerName = brokerNameIn;
     if (brokerName.empty() && !extraInfo.empty()) {
-        // 与 Java 一致：从 CK 串第 6 段取 brokerName（ACK 是靠它找地址的）
         brokerName = extra_info::getBrokerName(extra_info::split(extraInfo));
     }
-    // 静态主题的 mock broker 名在这里经端点表重写（Java ackAsync 的只要主 + 重写）。
     const std::string addr = popAckAddrFor(topic, brokerName, queueId, addrIn);
 
     auto header = std::make_shared<AckMessageRequestHeader>();
@@ -1348,8 +1198,6 @@ ChangeInvisibleTimeResult MQClientInstance::changeInvisibleTime(
     result.invisibleTime = respHeader.invisibleTime.value_or(0);
     result.reviveQid = respHeader.reviveQid.value_or(0);
     if (response.code == ResponseCode::SUCCESS) {
-        // 与 Java MQClientAPIImpl.changeInvisibleTimeAsync 一致：用**响应里的**新值
-        // 重建 8 段 extraInfo，供后续 ACK 使用。
         result.extraInfo = extra_info::buildExtraInfo(offset, result.popTime, result.invisibleTime,
                                                       result.reviveQid, topic, brokerName, queueId,
                                                       offset);
@@ -1367,9 +1215,7 @@ bool MQClientInstance::queryConsumerOffset(const std::string& consumerGroup,
     header->consumerGroup = consumerGroup;
     header->topic = mq.topic;
     header->queueId = mq.queueId;
-    // setZeroIfNotFound 在 Java 里是 header 字段
     auto request = RemotingCommand::createRequestCommand(RequestCode::QUERY_CONSUMER_OFFSET, header);
-    // QueryConsumerOffsetRequestHeader 无该字段时，Java 会把未找到当错误；这里按需附加
     if (setZeroIfNotFound) {
         request.extFields["setZeroIfNotFound"] = "true";
     }
@@ -1402,8 +1248,6 @@ void MQClientInstance::updateConsumerOffset(const std::string& consumerGroup,
 // ---------------------------------------------------------------- 队列锁（顺序消费）
 namespace {
 
-// LockBatchRequestBody：{"consumerGroup":..,"clientId":..,"mqSet":[{"topic":..,
-// "brokerName":..,"queueId":..}]}（对齐 Java LockBatchRequestBody）
 JsonValue buildMqSetJson(const std::vector<MessageQueue>& mqs) {
     JsonValue arr = JsonValue::makeArray();
     for (const MessageQueue& mq : mqs) {
@@ -1423,16 +1267,11 @@ std::vector<MessageQueue> MQClientInstance::lockBatchMq(const std::string& consu
                                                        const std::vector<MessageQueue>& mqs,
                                                        int32_t timeoutMillis) {
     std::vector<MessageQueue> lockOk;
-    // 按 broker 分组（Java 按 brokerName 逐个发请求）
     std::map<std::string, std::vector<MessageQueue>> byBroker;
     for (const MessageQueue& mq : mqs) {
         byBroker[mq.brokerName].push_back(mq);
     }
     for (const auto& kv : byBroker) {
-        // Java RebalanceImpl#lock:153 / lockAll:195 走
-        // findBrokerAddressInSubscribe(brokerName, MASTER_ID, true) —— 只认主、**不刷路由**，
-        // 拿不到就整台跳过（队列这一轮锁不上，等下一次重投）。退到从节点上锁等于锁在
-        // broker 侧的锁管理器里，master 不知情，顺序消费的互斥保证静默失效。
         std::string addr = findBrokerAddressInPublish(kv.first);
         if (addr.empty()) {
             continue;
@@ -1481,7 +1320,6 @@ void MQClientInstance::unlockBatchMq(const std::string& consumerGroup,
         byBroker[mq.brokerName].push_back(mq);
     }
     for (const auto& kv : byBroker) {
-        // 同 lockBatchMq：Java RebalanceImpl#unlock:74 / unlockAll:104 只认主、不刷路由。
         std::string addr = findBrokerAddressInPublish(kv.first);
         if (addr.empty()) {
             continue;
@@ -1501,7 +1339,6 @@ void MQClientInstance::unlockBatchMq(const std::string& consumerGroup,
 
 int64_t MQClientInstance::getMaxOffset(const MessageQueue& mq, int32_t timeoutMillis,
                                       const std::string& addrIn) {
-    // Java MQAdminImpl:195/214/232/250 的 offset 查询一律打主（见 publishAddrInAdmin）。
     std::string addr = addrIn.empty() ? publishAddrInAdmin(mq) : addrIn;
     auto header = std::make_shared<GetMaxOffsetRequestHeader>();
     header->topic = mq.topic;
@@ -1517,7 +1354,6 @@ int64_t MQClientInstance::getMaxOffset(const MessageQueue& mq, int32_t timeoutMi
 
 int64_t MQClientInstance::getMinOffset(const MessageQueue& mq, int32_t timeoutMillis,
                                       const std::string& addrIn) {
-    // 同 getMaxOffset：Java 的管理类 offset 查询只认主。
     std::string addr = addrIn.empty() ? publishAddrInAdmin(mq) : addrIn;
     auto header = std::make_shared<GetMinOffsetRequestHeader>();
     header->topic = mq.topic;
@@ -1534,7 +1370,6 @@ int64_t MQClientInstance::getMinOffset(const MessageQueue& mq, int32_t timeoutMi
 int64_t MQClientInstance::searchOffsetByTimestamp(const MessageQueue& mq, int64_t timestamp,
                                                  int32_t timeoutMillis,
                                                  const std::string& addrIn) {
-    // Java MQClientAPIImpl:1377 → :1381 把 LOWER 转给带边界类型的重载。
     return searchOffsetByBoundary(mq, timestamp, BoundaryType::LOWER, timeoutMillis, addrIn);
 }
 
@@ -1542,7 +1377,6 @@ int64_t MQClientInstance::searchOffsetByBoundary(const MessageQueue& mq, int64_t
                                                 const std::optional<BoundaryType>& boundaryType,
                                                 int32_t timeoutMillis,
                                                 const std::string& addrIn) {
-    // 同 getMaxOffset：Java 的管理类 offset 查询只认主。
     std::string addr = addrIn.empty() ? publishAddrInAdmin(mq) : addrIn;
     auto header = std::make_shared<SearchOffsetRequestHeader>();
     header->topic = mq.topic;
@@ -1585,8 +1419,6 @@ bool MQClientInstance::queryMessage(const std::string& topic, const std::string&
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::QUERY_MESSAGE, header);
     if (uniqKey) {
-        // Java MixAll.UNIQUE_MSG_QUERY_FLAG："_UNIQUE_KEY_QUERY"="true"。
-        // 注意它是 extFields 的**键名**，不是标志位（早期实现写成数字键是错的）。
         request.extFields[MixAll::UNIQUE_MSG_QUERY_FLAG] = "true";
     }
     RemotingCommand response = invokeSyncOnAddr(addr, request, timeoutMillis);
@@ -1601,9 +1433,6 @@ bool MQClientInstance::queryMessage(const std::string& topic, const std::string&
 std::vector<MessageExt> MQClientInstance::queryMessageAllBrokers(
     const std::string& topic, const std::string& key, int32_t maxNum, int64_t beginTimestamp,
     int64_t endTimestamp, const std::string& indexType, bool uniqKey, int32_t timeoutMillis) {
-    // 对应 Java MQAdminImpl.queryMessage：查该 topic **所有** broker 并合并去重后的消息。
-    // Java 还会做客户端侧二次校验（uniqKey 命中要求 msgId == key；普通 key 命中要求
-    // message.keys 拆分后含 key 且 topic 相同），这里保持一致。
     std::vector<MessageExt> messages;
     auto route = getTopicRouteData(topic);
     if (route == nullptr) {
@@ -1674,9 +1503,6 @@ void MQClientInstance::unregisterClient(const std::string& addr, const std::stri
                                        const std::string& consumerGroup, int32_t timeoutMillis) {
     auto header = std::make_shared<UnregisterClientRequestHeader>();
     header->clientId = clientId;
-    // 空着的那个槽位 Java 传的是 null，字段根本不上线；broker ClientManageProcessor:228/237
-    // 判的是 `group != null`，空串会被当成「真有个空组名」去查 "" 的订阅组配置。
-    // 纯空白同理：合法组名不可能全是空白（Validators 那一关过不去）。
     header->producerGroup = UtilAll::isBlank(producerGroup)
         ? std::nullopt
         : std::optional<std::string>(producerGroup);
@@ -1733,10 +1559,6 @@ void MQClientInstance::createTopicInBroker(const std::string& brokerAddr,
     header->readQueueNums = readQueueNums;
     header->writeQueueNums = writeQueueNums;
     header->perm = perm;
-    // ⚠ 必须下发 topicFilterType：broker 的 CreateTopicRequestHeader.checkFields()
-    // 会把它转成枚举，为空直接报 "topicFilterType = [null] value invalid"。
-    // attributes 必须是 ""（Java AttributeParser.parseToString(空 map) 的结果）而非 null。
-    // 这两条都是先在 Python 侧被真实 broker 打回、再回填到 C++ 的。
     header->topicFilterType = topicFilterType;
     header->topicSysFlag = topicSysFlag;
     header->order = false;
@@ -1745,7 +1567,6 @@ void MQClientInstance::createTopicInBroker(const std::string& brokerAddr,
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::UPDATE_AND_CREATE_TOPIC, header);
 
-    // Java MQAdminImpl.createTopic 对每个 broker 重试 5 次（连接抖动容忍）
     std::string lastError;
     int attempts = retryTimes > 0 ? retryTimes : 1;
     for (int i = 0; i < attempts; ++i) {
@@ -1869,10 +1690,6 @@ GetConsumerListByGroupResponseBody MQClientInstance::getConsumerListByGroup(
 
 std::vector<std::string> MQClientInstance::getConsumerIdListByGroup(
     const std::string& topic, const std::string& consumerGroup, int32_t timeoutMillis) {
-    // 取该 topic 路由里的 master broker 发 GET_CONSUMER_LIST_BY_GROUP(38)：
-    // 所有客户端都会向集群内每台 broker 心跳注册，故任取一台即持有完整消费者列表。
-    // 查不到（无路由 / 非 SUCCESS / 异常）返回空 vector；调用方按 Java 语义「保留当前分配」，
-    // 不要回退成"自己独占全部队列"（那会让多实例互相重复消费）。
     std::string addr;
     {
         auto route = getTopicRouteData(topic);
@@ -1899,10 +1716,6 @@ void MQClientInstance::unregisterClientAllBrokers(const std::string& clientId,
                                                  const std::string& producerGroup,
                                                  const std::string& consumerGroup,
                                                  int32_t timeoutMillis) {
-    // 向所有已知 broker 注销本 clientId（对应 Java MQClientInstance.unregisterClient）：
-    // 生产者/消费者 shutdown 时逐台 broker 发 UNREGISTER_CLIENT(35)。不发的话 broker 端
-    // Consumer/ProducerManager 只能等心跳超时（默认 ~120s）清理，期间事务回查、消费者
-    // 变更通知仍可能发往已退出的实例。单台失败只记 debug——shutdown 路径不应因网络抖动抛异常。
     for (const std::string& addr : getAllBrokerAddrs()) {
         try {
             unregisterClient(addr, clientId, producerGroup, consumerGroup, timeoutMillis);
@@ -1914,8 +1727,6 @@ void MQClientInstance::unregisterClientAllBrokers(const std::string& clientId,
 
 // ---------------------------------------------------------------- CHECK_CLIENT_CONFIG(46)
 std::string MQClientInstance::findBrokerAddrByTopic(const std::string& topic) {
-    // Java MQClientInstance#findBrokerAddrByTopic:1390 —— 只读缓存（不像 getTopicRouteData
-    // 那样补拉路由），随机挑一个 BrokerData 再取它的 master 优先地址。
     std::shared_ptr<TopicRouteData> route;
     {
         std::lock_guard<std::recursive_mutex> lk(routeLock_);
@@ -1935,9 +1746,6 @@ void MQClientInstance::checkClientConfig(const std::string& brokerAddr,
                                          const std::string& clientId,
                                          const SubscriptionData& subscriptionData,
                                          int32_t timeoutMillis) {
-    // Java MQClientAPIImpl#checkClientInBroker:3256：请求头 null、body 是
-    // CheckClientRequestBody 的 JSON；非 SUCCESS 用响应码抛 MQClientException
-    // （而不是 checkResponseCode 的 MQBrokerException），调用方才能区分 SUBSCRIPTION_PARSE_FAILED。
     RemotingCommand request =
         RemotingCommand::createRequestCommand(RequestCode::CHECK_CLIENT_CONFIG, nullptr);
     CheckClientRequestBody body;
@@ -1955,7 +1763,6 @@ void MQClientInstance::checkClientConfig(const std::string& brokerAddr,
 void MQClientInstance::checkSubscriptionsInBroker(const std::string& group,
                                                   const std::vector<SubscriptionData>& subs) {
     for (const SubscriptionData& sub : subs) {
-        // Java ExpressionType.isTagType：null / "" / "TAG" 都算 TAG，一律跳过。
         if (sub.expressionType.empty() || sub.expressionType == ExpressionType::TAG) continue;
         const std::string addr = findBrokerAddrByTopic(sub.topic);
         if (addr.empty()) continue;  // 查不到路由 → 跳过，不报错
@@ -1964,9 +1771,6 @@ void MQClientInstance::checkSubscriptionsInBroker(const std::string& group,
         } catch (const MQClientException&) {
             throw;  // 已带 broker 响应码，原样上抛
         } catch (const std::exception& e) {
-            // 连不上/超时也当启动失败：Java 抛的是同一段文案的 MQClientException（cause 里
-            // 挂原异常，本端口的 MQClientException 没有 cause 字段，所以只记进日志），
-            // 由调用方（consumer.start）收拾。老 broker 不认 46 码时就落在这里。
             logger_warn("checkClientConfig failed, addr=" + addr + ": " + e.what());
             throw MQClientException(
                 std::string("Check client in broker error, maybe because you use ")
