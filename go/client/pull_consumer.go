@@ -44,6 +44,7 @@ package client
 
 import (
 	"fmt"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -584,6 +585,31 @@ func (c *DefaultMQPullConsumer) Start() error {
 
 // checkConfigLocked runs the fixed check list — same order, same wording.
 // Must be called with c.mu held.
+// initPullAsyncExecutors builds the two pools PullAsync runs on (the
+// pullAsyncPool / pullCallbackPool fields). Mirrors the producer's async send
+// executors: built in Start, torn down in Shutdown, so a consumer that never
+// starts owns no live goroutine pools and Shutdown leaves nothing running.
+func (c *DefaultMQPullConsumer) initPullAsyncExecutors() {
+	workers := runtime.NumCPU()
+	if workers < 1 {
+		workers = 1
+	}
+	c.pullAsyncPool.Store(newBoundedPool("PullAsyncExecutor", workers, 1<<16))
+	c.pullCallbackPool.Store(newBoundedPool("PullCallbackExecutor", workers, 1<<16))
+}
+
+// destroyPullAsyncExecutors drains both pools (ExecutorService.shutdown
+// semantics: stop accepting, let queued tasks finish). Must be called WITHOUT
+// c.mu held — draining waits for in-flight tasks that take c.mu themselves.
+func (c *DefaultMQPullConsumer) destroyPullAsyncExecutors() {
+	if pool := c.pullAsyncPool.Swap(nil); pool != nil {
+		pool.Shutdown()
+	}
+	if pool := c.pullCallbackPool.Swap(nil); pool != nil {
+		pool.Shutdown()
+	}
+}
+
 func (c *DefaultMQPullConsumer) checkConfigLocked() error {
 	if err := common.CheckGroup(c.consumerGroup); err != nil {
 		return err

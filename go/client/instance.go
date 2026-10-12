@@ -17,7 +17,6 @@
 //   - the scheduled tasks with scheduleAtFixedRate anchoring (task n
 //     fires at initialDelay + (n-1)*period, never initialDelay + period).
 package client
-package client
 
 import (
 	"fmt"

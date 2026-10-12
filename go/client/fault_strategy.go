@@ -202,25 +202,29 @@ func (l *latencyFaultToleranceImpl) updateFaultItem(name string, currentLatency,
 }
 
 // isAvailable / isReachable both answer TRUE for an unknown broker (Java: a
-// broker that never failed is available and reachable).
+// broker that never failed is available and reachable). The item's fields are
+// read under the table lock: the detector loop writes reachableFlag /
+// startTimestamp from its own goroutine, so an unlocked read would race.
 func (l *latencyFaultToleranceImpl) isAvailable(name string) bool {
 	l.mu.Lock()
 	item, ok := l.items[name]
-	l.mu.Unlock()
+	available := true
 	if ok {
-		return item.isAvailable()
+		available = float64(time.Now().UnixMilli()) >= item.startTimestamp
 	}
-	return true
+	l.mu.Unlock()
+	return available
 }
 
 func (l *latencyFaultToleranceImpl) isReachable(name string) bool {
 	l.mu.Lock()
 	item, ok := l.items[name]
-	l.mu.Unlock()
+	reachable := true
 	if ok {
-		return item.isReachable()
+		reachable = item.reachableFlag
 	}
-	return true
+	l.mu.Unlock()
+	return reachable
 }
 
 func (l *latencyFaultToleranceImpl) remove(name string) {

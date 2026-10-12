@@ -61,7 +61,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/zhaohai666-rocketmq-client-remoting/go/common"
+	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
 )
 
 // Schedule-service defaults (Java MQPullConsumerScheduleService /
@@ -577,7 +577,7 @@ func (s *MQPullConsumerScheduleService) putTask(topic string, queues []common.Me
 			continue
 		}
 		if _, ok := set[mq]; !ok {
-			task.cancel()
+			task.cancelTask()
 			delete(s.tasks, mq)
 		}
 	}
@@ -593,9 +593,9 @@ func (s *MQPullConsumerScheduleService) putTask(topic string, queues []common.Me
 	s.mu.Unlock()
 }
 
-// cancel is Java setCancelled(true) + the table removal, plus a closed
+// cancelTask is Java setCancelled(true) + the table removal, plus a closed
 // channel so a task sleeping between rounds notices immediately.
-func (t *pullQueueTask) cancel() {
+func (t *pullQueueTask) cancelTask() {
 	t.cancelled.Store(true)
 	t.cancelOnce.Do(func() { close(t.cancel) })
 }
@@ -823,7 +823,7 @@ func (s *MQPullConsumerScheduleService) Shutdown() {
 	// the process — same bound the push consumer's drain uses).
 	s.mu.Lock()
 	for mq, task := range s.tasks {
-		task.cancel()
+		task.cancelTask()
 		delete(s.tasks, mq)
 	}
 	s.mu.Unlock()

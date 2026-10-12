@@ -100,16 +100,16 @@ type consumerBroker struct {
 	// assignmentsByTopic keys the canned 400 answer by requested topic; a
 	// topic with no entry gets the "success, no set" default (which the
 	// client reads as Java's null = keep current).
-	queryAssignments []*remoting.QueryAssignmentRequestBody
+	queryAssignments   []*remoting.QueryAssignmentRequestBody
 	assignmentsByTopic map[string]*assignmentFixture
 }
 
 func newConsumerBroker() *consumerBroker {
 	return &consumerBroker{
-		msgs:      map[mqKey][]*common.MessageExt{},
-		maxOffset: map[mqKey]int64{},
-		minOffset: map[mqKey]int64{},
-		committed: map[string]int64{},
+		msgs:               map[mqKey][]*common.MessageExt{},
+		maxOffset:          map[mqKey]int64{},
+		minOffset:          map[mqKey]int64{},
+		committed:          map[string]int64{},
 		assignmentsByTopic: map[string]*assignmentFixture{},
 	}
 }
