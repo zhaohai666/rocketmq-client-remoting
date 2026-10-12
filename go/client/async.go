@@ -238,6 +238,10 @@ func (p *DefaultMQProducer) SendAsync(msg *common.Message, callback SendCallback
 // attempt separately: one Stopwatch starts at `beginStartTime`
 // and every retry spends from that same remainder.
 func (p *DefaultMQProducer) SendAsyncWithTimeout(msg *common.Message, callback SendCallback, timeoutMillis int64) error {
+	if acc := p.accumulator(); acc != nil {
+		acc.SendAsync(msg, callback, p)
+		return nil
+	}
 	return p.dispatchAsync(&asyncRequest{msg: msg, callback: callback, timeout: timeoutMillis})
 }
 
@@ -247,6 +251,10 @@ func (p *DefaultMQProducer) SendAsyncToQueue(msg *common.Message, mq common.Mess
 }
 
 func (p *DefaultMQProducer) SendAsyncToQueueWithTimeout(msg *common.Message, mq common.MessageQueue, callback SendCallback, timeoutMillis int64) error {
+	if acc := p.accumulator(); acc != nil {
+		acc.SendAsyncWithMq(msg, mq, callback, p)
+		return nil
+	}
 	return p.dispatchAsync(&asyncRequest{msg: msg, mq: &mq, callback: callback, timeout: timeoutMillis})
 }
 

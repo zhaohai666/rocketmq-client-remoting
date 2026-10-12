@@ -451,6 +451,16 @@ type DefaultMQProducer struct {
 	// detectorRunning drives the fault-avoidance reachability probe goroutine
 	// (fault_detector.go); started by Start, stopped by Shutdown.
 	detectorRunning atomic.Bool
+
+	// ---- auto-batch send (ProduceAccumulator) ----
+	// autoBatch is a pre-Start config flag; autoBatchReady + accumulatorPtr are
+	// published by Start once the accumulator is live and read lock-free on every
+	// send (the hot path must not take p.mu).
+	autoBatch       bool
+	batchMaxDelayMs int64
+	batchMaxBytes   int64
+	autoBatchReady  atomic.Bool
+	accumulatorPtr  atomic.Pointer[ProduceAccumulator]
 }
 
 // NewDefaultMQProducer validates the group and applies the SDK defaults.
@@ -752,6 +762,18 @@ func (p *DefaultMQProducer) startLocked() (bool, error) {
 	// a producer which never starts never owns two live goroutine pools; the
 	// mirror image is destroyAsyncExecutors in Shutdown.
 	p.initAsyncExecutors()
+	if p.autoBatch {
+		acc := NewProduceAccumulator(p.clientID)
+		if p.batchMaxDelayMs > 0 {
+			_ = acc.BatchMaxDelayMs(p.batchMaxDelayMs)
+		}
+		if p.batchMaxBytes > 0 {
+			_ = acc.BatchMaxBytes(p.batchMaxBytes)
+		}
+		acc.Start()
+		p.accumulatorPtr.Store(acc)
+		p.autoBatchReady.Store(true)
+	}
 	p.mqClient = inst
 	p.started = true
 	p.heartbeatRunning.Store(true)
@@ -810,6 +832,12 @@ func (p *DefaultMQProducer) Shutdown() {
 	// Java DefaultMQProducerImpl.shutdown():318 stops the detector executor
 	// alongside the heartbeat loop.
 	p.stopDetector()
+	// Stop the auto-batch guard before the transport goes away so no flush
+	// races an unregistered client.
+	if acc := p.accumulatorPtr.Load(); acc != nil {
+		p.autoBatchReady.Store(false)
+		acc.Shutdown()
+	}
 	if p.mqClient != nil {
 		// Graceful unregister (UNREGISTER_CLIENT = 35) per broker BEFORE the
 		// transport goes away: the broker's ProducerManager state is per broker,
@@ -1464,12 +1492,19 @@ func (p *DefaultMQProducer) SendWithTimeout(msg *common.Message, timeoutMillis i
 	if msg == nil {
 		return nil, common.ClientError("the message is null")
 	}
-	// The send kernel's finally semantics restore the caller's message: the
-	// body goes back to the pre-compression one and the topic loses the
-	// namespace prefix. Skipping it breaks callers that reuse the same Message:
-	// the in-place compression would compress an already-compressed stream on
-	// the next send (zlib(zlib(x))), and the caller would keep seeing the
-	// rewritten `ns%topic`.
+	if acc := p.accumulator(); acc != nil {
+		return acc.Send(msg, p)
+	}
+	return p.sendDirectWithTimeout(msg, timeoutMillis)
+}
+
+// sendDirectWithTimeout is the non-batched sync send (the classic SendWithTimeout
+// body). The send kernel's finally semantics restore the caller's message: the
+// body goes back to the pre-compression one and the topic loses the namespace
+// prefix. Skipping it breaks callers that reuse the same Message: the in-place
+// compression would compress an already-compressed stream on the next send
+// (zlib(zlib(x))), and the caller would keep seeing the rewritten `ns%topic`.
+func (p *DefaultMQProducer) sendDirectWithTimeout(msg *common.Message, timeoutMillis int64) (*SendResult, error) {
 	prevBody := msg.Body
 	defer func() {
 		msg.Body = prevBody
@@ -1493,6 +1528,13 @@ func (p *DefaultMQProducer) sendToQueueWithTimeout(msg *common.Message, mq commo
 	if msg == nil {
 		return nil, common.ClientError("the message is null")
 	}
+	if acc := p.accumulator(); acc != nil {
+		return acc.SendWithMq(msg, mq, p)
+	}
+	return p.sendDirectToQueueWithTimeout(msg, mq, timeoutMillis)
+}
+
+func (p *DefaultMQProducer) sendDirectToQueueWithTimeout(msg *common.Message, mq common.MessageQueue, timeoutMillis int64) (*SendResult, error) {
 	prevBody := msg.Body
 	defer func() {
 		msg.Body = prevBody
@@ -1584,6 +1626,153 @@ func (p *DefaultMQProducer) sendBatch(messages []*common.Message, pinned *common
 		return nil, common.ClientError("no message queue for publish info")
 	}
 	return p.sendAttempt(batch.Message, true, selected, sysFlag, timeoutMillis, CommunicationModeSync)
+}
+
+// sendAccumulatorBatch assembles the accumulated messages into ONE MessageBatch
+// carrying the AggregateKey's tag and (sync-collected) keys, then sends it as a
+// batch. It mirrors sendBatch but takes the batch-level tag/keys the accumulator
+// owns, so a batch is never split across topics/tags on the wire. Sub-message
+// topics are namespaced for the encode and restored afterwards so callers may
+// reuse their Message objects.
+func (p *DefaultMQProducer) sendAccumulatorBatch(messages []*common.Message, tag string, hasTag bool,
+	keys map[string]struct{}, pinned *common.MessageQueue, timeoutMillis int64) (*SendResult, error) {
+	if _, err := p.requireClient(); err != nil {
+		return nil, err
+	}
+	if len(messages) == 0 {
+		return nil, common.ClientError("message list is empty")
+	}
+	for _, m := range messages {
+		if err := common.CheckMessage(m, p.maxMessageSize); err != nil {
+			return nil, err
+		}
+		common.SetUniqID(m)
+	}
+	prevTopics := make([]string, len(messages))
+	for i, m := range messages {
+		prevTopics[i] = m.Topic
+		m.Topic = p.withNamespace(m.Topic)
+	}
+	defer func() {
+		for i, m := range messages {
+			m.Topic = prevTopics[i]
+		}
+	}()
+
+	batch, err := common.GenerateFromList(messages)
+	if err != nil {
+		return nil, err
+	}
+	common.SetUniqID(batch.Message)
+	if hasTag {
+		batch.Message.SetTags(tag)
+	}
+	parts := make([]string, 0, len(keys))
+	for k := range keys {
+		parts = append(parts, k)
+	}
+	batch.Message.SetKeys(strings.Join(parts, common.KeySeparator))
+	batch.Message.Body = batch.Encode()
+
+	sysFlag := p.tryToCompressMessage(batch.Message, true)
+	var res *SendResult
+	if pinned != nil {
+		if err := p.checkPinnedTopic(batch.Message.Topic, *pinned, pinnedTopicMismatchSync); err != nil {
+			return nil, err
+		}
+		res, err = p.sendAttempt(batch.Message, true, *pinned, sysFlag, timeoutMillis, CommunicationModeSync)
+	} else {
+		var publish *TopicPublishInfo
+		publish, err = p.topicPublishInfo(batch.Message.Topic)
+		if err != nil {
+			return nil, err
+		}
+		selected, ok, selErr := publish.SelectOneMessageQueue(nil)
+		if selErr != nil {
+			return nil, selErr
+		}
+		if !ok {
+			return nil, common.ClientError("no message queue for publish info")
+		}
+		res, err = p.sendAttempt(batch.Message, true, selected, sysFlag, timeoutMillis, CommunicationModeSync)
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Java MQClientAPIImpl.processSendResponse:786: for a client batch (the
+	// broker echoes no batchUniqId), the reply's msgId is built CLIENT-SIDE as
+	// the comma-joined per-member UNIQ_KEYs — the ProduceAccumulator splits
+	// per-message results from exactly that list. The broker's own (here:
+	// comma-joined per-member offset ids) stays in OffsetMsgID.
+	if len(messages) > 1 {
+		ids := make([]string, 0, len(messages))
+		for _, m := range messages {
+			if u, ok := common.GetUniqID(m); ok {
+				ids = append(ids, u)
+			}
+		}
+		res.MsgID = strings.Join(ids, ",")
+	}
+	return res, nil
+}
+
+// accumulator returns the live ProduceAccumulator, or nil when auto-batching is
+// off or not yet started. Lock-free: the send hot path must not take p.mu.
+func (p *DefaultMQProducer) accumulator() *ProduceAccumulator {
+	if !p.autoBatchReady.Load() {
+		return nil
+	}
+	return p.accumulatorPtr.Load()
+}
+
+// sendDirectWithMq is the direct (non-batched) sync send used as the
+// accumulator's fallback for delayed/retry/gate-full messages.
+func (p *DefaultMQProducer) sendDirectWithMq(msg *common.Message, mq *common.MessageQueue, timeoutMillis int64) (*SendResult, error) {
+	if mq == nil {
+		return p.sendDirectWithTimeout(msg, timeoutMillis)
+	}
+	return p.sendDirectToQueueWithTimeout(msg, *mq, timeoutMillis)
+}
+
+// sendAsyncDirect is the direct (non-batched) async send used as the
+// accumulator's fallback; it dispatches straight to the async kernel, bypassing
+// the accumulator (no recursion).
+func (p *DefaultMQProducer) sendAsyncDirect(msg *common.Message, mq *common.MessageQueue, callback SendCallback, timeoutMillis int64) {
+	req := &asyncRequest{msg: msg, callback: callback, timeout: timeoutMillis}
+	if mq != nil {
+		m := *mq
+		req.mq = &m
+	}
+	_ = p.dispatchAsync(req)
+}
+
+// SetAutoBatch enables/disables ProduceAccumulator auto-batching. Call before Start.
+func (p *DefaultMQProducer) SetAutoBatch(enable bool) {
+	p.mu.Lock()
+	p.autoBatch = enable
+	p.mu.Unlock()
+}
+
+// SetBatchMaxDelayMs sets the per-batch hold time in ms (1..30000). Call before Start.
+func (p *DefaultMQProducer) SetBatchMaxDelayMs(ms int64) error {
+	if ms <= 0 || ms > 30*1000 {
+		return common.ClientError("batchMaxDelayMs expect between 1ms and 30s, but get " + itoa64(ms) + "!")
+	}
+	p.mu.Lock()
+	p.batchMaxDelayMs = ms
+	p.mu.Unlock()
+	return nil
+}
+
+// SetBatchMaxBytes sets the per-batch byte threshold (1..2MB). Call before Start.
+func (p *DefaultMQProducer) SetBatchMaxBytes(n int64) error {
+	if n <= 0 || n > 2*1024*1024 {
+		return common.ClientError("batchMaxBytes expect between 1B and 2MB, but get " + itoa64(n) + "!")
+	}
+	p.mu.Lock()
+	p.batchMaxBytes = n
+	p.mu.Unlock()
+	return nil
 }
 
 // SendOneway fires and forgets. There is no response, so the
