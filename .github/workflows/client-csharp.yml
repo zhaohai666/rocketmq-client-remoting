@@ -1,0 +1,28 @@
+name: client-csharp
+
+on:
+  push:
+    paths:
+      - 'csharp/**'
+      - '.github/workflows/client-csharp.yml'
+  pull_request:
+    paths:
+      - 'csharp/**'
+      - '.github/workflows/client-csharp.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Run offline test suite
+        run: dotnet test csharp/tests/RocketMQ.Client.Tests/RocketMQ.Client.Tests.csproj -c Release

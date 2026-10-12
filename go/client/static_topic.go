@@ -1,23 +1,3 @@
-// Static topic (unitized topic) routing support, ported from the Java client:
-//   - org.apache.rocketmq.remoting.rpc.ClientMetadata
-//     .topicRouteData2EndpointsForStaticTopic
-//   - org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingUtils
-//     .getMockBrokerName
-//   - org.apache.rocketmq.client.impl.factory.MQClientInstance
-//     .getBrokerNameFromMessageQueue (see Instance.GetBrokerNameFromMessageQueue)
-//
-// Wire facts (do NOT "simplify"):
-//   - The route decodes topicQueueMappingByBroker as an opaque
-//     []MappingEntry (broker -> Info json object). The typed view is parsed
-//     HERE, not in the protocol layer, so the pass-through stays untouched.
-//   - TopicQueueMappingInfo.scope defaults to MixAll.METADATA_SCOPE_GLOBAL
-//     ("__global__"); the mock broker name for the global scope strips the
-//     leading "__" ("__syslo__global__").
-//   - Java's maxTotalNumOfEpoch is read but never reassigned (stays -1), so
-//     the `epoch >= maxTotalNumOfEpoch` guard is always true and maxTotalNums
-//     is simply the max totalQueues of the scope — quirk kept.
-//   - A later equal-epoch entry OVERWRITES an earlier one (Java
-//     `oldEpoch <= epoch`).
 package client
 
 import (
@@ -26,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
+	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
 // MixAll.METADATA_SCOPE_GLOBAL / LOGICAL_QUEUE_MOCK_BROKER_PREFIX /
@@ -49,9 +30,6 @@ func getMockBrokerName(scope string) string {
 	return logicalQueueMockBrokerPrefix + scope
 }
 
-// topicQueueMappingInfo is the typed view of one
-// topicQueueMappingByBroker[brokerName] entry (Java
-// TopicQueueMappingInfo).
 type topicQueueMappingInfo struct {
 	scope       string
 	totalQueues int
@@ -60,9 +38,32 @@ type topicQueueMappingInfo struct {
 	currIDMap   map[int]int
 }
 
-// parseTopicQueueMappingInfo reads the typed view out of the raw json object
-// the route decoder kept opaque. Malformed entries are dropped (ok=false) —
-// Java would NPE on them; a salvageable partial mapping beats a crash.
+// jsonInt accepts every numeric representation our decoder can produce:
+// ParseJSON yields remoting.JSONNumber on the wire path, while hand-built
+// fixtures (unit tests, Encode→decode round-trips) carry float64.
+func jsonInt(v any) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case remoting.JSONNumber:
+		i, err := n.Int64()
+		if err != nil {
+			f, ferr := n.Float64()
+			if ferr != nil {
+				return 0, false
+			}
+			return int64(f), true
+		}
+		return i, true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	default:
+		return 0, false
+	}
+}
+
 func parseTopicQueueMappingInfo(raw any) (topicQueueMappingInfo, bool) {
 	obj, ok := raw.(map[string]any)
 	if !ok {
@@ -72,14 +73,14 @@ func parseTopicQueueMappingInfo(raw any) (topicQueueMappingInfo, bool) {
 	if s, ok := obj["scope"].(string); ok {
 		info.scope = s
 	}
-	if n, ok := obj["totalQueues"].(float64); ok {
+	if n, ok := jsonInt(obj["totalQueues"]); ok {
 		info.totalQueues = int(n)
 	}
 	if s, ok := obj["bname"].(string); ok {
 		info.bname = s
 	}
-	if n, ok := obj["epoch"].(float64); ok {
-		info.epoch = int64(n)
+	if n, ok := jsonInt(obj["epoch"]); ok {
+		info.epoch = n
 	}
 	if m, ok := obj["currIdMap"].(map[string]any); ok {
 		info.currIDMap = make(map[int]int, len(m))
@@ -88,7 +89,7 @@ func parseTopicQueueMappingInfo(raw any) (topicQueueMappingInfo, bool) {
 			if err != nil {
 				continue
 			}
-			phys, ok := v.(float64)
+			phys, ok := jsonInt(v)
 			if !ok {
 				continue
 			}
@@ -107,8 +108,6 @@ func topicRouteData2EndpointsForStaticTopic(topic string, route *TopicRouteData)
 		return nil
 	}
 
-	// group the infos by scope (entries WITHOUT a scope do not participate,
-	// as in Java).
 	infosByScope := map[string]map[string]topicQueueMappingInfo{}
 	for _, entry := range route.TopicQueueMappingByBroker {
 		info, ok := parseTopicQueueMappingInfo(entry.Info)
@@ -123,10 +122,6 @@ func topicRouteData2EndpointsForStaticTopic(topic string, route *TopicRouteData)
 
 	endpoints := map[common.MessageQueue]string{}
 	for scope, infos := range infosByScope {
-		// epoch-desc with a deterministic (broker asc) tie-break. Java sorts
-		// epoch-desc over a ConcurrentHashMap's entry set, so its equal-epoch
-		// overwrite order is unspecified there anyway; pinning broker-asc
-		// makes the result reproducible.
 		names := make([]string, 0, len(infos))
 		for name := range infos {
 			names = append(names, name)
@@ -145,7 +140,7 @@ func topicRouteData2EndpointsForStaticTopic(topic string, route *TopicRouteData)
 		})
 
 		maxTotalNums := 0
-		maxTotalNumOfEpoch := int64(-1) // Java never updates this — guard always true
+		maxTotalNumOfEpoch := int64(-1)
 		mqEndPoints := map[common.MessageQueue]topicQueueMappingInfo{}
 		for _, ni := range ordered {
 			if ni.info.epoch >= maxTotalNumOfEpoch && ni.info.totalQueues > maxTotalNums {

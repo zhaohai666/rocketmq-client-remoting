@@ -57,6 +57,7 @@ internal static class Program
                 "unit-config" => LiveUnitConfig.Run(rest),
                 "send-header" => LiveSendHeader.Run(rest),
                 "sql92" => LiveSql92.Run(rest),
+                "static-topic-live" => LiveStaticTopic.Run(rest),
                 "unreg-live" => ProducerUnregisterLive.Run(rest),
                 "fail-fast" => LiveFailFast.Run(rest),
                 "scheduled-intervals" => LiveScheduledIntervals.Run(rest),
@@ -118,6 +119,7 @@ internal static class Program
               unit-config [namesrv]      真实集群 unitName/unitMode/stream 联调（clientId 后缀、topic UNIT 位、%RETRY% UNIT_SUB 位）
               send-header [namesrv]      真实集群发送头 c/d/n 联调（模板 topic 决定自动建出来的队列数、五种入口逐条落地）
               sql92      [namesrv]        真实集群 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 联调（需 broker 开 enablePropertyFilter）
+              static-topic-live [namesrv] 真实集群静态主题联调（513 createStaticTopic + 端点集推导 + 实例重写 + 收发）
               unreg-live [namesrv]        真实集群退出注销联调（UNREGISTER_CLIENT(35) 抓帧 + 204 前后对照 + 对照组）
               fail-fast  [namesrv]        broker 真死时在途请求立刻判死（Java failFast）联调（会重启 broker）
               scheduled-intervals [namesrv] 真实集群周期任务联调（路由刷新周期 1s/30s、位点落盘周期 1s/60s 真机计时）

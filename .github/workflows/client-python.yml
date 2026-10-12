@@ -1,0 +1,33 @@
+name: client-python
+
+on:
+  push:
+    paths:
+      - 'python/**'
+      - '.github/workflows/client-python.yml'
+  pull_request:
+    paths:
+      - 'python/**'
+      - '.github/workflows/client-python.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 运行时零第三方依赖；测试门禁需要 pytest，压缩夹具需要 lz4 / xxhash。
+      - name: Install test dependencies
+        run: pip install pytest lz4 xxhash
+
+      - name: Run offline test suite
+        working-directory: python
+        run: python -m pytest tests/ -q --basetemp="${{ runner.temp }}/rmq-py-tests"

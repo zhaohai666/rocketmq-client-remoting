@@ -42,6 +42,10 @@ target_link_libraries(rmq_live_tls_negative PRIVATE rocketmq::remoting)
 add_executable(rmq_live_pull live_pull.cpp)
 target_link_libraries(rmq_live_pull PRIVATE rocketmq::remoting)
 
+# 静态主题真机腿（七端口径：513 建topic + 端点推导 + 实例重写 + 端到端收发）
+add_executable(rmq_live_static_topic live_static_topic.cpp)
+target_link_libraries(rmq_live_static_topic PRIVATE rocketmq::remoting)
+
 # 轻量拉取消费者（DefaultLitePullConsumer）真机联调：subscribe/assign 双模式 + poll
 add_executable(rmq_live_lite_pull live_lite_pull.cpp)
 target_link_libraries(rmq_live_lite_pull PRIVATE rocketmq::remoting)

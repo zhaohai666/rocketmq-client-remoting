@@ -139,7 +139,6 @@ export class DefaultMQPushConsumer {
   tlsEnable: boolean | null = null;
   // TLS 细项（见 setTlsOptions）；null = test-mode。
   tlsOptions: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null = null;
-  // SOCKS 代理（Java ClientConfig#socksProxyConfig）；null = 直连。
   socksProxyConfig: SocksProxyConfig | null = null;
 
   messageModel: string = MessageModel.CLUSTERING;
@@ -262,9 +261,6 @@ export class DefaultMQPushConsumer {
   setTlsOptions(opts: { caCert?: string; clientCert?: string; clientKey?: string; serverName?: string } | null): this {
     this.tlsOptions = opts; return this;
   }
-  // SOCKS 代理（Java ClientConfig#setSocksProxyConfig）：addr='host:port'，
-  // username/password 可选，version 默认 5、可 4/'SOCKS4'。TCP 建连后、TLS 握手前
-  // 完成 CONNECT；TopAddressing 的 HTTP 寻址不走代理。
   setSocksProxyConfig(config: SocksProxyConfig | null): this { this.socksProxyConfig = config; return this; }
   setMessageModel(model: string): this { this.messageModel = model; return this; }
   setConsumeFromWhere(where: string): this { this.consumeFromWhere = where; return this; }
@@ -426,9 +422,6 @@ export class DefaultMQPushConsumer {
     // (the push consumer leaves the stream flag off).
     this.clientID = MixAll.clientIdFor(this.instanceName);
 
-    // 跨 facade 复用（Java MQClientManager.factoryTable）：同 clientId 的门面共享
-    // 一个实例；配置快照 first-wins（cloneClientConfig 口径），复用方不改写实例的
-    // tls/代理，也不重复注册 rpcHook 链。
     const manager = MQClientManager.getInstance();
     const { instance: client, created } = manager.getOrCreateMQClientInstance(
       this.clientID, () => new MQClient(this.clientID, this.nameServerAddr));
@@ -436,9 +429,6 @@ export class DefaultMQPushConsumer {
       if (this.tlsEnable != null) client.remotingClient.tlsEnable = this.tlsEnable;
       if (this.tlsOptions != null) client.remotingClient.tlsOptions = this.tlsOptions;
       if (this.socksProxyConfig != null) client.remotingClient.socksProxyConfig = this.socksProxyConfig;
-      // Java MQClientAPIImpl:329 — NamespaceRpcHook is the FIRST hook on the
-      // remoting client; a configured namespaceV2 goes out as nsd/ns extFields
-      // on every rpc (route fetch, heartbeat, pull, send-back, offsets).
       registerRpcHooks(client.remotingClient, { namespaceV2: () => this.namespaceV2 });
     }
     manager.registerClient(this.clientID, client);
@@ -1090,12 +1080,19 @@ export class DefaultMQPushConsumer {
       // — not "keep the previous value".
       let brokerId = this.pullFromWhichNode.get(key);
       if (brokerId === undefined) brokerId = MixAll.MASTER_ID;
-      let resolved = this._findBrokerAddressInSubscribe(mq.getBrokerName(), brokerId, false);
+      // 静态主题：地址解析必须走端点重写（Java PullAPIWrapper.pullKernelImpl:
+      // findBrokerAddressInSubscribe(getBrokerNameFromMessageQueue(mq), ...)），
+      // wire header 里的 brokerName 仍保留逻辑（mock）名，由 broker 侧
+      // TopicQueueMappingDetail 做逻辑→物理翻译。测试工程的 duck-typed mock
+      // client 可能没有这个方法——非静态主题的重写结果就是原 broker 名，回退安全。
+      const realBrokerName = typeof client.getBrokerNameFromMessageQueue === 'function'
+        ? client.getBrokerNameFromMessageQueue(mq) : mq.getBrokerName();
+      let resolved = this._findBrokerAddressInSubscribe(realBrokerName, brokerId, false);
       if (!resolved) {
         await client.updateTopicRouteInfoFromNameServer(mq.getTopic(), false).catch(() => {});
-        resolved = this._findBrokerAddressInSubscribe(mq.getBrokerName(), brokerId, false);
+        resolved = this._findBrokerAddressInSubscribe(realBrokerName, brokerId, false);
         if (!resolved) {
-          logger.debug('The broker[%s] not exist', mq.getBrokerName());
+          logger.debug('The broker[%s] not exist', realBrokerName);
           if (await this._sleepOrStop(500, stopFlag)) return;
           continue;
         }
@@ -2105,25 +2102,15 @@ export class DefaultMQPushConsumer {
   // _registerProcessors wires the broker-initiated requests. Handlers run on
   // the remoting read path: set flags / schedule work, NEVER send a synchronous
   // request inline (self-deadlock).
-  //
-  // 登记走实例级多播（registerFacadeProcessor）而不是 remotingClient 直连槽：
-  // 共享 clientId 的多个 consumer 各自往同一 remotingClient 上 registerProcessor
-  // 会互相顶掉（后启动的覆盖先启动的）。多播**广播**给所有登记者；Java
-  // ClientRemotingProcessor 的口径是处理器内部按请求里的组名决定谁干活 ——
-  // 组不匹配的登记者返回 null（oneway 类不触发、应答类不冒充），匹配者给出
-  // 第一个非 null 应答回传输层。
   private _registerProcessors(): void {
     const client = this.mqClient;
     if (!client) return;
-    // 从 extFields 里取组名（两种字段名：consumerGroup / group，Java 各 header 的
-    // 线上字段不一样），与本门面的组（含 namespace 包装后的值）比对。
     const groupOf = (cmd: RemotingCommand): string => {
       const ext = cmd.extFields || {};
       return String(ext['consumerGroup'] != null ? ext['consumerGroup'] : (ext['group'] != null ? ext['group'] : ''));
     };
     const mine = (cmd: RemotingCommand): boolean => {
       const g = groupOf(cmd);
-      // 老 broker 可能不带组名：不带时按 Java 的兜法一样照单处理（单门面行为不变）。
       return g === '' || g === this.consumerGroup;
     };
     const handlers = new Map<number, FacadeProcessor>();

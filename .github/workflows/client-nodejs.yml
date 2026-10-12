@@ -1,0 +1,31 @@
+name: client-nodejs
+
+on:
+  push:
+    paths:
+      - 'nodeJs/**'
+      - '.github/workflows/client-nodejs.yml'
+  pull_request:
+    paths:
+      - 'nodeJs/**'
+      - '.github/workflows/client-nodejs.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 零第三方依赖：node --experimental-strip-types 直跑 TS，selfcheck 覆盖
+      # 全部 53 个模块 + 冒烟用例。
+      - name: Run selfcheck (all modules + smoke tests)
+        working-directory: nodeJs
+        run: node --experimental-strip-types selfcheck.ts

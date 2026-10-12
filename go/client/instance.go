@@ -56,10 +56,7 @@ type ClientInstanceConfig struct {
 	HeartbeatIntervalMillis int64
 	// PersistConsumerOffsetIntervalMillis (default 5s).
 	PersistConsumerOffsetIntervalMillis int64
-	// SocksProxy tunnels every remoting TCP connection through a SOCKS proxy
-	// (Java ClientConfig#socksProxyConfig -> NettyClientConfig). The
-	// address-server HTTP fetch (TopAddressing) is NOT proxied.
-	SocksProxy *remoting.SocksProxyConfig
+	SocksProxy                          *remoting.SocksProxyConfig
 }
 
 // NewClientInstanceConfig returns the classic defaults.
@@ -162,14 +159,9 @@ type Instance struct {
 	nameServerAddrs       []string
 	topicRouteTable       map[string]*TopicRouteData
 	topicPublishInfoTable map[string]*TopicPublishInfo
-	// topicEndPointsTable — for STATIC topics only: MessageQueue(logical,
-	// mock-broker-name, globalId) -> real broker name. Java MQClientInstance
-	// keeps the same table (built from TopicRouteData.topicQueueMapping on
-	// every route refresh) and resolves mock names through
-	// getBrokerNameFromMessageQueue.
-	topicEndPointsTable map[string]map[common.MessageQueue]string
-	brokerAddrTable     map[string]map[int64]string
-	topicsInUse         map[string]struct{}
+	topicEndPointsTable   map[string]map[common.MessageQueue]string
+	brokerAddrTable       map[string]map[int64]string
+	topicsInUse           map[string]struct{}
 
 	started atomic.Bool
 
@@ -923,9 +915,6 @@ func (i *Instance) UpdateTopicRouteInfoFromNameServer(topic string, timeoutMilli
 	}
 	i.mu.Lock()
 	i.topicRouteTable[topic] = route
-	// Static topics: refresh the logical->real broker endpoints (Java builds
-	// topicEndPointsTable in the same route-refresh block). A non-static
-	// route clears a stale entry.
 	if endpoints := topicRouteData2EndpointsForStaticTopic(topic, route); endpoints != nil {
 		i.topicEndPointsTable[topic] = endpoints
 	} else {
@@ -1032,11 +1021,6 @@ func (i *Instance) RouteOf(topic string) *TopicRouteData {
 	return i.topicRouteTable[topic]
 }
 
-// GetBrokerNameFromMessageQueue resolves a static topic's LOGICAL queue
-// (mock broker name "__syslo__<scope>") to the REAL hosting broker name via
-// the topicEndPointsTable (Java MQClientInstance.getBrokerNameFromMessageQueue).
-// Non-static topics — or a queue the table does not know — pass their own
-// broker name through.
 func (i *Instance) GetBrokerNameFromMessageQueue(mq common.MessageQueue) string {
 	i.mu.Lock()
 	endpoints := i.topicEndPointsTable[mq.Topic]
@@ -1047,6 +1031,25 @@ func (i *Instance) GetBrokerNameFromMessageQueue(mq common.MessageQueue) string 
 		}
 	}
 	return mq.BrokerName
+}
+
+// EndPointsOf returns a copy of the static-topic endpoints entry for the
+// topic (nil when the topic has no mapping, i.e. it is not a static topic).
+// Diagnostics/live-tool parity with the other ends: python exposes the client
+// instance, C# exposes Client(), rust exposes mq_client(); this is the Go
+// read-only accessor over topicEndPointsTable.
+func (i *Instance) EndPointsOf(topic string) map[common.MessageQueue]string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	src := i.topicEndPointsTable[topic]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[common.MessageQueue]string, len(src))
+	for mq, bname := range src {
+		out[mq] = bname
+	}
+	return out
 }
 
 // PublishInfoOf reads the cached publish info without any RPC.

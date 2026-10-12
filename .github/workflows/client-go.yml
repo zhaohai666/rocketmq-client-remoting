@@ -1,0 +1,41 @@
+name: client-go
+
+on:
+  push:
+    paths:
+      - 'go/**'
+      - '.github/workflows/client-go.yml'
+  pull_request:
+    paths:
+      - 'go/**'
+      - '.github/workflows/client-go.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: gofmt check (empty output required)
+        working-directory: go
+        run: test -z "$(gofmt -l)"
+
+      - name: go vet
+        working-directory: go
+        run: go vet ./...
+
+      - name: go test (race)
+        working-directory: go
+        run: go test ./... -count=1 -race
+
+      - name: Offline selfcheck
+        working-directory: go
+        run: go run ./examples/selfcheck

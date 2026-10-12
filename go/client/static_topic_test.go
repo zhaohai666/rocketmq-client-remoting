@@ -80,6 +80,53 @@ func TestEndpointsSingleScopeWithUnhostedQueue(t *testing.T) {
 	}
 }
 
+// Regression: on the wire ParseJSON decodes numbers as remoting.JSONNumber,
+// NOT float64 — a hand-built float64 fixture never caught that the typed
+// mapping parse silently dropped every field and produced an empty endpoint
+// set against a real nameserver (found on the live static-topic leg).
+func TestEndpointsFromDecodedWireRoute(t *testing.T) {
+	wire := `{
+	  "orderTopicConf": null,
+	  "queueDatas": [{"brokerName":"broker-a","readQueueNums":4,"writeQueueNums":4,"perm":6,"topicSysFlag":0}],
+	  "brokerDatas": [{"cluster":"DefaultCluster","brokerName":"broker-a","brokerAddrs":{"0":"127.0.0.1:10911"}}],
+	  "topicQueueMappingByBroker": {
+	    "broker-a": {
+	      "topic": "StaticWire",
+	      "scope": "__global__",
+	      "totalQueues": 8,
+	      "bname": "broker-a",
+	      "epoch": 0,
+	      "dirty": false,
+	      "currIdMap": {"0":0,"1":1,"2":2,"3":3},
+	      "hostedQueues": {
+	        "0": [{"gen":0,"queueId":0,"bname":"broker-a","logicOffset":0,"startOffset":0,"endOffset":-1,"timeOfStart":-1,"timeOfEnd":-1}]
+	      }
+	    }
+	  }
+	}`
+	route, err := DecodeTopicRouteData([]byte(wire))
+	if err != nil {
+		t.Fatalf("decode wire route: %v", err)
+	}
+	if len(route.TopicQueueMappingByBroker) != 1 {
+		t.Fatalf("mapping entries = %d, want 1", len(route.TopicQueueMappingByBroker))
+	}
+	endpoints := topicRouteData2EndpointsForStaticTopic("StaticWire", route)
+	if len(endpoints) != 8 {
+		t.Fatalf("endpoints = %d entries, want 8 (JSONNumber fields were dropped?)", len(endpoints))
+	}
+	for id := int32(0); id < 4; id++ {
+		if got := endpoints[common.NewMessageQueue("StaticWire", "__syslo__global__", id)]; got != "broker-a" {
+			t.Errorf("hosted global %d -> %q, want broker-a", id, got)
+		}
+	}
+	for id := int32(4); id < 8; id++ {
+		if got := endpoints[common.NewMessageQueue("StaticWire", "__syslo__global__", id)]; got != "__syslo__none__" {
+			t.Errorf("unhosted global %d -> %q, want the NOT_EXIST sentinel", id, got)
+		}
+	}
+}
+
 func TestEndpointsScopesStayApartAndEpochFences(t *testing.T) {
 	route := mappingRoute(
 		MappingEntry{Broker: "broker-old", Info: rawMapping("__global__", 1, "broker-old", 3, map[string]any{"0": float64(0)})},

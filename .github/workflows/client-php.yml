@@ -1,0 +1,31 @@
+name: client-php
+
+on:
+  push:
+    paths:
+      - 'php/**'
+      - '.github/workflows/client-php.yml'
+  pull_request:
+    paths:
+      - 'php/**'
+      - '.github/workflows/client-php.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: zstd, lz4
+        # 压缩矩阵的 CLI 优先路径在缺扩展时自动走纯实现兜底，扩展缺失不致命。
+
+      - name: Run offline test suite
+        working-directory: php
+        run: php tests/run_all.php

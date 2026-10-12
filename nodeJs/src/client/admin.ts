@@ -219,17 +219,10 @@ export class DefaultMQAdminExt {
     this._makeAdminInstancePidUnique();
     const clientId = MixAll.clientIdFor(this.instanceName, this.unitName, this.enableStreamRequestType);
     const presetRC = this.client != null ? this.client.remotingClient : null;
-    // 跨 facade 复用（Java MQClientManager.factoryTable + adminExtTable 语义）：
-    // 同 clientId 的 admin 与 producer/consumer 共享一个实例 —— 一条到同 broker
-    // 的 RPC 通道、一份路由缓存与后台定时器；引用计数归零才真正 shutdown。
     const manager = MQClientManager.getInstance();
     const { instance: client, created } = manager.getOrCreateMQClientInstance(
       clientId, () => new MQClient(clientId, this.namesrvAddr, presetRC));
     this.client = client;
-    // Java MQClientAPIImpl:329-335 registration order: Namespace -> Stream
-    // (only when enableStreamRequestType) -> user (ACL) hook. The namespace
-    // extFields must be present BEFORE the ACL hook signs the request.
-    // first-wins：hook 链只由创建者注册，复用方不重复挂链（Java 只认创建时那份）。
     if (created) {
       registerRpcHooks(this.client.remotingClient, {
         namespaceV2: () => this.namespaceV2,
@@ -422,26 +415,22 @@ export class DefaultMQAdminExt {
 
   // createAndUpdateTopicConfig sends UPDATE_AND_CREATE_TOPIC(17) to one addr.
   async createAndUpdateTopicConfig(addr: string, config: TopicConfig): Promise<void> {
-    await this._createTopicInBroker(addr, this.createTopicKey, config.topicName,
+    // TopicConfig 的字段名是 topic（topicName 只是 toDict 的 JSON 键）——
+    // 读错字段 header 里 topic=undefined，broker 会回 "specified topic is
+    // blank"（真机静态主题腿抓出来的）。
+    await this._createTopicInBroker(addr, this.createTopicKey, config.topic,
       config.readQueueNums, config.writeQueueNums, config.perm,
       config.topicSysFlag, config.topicFilterType || TopicFilterType.SINGLE_TAG,
       config.order === true, config.attributes != null ? JSON.stringify(config.attributes) : '');
   }
 
-  // createStaticTopic sends UPDATE_AND_CREATE_STATIC_TOPIC(513) to ONE broker
-  // (broker-local operation for unitized deployments, Java
-  // MQClientAPIImpl.createStaticTopic): a CreateTopicRequestHeader-shaped
-  // custom header (topic/defaultTopic/queue nums/perm/topicFilterType/
-  // topicSysFlag/order/force) plus an encoded TopicQueueMappingDetail body.
-  // `topicFilterType` must be carried — see the UPDATE_AND_CREATE_TOPIC(17)
-  // wire fact above, the header validation is shared.
   async createStaticTopic(brokerAddr: string, defaultTopic: string, config: TopicConfig,
     mappingDetail: TopicQueueMappingDetail, force: boolean = false): Promise<void> {
     if (mappingDetail == null) {
       throw new MQClientException('createStaticTopic: mappingDetail must not be null');
     }
     await this._invokeBroker(brokerAddr, RequestCode.UPDATE_AND_CREATE_STATIC_TOPIC, adminExt({
-      topic: config.topicName,
+      topic: config.topic,
       defaultTopic,
       readQueueNums: config.readQueueNums,
       writeQueueNums: config.writeQueueNums,
@@ -1364,16 +1353,30 @@ export class DefaultMQAdminExt {
     return merged;
   }
 
-  // viewMessage sends VIEW_MESSAGE_BY_ID(33) STRAIGHT to the broker
-  // address encoded inside the offset msgId (no route lookup). The body is one
-  // 17-segment stored message.
+  // viewMessage mirrors Java DefaultMQAdminExtImpl#viewMessage: try the
+  // offset-msgId decode first; a client UNIQ_KEY is NOT an offset id and the
+  // decode throws (or yields a bogus port) — Java catches that and falls back
+  // to the U-index query across the route's brokers. Keep the same contract:
+  // never let a uniq key die inside decodeMessageId.
   async viewMessage(topic: string, msgId: string): Promise<MessageExt> {
-    const client = this._requireClient();
-    const { ip, port, offset } = decodeMessageId(msgId);
-    if (port <= 0 || port > 65535) {
-      throw new MQClientException(`not a valid offset msgId: ${msgId}`);
+    let addr = '';
+    let offset = BigInt(0);
+    let offsetIdOk = true;
+    try {
+      const parsed = decodeMessageId(msgId);
+      if (parsed.port <= 0 || parsed.port > 65535) {
+        offsetIdOk = false;
+      } else {
+        addr = `${parsed.ip}:${parsed.port}`;
+        offset = BigInt(parsed.offset);
+      }
+    } catch {
+      offsetIdOk = false;
     }
-    const addr = `${ip}:${port}`;
+    if (!offsetIdOk) {
+      return this.viewMessageByUniqKey(topic, msgId);
+    }
+    const client = this._requireClient();
     const request = this._request(RequestCode.VIEW_MESSAGE_BY_ID, adminExt({
       offset: String(offset),
       topic,
@@ -1385,7 +1388,21 @@ export class DefaultMQAdminExt {
     if (response.body == null || response.body.length === 0) {
       throw new MQClientException(`message not found: ${msgId}`);
     }
-    return decodeMessage(response.body, true, true);
+    const msg = decodeMessage(response.body, true, true);
+    if (msg == null) throw new MQClientException(`message not found: ${msgId}`);
+    return msg;
+  }
+
+  // The uniq-key leg of Java's viewMessage fallback:
+  // MQAdminImpl#queryMessageByUniqKey — U-index query across every broker in
+  // the route, first hit wins, verified against the UNIQ_KEY property so a
+  // stray key collision can't satisfy the lookup.
+  async viewMessageByUniqKey(topic: string, uniqKey: string): Promise<MessageExt> {
+    const result = await this.queryMessageFromRoute(topic, uniqKey, 32, 0, 0, 'U');
+    for (const m of result.messageList) {
+      if (m.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX) === uniqKey) return m;
+    }
+    throw new MQClientException(`message not found by uniq key: ${uniqKey}`);
   }
 
   // consumeMessageDirectly sends CONSUME_MESSAGE_DIRECTLY(309)

@@ -1,27 +1,3 @@
-// The admin methods that were still missing versus
-// org.apache.rocketmq.tools.admin.DefaultMQAdminExtImpl, ported together with
-// the wire behaviour of org.apache.rocketmq.client.impl.MQClientAPIImpl.
-//
-// Wire facts established from the Java sources (do NOT "simplify" them):
-//
-//   - UPDATE_AND_CREATE_TOPIC_LIST(18) sends an EMPTY custom header; the whole
-//     payload is the JSON body {"topicConfigList":[...]}. The Java header
-//     class deliberately declares no fields (topic names are a body-level
-//     resource for the authorization builder).
-//   - UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225) likewise sends an empty
-//     header plus {"groupConfigList":[...]}. Note the field name differs from
-//     the single-group variant, which is a bare SubscriptionGroupConfig object.
-//   - UPDATE_AND_CREATE_STATIC_TOPIC(513) reuses CreateTopicRequestHeader
-//     (topic/defaultTopic/readQueueNums/writeQueueNums/perm/topicFilterType/
-//     topicSysFlag/order/force) and puts an encoded TopicQueueMappingDetail in
-//     the body. It is a broker-local operation for unitized deployments.
-//   - UPDATE_AND_GET_GROUP_FORBIDDEN(353) sends UpdateGroupForbiddenRequestHeader
-//     (group/topic/readable) and decodes a GroupForbidden JSON body.
-//   - RESUME_CHECK_HALF_MESSAGE(323) sends topic/msgId and maps any non-SUCCESS
-//     reply to `false` rather than an error (Java MQClientAPIImpl:3279).
-//   - createOrUpdateOrderConf is NOT a request of its own: it is a
-//     read-modify-write over the nameserver KV namespace ORDER_TOPIC_CONFIG,
-//     where the stored value is ";"-joined "key:value" entries.
 package client
 
 import (
@@ -32,13 +8,8 @@ import (
 	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
-// NamespaceOrderTopicConfig is
-// org.apache.rocketmq.common.namesrv.NamesrvUtil#NAMESPACE_ORDER_TOPIC_CONFIG.
 const NamespaceOrderTopicConfig = "ORDER_TOPIC_CONFIG"
 
-// TopicQueueMappingDetail mirrors
-// org.apache.rocketmq.remoting.protocol.statictopic.TopicQueueMappingDetail —
-// the unitized-topic mapping document carried in a static-topic create.
 type TopicQueueMappingDetail struct {
 	Topic        string
 	Scope        string
@@ -50,8 +21,6 @@ type TopicQueueMappingDetail struct {
 	HostedQueues map[int][]LogicQueueMappingItem
 }
 
-// LogicQueueMappingItem mirrors
-// org.apache.rocketmq.remoting.protocol.statictopic.LogicQueueMappingItem.
 type LogicQueueMappingItem struct {
 	Gen         int32
 	QueueID     int32
@@ -107,8 +76,6 @@ func (d *TopicQueueMappingDetail) Encode() []byte {
 	return remoting.EncodeJSON(d.toJSONValue())
 }
 
-// GroupForbidden mirrors
-// org.apache.rocketmq.remoting.protocol.subscription.GroupForbidden.
 type GroupForbidden struct {
 	Topic    string
 	Group    string
@@ -193,6 +160,13 @@ func (a *DefaultMQAdminExt) CreateStaticTopic(brokerAddr, defaultTopic string,
 	if mapping == nil {
 		return common.ClientError("createStaticTopic: nil TopicQueueMappingDetail")
 	}
+	// Java's TopicConfig defaults perm to PERM_READ|PERM_WRITE; Go's struct
+	// has no zero-value default, and a perm=0 topic is created unwritable AND
+	// unreadable (producers then see zero publish queues). Treat 0 as "unset"
+	// and apply the Java default.
+	if config.Perm == 0 {
+		config.Perm = common.PermRead | common.PermWrite
+	}
 	filterType := config.TopicFilterType
 	if filterType == "" {
 		filterType = remoting.TopicFilterTypeSingleTag
@@ -213,9 +187,6 @@ func (a *DefaultMQAdminExt) CreateStaticTopic(brokerAddr, defaultTopic string,
 	return err
 }
 
-// UpdateAndGetGroupReadForbidden sends UPDATE_AND_GET_GROUP_FORBIDDEN(353) and
-// returns the decoded GroupForbidden. A nil `readable` means "query only",
-// which is what Java sends when the caller does not want to change the flag.
 func (a *DefaultMQAdminExt) UpdateAndGetGroupReadForbidden(brokerAddr, group, topic string,
 	readable *bool) (*GroupForbidden, error) {
 	if group == "" {
@@ -239,13 +210,6 @@ func (a *DefaultMQAdminExt) UpdateAndGetGroupReadForbidden(brokerAddr, group, to
 	return DecodeGroupForbidden(response.Body)
 }
 
-// ResumeCheckHalfMessage sends RESUME_CHECK_HALF_MESSAGE(323) so the broker
-// re-runs the half-message check for one message. Java maps every non-SUCCESS
-// reply to `false` instead of raising (MQClientAPIImpl:3279) — network errors
-// still raise, but a broker-level rejection (e.g. the msgId is not a half
-// message, which surfaces as SYSTEM_ERROR) is reported through the boolean.
-// invokeBroker's checkResponse would turn that rejection into an error, so
-// this inspects the raw reply.
 func (a *DefaultMQAdminExt) ResumeCheckHalfMessage(brokerAddr, topic, msgID string) (bool, error) {
 	if topic == "" {
 		return false, common.ClientError("resumeCheckHalfMessage: topic must not be empty")
@@ -290,13 +254,9 @@ func (a *DefaultMQAdminExt) CreateOrUpdateOrderConf(key, value string, isCluster
 
 	oldValue, _, err := a.GetKVConfig(NamespaceOrderTopicConfig, key)
 	if err != nil {
-		// Java prints and continues with an empty map: a missing key is the
-		// normal first-write case, not a failure.
 		oldValue = ""
 	}
 
-	// entry key -> full "key:value" text, preserving Java's HashMap semantics
-	// (last write for a duplicated key wins).
 	entries := map[string]string{}
 	order := []string{}
 	if strings.TrimSpace(oldValue) != "" {
@@ -378,14 +338,6 @@ func (a *DefaultMQAdminExt) DeleteExpiredCommitLogByAddr(addrs []string, time in
 	return failed
 }
 
-// CleanUnusedTopicByAddr mirrors
-// DefaultMQAdminExtImpl.cleanUnusedTopicByAddr → MQClientAPIImpl:2696: ONE
-// CLEAN_UNUSED_TOPIC(316) request that tells the broker to drop its own unused
-// topics. The client does NOT walk the topic table and delete one by one —
-// that would race the broker's own bookkeeping and trip over the broker-created
-// topics (BenchmarkTest, retry/DLQ topics) the broker refuses to delete
-// (SYSTEM_ERROR "conflict with system topic"). Java raises on non-SUCCESS here,
-// which invokeBroker already does.
 func (a *DefaultMQAdminExt) CleanUnusedTopicByAddr(brokerAddr string) error {
 	_, err := a.invokeBroker(brokerAddr, remoting.ReqCleanUnusedTopic, nil, nil, 0)
 	return err
@@ -393,12 +345,6 @@ func (a *DefaultMQAdminExt) CleanUnusedTopicByAddr(brokerAddr string) error {
 
 // SetMessageRequestMode sends SET_MESSAGE_REQUEST_MODE(401), switching a
 // POP consumer group between POP and pull mode (unitized deployments).
-//
-// Java `MQClientAPIImpl:3304-3311` builds the request with a **null header** and
-// puts all four fields in the body: the broker's `AdminBrokerProcessor` decodes a
-// `SetMessageRequestModeRequestBody` and never reads an ext field, so a header-only
-// request makes it NPE on a null body. Same wire shape as the consumer-side
-// `Instance.SetMessageRequestMode`.
 func (a *DefaultMQAdminExt) SetMessageRequestMode(brokerAddr, topic, consumerGroup string,
 	mode string, popShareQueueNum int32) error {
 	body := (&remoting.SetMessageRequestModeRequestBody{
@@ -410,8 +356,3 @@ func (a *DefaultMQAdminExt) SetMessageRequestMode(brokerAddr, topic, consumerGro
 	_, err := a.invokeBroker(brokerAddr, remoting.ReqSetMessageRequestMode, nil, body, 0)
 	return err
 }
-
-// GetTopicClusterList already lives in admin.go (it delegates to
-// GetClusterList, the client-side derivation Java performs with
-// EXAMINE_BROKER_CLUSTER_INFO(25) + EXAMINE_TOPIC_ROUTE(105) — no request of
-// its own). Nothing to add here.
