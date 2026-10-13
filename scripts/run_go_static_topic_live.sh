@@ -1,5 +1,5 @@
 #!/bin/bash
-# Go 静态主题（513 createStaticTopic + 端点重写）的真机验证：七端口径 S1-S5 的
+# Go 静态主题（513 createStaticTopic + 端点重写）的真机验证：按 S1-S5 的
 # Go 版（对应 python/verify_static_topic_live.py 及其余五端 live_static_topic）。
 #
 # 用法: bash scripts/run_go_static_topic_live.sh [namesrv]  （默认 127.0.0.1:9876）

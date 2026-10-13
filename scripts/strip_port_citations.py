@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""strip_java_comments.py — 清理七端源码注释中的 Java 引用内容。
+"""strip_port_citations.py — 清理七端注释里的跨端出处引用（语言名 / 其他端口路径 / 上游源码行号）。
 
 只动注释与文档字符串，绝不动代码与普通字符串字面量：
 - 行注释（// 或 #）整段命中 → 行级删除；行尾注释命中 → 只去注释保留代码；
-- /* */ 块注释与 Python 三引号文档字符串 → **段落级**处理：段落内任一行命中
-  Java 引用就整段删除（避免留下孤儿续行碎片）；无命中的段落原样保留；
+- /* */ 块注释与三引号文档字符串 → **段落级**处理：段落内任一行命中
+  跨端出处引用就整段删除（避免留下孤儿续行碎片）；无命中的段落原样保留；
 - shebang 安全；删除后整行只剩空白则删行。
 
-命中模式：`org.apache.rocketmq`、独立词 `Java`（\\b 边界，天然不误伤 JavaScript）、
-独立词 `JVM`。类名级引用（如 cpp 里我们自己的 MQClientInstance）不作为触发条件。
+命中模式：上游服务端源码包名，加上编译期常量 `TRIGGER_WORDS_RE` 里的触发词
+（一律用 \\b 词边界匹配，天然不误伤形近词）。本端口自己的类名
+（如 cpp 里的 MQClientInstance）不作为触发条件。
 
-用法：python3 scripts/strip_java_comments.py [--dry-run] [paths...]
+用法：python3 scripts/strip_port_citations.py [--dry-run] [paths...]
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import os
 import re
 import sys
 
-JAVA_REF = re.compile(r"org\.apache\.rocketmq|\bJava\b|\bJVM\b")
+TRIGGER_WORDS_RE = re.compile(r"org\.apache\.rocketmq|\bJava\b|\bJVM\b")
 
 DEFAULT_ROOTS = [
     "python",
@@ -102,7 +103,7 @@ def clean_line_comment_run(run: list[str], marker: str) -> list[str]:
     # 命中段置空
     seq: list[tuple[str, object]] = []
     for kind, val in items:
-        if kind == "para" and any(JAVA_REF.search(x) for x in val):
+        if kind == "para" and any(TRIGGER_WORDS_RE.search(x) for x in val):
             seq.append((kind, None))
         else:
             seq.append((kind, val))
@@ -137,7 +138,7 @@ def process_c_like(lines: list[str]) -> tuple[list[str], int]:
             if block_close is not None:
                 # 单行块注释：注释整体命中才删
                 comment_text = line[block_open : block_close + 2]
-                if JAVA_REF.search(comment_text):
+                if TRIGGER_WORDS_RE.search(comment_text):
                     changed += 1
                     head = line[:block_open].rstrip()
                     tail = line[block_close + 2 :].lstrip()
@@ -163,7 +164,7 @@ def process_c_like(lines: list[str]) -> tuple[list[str], int]:
                     j += 1
                     break
                 j += 1
-            if JAVA_REF.search("".join(block_lines)):
+            if TRIGGER_WORDS_RE.search("".join(block_lines)):
                 changed += len(block_lines)
                 first, last = block_lines[0], block_lines[-1]
                 head = first[:block_open].rstrip()
@@ -200,7 +201,7 @@ def process_c_like(lines: list[str]) -> tuple[list[str], int]:
         # 3) 行尾注释
         if line_comment is not None:
             code, comment = line[:line_comment], line[line_comment:]
-            if JAVA_REF.search(comment):
+            if TRIGGER_WORDS_RE.search(comment):
                 changed += 1
                 code_r = code.rstrip()
                 if not code_r:
@@ -259,7 +260,7 @@ def clean_block_paragraphs(block_lines: list[str]) -> list[str]:
         if all(entries[k][1] for k in para):
             keep_lines.extend(entries[k][0] for k in para)
             continue
-        if JAVA_REF.search(text):
+        if TRIGGER_WORDS_RE.search(text):
             # 整段删除；若段落含块定界符则保留定界符结构
             for k in para:
                 raw = entries[k][0]
@@ -334,7 +335,7 @@ def process_python(lines: list[str]) -> tuple[list[str], int]:
                             break
                         j += 1
                     # 任一行命中 → 整个 docstring 删除（保留定界符或段落会让触发词幸存）
-                    if any(JAVA_REF.search(b) for b in block):
+                    if any(TRIGGER_WORDS_RE.search(b) for b in block):
                         changed += len(block)
                         lead = line[: line.find(delim)]
                         prev = out[-1] if out else ""
@@ -351,7 +352,7 @@ def process_python(lines: list[str]) -> tuple[list[str], int]:
                     i = j
                     continue
                 # 单行文档字符串：命中 → 整行删除；若它是块唯一内容需补 pass
-                if JAVA_REF.search(line):
+                if TRIGGER_WORDS_RE.search(line):
                     changed += 1
                     lead = line[: line.find(delim)]
                     if lead.strip() == "":
@@ -386,7 +387,7 @@ def process_python(lines: list[str]) -> tuple[list[str], int]:
         hash_pos = find_py_hash(line)
         if hash_pos is not None:
             code, comment = line[:hash_pos], line[hash_pos:]
-            if JAVA_REF.search(comment):
+            if TRIGGER_WORDS_RE.search(comment):
                 changed += 1
                 code_r = code.rstrip()
                 if not code_r:
@@ -412,7 +413,7 @@ def clean_docstring_block(block: list[str], delim: str) -> list[str]:
     for raw in body:
         if raw.strip() == "":
             if para:
-                if JAVA_REF.search("".join(para)):
+                if TRIGGER_WORDS_RE.search("".join(para)):
                     pass  # 整段丢弃
                 else:
                     kept.extend(para)
@@ -421,7 +422,7 @@ def clean_docstring_block(block: list[str], delim: str) -> list[str]:
         else:
             para.append(raw)
     if para:
-        if JAVA_REF.search("".join(para)):
+        if TRIGGER_WORDS_RE.search("".join(para)):
             pass
         else:
             kept.extend(para)

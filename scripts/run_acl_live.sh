@@ -1,11 +1,11 @@
 #!/bin/bash
-# ACL 鉴权真机验证（起 namesrv + broker(authenticationEnabled=true) → 跑四端 → 收工）。
+# ACL 鉴权真机验证（起 namesrv + broker(authenticationEnabled=true) → 逐个客户端跑 → 收工）。
 #
 # 用法: bash scripts/run_acl_live.sh [python|rust|csharp|cpp|all ...]   （默认 all）
 #
 # 为什么要有这个脚本：ACL 的假通过太多了 —— broker 没开鉴权时**正向场景照样全绿**，
-# 只有反向场景（无凭据 / 错 secretKey）才戳得穿；而四端的「签名算错」与「没签名」在
-# broker 侧是同一种拒绝。所以四端脚本都成对断言「签名被接受」+「拒绝码必须是 16」，
+# 只有反向场景（无凭据 / 错 secretKey）才戳得穿；而「签名算错」与「没签名」在
+# broker 侧是同一种拒绝。所以每个脚本都成对断言「签名被接受」+「拒绝码必须是 16」，
 # 并且必须打真集群。本脚本负责把集群按 ACL 配置拉起来（本机没有现成的 ACL harness，
 # 仓库里另一份 scripts/rmq_test_broker.sh 是 macOS 的普通配置集群）。
 #
