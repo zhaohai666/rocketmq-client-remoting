@@ -29,12 +29,33 @@ jobs:
       # 失败清单走 ::error:: 打印：Actions 原始日志只有登录后可见，注解是公开可读的。
       - name: Run offline test suite
         working-directory: rust
+        env:
+          RUST_BACKTRACE: 1
         run: |
           set +e
-          cargo test 2>&1 | tee /tmp/cargo.log
-          rc=${PIPESTATUS[0]}
+          # cargo test 没有用例级超时：一条卡住的用例会一路跑到 GitHub 的 6 小时上限，
+          # 既不出结论也不留注解（run 日志要登录才看得到）。整轮给 20 分钟墙钟——本机全量
+          # 约 10 秒，CI 冷缓存编译也在这一档内。到点抓一份卡住进程的线程栈连同日志尾部
+          # 一起打成 ::error::，让"哪条用例卡住"这件事在公开注解里就能看到。
+          timeout -k 60 1200 cargo test > /tmp/cargo.log 2>&1
+          rc=$?
+          if [ "$rc" = "124" ] || [ "$rc" = "137" ]; then
+            echo "::error::cargo test 超过 20 分钟墙钟（本机全量约 10 秒）——下面是卡住时的线程栈"
+            command -v gdb > /dev/null || sudo apt-get install -y gdb > /dev/null 2>&1
+            for pid in $(pgrep -f 'target/debug/deps/'); do
+              echo "--- pid ${pid}: $(tr '\0' ' ' < /proc/${pid}/cmdline | cut -c1-120)"
+              sudo gdb -p "${pid}" -batch -ex 'thread apply all bt' 2>/dev/null | head -80
+            done > /tmp/bt.log 2>&1
+            # 栈为空说明没有可抓的测试进程（卡在编译/链接），日志尾部能区分这两者
+            [ -s /tmp/bt.log ] || echo "::error::没有可抓取的测试进程栈，卡住的可能是编译/链接而不是某条用例"
+            head -60 /tmp/bt.log | while IFS= read -r line; do echo "::error::${line}"; done
+            tail -8 /tmp/cargo.log | while IFS= read -r line; do echo "::error::[cargo.log 尾部] ${line}"; done
+            pkill -9 -f 'target/debug/deps/' > /dev/null 2>&1
+          fi
           grep -E '^(test .* FAILED|error(\[E[0-9]+\])?:|failures:$)' /tmp/cargo.log \
             | head -40 | while IFS= read -r line; do echo "::error::${line}"; done
           sed -n '/^failures:$/,/^test result/p' /tmp/cargo.log | head -40 \
             | while IFS= read -r line; do echo "::error::${line}"; done
+          # 原来这里是 cargo 的直接输出；现在重定向进文件，收尾把结果段贴回步骤日志
+          tail -40 /tmp/cargo.log
           exit $rc
