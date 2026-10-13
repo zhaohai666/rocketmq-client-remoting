@@ -1,5 +1,4 @@
-//! 真机静态主题腿（七端口径的 rust 版，与 `python/verify_static_topic_live.py`
-//! 同场景、逐条同断言）：
+//! 真机静态主题腿（逐条真机断言）：
 //!
 //! S1 createStaticTopic(513)：单 broker，totalQueues=8，物理 4 队列；
 //! S2 路由回读 TopicQueueMappingByBroker；
@@ -342,7 +341,7 @@ async fn main() -> ExitCode {
         &format!("got={got}"),
     );
     consumer.shutdown();
-    let _ = admin.shutdown();
+    admin.shutdown();
 
     let (pass, fail) = tally.result();
     println!("\n=== RESULT pass={pass} fail={fail} ===");

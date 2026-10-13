@@ -251,12 +251,12 @@ fn md5(input: &[u8]) -> [u8; 16] {
 mod tests {
     use super::*;
 
-    /// MD5 摘要的小写十六进制串（只对拍测试用，故不放进生产代码里）。
+    /// MD5 摘要的小写十六进制串（只做测试里的逐字节比对用，故不放进生产代码里）。
     fn md5_hex(input: &[u8]) -> String {
         md5(input).iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// RFC 1321 附录 A 的官方测试向量（另加 `hashlib.md5` 生成的长输入向量）。
+    /// RFC 1321 附录 A 的官方测试向量（另加一条长输入向量）。
     #[test]
     fn md5_matches_the_reference_vectors() {
         assert_eq!(md5_hex(b""), "d41d8cd98f00b204e9800998ecf8427e");
@@ -271,7 +271,7 @@ mod tests {
             md5_hex(b"The quick brown fox jumps over the lazy dog"),
             "9e107d9d372bb6826bd81d3542a419d6"
         );
-        // 跨块 + 正好落在填充边界的几种长度（55/56/57），参考值来自 `hashlib.md5`
+        // 跨块 + 正好落在填充边界的几种长度（55/56/57），参考值按 MD5 定义算出
         for (len, expected) in [
             (55usize, "04364420e25c512fd958a70738aa8f72"),
             (56, "668a72d5ba17f08e62dabcafad6db14b"),
@@ -288,7 +288,7 @@ mod tests {
     fn ring_md5_hash_takes_only_the_first_four_bytes() {
         assert_eq!(Md5Hash.hash(""), 0xd41d_8cd9);
         assert_eq!(Md5Hash.hash("abc"), 0x9001_5098);
-        assert_eq!(Md5Hash.hash("abc") >> 32, 0, "结果必须在 32 位内（Java 是 long）");
+        assert_eq!(Md5Hash.hash("abc") >> 32, 0, "结果必须在 32 位内（只取 4 个字节）");
     }
 
     #[test]

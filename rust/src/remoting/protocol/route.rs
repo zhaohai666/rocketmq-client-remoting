@@ -1,4 +1,4 @@
-//! 移植 `python/remoting/protocol/route.py`：`QueueData` / `BrokerData` /
+//! 路由报文模型：`QueueData` / `BrokerData` /
 //! `TopicRouteData`。这三个类是 nameserver `GET_ROUTE_INFO_BY_TOPIC(105)` 应答的 body，
 //! 也是客户端路由表的全部数据结构。
 //!
@@ -47,7 +47,7 @@ impl QueueData {
         }
     }
 
-    /// 对应 `QueueData.compareTo`（Python 只比 brokerName）。
+    /// 排序比较器：只比 brokerName。
     pub fn compare_to(&self, other: &QueueData) -> Ordering {
         self.broker_name.cmp(&other.broker_name)
     }
@@ -113,7 +113,7 @@ impl BrokerData {
             .map(|(_, addr)| addr.clone())
     }
 
-    /// 对应 `BrokerData.compareTo`（Python 只比 brokerName）。
+    /// 排序比较器：只比 brokerName。
     pub fn compare_to(&self, other: &BrokerData) -> Ordering {
         self.broker_name.cmp(&other.broker_name)
     }
@@ -137,7 +137,7 @@ impl BrokerData {
         let mut addrs = Vec::new();
         for (k, v) in jentries(value, "brokerAddrs")? {
             // 报文里是 `"0"`（或 fastjson2 的裸 `0`，解析后同样是字符串）。
-            // Python 用 `int(k)`，脏键会抛；这里跳过，不让一份可用路由整个作废。
+            // 脏键（解析不出数字）跳过而不是抛错，不让一份可用路由整个作废。
             let id = match k.trim().parse::<i64>() {
                 Ok(id) => id,
                 Err(_) => continue,
@@ -153,7 +153,7 @@ impl BrokerData {
             broker_name: jstring_or(value, "brokerName", ""),
             broker_addrs: addrs,
             zone_name: jstring_or(value, "zoneName", ""),
-            // Python: `d.get("enableActingMaster", False) or False`
+            // enableActingMaster 缺键 / 假值都按 false 读
             enable_acting_master: jboolean(value, "enableActingMaster", false),
         })
     }
@@ -265,7 +265,7 @@ impl TopicRouteData {
                     .collect(),
             ));
         }
-        // Python: `d.get("topicQueueMappingByBroker")` —— 缺键 / null 都是 None，
+        // `topicQueueMappingByBroker`：缺键 / null 都是 None，
         // 显式 `{}` 是 Some(空表)，重新编码时要把键写回去。
         let topic_queue_mapping_by_broker = match jfield(value, "topicQueueMappingByBroker") {
             None => None,
@@ -360,7 +360,7 @@ impl TopicRouteData {
         };
         let sort_queues = |list: &[QueueData]| {
             let mut sorted: Vec<QueueData> = list.to_vec();
-            // 排序键逐项对应 Python 的 `(broker_name, read, write, perm)`；
+            // 排序键逐项是 `(broker_name, read, write, perm)`；
             // topicSysFlag 不参与，避免 broker 只改 sysFlag 就误判成路由变化。
             sorted.sort_by(|a, b| {
                 (
@@ -404,7 +404,7 @@ mod tests {
     use super::*;
     use super::super::serialize::fastjson;
 
-    // 以下字面量由 Python 参考实现（route.py 的 to_dict + json.dumps 紧凑分隔符）打印得到。
+    // 以下字面量是线上记录的紧凑 JSON（无空格分隔符）真值。
 
     const WIRE_QUEUE_DATA: &str =
         r#"{"brokerName":"broker-a","readQueueNums":8,"writeQueueNums":8,"perm":6,"topicSysFlag":0}"#;
@@ -419,7 +419,7 @@ mod tests {
     /// nameserver 真实回包形状：`brokerAddrs` 的键是 fastjson2 裸数字。
     const NS_ROUTE: &str = r#"{"brokerDatas":[{"brokerAddrs":{0:"127.0.0.1:10911"},"brokerName":"broker-a","cluster":"DefaultCluster","enableActingMaster":false,"zoneName":""}],"filterServerTable":{},"queueDatas":[{"brokerName":"broker-a","perm":6,"readQueueNums":8,"topicSysFlag":0,"writeQueueNums":8}],"orderTopicConf":null}"#;
 
-    /// `NS_ROUTE` 解码后按 Python 的键序重新编码的结果（Python 实测）。
+    /// `NS_ROUTE` 解码后按本端键序重新编码的结果（与线上记录一致）。
     const NS_ROUTE_REWRITTEN: &str = r#"{"orderTopicConf":null,"queueDatas":[{"brokerName":"broker-a","readQueueNums":8,"writeQueueNums":8,"perm":6,"topicSysFlag":0}],"brokerDatas":[{"cluster":"DefaultCluster","brokerName":"broker-a","brokerAddrs":{"0":"127.0.0.1:10911"},"zoneName":"","enableActingMaster":false}],"filterServerTable":{}}"#;
 
     const ROUTE_WITH_MAPPING: &str = r#"{"orderTopicConf":"1 2 3","queueDatas":[],"brokerDatas":[],"filterServerTable":{},"topicQueueMappingByBroker":{"broker-a":{"epoch":3,"queueId":0}}}"#;
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn topic_route_mapping_key_is_absent_not_empty() {
-        // Python: None 时整个键不出现；`{}` 时写出 `"topicQueueMappingByBroker":{}`。
+        // 报文里 None 时整个键不出现；`{}` 时写出 `"topicQueueMappingByBroker":{}`。
         let with = TopicRouteData {
             topic_queue_mapping_by_broker: Some(Vec::new()),
             ..Default::default()
@@ -589,7 +589,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        // Python ALL_MQ_READONLY_FILTER == [("T","broker-a",0),("T","broker-a",1)]
+        // 只读队列过滤的期望结果：同 topic / brokerName，brokerId 0 与 1 都保留
         assert_eq!(
             ro.get_all_message_queue("T"),
             vec![
@@ -681,7 +681,7 @@ mod tests {
         zone_only.broker_datas[0].zone_name = "zone-2".to_string();
         assert!(!zone_only.topic_route_data_changed(Some(&trd)));
 
-        // 写队列数变化必须算变化（Python 排序键里有 writeQueueNums）。
+        // 写队列数变化必须算变化（排序键里有 writeQueueNums）。
         let mut write_only = trd.clone_topic_route_data();
         write_only.queue_datas[0].write_queue_nums = 4;
         assert!(write_only.topic_route_data_changed(Some(&trd)));

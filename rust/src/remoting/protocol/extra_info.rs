@@ -401,7 +401,7 @@ pub fn get_queue_offset_map_key(topic: &str, queue_id: i64, queue_offset: i64) -
 mod tests {
     use super::*;
 
-    /// 参考实现 `build_extra_info` 的真实输出（`extra_info.py:142-160`）。
+    /// 额外信息串（空格分隔字段）的线上记录真值。
     const CK_NORMAL: &str = "12345 1700000000000 60000 0 0 broker-a 3";
     const CK_WITH_OFFSET: &str = "12345 1700000000000 60000 0 0 broker-a 3 67890";
     const CK_RETRY_V1: &str = "1 2 3 4 1 broker-a 0";
@@ -520,7 +520,7 @@ mod tests {
         let out = parse_start_offset_info(Some("0 3 0;0 2 1"))
             .unwrap()
             .unwrap();
-        // 参考实现：{"0@3": 0, "0@2": 1}（插入顺序）
+        // 键序按报文出现顺序保留：{"0@3": 0, "0@2": 1}
         assert_eq!(
             out,
             vec![("0@3".to_string(), 0i64), ("0@2".to_string(), 1i64)]
@@ -560,7 +560,7 @@ mod tests {
         let out = parse_msg_offset_info(Some("0 3 0,1,2;1 2 5"))
             .unwrap()
             .unwrap();
-        // 参考实现：{"0@3": [0,1,2], "1@2": [5]}
+        // 顺序按报文原样保留：{"0@3": [0,1,2], "1@2": [5]}
         assert_eq!(
             out,
             vec![

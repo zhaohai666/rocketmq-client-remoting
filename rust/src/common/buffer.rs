@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn decimal_long_matches_python() {
-        // python: write_decimal_long(0) -> 0000000130, (12345) -> 00000005 3132333435
+        // 线上格式：8 位十进制长度前缀 + ASCII 数字，如 0 -> 0000000130
         let vectors = [
             (0i64, "0000000130"),
             (1, "0000000131"),

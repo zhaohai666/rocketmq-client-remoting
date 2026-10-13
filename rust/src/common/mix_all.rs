@@ -1,5 +1,5 @@
-//! `PermName` 在 Python 里放在 `sysflag.py`，Rust 沿用该位置（见
-//! [`crate::common::sysflag::PermName`），此处只做 re-export，避免两处定义漂移。
+//! `PermName` 唯一定义在 [`crate::common::sysflag::PermName`]，此处只做 re-export（见
+//! 下一行），避免两处定义漂移。
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
@@ -181,7 +181,7 @@ impl MixAll {
     }
 
     /// 已知系统 topic（admin 过滤用户 topic 时用；broker 侧真值以
-    /// `GET_SYSTEM_TOPIC_LIST` 返回为准，Python `admin.getUserTopicConfig` 两路都查）。
+    /// `GET_SYSTEM_TOPIC_LIST` 返回为准，用户 topic 过滤走 broker + 本地两路）。
     pub fn system_topic_set() -> &'static [&'static str] {
         &[
             Self::DEFAULT_TOPIC,
@@ -246,7 +246,7 @@ impl MixAll {
         )
     }
 
-    /// 对应 Python `MixAll.get_ip_str`：探测出口 IP，失败回落 `127.0.0.1`。
+    /// 探测本机出口 IP，失败回落 `127.0.0.1`。
     pub fn get_ip_str() -> String {
         util_all::local_ip()
     }
@@ -591,7 +591,7 @@ mod tests {
         assert!(a.starts_with("PID-"));
         let tail = &a["PID-".len()..];
         assert_eq!(tail.len(), 32);
-        // Python 用 uuid4().hex：32 位**小写**十六进制
+        // 后缀固定为 32 位**小写**十六进制（uuid4 hex 形式）
         assert!(tail
             .chars()
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));

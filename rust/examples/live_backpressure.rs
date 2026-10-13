@@ -2,8 +2,8 @@
 //!
 //!
 //!
-//! ⚠ 四条脚本纪律（①②③ 是 Python 那一轮真机联调踩出来的，④ 是 Rust 这一轮踩出来的）：
-//!   ① topic 一律带 stamp —— 四语言**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
+//! ⚠ 四条脚本纪律（都是真机联调踩出来的）：
+//!   ① topic 一律带 stamp —— 多轮**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
 //!   ② 「被拒的发送连请求都没发出去」只能看 broker 侧落库条数（各队列 maxOffset-minOffset 之和），
 //!      光看客户端回调会被「回调报错但请求照样发出去」的实现蒙过去；
 //!   ③ 新建 topic 要等 broker 把 topicConfig 增量注册到 namesrv（秒级到十秒级），所以所有
@@ -88,7 +88,7 @@ impl Checker {
     }
 }
 
-/// 线程安全的回调记录（对应 Python 验证脚本里的 `_Recorder`）。
+/// 线程安全的回调记录。
 #[derive(Default)]
 struct Recorder {
     done: AtomicUsize,
@@ -571,7 +571,7 @@ async fn b2_and_b3_num_gate(ck: &mut Checker, env: &Env) {
         && rejected
             .all_errors_contain("send message tryAcquire semaphoreAsyncNum timeout", 2);
     ck.check(
-        "B2 超限的两笔回调 TooMuchRequest，文案与 Java 逐字一致",
+        "B2 超限的两笔回调 TooMuchRequest，文案逐字匹配",
         both_failed,
         &rejected.summary(),
     );
@@ -788,7 +788,7 @@ async fn b4_size_gate(ck: &mut Checker, env: &Env) {
             2,
         );
     ck.check(
-        "B4 超限的两笔回调 semaphoreAsyncSize timeout，文案与 Java 逐字一致",
+        "B4 超限的两笔回调 semaphoreAsyncSize timeout，文案逐字匹配",
         rejected_ok,
         &second.summary(),
     );

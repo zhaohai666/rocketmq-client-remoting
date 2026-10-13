@@ -5,7 +5,7 @@
 //!
 //!
 //! ⚠ 四条脚本纪律（沿用 `live_backpressure.rs`）：
-//!   ① topic 一律带 stamp —— 四语言**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
+//!   ① topic 一律带 stamp —— 多轮**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
 //!   ② 「被拒的发送连请求都没发出去」只能看 broker 侧落库条数（各队列 maxOffset-minOffset 之和），
 //!      光看客户端回调会被「回调报错但请求照样发出去」的实现蒙过去；
 //!   ③ 新建 topic 要等 broker 把 topicConfig 增量注册到 namesrv（秒级到十秒级），所以所有
@@ -80,7 +80,7 @@ impl Checker {
     }
 }
 
-/// 线程安全的回调记录（对应 Python 验证脚本里的 `_Recorder`）。
+/// 线程安全的回调记录。
 ///
 /// 除了结果本身还记两样东西：终态回调跑在**哪条线程**上（A1 的线程口径）、以及**什么
 /// 时刻**（A6 的「`shutdown()` 不等在途」）。
@@ -459,7 +459,7 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
         &rec.summary(),
     );
     ck.check(
-        "A1 before 钩子不在调用方线程上跑（Java 的 AsyncSenderExecutor_N）",
+        "A1 before 钩子不在调用方线程上跑（异步发送线程池）",
         hook.first_before_thread().is_some_and(|t| t != caller_thread),
         &format!(
             "钩子线程={:?} 调用方线程={caller_thread:?}",
@@ -467,7 +467,7 @@ async fn a1_non_blocking_and_read_back(ck: &mut Checker, env: &Env) {
         ),
     );
     ck.check(
-        "A1 用户回调不在调用方线程上跑（Java 的 NettyClientPublicExecutor_N）",
+        "A1 用户回调不在调用方线程上跑（公共回调线程池）",
         rec.thread_at(0).is_some_and(|t| t != caller_thread),
         &format!(
             "回调线程={:?} 调用方线程={caller_thread:?}",

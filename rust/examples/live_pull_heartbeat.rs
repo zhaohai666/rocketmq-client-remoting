@@ -1,10 +1,6 @@
 //! 拉模式消费者（`DefaultMQPullConsumer`）的心跳必须把消费组注册进 broker（#98）——
 //! 对真实 5.5.1 集群的验证。
 //!
-//! 场景与 `python/verify_pull_consumer_heartbeat_live.py`、`cpp/examples/live_pull_heartbeat.cpp`
-//! 和 `csharp/examples/RocketMQ.Examples/LivePullHeartbeat.cs` 一致（四语言同一套断言）：
-//!
-//!
 //! 为什么必须真机：离线单测只能证明报文形状（`pull_heartbeat_matches_the_java_shape` 等），
 //! 证明不了 broker 的 `ConsumerManager.consumerTable` 真的登记了本组，也证明不了 35 之后
 //! 立刻摘除 —— 这两件事只有真 broker 有。
@@ -194,12 +190,12 @@ async fn run(namesrv: &str, master: &str, slave: Option<&str>) -> Checker {
                 &format!("connections={}", conn.connection_set.len()),
             );
             ck.check(
-                "A2 消费类型是 CONSUME_ACTIVELY（Java DefaultMQPullConsumerImpl:348）",
+                "A2 消费类型是 CONSUME_ACTIVELY",
                 conn.consume_type.as_deref() == Some("CONSUME_ACTIVELY"),
                 &format!("consumeType={:?}", conn.consume_type),
             );
             ck.check(
-                "A2 消费位点是 CONSUME_FROM_LAST_OFFSET（:353）",
+                "A2 消费位点是 CONSUME_FROM_LAST_OFFSET",
                 conn.consume_from_where.as_deref() == Some("CONSUME_FROM_LAST_OFFSET"),
                 &format!("consumeFromWhere={:?}", conn.consume_from_where),
             );

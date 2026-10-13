@@ -8,14 +8,13 @@
 //!
 //! # 给后续 `consumer.rs` 留的接缝（seam）
 //! 本模块**不认识**消息、listener、`MQClientInstance`，也就无需任何消费者侧 trait：
-//! 唯一接缝是 [`ConsumeTask`]（= `Pin<Box<dyn Future<Output = ()> + Send>>`，等价 Python
-//! `submit(fn, *args, **kwargs)` 里的 `(fn, args, kwargs)` 三元组）。消费回调的接缝
+//! 唯一接缝是 [`ConsumeTask`]（= `Pin<Box<dyn Future<Output = ()> + Send>>`，
+//! 一个自包含的异步闭包）。消费回调的接缝
 //! 已在 [`super::result`] 里定义好 ——
 //! [`MessageListenerConcurrently`](super::result::MessageListenerConcurrently) 与
 //! [`MessageListenerOrderly`](super::result::MessageListenerOrderly)，都是 `Send + Sync`
 //! 的对象安全 trait，本模块刻意不重复定义（复用规则）。`consumer.rs` 要写的就是
-//! Python `consumer.py:1396` `self._pop_executor.submit(self._consume_pop_batch, batch, pq, mq)`
-//! 的等价物：
+//! POP 批任务的提交（把 `batch/pq/mq` 装进任务再 `submit`）：
 //!
 //! ```text
 //! executor.submit(Box::pin(async move { consume_pop_batch(listener, client, batch, pq, mq).await }))
@@ -41,13 +40,13 @@ pub const DEFAULT_THREAD_NAME_PREFIX: &str = "rmq-consume";
 
 pub const SHORT_MAX_VALUE: i32 = 32767;
 
-/// 投递给执行器的一个任务，等价 Python `submit(fn, *args, **kwargs)` 的 `(fn, args, kwargs)`。
+/// 投递给执行器的一个任务。
 ///
-/// 这是本模块对外的**唯一接缝**：future 天生惰性，于是「构造」= Python 在 submit 处求实参，
-/// 「执行」= worker 领到任务，两个时点天然分开。用法：`executor.submit(Box::pin(async move { .. }))`。
+/// 这是本模块对外的**唯一接缝**：future 天生惰性，「构造」（求实参）与
+/// 「执行」（worker 领到任务）两个时点天然分开。用法：`executor.submit(Box::pin(async move { .. }))`。
 pub type ConsumeTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-/// 取锁（Python 的 `with self._lock`）。
+/// 取锁。
 ///
 /// 中毒时照用：池子状态只有计数和队列，panic 过的持有者不会留下半致的不变量，
 /// 而让整个消费池彻底失联才是更大的问题。
@@ -55,13 +54,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 池子状态（对应 Python `ConsumeExecutor.__init__` 里那批 `self._xxx` 字段）。
+/// 池子状态：核心/最大并发、任务队列、在编 worker 数等。
 struct State {
     core: i32,
     max: i32,
     queue: VecDeque<ConsumeTask>,
     workers: i32,
-    /// 线程名序号（`self._seq`），名字格式 `<prefix>-<seq>` 与 Python `%s-%d` 一致
+    /// 线程名序号，名字格式 `<prefix>-<seq>`，每次 spawn 递增
     seq: u64,
     /// `self._shutdown`
     shutdown: bool,
@@ -75,7 +74,7 @@ impl State {
         name
     }
 
-    /// 对应 Python `_run` 里的 `self._workers -= 1`（原 `_retire_locked` 的名册摘除见差异 #6）。
+    /// worker 离场扣账（名册摘除的口径见差异 #6）。
     ///
     /// **调用方必须已持锁，且「是否该退出」的判断与本次扣账在同一临界区内**：
     /// 否则两个超编 worker 同时超时会让 core 内的 worker 也被扣掉。
@@ -105,9 +104,9 @@ impl fmt::Debug for State {
 
 struct Inner {
     state: Mutex<State>,
-    /// Python 的 `threading.Condition(self._lock)`：有新任务 / 已关闭时叫醒空闲 worker。
+    /// 条件变量：有新任务 / 已关闭时叫醒空闲 worker。
     work_available: Notify,
-    /// worker 走光时叫醒 [`ConsumeExecutor::await_termination`]（Python 的 `Thread.join`）。
+    /// worker 走光时叫醒 [`ConsumeExecutor::await_termination`]。
     retired: Notify,
     /// `self._handler_exceptions`：被吞掉的任务异常计数。
     handler_exceptions: AtomicUsize,
@@ -117,8 +116,8 @@ struct Inner {
     pinned: Mutex<Option<Handle>>,
 }
 
-/// `Clone` 共享同一个池（内部 `Arc`）：Python 里 consumer 持有的是引用，Rust 侧
-/// `consumer.rs` 直接 clone 给各 POP 循环即可，不要再套一层 `Arc<ConsumeExecutor>`。
+/// `Clone` 共享同一个池（内部 `Arc`）：`consumer.rs`
+/// 直接 clone 给各 POP 循环即可，不要再套一层 `Arc<ConsumeExecutor>`。
 #[derive(Clone)]
 pub struct ConsumeExecutor {
     inner: Arc<Inner>,
@@ -139,8 +138,7 @@ impl fmt::Debug for ConsumeExecutor {
 }
 
 impl ConsumeExecutor {
-    /// 对应 Python `ConsumeExecutor(core, max)`：keep_alive 60s、线程名前缀 `rmq-consume`
-    /// （Python 的两个默认参数）。
+    /// keep_alive 60s、线程名前缀 `rmq-consume`（默认参数）。
     pub fn new(core_pool_size: i32, maximum_pool_size: i32) -> ConsumeExecutor {
         ConsumeExecutor::with_params(
             core_pool_size,
@@ -150,8 +148,7 @@ impl ConsumeExecutor {
         )
     }
 
-    /// 对应 Python `ConsumeExecutor(core, max, keep_alive_seconds=..., thread_name_prefix=...)`
-    /// （POP 路径实际用的形态，见 Python `consumer.py:789`）。
+    /// 显式给全参数的构造（POP 路径实际用的形态）。
     pub fn with_params(
         core_pool_size: i32,
         maximum_pool_size: i32,
@@ -191,8 +188,8 @@ impl ConsumeExecutor {
 
     // ---------------- 对外 API ----------------
 
-    /// 失败只有两种：池已关闭（Python 的 `RuntimeError`，文案一致）、拿不到 tokio
-    /// 运行时（差异 #1，Python 无此约束）。任务本身没有结果，所以 `Ok(())` 只表示「入队了」。
+    /// 失败只有两种：池已关闭（错误文案逐字校验）、拿不到 tokio
+    /// 运行时（差异 #1）。任务本身没有结果，所以 `Ok(())` 只表示「入队了」。
     pub fn submit(&self, task: ConsumeTask) -> Result<()> {
         let handle = self.resolve_handle()?;
         self.submit_with(&handle, task)
@@ -203,7 +200,7 @@ impl ConsumeExecutor {
         let spawn = {
             let mut state = lock(&self.inner.state);
             if state.shutdown {
-                // 文案与 Python `consume_executor.py:67` 逐字一致
+                // 错误文案逐字校验
                 bail!("ConsumeExecutor has been shut down");
             }
             state.queue.push_back(task);
@@ -216,7 +213,7 @@ impl ConsumeExecutor {
         if let Some(name) = spawn {
             spawn_worker(&self.inner, handle, name);
         }
-        // 对应 Python `self._work_available.notify()`（这里是全员唤醒，见差异 #4）
+        // 这里是全员唤醒（见差异 #4）
         self.inner.work_available.notify_waiters();
         Ok(())
     }
@@ -235,7 +232,7 @@ impl ConsumeExecutor {
     /// core 变小时只让超编的空闲 worker 走 keep_alive 退出逻辑（不打断在跑的任务）。
     /// 记账（`workers` 抬升）在返回前就完成，所以 `worker_count()` 立刻可读。
     ///
-    /// `n < 0` 返回 `Err`（Python 的 `ValueError`，文案一致）。
+    /// `n < 0` 返回 `Err`（错误文案逐字校验）。
     pub fn set_core_pool_size(&self, n: i32) -> Result<()> {
         let handle = self.resolve_handle()?;
         self.set_core_pool_size_with(&handle, n)
@@ -244,7 +241,7 @@ impl ConsumeExecutor {
     /// [`ConsumeExecutor::set_core_pool_size`] 的显式句柄版本。
     pub fn set_core_pool_size_with(&self, handle: &Handle, n: i32) -> Result<()> {
         if n < 0 {
-            // 文案与 Python `consume_executor.py:98` 逐字一致
+            // 错误文案逐字校验
             bail!("core pool size must be >= 0");
         }
         let spawned = {
@@ -270,7 +267,7 @@ impl ConsumeExecutor {
         for name in spawned {
             spawn_worker(&self.inner, handle, name);
         }
-        // Python 的 setCorePoolSize 不 notify（新起的线程自己会看队列）；这里补一次唤醒，
+        // setCorePoolSize 本身不 notify（新起的线程自己会看队列）；这里补一次唤醒，
         // 让「core 抬高但被 max 卡住没起新线程」时的空闲 worker 也能立刻来领任务。
         self.inner.work_available.notify_waiters();
         Ok(())
@@ -293,7 +290,7 @@ impl ConsumeExecutor {
         lock(&self.inner.state).queue.len()
     }
 
-    /// 被吞掉的任务异常计数（Python `handler_exception_count`，仅供观测/单测）。
+    /// 被吞掉的任务异常计数（仅供观测/单测）。
     pub fn handler_exception_count(&self) -> usize {
         self.inner.handler_exceptions.load(Ordering::Acquire)
     }
@@ -305,14 +302,14 @@ impl ConsumeExecutor {
             state.shutdown = true;
             first_time
         };
-        // 对应 Python `self._work_available.notify_all()`
+        // 全员唤醒
         self.inner.work_available.notify_waiters();
         if !first_time {
             rmq_debug!("consume executor already shut down, nothing to do");
         }
     }
 
-    /// 等所有 worker 退出（Python `shutdown(wait=True)` 里那段 `Thread.join()`）。
+    /// 等所有 worker 退出。
     pub async fn await_termination(&self) {
         loop {
             // 先登记唤醒凭据再看计数：「最后一个 worker 刚好在此刻退出」不会丢通知
@@ -347,13 +344,13 @@ impl ConsumeExecutor {
     }
 }
 
-/// 对应 Python `_spawn_locked` 的后半段（`threading.Thread(target=_run, daemon=True).start()`）。
+/// 起一个 worker 任务。
 fn spawn_worker(inner: &Arc<Inner>, handle: &Handle, name: String) {
     rmq_debug!("consume executor spawn worker {name}");
     handle.spawn(worker_loop(Arc::clone(inner), handle.clone(), name));
 }
 
-/// 对应 Python `_run`：领任务 → 跑 → 再领，直到该退出。
+/// worker 主循环：领任务 → 跑 → 再领，直到该退出。
 async fn worker_loop(inner: Arc<Inner>, handle: Handle, name: String) {
     rmq_debug!("consume executor worker {name} started");
     loop {
@@ -365,9 +362,9 @@ async fn worker_loop(inner: Arc<Inner>, handle: Handle, name: String) {
     }
 }
 
-/// 对应 Python `_run` 里持锁等待 + `popleft()` 那一段。
+/// 持锁等待 + 队首领取那一步。
 ///
-/// 返回 `None` 表示本 worker 该退出了（等价 `workers -= 1` + `_retire_locked`）。
+/// 返回 `None` 表示本 worker 该退出了（等价 `workers -= 1` + 名册摘除）。
 async fn take_task(inner: &Arc<Inner>, name: &str) -> Option<ConsumeTask> {
     loop {
         // 先登记唤醒凭据、再看队列：`notify_waiters` 只叫醒当时已在等的人
@@ -375,7 +372,7 @@ async fn take_task(inner: &Arc<Inner>, name: &str) -> Option<ConsumeTask> {
         tokio::pin!(notified);
         notified.as_mut().enable();
 
-        // ---- Python: `if self._shutdown and not self._queue: retire` / `task = popleft()` ----
+        // ---- 该退出则退出，否则领取队首任务 ----
         {
             let mut state = lock(&inner.state);
             if state.shutdown && state.queue.is_empty() {
@@ -392,14 +389,14 @@ async fn take_task(inner: &Arc<Inner>, name: &str) -> Option<ConsumeTask> {
             }
         }
 
-        // ---- Python: `self._work_available.wait(timeout=self._keep_alive)` ----
+        // ---- 带超时地等待叫醒（新任务 / 关闭） ----
         let keep_alive = inner.keep_alive;
         if tokio::time::timeout(keep_alive, notified).await.is_ok() {
             // 被新任务 / shutdown 叫醒：回到循环顶重看队列
             continue;
         }
 
-        // ---- Python: 空闲超时，只有超编线程（> core）才退出 ----
+        // ---- 空闲超时，只有超编线程（> core）才退出 ----
         let mut state = lock(&inner.state);
         if state.queue.is_empty() && !state.shutdown && state.workers > state.core {
             state.retire_locked(name);
@@ -417,7 +414,7 @@ async fn take_task(inner: &Arc<Inner>, name: &str) -> Option<ConsumeTask> {
     }
 }
 
-/// 对应 Python `_run` 末尾的 `try: fn(*args, **kwargs) / except BaseException`。
+/// 跑一个任务：吞掉任何异常并计数。
 async fn run_task(inner: &Arc<Inner>, handle: &Handle, task: ConsumeTask, name: &str) {
     match handle.spawn(task).await {
         Ok(()) => {}
@@ -438,7 +435,7 @@ mod tests {
     use std::sync::atomic::AtomicI32;
     use tokio::sync::oneshot;
 
-    /// 把任意异步块变成 [`ConsumeTask`]（等价 Python 的 `submit(fn, *args)`）。
+    /// 把任意异步块变成 [`ConsumeTask`]。
     fn task<F>(future: F) -> ConsumeTask
     where
         F: Future<Output = ()> + Send + 'static,
@@ -460,8 +457,8 @@ mod tests {
 
     /// 「占住 worker 直到闸门放开」的任务 + 报到通道。
     ///
-    /// 闸门用 [`tokio::sync::Mutex`]：测试持有时任务全部阻塞在里面（等价 Python 的
-    /// `started.set(); release.wait(5)`），**报到发生在阻塞之前**，所以测试观察到
+    /// 闸门用 [`tokio::sync::Mutex`]：测试持有时任务全部阻塞在里面，
+    /// **报到发生在阻塞之前**，所以测试观察到
     /// `started` 就能确定该 worker 已被占住。
     fn blocked_task(gate: &Arc<tokio::sync::Mutex<()>>) -> (ConsumeTask, oneshot::Receiver<()>) {
         let (started_tx, started_rx) = oneshot::channel();
@@ -475,7 +472,7 @@ mod tests {
         )
     }
 
-    // ---------------------------------------------------- TestConsumeExecutor（Python 同名 7 项）
+    // ---------------------------------------------------- 执行器行为（7 项）
 
     #[tokio::test]
     async fn spawns_up_to_core_then_queues() {
@@ -590,7 +587,6 @@ mod tests {
 
     #[tokio::test]
     async fn task_panic_does_not_kill_worker() {
-        // 对应 Python `test_task_exception_does_not_kill_worker`
         let ex = ConsumeExecutor::with_params(1, 2, Duration::from_secs(30), "rmq-test");
         assert_eq!(ex.handler_exception_count(), 0);
 
@@ -624,7 +620,7 @@ mod tests {
             err.to_string(),
             "MQClientException: ConsumeExecutor has been shut down"
         );
-        // 重复 shutdown 是 no-op（Python 第二次也只是复制名册）
+        // 重复 shutdown 是 no-op
         ex.shutdown();
         ex.await_termination().await;
     }
@@ -687,7 +683,7 @@ mod tests {
         let ex = ConsumeExecutor::new(1, 2);
         let err = ex
             .set_core_pool_size(-1)
-            .expect_err("negative core is a ValueError in Python");
+            .expect_err("negative core must be rejected");
         assert_eq!(
             err.to_string(),
             "MQClientException: core pool size must be >= 0"
@@ -703,14 +699,14 @@ mod tests {
         assert_eq!(
             ex.get_max_pool_size(),
             SHORT_MAX_VALUE,
-            "Java 把 max 抬到 core"
+            "max 一并被抬到 core"
         );
         assert_eq!(ex.worker_count(), 0, "队列空 → 一个 worker 都不建");
     }
 
     #[tokio::test]
     async fn set_core_pool_size_after_shutdown_only_records_core() {
-        // Python: `if delta > 0 and not self._shutdown` —— 关闭后不再补线程
+        // 关闭后不再补线程（只在 delta > 0 且未关闭时 spawn）
         let ex = ConsumeExecutor::with_params(1, 8, Duration::from_secs(30), "rmq-test");
         ex.submit(task(async {})).expect("submit");
         ex.shutdown();
@@ -734,7 +730,7 @@ mod tests {
 
     #[test]
     fn submit_needs_a_tokio_runtime() {
-        // 差异 #1：Python 起的是 daemon 线程，无此约束
+        // 差异 #1：worker 是 tokio 任务，需要宿主运行时
         let ex = ConsumeExecutor::new(1, 2);
         let outsider = ex.clone();
         let result = std::thread::spawn(move || outsider.submit(task(async {})))

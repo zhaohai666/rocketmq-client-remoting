@@ -64,12 +64,12 @@ impl TopicConfig {
         }
     }
 
-    /// 对应 Python `encode()`：`json.dumps(to_dict())`。
+    /// 写出紧凑 JSON 串（与 `to_json_value()` 的序列化结果一致）。
     pub fn encode(&self) -> String {
         self.to_json_value().to_string()
     }
 
-    /// 对应 Python `to_dict()`，键顺序与 Python 字面量一致。
+    /// 键顺序按线上记录的 JSON 字面量钉死。
     pub fn to_json_value(&self) -> Value {
         json_object(vec![
             ("topicName", Value::String(self.topic_name.clone())),
@@ -123,7 +123,7 @@ impl TopicConfig {
     }
 }
 
-/// 对应 Python `__repr__`（`perm` 走 `PermName.perm2string`）。
+/// 诊断用的文本形式（`perm` 走 `PermName::perm_to_string`）。
 impl fmt::Display for TopicConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn defaults_match_server_probe() {
-        // Python test_topic_config_java_defaults
+        // 默认值以 broker 侧记录的真值为准
         let cfg = TopicConfig::new("t");
         assert_eq!(cfg.read_queue_nums, 16);
         assert_eq!(cfg.write_queue_nums, 16);
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(cfg.attribute("+fileReservedTime"), Some("72"));
         assert_eq!(cfg.read_queue_nums, 16);
         assert_eq!(cfg.perm, 6);
-        // 读回后再写出的是 Python 顺序
+        // 读回后再写出的仍是同一份键顺序
         assert!(cfg.encode().starts_with(r#"{"topicName":"attr-topic","#));
     }
 

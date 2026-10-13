@@ -3,8 +3,6 @@
 //! （POP_MESSAGE / ACK_MESSAGE / CHANGE_MESSAGE_INVISIBLETIME）、offset 查询/更新、
 //! 心跳、队列锁、管理类 API（创建/删除 Topic、集群信息等）、broker 主动请求
 //! （220/221/307/309/326）分派。
-//!
-//! ## 与 Python 参考实现的有意差异（均在对应条目 doc 上再次标注）
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -85,10 +83,10 @@ pub(crate) const MQ_CLIENT_API_TIMEOUT_MILLIS: i64 = 3000;
 /// 对象安全：异步行为方法用 `self: Arc<Self>` 接收者 + 装箱 future，
 /// 实例里以 `Arc<dyn RegisteredConsumer>` 持有。
 pub trait RegisteredConsumer: Send + Sync {
-    /// 消费者自己的 clientId（Python `HeartbeatData(self.client_id)`）。
+    /// 消费者自己的 clientId（进心跳的 ConsumerData）。
     fn client_id(&self) -> String;
 
-    /// `ConsumerData.groupName`（Python `self.consumer_group`）。
+    /// `ConsumerData.groupName`。
     fn consumer_group(&self) -> String;
 
     fn consume_type(&self) -> String;
@@ -103,7 +101,7 @@ pub trait RegisteredConsumer: Send + Sync {
 
     fn subscription(&self) -> Vec<String>;
 
-    /// `topic -> SubscriptionData` 表（Python `self.subscription_data.values()`），
+    /// `topic -> SubscriptionData` 表，
     /// 进心跳的 `ConsumerData.subscriptionDataSet`。
     fn subscriptions(&self) -> Vec<SubscriptionData>;
 
@@ -119,16 +117,14 @@ pub trait RegisteredConsumer: Send + Sync {
         offset_table: Vec<(MessageQueue, i64)>,
     ) -> ConsumerFuture<()>;
 
-    /// 221 处理：返回已消费位点表（Python `consumer.get_consumer_status(topic)`）。
-    /// `None` = 请求头里没有 topic，与"显式传空串"区分开（Python 用 truthy 判断，
-    /// 只有非空 topic 才过滤）。
+    /// 221 处理：返回已消费位点表。
+    /// `None` = 请求头里没有 topic，与"显式传空串"区分开（只有非空 topic 才过滤）。
     fn get_consumer_status(&self, topic: Option<&str>) -> Vec<(MessageQueue, i64)>;
 
-    /// 307 处理：运行信息（Python `consumer.consumer_running_info()`）。
+    /// 307 处理：运行信息。
     fn consumer_running_info(&self) -> ConsumerRunningInfo;
 
-    /// 309 处理：本地真实消费一条消息（Python
-    /// `consumer.consume_message_directly(msg, broker_name)`）。
+    /// 309 处理：本地真实消费一条消息。
     fn consume_message_directly(
         &self,
         msg: MessageExt,
@@ -142,17 +138,17 @@ pub trait RegisteredConsumer: Send + Sync {
 pub type ConsumerFuture<T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>;
 
 pub trait TraceDispatcher: Send + Sync {
-    /// Python `TraceDispatcher.start(name_srv_addr)`。
+    /// 启动轨迹分发器（带上 namesrv 地址）。
     fn start(&self, name_server_addr: &str) -> Result<()>;
 
-    /// Python `TraceDispatcher.shutdown()`。
+    /// 关闭轨迹分发器。
     fn shutdown(&self);
 }
 
 // ================================================================ TopicPublishInfo
 
-/// Python 用 `threading.Lock` 保护轮询游标 `_index`；这里锁覆盖队列列表 + 游标 +
-/// 路由字段（更新路由时整批替换，读侧一次性快照，语义等价）。
+/// 一把锁覆盖队列列表 + 游标 +
+/// 路由字段（更新路由时整批替换，读侧一次性快照）。
 #[derive(Debug, Default)]
 pub struct TopicPublishInfo {
     state: Mutex<PublishState>,
@@ -163,7 +159,7 @@ struct PublishState {
     order_topic: bool,
     msg_queue_list: Vec<MessageQueue>,
     topic_route_data: Option<TopicRouteData>,
-    /// Python `_index`（int，可为负无所谓，取模前用 rem_euclid 保证非负）。
+    /// 轮询游标（int，可为负无所谓，取模前用 rem_euclid 保证非负）。
     index: i64,
 }
 
@@ -183,7 +179,7 @@ impl TopicPublishInfo {
         !state.msg_queue_list.is_empty()
     }
 
-    /// Python `reset_index`。
+    /// 把轮询游标清零。
     pub fn reset_index(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).index = 0;
     }
@@ -212,7 +208,7 @@ impl TopicPublishInfo {
         Ok(None)
     }
 
-    /// `order_topic` 读（Python 直接读属性）。
+    /// `order_topic` 读（直接读缓存字段）。
     pub fn order_topic(&self) -> bool {
         self.state
             .lock()
@@ -238,8 +234,8 @@ impl TopicPublishInfo {
             .clone()
     }
 
-    /// Python `to_dict`：`{"orderTopic":..., "messageQueueList":[{topic,brokerName,queueId}]}`。
-    /// 注意 Python 的 `messageQueueList` **不含路由本身**，只列队列。
+    /// 序列化：`{"orderTopic":..., "messageQueueList":[{topic,brokerName,queueId}]}`。
+    /// 注意 `messageQueueList` **不含路由本身**，只列队列。
     pub fn to_dict(&self) -> serde_json::Value {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         serde_json::Value::Object(serde_json::Map::from_iter(vec![
@@ -272,8 +268,8 @@ impl TopicPublishInfo {
         ]))
     }
 
-    /// 路由落库时整批刷新（对应 Python `update_topic_route_info_from_name_server`
-    /// 末尾对 `publish.order_topic / topic_route_data / msg_queue_list` 的三连赋值）。
+    /// 路由落库时整批刷新：`order_topic / topic_route_data / msg_queue_list`
+    /// 三连赋值。
     fn update_from_route(&self, route: &TopicRouteData, topic: &str) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.order_topic = route.order_topic_conf.is_some();
@@ -310,7 +306,7 @@ impl PublishInfo for TopicPublishInfo {
     }
 }
 
-/// Python `route.get_all_message_queue(topic)`：按 queueDatas × writeQueueNums 组装。
+/// 按 queueDatas × writeQueueNums 组装 topic 的全部队列。
 /// 与 `TopicRouteData::get_all_message_queue` 同源，这里独立走读以便
 /// `TopicPublishInfo` 与实例都复用。
 fn route_queue_lists(route: &TopicRouteData, topic: &str) -> Vec<MessageQueue> {
@@ -323,20 +319,19 @@ fn route_queue_lists(route: &TopicRouteData, topic: &str) -> Vec<MessageQueue> {
 
 // ================================================================ 发布消息包装
 
-/// 发送入口的消息包装（对应 Python 的鸭子类型：`send_message(msg)` 既收
-/// `Message` 也收 `MessageBatch`；`MessageBatch` 继承 `Message`，
-/// `isinstance(msg, MessageBatch)` 决定 batch 标志 / 是否补 UNIQ_KEY）。
+/// 发送入口的消息包装：发送内核既收
+/// `Message` 也收 `MessageBatch`；batch 标志决定编码路径与是否补 UNIQ_KEY。
 #[derive(Debug)]
 pub enum PublishMessage<'a> {
-    /// 普通消息（Python `Message`）。
+    /// 普通消息。
     Single(&'a mut Message),
-    /// 批量消息（Python `MessageBatch`；body 已在 `generate_from_list` 时编码好）。
+    /// 批量消息（body 已在组批时编码好）。
     Batch(&'a mut MessageBatch),
 }
 
 impl<'a> PublishMessage<'a> {
-    /// 外层 `Message` 视图：Python 里 `MessageBatch` 本身就是一个 `Message`，
-    /// Rust 的批量消息把外层字段收在 `batch.message` 里，语义一致。
+    /// 外层 `Message` 视图：批量消息把外层字段收在
+    /// `batch.message` 里，语义等价。
     pub fn as_message(&self) -> &Message {
         match self {
             PublishMessage::Single(m) => m,
@@ -344,8 +339,7 @@ impl<'a> PublishMessage<'a> {
         }
     }
 
-    /// 外层 `Message` 的可变视图：发送内核里的 traceparent 注入
-    /// （Python `_send_with_hooks` 的 `inject_trace_context(msg)`）要就地改属性。
+    /// 外层 `Message` 的可变视图：发送内核里的 traceparent 注入要就地改属性。
     pub fn as_message_mut(&mut self) -> &mut Message {
         match self {
             PublishMessage::Single(m) => m,
@@ -353,7 +347,7 @@ impl<'a> PublishMessage<'a> {
         }
     }
 
-    /// Python `isinstance(msg, MessageBatch)`。
+    /// 是否批量消息。
     pub fn is_batch(&self) -> bool {
         matches!(self, PublishMessage::Batch(_))
     }
@@ -370,35 +364,35 @@ impl<'a> PublishMessage<'a> {
 
 // ================================================================ 配置
 
-/// `MQClientInstance` 构造参数（Python `__init__` 的关键字参数 + 模块内部常量）。
+/// `MQClientInstance` 构造参数（全量显式注入 + 模块内部常量）。
 #[derive(Clone)]
 pub struct MQClientInstanceConfig {
-    /// Python `connect_timeout_millis`（默认 3000）。
+    /// 连接超时（默认 3000）。
     pub connect_timeout_millis: i64,
-    /// Python `invoke_timeout_millis`（默认 15000）。
+    /// RPC 调用超时（默认 15000）。
     pub invoke_timeout_millis: i32,
-    /// Python `tls_enable`：`None` 走环境变量 `ROCKETMQ_TLS_ENABLE`（与
+    /// TLS 开关：`None` 走环境变量 `ROCKETMQ_TLS_ENABLE`（与
     /// [`RemotingClientConfig::default`] 同口径），`Some(v)` 强制。
     pub tls_enable: Option<bool>,
     pub socks_proxy: Option<SocksProxyConfig>,
     pub route_refresh_interval_millis: u64,
-    /// 动态 namesrv 首延迟 / 周期（Python `_namesrv_refresh_loop`：10s / 120s）。
+    /// 动态 namesrv 首延迟 / 周期（10s / 120s）。
     pub namesrv_refresh_initial_delay_millis: u64,
     pub namesrv_refresh_interval_millis: u64,
-    /// 线程弹性巡检（Python `_adjust_thread_pool_loop`：60s / 60s）。
+    /// 线程弹性巡检（60s / 60s）。
     pub adjust_pool_initial_delay_millis: u64,
     pub adjust_pool_interval_millis: u64,
     pub heartbeat_initial_delay_millis: u64,
     pub heartbeat_interval_millis: u64,
     pub persist_offset_initial_delay_millis: u64,
     pub persist_offset_interval_millis: u64,
-    /// 实例级共享统计器（Python 内部构造 `ConsumerStatsManager()`；这里注入，
-    /// `None` = 默认新建，行为与 Python 相同）。
+    /// 实例级共享统计器（注入用；
+    /// `None` = 默认新建）。
     pub consumer_stats_manager: Option<Arc<ConsumerStatsManager>>,
     pub latency_fault_tolerance: Option<Arc<LatencyFaultToleranceImpl>>,
     /// 见 [`TraceDispatcher`]：本模块只存不调。
     pub trace_dispatcher: Option<Arc<dyn TraceDispatcher>>,
-    /// 动态 name server（Python 内部 `DefaultTopAddressing()`；注入用，
+    /// 动态 name server（注入用，
     /// `None` = `DefaultTopAddressing::default()`，读环境变量）。
     pub top_addressing: Option<DefaultTopAddressing>,
     pub unit_name: Option<String>,
@@ -501,8 +495,8 @@ impl std::fmt::Debug for MQClientInstanceConfig {
 
 // ================================================================ MQClientInstance
 
-/// 路由三张表（Python `topic_route_table` + `topic_publish_info_table` +
-/// `broker_addr_table`，共用一把 `topic_route_lock`）。
+/// 路由三张表：`topic_route_table` + `topic_publish_info_table` +
+/// `broker_addr_table`，共用一把路由锁。
 #[derive(Default)]
 struct RouteTables {
     topic_route_table: HashMap<String, TopicRouteData>,
@@ -516,7 +510,7 @@ struct Inner {
     name_server_addrs: Mutex<Vec<String>>,
     remoting_client: RemotingClient,
     tables: Mutex<RouteTables>,
-    /// Python `_topics_in_use`。
+    /// 已登记使用的 topic 集合。
     topics_in_use: Mutex<HashSet<String>>,
     started: AtomicBool,
     consumer_table: Mutex<HashMap<String, Arc<dyn RegisteredConsumer>>>,
@@ -557,7 +551,7 @@ fn parse_reset_offset_table(data: &[u8]) -> Result<Vec<(MessageQueue, i64)>> {
     }
 }
 
-/// Python `MQClientInstance`（类级 `INSTANCE_MAP` 在 Rust 里是
+/// 客户端实例本体（类级 `INSTANCE_MAP` 是
 /// [`MQClientInstance::INSTANCE_MAP`]，存弱引用）。
 #[derive(Clone)]
 pub struct MQClientInstance {
@@ -571,7 +565,7 @@ impl MQClientInstance {
         MAP.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
-    /// Python `MQClientInstance(client_id, name_server_addrs)`（其余参数取默认）。
+    /// 按 client_id + namesrv 地址列表构造（其余参数取默认）。
     pub fn new(client_id: &str, name_server_addrs: Vec<String>) -> MQClientInstance {
         MQClientInstance::with_config(
             client_id,
@@ -580,7 +574,7 @@ impl MQClientInstance {
         )
     }
 
-    /// Python `__init__` 的完整注入版本（差异见模块头第 2 条）。
+    /// 全参数注入版本。
     pub fn with_config(
         client_id: &str,
         name_server_addrs: Vec<String>,
@@ -669,7 +663,7 @@ impl MQClientInstance {
         MQClientInstance::with_config(client_id, name_server_addrs, config)
     }
 
-    /// `INSTANCE_MAP` 读侧（Python 没有该函数；供 admin/测试按 clientId 找回实例）。
+    /// `INSTANCE_MAP` 读侧（供 admin/测试按 clientId 找回实例）。
     pub fn find_instance(client_id: &str) -> Option<MQClientInstance> {
         let weak = MQClientInstance::instance_map()
             .lock()
@@ -859,11 +853,11 @@ impl MQClientInstance {
             _ => Vec::new(),
         };
         let topic = header.topic.unwrap_or_default();
-        // Python 丢后台线程（220 的 rebalance 会 invokeSync，不能卡在 remoting 读线程）；
-        // 这里丢 tokio 任务，立即回 None（oneway）。
+        // 220 的 rebalance 会 invokeSync，不能卡在 remoting 读线程：丢后台任务，
+        // 立即回 None（oneway）。
         let task = consumer.reset_offset(topic.clone(), offset_table);
         // 220 只可能在 remoting 读线程里到达，那里必有运行时；真取不到时
-        // 宁愿丢任务也不能 panic（Python 此时只是起线程失败）。
+        // 宁愿丢任务也不能 panic。
         let Some(handle) = self.inner.remoting_client.runtime_handle() else {
             rmq_warn!(
                 "RESET_CONSUMER_CLIENT_OFFSET: no tokio runtime, reset skipped \
@@ -958,7 +952,7 @@ impl MQClientInstance {
                 Some("empty message body".to_string()),
             );
         };
-        // Python `decode_message(cmd.body, check_crc=False)`（Rust 默认 options 的
+        // 解码不校验 CRC（默认 options 的
         // check_crc 本来就是 false，见 message_decoder::DecodeOptions::default）。
         let msg = match decode_message(raw) {
             Ok(msg) => msg,
@@ -982,7 +976,7 @@ impl MQClientInstance {
         }
     }
 
-    /// 326 处理：把应答投给等待中的 request()（Python `_process_reply_message`）。
+    /// 326 处理：把应答投给等待中的 request()。
     pub(crate) fn process_reply_message(&self, cmd: &RemotingCommand) -> RemotingCommand {
         let header: ReplyMessageRequestHeader = match cmd.decode_command_custom_header() {
             Ok(h) => h,
@@ -1022,9 +1016,9 @@ impl MQClientInstance {
 
     // ---------------- 生命周期 ----------------
 
-    /// Python `start()`：置位 started、启动统计采样、（可选）动态 namesrv 刷新，
-    /// 然后拉起 4 个后台任务。Python 在动态取址拿不到地址时抛
-    /// `MQClientException`，这里等价返回 `Err`。
+    /// 置位 started、启动统计采样、（可选）动态 namesrv 刷新，
+    /// 然后拉起 4 个后台任务。动态取址拿不到地址时返回
+    /// `Err`。
     pub async fn start(&self) -> Result<()> {
         if self
             .inner
@@ -1069,7 +1063,7 @@ impl MQClientInstance {
                 self.inner.config.namesrv_refresh_interval_millis,
             );
         }
-        // Python `_route_refresh_loop`：首个 10ms、周期 route_refresh_interval
+        // 路由刷新循环：首个 10ms、周期 route_refresh_interval
         let me = self.clone();
         let handle = tokio::spawn(async move {
             me.route_refresh_loop().await;
@@ -1237,7 +1231,7 @@ impl MQClientInstance {
         self.update_name_server_address_list(&addrs);
     }
 
-    /// Python `update_name_server_address_list`：空列表不改。
+    /// 更新 namesrv 地址列表：空列表不改。
     pub fn update_name_server_address_list(&self, addrs: &[String]) {
         if addrs.is_empty() {
             return;
@@ -1255,7 +1249,7 @@ impl MQClientInstance {
         }
     }
 
-    /// Python `register_topic_in_use`：登记需要后台周期刷新路由的 topic。
+    /// 登记需要后台周期刷新路由的 topic。
     pub fn register_topic_in_use(&self, topic: &str) {
         if !topic.is_empty() {
             self.inner
@@ -1272,7 +1266,7 @@ impl MQClientInstance {
 impl MQClientInstance {
     // ---------------- 底层 invoke ----------------
 
-    /// Python `_invoke_sync`：`remoting_client.invoke_sync` 的薄封装。
+    /// `remoting_client.invoke_sync` 的薄封装。
     pub(crate) async fn invoke_sync(
         &self,
         addr: &str,
@@ -1285,8 +1279,8 @@ impl MQClientInstance {
             .await
     }
 
-    /// Python `_check_response`：非 SUCCESS 一律抛 `MQBrokerException`
-    /// （remark 为空时 Python 用 `""`）。
+    /// 应答检查：非 SUCCESS 一律抛 `MQBrokerException`
+    /// （remark 为空时用 `""`）。
     pub(crate) fn check_response(response: &RemotingCommand) -> Result<&RemotingCommand> {
         if response.code == response_code::SUCCESS {
             return Ok(response);
@@ -1299,7 +1293,7 @@ impl MQClientInstance {
 
     // ---------------- 路由管理 ----------------
 
-    /// Python `update_topic_route_info_from_name_server`：拉取并落库 topic 路由。
+    /// 拉取并落库 topic 路由。
     pub async fn update_topic_route_info_from_name_server(
         &self,
         topic: &str,
@@ -1360,18 +1354,18 @@ impl MQClientInstance {
                 .or_insert_with(|| Arc::new(TopicPublishInfo::new()))
                 .clone()
         };
-        // Python 在 `topic_route_lock` 内直接改 publish 的三个字段；Rust 里
-        // `TopicPublishInfo` 自带细粒度锁，先出表锁再整体刷新（顺序等价，且避免嵌套锁）。
+        // publish 的三个字段要整批刷新：
+        // `TopicPublishInfo` 自带细粒度锁，先出表锁再整体刷新（避免嵌套锁）。
         publish.update_from_route(&route, topic);
         Ok(true)
     }
 
-    /// Python 内部闭包 `_fetch`：逐个 namesrv 试；**拿到响应但不可用就 break**
+    /// 逐个 namesrv 试；**拿到响应但不可用就 break**
     /// （不再试后续 namesrv），只有传输/解码异常才继续下一个；
-    /// 循环结束后「最后一个异常」若不是 broker 业务错就原样抛出（Python 逐字如此）。
+    /// 循环结束后「最后一个异常」若不是 broker 业务错就原样抛出。
     ///
-    /// 与 Python 的唯一差别：Python 复用一个 `request` 对象，Rust 的 remoting 层按
-    /// `opaque` 配对响应，故每次尝试新建请求（每次 `opaque` 递增，语义不变）。
+    /// remoting 层按 `opaque` 配对响应，故每次尝试新建请求
+    /// （每次 `opaque` 递增，语义不变）。
     async fn fetch_topic_route_from_namesrv(
         &self,
         topic: &str,
@@ -1392,12 +1386,12 @@ impl MQClientInstance {
                         break;
                     }
                     match response.body() {
-                        // Python 的 decode 在 try 里：解码失败算 last_exc 并继续下一个 namesrv
+                        // 解码失败算 last_exc 并继续下一个 namesrv
                         Some(body) if !body.is_empty() => match TopicRouteData::decode(body) {
                             Ok(data) => return Ok(Some(data)),
                             Err(e) => last_exc = Some(e),
                         },
-                        // SUCCESS 但没 body：Python 同样 break（不再试后续 namesrv）
+                        // SUCCESS 但没 body：这里同样 break（不再试后续 namesrv）
                         _ => break,
                     }
                 }
@@ -1405,7 +1399,7 @@ impl MQClientInstance {
             }
         }
         if let Some(e) = last_exc {
-            // Python: `if last_exc is not None and not isinstance(last_exc, MQBrokerException)`
+            // 最后一个异常不是 broker 业务错才原样抛出
             if !matches!(e, Error::Broker { .. }) {
                 return Err(e);
             }
@@ -1413,7 +1407,7 @@ impl MQClientInstance {
         Ok(None)
     }
 
-    /// Python `get_topic_publish_info`：缓存可用直接返回，否则拉一次路由；
+    /// 缓存可用直接返回，否则拉一次路由；
     /// 仍拿不到队列 ⇒ `Can not find Message Queue for topic: <topic>`。
     pub async fn get_topic_publish_info(
         &self,
@@ -1433,7 +1427,7 @@ impl MQClientInstance {
         }
     }
 
-    /// Python `get_topic_route_data`：命中缓存即返回；否则拉一次路由（**吞掉异常**）后再读。
+    /// 命中缓存即返回；否则拉一次路由（**吞掉异常**）后再读。
     pub async fn get_topic_route_data(&self, topic: &str) -> Option<TopicRouteData> {
         if let Some(route) = self.route_of(topic) {
             return Some(route);
@@ -1442,7 +1436,7 @@ impl MQClientInstance {
             .update_topic_route_info_from_name_server(topic, 5000, false)
             .await
         {
-            // Python `except Exception: pass`
+            // 刷新失败吞掉异常，继续读缓存
             rmq_debug!("get_topic_route_data refresh failed for {topic}: {e}");
         }
         self.route_of(topic)
@@ -1459,7 +1453,7 @@ impl MQClientInstance {
             .collect()
     }
 
-    /// 只读缓存路由（不触发 RPC）；Python 直接读 `self.topic_route_table`。
+    /// 只读缓存路由（不触发 RPC），未命中返回 `None`。
     pub(crate) fn route_of(&self, topic: &str) -> Option<TopicRouteData> {
         self.inner
             .tables
@@ -1481,7 +1475,7 @@ impl MQClientInstance {
             .cloned()
     }
 
-    /// Python `find_broker_addr_in_route`（staticmethod）。
+    /// 在路由里找该 brokerName 的地址。
     pub fn find_broker_addr_in_route(route: &TopicRouteData, broker_name: &str) -> Option<String> {
         route
             .get_broker_datas()
@@ -1492,7 +1486,7 @@ impl MQClientInstance {
 
     // ---------------- 消息发送 ----------------
 
-    /// Python `send_message`：按路由解析 broker 地址后同步发送。
+    /// 按路由解析 broker 地址后同步发送。
     #[allow(clippy::too_many_arguments)]
     pub async fn send_message(
         &self,
@@ -1505,7 +1499,7 @@ impl MQClientInstance {
         create_topic_key: &str,
         default_topic_queue_nums: i32,
     ) -> Result<SendResult> {
-        // Python `publish_addr_for(mq.broker_name, mq.topic)`：查发布地址（只认 master）
+        // 查发布地址（只认 master）
         // → 查不到刷一次路由 → 仍查不到照 `sendKernelImpl:1100` 报
         // 「The broker[X] not exist」。**不是** `broker_addr_in_route`（那个允许落到从节点，
         // 主从切换期间会白挨一轮 SYSTEM_BUSY(2)）。
@@ -1524,7 +1518,7 @@ impl MQClientInstance {
         .await
     }
 
-    /// Python `send_message_to_addr`。
+    /// 向指定地址直发。
     #[allow(clippy::too_many_arguments)]
     pub async fn send_message_to_addr(
         &self,
@@ -1551,10 +1545,10 @@ impl MQClientInstance {
         Self::parse_send_response(&response, msg.as_message(), mq)
     }
 
-    /// Python `send_message_oneway`：`mark_oneway_rpc` 后 fire-and-forget。
+    /// `mark_oneway_rpc` 后 fire-and-forget。
     ///
-    /// Python 的 `timeout_millis` 形参在本方法里从未被使用（oneway 不等响应），
-    /// 这里省略该形参（唯一一处签名收窄）。
+    /// `timeout_millis` 在 oneway 里没有语义（不等响应），
+    /// 本方法签名省略该参数。
     #[allow(clippy::too_many_arguments)]
     pub async fn send_message_oneway(
         &self,
@@ -1606,7 +1600,7 @@ impl MQClientInstance {
         );
     }
 
-    /// Python `_build_send_request`（V2 短字段头，`sendSmartMsg` 恒 true）。
+    /// 组装 SEND_MESSAGE_V2 请求（V2 短字段头，`sendSmartMsg` 恒 true）。
     pub(crate) fn build_send_request(
         producer_group: &str,
         msg: &mut PublishMessage<'_>,
@@ -1671,7 +1665,7 @@ impl MQClientInstance {
         request
     }
 
-    /// Python `_encode_body`（staticmethod）：普通消息是原始 body；
+    /// body 编码：普通消息是原始 body；
     /// 批量消息的 body 在构造时已由 `encode_messages` 编好。
     fn encode_body(msg: &Message) -> Vec<u8> {
         msg.body.clone().unwrap_or_default()
@@ -1718,7 +1712,7 @@ impl MQClientInstance {
                     .unwrap_or(MixAll::DEFAULT_TRACE_REGION_ID)
                     .to_string(),
             ),
-            // Python: `str(ext.get(TRACE_ON)) != "false"` —— 缺字段/空串都算开启
+            // 只有字面量 "false" 算关闭：缺字段/空串都算开启
             trace_on: match response.get_ext_field(PROPERTY_TRACE_SWITCH) {
                 Some(value) => value != "false",
                 None => true,
@@ -1752,7 +1746,7 @@ impl MQClientInstance {
 
     // ---------------- 拉取 ----------------
 
-    /// Python `pull_message`：14 个位置参数逐一对应。
+    /// 拉取请求（PULL_MESSAGE），参数逐一落进请求头字段。
     #[allow(clippy::too_many_arguments)]
     pub async fn pull_message(
         &self,
@@ -1857,7 +1851,7 @@ impl MQClientInstance {
         let mut resp_header = PullMessageResponseHeader::default();
         resp_header.from_ext_fields(response.ext_fields());
         let mut found = response.body().map(decode_messages).unwrap_or_default();
-        // Python 无条件盖 brokerName/queueId
+        // 无条件盖 brokerName/queueId
         for m in found.iter_mut() {
             m.broker_name = Some(mq.broker_name.clone());
             m.queue_id = mq.queue_id;
@@ -1900,7 +1894,7 @@ impl MQClientInstance {
 // ================================================================ POP / ACK / 不可见时间
 
 impl MQClientInstance {
-    /// Python `pop_message` 的 addr / brokerName 解析段。
+    /// `pop_message` 的 addr / brokerName 解析段。
     async fn pop_target(
         &self,
         topic: &str,
@@ -1928,9 +1922,9 @@ impl MQClientInstance {
         Ok((addr, broker_name))
     }
 
-    /// Python `pop_message`（POP_MESSAGE = 200050）。
+    /// POP 弹取（POP_MESSAGE = 200050）。
     ///
-    /// 与 pull 的语义差别（Python docstring）：**不需要提交位点**，消费完成用
+    /// 与 pull 的语义差别：**不需要提交位点**，消费完成用
     /// [`ack_message`] 确认；不 ack 的消息在 `invisible_time` 后被 broker 复活重投到
     /// `%RETRY%<group>_<topic>`（V1），下次 POP 再弹回来 —— 至少一次语义；
     /// `queue_id = -1` 表示弹该 topic 的所有队列。
@@ -2016,8 +2010,7 @@ impl MQClientInstance {
         })
     }
 
-    /// Python `_pop_queue_map_key`（staticmethod，Python 多传一个 `extra` 模块参数，
-    /// Rust 直接用模块路径，故省掉）。
+    /// 从消息的 `POP_CK` 构造队列映射键（模块路径直接用，无需额外参数）。
     pub fn pop_queue_map_key(msg: &MessageExt) -> Result<String> {
         let ck = msg
             .properties
@@ -2039,10 +2032,7 @@ impl MQClientInstance {
         }
     }
 
-    /// Python `_stamp_pop_ck`：给 POP 出来的消息反构 `POP_CK` 与 `1ST_POP_TIME`。
-    ///
-    ///
-    /// Python 形参里的 `self` 未被使用（它只调 staticmethod），这里是关联函数。
+    /// 给 POP 出来的消息反构 `POP_CK` 与 `1ST_POP_TIME`（关联函数，无实例状态）。
     pub(crate) fn stamp_pop_ck(
         found: &mut [MessageExt],
         broker_name: &str,
@@ -2153,7 +2143,7 @@ impl MQClientInstance {
         Ok(())
     }
 
-    /// Python `ack_message`（ACK_MESSAGE = 200051）：确认一条 POP 消息。
+    /// 确认一条 POP 消息（ACK_MESSAGE = 200051）。
     ///
     /// `extra_info` 用消息上的 `POP_CK` 属性；`offset` 必须是 **consumeQueue offset**
     /// （即 CK 串第 8 段 / msgQueueOffset），不是 commitlog offset —— 传错 broker 会回
@@ -2170,7 +2160,7 @@ impl MQClientInstance {
         timeout_millis: i64,
         addr: Option<&str>,
     ) -> Result<i32> {
-        // 形参名与模块同名（Python 也这么写：`import extra_info as extra`），局部起别名
+        // 形参名与模块同名，局部起别名
         use crate::remoting::protocol::extra_info as extra;
         let broker_name = match broker_name {
             Some(name) => name.to_string(),
@@ -2198,7 +2188,7 @@ impl MQClientInstance {
         Ok(response.code)
     }
 
-    /// Python `change_invisible_time`（CHANGE_MESSAGE_INVISIBLETIME = 200053）。
+    /// 修改不可见时间（CHANGE_MESSAGE_INVISIBLETIME = 200053）。
     ///
     /// 用于「还在处理、别让 broker 复活重投」的场景。响应返回的是**新的**
     /// popTime / invisibleTime / reviveQid，客户端据此重建 8 段 extraInfo
@@ -2277,8 +2267,8 @@ impl MQClientInstance {
 impl MQClientInstance {
     // ---------------- 地址工具 ----------------
 
-    /// Python `_addr_for`：按 topic（可选再按 brokerName）解析 broker 地址。
-    /// brokerName 为空串时与 Python 一样退化为「路由里第一台 broker」。
+    /// 按 topic（可选再按 brokerName）解析 broker 地址。
+    /// brokerName 为空串时退化为「路由里第一台 broker」。
     pub(crate) async fn addr_for(&self, topic: &str, broker_name: Option<&str>) -> Result<String> {
         let route = self
             .get_topic_route_data(topic)
@@ -2298,7 +2288,7 @@ impl MQClientInstance {
             .ok_or_else(|| Error::client(format!("No available broker addr for topic: {topic}")))
     }
 
-    /// Python `_broker_addr(mq)`：按 `mq.broker_name` 在该 topic 路由里查地址。
+    /// 按 `mq.broker_name` 在该 topic 路由里查地址。
     pub(crate) async fn broker_addr(&self, mq: &MessageQueue) -> Result<String> {
         let route = self
             .get_topic_route_data(&mq.topic)
@@ -2312,12 +2302,12 @@ impl MQClientInstance {
         })
     }
 
-    /// Python `_broker_addr_for_topic`：等价于 `_addr_for(topic)`（Python 里两处代码相同）。
+    /// 等价于 `addr_for(topic)`（两处代码相同）。
     pub(crate) async fn broker_addr_for_topic(&self, topic: &str) -> Result<String> {
         self.addr_for(topic, None).await
     }
 
-    /// Python `broker_addr_of`：在**所有**已缓存路由里找该 brokerName 的地址。
+    /// 在**所有**已缓存路由里找该 brokerName 的地址。
     pub fn broker_addr_of(&self, broker_name: &str) -> Option<String> {
         self.cached_routes()
             .into_iter()
@@ -2394,7 +2384,7 @@ impl MQClientInstance {
         }
     }
 
-    /// POP ack / changeInvisibleTime 的地址解析（Go `popAckAddress` 同形）。
+    /// POP ack / changeInvisibleTime 的地址解析。
     pub async fn pop_ack_addr(&self, broker_name: &str, topic: &str, queue_id: i32) -> Result<String> {
         let resolve_des = |inst: &Self| -> String {
             if crate::client::static_topic::is_logical_queue_mock_broker_name(broker_name) {
@@ -2439,9 +2429,9 @@ impl MQClientInstance {
         addr.ok_or_else(|| Error::client(format!("The broker[{}] not exist", mq.broker_name)))
     }
 
-    /// Python `get_route_of_all_brokers`：所有已缓存路由里的 broker 地址（去重）。
+    /// 所有已缓存路由里的 broker 地址（去重）。
     ///
-    /// Python 按 dict 插入序返回；Rust 的 HashMap 无序，这里按地址字典序排序，
+    /// HashMap 无序，这里按地址字典序排序，
     /// 让心跳/注销的发送顺序确定（集合内容完全一致）。
     pub fn get_route_of_all_brokers(&self) -> Vec<String> {
         let mut addrs: Vec<String> = Vec::new();
@@ -2474,7 +2464,7 @@ impl MQClientInstance {
         addrs
     }
 
-    /// 已缓存路由快照（Python 直接遍历 `topic_route_table.values()`）。
+    /// 已缓存路由快照。
     fn cached_routes(&self) -> Vec<TopicRouteData> {
         self.inner
             .tables
@@ -2500,7 +2490,7 @@ impl MQClientInstance {
 
     // ---------------- Offset 查询 / 更新 ----------------
 
-    /// Python `query_consumer_offset`：`QUERY_NOT_FOUND(22)` ⇒ `None`（Python 直接 return，
+    /// `QUERY_NOT_FOUND(22)` ⇒ `None`（直接返回，不抛），
     /// 不抛），其余非 SUCCESS 由 `_check_response` 抛 `MQBrokerException`。
     pub async fn query_consumer_offset(
         &self,
@@ -2536,7 +2526,7 @@ impl MQClientInstance {
         Ok(resp_header.offset)
     }
 
-    /// Python `update_consumer_offset`。
+    /// 上报消费位点。
     pub async fn update_consumer_offset(
         &self,
         consumer_group: &str,
@@ -2620,7 +2610,7 @@ impl MQClientInstance {
         Ok(resp_header.offset.unwrap_or(0))
     }
 
-    /// Python `search_offset_by_timestamp`（不带边界参数的重载）。
+    /// 按时间戳查 offset（不带边界参数的重载）。
     pub async fn search_offset_by_timestamp(
         &self,
         mq: &MessageQueue,
@@ -2814,7 +2804,7 @@ impl MQClientInstance {
                 .await
             {
                 Ok(Some(body)) if !body.is_empty() => body,
-                // Python：异常与空 body 都是 continue
+                // 异常与空 body 都是 continue
                 _ => continue,
             };
             for mut msg in decode_messages(&body) {
@@ -2846,7 +2836,7 @@ impl MQClientInstance {
 
     // ---------------- 队列锁（顺序消费） ----------------
 
-    /// 按 brokerName 分组，**保持首次出现顺序**（Python 的 dict 就是插入序）。
+    /// 按 brokerName 分组，**保持首次出现顺序**（插入序）。
     fn group_by_broker(mqs: &[MessageQueue]) -> Vec<(String, Vec<MessageQueue>)> {
         let mut out: Vec<(String, Vec<MessageQueue>)> = Vec::new();
         for mq in mqs {
@@ -2859,7 +2849,7 @@ impl MQClientInstance {
     }
 
     /// 按 broker 分组发送；返回 broker 确认锁定成功的队列集（`lockOKMQSet`）。
-    /// 单台失败只 warn 并继续（Python 同）。
+    /// 单台失败只 warn 并继续。
     pub async fn lock_batch_mq(
         &self,
         consumer_group: &str,
@@ -2941,7 +2931,7 @@ impl MQClientInstance {
 
     // ---------------- 心跳 / 注销 ----------------
 
-    /// Python `send_heartbeat`（HEART_BEAT = 34）。
+    /// 发心跳（HEART_BEAT = 34）。
     pub async fn send_heartbeat(
         &self,
         addr: &str,
@@ -3183,7 +3173,7 @@ impl MQClientInstance {
         Ok(())
     }
 
-    /// Python `unregister_client`（UNREGISTER_CLIENT = 35）。
+    /// 向 namesrv 注销客户端（UNREGISTER_CLIENT = 35）。
     pub async fn unregister_client(
         &self,
         addr: &str,
@@ -3208,7 +3198,7 @@ impl MQClientInstance {
 
     // ---------------- 管理类 API ----------------
 
-    /// Python `get_broker_cluster_info`（GET_BROKER_CLUSTER_INFO = 106）。
+    /// 拉取 broker 集群信息（GET_BROKER_CLUSTER_INFO = 106）。
     pub async fn get_broker_cluster_info(&self, timeout_millis: i64) -> Result<ClusterInfo> {
         let mut request =
             RemotingCommand::create_request_command(request_code::GET_BROKER_CLUSTER_INFO, None);
@@ -3242,7 +3232,7 @@ impl MQClientInstance {
         bail!("Failed to get broker cluster info from name server")
     }
 
-    /// Python `get_all_topic_list_from_name_server`（GET_ALL_TOPIC_LIST_FROM_NAMESERVER = 206）。
+    /// 从 namesrv 拉全量 topic 列表（GET_ALL_TOPIC_LIST_FROM_NAMESERVER = 206）。
     pub async fn get_all_topic_list_from_name_server(
         &self,
         timeout_millis: i64,
@@ -3313,7 +3303,7 @@ impl MQClientInstance {
                 .await
             {
                 Ok(response) => {
-                    // Python: `except MQBrokerException: raise` —— 业务错不重试
+                    // 业务错不重试，直接上抛
                     Self::check_response(&response)?;
                     return Ok(());
                 }
@@ -3363,7 +3353,7 @@ impl MQClientInstance {
             let Some(addr) = broker_data.select_broker_addr().filter(|a| !a.is_empty()) else {
                 continue;
             };
-            // Python 这里用 create_topic_in_broker 的默认值：SINGLE_TAG / order=false / 重试 5 次
+            // 这里用 create_topic_in_broker 的默认值：SINGLE_TAG / order=false / 重试 5 次
             let result = self
                 .create_topic_in_broker(
                     &addr,
@@ -3387,14 +3377,14 @@ impl MQClientInstance {
         }
         if !created_at_least_once {
             if let Some(cause) = last_exc {
-                // Python: MQClientException("create new topic failed", cause=last_exc)
+                // 一台都没建成：报 "create new topic failed"，带上最后一个异常
                 return Err(Error::client(format!("create new topic failed: {cause}")));
             }
         }
         Ok(())
     }
 
-    /// Python `delete_topic_in_broker`（DELETE_TOPIC_IN_BROKER = 215）。
+    /// 在 broker 上删 topic（DELETE_TOPIC_IN_BROKER = 215）。
     pub async fn delete_topic_in_broker(
         &self,
         broker_addr: &str,
@@ -3411,7 +3401,7 @@ impl MQClientInstance {
         Ok(())
     }
 
-    /// Python `delete_topic_in_namesrv`（DELETE_TOPIC_IN_NAMESRV = 216）：
+    /// 在 namesrv 上删 topic 配置（DELETE_TOPIC_IN_NAMESRV = 216）：
     /// 任取一台成功的 namesrv，全失败才抛。
     pub async fn delete_topic_in_namesrv(&self, topic: &str, timeout_millis: i64) -> Result<()> {
         let mut request =
@@ -3541,7 +3531,7 @@ async fn wait_until_or_stop(stop: &watch::Sender<bool>, deadline: tokio::time::I
     }
 }
 
-/// Python 的 `tls_enable=None` 行为：读环境变量。
+/// `tls_enable=None` 的行为：读环境变量。
 fn default_tls_enable_from_env() -> bool {
     matches!(
         std::env::var("ROCKETMQ_TLS_ENABLE")
@@ -3553,7 +3543,7 @@ fn default_tls_enable_from_env() -> bool {
     )
 }
 
-/// 326 的报文 → MessageExt（Python `_process_reply_message` 的还原段，单独拆出以便单测）。
+/// 326 的报文 → MessageExt（应答还原段，单独拆出以便单测）。
 fn build_reply_message_ext(
     header: &ReplyMessageRequestHeader,
     body: Option<&[u8]>,
@@ -3571,7 +3561,7 @@ fn build_reply_message_ext(
     msg.flag = header.flag.unwrap_or(0);
     msg.born_timestamp = header.born_timestamp.unwrap_or(0);
     msg.reconsume_times = header.reconsume_times.unwrap_or(0);
-    // Python `if header.born_host:` —— 空串视为未提供，不能存成 Some("")。
+    // 空串视为未提供，不能存成 Some("")。
     msg.born_host = header
         .born_host
         .clone()
@@ -3591,8 +3581,8 @@ fn build_reply_message_ext(
     Ok(msg)
 }
 
-/// 六个实例级 broker 主动请求码共用一个处理器（Python 注册的是同一个实例上的
-/// 不同方法，Rust 的 `RequestProcessor` 一个对象可注册到多个 code，语义一致）。
+/// 六个实例级 broker 主动请求码共用一个处理器（一个 `RequestProcessor`
+/// 对象注册到多个 code，等价于按方法逐个注册）。
 struct ClientRemotingProcessor {
     instance: Weak<Inner>,
 }
@@ -3610,7 +3600,7 @@ impl RequestProcessor for ClientRemotingProcessor {
         let response = match request.code {
             request_code::PUSH_REPLY_MESSAGE_TO_CLIENT => instance.process_reply_message(&request),
             request_code::RESET_CONSUMER_CLIENT_OFFSET => {
-                // oneway：Python 返回 None；Rust 由 ResponseSink 按 wants_reply 丢弃，
+                // oneway：ResponseSink 按 wants_reply 丢弃，
                 // 这里干脆不回。
                 instance.process_reset_offset(&request);
                 return;
@@ -3641,7 +3631,7 @@ impl RequestProcessor for ClientRemotingProcessor {
 //
 // broker 主动请求（220/221/307/309/326）只能由 broker 沿已建立的连接反向打进来，
 // 在线样例（`examples/live_mq_client.rs`）无法注入，所以这里离线把协议 + 分派
-// 逻辑锁死 —— 对齐 `python/tests/test_broker_requests.py`（该文件的消费者侧用例
+// 逻辑锁死 —— 协议对齐用例（消费者侧的对应用例
 // 要等 `consumer.rs` 落地后再补）。
 
 // 夹具统一走「default + 只设被读的字段」：请求头有十几个字段，逐字段字面量会把
@@ -3996,7 +3986,7 @@ mod tests {
         let consumer = StubConsumer::new();
         instance.register_consumer(GROUP, consumer.clone());
 
-        // Python 把 `header.topic` 原样交给消费者（None 与 "" 语义不同：只有非空
+        // `header.topic` 原样交给消费者（None 与 "" 语义不同：只有非空
         // topic 才过滤），所以这里必须能区分三种入参。
         let cases: Vec<Option<String>> = vec![None, Some(String::new()), Some(TOPIC.to_string())];
         for topic in cases.clone() {
@@ -4104,7 +4094,7 @@ mod tests {
         let mut header = ConsumeMessageDirectlyResultRequestHeader::default();
         header.consumer_group = Some(GROUP.to_string());
 
-        // 空 body / 缺 body（Python 两处都是 SYSTEM_ERROR + 固定 remark）。
+        // 空 body / 缺 body（两处都是 SYSTEM_ERROR + 固定 remark）。
         let mut empty = request(request_code::CONSUME_MESSAGE_DIRECTLY, header.clone());
         empty.set_body(Some(Vec::new()));
         let resp = instance.process_consume_message_directly(&empty);
@@ -4176,7 +4166,7 @@ mod tests {
 
     #[test]
     fn reply_message_treats_blank_hosts_as_absent() {
-        // Python `if header.born_host:` —— 空串不能变成 Some("")。
+        // 空串不能变成 Some("")。
         let mut header = ReplyMessageRequestHeader::default();
         header.topic = Some(TOPIC.to_string());
         header.born_host = Some(String::new());
@@ -4191,13 +4181,13 @@ mod tests {
         assert!(
             msg.get_property(PROPERTY_REPLY_MESSAGE_ARRIVE_TIME)
                 .is_some(),
-            "arrive time must be stamped like Python"
+            "arrive time must be stamped"
         );
     }
 
     #[tokio::test]
     async fn unmatched_reply_message_still_answers_success() {
-        // 没有等待中的 request()：Python 只 warn，回 SUCCESS（broker 侧不需要重试）。
+        // 没有等待中的 request()：只 warn，回 SUCCESS（broker 侧不需要重试）。
         let instance = new_instance();
         let mut header = ReplyMessageRequestHeader::default();
         header.topic = Some(TOPIC.to_string());
@@ -4321,7 +4311,7 @@ mod tests {
         );
         let after_stop = consumer.persisted.load(Ordering::SeqCst);
 
-        // 重启必须真能跑：Python 靠把线程句柄置 None 重来，这里靠 stop 信号复位。
+        // 重启必须真能跑：靠 stop 信号复位。
         instance.start().await.unwrap();
         instance.register_consumer(GROUP, consumer.clone());
         assert_eq!(task_count(&instance), started);
@@ -4969,7 +4959,7 @@ mod tests {
         );
         assert!(
             text.contains("server has not been upgraded to support"),
-            "java wrap message missing: {text}"
+            "wrap message missing: {text}"
         );
         instance.shutdown();
     }
@@ -5315,7 +5305,7 @@ mod tests {
         assert!(PullSysFlag::has_suspend_flag(sent_flag), "suspend 位保持");
         assert!(
             ext_of(rec, "subscription").is_none(),
-            "SUBSCRIPTION 位关闭时该字段根本不进 extFields（Java 的 null → 丢字段）"
+            "SUBSCRIPTION 位关闭时该字段根本不进 extFields（null → 丢字段）"
         );
         // 应答头 suggestWhichBrokerId 透传给调用方，供回写 pullFromWhichNodeTable
         assert_eq!(result.suggest_which_broker_id, Some(0));
@@ -5380,8 +5370,7 @@ mod tests {
     /// （`None` ⇒ TOPIC_NOT_EXIST），其余一律 SUCCESS；把收到的请求码记下来。
     ///
     /// 路由一律走**真的** `update_topic_route_info_from_name_server` 落库：发布地址
-    /// 平表的写入点就在它里面，绕过去直接往 `broker_addr_table` 塞值等于这条路径没测
-    /// （Python `test_publish_route_master.py::_serving` 同理）。
+    /// 平表的写入点就在它里面，绕过去直接往 `broker_addr_table` 塞值等于这条路径没测。
     struct RouteNamesrv {
         addr: String,
         holder: Arc<Mutex<Option<Vec<u8>>>>,

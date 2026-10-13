@@ -591,7 +591,7 @@ async fn p1_lifecycle(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) -
         &format!("clientId={client_id}"),
     );
     ck.check(
-        "P1 the instance is registered under that clientId (Java's INSTANCE_MAP)",
+        "P1 the instance is registered under that clientId",
         MQClientInstance::find_instance(&client_id).is_some(),
         &client_id,
     );
@@ -600,7 +600,7 @@ async fn p1_lifecycle(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) -
     p.start().await.map_err(|e| format!("second start failed: {e}"))?;
     let after = p.client().map(|c| c.client_id().to_string());
     ck.check(
-        "P1 start() is idempotent, like Python's _started guard",
+        "P1 start() is idempotent",
         before == after && after.as_deref() == Some(client_id.as_str()),
         &format!("{before:?} {after:?}"),
     );
@@ -611,7 +611,7 @@ async fn p1_lifecycle(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) -
         !p.is_started(),
         "still started",
     );
-    // 允许重启（Python 会重新起实例与心跳线程）
+    // 允许重启（会重新起实例与心跳线程）
     p.start().await.map_err(|e| format!("restart failed: {e}"))?;
     let mut m = msg(topic, b"after-restart", "", "");
     let sent = p.send(&mut m, Some(5000), None).await;
@@ -811,7 +811,7 @@ async fn p2_send_paths(
             && r.queue_offset >= 0
     });
     ck.check(
-        "P2 send_async drives the success callback with a Java-shaped SendResult",
+        "P2 send_async drives the success callback with a fully-shaped SendResult",
         called && shaped && probe.errors().is_empty(),
         &probe.summary(),
     );
@@ -945,7 +945,7 @@ async fn p2_send_paths(
         .await
         && after_reject.ok() == 1;
     ck.check(
-        "P2 an in-pool validator failure callbacks once with Java's text and leaves the producer usable",
+        "P2 an in-pool validator failure callbacks once with the exact text and leaves the producer usable",
         rejected_back
             && rejected.done() == 1
             && rejected.ok() == 0
@@ -1098,7 +1098,7 @@ async fn p3_hooks(
         .unwrap_or_default();
     let tail = hook.lines()[before_len..].to_vec();
     ck.check(
-        "P3b 定点到不存在的 broker：本端报 not exist，一个钩子都不跑（Java :1100 在 try 之外）",
+        "P3b 定点到不存在的 broker：本端报 not exist，一个钩子都不跑（校验在 try 之外）",
         bogus.contains("The broker[RustNoSuchBroker_zzz] not exist") && tail.is_empty(),
         &format!("err={bogus} tail={tail:?}"),
     );
@@ -1166,7 +1166,7 @@ async fn p4_trace_seam(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) 
     let _ = p.send(&mut traced, Some(3000), None).await;
     let count_after = dispatcher.reported().len();
     ck.check(
-        "P4 a message on the trace topic itself is never traced, like Java's guard",
+        "P4 a message on the trace topic itself is never traced",
         count_after == contexts.len(),
         &format!("before={} after={count_after}", contexts.len()),
     );
@@ -1361,7 +1361,7 @@ async fn p6_transactions(
     );
 
     // ---- TransactionMQProducer：预置监听器之后，发送时不必再传
-    // （Python/C++ 里这个子类唯一多做的事就是这段兜底，这里要把它打实。）
+    // （本端这个子类唯一多做的事就是这段兜底，这里要把它打实。）
     let txn_group = format!("PID_rust_producer_{run}_p6txn");
     let txn = TransactionMQProducer::new(&txn_group).map_err(|e| format!("txn build failed: {e}"))?;
     txn.set_namesrv_addr(namesrv);
@@ -1400,7 +1400,7 @@ async fn p6_transactions(
         .map(|v| v.len())
         .unwrap_or(0);
     ck.check(
-        "P6 TransactionMQProducer derefs to the base producer, like the C++ subclass does",
+        "P6 TransactionMQProducer derefs to the base producer",
         via_deref == QUEUE_NUMS as usize,
         &format!("queues={via_deref}"),
     );
@@ -1506,14 +1506,14 @@ async fn p7_admin(
         &format!("len={missing}"),
     );
 
-    // ---- view_message：与 Python 一致地显式不支持
+    // ---- view_message：显式不支持
     let err = p
         .view_message(topic, "0102030405")
         .err()
         .map(|e| e.to_string())
         .unwrap_or_default();
     ck.check(
-        "P7 view_message refuses instead of pretending, as the Python edition does",
+        "P7 view_message refuses instead of pretending",
         err.contains("not supported"),
         &err,
     );
@@ -1540,7 +1540,7 @@ async fn p7_admin(
 /// 「broker 回可重试码就换一台」「慢 broker 吃光预算报 call timeout」「端口拒绝报
 /// 10001」这三条要的是 broker 主动回错误码 / 慢到吃掉预算 / 端口拒连 —— 真集群一台
 /// 健康的单 broker 都给不了，留在 `src/client/producer/send_retry_tests.rs` 的
-/// 进程内假集群里对拍（与 python/cpp 的同题用例一一对应）。
+/// 进程内假集群里对拍。
 async fn p8_send_retry_kernel(
     p: &DefaultMQProducer,
     topic: &str,
@@ -1549,7 +1549,7 @@ async fn p8_send_retry_kernel(
 ) -> Live {
     let defaults: Vec<i32> = DEFAULT_RETRY_RESPONSE_CODES.to_vec();
     ck.check(
-        "P8 the default retryable broker codes are exactly the Java eight",
+        "P8 the default retryable broker codes are exactly the eight expected ones",
         defaults == [1, 2, 14, 16, 17, 204, 205, 1500]
             && p.get_retry_response_codes().len() == 8
             && p.is_retry_response_code(Some(response_code::SERVICE_NOT_AVAILABLE))
@@ -1581,9 +1581,9 @@ async fn p8_send_retry_kernel(
     p.set_retry_another_broker_when_not_store_ok(false);
     p.set_send_msg_max_timeout_per_request(-1);
 
-    // 路由彻底拉不到：这次连 namesrv 都拒了。Python 参考实现刻意**不**把传输层失败
-    // 粉饰成「没有路由」（`mq_client.py` 的 `_fetch` 只在 broker 回了错误码时才往下传），
-    // 所以这里断言的是：原样报连接失败，且一次 broker 都没联系、重试次数没被空转掉。
+    // 路由彻底拉不到：这次连 namesrv 都拒了。本端刻意**不**把传输层失败粉饰成「没有路由」
+    // （只有 broker 回了错误码时才往上层传递路由缺失），所以这里断言的是：原样报连接失败，
+    // 且一次 broker 都没联系、重试次数没被空转掉。
     let dead_addr = std::net::TcpListener::bind("127.0.0.1:0")
         .ok()
         .and_then(|l| l.local_addr().ok())
@@ -1736,7 +1736,7 @@ async fn p9_recall(
         .map(|e| e.to_string())
         .unwrap_or_default();
     ck.check(
-        "P9 recalling on a %RETRY% topic is refused with Java's message",
+        "P9 recalling on a %RETRY% topic is refused with the expected message",
         retry_err.contains("topic is not supported"),
         &retry_err,
     );
@@ -1964,7 +1964,7 @@ async fn run(namesrv: &str) -> Checker {
     };
     p.set_namesrv_addr(namesrv);
     p.set_instance_name(&format!("{run}-main"));
-    // 让压缩阈值用默认 4 KiB，但显式打开故障规避开关的关闭态（Python 默认）
+    // 让压缩阈值用默认 4 KiB，但显式打开故障规避开关的关闭态
     p.set_send_latency_fault_enable(false);
     if let Err(e) = p.start().await {
         ck.abort("P0 start", &e.to_string());

@@ -1,5 +1,4 @@
-//! 与 `python/verify_clean_expired_msg_live.py`、`cpp/examples/live_clean_expired_msg.cpp`、
-//! C# 的对应场景同题、逐条对应（A0–A5）。
+//! 过期消息清扫与回投真机验证（A0–A5）。
 //!
 //! 离线单测（`src/client/consumer.rs` 的 `clean_expired_queue_*` 与
 //! `send_back_batch_skips_entries_swept_away`）锁的是**判据**（选条/阈值/上限/摘除闸门/
@@ -522,7 +521,7 @@ async fn run(namesrv: &str) -> Checker {
         tokio::time::sleep(Duration::from_millis(1000)).await;
     }
     ck.check(
-        "A5-挂住的 listener 返回后业务队列位点走到 1（Java removeMessage 含已清扫条目）",
+        "A5-挂住的 listener 返回后业务队列位点走到 1（removeMessage 含已清扫条目）",
         committed == 1,
         &format!("offset={committed}"),
     );

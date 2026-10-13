@@ -65,7 +65,7 @@ pub struct SendMessageContext {
     pub born_host: String,
     pub communication_mode: Option<CommunicationMode>,
     pub send_result: Option<SendResult>,
-    /// 对应 Python `exception`：发送失败时由调用方写入，`after` 钩子里读它判成败。
+    /// 异常槽位：发送失败时由调用方写入，`after` 钩子里读它判成败。
     pub exception: Option<Error>,
     pub mq_trace_context: Option<AnyHolder>,
     pub props: Option<HashMap<String, String>>,
@@ -113,7 +113,7 @@ pub struct ConsumeMessageContext {
     pub msg_list: Vec<MessageExt>,
     pub mq: Option<MessageQueue>,
     pub success: bool,
-    /// 消费状态的名字串（Python `str(status)`，如 `"CONSUME_SUCCESS"`）。
+    /// 消费状态的名字串（如 `"CONSUME_SUCCESS"`）。
     pub status: Option<String>,
     pub mq_trace_context: Option<AnyHolder>,
     pub props: Option<HashMap<String, String>>,
@@ -122,9 +122,8 @@ pub struct ConsumeMessageContext {
 }
 
 impl ConsumeMessageContext {
-    /// 对应 Python `ConsumeMessageContext(consumer_group, msg_list, mq)`：
-    /// `success` 缺省 `True`；`msg_list` 为 `None` 或空时得到空列表
-    /// （Python 的 `list(msg_list) if msg_list else []` 两种入参结果相同）。
+    /// 构造消费钩子上下文：`success` 缺省 `true`；
+    /// `msg_list` 为 `None` 或空时都得到空列表。
     pub fn new(
         consumer_group: &str,
         msg_list: Option<Vec<MessageExt>>,
@@ -284,28 +283,27 @@ pub trait FilterMessageHook: Send + Sync {
 
 // -------------------------------------------------------------- 钩子注册表
 
-/// 对应 Python producer / consumer 上的 `send_message_hook_list` 等注册表。
+/// `send_message_hook_list` 等钩子注册表。
 ///
-/// Python 用 `list.append` + 顺序遍历，注册与触发可能跨线程，所以这里是
+/// 注册与触发可能跨线程，所以这里是
 /// `RwLock<Vec<Arc<H>>>`；[`HookList::hooks`] 返回**快照**，
-/// 语义等于 Python 遍历当时那张列表。
+/// 遍历语义等于「当时那张列表」。
 pub struct HookList<H: ?Sized> {
     inner: RwLock<Vec<Arc<H>>>,
 }
 
 impl<H: ?Sized> HookList<H> {
-    /// 空表（Python `self.xxx_hook_list = []`）。
+    /// 空表。
     pub fn new() -> Self {
         HookList { inner: RwLock::new(Vec::new()) }
     }
 
-    /// 对应 Python `register_*_hook`：追加到末尾，触发顺序 = 注册顺序。
-    /// Python 的 `if hook is not None` 判空在 Rust 由 `Arc` 保证非空，无需重复。
+    /// 追加到末尾，触发顺序 = 注册顺序；非空由 `Arc` 保证，无需判空。
     pub fn register(&self, hook: Arc<H>) {
         write_guard(&self.inner).push(hook);
     }
 
-    /// 对应 Python `has_*_hook`。
+    /// 是否已注册钩子。
     pub fn has_hooks(&self) -> bool {
         !read_guard(&self.inner).is_empty()
     }
@@ -336,9 +334,9 @@ impl<H: ?Sized> fmt::Debug for HookList<H> {
     }
 }
 
-/// `send_message_hook_list`（Python `DefaultMQProducer`）。
+/// `send_message_hook_list`：producer 侧发送钩子注册表。
 pub type SendMessageHookList = HookList<dyn SendMessageHook>;
-/// `consume_message_hook_list`（Python `DefaultMQPushConsumer`）。
+/// `consume_message_hook_list`：consumer 侧消费钩子注册表。
 pub type ConsumeMessageHookList = HookList<dyn ConsumeMessageHook>;
 /// `end_transaction_hook_list`。
 pub type EndTransactionHookList = HookList<dyn EndTransactionHook>;
@@ -373,8 +371,7 @@ pub fn execute_send_message_hook_after(
 
 /// `DefaultMQProducerImpl.executeCheckForbiddenHook`。
 ///
-/// ⚠ 与上面两个相反：**不吞异常**，第一个拒绝就向上抛
-/// （Python 同名方法就是裸 `for hook: hook.check_forbidden(ctx)`）。
+/// ⚠ 与上面两个相反：**不吞异常**，第一个拒绝就向上抛。
 pub fn execute_check_forbidden_hook(
     hooks: &CheckForbiddenHookList,
     context: &mut CheckForbiddenContext,
@@ -421,8 +418,7 @@ pub fn execute_consume_hook_after(hooks: &ConsumeMessageHookList, context: &mut 
 pub fn execute_filter_hooks(hooks: &FilterMessageHookList, context: &mut FilterMessageContext) {
     for hook in hooks.hooks() {
         if let Err(e) = hook.filter_message(context) {
-            // Python 还要用 `_safe_hook_name` 兜住 hook_name() 自己抛错；
-            // Rust 的 hook_name 不可失败，直接带上。
+            // hook_name 不可失败，日志直接带上。
             rmq_error!("execute hook error. hookName={}: {}", hook.hook_name(), e);
         }
     }
@@ -451,7 +447,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// 记录调用顺序的假钩子，等价于 Python 测试里的 `_Recording*` / `_Boom*` 类。
+    /// 记录调用顺序的假钩子。
     #[derive(Default)]
     struct Recorder {
         calls: Mutex<Vec<String>>,
@@ -601,7 +597,7 @@ mod tests {
         assert_eq!(CommunicationMode::Sync.name(), "SYNC");
         assert_eq!(CommunicationMode::Async.to_string(), "ASYNC");
         assert_eq!(CommunicationMode::Oneway.to_string(), "ONEWAY");
-        // 未知名字回落 SYNC（Python 没有 from_name，与 result.rs 的 from_code 口径一致）
+        // 未知名字回落 SYNC（与 result.rs 的 from_code 口径一致）
         assert_eq!(CommunicationMode::from_name("NOPE"), CommunicationMode::Sync);
         assert_eq!(CommunicationMode::from_name(""), CommunicationMode::Sync);
         assert_eq!(CommunicationMode::from_name("ONEWAY"), CommunicationMode::Oneway);
@@ -653,8 +649,7 @@ mod tests {
 
     #[test]
     fn consume_context_success_defaults_true_like_python_init() {
-        // Python `ConsumeMessageContext()` 的 success 是 True；
-        // 投递路径上 consumer.py 会显式改成 False（_build_consume_hook_context）。
+        // 构造时 success 是 true；投递路径上 consumer 侧会显式改成 false。
         let context = ConsumeMessageContext::new("GID_test", None, None);
         assert!(context.success);
         assert_eq!(context.consumer_group, "GID_test");
@@ -670,7 +665,7 @@ mod tests {
             Some(MessageQueue::new("TopicTest", "broker-a", 0)),
         );
         assert_eq!(with_msgs.msg_list.len(), 1);
-        // 空列表与 None 一样落到空表（Python `list(x) if x else []`）
+        // 空列表与 None 一样落到空表
         assert!(ConsumeMessageContext::new("G", Some(Vec::new()), None).msg_list.is_empty());
     }
 
@@ -713,7 +708,7 @@ mod tests {
         // 第一个钩子的错误被吞（warn），第二个照常执行
         assert_eq!(boom.snapshot(), vec!["before".to_string()]);
         assert_eq!(fine.snapshot(), vec!["before".to_string()]);
-        // before 写下的私有状态 after 能取回（Python 的 mq_trace_context 约定）
+        // before 写下的私有状态 after 能取回（mq_trace_context 约定）
         execute_send_message_hook_after(&hooks, &mut context);
         assert_eq!(
             fine.snapshot(),
@@ -804,7 +799,7 @@ mod tests {
         assert_eq!(context.msg_list[0].get_body(), b"keep");
         assert_eq!(recorder.snapshot(), vec!["filter".to_string()]);
 
-        // 抛错的过滤钩子不影响投递：列表原样（Python test_filter_hook_exception_is_swallowed）
+        // 抛错的过滤钩子不影响投递：列表原样
         let boom_hooks = FilterMessageHookList::new();
         boom_hooks.register(Arc::new(BoomFilter));
         let mut context = FilterMessageContext::new("G", Some(vec![msg_ext(b"a")]), None);
@@ -812,7 +807,7 @@ mod tests {
         assert_eq!(context.msg_list.len(), 1);
         assert_eq!(context.msg_list[0].get_body(), b"a");
 
-        // 钩子也可以把列表整体清空（Python `context.msg_list = []`）
+        // 钩子也可以把列表整体清空
         let mut context = FilterMessageContext::new("G", Some(vec![msg_ext(b"a")]), None);
         context.msg_list.clear();
         assert!(context.msg_list.is_empty());

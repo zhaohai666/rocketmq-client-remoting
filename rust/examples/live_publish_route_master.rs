@@ -1,5 +1,4 @@
-//! 与 `python/verify_publish_route_master_live.py`、`cpp/examples/live_publish_route_master.cpp`、
-//! `csharp/examples/RocketMQ.Examples/LivePublishRouteMaster.cs` 同场景、逐条同断言。
+//! 发布路由取 master 真机验证。
 //!
 //! 前置：namesrv + master + slave 都在跑（按本地集群 runbook）；脚本自己**只停一次 master**
 //! （`scripts/rmq_test_broker.sh` 只认 master 的 java 进程），`Drop` 保险保证 master 一定回来。
@@ -482,7 +481,7 @@ async fn scenario(ck: &mut Checker, fx: &Fixture, script: &std::path::Path) {
     // ---------- S3 (A) 发布信息组不出队列 ----------
     println!("\nS3 (A) 发布信息跳过没有 master 的 broker");
     // 访问器契约：只在发布信息**有队列**时 Ok，否则本端 10005。此刻它抛，
-    // 等价于 Python 读表得到的 `msg_queue_list == 0`（且这里还多证了一次
+    // 等价于 `msg_queue_list == 0` 的情形（且这里还多证了一次
     // 「重新拉回来的路由照样组不出队列」——访问器会先刷一次路由）。
     let publish_down = fx.admin.get_topic_publish_info(&topic, false).await;
     let publish_err = match &publish_down {

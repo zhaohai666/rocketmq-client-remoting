@@ -8,9 +8,8 @@
 //!
 //!
 //! ⚠ 未覆盖：broker 主动请求（220/221/307/309/326）无法从外部注入 —— 它们走 broker
-//! 已建立的那条连接。协议与分派由 `mq_client.rs` 的离线单测覆盖（对齐
-//! `python/tests/test_broker_requests.py`），这里只验 `RegisteredConsumer` seam
-//! 在实例侧的调用面。
+//! 已建立的那条连接。协议与分派由 `mq_client.rs` 的离线单测覆盖，这里只验
+//! `RegisteredConsumer` seam 在实例侧的调用面。
 //!
 //! 用法（先按项目 README 起本地集群）：
 //! ```text
@@ -61,7 +60,7 @@ use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingComm
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializable;
 
-/// 建出来的 topic 队列数（对齐 Python `create_topic_in_broker` 默认 4）。
+/// 建出来的 topic 队列数（默认 4）。
 const QUEUE_NUMS: i32 = 4;
 /// M3 走轮询发送的消息条数（正好覆盖 4 个队列两轮）。
 const MSG_TOTAL: i32 = 8;
@@ -458,7 +457,7 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
     let instance = MQClientInstance::new(&client_id, vec![namesrv.to_string()]);
 
     ck.check(
-        "M1 the instance registers itself under its clientId, like Python INSTANCE_MAP",
+        "M1 the instance registers itself under its clientId",
         MQClientInstance::find_instance(&client_id).is_some(),
         "find_instance returned None",
     );
@@ -509,7 +508,7 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
     );
     rebuilt.shutdown();
 
-    // 动态取址：没配地址服务器时 Python `fetch_name_server_addr` 直接返回 None。
+    // 动态取址：没配地址服务器时 fetch_name_server_addr 直接返回 None。
     let fresh = MQClientInstance::new(&format!("{client_id}-fresh"), vec![namesrv.to_string()]);
     let fetched = fresh
         .fetch_name_server_addr()
@@ -520,10 +519,10 @@ async fn m1_identity(namesrv: &str, ck: &mut Checker) -> Live {
         fetched.is_none() && fresh.name_server_addrs() == vec![namesrv.to_string()],
         &format!("{fetched:?} {:?}", fresh.name_server_addrs()),
     );
-    // Python `update_name_server_address_list`：空列表一律不改。
+    // update_name_server_address_list：空列表一律不改。
     fresh.update_name_server_address_list(&[]);
     ck.check(
-        "M1 an empty namesrv update is a no-op, like Python",
+        "M1 an empty namesrv update is a no-op",
         fresh.name_server_addrs() == vec![namesrv.to_string()],
         &format!("{:?}", fresh.name_server_addrs()),
     );
@@ -607,7 +606,7 @@ async fn m2_route_and_publish(
         ),
     );
     ck.check(
-        "M2 brokerName -> addr resolves through the cache exactly like Python's helper",
+        "M2 brokerName -> addr resolves through the cache",
         MQClientInstance::find_broker_addr_in_route(&route, broker_name).as_deref()
             == Some(broker_addr)
             && instance.broker_addr_of(broker_name).as_deref() == Some(broker_addr)
@@ -637,7 +636,7 @@ async fn m2_route_and_publish(
         &format!("{:?}", publish.to_dict()),
     );
     ck.check(
-        "M2 to_dict keeps Python's publish-info shape (orderTopic + messageQueueList only)",
+        "M2 to_dict keeps the publish-info shape (orderTopic + messageQueueList only)",
         serde_json::to_string(&publish.to_dict())
             .unwrap_or_default()
             .starts_with(r#"{"orderTopic":false,"messageQueueList":[{"topic":"#,),
@@ -688,7 +687,7 @@ async fn m2_route_and_publish(
         picked == vec![2, 2, 2, 2],
         &format!("{picked:?}"),
     );
-    // 全部被拒 ⇒ Python 也是「试完一圈返回 None」，不是抛错。
+    // 全部被拒 ⇒ 也是「试完一圈返回 None」，不是抛错。
     let reject_all = |_mq: &MessageQueue| false;
     let all_rejected: &[&QueueFilter<'_>] = &[&reject_all];
     let rejected = publish.select_one_message_queue(all_rejected);
@@ -711,7 +710,7 @@ async fn m2_route_and_publish(
         .map(|e| e.to_string())
         .unwrap_or_default();
     ck.check(
-        "M2 an unknown topic refreshes to false and carries Python's queue error",
+        "M2 an unknown topic refreshes to false and carries the queue error",
         !none && err.contains("Can not find Message Queue for topic:"),
         &format!("refreshed={none} err={err}"),
     );
@@ -794,7 +793,7 @@ async fn m3_send_and_pull(
         let region_ok = result.region_id.as_deref() == Some(MixAll::DEFAULT_TRACE_REGION_ID)
             && result.trace_on;
         ck.check(
-            &format!("M3 send #{i} returns Python-shaped SendResult fields"),
+            &format!("M3 send #{i} returns fully-shaped SendResult fields"),
             result.status == SendStatus::SendOk && ids_ok && queue_ok && region_ok,
             &format!("uniq={uniq} result={result:?}"),
         );
@@ -1114,7 +1113,7 @@ async fn m5_heartbeat(
     let stub = StubConsumer::new(instance.client_id(), consumer_group, topic, broker_name);
     instance.register_consumer(consumer_group, Arc::clone(&stub) as Arc<dyn RegisteredConsumer>);
     ck.check(
-        "M5 find_consumer returns the same registration Python's dict would",
+        "M5 find_consumer returns the same registration",
         instance
             .find_consumer(consumer_group)
             .map(|c| c.consumer_group())
@@ -1127,7 +1126,7 @@ async fn m5_heartbeat(
     let encoded = String::from_utf8_lossy(&heartbeat.encode()).into_owned();
     let cd = &heartbeat.consumer_data_set[0];
     ck.check(
-        "M5 prepare_heartbeat_data builds the Java-shaped heartbeat body from the registry",
+        "M5 prepare_heartbeat_data builds the full heartbeat body from the registry",
         heartbeat.client_id == instance.client_id()
             && heartbeat.consumer_data_set.len() == 1
             && cd.group_name == consumer_group
@@ -1475,7 +1474,7 @@ async fn m8_shared_factory(
         None => return Err("A's factory is missing from INSTANCE_MAP".to_string()),
     };
     ck.check(
-        "M8 producer start registers its group on the factory (Java registerProducer)",
+        "M8 producer start registers its group on the factory",
         shared.has_producer(group_a) && !shared.has_producer(group_b),
         &format!("clientId={}", shared.client_id()),
     );

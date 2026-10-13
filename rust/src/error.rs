@@ -63,7 +63,7 @@ impl fmt::Display for Error {
             Error::Broker { response_code, message } => {
                 write!(f, "MQBrokerException(code={response_code}): {message}")
             }
-            // 文本与 Python `producer._wait_request_response` 抛出的消息逐字一致。
+            // 运行时错误文本：上层与日志按这段字面量匹配，不能改。
             Error::RequestTimeout { topic, timeout_millis } => write!(
                 f,
                 "send request message to <{topic}> OK, but wait reply message timeout, \
@@ -112,14 +112,13 @@ impl Error {
         Error::Client { response_code: Some(code), message: message.into() }
     }
 
-    /// 对应 Python `raise RequestTimeoutException("send request message to <%s> OK, ...")`。
+    /// 文案按线上记录逐字钉死：`send request message to <%s> OK, ...`。
     pub fn request_timeout(topic: impl Into<String>, timeout_millis: i64) -> Error {
         Error::RequestTimeout { topic: topic.into(), timeout_millis }
     }
 }
 
-
-/// `bail!("...")` = `return Err(Error::client(format!("...")))`，对应 Python 里直接 raise。
+/// `bail!("...")` = `return Err(Error::client(format!("...")))`，即直接把错误返回给调用方。
 #[macro_export]
 macro_rules! bail {
     ($($t:tt)*) => {
@@ -134,7 +133,7 @@ mod tests {
 
     #[test]
     fn request_timeout_text_matches_python() {
-        // python/client/producer.py::_wait_request_response 的字面量
+        // 运行时错误文本是字面量契约，一个字符都不能改
         let e = Error::request_timeout("TopicTest", 3000);
         assert_eq!(
             e.to_string(),
@@ -145,8 +144,8 @@ mod tests {
 
     #[test]
     fn test_client_error_codes_match_server_contract() {
-        let Ok(root) = std::env::var("ROCKETMQ_JAVA_SRC") else {
-            eprintln!("ROCKETMQ_JAVA_SRC 未设置，跳过 ClientErrorCode 对拍");
+        let Ok(root) = std::env::var("ROCKETMQ_SERVER_SRC") else {
+            eprintln!("ROCKETMQ_SERVER_SRC 未设置，跳过 ClientErrorCode 对拍");
             return;
         };
         let path = std::path::PathBuf::from(&root)
@@ -165,9 +164,9 @@ mod tests {
             ("CREATE_REPLY_MESSAGE_EXCEPTION", client_error_code::CREATE_REPLY_MESSAGE_EXCEPTION),
         ] {
             let Some(theirs) = java_const(&text, name) else {
-                panic!("java ClientErrorCode 已无常量 {name}");
+                panic!("服务端 ClientErrorCode 已无常量 {name}");
             };
-            assert_eq!(theirs, ours, "java ClientErrorCode.{name} 与 rust 侧不一致");
+            assert_eq!(theirs, ours, "服务端 ClientErrorCode.{name} 与 rust 侧不一致");
         }
     }
 

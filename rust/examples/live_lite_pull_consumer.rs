@@ -1,6 +1,6 @@
 //! [`DefaultLitePullConsumer`] 对**真实 5.5.1 broker** 的联调验证。
 //!
-//! 场景与 `python/verify_lite_pull_live.py`（S1..S6）对齐，另外补了 pause/resume、
+//! 覆盖 S1..S6 六个基础场景，另外补了 pause/resume、
 //! 手工心跳、以及「`seek()` 会丢掉缓冲里该队列早于目标位点的消息」这三条
 //! （L7/L8/L4）——它们都只有真机能验（后台拉取循环 + broker 侧位点与订阅）。
 //!
@@ -104,7 +104,7 @@ fn wall_clock(secs_offset: i64) -> String {
 
 /// 等首轮重平衡把队列分下来。
 ///
-/// ⚠ lite 的 `start()` **不**同步重平衡（Python 也是：起后台循环后由
+/// ⚠ lite 的 `start()` **不**同步重平衡（起后台循环后由
 /// `_pull_service_loop` 每 >1s 触发一次），所以刚 start 时 `assignment()` 可能是空的。
 /// 这里显式 `rebalance()` 催一次，别把「最终一致」测成「瞬时一致」。
 async fn wait_assignment(c: &DefaultLitePullConsumer, want: usize, secs: u64) -> Vec<MessageQueue> {
@@ -359,7 +359,7 @@ async fn l1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     ck.check("L1 start 后 is_started", c2.is_started(), "");
     ck.check("L1 重复 start 幂等", c2.start().await.is_ok(), "");
     ck.check(
-        "L1 client_id = 本机IP@instanceName（Java buildMQClientId）",
+        "L1 client_id = 本机IP@instanceName（buildMQClientId 语义）",
         c2.client_id()
             .split_once('@')
             .is_some_and(|(ip, instance)| !ip.is_empty() && instance.starts_with("live-lite-life")),
@@ -819,7 +819,7 @@ async fn l8_heartbeat_and_state(ck: &mut Checker, fx: &Fixture, topic: &str, mqs
         None => return,
     };
     // 心跳的目标是「实例路由表里已知的 broker」。lite 的 `start()` 已经同步刷过一次
-    // 订阅 topic 的路由（Python/C++/C# 同口径），所以首轮心跳就能落到 broker 上；
+    // 订阅 topic 的路由，所以首轮心跳就能落到 broker 上；
     // 这里仍然先等重平衡拿到分配，再验心跳真的到得了 broker
     // —— 没注册上订阅，broker 侧的 tag 过滤与 GET_CONSUMER_LIST_BY_GROUP 都会失真。
     let _ = wait_assignment(&c, QUEUE_NUMS as usize, 20).await;
@@ -866,7 +866,7 @@ async fn l8_heartbeat_and_state(ck: &mut Checker, fx: &Fixture, topic: &str, mqs
     c.shutdown();
 }
 
-// ------------------------ L11 三张位点表（对位 C++ live_lite_pull.cpp 的 S8）
+// ------------------------ L11 三张位点表
 
 /// 只读 broker 上那一格位点，不碰被测实例的任何内存（独立组连接）。
 async fn broker_offset(probe: &DefaultMQPullConsumer, mq: &MessageQueue) -> i64 {
@@ -1182,7 +1182,7 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
         ck.abort("L11g commit(部分队列)", &e.to_string());
     }
     ck.check(
-        "L11g 点名提交会把没点名的内存值清掉（Java 的 remove unused mq）",
+        "L11g 点名提交会把没点名的内存值清掉（remove unused mq）",
         o.pending_commit_of(&q0) == -1,
         &format!("pending={}", o.pending_commit_of(&q0)),
     );
@@ -1212,7 +1212,7 @@ async fn l11_three_offset_tables(ck: &mut Checker, fx: &Fixture, mqs: &[MessageQ
         &format!("brokerOffset={broker_set}"),
     );
     ck.check(
-        "L11g persistAll 之后内存表回到已消费游标（Java 的 updateConsumeOffset）",
+        "L11g persistAll 之后内存表回到已消费游标（updateConsumeOffset 语义）",
         o.pending_commit_of(&q0) == 60,
         &format!("pending={}", o.pending_commit_of(&q0)),
     );

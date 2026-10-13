@@ -68,7 +68,7 @@ use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingComm
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializable;
 
-/// 建出来的 topic 队列数（对齐 Python `create_topic_in_broker` 默认 4）。
+/// 建出来的 topic 队列数（默认 4）。
 const QUEUE_NUMS: i32 = 4;
 /// T2 里假时钟的起点（毫秒）；用固定值让隔离窗口断言可复现。
 const FAKE_NOW_BASE: i64 = 1_700_000_000_000;
@@ -413,7 +413,7 @@ async fn t1_top_addressing(
         &format!("ws_addr={}", ta.ws_addr()),
     );
     ck.check(
-        "T1 timeout default is Java's 3000ms",
+        "T1 timeout default is 3000ms",
         ta.timeout_millis() == 3000,
         &format!("timeout={}", ta.timeout_millis()),
     );
@@ -539,7 +539,7 @@ fn fake_now() -> i64 {
 
 /// [`PublishInfo`] 的最小实现：真实路由里的队列 + 一组模拟的第二 broker 队列。
 ///
-/// 轮询语义照 Python `TopicPublishInfo.select_one_message_queue`：
+/// 轮询语义：
 /// 无过滤器恒定前进；有过滤器最多试 `n` 个、每次试探都推进游标。
 struct LivePublishInfo {
     queues: Vec<MessageQueue>,
@@ -778,7 +778,7 @@ async fn t3_consumer_stats(
 
     let mgr = ConsumerStatsManager::new();
     ck.check(
-        "T3 key is topic@group like Python",
+        "T3 key is topic@group",
         ConsumerStatsManager::key(topic, group) == format!("{topic}@{group}"),
         &format!("key={}", ConsumerStatsManager::key(topic, group)),
     );
@@ -800,7 +800,7 @@ async fn t3_consumer_stats(
         mgr.is_running(),
         "start_with_handle did not spawn the sampler",
     );
-    // 重复 start 必须是 no-op（Python 见到已有线程直接 return）。
+    // 重复 start 必须是 no-op（见到已有线程直接 return）。
     mgr.start_with_handle(&handle);
     ck.check("T3 start is idempotent", mgr.is_running(), "second start killed the sampler");
 
@@ -855,13 +855,13 @@ async fn t3_consumer_stats(
     // 直接喂 compute_stats_data 与 item 口径一致（同一个 first/last 差分算法）。
     let direct: StatsSnapshot = compute_stats_data(&[(1_000, 0, 0), (3_000, 4, 2)]);
     ck.check(
-        "T3 compute_stats_data matches the Java first/last diff",
+        "T3 compute_stats_data matches the first/last diff",
         direct.sum == 4 && direct.times == 2 && (direct.tps - 2.0).abs() < 1e-9
             && (direct.avgpt - 2.0).abs() < 1e-9,
         &format!("direct={direct}"),
     );
     ck.check(
-        "T3 StatsSnapshot Display keeps Python's two decimals",
+        "T3 StatsSnapshot Display keeps two decimals",
         format!("{direct}") == "StatsSnapshot(sum=4, tps=2.00, avgpt=2.00, times=2)",
         &format!("display={direct}"),
     );
@@ -892,7 +892,7 @@ async fn t3_consumer_stats(
         !mgr.is_running(),
         "sampler still running after shutdown",
     );
-    // shutdown 之后可以重新 start（Python 的线程句柄被置 None）。
+    // shutdown 之后可以重新 start（线程句柄被置 None）。
     mgr.start_with_handle(&handle);
     ck.check("T3 restart after shutdown works", mgr.is_running(), "restart failed");
     mgr.shutdown();
@@ -1052,7 +1052,7 @@ async fn t4_hooks(
         &format!("events={snapshot:?}"),
     );
     ck.check(
-        "T4 CommunicationMode prints Python's constant",
+        "T4 CommunicationMode prints the expected constant",
         CommunicationMode::Sync.name() == "SYNC"
             && CommunicationMode::from_name("ASYNC") == CommunicationMode::Async,
         &format!("mode={}", CommunicationMode::Sync),
@@ -1067,7 +1067,7 @@ async fn t4_hooks(
     }) as Arc<dyn rocketmq_client_remoting::client::hook::ConsumeMessageHook>);
     let mut cctx = ConsumeMessageContext::new(consumer_group, Some(pulled.to_vec()), Some(mq.clone()));
     ck.check(
-        "T4 ConsumeMessageContext defaults success to True like Python",
+        "T4 ConsumeMessageContext defaults success to True",
         cctx.success && cctx.msg_list.len() == pulled.len(),
         &format!("success={} len={}", cctx.success, cctx.msg_list.len()),
     );
@@ -1242,7 +1242,7 @@ async fn t5_trace(
         &format!("got={got:?}"),
     );
     ck.check(
-        "T5 a Pub record carries no storeTime (Java's 14-field layout)",
+        "T5 a Pub record carries no storeTime (14-field layout)",
         got.store_time == 0 && got.client_host == local_address(),
         &format!("storeTime={} clientHost={}", got.store_time, got.client_host),
     );
@@ -1382,7 +1382,7 @@ async fn t6_metrics(
         &format!("{snap}"),
     );
     ck.check(
-        "T6 sendRTAvg is rtSum / successCount (Python's denominator)",
+        "T6 sendRTAvg is rtSum / successCount",
         (snap.send_rt_avg * 2.0 - snap.send_rt_sum).abs() <= 0.002
             && snap.send_rt_sum > snap.send_rt_avg,
         &format!("{snap}"),
@@ -1411,7 +1411,7 @@ async fn t6_metrics(
     );
     let json = snap.to_json_value();
     ck.check(
-        "T6 snapshot JSON keeps Python's key names",
+        "T6 snapshot JSON keeps the camelCase key names",
         json.get("sendCount").is_some()
             && json.get("sendFailureCount").is_some()
             && json.get("consumeRTAvg").is_some()
@@ -1419,7 +1419,7 @@ async fn t6_metrics(
         &format!("{json}"),
     );
     ck.check(
-        "T6 snapshot Display is Python's ClientMetrics<dict>",
+        "T6 snapshot Display prints the ClientMetrics{...} form",
         snap.to_string().starts_with("ClientMetrics{"),
         &format!("{snap}"),
     );

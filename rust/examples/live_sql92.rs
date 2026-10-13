@@ -1,7 +1,6 @@
 //! SQL92 过滤 + `CHECK_CLIENT_CONFIG(46)` 对**真实 5.5.1 集群**的联调验证。
 //!
-//! 与 `python/verify_sql92_live.py`、`cpp/examples/sql92_live.cpp`、
-//! `csharp/examples/RocketMQ.Examples/LiveSql92.cs` 同一套断言（四语言对拍）。
+//! 逐项真机断言。
 //!
 //! 为什么必须在真集群上跑：SQL92 这条链路最容易「静默失效」。broker 的
 //! `ExpressionMessageFilter` 在 ConsumeQueue 阶段拿不到编译好的过滤数据时**直接放行全部
@@ -366,7 +365,7 @@ async fn s1_wire_evidence(env: &Env, ck: &mut Checker) {
         return;
     }
     ck.check(
-        "纯 TAG 订阅一笔 46 都不发（Java isTagType 短路）",
+        "纯 TAG 订阅一笔 46 都不发（isTagType 短路）",
         tag_probe.check_count() == 0,
         &format!("codes={:?}", tag_probe.codes()),
     );
@@ -394,7 +393,7 @@ async fn s2_s3_real_filtering(env: &Env, ck: &mut Checker) {
             }
         }
     }
-    // 顺序照 Python：**先全部 start，再发消息**。
+    // 顺序：**先全部 start，再发消息**。
     for c in &consumers {
         if let Err(e) = c.start().await {
             ck.abort("S2 consumer start", &e.to_string());

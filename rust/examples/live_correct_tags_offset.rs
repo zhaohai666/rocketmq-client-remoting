@@ -1,5 +1,4 @@
-//! 与 `python/verify_correct_tags_offset_live.py`、`cpp/examples/live_correct_tags_offset.cpp`、
-//! csharp 的对应场景同题、逐条对应。
+//! 订阅 tag 位点修正分支真机验证。
 //!
 //! 离线单测（`src/client/consumer.rs` 的 `correct_tags_offset_*` 与
 //! `dispatch_loop_keeps_the_correction_out_until_the_listener_returns`）锁的是**判据**；
@@ -179,7 +178,7 @@ impl Fixture {
     /// 该 topic 在路由上的真实队列列表。
     ///
     /// 不能用「主 topic 有几个队列」当通用假设：`%RETRY%<group>` 是 broker 建的，
-    /// 只有 1 个队列（Python 参考实现同样按路由查）。照 4 个去查会把"只有 q0 有记录"
+    /// 只有 1 个队列（本端也按路由查）。照 4 个去查会把"只有 q0 有记录"
     /// 误报成失败。
     async fn queues(&self, topic: &str) -> Vec<MessageQueue> {
         match self.admin.get_topic_publish_info(topic, false).await {

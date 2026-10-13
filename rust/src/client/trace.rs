@@ -128,10 +128,10 @@ impl fmt::Display for AccessChannel {
     }
 }
 
-/// Rust（和 Python）的 `split` 会保留末尾空串，而编码结果末尾正好补了
+/// Rust 的 `split` 会保留末尾空串，而编码结果末尾正好补了
 /// FIELD_SPLITOR，所以直接用 `str::split` 会多出一段空记录；对内容段
 /// （CONTENT_SPLITOR）同理 —— SubBefore 无 keys 时字段会整体错位。
-/// 这条差异是真金白银的对拍坑，勿改成 `str::split`。
+/// 这条差异是真金白银踩过的坑，勿改成 `str::split`。
 pub fn java_split(value: &str, sep: char) -> Vec<&str> {
     let mut parts: Vec<&str> = value.split(sep).collect();
     while parts.last() == Some(&"") {
@@ -162,7 +162,7 @@ fn compute_local_address() -> String {
             }
             out
         }
-        // 解析不了（例如宿主返回了主机名）就原样用，对应 Python 的 except 分支
+        // 解析不了（例如宿主返回了主机名）就原样用，不报错
         _ => ip,
     }
 }
@@ -1160,7 +1160,7 @@ mod tests {
         let ctx = TraceContext::new();
         assert_eq!(ctx.trace_type, None);
         assert!(ctx.time_stamp > 0);
-        assert!(ctx.is_success, "Java isSuccess 默认 true");
+        assert!(ctx.is_success, "isSuccess 默认 true");
         assert_eq!(ctx.cost_time, 0);
         assert_eq!(ctx.context_code, 0);
         assert_eq!(ctx.access_channel, None);
@@ -1171,7 +1171,7 @@ mod tests {
         assert_eq!(
             ctx.request_id,
             ctx.request_id.to_ascii_uppercase(),
-            "Java UtilAll.bytes2string 是大写 hex"
+            "requestId 是大写 hex"
         );
         assert_ne!(ctx.request_id, TraceContext::new().request_id);
     }
@@ -1225,7 +1225,7 @@ mod tests {
 
     #[test]
     fn encoder_uses_only_ordinary_fields_in_trans_key() {
-        // 连续空格切出的空串会进集合（与 Python 一致），分发器拼 KEYS 时才过滤
+        // 连续空格切出的空串会进集合，分发器拼 KEYS 时才过滤
         let ctx = ctx_of(TraceType::Recall, vec![bean(MSG_ID_1, "A  B", 0)]);
         let tb = TraceDataEncoder::encoder_from_context_bean(Some(&ctx)).unwrap();
         assert!(tb.trans_key.contains("A"));

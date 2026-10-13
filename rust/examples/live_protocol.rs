@@ -7,7 +7,6 @@
 //! cargo run --example live_protocol -- 127.0.0.1:9876
 //! ```
 //!
-//! 对应 Python 侧的 `python/verify_pop_live.py` 与 `python/tests/*_live.py`：
 //! 断言统一走 [`Checker::check`] 累积，任何一项失败进程以非 0 退出码结束。
 //!
 //! ## 覆盖场景
@@ -68,10 +67,10 @@ use rocketmq_client_remoting::remoting::protocol::serialize::{
     header_length_of, protocol_type_of, RemotingSerializable,
 };
 
-/// 本次建出的 topic 队列数（对齐 Python `create_topic_in_broker` 的默认 4）。
+/// 本次建出的 topic 队列数（默认 4）。
 const QUEUE_NUMS: i32 = 4;
 
-/// 一次运行的日志前缀（Python 用 `now_str()`，这里同一角色）。
+/// 一次运行的时间戳日志前缀。
 ///
 /// topic / group 带时间戳后缀，避免同一集群上多次运行互相读到上次的消息 ——
 /// broker 的 `storePathRootDir` 是持久的，不复位就会累积历史消息。
@@ -152,7 +151,7 @@ async fn get_route(
         request_code::GET_ROUTEINFO_BY_TOPIC,
         Some(Box::new(GetRouteInfoRequestHeader {
             topic: Some(topic.to_string()),
-            // Python 不写这个字段（None 就不进 extFields），保持一致。
+            // 这个字段留 None（None 时不进 extFields）。
             accept_standard_json_only: None,
         })),
     );
@@ -176,9 +175,8 @@ fn decode_route(resp: &RemotingCommand, what: &str) -> Result<TopicRouteData, St
 ///
 /// ⚠ RocketMQ 5.x 的 NameServer **不再**为未知 topic 回落到 TBW102 —— 直接查
 /// 新 topic 会回 `TOPIC_NOT_EXIST(17)`，这正是控制台报
-/// "No route info of this topic" 的来源。Python 参考实现走的是同一条路：
-/// `mq_client.create_topic_in_route` 先查 `MixAll.DEFAULT_TOPIC` 的路由，
-/// 再对每个 broker 下 `UPDATE_AND_CREATE_TOPIC(17)`。
+/// "No route info of this topic" 的来源。本端引导走的是同一条路：先查
+/// `DEFAULT_TOPIC` 的路由，再对每个 broker 下 `UPDATE_AND_CREATE_TOPIC(17)`。
 /// broker 侧 `AdminBrokerProcessor.createTopic` 会同步
 /// `registerIncrementBrokerData` 把新 topic 推给所有 namesrv，所以 S1 无需等待。
 async fn s0_bootstrap(

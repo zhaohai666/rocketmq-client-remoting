@@ -1,4 +1,4 @@
-//! 移植 `python/remoting/protocol/admin_body.py`：
+//! 管理与统计类报文模型：
 //! `TopicStatsTable` / `TopicOffset` / `ConsumeStats` / `OffsetWrapper` /
 //! `TopicConfigSerializeWrapper` / `ConsumeQueueData` / `QueryConsumeQueueResponseBody`。
 //!
@@ -15,11 +15,11 @@
 //!
 //! ## 为什么这里有 `MessageQueueKey` 而不是 `crate::common::MessageQueue`
 //!
-//! 协议层必须能脱离 common 层独立编译（common 层由另一条流水线并行移植），
+//! 协议层必须能脱离 common 层独立编译（本层不引用 common），
 //! 所以在本层声明一个最小可比较的键类型；上层可以直接 `From` 转换。
 //!
 //! 本模块同时导出 `j*` 系列 JSON 取值工具，供 `route` / `body` / `heartbeat` /
-//! `subscription` 复用（对齐 Python 里 `body.py` 从 `admin_body.py` 借键工具的写法）。
+//! `subscription` 复用。
 
 use serde_json::{Map, Value};
 
@@ -28,10 +28,10 @@ use crate::error::{Error, Result};
 
 // ---------------------------------------------------------------- 通用 JSON 取值工具
 //
-// 语义与 Python 侧 `d.get(key, default)` + `int()/float()/bool()` 宽松转换一致：
+// JSON 取值的宽松转换语义：
 // 缺键回默认值，数字写成字符串也能读，脏数据回默认值而不是 panic。
 
-/// 取原始字段（不存在或显式 `null` 都返回 `None`，对应 Python 的 `d.get(k)`）。
+/// 取原始字段（不存在或显式 `null` 都返回 `None`）。
 pub fn jfield<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value.get(key).filter(|v| !v.is_null())
 }
@@ -129,7 +129,7 @@ pub fn expect_object(value: &Value, what: &str) -> Result<()> {
     }
 }
 
-/// 原样透传的 map 字段（缺失时给 `{}`，与 Python 的 `dict(d.get(k) or {})` 一致）。
+/// 原样透传的 map 字段（缺失或 `null` 时给 `{}`）。
 pub fn jraw_map(value: &Value, key: &str) -> Value {
     match jfield(value, key) {
         Some(Value::Object(map)) => Value::Object(map.clone()),
@@ -221,7 +221,7 @@ pub fn parse_message_queue_key(key: &str) -> Option<MessageQueueKey> {
 
 /// 通用：解析以 MessageQueue 为键的 map（fastjson2 非字符串键），保持报文顺序。
 ///
-/// 非内联对象键按 Python 语义直接跳过。
+/// 非内联对象键（报文里形状不对的那几项）直接跳过。
 pub fn decode_message_queue_map<T, F>(raw: Option<&Value>, parse: F) -> Result<Vec<(MessageQueueKey, T)>>
 where
     F: Fn(&Value) -> Result<T>,
@@ -586,7 +586,7 @@ impl QueryConsumeQueueResponseBody {
                 for item in items {
                     list.push(ConsumeQueueData::from_json_value(item)?);
                 }
-                // Python: `[..] if raw else None` —— 空数组等价于 None。
+                // 空数组等价于 None：没有条目就不给 Some(空表)。
                 Some(list)
             }
         };
@@ -622,7 +622,7 @@ mod tests {
         r#""topicPutTps":0.0}"#
     );
 
-    /// 来自 `python/tests/test_admin_models.py::WIRE_CONSUME_STATS`。
+    /// 线上记录的 ConsumeStats 应答报文。
     pub const WIRE_CONSUME_STATS: &str = concat!(
         r#"{"consumeTps":1.5,"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:"#,
         r#"{"brokerOffset":100,"consumerOffset":90,"lastTimestamp":1700000000000,"pullOffset":0}}}"#
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn plain_string_map_keys_are_not_message_queues() {
-        // Python: parseMessageQueueKey("0"|"G1") -> false
+        // 普通字符串键（"0" / "G1"）不是消息队列键，一律判 false
         assert!(parse_message_queue_key("0").is_none());
         assert!(parse_message_queue_key("G1").is_none());
         assert!(parse_message_queue_key("").is_none());
@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn two_entry_offset_table_keeps_report_order() {
-        // python/tests/test_admin_models.py 的两队列夹具：totalMaxOffset 10
+        // 两队列的报文夹具：totalMaxOffset 应为 8 + 2 = 10
         let text = concat!(
             r#"{"offsetTable":{{"brokerName":"broker-a","queueId":0,"topic":"T"}:"#,
             r#"{"minOffset":0,"maxOffset":8,"lastUpdateTimestamp":1789374000000},"#,

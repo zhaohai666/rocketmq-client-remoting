@@ -3,8 +3,7 @@
 //! N 个 broker，只说 remoting 协议），把每个 broker 的应答码和应答延迟脚本化。
 //!
 //! 末尾另有一节「unitMode / enableStreamRequestType」用同一套假集群做**线上报文**断言
-//! （`unitMode` 落在 V2 头的单字母键 `k`、`ReqT` 由 stream 钩子在 encode 之前写入），
-//! 与 `python/tests/test_send_retry.py`、`cpp/tests/test_send_retry.cpp` 同题。
+//! （`unitMode` 落在 V2 头的单字母键 `k`、`ReqT` 由 stream 钩子在 encode 之前写入）。
 
 #![cfg(test)]
 
@@ -456,7 +455,7 @@ async fn added_retry_response_code_makes_a_code_retryable() {
     let producer = started("retry_added", &cluster).await;
     producer.add_retry_response_code(response_code::MESSAGE_ILLEGAL);
     assert!(producer.is_retry_response_code(Some(response_code::MESSAGE_ILLEGAL)));
-    // 压根没等到响应码（连接都没通）等于不可重试，与 Python `None in set` 一致
+    // 压根没等到响应码（连接都没通）等于不可重试：空码不在可重试集合里
     assert!(!producer.is_retry_response_code(None));
 
     let mut msg = Message::new("T1", Some(b"body"));
@@ -477,7 +476,7 @@ async fn exhausted_retries_report_brokers_sent_and_code() {
     let mut msg = Message::new("T1", Some(b"body"));
     let err = producer.send(&mut msg, None, None).await.expect_err("全失败必须抛错");
     let (code, message) = expect_client_code(err);
-    // 最后一次失败是 broker 码 ⇒ 沿用该码（Python `code = last_exc.response_code`）
+    // 最后一次失败是 broker 码 ⇒ 沿用该码
     assert_eq!(code, Some(response_code::SYSTEM_BUSY));
     assert!(message.contains("Send [3] times"), "{message}");
     assert!(message.contains("Topic: T1"), "{message}");
@@ -1021,7 +1020,7 @@ async fn send_batch_writes_client_ids_before_encoding_the_body() {
     // ② msg_id 就是批量自己写在报文属性里的 UNIQ_KEY，offsetMsgId 才是 broker 那份
     let msg_id = result.msg_id.clone().expect("批量也要报出客户端 ID");
     assert_eq!(msg_id.len(), 32, "{msg_id}");
-    assert!(!msg_id.contains(','), "Java 的逗号串口径本端口不跟随：{msg_id}");
+    assert!(!msg_id.contains(','), "批量 msgId 用单个句柄，不拼逗号串：{msg_id}");
     let wire_ext = cluster.send_ext(0, 0);
     let props = ext_value(&wire_ext, "i").unwrap_or_default();
     assert!(props.contains(msg_id.as_str()), "批量自身的 ID 要真的上线：{props}");
@@ -1097,7 +1096,7 @@ async fn stream_request_type_is_off_by_default_for_producers() {
 
 use std::sync::atomic::AtomicUsize;
 
-/// 记录回调的发送回调（Python 测试里的 `_Callback`）。
+/// 记录回调的发送回调。
 #[derive(Default)]
 struct Recorder {
     done: AtomicUsize,
@@ -1271,7 +1270,7 @@ fn labelled(topic_len: usize, label: &str) -> Message {
     msg
 }
 
-/// 开了背压的生产者：条数闸设成 `num`、字节闸夹到地板值 1M（同 Python 的夹具）。
+/// 开了背压的生产者：条数闸设成 `num`、字节闸夹到地板值 1M。
 ///
 /// 字节闸只能配到 1M —— 再小会被夹回来，而 1M 已经够把「一笔扣了多少字节」算清楚
 /// （body 只有几百字节）。
@@ -1423,7 +1422,7 @@ fn constructor_floors_undersized_capacities() {
     assert_eq!(
         producer.get_back_pressure_for_async_send_num(),
         1,
-        "配置值本身不改（Java 的字段同样原样留着）"
+        "配置值本身原样留着不改"
     );
     assert_eq!(
         producer.semaphore_async_send_num_available_permits(),
@@ -1505,7 +1504,7 @@ async fn num_gate_rejects_with_contract_message_and_sends_nothing() {
     assert_eq!(errors.len(), 1);
     assert!(
         errors[0].contains("send message tryAcquire semaphoreAsyncNum timeout"),
-        "文案要与 Java 逐字一致: {}",
+        "错误文案逐字校验: {}",
         errors[0]
     );
     assert!(
@@ -1545,7 +1544,7 @@ async fn size_gate_rejects_and_gives_the_num_permit_back() {
     let errors = cb.errors();
     assert!(
         errors[0].contains("send message tryAcquire semaphoreAsyncSize timeout"),
-        "文案要与 Java 逐字一致: {}",
+        "错误文案逐字校验: {}",
         errors[0]
     );
     assert_eq!(
@@ -1768,7 +1767,7 @@ async fn queue_wait_beyond_budget_reports_async_send_call_timeout() {
     assert_eq!(errors.len(), 1);
     assert!(
         errors[0].contains("DEFAULT ASYNC send call timeout"),
-        "文案要与 Java 逐字一致: {}",
+        "错误文案逐字校验: {}",
         errors[0]
     );
     assert_eq!(cluster.requests(0), 0, "预算没了就不该再发请求");
@@ -1807,7 +1806,7 @@ async fn queue_full_rejects_the_caller_without_sending() {
         .expect_err("队列满了要把这一笔退回调用方");
     assert!(
         err.to_string().contains("executor rejected"),
-        "文案要对齐 Python（Java 的字面量末尾多一个空格）: {err}"
+        "拒绝文案逐字校验（末尾不留多余空格）: {err}"
     );
     assert_eq!(cb.done.load(Ordering::SeqCst), 0, "被拒的一笔不该有回调");
     assert_eq!(cluster.requests(0), 0, "被拒之前一次请求都不该发出去");
@@ -1853,7 +1852,7 @@ async fn queue_full_with_backpressure_dispatches_off_the_queue() {
     producer.shutdown();
 }
 
-/// 池已随 `shutdown()` 关掉 ⇒ 同步报错给调用方（Python 同），而不是把任务投进一个
+/// 池已随 `shutdown()` 关掉 ⇒ 同步报错给调用方，而不是把任务投进一个
 /// 不会再有人消费的队列。回调一次都不跑。
 #[tokio::test]
 async fn send_async_after_shutdown_is_rejected() {
@@ -1892,7 +1891,7 @@ async fn prep_stage_beyond_budget_reports_send_kernel_timeout() {
     let errors = cb.errors();
     assert!(
         errors[0].contains("sendKernelImpl call timeout"),
-        "文案要与 Java 逐字一致: {}",
+        "错误文案逐字校验: {}",
         errors[0]
     );
     assert_eq!(cluster.requests(0), 0, "预算没了就不该把请求交出去");
@@ -1949,7 +1948,7 @@ async fn async_retry_honours_retry_times_when_send_async_failed() {
     assert_eq!(errors.len(), 1);
     assert!(
         errors[0].contains("send request failed"),
-        "Java 的 RemotingSendRequestException 分支: {}",
+        "RemotingSendRequestException 分支: {}",
         errors[0]
     );
     producer.shutdown();
@@ -1993,7 +1992,7 @@ async fn broker_rejected_response_ends_the_chain_after_one_attempt() {
         .expect("运行时内可派发");
     assert!(wait_until(|| cb.done.load(Ordering::SeqCst) == 1).await);
     assert_eq!(cluster.requests(0), 1);
-    assert_eq!(cluster.requests(1), 0, "异步链不换 broker（Java needRetry=false）");
+    assert_eq!(cluster.requests(1), 0, "异步链不换 broker（needRetry=false 的那支）");
     let errors = cb.errors();
     assert!(
         errors[0].contains("MQBrokerException"),
@@ -2092,7 +2091,7 @@ fn send_async_before_start_raises_without_calling_back() {
         .expect_err("未启动就该同步报错");
     assert!(
         err.to_string().contains("producer not started"),
-        "文案要对齐 Python `_require_client`: {err}"
+        "未启动的守卫文案逐字校验: {err}"
     );
     assert_eq!(cb.done.load(Ordering::SeqCst), 0);
 }
@@ -2223,7 +2222,7 @@ async fn pinned_async_send_refuses_with_the_async_wording_via_the_callback() {
     let errors = cb.errors();
     assert!(
         errors.first().is_some_and(|e| e.contains(PINNED_TOPIC_MISMATCH_ASYNC)),
-        "异步文案要逐字对上 Java: {errors:?}"
+        "异步文案逐字校验: {errors:?}"
     );
     assert_eq!(cluster.requests(0), 0, "拒绝要发生在任何请求之前");
     producer.shutdown();
@@ -2247,7 +2246,7 @@ async fn oneway_pinned_send_has_no_topic_guard() {
     producer
         .send_oneway(&mut msg, Some(&mq))
         .await
-        .expect("Java 的 sendOneway 没有守卫");
+        .expect("单向发送这条路径没有队列归属守卫");
     // 单向发送不等应答，客户端返回时假 broker 可能还没读完这一帧 —— 轮询等它落地。
     assert!(
         wait_until(|| cluster.requests(0) == 2).await,
@@ -2257,7 +2256,7 @@ async fn oneway_pinned_send_has_no_topic_guard() {
     assert_eq!(
         ext_value(&cluster.send_ext(0, 1), "b"),
         Some("T1"),
-        "Java 的头里 topic 取 msg.getTopic()，只有 queueId 来自 mq —— 没有守卫时就会这样错位上线"
+        "头里的 topic 取消息自己的 topic，只有 queueId 来自点名队列 —— 没有守卫时就会这样错位上线"
     );
     producer.shutdown();
 }

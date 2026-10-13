@@ -1,5 +1,4 @@
-//! 与 `python/verify_fail_fast_live.py`、`cpp/examples/live_fail_fast.cpp`、
-//! `csharp/examples/RocketMQ.Examples/LiveFailFast.cs` 同场景、同断言。
+//! 快速失败（failFast）传输层真机验证。
 //!
 //! 前置：NameServer + Broker 已起（脚本会**停一次 broker 再拉起**，不删 store）。
 //!
@@ -379,7 +378,7 @@ async fn run(namesrv: &str, broker_script: PathBuf) -> Checker {
         .map(|p| p.2.clone())
         .unwrap_or_default();
     ck.check(
-        "L3 报的是 RemotingSendRequestException（Java failFast 的口径）",
+        "L3 报的是 RemotingSendRequestException（failFast 的口径）",
         send_request == PARKED,
         &format!("kinds={kinds}"),
     );

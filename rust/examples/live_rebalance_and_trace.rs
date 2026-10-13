@@ -14,7 +14,7 @@
 //!   listener 消费一次、listener 看到的是真字段（storeHost / storeTimestamp /
 //!   queueOffset / reconsumeTimes），以及 `Clone` 与原池共享关停状态。
 //! - R3 `trace_hook`：把 `SendMessageTraceHook` / `ConsumeMessageTraceHook` 挂上
-//!   真实发送链路（`SendResult` 完全按 Python `_parse_send_response` 的口径构造），
+//!   真实发送链路（`SendResult` 完全按 broker 响应的解析口径构造），
 //!   轨迹通道**真的把编码结果发到独立轨迹 topic**，再从 broker 拉回来解码，
 //!   核对 Pub / SubBefore / SubAfter 三类记录与 SubBefore↔SubAfter 共享的 requestId。
 //! - R4 清理：删掉业务 topic 与轨迹 topic 的 broker 配置和 namesrv 路由。
@@ -25,7 +25,7 @@
 //!
 //! 未覆盖：`EndTransactionTraceHook` 需要事务半消息（`SEND_MESSAGE_V2` +
 //! `END_TRANSACTION(37)`），等 `producer.rs` 落地事务链路后一并验证；该钩子自身的
-//! 字段口径已由 `trace_hook.rs` 的 Python 对拍单测覆盖。
+//! 字段口径已由 `trace_hook.rs` 的对拍单测覆盖。
 //!
 //! 用法（先按项目 README 起本地集群）：
 //! ```text
@@ -82,7 +82,7 @@ use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingComm
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializable;
 
-/// 建出来的 topic 队列数（对齐 Python `create_topic_in_broker` 默认 4）。
+/// 建出来的 topic 队列数（默认 4）。
 const QUEUE_NUMS: i32 = 4;
 /// body 以 `later-` 开头的那一批返回 RECONSUME_LATER，用来证明状态真的回传给调用方。
 const LATER_PREFIX: &str = "later-";
@@ -264,7 +264,7 @@ fn build_message(topic: &str, body: &[u8], tags: &str, keys: &str) -> Message {
     msg
 }
 
-/// Python `_parse_send_response` 的 status_map（响应码 → SendStatus）。
+/// 发送响应的 status_map（响应码 → SendStatus）。
 fn send_status_from_code(code: i32) -> Option<SendStatus> {
     match code {
         response_code::SUCCESS => Some(SendStatus::SendOk),
@@ -275,7 +275,7 @@ fn send_status_from_code(code: i32) -> Option<SendStatus> {
     }
 }
 
-/// 一次真实发送的结果。`result` 逐字段照抄 Python `mq_client._parse_send_response`
+/// 一次真实发送的结果。`result` 逐字段按 broker 响应的解析口径构造
 /// —— R3 的轨迹钩子只认这个口径（`regionId` 或 `traceOn` 缺一个就不落库）。
 struct Sent {
     /// 客户端 UNIQ_KEY（= `result.msg_id`）。
@@ -336,7 +336,7 @@ async fn send_full(
     let trace_switch = resp.get_ext_field(message_const::PROPERTY_TRACE_SWITCH);
     let result = SendResult {
         status,
-        // Python `get_uniq_id(msg) or header.msg_id`
+        // uniq 非空用 uniq，否则回落到响应头 msg_id
         msg_id: Some(if uniq.is_empty() { broker_msg_id.clone() } else { uniq.clone() }),
         message_queue: Some(MessageQueue::new(
             &topic,
@@ -345,7 +345,7 @@ async fn send_full(
         )),
         queue_offset: resp_header.queue_offset.unwrap_or(0),
         transaction_id: resp_header.transaction_id.clone(),
-        // Python `offset_msg_id = header.msg_id`：响应头的 msgId 是 broker 侧的 offsetMsgId
+        // 响应头的 msgId 是 broker 侧的 offsetMsgId
         offset_msg_id: Some(broker_msg_id.clone()),
         // 定时消息才有；普通消息恒为 None
         recall_handle: resp_header.recall_handle.clone(),
@@ -354,7 +354,7 @@ async fn send_full(
         } else {
             region.to_string()
         }),
-        // Python `str(ext.get(TRACE_ON)) != "false"`：字段缺失时是 "None" ⇒ true
+        // 只有显式 "false" 才算关，字段缺失 ⇒ true
         trace_on: trace_switch.map(|v| v != "false").unwrap_or(true),
     };
     Ok(Sent {
@@ -489,7 +489,7 @@ async fn r1_allocate_strategy(
         Arc::new(AllocateMessageQueueAveragelyByCircle);
     let config: Arc<dyn AllocateMessageQueueStrategy> = Arc::new(AllocateMessageQueueByConfig::default());
     ck.check(
-        "R1 strategy names are Java's AVG / AVG_BY_CIRCLE / CONFIG",
+        "R1 strategy names are AVG / AVG_BY_CIRCLE / CONFIG",
         avg.get_name() == "AVG" && circle.get_name() == "AVG_BY_CIRCLE" && config.get_name() == "CONFIG",
         &format!(
             "names=[{}, {}, {}]",
@@ -560,7 +560,7 @@ async fn r1_allocate_strategy(
         &format!("avg {:?} -> {again:?}, circle {:?} -> {again_circle:?}", avg3[0], circle3[0]),
     );
 
-    // 守卫：客户端 id 不在组内 / 没有队列 / 没有同伴 ⇒ 空结果（Python 一致，不报错）。
+    // 守卫：客户端 id 不在组内 / 没有队列 / 没有同伴 ⇒ 空结果（不报错）。
     let outsider = alloc(&avg, &format!("{consumer_group}@10.0.0.9#9"), &three)?;
     let no_queues = avg
         .allocate(consumer_group, &three[0], &[], &three)
@@ -724,7 +724,7 @@ async fn r2_consume_executor(
         );
         prev_offset = Some(sent.queue_offset);
         ck.check(
-            "R2 the real SendResult carries Python's msgId / offsetMsgId pair",
+            "R2 the real SendResult carries the msgId / offsetMsgId pair",
             sent.msg_id != sent.offset_msg_id
                 && sent.result.region_id.as_deref() == Some(MixAll::DEFAULT_TRACE_REGION_ID)
                 && sent.result.trace_on,
@@ -762,7 +762,7 @@ async fn r2_consume_executor(
         &format!("{executor:?}"),
     );
 
-    // 入参照抄 Python 的夹取：core 不为负、max 不小于 core。
+    // 入参夹取：core 不为负、max 不小于 core。
     let clamped = ConsumeExecutor::with_params(-1, 3, Duration::ZERO, "rmq-clamp");
     let raised = ConsumeExecutor::with_params(5, 2, Duration::from_secs(1), "rmq-raise");
     ck.check(
@@ -775,7 +775,7 @@ async fn r2_consume_executor(
     );
     let rejected = executor.set_core_pool_size(-1).err().map(|e| e.to_string());
     ck.check(
-        "R2 set_core_pool_size(-1) is rejected with Python's ValueError text",
+        "R2 set_core_pool_size(-1) is rejected with the expected error text",
         rejected.as_deref().map(|m| m.ends_with("core pool size must be >= 0")) == Some(true),
         &format!("err={rejected:?}"),
     );
@@ -819,7 +819,7 @@ async fn r2_consume_executor(
         &format!("queued={} workers={}", executor.queued_count(), executor.worker_count()),
     );
 
-    // 第 4 批走 clone：`Clone` 共享同一个池（Python 里 consumer 持有的就是同一个引用）。
+    // 第 4 批走 clone：`Clone` 共享同一个池。
     let shared = executor.clone();
     let task = make_consume_task(
         3,
@@ -899,7 +899,7 @@ async fn r2_consume_executor(
     executor.shutdown();
     let refused = shared.submit(Box::pin(async {})).err().map(|e| e.to_string());
     ck.check(
-        "R2 submit after shutdown is refused with Python's RuntimeError text, and the clone sees the same flag",
+        "R2 submit after shutdown is refused with the expected error text, and the clone sees the same flag",
         refused.as_deref().map(|m| m.ends_with("ConsumeExecutor has been shut down")) == Some(true),
         &format!("err={refused:?} cloneWorkers={}", shared.worker_count()),
     );
@@ -921,8 +921,7 @@ async fn r2_consume_executor(
 
 // ------------------------------------------------------------------ R3
 
-/// 真实轨迹通道：钩子交出的每条 `TraceContext` 编码后**真的发到轨迹 topic**，
-/// 对应 Python `AsyncTraceDispatcher._send_trace_data_by_mq`
+/// 真实轨迹通道：钩子交出的每条 `TraceContext` 编码后**真的发到轨迹 topic**
 /// （body = trans_data，KEYS = 排序后的 trans_key，不带 tags）。
 struct LiveTraceSink {
     handle: Handle,
@@ -998,8 +997,8 @@ impl TraceReportSink for LiveTraceSink {
         };
         self.accepted.fetch_add(1, Ordering::SeqCst);
         lock(&self.reported).push(context);
-        // Python `KEY_SEPARATOR.join(sorted(key_set))`：trans_key 是 BTreeSet，
-        // 迭代序即排序序，与 Python 的 sorted() 同。
+        // trans_key 用 `KEY_SEPARATOR` 连接，它是 BTreeSet，
+        // 迭代序即排序序，join 出来的结果天然有序。
         let keys = bean
             .trans_key
             .iter()
@@ -1151,7 +1150,7 @@ async fn r3_trace_hook(
         &format!("bean={first_bean:?} wantBodyLen={}", format!("trace-{topic}-payload-0").len()),
     );
     ck.check(
-        "R3 storeTime is time_stamp + costTime/2 (Python's floor division)",
+        "R3 storeTime is time_stamp + costTime/2 (integer division)",
         first_bean.store_time == first_pub.time_stamp + i64::from(first_pub.cost_time) / 2,
         &format!(
             "ts={} cost={} storeTime={}",
@@ -1265,7 +1264,7 @@ async fn r3_trace_hook(
         &format!("after={sub_after:?}"),
     );
 
-    // 空批次：before/after 都不该产出任何记录（Python 的第一道 `if not msg_list`）。
+    // 空批次：before/after 都不该产出任何记录。
     let before_empty = sink.accepted();
     let mut empty_ctx = ConsumeMessageContext::new(consumer_group, None, None);
     execute_consume_hook_before(&consume_hooks, &mut empty_ctx);

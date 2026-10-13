@@ -15,7 +15,7 @@ pub enum SendStatus {
 }
 
 impl SendStatus {
-    /// 对应 Python `SendStatus.from_code`：未知 code 回落 `SEND_OK`。
+    /// 未知 code 一律回落 `SEND_OK`。
     pub fn from_code(code: i32) -> SendStatus {
         match code {
             1 => SendStatus::FlushDiskTimeout,
@@ -118,7 +118,7 @@ impl SendResult {
 }
 
 impl fmt::Display for SendResult {
-    /// 逐字段对齐 Python `SendResult.__repr__`，日志/自检查里会比对这串文本。
+    /// 逐字段渲染，日志/自检查里会比对这串文本。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -136,7 +136,7 @@ impl fmt::Display for SendResult {
     }
 }
 
-/// 可选字段的显示口径：`None` 就写 `None`（Python `Optional` 字段的 repr）。
+/// 可选字段的显示口径：`None` 就写 `None`。
 pub(crate) fn opt_str(value: &Option<String>) -> String {
     match value {
         Some(s) => s.clone(),
@@ -158,7 +158,7 @@ pub enum LocalTransactionState {
 }
 
 impl LocalTransactionState {
-    /// 对应 Python `TransactionSendResult` 的 code 解析：未知值按 `UNKNOW`。
+    /// 事务应答 code 解析：未知值按 `UNKNOW`。
     pub fn from_code(code: i32) -> LocalTransactionState {
         match code {
             0 => LocalTransactionState::CommitMessage,
@@ -285,7 +285,7 @@ pub enum PopStatus {
 }
 
 impl PopStatus {
-    /// 对应 Python 的解析：broker 给的是名字串，未知值按 `FOUND` 处理。
+    /// POP 应答解析：broker 给的是名字串，未知值按 `FOUND` 处理。
     pub fn from_name(name: &str) -> PopStatus {
         match name {
             "NO_NEW_MSG" => PopStatus::NoNewMsg,
@@ -341,7 +341,7 @@ impl fmt::Display for PopResult {
     }
 }
 
-/// 对应 `change_invisible_time` 的结果（Python `ChangeInvisibleTimeResult`）。
+/// 对应 `change_invisible_time` 的结果。
 ///
 /// `extra_info` 是用响应里**新的** popTime/invisibleTime/reviveQid 重建的 CK 串，
 /// 后续 ACK 必须用它，而不是请求时传进去的旧串。
@@ -459,7 +459,7 @@ impl fmt::Display for ConsumeOrderlyStatus {
 pub struct ConsumeConcurrentlyContext {
     pub message_queue: Option<MessageQueue>,
     /// 缺省 0；为 0 时由投递线程改写成 `3 + reconsumeTimes`
-    /// （见 `consumer.rs` 的重投逻辑，对齐 Python `_send_back_batch`）。
+    /// （见 `consumer.rs` 的批量重投逻辑）。
     pub delay_level_when_next_consume: i32,
     pub ack_index: i32,
 }

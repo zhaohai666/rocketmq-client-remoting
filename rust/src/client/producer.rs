@@ -109,7 +109,7 @@ mod send_retry_tests;
 #[cfg(test)]
 mod detector_tests;
 
-/// Python `DefaultMQProducer.instance_name` 的默认值。
+/// `instance_name` 的默认值。
 pub const DEFAULT_INSTANCE_NAME: &str = "DEFAULT";
 /// 单条消息 body 的默认上限：4 MiB。
 pub const DEFAULT_MAX_MESSAGE_SIZE: i32 = 1024 * 1024 * 4;
@@ -187,7 +187,7 @@ impl MessageQueueSelector for SelectMessageQueueByRandom {
         if mqs.is_empty() {
             bail!("no message queue");
         }
-        // 与 Python `random.randint(0, n-1)` 同样用进程级随机源（无线上语义）。
+        // 进程级随机源取模（无线上语义）。
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as usize)
@@ -224,10 +224,10 @@ pub trait SendCallback: Send + Sync + 'static {
     fn on_exception(&self, err: Error);
 }
 
-/// 成功回调闭包（Python `SendCallbackImpl(success_fn=...)`）。
+/// 成功回调闭包。
 pub type OnSuccessFn = Box<dyn FnOnce(SendResult) + Send + 'static>;
 
-/// 失败回调闭包（Python `SendCallbackImpl(exception_fn=...)`）。
+/// 失败回调闭包。
 pub type OnExceptionFn = Box<dyn FnOnce(Error) + Send + 'static>;
 
 /// 便捷回调：把两个普通闭包拼成 [`SendCallback`]
@@ -238,7 +238,7 @@ pub struct ClosureSendCallback {
 }
 
 impl ClosureSendCallback {
-    /// `success` / `failure` 任一可为 `None`（Python 的默认参数）。
+    /// `success` / `failure` 任一可为 `None`。
     pub fn new(
         success: Option<OnSuccessFn>,
         failure: Option<OnExceptionFn>,
@@ -266,7 +266,7 @@ impl ClosureSendCallback {
 
 impl SendCallback for ClosureSendCallback {
     /// `FnOnce` 只能跑一次：取走即空，重复回调（成功与失败同时发生）时后到的那个
-    /// 被忽略 —— Python 的 `SendCallbackImpl` 会重复调，但那条路径本身就不该出现。
+    /// 被忽略（成功与失败同时发生本就不该出现）。
     fn on_success(&self, result: SendResult) {
         if let Some(f) = self.take_success() {
             f(result);
@@ -284,7 +284,7 @@ impl SendCallback for ClosureSendCallback {
 
 /// 事务监听器：半消息发送成功后执行本地事务，并响应 broker 回查。
 ///
-/// Python 允许 `execute_local_transaction` 返回 `None`（视作 `UNKNOW`）并捕获异常；
+/// 监听器可以返回「不知道」（视作 `UNKNOW`）并自行捕获异常；
 /// Rust 用 [`LocalTransactionState::Unknow`] 表达「不知道」，监听器内部自己把异常
 /// 转成 `Unknow`（发送链路的 `catch` 语义见
 /// [`DefaultMQProducer::send_message_in_transaction`]）。
@@ -317,7 +317,7 @@ pub trait TransactionListener: Send + Sync + 'static {
 /// 下面的 blanket impl 让任何同时实现两者的类型自动可用，[`SinkAdapter`] 再把它
 /// 适配成钩子需要的形状。
 pub trait TraceDispatcherChannel: Send + Sync {
-    /// 对应 `TraceDispatcher::start`（Python `dispatcher.start(namesrv_addr)`）。
+    /// 对应 `TraceDispatcher::start`。
     fn start(&self, name_server_addr: &str) -> Result<()>;
 
     /// 对应 `TraceDispatcher::shutdown`。
@@ -386,17 +386,15 @@ impl TraceReportSink for SinkAdapter {
 /// [`Default`] 实现）。
 #[derive(Debug, Clone)]
 pub struct ProducerConfig {
-    /// Python `producer_group`。
     pub producer_group: String,
-    /// Python `tls_enable`：`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
+    /// `None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
     pub tls_enable: Option<bool>,
     pub socks_proxy: Option<SocksProxyConfig>,
-    /// Python `enable_trace_context`：`None` = 交给环境变量
+    /// `None` = 交给环境变量
     /// `ROCKETMQ_TRACE_CONTEXT_ENABLE`。
     pub enable_trace_context: Option<bool>,
-    /// Python `namespace`（非空时 topic 与 producerGroup 都加 `<ns>%` 前缀）。
+    /// `namespace`（非空时 topic 与 producerGroup 都加 `<ns>%` 前缀）。
     pub namespace: String,
-    /// Python `instance_name`。
     pub instance_name: String,
     /// `unitName`（默认不设）：非空时拼进 clientId，
     /// 并作为地址服务器 URL 的 `-<unitName>` 段。
@@ -415,24 +413,18 @@ pub struct ProducerConfig {
     /// 路由周期刷新间隔，`start()` 时透传给 `MQClientInstance`，之后改不改都不再影响
     /// 已排定的任务（`scheduleAtFixedRate` 一次性排定周期）。
     pub poll_name_server_interval_millis: u64,
-    /// Python `client_id`：`None` 时 `start()` 生成 `<instanceName>@<yyyyMMddHHmmss>`。
+    /// `None` 时 `start()` 生成 `<instanceName>@<yyyyMMddHHmmss>`。
     pub client_id: Option<String>,
-    /// Python `create_topic_key`。
     pub create_topic_key: String,
-    /// Python `default_topic_queue_nums`。
     pub default_topic_queue_nums: i32,
-    /// Python `send_msg_timeout`。
     pub send_msg_timeout: i64,
-    /// Python `compress_msg_body_over_howmuch`。
     pub compress_msg_body_over_howmuch: i32,
-    /// Python `compress_level`。
     pub compress_level: i32,
-    /// Python `compress_type`：**算法号**（[`MessageSysFlag::ZLIB_TYPE`] /
+    /// **算法号**（[`MessageSysFlag::ZLIB_TYPE`] /
     /// `LZ4_TYPE` / `ZSTD_TYPE`，即 0~3），不是 `*_COMPRESSION_*_TYPE` 那种
     /// 已经移位到 flag 位上的形式；[`crate::common::compression::compress`] 与
     /// [`MessageSysFlag::set_compression_type`] 都取算法号。默认 ZLIB。
     pub compress_type: i32,
-    /// Python `retry_times_when_send_failed`。
     pub retry_times_when_send_failed: i32,
     /// `retry_times_when_send_async_failed`（默认 2）：
     /// 异步发送在**请求已发出之后**的换 broker 重试次数上限，即异步链
@@ -450,10 +442,9 @@ pub struct ProducerConfig {
     /// `send_msg_max_timeout_per_request`（默认 -1 = 单次请求不设上限，
     /// 只受整体 `send_msg_timeout` 预算约束）。
     pub send_msg_max_timeout_per_request: i64,
-    /// Python `retry_response_codes`：broker 回了这些**业务错误码**时换一台 broker 重发，
+    /// broker 回了这些**业务错误码**时换一台 broker 重发，
     /// 而不是直接把失败抛给调用方。
     pub retry_response_codes: BTreeSet<i32>,
-    /// Python `max_message_size`。
     pub max_message_size: i32,
     /// `enable_backpressure_for_async_mode`：
     /// 默认 **关**。开了之后异步发送在真正发请求之前要先过两个维度的公平信号量闸。
@@ -464,24 +455,18 @@ pub struct ProducerConfig {
     /// `back_pressure_for_async_send_size`：
     /// 在途**字节数**上限，默认 100M，地板 [`MIN_ASYNC_SEND_SIZE`]。
     pub back_pressure_for_async_send_size: i64,
-    /// Python `topics`。
     pub topics: Vec<String>,
-    /// Python `name_server_addrs`。
     pub name_server_addrs: Vec<String>,
-    /// Python `heartbeat_interval_millis`。
     pub heartbeat_interval_millis: u64,
-    /// Python `send_latency_fault_enable`。
     pub send_latency_fault_enable: bool,
     pub start_detector_enable: bool,
     pub detect_timeout: i64,
     pub detect_interval: i64,
-    /// Python `enable_trace`。
     pub enable_trace: bool,
-    /// Python `trace_topic`（`None` → 系统默认轨迹 topic）。
+    /// `trace_topic`（`None` → 系统默认轨迹 topic）。
     pub trace_topic: Option<String>,
-    /// Python `trace_msg_batch_num`。
     pub trace_msg_batch_num: i32,
-    /// Python `request_timeout`（`request()` 未显式给 timeout 时用）。
+    /// `request_timeout`（`request()` 未显式给 timeout 时用）。
     pub request_timeout: i64,
     /// `autoBatch`（默认 **false**）：打开后 `send(Message)`
     /// 先按 `AggregateKey` 归并成批量再发（见 [`crate::client::produce_accumulator`]）。
@@ -566,33 +551,29 @@ impl Default for ProducerConfig {
 /// `mq_client::ClientRemotingProcessor` 相同：否则
 /// `Inner → RemotingClient → processor → Inner` 会成环而永不释放。
 struct Inner {
-    /// Python 上散落的公有属性；`RwLock` 让 setter 与 Python 一样「随时可调」，
+    /// 散落的公有属性集中在一份配置里；`RwLock` 让 setter「随时可调」，
     /// 异步发送路径在读锁外快照所需字段（跨 `.await` 持读锁会让 future 不 `Send`）。
     cfg: RwLock<ProducerConfig>,
-    /// Python `_mq_client`。
+    /// 客户端实例。
     client: Mutex<Option<MQClientInstance>>,
-    /// Python `_started`。
     started: AtomicBool,
     /// 差异 3：`start()` 时惰性绑定的运行时句柄，`send_async` 与心跳任务用它派发。
     runtime: OnceLock<tokio::runtime::Handle>,
-    /// Python `_heartbeat_running`（true = 停）。
+    /// 心跳停止标志（true = 停）。
     stop: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    /// Python `_mq_fault_strategy`。
+    /// broker 故障表策略。
     fault_strategy: MQFaultStrategy,
-    /// Python `metrics`。
     metrics: ClientMetrics,
-    /// Python `send_message_hook_list`。
+    /// 发送前后钩子表。
     send_hooks: SendMessageHookList,
-    /// Python `end_transaction_hook_list`。
+    /// 事务结束钩子表。
     end_txn_hooks: EndTransactionHookList,
-    /// Python `check_forbidden_hook_list`。
+    /// 发送前拦截钩子表。
     check_forbidden_hooks: CheckForbiddenHookList,
-    /// Python `_transaction_listener`。
     transaction_listener: RwLock<Option<Arc<dyn TransactionListener>>>,
-    /// Python `trace_dispatcher`；差异 4：由调用方注入。
+    /// 轨迹分发器；差异 4：由调用方注入。
     trace: Mutex<Option<Arc<dyn TraceDispatcherChannel>>>,
-    /// Python `rpc_hook`。
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
     /// 异步发送在途**条数**的公平信号量（`_semaphore_async_send_num`）：
     /// 建对象时就按配置定容（越界兜地板值），
@@ -633,7 +614,7 @@ impl Inner {
         self.cfg.read().unwrap_or_else(|e| e.into_inner()).unit_mode
     }
 
-    /// Python `_send_header_args` 里的另两项：每次发请求都要带上、且只来源于生产者配置的
+    /// 发送请求头的另两项：每次发请求都要带上、且只来源于生产者配置的
     /// `c`（createTopicKey）与 `d`（defaultTopicQueueNums），
     /// 即发送内核为新建 topic 准备的 `createTopicKey` 与
     /// `defaultTopicQueueNums`（broker 据此自动建 topic 与队列数）。
@@ -708,7 +689,7 @@ type AsyncSendJob = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// 取不到核数时按 1 兜底。下限取 `MIN_ASYNC_SEND_NUM` 是因为「在途条数」背压信号量的
 /// 下限就是它(10)：发送器必须至少能并发跑这么多笔，这个背压下限才有意义——否则低核
 /// 机器上信号量永远凑不满（最多只会被占 1~2 份），背压等于失效。多核机器下
-/// `availableProcessors` 语义与原 Java 客户端一致，不受影响。
+/// `availableProcessors` 语义保持不变，不受影响。
 fn async_sender_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -768,7 +749,7 @@ impl AsyncSenderExecutor {
     }
 }
 
-/// 忘记调 `shutdown()` 时也不能留下还在跑的后台任务（Python 的守护线程随进程退出，
+/// 忘记调 `shutdown()` 时也不能留下还在跑的后台任务（守护线程随进程退出，
 /// Rust 的 tokio 任务会一直活在被泄漏的运行时里）。
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -794,8 +775,8 @@ impl Drop for Inner {
 /// 之后仍可继续 `set_xxx`，副本立即可见。
 ///
 /// 生命周期：[`start`](Self::start) → 若干 `send*` → [`shutdown`](Self::shutdown)。
-/// 未启动就发送会得到 [`Error::Client`]（Python `_require_client` 的
-/// `producer not started, call start() first`）。
+/// 未启动就发送会得到 [`Error::Client`]：
+/// `producer not started, call start() first`。
 #[derive(Clone)]
 pub struct DefaultMQProducer {
     inner: Arc<Inner>,
@@ -818,8 +799,8 @@ impl std::fmt::Debug for DefaultMQProducer {
 }
 
 impl DefaultMQProducer {
-    /// 对应 Python `DefaultMQProducer(producer_group)`；组名空则报错
-    /// （Python 抛 `MQClientException("producerGroup is empty")`）。
+    /// 按生产者组名构造；组名空则报错
+    /// （`MQClientException("producerGroup is empty")`）。
     pub fn new(producer_group: &str) -> Result<DefaultMQProducer> {
         let cfg = ProducerConfig {
             producer_group: producer_group.to_string(),
@@ -837,7 +818,7 @@ impl DefaultMQProducer {
         Ok(producer)
     }
 
-    /// 直接以一份完整配置构造（Python 没有对应入口，等价于逐个 `set_*`）。
+    /// 直接以一份完整配置构造（等价于逐个 `set_*`）。
     pub fn with_config(cfg: ProducerConfig) -> Result<DefaultMQProducer> {
         if cfg.producer_group.trim().is_empty() {
             bail!("producerGroup is empty");
@@ -876,7 +857,7 @@ impl DefaultMQProducer {
         Ok(DefaultMQProducer { inner })
     }
 
-    /// 当前生效的配置快照（Python 直接读属性）。
+    /// 当前生效的配置快照。
     pub fn config(&self) -> ProducerConfig {
         self.inner
             .cfg
@@ -893,7 +874,7 @@ impl DefaultMQProducer {
         self.inner.started.load(Ordering::Acquire)
     }
 
-    /// [`MQClientInstance`]（Python `_mq_client`），未启动时 `None`。
+    /// [`MQClientInstance`]，未启动时 `None`。
     pub fn client(&self) -> Option<MQClientInstance> {
         self.inner.client()
     }
@@ -910,7 +891,7 @@ impl DefaultMQProducer {
 
     // ---------------- 配置 ----------------
 
-    /// Python `set_namesrv_addr`：`;` 分隔，空白项丢弃。
+    /// `;` 分隔，空白项丢弃。
     pub fn set_namesrv_addr(&self, addr: &str) {
         let addrs = addr
             .split(';')
@@ -921,12 +902,11 @@ impl DefaultMQProducer {
         self.write_cfg(|c| c.name_server_addrs = addrs);
     }
 
-    /// Python `set_name_server_addresses`。
     pub fn set_name_server_addresses(&self, addrs: Vec<String>) {
         self.write_cfg(|c| c.name_server_addrs = addrs);
     }
 
-    /// Python `get_namesrv_addr`：`;` 拼接。
+    /// `;` 拼接。
     pub fn namesrv_addr(&self) -> String {
         self.inner
             .cfg
@@ -936,7 +916,6 @@ impl DefaultMQProducer {
             .join(";")
     }
 
-    /// Python `set_instance_name`。
     pub fn set_instance_name(&self, name: &str) {
         self.write_cfg(|c| c.instance_name = name.to_string());
     }
@@ -973,23 +952,22 @@ impl DefaultMQProducer {
         self.write_cfg(|c| c.poll_name_server_interval_millis = millis);
     }
 
-    /// Python `set_namespace`（`__init__` 的 `namespace` 参数）。
+    /// 设置 namespace。
     pub fn set_namespace(&self, namespace: &str) {
         self.write_cfg(|c| c.namespace = namespace.to_string());
     }
 
-    /// Python `set_topics`。
     pub fn set_topics(&self, topics: Vec<String>) {
         self.write_cfg(|c| c.topics = topics);
     }
 
-    /// Python `tls_enable` 属性（`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`）。
+    /// `tls_enable`（`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`）。
     pub fn set_tls_enable(&self, tls_enable: Option<bool>) {
         self.write_cfg(|c| c.tls_enable = tls_enable);
     }
 
-    /// Python `enable_trace_context` 属性（`None` = 交给环境变量
-    /// `ROCKETMQ_TRACE_CONTEXT_ENABLE`，Python 在 `__init__` 里就解析掉）。
+    /// `enable_trace_context`（`None` = 交给环境变量
+    /// `ROCKETMQ_TRACE_CONTEXT_ENABLE`，启动时定型）。
     pub fn set_enable_trace_context(&self, enable: Option<bool>) {
         self.write_cfg(|c| c.enable_trace_context = enable);
     }
@@ -1000,17 +978,14 @@ impl DefaultMQProducer {
         });
     }
 
-    /// Python `set_max_message_size`。
     pub fn set_max_message_size(&self, size: i32) {
         self.write_cfg(|c| c.max_message_size = size);
     }
 
-    /// Python `set_send_msg_timeout`。
     pub fn set_send_msg_timeout(&self, timeout_millis: i64) {
         self.write_cfg(|c| c.send_msg_timeout = timeout_millis);
     }
 
-    /// Python `set_retry_times_when_send_failed`。
     pub fn set_retry_times_when_send_failed(&self, n: i32) {
         self.write_cfg(|c| c.retry_times_when_send_failed = n);
     }
@@ -1023,13 +998,13 @@ impl DefaultMQProducer {
         self.read_cfg(|c| c.retry_times_when_send_async_failed)
     }
 
-    /// C++ `setAsyncSenderQueueCapacity`（Python 直接改 `async_sender_queue_capacity` 属性）：
-    /// 异步发送队列容量，**只在 `start()` 建池时生效**。
+    /// 异步发送队列容量（`async_sender_queue_capacity` 属性），
+    /// **只在 `start()` 建池时生效**。
     pub fn set_async_sender_queue_capacity(&self, capacity: i32) {
         self.write_cfg(|c| c.async_sender_queue_capacity = capacity);
     }
 
-    /// C++ `getAsyncSenderQueueCapacity`。
+    /// 取异步发送队列容量。
     pub fn get_async_sender_queue_capacity(&self) -> i32 {
         self.read_cfg(|c| c.async_sender_queue_capacity)
     }
@@ -1038,7 +1013,6 @@ impl DefaultMQProducer {
         self.write_cfg(|c| c.retry_another_broker_when_not_store_ok = retry);
     }
 
-    /// Python `is_retry_another_broker_when_not_store_ok`。
     pub fn is_retry_another_broker_when_not_store_ok(&self) -> bool {
         self.read_cfg(|c| c.retry_another_broker_when_not_store_ok)
     }
@@ -1050,12 +1024,11 @@ impl DefaultMQProducer {
         self.write_cfg(|c| c.send_msg_max_timeout_per_request = timeout_millis);
     }
 
-    /// Python `get_send_msg_max_timeout_per_request`。
     pub fn get_send_msg_max_timeout_per_request(&self) -> i64 {
         self.read_cfg(|c| c.send_msg_max_timeout_per_request)
     }
 
-    /// Python `add_retry_response_code`：往可重试码集合里加一个 broker 响应码。
+    /// 往可重试码集合里加一个 broker 响应码。
     pub fn add_retry_response_code(&self, response_code: i32) {
         self.write_cfg(|c| {
             c.retry_response_codes.insert(response_code);
@@ -1066,7 +1039,7 @@ impl DefaultMQProducer {
         self.read_cfg(|c| c.retry_response_codes.clone())
     }
 
-    /// Python `is_retry_response_code`：`None`（压根没等到响应码）等于不可重试。
+    /// `None`（压根没等到响应码）等于不可重试。
     pub fn is_retry_response_code(&self, response_code: Option<i32>) -> bool {
         match response_code {
             Some(code) => self.read_cfg(|c| c.retry_response_codes.contains(&code)),
@@ -1074,39 +1047,35 @@ impl DefaultMQProducer {
         }
     }
 
-    /// Python `set_compress_msg_body_over_howmuch`。
     pub fn set_compress_msg_body_over_howmuch(&self, size: i32) {
         self.write_cfg(|c| c.compress_msg_body_over_howmuch = size);
     }
 
-    /// Python `set_compress_level`。
     pub fn set_compress_level(&self, level: i32) {
         self.write_cfg(|c| c.compress_level = level);
     }
 
-    /// Python `set_compress_type`（取 [`MessageSysFlag::ZLIB_TYPE`] 等**算法号**）。
+    /// 设置压缩算法（取 [`MessageSysFlag::ZLIB_TYPE`] 等**算法号**）。
     pub fn set_compress_type(&self, compression_type: i32) -> Result<()> {
         let normalized = compression::validate_compression_type(compression_type)?;
         self.write_cfg(|c| c.compress_type = normalized);
         Ok(())
     }
 
-    /// Python `set_create_topic_key`。
     pub fn set_create_topic_key(&self, key: &str) {
         self.write_cfg(|c| c.create_topic_key = key.to_string());
     }
 
-    /// Python `set_default_topic_queue_nums`。
     pub fn set_default_topic_queue_nums(&self, n: i32) {
         self.write_cfg(|c| c.default_topic_queue_nums = n);
     }
 
-    /// Python `set_heartbeat_interval_millis`（属性直改）。
+    /// 心跳间隔（属性直改）。
     pub fn set_heartbeat_interval_millis(&self, millis: u64) {
         self.write_cfg(|c| c.heartbeat_interval_millis = millis);
     }
 
-    /// Python `set_producer_group`：启动后禁止改（broker 侧已按旧组名登记）。
+    /// 启动后禁止改（broker 侧已按旧组名登记）。
     pub fn set_producer_group(&self, group: &str) -> Result<()> {
         if self.is_started() {
             bail!("producerGroup cannot be changed after startup");
@@ -1115,7 +1084,7 @@ impl DefaultMQProducer {
         Ok(())
     }
 
-    /// Python `set_send_latency_fault_enable`：配置与策略一起改
+    /// 配置与策略一起改
     /// （策略是 `Arc` 共享的，所以运行中切换也生效）。
     pub fn set_send_latency_fault_enable(&self, enable: bool) {
         self.write_cfg(|c| c.send_latency_fault_enable = enable);
@@ -1148,17 +1117,16 @@ impl DefaultMQProducer {
         self.read_cfg(|c| c.detect_interval)
     }
 
-    /// Python `set_request_timeout`。
     pub fn set_request_timeout(&self, timeout_millis: i64) {
         self.write_cfg(|c| c.request_timeout = timeout_millis);
     }
 
-    /// Python `get_metrics`。
+    /// 取指标采集器。
     pub fn metrics(&self) -> &ClientMetrics {
         &self.inner.metrics
     }
 
-    /// Python `_mq_fault_strategy`（暴露故障表便于排错/测试）。
+    /// 暴露故障表便于排错/测试。
     pub fn fault_strategy(&self) -> &MQFaultStrategy {
         &self.inner.fault_strategy
     }
@@ -1169,7 +1137,6 @@ impl DefaultMQProducer {
         self.write_cfg(|c| c.enable_backpressure_for_async_mode = enable);
     }
 
-    /// Python `is_enable_backpressure_for_async_mode`。
     pub fn is_enable_backpressure_for_async_mode(&self) -> bool {
         self.read_cfg(|c| c.enable_backpressure_for_async_mode)
     }
@@ -1180,7 +1147,7 @@ impl DefaultMQProducer {
         self.inner.semaphore_async_send_num.set_total_permits(num);
     }
 
-    /// Python `get_back_pressure_for_async_send_num`（当前配置的总量，不是空闲量）。
+    /// 异步发送在途许可的总量（不是空闲量）。
     pub fn get_back_pressure_for_async_send_num(&self) -> i64 {
         self.read_cfg(|c| c.back_pressure_for_async_send_num)
     }
@@ -1193,7 +1160,6 @@ impl DefaultMQProducer {
         self.inner.semaphore_async_send_size.set_total_permits(size);
     }
 
-    /// Python `get_back_pressure_for_async_send_size`。
     pub fn get_back_pressure_for_async_send_size(&self) -> i64 {
         self.read_cfg(|c| c.back_pressure_for_async_send_size)
     }
@@ -1202,23 +1168,21 @@ impl DefaultMQProducer {
         self.inner.semaphore_async_send_num.available_permits()
     }
 
-    /// Python `get_semaphore_async_send_size_available_permits`。
+    /// 异步发送信号量的空闲许可数。
     pub fn semaphore_async_send_size_available_permits(&self) -> i64 {
         self.inner.semaphore_async_send_size.available_permits()
     }
 
     // ---------------- 消息轨迹配置 ----------------
 
-    /// Python `set_enable_trace`。
     ///
     /// ⚠ 轨迹分发器本身**不在这里新建**（差异 4）：先
-    /// [`set_trace_dispatcher`](Self::set_trace_dispatcher) 注入，`start()` 才会照
-    /// Python 的顺序注册两个轨迹钩子并启动它。
+    /// [`set_trace_dispatcher`](Self::set_trace_dispatcher) 注入，`start()` 才会
+    /// 按固定顺序注册两个轨迹钩子并启动它。
     pub fn set_enable_trace(&self, enable: bool) {
         self.write_cfg(|c| c.enable_trace = enable);
     }
 
-    /// Python `is_enable_trace`。
     pub fn is_enable_trace(&self) -> bool {
         self.inner
             .cfg
@@ -1227,14 +1191,13 @@ impl DefaultMQProducer {
             .enable_trace
     }
 
-    /// Python `set_trace_topic`（`None` → 系统默认轨迹 topic）。
+    /// 轨迹 topic（`None` → 系统默认轨迹 topic）。
     pub fn set_trace_topic(&self, trace_topic: Option<&str>) {
         self.write_cfg(|c| {
             c.trace_topic = trace_topic.map(str::to_string);
         });
     }
 
-    /// Python `set_trace_msg_batch_num`。
     pub fn set_trace_msg_batch_num(&self, n: i32) {
         self.write_cfg(|c| c.trace_msg_batch_num = n);
     }
@@ -1244,12 +1207,12 @@ impl DefaultMQProducer {
         *self.inner.trace.lock().unwrap_or_else(|e| e.into_inner()) = dispatcher;
     }
 
-    /// 已注入的轨迹分发器（Python `trace_dispatcher` 属性）。
+    /// 已注入的轨迹分发器。
     pub fn trace_dispatcher(&self) -> Option<Arc<dyn TraceDispatcherChannel>> {
         self.inner.trace_dispatcher()
     }
 
-    /// Python `rpc_hook` 属性；`start()` 时注册到 remoting 通道。
+    /// `rpc_hook`；`start()` 时注册到 remoting 通道。
     pub fn set_rpc_hook(&self, hook: Option<Arc<dyn RPCHook>>) {
         *self
             .inner
@@ -1269,37 +1232,32 @@ impl DefaultMQProducer {
 
     // ---------------- 钩子注册 ----------------
 
-    /// Python `register_send_message_hook`。
     pub fn register_send_message_hook(&self, hook: Arc<dyn SendMessageHook>) {
         self.inner.send_hooks.register(hook);
     }
 
-    /// Python `has_send_message_hook`。
     pub fn has_send_message_hook(&self) -> bool {
         self.inner.send_hooks.has_hooks()
     }
 
-    /// Python `register_check_forbidden_hook`。
     pub fn register_check_forbidden_hook(&self, hook: Arc<dyn CheckForbiddenHook>) {
         self.inner.check_forbidden_hooks.register(hook);
     }
 
-    /// Python `has_check_forbidden_hook`。
     pub fn has_check_forbidden_hook(&self) -> bool {
         self.inner.check_forbidden_hooks.has_hooks()
     }
 
-    /// Python `register_end_transaction_hook`。
     pub fn register_end_transaction_hook(&self, hook: Arc<dyn EndTransactionHook>) {
         self.inner.end_txn_hooks.register(hook);
     }
 
-    /// Python `_has_send_interceptors`：两类钩子任一存在就得走带钩子的发送内核。
+    /// 两类钩子任一存在就得走带钩子的发送内核。
     fn has_send_interceptors(&self) -> bool {
         self.inner.send_hooks.has_hooks() || self.inner.check_forbidden_hooks.has_hooks()
     }
 
-    /// Python `set_transaction_listener` / `_transaction_listener` 属性。
+    /// 设置/清空事务监听器。
     pub fn set_transaction_listener(&self, listener: Option<Arc<dyn TransactionListener>>) {
         *self
             .inner
@@ -1308,7 +1266,7 @@ impl DefaultMQProducer {
             .unwrap_or_else(|e| e.into_inner()) = listener;
     }
 
-    /// Python `get_transaction_listener`。
+    /// 取当前事务监听器。
     pub fn transaction_listener(&self) -> Option<Arc<dyn TransactionListener>> {
         self.inner
             .transaction_listener
@@ -1317,7 +1275,7 @@ impl DefaultMQProducer {
             .clone()
     }
 
-    /// Python `self.xxx = value` 的统一入口。
+    /// 写配置的统一入口。
     fn write_cfg(&self, f: impl FnOnce(&mut ProducerConfig)) {
         f(&mut self.inner.cfg.write().unwrap_or_else(|e| e.into_inner()));
     }
@@ -1329,9 +1287,8 @@ impl DefaultMQProducer {
 
     // ---------------- 生命周期 ----------------
 
-    /// Python `start()`。
     ///
-    /// 步骤与 `producer.py:434-469` 逐条对齐：校验地址 → 生成 clientId →
+    /// 启动步骤逐条固定：校验地址 → 生成 clientId →
     /// 生产者组拼命名空间 → 建/复用 [`MQClientInstance`] → 注册 RPC 钩子 →
     /// 启动实例 → 回填动态拿到的 namesrv → 注册事务回查处理器 → 起心跳任务。
     pub async fn start(&self) -> Result<()> {
@@ -1376,7 +1333,7 @@ impl DefaultMQProducer {
                 cfg.enable_stream_request_type,
             )
         });
-        // Python 在 `__init__` 里就把 None 解析成布尔；这里等价地在 start 时定型。
+        // 把 None 解析成布尔：这里在 start 时定型。
         let trace_context_on = cfg
             .enable_trace_context
             .unwrap_or_else(trace_context_enabled_from_env);
@@ -1467,7 +1424,7 @@ impl DefaultMQProducer {
                         send_heartbeat_to_all_broker(&inner, &client).await;
                     }
                     drop(inner);
-                    // Python 以 1s 为粒度轮询 `_heartbeat_running`；watch 通道
+                    // 用 watch 通道替代 1s 粒度轮询：
                     // 直接等到点或被叫醒。
                     if tokio::time::timeout(
                         Duration::from_millis(interval_millis.max(1000)),
@@ -1482,8 +1439,8 @@ impl DefaultMQProducer {
             });
             self.push_task(task);
         } else {
-            // 没有运行时就没法跑心跳：发送本身仍可用（Python 的线程也一样会失败吗？
-            // 不会，Python 总能起线程）。这里显式告警，避免用户静默丢掉事务回查能力。
+            // 没有运行时就没法跑心跳：发送本身仍可用（线程模型下总能起线程）。
+            // 这里显式告警，避免用户静默丢掉事务回查能力。
             rmq_warn!(
                 "producer: no tokio runtime, heartbeat disabled; broker transaction \
                        check-back will not reach this producer"
@@ -1519,7 +1476,7 @@ impl DefaultMQProducer {
         Ok(())
     }
 
-    /// Python `shutdown()`。
+    /// 关闭生产者。
     ///
     /// ⚠ 与「spawn 后立即返回」的旧形态不同：35 号注销与实例拆解挂在运行时上跑，
     /// 但本方法**阻塞等它落地**（上限 [`SHUTDOWN_FINALIZE_BUDGET`]）。
@@ -1546,8 +1503,8 @@ impl DefaultMQProducer {
             task.abort();
         }
         stop_expired_request_scan();
-        // ⚠ 与 Python 的差别：Python 只把 `_mq_client` 留着（下次 start 会新建并覆盖
-        // INSTANCE_MAP）；这里丢掉引用，好让 `create_mq_client_instance` 在重启时
+        // ⚠ 这里丢掉实例引用（只留着的话，下次 start 会新建并覆盖 INSTANCE_MAP），
+        // 好让 `create_mq_client_instance` 在重启时
         // 建出干净的新实例，而不是复用一个已被 shutdown 的。
         let client = self
             .inner
@@ -1588,7 +1545,7 @@ impl DefaultMQProducer {
                         finalize,
                     );
                 }
-                // 无运行时：这一发注销发不出去（Python 那里线程照起），但至少把实例还掉。
+                // 无运行时：这一发注销发不出去，但至少把实例还掉。
                 _ => {
                     rmq_warn!("producer shutdown: no tokio runtime, skip broker unregister");
                     client.shutdown();
@@ -1600,7 +1557,6 @@ impl DefaultMQProducer {
         }
     }
 
-    /// Python `_require_client`。
     fn require_client(&self) -> Result<MQClientInstance> {
         if !self.is_started() {
             return Err(Error::client("producer not started, call start() first"));
@@ -1631,8 +1587,7 @@ impl DefaultMQProducer {
 
     /// 注入优先（[`set_trace_dispatcher`](Self::set_trace_dispatcher)，原差异 4）；
     /// `enable_trace=true` 且未注入时经 [`auto_bridged_dispatcher`] 自动建一套
-    /// —— 与 Python `producer._start_trace_dispatcher`（`producer.py:869-891`）
-    /// 行为一致。任何失败都只记日志 —— 轨迹挂了不能影响正常发送。
+    /// —— 与宿主侧自动接线行为一致。任何失败都只记日志 —— 轨迹挂了不能影响正常发送。
     fn start_trace_dispatcher(&self) {
         let cfg = self.config();
         let dispatcher: Arc<dyn TraceDispatcherChannel> = match self.inner.trace_dispatcher() {
@@ -1646,14 +1601,14 @@ impl DefaultMQProducer {
                     cfg.trace_topic.clone(),
                 ) {
                     Ok(d) => {
-                        // Python `dispatcher.set_host_producer(self)`（producer.py:881）
+                        // 把宿主接到分发器上
                         d.set_host_producer(Arc::new(self.clone()));
                         let channel: Arc<dyn TraceDispatcherChannel> = d;
                         self.set_trace_dispatcher(Some(channel.clone()));
                         channel
                     }
                     Err(e) => {
-                        // 文案照抄 Python producer.py:886
+                        // 错误文案逐字校验
                         rmq_error!(
                             "system mqtrace hook init failed ,maybe can't send msg trace data: {e}"
                         );
@@ -1664,7 +1619,7 @@ impl DefaultMQProducer {
             None => return,
         };
         if cfg.enable_trace {
-            // 重启不能把轨迹钩子注册第二遍（Python 每次 start 新建 dispatcher，
+            // 重启不能把轨迹钩子注册第二遍（每次 start 新建 dispatcher 时
             // 钩子也只挂一次）。
             let sink: Arc<dyn TraceReportSink> = Arc::new(SinkAdapter(dispatcher.clone()));
             if !has_hook_named(&self.inner.send_hooks.hooks(), "SendMessageTraceHook") {
@@ -1680,7 +1635,7 @@ impl DefaultMQProducer {
     }
 }
 
-/// 按 `hook_name()` 去重（Python 靠「每次新建 dispatcher 时才注册」天然不重复）。
+/// 按 `hook_name()` 去重（「每次新建 dispatcher 时才注册」本就不会重复）。
 fn has_hook_named(hooks: &[Arc<dyn SendMessageHook>], name: &str) -> bool {
     hooks.iter().any(|h| h.hook_name() == name)
 }
@@ -1747,16 +1702,14 @@ impl ServiceDetector for MaxOffsetServiceDetector {
 
 // ================================================================ 轨迹自动桥接
 
-/// Python `_get_and_create_trace_producer`（`trace_dispatcher.py:95-105`）的 Rust 版：
 /// 建一个**真的**内部生产者并连同分发器一起装配好。
 ///
 /// `send_msg_timeout=5000` / `max_msg_size=128000` / `enable_trace=false` 三项
-/// 由 [`AsyncTraceDispatcher::with_config`] 按 Python 的顺序打在生产者上，这里不重复。
+/// 由 [`AsyncTraceDispatcher::with_config`] 按固定顺序打在生产者上，这里不重复。
 ///
 /// 与注入式用法的分工：调用方注入的 [`TraceDispatcherChannel`] 优先（原差异 4 约定）；
 /// `enable_trace=true` 且未注入时，`start_trace_dispatcher` 走这里自动建一套，
-/// 与 Python `producer._start_trace_dispatcher` / `consumer._start_trace_dispatcher`
-/// 的行为一致 —— 轨迹开箱即用，不再要求手写桥接。
+/// 与生产/消费两侧的自动接线行为一致 —— 轨迹开箱即用，不再要求手写桥接。
 pub fn auto_bridged_dispatcher(
     host_group: &str,
     dispatcher_type: TraceDispatcherType,
@@ -1773,7 +1726,7 @@ pub fn auto_bridged_dispatcher(
         TraceDispatcherConfig {
             producer: Some(Arc::new(producer)),
             trace_producer_group: Some(producer_group),
-            // Python `:75`：`min(batch_num, 20)`；负数对 usize 无意义，钳到 0。
+            // `min(batch_num, 20)`；负数对 usize 无意义，钳到 0。
             batch_num: batch_num.clamp(0, 20) as usize,
             trace_topic_name: trace_topic,
             ..Default::default()
@@ -1781,18 +1734,17 @@ pub fn auto_bridged_dispatcher(
     )))
 }
 
-/// Python `set_host_producer(self)` / `set_host_consumer(self)`
-/// （`trace_dispatcher.py:114-118`）的宿主端：分发器的 `_client_id` 读的就是
-/// 宿主 `_mq_client.client_id`，未启动时是空串。
+/// 分发器的宿主端：分发器取 clientId 读的就是
+/// 宿主的 [`MQClientInstance`] 的 clientId，未启动时是空串。
 impl TraceHost for DefaultMQProducer {
     fn client_id(&self) -> String {
         DefaultMQProducer::client_id(self).unwrap_or_default()
     }
 }
 
-/// [`TraceProducer`] 接缝的真实现（Python 的 `trace_producer` 本来就是一个真的
-/// `DefaultMQProducer`，`trace_dispatcher.py:95-105`；此前本 crate 只有测试桩实现
-/// 该接缝，导致轨迹在未手写桥接时完全发不出去）。
+/// [`TraceProducer`] 接缝的真实现（内部生产者本来就是一个真的
+/// `DefaultMQProducer`；若接缝只有测试桩实现，
+/// 轨迹在未手写桥接时就完全发不出去）。
 impl TraceProducer for DefaultMQProducer {
     fn set_name_server_addr(&self, name_server_addr: &str) {
         DefaultMQProducer::set_name_server_addresses(self, vec![name_server_addr.to_string()]);
@@ -1833,7 +1785,7 @@ impl TraceProducer for DefaultMQProducer {
     ) -> TraceProducerFuture<Result<()>> {
         Box::pin(async move {
             // 内部生产者 enable_trace=false（with_config 已关），send 不会再产出轨迹；
-            // Some(timeout) 绕过自动攒批，与 Python `send(msg, 5000)` 的同步直发一致。
+            // Some(timeout) 绕过自动攒批，等同同步直发。
             DefaultMQProducer::send(&self, &mut message, Some(timeout_millis), None)
                 .await
                 .map(|_| ())
@@ -1863,9 +1815,9 @@ impl TraceProducer for DefaultMQProducer {
     }
 }
 
-/// Python `_send_heartbeat_to_all_broker`：向所有已知 broker 发心跳（含 ProducerData）。
+/// 向所有已知 broker 发心跳（含 ProducerData）。
 ///
-/// 返回成功的台数；单台失败只记 warn（Python 同）。
+/// 返回成功的台数；单台失败只记 warn。
 async fn send_heartbeat_to_all_broker(inner: &Inner, client: &MQClientInstance) -> usize {
     let group = inner.producer_group();
     let addrs = client.get_route_of_all_brokers();
@@ -1874,9 +1826,9 @@ async fn send_heartbeat_to_all_broker(inner: &Inner, client: &MQClientInstance) 
     }
     let mut hb = HeartbeatData::new(client.client_id().to_string());
     hb.add_producer_data(ProducerData::new(group));
-    // ⚠ Python 的 HeartbeatData 没有 heartbeatFingerprint / withoutSub 字段
-    // （已知缺陷，见项目记忆）。缺失时 broker 反序列化为 0，等价于走 V1 注册路径，
-    // 与 C++ 侧显式置 0 的效果一致，这里保持现状不引入新差异。
+    // ⚠ 心跳报文里的 heartbeatFingerprint / withoutSub 字段保持缺省
+    // （已知缺陷）。缺失时 broker 反序列化为 0，等价于走 V1 注册路径，
+    // 与显式置 0 的效果一致，这里保持现状不引入新差异。
     let mut ok = 0usize;
     for addr in addrs {
         if let Err(e) = client.send_heartbeat(&addr, &hb, 5000).await {
@@ -1895,8 +1847,8 @@ async fn send_heartbeat_to_all_broker(inner: &Inner, client: &MQClientInstance) 
 /// 现在只剩 [`DefaultMQProducer::topic_publish_info`] 用它决定「要不要强制刷一次路由」；
 /// 发送主循环改用了更细的 [`classify_send_error`]（三档异常在故障表上的记法不同）。
 ///
-/// [`Error::RequestTimeout`] 也在重试之列 —— Python 里它是 `MQClientException`
-/// 的子类，会被同一个 `except` 接住（发送链路本身产不出它，列出来只为口径完整）。
+/// [`Error::RequestTimeout`] 也在重试之列 —— 线上协议里它是 `MQClientException`
+/// 的一种，会被同一档接住（发送链路本身产不出它，列出来只为口径完整）。
 fn retryable(err: &Error) -> bool {
     matches!(
         err,
@@ -1912,7 +1864,7 @@ fn retryable(err: &Error) -> bool {
     )
 }
 
-/// Python 用 `isinstance` 分派；Rust 没有异常继承树，靠 [`Error`] 的变体一一对应
+/// 没有异常继承树可按类型分派，靠 [`Error`] 的变体一一对应
 /// （见 [`classify_send_error`]）。三档在**故障表**和**是否继续重试**上都不一样，
 /// 所以不能像早期版本那样合成一个 `retryable` 判断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1925,11 +1877,11 @@ enum SendErrorKind {
     Client,
 }
 
-/// 把一次发送失败的 [`Error`] 归到 Python 的哪个 `except` 分支；
-/// `None` = 三个分支都接不住（校验错、解码错、本地 IO 错），直接向上抛。
+/// 把一次发送失败的 [`Error`] 归到对应的错误档位；
+/// `None` = 三档都接不住（校验错、解码错、本地 IO 错），直接向上抛。
 ///
-/// [`Error::RequestTimeout`] 属 `MQClientException` 家族（Python
-/// `RequestTimeoutException extends MQClientException`），这点和
+/// [`Error::RequestTimeout`] 属 `MQClientException` 家族
+/// （`RequestTimeoutException` 派生自 `MQClientException`），这点和
 /// [`Error::Timeout`]（remoting 层的 `RemotingTimeoutException`）分属两档，
 /// 是有意为之：前者说明 broker 收到了请求，后者连通道都没走通。
 fn classify_send_error(err: &Error) -> Option<SendErrorKind> {
@@ -1948,8 +1900,8 @@ fn classify_send_error(err: &Error) -> Option<SendErrorKind> {
 
 /// 从 `began`（[`monotonic_millis`] 取的起点）到现在的毫秒数，向下取整。
 ///
-/// 对应 Python 的 `int((time.monotonic() - began) * 1000)`：`as i64` 对正浮点数
-/// 同样是向零取整，语义一致。用挂钟（`current_time_millis`）算不行——系统时间
+/// 单调时钟差值换算成毫秒：`as i64` 对正浮点数
+/// 就是向零取整，语义一致。用挂钟（`current_time_millis`）算不行——系统时间
 /// 一回退就会得到负延迟，反而把慢 broker 记成"很快"。
 fn latency_since(began: f64) -> i64 {
     (monotonic_millis() - began) as i64
@@ -1964,7 +1916,7 @@ fn back_pressure_msg_len(msg: &Message) -> i64 {
 }
 
 /// 批量异步扣多少「字节」许可：逐条累加（空 body 也算 1），整批为空时算 1 ——
-/// 对应 Python `_back_pressure_msg_len` 的 list/MessageBatch 分支。
+/// 与批量消息的背压长度口径一致。
 /// 不给整批一个值就等于让批量消息绕过字节闸：一批 100 条只占 1 份容量。
 fn batch_back_pressure_msg_len(msgs: &[Message]) -> i64 {
     let mut total: i64 = 0;
@@ -2001,10 +1953,10 @@ impl Drop for SendPermits {
     }
 }
 
-/// Python `_build_send_context` 里那串「延迟类属性」判定键。
+/// 「延迟类属性」判定键。
 ///
 /// `__STARTDELIVERTIME` / `TIMER_*` 在本 crate 的 `message_const` 里没有常量
-/// （Python 也是写死字面量 + `getattr` 兜底），保持一致。
+/// （这里同样写死字面量 + 兜底），保持一致。
 const DELAY_PROPERTY_KEYS: [&str; 5] = [
     "__STARTDELIVERTIME",
     crate::common::message_const::PROPERTY_DELAY_TIME_LEVEL,
@@ -2060,11 +2012,11 @@ impl AccumulatorSender for DefaultMQProducer {
 impl DefaultMQProducer {
     // ---------------- 校验 / 压缩 / 路由 ----------------
 
-    /// Python `_check_message` → `client/validators.check_message`。
+    /// 发送前的消息校验。
     ///
     /// 判定全部收敛到 [`validators`]：topic（blank / 127 / 字符表）→ 禁发 topic →
     /// body（null / 零长 / 超 max_message_size）→ INNER_MULTI_DISPATCH 分隔符，
-    /// 顺序与文案跟 Python 一字不差。
+    /// 顺序与错误文案逐字校验。
     fn check_message(&self, msg: &Message) -> Result<()> {
         let max = self
             .inner
@@ -2075,7 +2027,7 @@ impl DefaultMQProducer {
         validators::check_message(msg, max)
     }
 
-    /// Python `try_to_compress_message`：满足阈值时**就地压缩**，返回应下发的 sys_flag。
+    /// 满足阈值时**就地压缩**，返回应下发的 sys_flag。
     fn try_to_compress_message(&self, msg: &mut Message) -> (i32, Option<Vec<u8>>) {
         let (threshold, compress_type, level) = {
             let cfg = self.inner.cfg.read().unwrap_or_else(|e| e.into_inner());
@@ -2117,7 +2069,7 @@ impl DefaultMQProducer {
         msg.topic = NamespaceUtil::without_namespace(&msg.topic, &self.inner.namespace());
     }
 
-    /// 批量版本的压缩判定（Python 由 `isinstance(msg, MessageBatch)` 直接返回 0）。
+    /// 批量版本的压缩判定（批量直接返回 0）。
     ///
     /// 批量**永不压缩**（`MessageBatch.encode()` 出来的拼接体不压），所以这里也不需要
     /// `prevBody`：返回的 flag 恒 0，调用方没有要还原的 body。
@@ -2185,7 +2137,7 @@ impl DefaultMQProducer {
     /// msgType 的判定顺序也照抄：`TRAN_MSG=true` → Trans_Msg_Half；带任何延迟类属性
     /// → Delay_Msg；否则 Normal_Msg。
     ///
-    /// ⚠ Python 把**同一个** message 对象挂进 context（发送路径的后续修改钩子看得见）；
+    /// ⚠ context 里挂的是**发送前**的消息快照（发送路径后续的修改钩子看不见）；
     /// Rust 的 [`SendMessageContext::message`] 是 owned，只能取**发送前**的快照 ——
     /// 轨迹钩子读的正是发送前就确定的 topic/tags/keys/bodyLength，无行为差别。
     fn build_send_context(
@@ -2218,7 +2170,7 @@ impl DefaultMQProducer {
         context
     }
 
-    /// Python `_execute_check_forbidden`：构造上下文并执行（异常**不吞**，
+    /// 构造上下文并执行（异常**不吞**，
     /// 见 [`execute_check_forbidden_hook`]）。
     fn execute_check_forbidden(
         &self,
@@ -2492,12 +2444,11 @@ impl DefaultMQProducer {
 
     // ---------------- 正常发送 ----------------
 
-    /// 同步发送（Python `send(msg, timeout_millis=None, mq=None)`）。
+    /// 同步发送（`send(msg, timeout_millis = None, mq = None)`）。
     ///
     /// `mq` 为 `Some` 时定点发送（不重试、不走故障规避）；`None` 时轮询/故障规避选队，
     /// 并按 `retry_times_when_send_failed` 重试。批量消息请用
-    /// [`send_batch`](Self::send_batch)（Python 靠 `isinstance(msg, list)` 分流，
-    /// Rust 的类型系统已经把它们分开）。
+    /// [`send_batch`](Self::send_batch)（类型系统已经把两类消息分开）。
     pub async fn send(
         &self,
         msg: &mut Message,
@@ -2613,8 +2564,8 @@ impl DefaultMQProducer {
         let begin_first = monotonic_millis();
         let mut brokers_sent: Vec<String> = Vec::new();
         let mut last_broker_name: Option<String> = None;
-        // Python 把「最后一次成功的 SendResult」留在变量里：非 SEND_OK 且开了换 broker
-        // 时会带着它继续重试，后面全失败就原样返回这个"存了但没存好"的结果。
+        // 把「最后一次成功的 SendResult」留在变量里：非 SEND_OK 且开了换 broker
+        // 时会带着它继续重试，后面全失败就原样返回这个「存了但没存好」的结果。
         let mut result: Option<SendResult> = None;
         let mut last_exc: Option<Error> = None;
         let mut call_timeout = false;
@@ -2626,7 +2577,7 @@ impl DefaultMQProducer {
                 attempt > 0,
             ) {
                 Ok(selected) => selected,
-                // 选不到队列属 MQClientException：Python 此时 selected 仍是 None，
+                // 选不到队列属 MQClientException：此时 selected 仍是 None，
                 // `_update_fault_item` 直接 return（不记故障表），只留 last_exc 进下一轮。
                 Err(e) => {
                     last_exc = Some(e);
@@ -2687,7 +2638,7 @@ impl DefaultMQProducer {
                 Err(e) => {
                     self.inner.metrics.record_send_failure(send_start);
                     match classify_send_error(&e) {
-                        // 三个 except 都接不住的异常（校验/解码…）：Python 直接向上抛
+                        // 三档都接不住的异常（校验/解码…）：直接向上抛
                         None => return Err(e),
                         Some(SendErrorKind::Broker) => {
                             // broker 明确回了错误码：隔离该 broker（可达性不动），
@@ -2765,7 +2716,7 @@ impl DefaultMQProducer {
         })
     }
 
-    /// Python `send` 的批量分支（`_send_batch`）。
+    /// 批量发送分支。
     ///
     /// 约束由 [`MessageBatch::generate_from_list`] 保证：非空、同 topic、同
     /// waitStoreMsgOK、不含延迟消息与重试 topic。批量消息**永不压缩**。
@@ -2819,7 +2770,7 @@ impl DefaultMQProducer {
             }
             None => {
                 let route = self.topic_publish_info(&client, &topic).await?;
-                // Python 用 batch.topic 建 mq_sel；Rust 的批量外层 topic 已等于 topic
+                // 批量外层 topic 已等于 topic，直接用它建 mq_sel
                 match route.select_one_message_queue(&[])? {
                     Some(mq) => MessageQueue::new(&topic, &mq.broker_name, mq.queue_id),
                     None => return Err(Error::client("no message queue for publish info")),
@@ -2933,9 +2884,8 @@ impl DefaultMQProducer {
         self.complete_async(&callback, outcome, None, Some(permits));
     }
 
-    /// ⚠ 差别：Python 往 `send_message_oneway` 传了 `send_msg_timeout`，单向调用
-    /// 本就没有超时概念，Rust 的 [`MQClientInstance::send_message_oneway`] 也不收
-    /// 这个参数。
+    /// ⚠ 差别：单向调用本就没有超时概念，
+    /// [`MQClientInstance::send_message_oneway`] 也不收超时参数。
     pub async fn send_oneway(&self, msg: &mut Message, mq: Option<&MessageQueue>) -> Result<()> {
         let client = self.require_client()?;
         let wrapped = self.with_namespace(&msg.topic);
@@ -3061,7 +3011,7 @@ impl DefaultMQProducer {
         timeout_millis: Option<i64>,
         mq: Option<MessageQueue>,
     ) -> Result<()> {
-        // Python `send_async:1098-1102`：未启动 / 池已关都同步抛，不走回调。
+        // 未启动 / 池已关都同步抛，不走回调。
         let _ = self.require_client()?;
         let handle = self
             .runtime_handle()
@@ -3117,7 +3067,7 @@ impl DefaultMQProducer {
                 return;
             }
         };
-        // Python `_run`：出队之后才算真实耗时 —— 预算被排队吃掉就直接回调，不发请求。
+        // 出队之后才算真实耗时 —— 预算被排队吃掉就直接回调，不发请求。
         let cost = latency_since(began);
         if timeout <= cost {
             return self.fail_async(
@@ -3130,13 +3080,13 @@ impl DefaultMQProducer {
             .await;
     }
 
-    /// 背压按**整批**扣字节许可（Python `_back_pressure_msg_len`：逐条累加、空 body 也算 1），
+    /// 背压按**整批**扣字节许可（逐条累加、空 body 也算 1），
     /// 否则一批 100 条只占 1 份容量，等于批量消息绕过了字节闸。
     ///
     /// ⚠ 与单条异步的差别只在**重试语义**：批量路径没有异步链的换 broker 重试（`on_exception`），
     /// 走的是同步内核自己的 `retry_times_when_send_failed` 循环。`SendMessageHook`
-    /// （before/after）**照跑** —— 同步内核内部就是 `send_with_hooks`，与 Python 的
-    /// `_send_batch` 同一口径；钩子上下文由内核建、由内核收尾，[`complete_async`] 只交付
+    /// （before/after）**照跑** —— 同步内核内部就是 `send_with_hooks`，同一口径；
+    /// 钩子上下文由内核建、由内核收尾，[`complete_async`] 只交付
     /// 用户回调和归还许可，不会再跑一次 after。
     pub fn send_batch_async(
         &self,
@@ -3255,8 +3205,8 @@ impl DefaultMQProducer {
                         Some(publish),
                     ),
                     Err(e) => {
-                        // Python 这里 selected 为 None 时报 `Send [0] times, still failed,
-                        // Topic: …, BrokersSent: []`；Rust 的选队列是 `Result`，原始异常
+                        // 这里 selected 为 None 时报 `Send [0] times, still failed,
+                        // Topic: …, BrokersSent: []`；选队列返回 `Result`，原始异常
                         // 只能拼进文本（与同步内核同一口径）。
                         return self.fail_async(
                             &callback,
@@ -3586,7 +3536,7 @@ fn classify_async_failure(err: Error, cost: i64) -> (Error, bool) {
             true,
         ),
         // 其余 RemotingException 都是 `"unknown reason"`，但 `RemotingTooMuchRequestException`
-        // 是「自己人太多」，换 broker 也没用（Python 同：`not isinstance(e, RemotingTooMuch…)`）。
+        // 是「自己人太多」，换 broker 也没用（`RemotingTooMuch…` 单独一档）。
         e @ Error::TooMuchRequest(_) => (
             Error::client(format!("unknown reason, last error: {e}")),
             false,
@@ -3601,13 +3551,12 @@ fn classify_async_failure(err: Error, cost: i64) -> (Error, bool) {
 
 // ================================================================ 事务消息
 
-/// Python `_wait_request_response` 之外，事务链路里「发送后才知道的收尾信息」来源。
+/// 事务链路里「发送后才知道的收尾信息」来源。
 ///
 /// * [`TxnEnd::Normal`]：客户端主动提交/回滚，偏移与事务号取自 `SendResult`；
 /// * [`TxnEnd::Check`]：broker 回查后收尾，取自回查 header（此时没有 `SendResult`）。
 ///
-/// 对应 Python `_end_transaction(send_result, msg, ..., check_header, msg_ext, broker_addr)`
-/// 那六个参数——Rust 用枚举把两条互斥的取值路径分开，免得传一堆 `Option`。
+/// 收尾信息有两条互斥的取值路径，用枚举分开，免得传一堆 `Option`。
 enum TxnEnd<'a> {
     Normal {
         send_result: &'a SendResult,
@@ -3620,8 +3569,8 @@ enum TxnEnd<'a> {
     },
 }
 
-/// Python 事务消息禁止的延迟属性（与钩子上下文那份判定**列表不同**：这里没有
-/// `__STARTDELIVERTIME`，Python `ensureNotDelayedForTransactional` 只用
+/// 事务消息禁止的延迟属性（与钩子上下文那份判定**列表不同**：这里没有
+/// `__STARTDELIVERTIME`，只用
 /// DELAY / DELAY_TIME / TIMER_* 五个键）。
 const TRANSACTION_FORBIDDEN_DELAY_KEYS: [&str; 5] = [
     PROPERTY_DELAY_TIME_LEVEL,
@@ -3640,16 +3589,15 @@ impl DefaultMQProducer {
         }
     }
 
-    /// 发送事务消息（Python `send_message_in_transaction`）。
-    ///
+    /// 发送事务消息。
     ///
     /// `listener` 为 `None` 时用 [`set_transaction_listener`](Self::set_transaction_listener)
-    /// 设过的那个（Python 的 `send_message_in_transaction(msg, listener=None)` 在
-    /// `TransactionMQProducer` 里做的兜底，这里合并到同一个入口）；两个都没有才报错。
+    /// 设过的那个（`TransactionMQProducer` 的兜底已合并到同一个入口）；
+    /// 两个都没有才报错。
     /// 传进来的 listener 会同时记为「当前监听器」，供 broker 回查使用。
     ///
-    /// ⚠ 差异：Python 里「本地事务抛异常」会被捕获，把异常文本写进 END_TRANSACTION 的
-    /// remark 并保持 UNKNOW（`producer.py:934-939`）；Rust 的
+    /// ⚠ 差异：「本地事务抛异常」在原语义里会被捕获，把异常文本写进 END_TRANSACTION 的
+    /// remark 并保持 UNKNOW；Rust 的
     /// [`TransactionListener::execute_local_transaction`] 不抛异常，实现者要把失败
     /// 表达为 [`LocalTransactionState::Unknow`]，让 broker 稍后回查。
     pub async fn send_message_in_transaction(
@@ -3845,7 +3793,7 @@ impl DefaultMQProducer {
         Ok(())
     }
 
-    /// Python `_handle_check_transaction_state`：处理 broker 主动发来的事务回查
+    /// 处理 broker 主动发来的事务回查
     /// （CHECK_TRANSACTION_STATE=39）。
     fn handle_check_transaction_state(&self, request: RemotingCommand, addr: String) -> Result<()> {
         let header: CheckTransactionStateRequestHeader =
@@ -3944,7 +3892,7 @@ impl DefaultMQProducer {
     ///
     ///
     ///
-    /// ⚠ 差别：Python 用 `_NullSendCallback` 把「发送失败」写回等待槽；Rust 里发送
+    /// ⚠ 差别：原语义用空回调把「发送失败」写回等待槽；这里发送
     /// 就在本函数内 `await`，直接拿返回值调
     /// [`RequestResponseFuture::set_failed`]，效果一致（少一个只在内部用的回调类型）。
     pub async fn request(
@@ -3990,7 +3938,7 @@ impl DefaultMQProducer {
         let result = self
             .wait_request_response(&topic, timeout, &future, cost)
             .await;
-        // Python 的 `finally: REQUEST_FUTURE_HOLDER.remove_request(...)`
+        // 无论成败都要清理 request future
         request_future_holder().remove_request(&correlation_id);
         result
     }
@@ -4053,17 +4001,17 @@ impl DefaultMQProducer {
 // ================================================================ 管理类便捷方法
 
 /// 这些方法都要求生产者已 `start()`（拿不到 [`MQClientInstance`] 就报错），
-/// 超时值与 Python 的默认参数逐条一致：路由/offset/建 topic 用 5000ms，
+/// 超时值固定：路由/offset/建 topic 用 5000ms，
 /// 消息查询用 15000ms。
 impl DefaultMQProducer {
-    /// Python `fetch_publish_message_queues`：取 topic 的可发送队列（缓存没有会拉一次路由）。
+    /// 取 topic 的可发送队列（缓存没有会拉一次路由）。
     pub async fn fetch_publish_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = self.require_client()?;
         let publish = client.get_topic_publish_info(topic, false).await?;
         Ok(publish.msg_queue_list())
     }
 
-    /// Python `create_topic`：借默认 topic 路由里的 broker 新建 topic。
+    /// 借默认 topic 路由里的 broker 新建 topic。
     pub async fn create_topic(
         &self,
         new_topic: &str,
@@ -4087,7 +4035,7 @@ impl DefaultMQProducer {
             .await
     }
 
-    /// Python `search_offset`：按时间戳找队列上的位点。
+    /// 按时间戳找队列上的位点。
     pub async fn search_offset(&self, mq: &MessageQueue, timestamp: i64) -> Result<i64> {
         let client = self.require_client()?;
         client
@@ -4095,19 +4043,17 @@ impl DefaultMQProducer {
             .await
     }
 
-    /// Python `max_offset`。
     pub async fn max_offset(&self, mq: &MessageQueue) -> Result<i64> {
         let client = self.require_client()?;
         client.get_max_offset(mq, 5000, None).await
     }
 
-    /// Python `min_offset`。
     pub async fn min_offset(&self, mq: &MessageQueue) -> Result<i64> {
         let client = self.require_client()?;
         client.get_min_offset(mq, 5000, None).await
     }
 
-    /// Python `earliest_msg_store_time`：队列上最早一条消息的存储时间（0 = 队列空）。
+    /// 队列上最早一条消息的存储时间（0 = 队列空）。
     pub async fn earliest_msg_store_time(&self, mq: &MessageQueue) -> Result<i64> {
         let client = self.require_client()?;
         let addr = client.broker_addr(mq).await?;
@@ -4126,7 +4072,7 @@ impl DefaultMQProducer {
         Ok(resp_header.timestamp.unwrap_or(0))
     }
 
-    /// Python `query_message`：按业务 key 查消息，返回解好码的
+    /// 按业务 key 查消息，返回解好码的
     /// [`MessageExt`] 列表（查不到 ⇒ 空列表，不报错）。
     pub async fn query_message(
         &self,
@@ -4140,12 +4086,12 @@ impl DefaultMQProducer {
         let body = client
             .query_message(topic, key, max_num, begin, end, 15000, None, None, false)
             .await?;
-        // Python：`body is None => []`
+        // body 为空时回空表
         Ok(body.map(|b| decode_messages(&b)).unwrap_or_default())
     }
 
-    /// Python `view_message`：按 msgId 读一条消息 —— Python 参考实现直接抛
-    /// `MQClientException`，这里同样只报错（不静默返回空列表）。
+    /// 按 msgId 读一条消息 —— 这里同样只抛
+    /// `MQClientException`（不静默返回空列表）。
     pub fn view_message(&self, topic: &str, msg_id: &str) -> Result<Vec<MessageExt>> {
         Err(Error::client(format!(
             "viewMessage by msgId is not supported in Rust edition (topic={topic}, msgId={msg_id})"
@@ -4155,13 +4101,13 @@ impl DefaultMQProducer {
 
 // ================================================================ 事务生产者
 
-/// Python/C++ 里它是 `DefaultMQProducer` 的子类，只多做一件事：**预置**
+/// 它是 `DefaultMQProducer` 的扩展，只多做一件事：**预置**
 /// [`TransactionListener`]，发送时不必每次传。Rust 没有继承，用「包一层 +
 /// [`std::ops::Deref`]`」得到同样的手感——基础生产者的所有方法照常可用。
 ///
 /// ⚠ [`DefaultMQProducer::send_message_in_transaction`] 本身已经支持「`listener`
 /// 传 `None` 时回落到 [`DefaultMQProducer::set_transaction_listener`] 设过的那个」
-/// （Python 把这段兜底写在子类里，这里合并到基类，C++ 移植的做法一致），
+/// （这段兜底已合并到基类），
 /// 所以本类型只是把「必须先设监听器」这一约束显式化。
 #[derive(Debug, Clone)]
 pub struct TransactionMQProducer {
@@ -4169,7 +4115,7 @@ pub struct TransactionMQProducer {
 }
 
 impl TransactionMQProducer {
-    /// Python `TransactionMQProducer(producer_group)`。
+    /// 按生产者组名构造事务生产者。
     pub fn new(producer_group: &str) -> Result<TransactionMQProducer> {
         Ok(TransactionMQProducer {
             producer: DefaultMQProducer::new(producer_group)?,
@@ -4183,7 +4129,7 @@ impl TransactionMQProducer {
         })
     }
 
-    /// 包住一个已有的生产者（Python 的子类关系在 Rust 里的另一种表达）。
+    /// 包住一个已有的生产者（组合替代继承）。
     pub fn from_producer(producer: DefaultMQProducer) -> TransactionMQProducer {
         TransactionMQProducer { producer }
     }
@@ -4193,17 +4139,16 @@ impl TransactionMQProducer {
         &self.producer
     }
 
-    /// Python `set_transaction_listener`。
     pub fn set_transaction_listener(&self, listener: Option<Arc<dyn TransactionListener>>) {
         self.producer.set_transaction_listener(listener);
     }
 
-    /// Python `get_transaction_listener`。
+    /// 取当前事务监听器。
     pub fn transaction_listener(&self) -> Option<Arc<dyn TransactionListener>> {
         self.producer.transaction_listener()
     }
 
-    /// Python `send_message_in_transaction`：不传 listener ⇒ 用预设的那个；
+    /// 不传 listener ⇒ 用预设的那个；
     /// 两个都没有 ⇒ 报错（基类做同样的检查，这里只是把语义固定下来）。
     pub async fn send_message_in_transaction(
         &self,
@@ -4242,7 +4187,7 @@ mod tests {
         DefaultMQProducer::new(group).expect("合法组名不该构造失败")
     }
 
-    /// 本生产者压缩时应置的 sysFlag 位（COMPRESSED_FLAG + 压缩类型，Python 同款判据）。
+    /// 本生产者压缩时应置的 sysFlag 位（COMPRESSED_FLAG + 压缩类型）。
     fn compression_flag(p: &DefaultMQProducer) -> i32 {
         MessageSysFlag::set_compression_type(
             MessageSysFlag::COMPRESSED_FLAG,
@@ -4310,7 +4255,7 @@ mod tests {
         let p = producer("GID_keep");
         p.set_producer_group("GID_new").expect("未启动时允许改组名");
         assert_eq!(p.producer_group(), "GID_new");
-        // 空组名只在构造期校验（Python 的 setter 同样不校验）
+        // 空组名只在构造期校验（setter 不校验）
         assert!(DefaultMQProducer::new("").is_err());
     }
 
@@ -4550,7 +4495,7 @@ mod tests {
     fn compression_type_and_empty_body_edges() {
         let p = producer("GID_compress_edge");
         p.set_compress_msg_body_over_howmuch(1);
-        // 空正文：即便阈值最低也不压（Python `if not body: return 0`）
+        // 空正文：即便阈值最低也不压
         let mut empty = Message::new("T1", Some(b""));
         let (flag, prev) = p.try_to_compress_message(&mut empty);
         assert_eq!(flag, 0);
@@ -4620,7 +4565,7 @@ mod tests {
         assert_eq!(
             p.get_namespace_v2(),
             None,
-            "None = 清除（Java setNamespaceV2(null)）"
+            "None = 清除"
         );
         p.set_namespace("ns1");
         assert_eq!(p.get_namespace_v2(), None, "v1 namespace 不写 v2 字段");
@@ -4673,7 +4618,7 @@ mod tests {
         let ctx = p.build_send_context(&delay, "GID_ctx", "", &m, "", CommunicationMode::Sync);
         assert_eq!(ctx.msg_type, MessageType::DelayMsg);
 
-        // 既是半消息又带延迟属性：Python 的顺序判定让 Delay 覆盖 Trans
+        // 既是半消息又带延迟属性：顺序判定让 Delay 覆盖 Trans
         let mut both = Message::new("T1", Some(b"x"));
         both.put_property(PROPERTY_TRANSACTION_PREPARED, "true");
         both.put_property("TIMER_DELIVER_MS", "123");
@@ -5000,7 +4945,7 @@ mod tests {
             ("bad group", "contains illegal characters"),
             (long_group.as_str(), "is longer than group max length"),
         ] {
-            // 构造期只查空白，非法字符要留到 start()（与 Python 同口径）
+            // 构造期只查空白，非法字符要留到 start()
             let p = DefaultMQProducer::new(group).expect("构造不该提前拒绝");
             p.set_namesrv_addr("127.0.0.1:9876");
             let err = p.start().await.expect_err("非法组名必须本地失败");
@@ -5054,7 +4999,7 @@ mod tests {
 
     /// 运行时之外、而且**没启动过** ⇒ 先报「未启动」，而不是「没有运行时」。
     ///
-    /// 两条都是同步报错（Python `_require_client` 同）：前者走回调更难查，后者意味着
+    /// 两条都是同步报错：前者走回调更难查，后者意味着
     /// 池还没建。真正「运行时之外」的分支要 start 在未绑定运行时的场景之后才可能命中，
     /// 而 `start()` 本身是 async，所以这里只能断言顺序。
     #[test]
@@ -5108,7 +5053,7 @@ mod tests {
         let p = producer("GID_view");
         let err = p
             .view_message("T1", "ABCDEF")
-            .expect_err("Python 参考实现直接抛错");
+            .expect_err("view_message 直接报错");
         assert!(err.to_string().contains("not supported"));
     }
 
@@ -5209,7 +5154,7 @@ mod tests {
 
     #[test]
     fn delay_keys_differ_between_hook_and_transaction() {
-        // 事务侧少了 __STARTDELIVERTIME：两份清单在 Python 里本就不同，固定住以防串改
+        // 事务侧少了 __STARTDELIVERTIME：两份清单本就不同，固定住以防串改
         assert!(!TRANSACTION_FORBIDDEN_DELAY_KEYS.contains(&"__STARTDELIVERTIME"));
         assert!(DELAY_PROPERTY_KEYS.contains(&"__STARTDELIVERTIME"));
         assert_eq!(TRANSACTION_FORBIDDEN_DELAY_KEYS.len(), 5);
@@ -5253,7 +5198,7 @@ mod tests {
             g1.starts_with("_INNER_TRACE_PRODUCER-GID_auto_produce-PRODUCE-"),
             "{g1}"
         );
-        // Python `min(batch_num, 20)`
+        // batch_num 上限 20
         assert_eq!(d.batch_num(), 20);
         // trace_topic 缺省回落系统轨迹 topic
         assert_eq!(d.get_trace_topic_name(), "RMQ_SYS_TRACE_TOPIC");
@@ -5300,7 +5245,7 @@ mod tests {
     #[test]
     fn trace_host_reports_empty_client_id_before_start() {
         let p = producer("GID_trace_host");
-        // Python `_client_id`：宿主没有 _mq_client 时返回空串
+        // 宿主没有 _mq_client 时返回空串
         assert_eq!(TraceHost::client_id(&p), "");
     }
 }

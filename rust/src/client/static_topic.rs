@@ -95,7 +95,7 @@ pub fn topic_route_data_2_endpoints_for_static_topic(
     let mut endpoints: HashMap<MessageQueue, String> = HashMap::new();
     for (scope, mut infos) in infos_by_scope {
         infos.sort_by(|a, b| a.0.cmp(&b.0));
-        infos.sort_by(|a, b| b.1.epoch.cmp(&a.1.epoch));
+        infos.sort_by_key(|a| std::cmp::Reverse(a.1.epoch));
 
         let mut max_total_nums = 0i32;
         let max_total_num_of_epoch: i64 = -1;

@@ -173,55 +173,44 @@ fn next_instance_id() -> u64 {
 /// 内部轨迹生产者的异步返回类型（无 async-trait 依赖的装箱 future，风格同
 /// [`crate::client::mq_client::ConsumerFuture`]）。
 ///
-/// Python 打到内部生产者上的调用全是同步阻塞的（`trace_dispatcher.py:134` 的
-/// `producer.start()`、`:260` 的 `send`、`:262` 的 `send_by_selector`、
-/// `:275` 的 `_topic_publish_info`），Rust 侧换成 tokio 异步后统一用本类型装箱。
+/// 打到内部生产者上的调用全是同步阻塞的（`start` / `shutdown` / `send` /
+/// 定点发送 / 取发布队列），Rust 侧换成 tokio 异步后统一用本类型装箱。
 pub type TraceProducerFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-/// 内部轨迹生产者接缝（对应 Python 的 `self.trace_producer`，一个
-/// `enable_trace=False` 的 `DefaultMQProducer`）。
-///
-///
+/// 内部轨迹生产者接缝：一个 `enable_trace = false` 的 `DefaultMQProducer`。
 ///
 /// 对象安全：需要 `await` 的方法用 `self: Arc<Self>` 接收者 + 装箱 future。
 pub trait TraceProducer: Send + Sync {
-    /// Python `producer.set_namesrv_addr(name_srv_addr)`（`trace_dispatcher.py:130`）。
     fn set_name_server_addr(&self, name_server_addr: &str);
 
-    /// Python `producer.set_instance_name(...)`（`trace_dispatcher.py:131-132`）。
     fn set_instance_name(&self, instance_name: &str);
 
     fn set_namespace_v2(&self, namespace_v2: &str);
 
-    /// Python `producer.set_send_msg_timeout(5000)`（`trace_dispatcher.py:101`）。
     fn set_send_msg_timeout(&self, timeout_millis: i64);
 
     fn set_max_message_size(&self, max_msg_size: usize);
 
-    /// Python `producer.set_enable_trace(False)`（`trace_dispatcher.py:104` / `:133`）。
     /// 分发器只会传 `false`，签名保留布尔以便实现方复用现成 setter。
     fn set_enable_trace(&self, enable: bool);
 
-    /// Python `producer.start()`（`trace_dispatcher.py:134`）。失败 ⇒ `Err`，
-    /// 由 [`AsyncTraceDispatcher::start`] 原样上抛（Python 冒到
-    /// `producer._start_trace_dispatcher` 的 `except` 里记 warning）。
+    /// 启动内部生产者。失败 ⇒ `Err`，由 [`AsyncTraceDispatcher::start`] 原样上抛
+    /// （宿主侧接线只记一条 warning，不会把启动失败转成崩溃）。
     fn start(self: Arc<Self>) -> TraceProducerFuture<Result<()>>;
 
-    /// Python `producer.shutdown()`（`trace_dispatcher.py:155`）。
-    /// Python 用 `try/except` 包住并记 debug 日志；Rust 的接缝没有返回值，
+    /// 关闭内部生产者：接缝没有返回值，
     /// 实现方（`DefaultMQProducer::shutdown` 一类）自己保证不 panic。
     fn shutdown(&self);
 
-    /// Python `producer.send(msg, 5000)`（`trace_dispatcher.py:260`）。
-    /// 返回的 `SendResult` 两边都被丢弃，故只回 `Result<()>`。
+    /// 发送结果 `SendResult` 无用，故只回 `Result<()>`。
     fn send(
         self: Arc<Self>,
         message: Message,
         timeout_millis: i64,
     ) -> TraceProducerFuture<Result<()>>;
 
-    /// 定点发送（对应 Python `producer.send(msg, timeout, mq=选中的队列)`，
-    /// 见模块差异 2）：`mq` 是 [`Self::publish_queues`] 里挑出来的队列。
+    /// 定点发送（把消息钉在选中的队列上，见模块差异 2）：
+    /// `mq` 是 [`Self::publish_queues`] 里挑出来的队列。
     fn send_to_queue(
         self: Arc<Self>,
         message: Message,
@@ -236,8 +225,7 @@ pub trait TraceProducer: Send + Sync {
 }
 
 /// [`TraceProducer`] 的「未接线」实现（模块差异 1）：什么都不发，只记日志。
-/// Python 在 `__init__` 里总会自己 new 一个内部生产者（`trace_dispatcher.py:95`），
-/// Rust 改为注入，未注入时用本类型兜底。
+/// 内部生产者改为注入，未注入时用本类型兜底。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DisabledTraceProducer;
 
@@ -303,14 +291,12 @@ impl TraceProducer for DisabledTraceProducer {
 
 // ================================================================ 宿主接缝
 
-/// 分发器宿主（Python 里是 `host_producer` / `host_consumer` 两个裸对象，
-/// `trace_dispatcher.py:87-88` + `:114-118`）。
+/// 分发器宿主：挂载它的生产者或消费者，只提供 `client_id()`。
 pub trait TraceHost: Send + Sync {
-    /// Python `host._mq_client.client_id`。
     fn client_id(&self) -> String;
 }
 
-/// 直接用 [`MQClientInstance`] 当宿主（等价于 Python 的 `host._mq_client`）。
+/// 直接用 [`MQClientInstance`] 当宿主。
 impl TraceHost for MQClientInstance {
     fn client_id(&self) -> String {
         MQClientInstance::client_id(self).to_string()
@@ -319,25 +305,21 @@ impl TraceHost for MQClientInstance {
 
 // ================================================================ 配置
 
-/// [`AsyncTraceDispatcher`] 的构造参数（对应 Python `__init__` 的关键字参数 +
-/// 类内常量，`trace_dispatcher.py:68-95`）。
+/// [`AsyncTraceDispatcher`] 的构造参数（默认值即分发器的固定常量）。
 #[derive(Clone)]
 pub struct TraceDispatcherConfig {
     /// 内部轨迹生产者（模块差异 1）。`None` ⇒ [`DisabledTraceProducer`]。
     pub producer: Option<Arc<dyn TraceProducer>>,
     /// 内部生产者组名。`None` ⇒ 由 [`AsyncTraceDispatcher::next_trace_producer_group`]
-    /// 现生成（Python 构造函数里 `_gen_group_name_for_trace()`，`:95` + `:107-109`）。
+    /// 现生成（固定前缀 + 进程级自增号）。
     /// 注入生产者时应当把当初建生产者用的同一个名字传进来，以免进程级计数器多走一格。
     pub trace_producer_group: Option<String>,
     pub batch_num: usize,
     pub trace_topic_name: Option<String>,
-    /// Python `self.max_msg_size = 128000`（`:76`）。
     pub max_msg_size: usize,
-    /// Python `producer.set_send_msg_timeout(5000)`（`:101`）与
-    /// `send` / `send_by_selector` 的 `5000`（`:260` / `:263`）—— 同一个常量。
+    /// 内部生产者的发送超时与发送时的 `5000` —— 同一个常量。
     pub send_msg_timeout_millis: i64,
     pub flush_trace_interval_millis: i64,
-    /// Python `WAIT_FOR_SHUTDOWN = 5000`（`:70`；见模块差异 5）。
     pub wait_for_shutdown_millis: u64,
     pub queue_capacity: usize,
 }
@@ -387,15 +369,14 @@ impl std::fmt::Debug for TraceDispatcherConfig {
 
 // ================================================================ 选择器
 
-/// `counter` 就是宿主分发器的 `self._send_which_queue`（`trace_dispatcher.py:89`，
-/// `itertools.count(0)`）：Python 每次发送都新建一个选择器对象，但**计数器是共享的**，
+/// `counter` 是宿主分发器的轮转计数器（进程级、从 0 开始）：
+/// 每次发送都新建一个选择器对象，但**计数器是共享的**，
 /// 所以轮询位置跨批次连续。
 struct BrokerSetSelector {
     counter: Arc<AtomicU64>,
 }
 
 impl BrokerSetSelector {
-    /// Python `_BrokerSetSelector.select`（`:54-62`）。
     fn select(&self, mqs: &[MessageQueue], broker_set: &HashSet<String>) -> Option<MessageQueue> {
         let mut filtered: Vec<&MessageQueue> = mqs
             .iter()
@@ -414,65 +395,46 @@ impl BrokerSetSelector {
 
 // ================================================================ AsyncTraceDispatcher
 
-/// 分发器实体（`AsyncTraceDispatcher` 的字段集合，`trace_dispatcher.py:73-95`）。
+/// 分发器实体：被句柄、钩子与后台任务共享的内部状态。
 ///
-/// 之所以拆成 `Arc<Inner>` + 句柄：Python 的对象被钩子、宿主生产者、后台线程共享，
+/// 之所以拆成 `Arc<Inner>` + 句柄：分发器要同时被钩子、宿主生产者、后台任务共享，
 /// Rust 侧 [`TraceReportSink`] / [`TraceDispatcher`] 两个接缝都要 `Arc<dyn ...>`，
 /// 而后台任务又需要「不阻止回收」的弱引用（模块差异 6）。
 struct Inner {
-    /// Python `self.group`（`:78`）。
     group: String,
-    /// Python `self.type`（`:79`）。
     dispatcher_type: TraceDispatcherType,
-    /// Python `self.trace_instance_id`（`:77`，进程级自增）。
     trace_instance_id: u64,
-    /// Python 内部生产者组名（`:100` + `:107-109`）。
+    /// 内部生产者组名（固定前缀 + 进程级自增号）。
     trace_producer_group: String,
-    /// Python `self.batch_num`（`:75`，已 clamp 到 20）。
     batch_num: usize,
-    /// Python `self.max_msg_size`（`:76`；可像 Python 一样直接改，见
-    /// [`AsyncTraceDispatcher::set_max_msg_size`]）。
+    /// 切块阈值：可直接改，见 [`AsyncTraceDispatcher::set_max_msg_size`]。
     max_msg_size: AtomicUsize,
-    /// Python `self.trace_topic_name`（`:92`）。
     trace_topic_name: String,
-    /// Python `self.access_channel`（`:85`，`start()` 里按入参覆盖，`:136`）。
     access_channel: AtomicU8,
-    /// Python `self.trace_context_queue`（`:80`，`queue.Queue(maxsize=2048)`）。
     queue: Mutex<VecDeque<TraceContext>>,
-    /// Python `self.trace_context_queue.maxsize`。
     queue_capacity: usize,
-    /// Python `self.discard_count`（`:81`）。
     discard_count: AtomicU64,
-    /// Python `self.stopped`（`:82`）。
     stopped: AtomicBool,
     /// 同步 [`Inner::shutdown`] 是否已挂出/执行过收尾：防止二次 `shutdown()`
     /// 把还在等在途发送的那轮收尾半路掐掉。
     finalizing: AtomicBool,
-    /// Python `self.is_started`（`:83`）。
     is_started: AtomicBool,
-    /// Python `self._last_flush_time`（`:90`）。
     last_flush_time: AtomicI64,
-    /// Python `FLUSH_TRACE_INTERVAL`（`:71`）。
     flush_trace_interval_millis: i64,
-    /// Python `self._send_which_queue`（`:89`）。
     send_which_queue: Arc<AtomicU64>,
-    /// Python `self._lock`（`:91`，`RLock`；只保护 `start()` 里的 `is_started` 段，
-    /// 差异见模块头第 8 条）。
+    /// 启动重入锁：只保护 `start()` 里的 `is_started` 段，
+    /// 差异见模块头第 8 条。
     start_lock: tokio::sync::Mutex<()>,
-    /// Python `self.worker`（`:84` + `:137-141`）。
     worker: Mutex<Option<JoinHandle<()>>>,
-    /// Python `self._executor`（`:93-94`）：在途发送任务句柄（用于优雅等待）。
+    /// 在途发送任务句柄（用于优雅等待）。
     pending: Mutex<Vec<JoinHandle<()>>>,
-    /// Python `self.trace_producer`（`:95`）。
     trace_producer: Arc<dyn TraceProducer>,
     namespace_v2: Mutex<String>,
-    /// Python `self.host_producer` / `self.host_consumer`（`:87-88` + `:114-118`）。
+    /// 宿主（生产者侧 / 消费者侧二选一）。
     host_producer: Mutex<Option<Arc<dyn TraceHost>>>,
     host_consumer: Mutex<Option<Arc<dyn TraceHost>>>,
-    /// Python `self.send_msg_timeout`（内部生产者上的 5000，`:101`）+
-    /// 发送时传的 `5000`（`:260` / `:263`）。
+    /// 内部生产者上的 5000 + 发送时传的 `5000`。
     send_msg_timeout_millis: i64,
-    /// Python `WAIT_FOR_SHUTDOWN`（`:70`，模块差异 5）。
     wait_for_shutdown_millis: u64,
     /// 惰性绑定的 tokio 运行时句柄（模块差异 4）。
     handle: OnceLock<Handle>,
@@ -480,7 +442,7 @@ struct Inner {
     this: Weak<Inner>,
 }
 
-/// 用法（Python `producer._start_trace_dispatcher`，`producer.py:471-493`）：
+/// 用法（宿主接线后启动分发器）：
 /// ```text
 /// let group = AsyncTraceDispatcher::next_trace_producer_group("GID_test", Produce);
 /// let producer = /* 用 group + rpc_hook 建内部生产者（enable_trace 必须为 false） */;
@@ -497,19 +459,18 @@ pub struct AsyncTraceDispatcher {
 }
 
 impl Inner {
-    /// Python `FLUSH_TRACE_INTERVAL` 之外那条防忙等间隔（`:204-205`，5ms）。
+    /// 刷写间隔之外的防忙等间隔（5ms）。
     const IDLE_SLEEP_MILLIS: u64 = 5;
 
-    /// Python `self.access_channel`（`:85` + `:136`）的读侧。
+    /// 读侧 access_channel。
     fn access_channel(&self) -> AccessChannel {
         access_channel_from_u8(self.access_channel.load(Ordering::Acquire))
     }
 }
 
 impl AsyncTraceDispatcher {
-    /// Python `AsyncTraceDispatcher(group, type_, batch_num=10)` +
-    /// 默认 `trace_topic_name=None`（`:73-74`）；`producer` 取代 Python 在构造里
-    /// 自己 new 的那个内部生产者（模块差异 1）。
+    /// 便捷构造：`batch_num = 10`、`trace_topic_name = None`；
+    /// `producer` 就是内部生产者（模块差异 1）。
     pub fn new(
         group: &str,
         dispatcher_type: TraceDispatcherType,
@@ -525,7 +486,7 @@ impl AsyncTraceDispatcher {
         )
     }
 
-    /// Python `__init__`（`trace_dispatcher.py:73-95`）的完整注入版本。
+    /// 完整注入版本：所有常量都由调用方给定。
     pub fn with_config(
         group: &str,
         dispatcher_type: TraceDispatcherType,
@@ -534,19 +495,19 @@ impl AsyncTraceDispatcher {
         if config.producer.is_none() {
             rmq_info!(
                 "trace dispatcher for group {group} builds its own internal trace producer \
-                 (Python `_get_and_create_trace_producer`, trace_dispatcher.py:95-105)"
+                 (none was injected, so it is built on demand)"
             );
         }
-        // Python `:95` + `:98-105`：组名自增一次（除非调用方已注入自己算好的名字），
-        // 并且这三项设置在 Python 里就打在内部生产者上。
+        // 组名自增一次（除非调用方已注入自己算好的名字），
+        // 并且这三项设置直接打在内部生产者上。
         let trace_producer_group = config.trace_producer_group.clone().unwrap_or_else(|| {
             AsyncTraceDispatcher::next_trace_producer_group(group, dispatcher_type)
         });
-        // Python 从不注入：`__init__` 末尾总是自建一个真的 DefaultMQProducer
+        // 未注入时自建一个真的 DefaultMQProducer
         // （组名 = _INNER_TRACE_PRODUCER-<group>-<type>-<seq>，send_msg_timeout=5000、
-        // max_message_size=同分发器、enable_trace=False 防递归）。Rust 此前未注入时
-        // 兜底 DisabledTraceProducer，轨迹链路默认静默断开，与其他端行为不一致；
-        // 现在与 Python 对齐——未注入就自建真实现，`TraceProducer` 接缝保留给
+        // max_message_size=同分发器、enable_trace=false 防递归）。
+        // 若退回 DisabledTraceProducer，轨迹链路会默认静默断开；
+        // 因此未注入就自建真实现，`TraceProducer` 接缝保留给
         // 测试桩和显式定制。
         let producer: Arc<dyn TraceProducer> = match config.producer.clone() {
             Some(injected) => injected,
@@ -608,45 +569,40 @@ impl AsyncTraceDispatcher {
     }
 
     /// 与实例方法版 [`Self::trace_producer_group`] 的区别：这里是**模块函数**，
-    /// 让调用方能在构造内部生产者之前先把名字算出来（Python 是构造内部生产者时现算，
+    /// 让调用方能在构造内部生产者之前先把名字算出来（内部生产者自己建时是现算，
     /// 顺序无从外置 —— 见模块差异 1）。
     pub fn next_trace_producer_group(group: &str, dispatcher_type: TraceDispatcherType) -> String {
         format_trace_producer_group(group, dispatcher_type, next_group_counter())
     }
 
-    // ---------------- 属性读（Python 直接读同名属性） ----------------
+    // ---------------- 属性读 ----------------
 
-    /// Python `self.group`（`:78`）。
     pub fn group(&self) -> &str {
         &self.inner.group
     }
 
-    /// Python `self.type`（`:79`）。
     pub fn dispatcher_type(&self) -> TraceDispatcherType {
         self.inner.dispatcher_type
     }
 
-    /// Python `self.trace_instance_id`（`:77`）。
     pub fn trace_instance_id(&self) -> u64 {
         self.inner.trace_instance_id
     }
 
-    /// 本分发器认定的内部生产者组名（Python 里只存在于生产者对象内部，`:100`）。
+    /// 本分发器认定的内部生产者组名（只存在于生产者对象内部）。
     pub fn trace_producer_group(&self) -> &str {
         &self.inner.trace_producer_group
     }
 
-    /// Python `self.batch_num`（`:75`，已 clamp 到 20）。
     pub fn batch_num(&self) -> usize {
         self.inner.batch_num
     }
 
-    /// Python `self.max_msg_size`（`:76`）：切块阈值（码点，模块差异 11）。
+    /// 切块阈值（码点，模块差异 11）。
     pub fn max_msg_size(&self) -> usize {
         self.inner.max_msg_size.load(Ordering::Acquire)
     }
 
-    /// Python `d.max_msg_size = ...`（直接改属性；单测 `test_trace.py:388` 就这么干）。
     pub fn set_max_msg_size(&self, max_msg_size: usize) {
         self.inner
             .max_msg_size
@@ -669,22 +625,19 @@ impl AsyncTraceDispatcher {
             .clone()
     }
 
-    /// Python `self.trace_topic_name` 的读侧（`get_trace_topic_name`，`:111-112`）。
+    /// 轨迹 topic 名的读侧。
     pub fn get_trace_topic_name(&self) -> String {
         self.inner.trace_topic_name.clone()
     }
 
-    /// Python `self.access_channel`（`:85` + `:136`）。
     pub fn access_channel(&self) -> AccessChannel {
         access_channel_from_u8(self.inner.access_channel.load(Ordering::Acquire))
     }
 
-    /// Python `self.discard_count`（`:81`）。
     pub fn discard_count(&self) -> u64 {
         self.inner.discard_count.load(Ordering::Acquire)
     }
 
-    /// Python `self.trace_context_queue.qsize()`（队列声明 `:80`，读取点 `:191`）。
     pub fn queue_size(&self) -> usize {
         self.inner
             .queue
@@ -693,23 +646,20 @@ impl AsyncTraceDispatcher {
             .len()
     }
 
-    /// Python `self.is_started`（`:83`；`shutdown()` 不会复位它，见模块差异 14）。
     pub fn is_started(&self) -> bool {
         self.inner.is_started.load(Ordering::Acquire)
     }
 
-    /// Python `self.stopped`（`:82`）。
     pub fn is_stopped(&self) -> bool {
         self.inner.stopped.load(Ordering::Acquire)
     }
 
-    /// Python `self._last_flush_time`（`:90`）的读侧。
+    /// 上次刷写时间的读侧。
     pub fn last_flush_time(&self) -> i64 {
         self.inner.last_flush_time.load(Ordering::Acquire)
     }
 
-    /// Python `self._last_flush_time` 的写侧（声明 `:90`；Python 只在
-    /// `_async_send_trace_message` 里 `:210` 自己赋值，没有 setter ——
+    /// 上次刷写时间的写侧（线上只在发送轨迹里自己赋值，没有 setter ——
     /// 这里开放给单测：不起后台任务也能验证「超过 5s 触发刷写」那条分支）。
     pub fn set_last_flush_time(&self, last_flush_time: i64) {
         self.inner
@@ -719,7 +669,6 @@ impl AsyncTraceDispatcher {
 
     // ---------------- 宿主 ----------------
 
-    /// Python `set_host_producer`（`:114-115`）。
     pub fn set_host_producer(&self, host: Arc<dyn TraceHost>) {
         *self
             .inner
@@ -728,7 +677,6 @@ impl AsyncTraceDispatcher {
             .unwrap_or_else(|e| e.into_inner()) = Some(host);
     }
 
-    /// Python `set_host_consumer`（`:117-118`）。
     pub fn set_host_consumer(&self, host: Arc<dyn TraceHost>) {
         *self
             .inner
@@ -739,13 +687,12 @@ impl AsyncTraceDispatcher {
 
     // ---------------- 生命周期 ----------------
 
-    /// 顺序与 Python 逐行一致：锁内（`is_started` 为假时）设 namesrv / instanceName /
-    /// `enable_trace=False` 并启动内部生产者 ⇒ 覆盖 `access_channel` ⇒
-    /// worker 未起时拉起后台任务。`atexit.register(self.shutdown)`（`:142`）无等价物
+    /// 固定顺序：锁内（`is_started` 为假时）设 namesrv / instanceName /
+    /// `enable_trace = false` 并启动内部生产者 ⇒ 覆盖 `access_channel` ⇒
+    /// worker 未起时拉起后台任务。进程退出钩子（atexit）无等价物
     /// （模块差异 6）。
     ///
-    /// 失败：内部生产者启动失败 ⇒ 原样上抛 `Err`（Python 让异常冒到
-    /// `producer._start_trace_dispatcher` 的 `except` 里记 warning），此时
+    /// 失败：内部生产者启动失败 ⇒ 原样上抛 `Err`（宿主接线处只记 warning），此时
     /// `is_started` 仍为 `false`。必须在一个 tokio 运行时上下文里调用
     /// （模块差异 4）。
     pub async fn start(
@@ -757,7 +704,7 @@ impl AsyncTraceDispatcher {
         {
             let _lock = self.inner.start_lock.lock().await;
             if !self.inner.is_started.load(Ordering::Acquire) {
-                // Python `:130-132`：instanceName = "PID_CLIENT_INNER_TRACE_PRODUCER_<namesrv>"
+                // instanceName = "PID_CLIENT_INNER_TRACE_PRODUCER_<namesrv>"
                 self.inner
                     .trace_producer
                     .set_name_server_addr(name_server_addr);
@@ -769,21 +716,21 @@ impl AsyncTraceDispatcher {
                 if !namespace_v2.is_empty() {
                     self.inner.trace_producer.set_namespace_v2(&namespace_v2);
                 }
-                // Python `:133`：⚠ 必须关闭自身的轨迹，否则轨迹消息会被再次追踪
+                // ⚠ 必须关闭自身的轨迹，否则轨迹消息会被再次追踪
                 self.inner.trace_producer.set_enable_trace(false);
                 Arc::clone(&self.inner.trace_producer).start().await?;
                 self.inner.is_started.store(true, Ordering::Release);
             }
         }
-        // Python `:136`：`access_channel or AccessChannel.LOCAL`（None ⇒ LOCAL）
+        // `access_channel or AccessChannel.LOCAL`（None ⇒ LOCAL）
         self.inner
             .set_access_channel(access_channel.unwrap_or_default());
         self.inner.start_worker();
         Ok(())
     }
 
-    /// 生产代码里 producer/consumer 移植层应优先用它（Python 的 `wait=False` 会让
-    /// 最后一批轨迹与生产者关闭相互竞争）。
+    /// 生产代码里 producer/consumer 移植层应优先用它
+    /// （不等最后一批刷完就关生产者会让两者相互竞争）。
     pub async fn shutdown_gracefully(&self) {
         self.inner.flush_and_wait().await;
         if self.inner.finalizing.swap(true, Ordering::AcqRel) {
@@ -800,8 +747,7 @@ impl AsyncTraceDispatcher {
         match self.inner.push_context(context) {
             Some(rejected) => {
                 let discard = self.inner.discard_count.fetch_add(1, Ordering::AcqRel) + 1;
-                // 文案照抄 Python `:172`（`"buffer full%d ,context is %s"`，那个缺失的
-                // 空格与逗号是线上字面量）
+                // 错误文案逐字校验：那个缺失的空格与逗号是线上字面量
                 rmq_info!("buffer full{discard} ,context is {rejected}");
                 false
             }
@@ -820,12 +766,12 @@ impl AsyncTraceDispatcher {
 
 // ---------------------------------------------------------------- 私有实现
 //
-// 以下都是 `Inner` 的方法，一一对应 Python `AsyncTraceDispatcher` 的下划线方法；
+// 以下都是 `Inner` 的方法，覆盖攒批 / 分组 / 切块 / 选队 / 发送链路；
 // 之所以写在 `Inner` 上：后台任务与发送链路只持 `Weak<Inner>`/`Arc<Inner>`，
 // 不依赖对外的 [`AsyncTraceDispatcher`] 句柄（模块差异 6）。
 
 impl Inner {
-    /// 与 Python 同：每轮 `_flush_trace_context(False)`，本轮没刷出批次时睡 5ms
+    /// 每轮 `flush_trace_context(false)`，本轮没刷出批次时睡 5ms
     /// （模块差异 7）；`stopped` 置位后退出。只持 `Weak`，宿主句柄全释放后自动退出
     /// （模块差异 6）。
     async fn async_run(inner: Weak<Inner>) {
@@ -846,8 +792,8 @@ impl Inner {
     /// 触发条件三者取其一：`force_flush`、队列长度 `>= batch_num`、
     /// 距上次刷写超过 `FLUSH_TRACE_INTERVAL`；每次最多取 `batch_num` 条。
     ///
-    /// 返回值是本轮真正取走的条数（0 ⇒ 什么都没刷出去，Python 在这种情形下睡 5ms）。
-    /// Python 的 `time.sleep(5)` 与异常吞掉分别由 [`Self::async_run`] 和
+    /// 返回值是本轮真正取走的条数（0 ⇒ 什么都没刷出去，由调用方睡 5ms）。
+    /// 防忙等 sleep 与异常吞掉分别由 [`Self::async_run`] 和
     /// [`Inner::async_send_trace_message`] 内部记日志替代（模块差异 7）。
     fn flush_trace_context(&self, force_flush: bool) -> usize {
         let size = self.queue_len();
@@ -881,13 +827,13 @@ impl Inner {
             .store(current_time_millis(), Ordering::Release);
         let drained = context_list.len();
         if let Err(e) = self.submit(context_list) {
-            // Python：`_executor.submit` 抛错会冒到 `_async_run` / `flush` 的
-            // `except`，记 "flushTraceContext error"；这里就地记同一条量级的日志。
+            // 提交失败会冒到 `async_run` / `flush` 的
+            // 这里就地记同一条量级的日志。
             rmq_error!("flushTraceContext error: {e} ({drained} contexts dropped)");
         }
     }
 
-    /// 把一批上下文交给「executor」（Python `_executor.submit`，`:211`）。
+    /// 把一批上下文交给「executor」（提交成一个独立 tokio 任务）。
     fn submit(&self, context_list: Vec<TraceContext>) -> Result<()> {
         let handle = self.runtime_handle()?;
         let me = self
@@ -932,7 +878,7 @@ impl Inner {
         })
     }
 
-    /// Python `with self._lock:` + `if self.worker is None:`（`:137-141`）。
+    /// 锁内判空：`worker` 不存在时才拉起后台任务。
     fn start_worker(&self) {
         let mut worker = self.worker.lock().unwrap_or_else(|e| e.into_inner());
         if worker.is_none() {
@@ -941,7 +887,7 @@ impl Inner {
                 Some(strong) => Arc::downgrade(&strong),
                 None => return,
             };
-            // Python 线程名 "MQ-AsyncArrayDispatcher-Thread<id>"（`:140`）无法在
+            // 线程名 "MQ-AsyncArrayDispatcher-Thread<id>" 无法在
             // tokio 任务上复刻（模块差异 5）；这里只把实例号打进调试日志。
             rmq_debug!("start trace worker for instance {}", self.trace_instance_id);
             *worker = Some(tokio::spawn(Inner::async_run(weak)));
@@ -949,7 +895,6 @@ impl Inner {
     }
 
     fn flush(&self) {
-        // Python `:177-181`
         while self.queue_len() != 0 {
             if self.flush_trace_context(true) == 0 {
                 rmq_warn!(
@@ -991,7 +936,7 @@ impl Inner {
         }
     }
 
-    /// Python `shutdown()` 的同步部分（`:144-162`）。
+    /// `shutdown()` 的同步部分。
     ///
     /// ⚠ 不能在这里就地关内部生产者：上面 `flush()` 刚把队列里剩的批次 spawn 成
     /// 在途发送任务，紧接着 `trace_producer.shutdown()` 会让它们撞上
@@ -1007,7 +952,7 @@ impl Inner {
     fn shutdown(&self) {
         self.flush();
         if self.finalizing.swap(true, Ordering::AcqRel) {
-            // 收尾已在跑/已完成：二次 shutdown 再关一次生产者是 Python :144-162
+            // 收尾已在跑/已完成：二次 shutdown 不再重复关生产者
             // 的原样行为（模块差异 14），但这里若重复挂收尾，会把第一轮还没等完
             // 的在途发送从中间掐掉。
             return;
@@ -1036,17 +981,17 @@ impl Inner {
         self.finalize_now();
     }
 
-    /// 就地收尾（此时已无在途发送；对应 Python `:153-161`）。
+    /// 就地收尾（此时已无在途发送）。
     fn finalize_now(&self) {
-        // Python `:153-157`：只有启动过才关内部生产者
+        // 只有启动过才关内部生产者
         if self.is_started.load(Ordering::Acquire) {
             self.trace_producer.shutdown();
         }
-        // Python `:158-161` `atexit.unregister(self.shutdown)`：无对应物（模块差异 6）
+        // 进程退出钩子（atexit）无对应物（模块差异 6）
         self.stored_stop();
     }
 
-    /// Python `self.stopped = True`（`:162`）+ 终止后台任务（模块差异 9）。
+    /// 置 `stopped` + 终止后台任务（模块差异 9）。
     fn stored_stop(&self) {
         self.stopped.store(true, Ordering::Release);
         if let Some(handle) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -1074,7 +1019,7 @@ impl Inner {
             } else {
                 self.trace_topic_name.clone()
             };
-            // Python `:226`：`context.trace_beans[0].topic`（上面已判非空）
+            // `context.trace_beans[0].topic`（上面已判非空）
             let Some(first) = context.trace_beans.first() else {
                 continue;
             };
@@ -1095,7 +1040,7 @@ impl Inner {
             }
         }
         for (key, bean_list) in groups {
-            // Python `:230` `topic, trace_topic = key.split(CONTENT_SPLITOR)`
+            // key 形如 `topic + CONTENT_SPLITOR + trace_topic`，只切第一个分隔符
             let Some((topic, trace_topic)) = key.split_once(TraceConstants::CONTENT_SPLITOR) else {
                 rmq_debug!("trace group key {key:?} has no content splitor, skipped");
                 continue;
@@ -1104,7 +1049,7 @@ impl Inner {
         }
     }
 
-    /// Python 末尾的 `trans_bean_list.clear()`（`:251`）由 Rust 的所有权接管。
+    /// 末尾的「清空待发列表」由 Rust 的所有权接管。
     async fn flush_data(
         &self,
         trans_bean_list: Vec<TraceTransferBean>,
@@ -1158,10 +1103,9 @@ impl Inner {
         let broker_set = self.try_get_message_queue_broker_set(trace_topic).await;
         let producer = Arc::clone(&self.trace_producer);
         let outcome = if broker_set.is_empty() {
-            // Python `:259-260`：拿不到 broker 集合 ⇒ 普通发送（生产者内部轮询）
+            // 拿不到 broker 集合 ⇒ 普通发送（生产者内部轮询）
             producer.send(msg, self.send_msg_timeout_millis).await
         } else {
-            // Python `:261-263` + 模块差异 2：先取路由再选队，最后定点发送
             let queues = producer
                 .clone()
                 .publish_queues(trace_topic.to_string())
@@ -1183,13 +1127,13 @@ impl Inner {
             }
         };
         if let Err(e) = outcome {
-            // 文案照抄 Python `:265`
+            // 错误文案逐字校验
             rmq_error!("send trace data failed, the traceData is {data}: {e}");
         }
     }
 
     /// 只有跨集群（CLOUD）场景才需要按 broker 过滤；拿不到路由时返回空集 ⇒ 走普通轮询。
-    /// 日志级别同 Python（`logger.debug`）。
+    /// 日志级别用 DEBUG。
     async fn try_get_message_queue_broker_set(&self, topic: &str) -> HashSet<String> {
         let mut broker_set = HashSet::new();
         let producer = Arc::clone(&self.trace_producer);
@@ -1204,7 +1148,7 @@ impl Inner {
         broker_set
     }
 
-    /// Python `_client_id`（`:120-124`）：**producer 优先于 consumer**，
+    /// 取宿主 clientId：**producer 优先于 consumer**，
     /// 没有宿主（或宿主没有 `_mq_client`）时返回空串。
     fn client_id(&self) -> String {
         let host = {
@@ -1229,7 +1173,7 @@ impl Inner {
 
     // ---------------- 队列 ----------------
 
-    /// 入队；满了把原值退回（对应 Python `put_nowait` 抛 `queue.Full`）。
+    /// 入队；满了把原值退回（非阻塞入队失败的等价路径）。
     fn push_context(&self, context: TraceContext) -> Option<TraceContext> {
         let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         if queue.len() >= self.queue_capacity {
@@ -1239,7 +1183,7 @@ impl Inner {
         None
     }
 
-    /// 出队（对应 Python `get_nowait`，空队列返回 `None`）。
+    /// 出队（非阻塞，空队列返回 `None`）。
     fn pop_context(&self) -> Option<TraceContext> {
         self.queue
             .lock()
@@ -1253,13 +1197,13 @@ impl Inner {
 }
 
 impl TraceDispatcher for AsyncTraceDispatcher {
-    /// Python `start(name_srv_addr, access_channel=None)` 的**同步**入口
+    /// `start(name_srv_addr, access_channel)` 的**同步**入口
     /// （对象安全要求，见模块差异 4）：整段启动逻辑交给 tokio 任务，
     /// 因此本方法返回 `Ok` 只保证「任务已排队」，内部生产者起没起来要看日志。
     ///
     /// 唯一的同步可见错误：当前线程不在 tokio 运行时上下文里且此前没绑定过句柄
-    /// ⇒ `Err`（Python 无线程模型限制）。
-    /// 能 await 的调用方请用 [`AsyncTraceDispatcher::start`]（Python 原版语义）。
+    /// ⇒ `Err`。
+    /// 能 await 的调用方请用 [`AsyncTraceDispatcher::start`]。
     fn start(&self, name_server_addr: &str) -> Result<()> {
         let handle = self.inner.runtime_handle()?;
         let me = self.clone();
@@ -1272,7 +1216,7 @@ impl TraceDispatcher for AsyncTraceDispatcher {
         Ok(())
     }
 
-    /// Python `shutdown()`（`:144-162`）：flush（不等待）+ 关内部生产者 + `stopped=True`。
+    /// `shutdown()`：flush（不等待）+ 关内部生产者 + 置 `stopped`。
     /// 关生产者这步由收尾任务在在途发送收敛后执行（否则最后一批轨迹会撞上
     /// 已关闭的生产者）；本方法会**有界等它落地**（多线程运行时；current_thread
     /// 运行时下退化为游离任务并告警）。要**异步**等完请用
@@ -1287,19 +1231,16 @@ impl TraceReportSink for AsyncTraceDispatcher {
         self.inner.trace_topic_name.clone()
     }
 
-    /// Python `append(ctx)`（`:165-173`）。
     fn report(&self, context: TraceContext) -> bool {
         self.append(context)
     }
 
-    /// Python `_client_id()`（`:120-124`）。
     fn client_id(&self) -> String {
         self.inner.client_id()
     }
 }
 
-/// `AccessChannel` 的可表示形式（Python 是个属性值，这里用原子量存，见
-/// `trace_dispatcher.py:85`）。
+/// `AccessChannel` 的可表示形式（这里用原子量存，见模块差异 15）。
 fn access_channel_to_u8(channel: AccessChannel) -> u8 {
     match channel {
         AccessChannel::Local => 0,
@@ -1329,27 +1270,25 @@ mod tests {
     use crate::common::message_type::MessageType;
     use std::sync::atomic::AtomicUsize;
 
-    // 金标准来源：`python/tests/test_trace.py` + 本机跑
-    // `python/client/trace_dispatcher.py` 的探针（/tmp/probe_td.py、
-    // /tmp/probe_td2.py，PYTHONPATH=. python3 执行），非手推。
+    // 金标准来源：本机探针抓下的真实编码结果（非手推）。
     const SOH: char = TraceConstants::CONTENT_SPLITOR;
     const STX: char = TraceConstants::FIELD_SPLITOR;
     const MSG_ID_1: &str = "AC1400A1F0A018B4AAC2A1B2C3D4E5F6";
     const MSG_ID_2: &str = "AC1400A1F0A018B4AAC2A1B2C3D4E5F7";
     const OFFSET_MSG_ID: &str = "AC1400A1000027100000000000000001";
     const TS: i64 = 1_700_000_000_000;
-    /// Python `EXPECTED_PUB`（`test_trace.py:37-39`）＝探针第 4 节抓到的 body。
+    /// `EXPECTED_PUB` ＝探针抓到的 body 金标准。
     const EXPECTED_PUB: &str = "Pub\u{1}1700000000000\u{1}DefaultRegion\u{1}GID_test\
          \u{1}TopicTest\u{1}AC1400A1F0A018B4AAC2A1B2C3D4E5F6\u{1}TagA\u{1}KeyA KeyB\
          \u{1}127.0.0.1:10911\u{1}42\u{1}7\u{1}0\
          \u{1}AC1400A1000027100000000000000001\u{1}true\u{2}";
     const EXPECTED_PUB_KEYS: &str = "AC1400A1F0A018B4AAC2A1B2C3D4E5F6 KeyA KeyB";
 
-    // ---------------- 假生产者（Python _FakeTraceProducer 的等价物） ----------------
+    // ---------------- 假生产者（记录调用序列的测试桩） ----------------
 
     #[derive(Debug, Clone)]
     struct SentRecord {
-        /// `send` / `send_to_queue`：区分 Python 的两条发送路径。
+        /// `send` / `send_to_queue`：区分两条发送路径。
         path: &'static str,
         topic: String,
         body: String,
@@ -1404,7 +1343,7 @@ mod tests {
 
     struct FakeProducer {
         recorder: Arc<Recorder>,
-        /// 打开后每次发送都返回 `Err`，用来验证 Python `:264-265` 那条
+        /// 打开后每次发送都返回 `Err`，用来验证那条
         /// 「捕获发送异常、只记日志、继续发下一块」的路径。
         fail_send: bool,
     }
@@ -1496,7 +1435,7 @@ mod tests {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
                 if queues.is_empty() {
-                    // Python 探针里 `_FakeTraceProducer._topic_publish_info` 直接 raise
+                    // 测试桩里取发布队列直接报错
                     Err(Error::client("no route in unit test"))
                 } else {
                     Ok(queues)
@@ -1561,7 +1500,7 @@ mod tests {
         dispatcher_with(10, None)
     }
 
-    // ---------------- 上下文构造（与 python/tests/test_trace.py 同形） ----------------
+    // ---------------- 上下文构造（金标用例同形） ----------------
 
     fn bean(topic: &str, msg_id: &str, keys: &str) -> TraceBean {
         TraceBean {
@@ -1621,7 +1560,7 @@ mod tests {
         assert!(!d.is_stopped());
         assert_eq!(d.access_channel(), AccessChannel::Local);
         assert_eq!(d.queue_size(), 0);
-        // Python `__init__` 里打在内部生产者上的三项（trace_dispatcher.py:101-104）
+        // 构造时打在内部生产者上的三项默认值
         assert_eq!(
             recorder.setters(),
             vec![
@@ -1634,7 +1573,7 @@ mod tests {
 
     #[test]
     fn batch_num_is_clamped_to_twenty() {
-        // Python `min(batch_num, 20)`（:75）
+        // `batch_num` 上限 20
         for (input, want) in [(50usize, 20usize), (1, 1), (100, 20), (20, 20)] {
             let (d, _) = dispatcher_with(input, None);
             assert_eq!(d.batch_num(), want, "batch_num({input})");
@@ -1643,7 +1582,7 @@ mod tests {
 
     #[test]
     fn trace_topic_falls_back_on_none_and_empty_string() {
-        // Python `trace_topic_name or MixAll.TRACE_TOPIC`（:92）
+        // `trace_topic_name` 缺失时回落 `MixAll::TRACE_TOPIC`
         let (d, _) = dispatcher_with(10, Some("MyTraceTopic"));
         assert_eq!(d.get_trace_topic_name(), "MyTraceTopic");
         assert_eq!(
@@ -1657,11 +1596,11 @@ mod tests {
 
     #[test]
     fn trace_producer_group_format() {
-        // 字面格式 = Python `_gen_group_name_for_trace`（`:107-109`）的金标准：
+        // 字面格式金标准：
         // 连建两个分发器后 gen 依次是
         //   _INNER_TRACE_PRODUCER-GID_test-PRODUCE-3
         //   _INNER_TRACE_PRODUCER-CID_test-CONSUME-4
-        // （前两个构造占掉 1、2 号 —— 计数器从 1 开始，`itertools.count(1)`，`:68`）
+        // （前两个构造占掉 1、2 号 —— 计数器从 1 开始）
         assert_eq!(
             format_trace_producer_group("GID_test", TraceDispatcherType::Produce, 3),
             "_INNER_TRACE_PRODUCER-GID_test-PRODUCE-3"
@@ -1687,7 +1626,7 @@ mod tests {
             group_seq(&second) > group_seq(&first),
             "{first} -> {second}"
         );
-        // 构造时也算一次（Python 在构造里给生产者起名，`:100`）
+        // 构造时也算一次（建内部生产者时要名字）
         let (d, _) = dispatcher();
         assert!(
             d.trace_producer_group()
@@ -1712,7 +1651,7 @@ mod tests {
         );
         assert_eq!(d.trace_producer_group(), group, "注入的名字原样保留");
         assert_eq!(d.group(), "G", "业务组名不受影响");
-        // 不注入时才走进程级计数器（名字前缀同 Python，号 > 0）
+        // 不注入时才走进程级计数器（名字前缀固定，号 > 0）
         let (built, _) = dispatcher();
         assert!(
             built
@@ -1735,7 +1674,7 @@ mod tests {
 
     #[test]
     fn instance_id_is_process_wide_and_increments() {
-        // Python `_INSTANCE_NUM = itertools.count(0)`（`:69`）：进程级、从 0 开始。
+        // 进程级实例号：从 0 开始自增。
         // 并行用例也会构造分发器 ⇒ 断言严格递增而非 +1。
         let (a, _) = dispatcher();
         let (b, _) = dispatcher();
@@ -1759,7 +1698,7 @@ mod tests {
 
     #[test]
     fn append_returns_false_when_queue_full() {
-        // Python 探针第 11 节：2048 条收、第 2049 条丢 + discard_count=1
+        // 探针金标准：2048 条收、第 2049 条丢 + discard_count=1
         let (d, _) = dispatcher();
         for _ in 0..2048 {
             assert!(d.append(simple_pub()));
@@ -1779,7 +1718,7 @@ mod tests {
         assert_eq!(d.queue_size(), 1);
     }
 
-    // ---------------- 发送：与 Python 探针逐字节对齐 ----------------
+    // ---------------- 发送：逐字节对齐金标准 ----------------
 
     #[tokio::test]
     async fn send_trace_data_single_pub_matches_python_golden() {
@@ -1788,7 +1727,7 @@ mod tests {
         let records = recorder.records();
         assert_eq!(records.len(), 1);
         let record = &records[0];
-        // 没有路由 ⇒ broker 集合为空 ⇒ Python `producer.send(msg, 5000)` 那条路径
+        // 没有路由 ⇒ broker 集合为空 ⇒ 普通 `send(msg, 5000)` 那条路径
         assert_eq!(record.path, "send");
         assert_eq!(record.topic, "RMQ_SYS_TRACE_TOPIC");
         assert_eq!(record.body, EXPECTED_PUB);
@@ -1812,7 +1751,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatcher_access_channel_applies_to_context_without_one() {
-        // Python `:218` `context.access_channel or self.access_channel`
+        // 上下文自带的 access_channel 优先，缺省才用分发器的
         let (d, recorder) = dispatcher();
         d.inner.set_access_channel(AccessChannel::Cloud);
         d.inner.send_trace_data(vec![simple_pub()]).await;
@@ -1883,7 +1822,7 @@ mod tests {
         //   limit=319 / 5 条 ⇒ [2,2,1]
         //   limit=1_000_000 / 4 条 ⇒ [4]
         let bean_len = EXPECTED_PUB.chars().count();
-        assert_eq!(bean_len, 160, "Python 探针：len(trans_data)=160");
+        assert_eq!(bean_len, 160, "金标：len(trans_data)=160");
         for (limit, n, expect_records) in [
             (160, 3, vec![1, 1, 1]),
             (320, 5, vec![2, 2, 1]),
@@ -1975,7 +1914,7 @@ mod tests {
         assert_eq!(recorder.records()[0].keys, "");
     }
 
-    // ---------------- 发送失败：Python 只记日志，不中断（`:264-265`） ----------------
+    // ---------------- 发送失败：只记日志，不中断 ----------------
 
     #[tokio::test]
     async fn send_failure_is_logged_and_next_chunk_still_sent() {
@@ -1996,14 +1935,14 @@ mod tests {
         assert_eq!(records.len(), 2, "两块都试过了");
         assert!(
             records.iter().all(|r| r.path == "send"),
-            "单测里没有路由 ⇒ broker_set 为空，走普通发送（Python `:259-260`）"
+            "单测里没有路由 ⇒ broker_set 为空，走普通发送"
         );
     }
 
     #[tokio::test]
     async fn failing_send_does_not_block_shutdown() {
-        // 队列照样排空、内部生产者照样关（Python `shutdown` 不看发送结果，`:144-162`；
-        // 探针 batch_num=1 + send 抛异常：qsize 归 0，2 条都试过）
+        // 队列照样排空、内部生产者照样关（`shutdown` 不看发送结果；
+        // batch_num=1 + send 抛异常：队列归 0，2 条都试过）
         let (d, recorder) = failing_dispatcher(1);
         d.start("127.0.0.1:9876", None).await.unwrap();
         d.set_last_flush_time(current_time_millis());
@@ -2052,9 +1991,9 @@ mod tests {
                 ("broker-a".to_string(), 1),
             ]
         );
-        // 计数器在 Python 里从 0 开始（itertools.count(0)，:89）
+        // 计数器从 0 开始
         assert_eq!(d.inner.send_which_queue.load(Ordering::Acquire), 3);
-        // 两次路由查询：一次算 broker 集合、一次给 selector 选队（Python 同样查两次）
+        // 两次路由查询：一次算 broker 集合、一次给 selector 选队
         assert_eq!(recorder.publish_calls.load(Ordering::Acquire), 6);
     }
 
@@ -2113,7 +2052,7 @@ mod tests {
         d.set_last_flush_time(current_time_millis() - 6_000);
         assert_eq!(d.inner.flush_trace_context(false), 5);
         assert_eq!(d.queue_size(), 0);
-        // 刷写后 last_flush_time 被更新（Python `:210`）
+        // 刷写后 last_flush_time 被更新
         assert!(current_time_millis() - d.last_flush_time() < 5_000);
         d.flush_and_wait().await;
         assert_eq!(record_count(&recorder.records()[0].body), 5);
@@ -2132,7 +2071,7 @@ mod tests {
         assert_eq!(d.queue_size(), 1);
         assert_eq!(d.inner.flush_trace_context(true), 1);
         assert_eq!(d.queue_size(), 0);
-        // 空队列：flush_trace_context 直接返回 0（Python 在这种情形睡 5ms）
+        // 空队列：flush_trace_context 直接返回 0（调用方在这种情形睡 5ms）
         assert_eq!(d.inner.flush_trace_context(true), 0);
         assert_eq!(d.inner.flush_trace_context(false), 0);
     }
@@ -2160,7 +2099,6 @@ mod tests {
 
     #[test]
     fn empty_context_list_is_not_submitted() {
-        // Python `:208-209`
         let (d, recorder) = dispatcher();
         d.inner.async_send_trace_message(Vec::new());
         assert_eq!(recorder.publish_calls.load(Ordering::Acquire), 0);
@@ -2173,7 +2111,7 @@ mod tests {
         d.append(simple_pub());
         assert!(d.inner.submit(vec![simple_pub()]).is_err());
         d.flush();
-        assert_eq!(d.queue_size(), 0, "Python 也是先出队再提交");
+        assert_eq!(d.queue_size(), 0, "先出队再提交");
         assert!(recorder.records().is_empty());
     }
 
@@ -2217,7 +2155,7 @@ mod tests {
         assert_eq!(
             d.get_namespace_v2(),
             "",
-            "默认未配置（Python `:86` 的空串）"
+            "默认未配置（空串）"
         );
         d.set_namespace_v2("NS_V2");
         assert_eq!(d.get_namespace_v2(), "NS_V2");
@@ -2273,7 +2211,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_worker_flushes_batched_contexts() {
-        // 后台循环：攒够 batch_num 就发（Python `_async_run` + `:194`）
+        // 后台循环：攒够 batch_num 就发
         let (d, recorder) = dispatcher_with(2, None);
         d.start("127.0.0.1:9876", None).await.unwrap();
         d.append(simple_pub());
@@ -2313,14 +2251,13 @@ mod tests {
         }
         assert!(d.is_stopped());
         assert_eq!(recorder.shutdowns.load(Ordering::Acquire), 1);
-        // Python `:144-162` 不复位 is_started
         assert!(d.is_started());
         assert!(!recorder.records().is_empty());
     }
 
     #[tokio::test]
     async fn shutdown_without_start_does_not_stop_producer() {
-        // Python `:153-157`：`if self.is_started`
+        // 未 start 时直接跳过
         let (d, recorder) = dispatcher();
         d.append(simple_pub());
         TraceDispatcher::shutdown(&d);
@@ -2512,7 +2449,7 @@ mod tests {
         assert_eq!(TraceReportSink::client_id(&d), "consumer-id");
         d.set_host_producer(Arc::new(Host(FakeClientId("producer-id"))));
         assert_eq!(TraceReportSink::client_id(&d), "producer-id");
-        // Python `:123-124`：宿主存在但 clientId 为空 ⇒ 返回空串，不再回落到 consumer
+        // 宿主存在但 clientId 为空 ⇒ 返回空串，不再回落到 consumer
         d.set_host_producer(Arc::new(Host(FakeClientId(""))));
         assert_eq!(TraceReportSink::client_id(&d), "");
         // MQClientInstance 直接当宿主（模块差异 16）
@@ -2532,7 +2469,7 @@ mod tests {
 
     #[test]
     fn content_splitor_stays_between_topic_and_trace_topic() {
-        // Python `:227`：key = topic + CONTENT_SPLITOR + trace_topic
+        // key = topic + CONTENT_SPLITOR + trace_topic
         let key = format!("TopicTest{SOH}RMQ_SYS_TRACE_TOPIC");
         let (topic, trace_topic) = key.split_once(SOH).unwrap_or_default();
         assert_eq!((topic, trace_topic), ("TopicTest", "RMQ_SYS_TRACE_TOPIC"));

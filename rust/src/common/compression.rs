@@ -65,7 +65,7 @@ pub fn decompress(data: &[u8], compression_type: i32) -> Result<Vec<u8>> {
     }
 }
 
-/// 对应 Python `decompress_body`：`decompress` 的公开入口。
+/// `decompress` 的公开入口，按消息体压缩位调用。
 pub fn decompress_body(data: &[u8], compression_type: i32) -> Result<Vec<u8>> {
     decompress(data, compression_type)
 }
@@ -124,17 +124,17 @@ mod tests {
     use super::*;
     use crate::common::util_all;
 
-    /// 与 Python / C++ 侧生成真值时使用的同一段明文（1120 字节）。
+    /// 真值 fixture 使用的同一段明文（1120 字节）。
     fn payload() -> Vec<u8> {
         b"rocketmq-compressed-payload-".repeat(40)
     }
 
-    /// Python `zlib.compress(b"rocketmq-compressed-payload-" * 40, 5)` 的字节（47B）。
+    /// 外部 zlib（level 5）压同一段明文产出的字节（47B）。
     /// 硬编码外部真值，用来证明我们读的是真正的 RFC1950 流，而不是自压自解。
     const ZLIB_L5_HEX: &str = "785e2bca4fce4e2dc92dd44dcecf2d284a2d2e4e4dd12d48acccc94f4cd12d1a9\
                                51b951b951b95a3400e0058e0b9f0";
 
-    /// 外部（Python `lz4.frame.compress`）产出的 LZ4 Frame，`lz4` CLI 校验可解（66B）。
+    /// 外部 LZ4 Frame 工具产出的帧，`lz4` CLI 校验可解（66B）。
     const LZ4_FRAME_HEX: &str = "04224d1868406004000000000000482b000000ff0d726f636b65746d712d636f\
                                  6d707265737365642d7061796c6f61642d1c00ffffffff30506c6f61642d00000000";
 
@@ -204,10 +204,10 @@ mod tests {
         let compressed = zlib_compress(&payload(), 5).unwrap();
         assert!(compressed.len() < payload().len(), "重复明文应被压缩");
         assert_eq!(compressed[0], 0x78, "zlib 流第一个字节是 CMF");
-        // 互通真值：Python `zlib.compress(data, 5)` 产出的 47 字节必须能解开。
-        // 反向不成立——deflate 的具体字节由实现决定（Python 用 C zlib、这里是
-        // flate2 的纯 Rust 后端，同级别字节数就会不同），所以只断言「我们产的
-        // 流是合法 RFC1950」，与 C++ 端口 `test_compression.cpp` 同一口径。
+        // 互通真值：外部 zlib（level 5）产出的 47 字节必须能解开。
+        // 反向不成立——deflate 的具体字节由实现决定（本端口 flate2 后端与
+        // 外部实现同级别字节数就会不同），所以只断言「我们产的
+        // 流是合法 RFC1950」。
         let external = unhex(ZLIB_L5_HEX);
         assert_eq!(external.len(), 47, "外部 fixture 长度");
         assert_eq!(zlib_decompress(&external).unwrap(), payload());

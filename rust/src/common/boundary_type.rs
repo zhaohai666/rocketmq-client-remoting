@@ -1,4 +1,4 @@
-//! * 枚举声明 `LOWER("lower")` / `UPPER("upper")`（`BoundaryType.java:23/:28`），
+//! * 枚举声明 `LOWER("lower")` / `UPPER("upper")`，
 //!   但入网的值是 `Enum.toString()`（`RemotingCommand.makeCustomHeaderToNet:430`
 //!   的 `value.toString()`）—— **大写枚举名** `LOWER` / `UPPER`；`getName()` 的小写名
 //!   只喂给 `getType`，从不上报文。

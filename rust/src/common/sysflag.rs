@@ -34,7 +34,7 @@ impl MessageSysFlag {
     pub const COMPRESSION_TYPE_COMPARATOR: i32 = 0x7 << 8;
     pub const COMPRESSION_TYPE_SHIFT: i32 = 8;
 
-    /// 兼容历史命名：压缩类型**数值**（未左移），对应 Python 的同名常量。
+    /// 兼容历史命名：压缩类型**数值**（未左移），即 sysFlag 位移前的原始取值。
     pub const LZ4_TYPE: i32 = 1;
     pub const ZSTD_TYPE: i32 = 2;
     pub const ZLIB_TYPE: i32 = 3;

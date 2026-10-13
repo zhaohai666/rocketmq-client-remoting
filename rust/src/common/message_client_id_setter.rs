@@ -18,7 +18,7 @@ pub fn get_uniq_id(msg: &Message) -> Option<String> {
     msg.get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).map(str::to_string)
 }
 
-/// 消费侧取 `UNIQ_KEY`（Python 的 duck typing 让同一个函数也吃 `MessageExt`）。
+/// 消费侧取 `UNIQ_KEY`（同一属性也存在于 `MessageExt`，故两者共用一份键名）。
 pub fn get_uniq_id_of_ext(msg: &MessageExt) -> Option<String> {
     msg.get_property(PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX).map(str::to_string)
 }
@@ -35,7 +35,7 @@ mod tests {
         let first = get_uniq_id(&msg).expect("第一次必须写入");
         set_uniq_id(&mut msg);
         assert_eq!(get_uniq_id(&msg).unwrap(), first, "已有值不得覆盖");
-        // 与 Python 一致：32 个大写 hex（IPv4 环境）
+        // 协议字面量：32 个大写 hex（IPv4 环境）
         assert_eq!(first.len(), 32, "got {first}");
         assert_eq!(first, first.to_ascii_uppercase());
     }

@@ -1,6 +1,6 @@
-//! 与本仓库其它端的有意差异（语义不变）：
-//! - Python 的 `snapshot()` 返回 dict，这里返回强类型 [`MetricsSnapshot`]，
-//!   [`MetricsSnapshot::to_json_value`] 的键名与顺序和 Python dict 完全一致；
+//! 设计要点（语义与线上基准一致）：
+//! - `snapshot()` 返回强类型 [`MetricsSnapshot`]，
+//!   [`MetricsSnapshot::to_json_value`] 的键名与顺序是固定的；
 //! - 时钟只在**私有**的 `record_*_side(failed, rt)` 里可注入，单测因此能精确断言 RT，
 //!   而不是睡墙钟。
 
@@ -8,9 +8,9 @@ use std::fmt;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 取当前毫秒时间戳（浮点），对应 Python `time.time() * 1000.0`。
+/// 取当前毫秒时间戳（浮点）。
 ///
-/// 时钟回拨时 RT 可能为负 —— Python 同样如此，不做防护（口径一致优先）。
+/// 时钟回拨时 RT 可能为负 —— 同样不做防护（与线上基准口径一致优先）。
 fn now_ms() -> f64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d.as_secs_f64() * 1000.0,
@@ -18,15 +18,15 @@ fn now_ms() -> f64 {
     }
 }
 
-/// Python `round(x, 3)`：对二进制真值做"四舍六入五成双"，与 Rust 的 `{:.3}` 一致。
+/// 保留三位小数：对二进制真值做"四舍六入五成双"，即 `{:.3}` 的打印结果。
 /// 解析失败（inf/NaN）时原样返回，绝不 panic。
 pub fn round3(value: f64) -> f64 {
     format!("{value:.3}").parse::<f64>().unwrap_or(value)
 }
 
-/// 指标快照（对应 Python `ClientMetrics.snapshot()` 返回的 dict）。
+/// 指标快照。
 ///
-/// 浮点字段均已按 Python 口径 `round(_, 3)`，整数字段是累计值。
+/// 浮点字段均已 `round3` 舍入，整数字段是累计值。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MetricsSnapshot {
     /// `sendCount`：发送**成功**次数。
@@ -56,7 +56,7 @@ pub struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
-    /// 转成与 Python dict **同键名、同顺序**的 JSON 对象
+    /// 转成**固定键名、固定顺序**的 JSON 对象
     /// （`sendCount/sendFailureCount/sendRTSum/sendRTMax/sendRTMin/sendRTAvg` + 消费侧同名）。
     pub fn to_json_value(&self) -> serde_json::Value {
         serde_json::json!({
@@ -77,14 +77,14 @@ impl MetricsSnapshot {
 }
 
 impl fmt::Display for MetricsSnapshot {
-    /// Python `ClientMetrics.__repr__` 打印的是 `ClientMetrics<dict>`；这里打印 JSON 串，
-    /// 键名与顺序一致，只有引号/空格风格不同（serde_json 的紧凑格式）。
+    /// 打印 JSON 串，键名与顺序同快照字段，
+    /// 采用 serde_json 的紧凑格式。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ClientMetrics{}", self.to_json_value())
     }
 }
 
-/// 一组（发送或消费）的内部累计量，对应 Python 的 `_xxx_count/_xxx_failure_count/...`。
+/// 一组（发送或消费）的内部累计量：`count/failure_count/rt_*`。
 #[derive(Debug, Default, Clone, Copy)]
 struct Side {
     count: i64,
@@ -96,7 +96,7 @@ struct Side {
 }
 
 impl Side {
-    /// Python `record_*_success/failure` 里那段共用的累加逻辑。
+    /// `record_*_success/failure` 里共用的累加逻辑。
     fn record(&mut self, failed: bool, rt: f64) {
         if failed {
             self.failure_count += 1;
@@ -113,7 +113,7 @@ impl Side {
         self.started = true;
     }
 
-    /// Python `snapshot()` 的半边，返回 `(count, failure_count, sum, max, min, avg)`。
+    /// 快照的半边，返回 `(count, failure_count, sum, max, min, avg)`。
     /// avg 的分母只算成功次数，0 次时给 0.0。
     fn parts(&self) -> (i64, i64, f64, f64, f64, f64) {
         let avg = if self.count != 0 {
@@ -132,7 +132,7 @@ impl Side {
     }
 }
 
-/// 线程安全的发送/消费基本指标计数器（Python `ClientMetrics`）。
+/// 线程安全的发送/消费基本指标计数器。
 ///
 /// 内部只有一把 `Mutex`，`Send + Sync`，可以被 `Arc` 包起来在 producer/consumer 的
 /// 多个任务间共享。锁中毒时照常取内值（统计路径绝不允许 panic）。
@@ -154,7 +154,7 @@ impl Clone for ClientMetrics {
 }
 
 impl ClientMetrics {
-    /// 对应 Python `ClientMetrics()`：全零初始状态。
+    /// 全零初始状态。
     pub fn new() -> Self {
         Self::default()
     }
@@ -165,17 +165,17 @@ impl ClientMetrics {
 
     // ---------------- 发送 ----------------
 
-    /// 对应 Python `record_send_start()`：**只返回时间戳**，不改状态。
+    /// 发送开始：**只返回时间戳**，不改状态。
     pub fn record_send_start(&self) -> f64 {
         now_ms()
     }
 
-    /// 对应 Python `record_send_success(start_ms)`。
+    /// 记录一次发送成功（按开始时间算 RT）。
     pub fn record_send_success(&self, start_ms: f64) {
         self.record_send_side(false, now_ms() - start_ms);
     }
 
-    /// 对应 Python `record_send_failure(start_ms)`：失败同样累加 rt_sum。
+    /// 记录一次发送失败：失败同样累加 rt_sum。
     pub fn record_send_failure(&self, start_ms: f64) {
         self.record_send_side(true, now_ms() - start_ms);
     }
@@ -187,17 +187,17 @@ impl ClientMetrics {
 
     // ---------------- 消费 ----------------
 
-    /// 对应 Python `record_consume_start()`：**只返回时间戳**，不改状态。
+    /// 消费开始：**只返回时间戳**，不改状态。
     pub fn record_consume_start(&self) -> f64 {
         now_ms()
     }
 
-    /// 对应 Python `record_consume_success(start_ms)`。
+    /// 记录一次消费成功（按开始时间算 RT）。
     pub fn record_consume_success(&self, start_ms: f64) {
         self.record_consume_side(false, now_ms() - start_ms);
     }
 
-    /// 对应 Python `record_consume_failure(start_ms)`。
+    /// 记录一次消费失败（按开始时间算 RT）。
     pub fn record_consume_failure(&self, start_ms: f64) {
         self.record_consume_side(true, now_ms() - start_ms);
     }
@@ -209,7 +209,7 @@ impl ClientMetrics {
 
     // ---------------- 快照 ----------------
 
-    /// 对应 Python `snapshot()`：取一次锁、读出**舍入后**的全量指标。
+    /// 取一次锁、读出**舍入后**的全量指标。
     pub fn snapshot(&self) -> MetricsSnapshot {
         let state = self.locked();
         let (send_count, send_failure_count, send_rt_sum, send_rt_max, send_rt_min, send_rt_avg) =
@@ -252,7 +252,7 @@ mod tests {
     fn fresh_snapshot_is_all_zero_and_matches_python_dict() {
         let snapshot = ClientMetrics::new().snapshot();
         assert_eq!(snapshot, MetricsSnapshot::default());
-        // Python 空快照的键名与顺序（json.dumps(sort_keys=True) 的对拍结果）
+        // 空快照的键名与顺序是固定的
         assert_eq!(
             snapshot.to_json_value(),
             serde_json::json!({
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn failures_share_the_rt_chain_but_not_the_count() {
-        // Python 口径：rt_sum 含失败耗时，avg 的分母只算成功次数。
+        // 口径：rt_sum 含失败耗时，avg 的分母只算成功次数。
         let metrics = ClientMetrics::new();
         record(&metrics, false, false, 0.0, 100.0); // rt 100
         record(&metrics, false, true, 0.0, 200.0); // rt 200（失败）
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn min_and_max_only_move_outwards_once_started() {
-        // Python cm2 用例：started 已置位、max=100、min=1，再记一条超大 rt
+        // 场景：started 已置位、max=100、min=1，再记一条超大 rt
         let metrics = ClientMetrics::new();
         {
             let mut state = metrics.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn round3_matches_python_on_half_way_vectors() {
-        // 对拍 python3: round(v, 3)（二进制真值 + 四舍六入五成双）
+        // 固定向量：二进制真值 + 四舍六入五成双
         for (v, want) in [
             (1.0005_f64, 1.0_f64),
             (0.0625, 0.062),

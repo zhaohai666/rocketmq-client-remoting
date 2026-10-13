@@ -1,6 +1,5 @@
-//! 手动拉取消费者（对应 Python `client/consumer.py` 的
-//! `DefaultMQPullConsumer`（:2005-2216）与 `DefaultLitePullConsumer`
-//! （:2218-2716））。
+//! 手动拉取消费者：`DefaultMQPullConsumer`（RPC 门面）与
+//! `DefaultLitePullConsumer`（后台拉取 + 本地缓冲）。
 //!
 //! 两者都是「调用方拿位点」的消费者，区别只在于谁去拉：
 //!
@@ -9,10 +8,10 @@
 //! * [`DefaultLitePullConsumer`]：`subscribe(..)`/`assign(..)` + 后台拉取线程把消息灌进
 //!   本地缓冲 + `poll(..)` 取批；位点默认 auto-commit。
 //!
-//! # 与 Python 参考实现的对应关系
+//! # 并发模型
 //!
-//! Python 用 `threading.Thread` + `Condition` 跑 lite 的心跳与拉取循环；这里换成
-//! tokio 任务 + [`tokio::sync::Notify`]，行为口径不变。两条刻意差别：
+//! lite 的心跳与拉取循环用 tokio 任务 + [`tokio::sync::Notify`]，
+//! 对应线程 + 条件变量的经典口径，行为不变。
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
@@ -52,33 +51,33 @@ use crate::{bail, rmq_debug, rmq_error, rmq_warn};
 use crate::client::consumer::ExpressionType;
 use crate::client::validators;
 
-/// Python 两个消费者共用的默认值：`brokerSuspendMaxTimeMillis` = 20000。
+/// 两个消费者共用的默认值：`broker_suspend_max_time_millis` = 20000。
 pub const DEFAULT_BROKER_SUSPEND_MAX_TIME_MILLIS: i64 = 20_000;
-/// Python `consumerTimeoutMillisWhenSuspend` = 30000（长轮询时的请求超时）。
+/// `consumer_timeout_millis_when_suspend` = 30000（长轮询时的请求超时）。
 pub const DEFAULT_CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND: i64 = 30_000;
-/// Python `DefaultMQPullConsumer.consumerPullTimeoutMillis` = 10000。
+/// `DefaultMQPullConsumer` 的 `consumer_pull_timeout_millis` = 10000。
 pub const DEFAULT_CONSUMER_PULL_TIMEOUT_MILLIS: i64 = 10_000;
-/// Python `pull()` 里写死的 `suspendTimeoutMillis`（短轮询用不到，但报文照发）。
+/// `pull()` 里写死的 `suspendTimeoutMillis`（短轮询用不到，但报文照发）。
 const PULL_SUSPEND_TIMEOUT_MILLIS: i64 = 15_000;
-/// Python lite `_pull_one` 写死的请求超时。
+/// lite 单队列拉取写死的请求超时。
 const LITE_PULL_TIMEOUT_MILLIS: i64 = 30_000;
-/// Python lite 心跳循环间隔（`for _ in range(50): sleep(0.1)`）。
+/// lite 心跳循环间隔（50 次 0.1s 轮询）。
 const LITE_HEARTBEAT_INTERVAL_MILLIS: u64 = 5_000;
-/// Python lite 心跳 RPC 超时。
+/// lite 心跳 RPC 超时。
 const LITE_HEARTBEAT_TIMEOUT_MILLIS: i64 = 5_000;
-/// Python lite 重平衡最小间隔（subscribe 模式）。
+/// lite 重平衡最小间隔（subscribe 模式）。
 const LITE_REBALANCE_INTERVAL_MILLIS: i64 = 1_000;
-/// Python `poll()` 单次 drain 上限（`while ... len(out) < 1024`）。
+/// `poll()` 单次 drain 上限（1024 条）。
 pub const MAX_POLL_BATCH_SIZE: usize = 1024;
-/// Python lite 心跳的 RPC 超时同上，此处仅为可读性命名。
+/// 心跳的 RPC 超时同上，此处仅为可读性命名。
 const LITE_PULL_RPC_TIMEOUT_MILLIS: i64 = 5_000;
 const LITE_METADATA_FIRST_DELAY_MILLIS: u64 = 10_000;
 
 pub const DEFAULT_HEARTBEAT_BROKER_INTERVAL_MILLIS: u64 = 30_000;
-/// 经典拉模式消费者的心跳 RPC 超时（与 lite 的 5000ms、C++/C# 同口径）。
+/// 经典拉模式消费者的心跳 RPC 超时（与 lite 的 5000ms 同口径）。
 const PULL_HEARTBEAT_TIMEOUT_MILLIS: i64 = 5_000;
 
-/// 取锁（Python 的 `with self._lock`）；中毒时照用，理由同 `consumer::lock`。
+/// 取锁；中毒时照用，理由同 `consumer::lock`。
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -114,12 +113,12 @@ fn same_queue_set(old: &[MessageQueue], new: &[MessageQueue]) -> bool {
     new.iter().all(|mq| old_set.contains(&mq_key(mq)))
 }
 
-/// 拉取请求的 sysFlag（Python `pull` = `suspend=False`、`pull_block_if_not_found` =
-/// `suspend=True`，两者 `commit_offset` 都是 `False`）。
+/// 拉取请求的 sysFlag：`pull` = `suspend = false`、
+/// `pull_block_if_not_found` = `suspend = true`，两者 `commit_offset` 都是 false。
 ///
 /// ⚠ 短轮询这条**绝不能**置 suspend 位：broker 会在队尾挂到
 /// `brokerSuspendMaxTimeMillis`（20s），而客户端 10s 就超时 ——
-/// 真机必现 `RemotingTimeoutException`（Python `consumer.py:2168` 的踩坑记录）。
+/// 真机必现 `RemotingTimeoutException`（踩坑记录）。
 fn pull_sys_flag(block: bool) -> i32 {
     PullSysFlag::build_sys_flag_basic(false, block, true, false)
 }
@@ -132,42 +131,41 @@ fn lite_pull_sys_flag() -> i32 {
 
 // ================================================================ DefaultMQPullConsumer
 
-/// [`DefaultMQPullConsumer`] 的配置（Python `DefaultMQPullConsumer.__init__`
-/// 里那批平铺属性，`consumer.py:2059-2081`）。
+/// [`DefaultMQPullConsumer`] 的配置（一批平铺属性）。
 #[derive(Debug, Clone)]
 pub struct PullConsumerConfig {
-    /// Python `consumer_group`。
+    /// 消费组名。
     pub consumer_group: String,
-    /// Python `namespace`。
+    /// 命名空间。
     pub namespace: String,
-    /// Python `instance_name`，默认 `"DEFAULT"`。
+    /// 实例名，默认 `"DEFAULT"`。
     pub instance_name: String,
-    /// Python `client_id`；`None` 时 `start()` 现造。
+    /// `client_id`；`None` 时 `start()` 现造。
     pub client_id: Option<String>,
     pub unit_name: Option<String>,
     pub namespace_v2: Option<String>,
     pub unit_mode: bool,
     pub enable_stream_request_type: bool,
     pub poll_name_server_interval_millis: u64,
-    /// Python `name_server_addrs`。
+    /// NameServer 地址列表。
     pub name_server_addrs: Vec<String>,
-    /// Python `tls_enable`：`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`
-    /// （Python 的拉取消费者没这个属性，这里与推送消费者统一）。
+    /// `None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`
+    /// （拉取消费者本没有这个字段，这里与推送消费者统一）。
     pub tls_enable: Option<bool>,
     pub socks_proxy: Option<SocksProxyConfig>,
-    /// Python `message_model`；拉模式只影响 `subscriptionAutomatically`
-    /// （本移植版不做注册，见模块头偏离 2），其余行为与它无关。
+    /// `message_model`；拉模式只影响 `subscriptionAutomatically`
+    /// （本移植版不做注册），其余行为与它无关。
     pub message_model: String,
-    /// Python `broker_suspend_max_time_millis` = 20000：长轮询时下发给 broker 的挂起时长。
+    /// `broker_suspend_max_time_millis` = 20000：长轮询时下发给 broker 的挂起时长。
     pub broker_suspend_max_time_millis: i64,
-    /// Python `consumer_pull_timeout_millis` = 10000：短轮询默认请求超时。
+    /// `consumer_pull_timeout_millis` = 10000：短轮询默认请求超时。
     pub consumer_pull_timeout_millis: i64,
-    /// Python `consumer_timeout_millis_when_suspend` = 30000：长轮询请求超时。
+    /// `consumer_timeout_millis_when_suspend` = 30000：长轮询请求超时。
     pub consumer_timeout_millis_when_suspend: i64,
-    /// Python `heartbeat_enabled`（`consumer.py:869`，默认 `True`）：置 false 后
-    /// start 的同步那轮与后台循环都不发心跳（C++/C# 同名开关）。
+    /// `heartbeat_enabled`（默认 true）：置 false 后
+    /// start 的同步那轮与后台循环都不发心跳。
     pub heartbeat_enabled: bool,
-    /// Python `heartbeat_interval_millis`（`consumer.py:870`，默认 30000ms）。
+    /// `heartbeat_interval_millis`（默认 30000ms）。
     pub heartbeat_broker_interval_millis: u64,
 }
 
@@ -273,7 +271,7 @@ impl std::fmt::Debug for DefaultMQPullConsumer {
 }
 
 impl DefaultMQPullConsumer {
-    /// Python `DefaultMQPullConsumer(consumer_group)`；组名空白报错
+    /// 按消费组名构造；组名空白报错
     /// （`MQClientException("consumerGroup is empty")`）。
     pub fn new(consumer_group: &str) -> Result<DefaultMQPullConsumer> {
         DefaultMQPullConsumer::with_config(PullConsumerConfig {
@@ -282,7 +280,7 @@ impl DefaultMQPullConsumer {
         })
     }
 
-    /// Python `DefaultMQPullConsumer(consumer_group, rpc_hook=..)`。
+    /// 按消费组名 + RPC 钩子构造。
     pub fn with_rpc_hook(
         consumer_group: &str,
         rpc_hook: Option<Arc<dyn RPCHook>>,
@@ -292,7 +290,7 @@ impl DefaultMQPullConsumer {
         Ok(consumer)
     }
 
-    /// 直接以一份完整配置构造（Python 靠逐个赋属性，这里等价）。
+    /// 直接以一份完整配置构造（等价于逐个赋属性）。
     pub fn with_config(cfg: PullConsumerConfig) -> Result<DefaultMQPullConsumer> {
         if cfg.consumer_group.trim().is_empty() {
             bail!("consumerGroup is empty");
@@ -308,12 +306,12 @@ impl DefaultMQPullConsumer {
         })
     }
 
-    /// 当前配置快照（Python 直接读属性）。
+    /// 当前配置快照。
     pub fn config(&self) -> PullConsumerConfig {
         read_cfg(&self.inner.cfg)
     }
 
-    /// 改配置（Python 的直接赋属性）。
+    /// 改配置（直接赋属性）。
     pub fn update_config(&self, f: impl FnOnce(&mut PullConsumerConfig)) {
         {
             let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
@@ -342,19 +340,17 @@ impl DefaultMQPullConsumer {
 
     // ---------------- 配置 ----------------
 
-    /// Python `set_namesrv_addr`：分号分隔，逐项 trim、丢空。
+    /// 分号分隔，逐项 trim、丢空。
     pub fn set_namesrv_addr(&self, addr: &str) {
         let addrs = split_addrs(addr);
         self.update_config(|c| c.name_server_addrs = addrs);
     }
 
-    /// Python `set_name_server_addresses`。
     pub fn set_name_server_addresses(&self, addrs: &[String]) {
         let addrs = addrs.to_vec();
         self.update_config(|c| c.name_server_addrs = addrs);
     }
 
-    /// Python `set_instance_name`。
     pub fn set_instance_name(&self, name: &str) {
         let name = name.to_string();
         self.update_config(|c| c.instance_name = name);
@@ -394,19 +390,16 @@ impl DefaultMQPullConsumer {
         self.update_config(|c| c.poll_name_server_interval_millis = millis);
     }
 
-    /// Python `set_namespace`。
     pub fn set_namespace(&self, namespace: &str) {
         let namespace = namespace.to_string();
         self.update_config(|c| c.namespace = namespace);
     }
 
-    /// Python `set_message_model`。
     pub fn set_message_model(&self, model: &str) {
         let model = model.to_string();
         self.update_config(|c| c.message_model = model);
     }
 
-    /// Python `set_rpc_hook`。
     pub fn set_rpc_hook(&self, hook: Option<Arc<dyn RPCHook>>) {
         *self
             .inner
@@ -449,12 +442,10 @@ impl DefaultMQPullConsumer {
 
     // ---------------- 投递前过滤钩子 ----------------
 
-    /// Python `register_filter_message_hook`。
     pub fn register_filter_message_hook(&self, hook: Arc<dyn FilterMessageHook>) {
         self.inner.filter_hooks.register(hook);
     }
 
-    /// Python `has_filter_message_hook`。
     pub fn has_filter_message_hook(&self) -> bool {
         self.inner.filter_hooks.has_hooks()
     }
@@ -477,7 +468,7 @@ impl DefaultMQPullConsumer {
 
     // ---------------- 生命周期 ----------------
 
-    /// Python `start()`：幂等、必须有 name server，`client_id` 缺省时现造。
+    /// 幂等、必须有 name server，`client_id` 缺省时现造。
     pub async fn start(&self) -> Result<()> {
         if self
             .inner
@@ -545,7 +536,7 @@ impl DefaultMQPullConsumer {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
         }
-        // 动态 name server：实例可能已从地址服务器拿到地址，回填（Python 同）。
+        // 动态 name server：实例可能已从地址服务器拿到地址，回填。
         if cfg.name_server_addrs.is_empty() {
             let addrs = client.name_server_addrs();
             if !addrs.is_empty() {
@@ -564,7 +555,7 @@ impl DefaultMQPullConsumer {
         Ok(())
     }
 
-    /// Python `shutdown()`；未启动时是 no-op。
+    /// `shutdown()`；未启动时是 no-op。
     pub fn shutdown(&self) {
         if self
             .inner
@@ -622,7 +613,6 @@ impl DefaultMQPullConsumer {
         }
     }
 
-    /// Python `_require_client`。
     fn require_client(&self) -> Result<MQClientInstance> {
         if !self.is_started() {
             return Err(Error::client("consumer not started, call start() first"));
@@ -639,7 +629,7 @@ impl DefaultMQPullConsumer {
         self.inner.heartbeat_count.load(Ordering::SeqCst)
     }
 
-    /// Python `_refresh_route_for_heartbeat`（同 lite 版）：心跳只发给「路由表里已知的
+    /// 心跳前的路由刷新（同 lite 版）：心跳只发给「路由表里已知的
     /// broker」，自建实例刚 start 时路由表是空的。先把 registerTopics 的路由拉一遍并
     /// 登记为在用，start() 里那次同步心跳才真正到达 broker。
     async fn refresh_route_for_heartbeat(&self) {
@@ -655,8 +645,7 @@ impl DefaultMQPullConsumer {
         }
     }
 
-    /// Python `_send_heartbeat_to_all_broker`（同 lite 版）：向路由里的每台 broker
-    /// （**含从节点**）发一份，返回成功台数。
+    /// 向路由里的每台 broker（同 lite 版，**含从节点**）发一份心跳，返回成功台数。
     pub async fn send_heartbeat_to_all_broker(&self) -> usize {
         send_pull_heartbeat(&self.inner).await
     }
@@ -688,14 +677,13 @@ impl DefaultMQPullConsumer {
 
     // ---------------- 拉取 ----------------
 
-    /// Python `fetch_subscribe_message_queues`：按**订阅信息**列队列。
+    /// 按**订阅信息**列队列。
     ///
-    ///
-    /// ⚠ 与 lite 版不同，这里**不拼命名空间**（`consumer.py` 直接把入参
-    /// topic 传给路由查询），与 Python 保持逐字一致。
+    /// ⚠ 与 lite 版不同，这里**不拼命名空间**：直接把入参 topic
+    /// 传给路由查询，与线上基准逐字一致。
     pub async fn fetch_subscribe_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = self.require_client()?;
-        // Python `list(publish.msg_queue_list)` 的口径：不改队列身份，直接返回。
+        // 口径：不改队列身份，直接返回列表。
         Ok(client.get_topic_subscribe_info(topic).await)
     }
 
@@ -757,7 +745,6 @@ impl DefaultMQPullConsumer {
         Ok(out)
     }
 
-    /// Python `pull(mq, sub_expression="*", offset=0, max_nums=32, timeout=None)`：
     /// **短轮询**（`suspend=False`），位点由调用方 `update_consume_offset` 提交。
     pub async fn pull(
         &self,
@@ -803,12 +790,12 @@ impl DefaultMQPullConsumer {
         Ok(self.apply_delivery_filter(mq, result))
     }
 
-    /// Python `pull_block_if_not_found`：长轮询（`suspend=True`，超时用
+    /// 长轮询（`suspend=True`，超时用
     /// `consumer_timeout_millis_when_suspend`，挂起时长用
     /// `broker_suspend_max_time_millis`）。
     ///
     /// ⚠ 请求超时必须明显大于挂起时长，否则消息恰好在挂起末尾到达时会稳定超时
-    /// （Python 默认 30000 > 20000 正是这个比例）。
+    /// （默认 30000 > 20000 正是这个比例）。
     pub async fn pull_block_if_not_found(
         &self,
         mq: &MessageQueue,
@@ -851,7 +838,7 @@ impl DefaultMQPullConsumer {
         Ok(self.apply_delivery_filter(mq, result))
     }
 
-    /// 只在 FOUND 且非空时跑投递前过滤（Python 的 `if result.status == FOUND and ...`）。
+    /// 只在 FOUND 且非空时跑投递前过滤。
     fn apply_delivery_filter(&self, mq: &MessageQueue, mut result: PullResult) -> PullResult {
         if result.status == PullStatus::Found && !result.msg_found_list.is_empty() {
             result.msg_found_list =
@@ -870,7 +857,6 @@ impl DefaultMQPullConsumer {
             .await
     }
 
-    /// Python `update_consume_offset`。
     pub async fn update_consume_offset(&self, mq: &MessageQueue, offset: i64) -> Result<()> {
         let client = self.require_client()?;
         let group = self.consumer_group();
@@ -879,7 +865,6 @@ impl DefaultMQPullConsumer {
             .await
     }
 
-    /// Python `search_offset`。
     pub async fn search_offset(&self, mq: &MessageQueue, timestamp: i64) -> Result<i64> {
         let client = self.require_client()?;
         client
@@ -887,7 +872,6 @@ impl DefaultMQPullConsumer {
             .await
     }
 
-    /// Python `max_offset`。
     pub async fn max_offset(&self, mq: &MessageQueue) -> Result<i64> {
         let client = self.require_client()?;
         client
@@ -895,7 +879,6 @@ impl DefaultMQPullConsumer {
             .await
     }
 
-    /// Python `min_offset`。
     pub async fn min_offset(&self, mq: &MessageQueue) -> Result<i64> {
         let client = self.require_client()?;
         client
@@ -903,7 +886,7 @@ impl DefaultMQPullConsumer {
             .await
     }
 
-    /// Python `earliest_msg_store_time`（GET_EARLIEST_MSG_STORETIME=32）。
+    /// `GET_EARLIEST_MSG_STORETIME`(32)：取队列最早存储时间。
     pub async fn earliest_msg_store_time(&self, mq: &MessageQueue) -> Result<i64> {
         let client = self.require_client()?;
         client
@@ -953,7 +936,7 @@ impl DefaultMQPullConsumer {
     }
 }
 
-/// Python `sub.sub_string or "*"`：空串回落 SUB_ALL。
+/// 空串回落 SUB_ALL。
 fn sub_expression_of(sub: &SubscriptionData) -> &str {
     if sub.sub_string.is_empty() {
         FilterAPI::SUB_ALL
@@ -962,7 +945,7 @@ fn sub_expression_of(sub: &SubscriptionData) -> &str {
     }
 }
 
-/// Python `addr.split(";")` + 逐项 trim + 丢空。
+/// 按分号切分 + 逐项 trim + 丢空。
 fn split_addrs(addr: &str) -> Vec<String> {
     addr.split(';')
         .map(str::trim)
@@ -971,8 +954,7 @@ fn split_addrs(addr: &str) -> Vec<String> {
         .collect()
 }
 
-/// Python `DefaultMQPullConsumer._build_heartbeat`（`consumer.py:1649-1676`）：
-/// 拉模式消费者组的一份 ConsumerData。
+/// 构造拉模式消费者组的一份 ConsumerData。
 fn build_pull_heartbeat(inner: &PullInner) -> HeartbeatData {
     let cfg = read_cfg(&inner.cfg);
     let mut hb = HeartbeatData::new(cfg.client_id.clone().unwrap_or_default());
@@ -993,7 +975,7 @@ fn build_pull_heartbeat(inner: &PullInner) -> HeartbeatData {
     hb
 }
 
-/// Python `_send_heartbeat_to_all_broker`：向所有已知 broker（含从节点）发一次本组
+/// 向所有已知 broker（含从节点）发一次本组
 /// 心跳，返回成功台数。
 async fn send_pull_heartbeat(inner: &PullInner) -> usize {
     let Some(client) = lock(&inner.client).clone() else {
@@ -1016,8 +998,8 @@ async fn send_pull_heartbeat(inner: &PullInner) -> usize {
     ok
 }
 
-/// Python `_heartbeat_loop`（`consumer.py:1663-1671`）：先等一个周期再发 ——
-/// start() 里已同步发过一轮，循环的第一次是"第二个心跳周期"。
+/// 心跳后台循环：先等一个周期再发 ——
+/// start() 里已同步发过一轮，循环的第一次是「第二个心跳周期」。
 async fn pull_heartbeat_loop(inner: Arc<PullInner>, mut rx: watch::Receiver<bool>) {
     while inner.running.load(Ordering::Acquire) {
         if wait_or_stop(
@@ -1037,49 +1019,49 @@ async fn pull_heartbeat_loop(inner: Arc<PullInner>, mut rx: watch::Receiver<bool
 
 // ================================================================ DefaultLitePullConsumer
 
-/// [`DefaultLitePullConsumer`] 的配置（Python `consumer.py:2290-2343`）。
+/// [`DefaultLitePullConsumer`] 的配置。
 #[derive(Debug, Clone)]
 pub struct LitePullConsumerConfig {
-    /// Python `consumer_group`。
+    /// 消费组名。
     pub consumer_group: String,
-    /// Python `namespace`。
+    /// 命名空间。
     pub namespace: String,
-    /// Python `instance_name`，默认 `"DEFAULT"`。
+    /// 实例名，默认 `"DEFAULT"`。
     pub instance_name: String,
-    /// Python `client_id`；`None` 时 `start()` 现造。
+    /// `client_id`；`None` 时 `start()` 现造。
     pub client_id: Option<String>,
     pub unit_name: Option<String>,
     pub namespace_v2: Option<String>,
     pub unit_mode: bool,
     pub enable_stream_request_type: bool,
     pub poll_name_server_interval_millis: u64,
-    /// Python `name_server_addrs`。
+    /// NameServer 地址列表。
     pub name_server_addrs: Vec<String>,
-    /// Python `tls_enable`（同上，与推送消费者统一）。
+    /// `tls_enable`（同上，与推送消费者统一）。
     pub tls_enable: Option<bool>,
     /// SOCKS 代理（同上，与推送消费者统一）。
     pub socks_proxy: Option<SocksProxyConfig>,
-    /// Python `message_model`。
+    /// `message_model`。
     pub message_model: String,
-    /// Python `consume_from_where`：仅影响**首次**位点解析。
+    /// 仅影响**首次**位点解析。
     pub consume_from_where: String,
     pub consume_timestamp: String,
-    /// Python `pull_batch_size` = 32（ setter 里 `max(1, n)`）。
+    /// `pull_batch_size` = 32（setter 里 `max(1, n)`）。
     pub pull_batch_size: i32,
-    /// Python `poll_timeout_millis` = 5000（`max(0, ms)`）。
+    /// `poll_timeout_millis` = 5000（`max(0, ms)`）。
     pub poll_timeout_millis: i64,
-    /// Python `auto_commit` = true：**拉到即提交**，不是 poll 之后。
+    /// `auto_commit` = true：**拉到即提交**，不是 poll 之后。
     pub auto_commit: bool,
-    /// Python `auto_commit_interval_millis` = 5000（`max(0, ms)`）。
+    /// `auto_commit_interval_millis` = 5000（`max(0, ms)`）。
     pub auto_commit_interval_millis: i64,
-    /// Python `consumer_timeout_millis_when_suspend` = 30000：lite 恒短轮询，
-    /// 字段保留（与 Python 同形状）但拉取路径不读它。
+    /// `consumer_timeout_millis_when_suspend` = 30000：lite 恒短轮询，
+    /// 字段只为配置形状保留，拉取路径不读它。
     pub consumer_timeout_millis_when_suspend: i64,
-    /// Python `broker_suspend_max_time_millis` = 20000：同上，拉取路径不读。
+    /// `broker_suspend_max_time_millis` = 20000：同上，拉取路径不读。
     pub broker_suspend_max_time_millis: i64,
-    /// Python `pull_interval_millis` = 50：队尾空轮询时的退避（`max(0, ms)`）。
+    /// `pull_interval_millis` = 50：队尾空轮询时的退避（`max(0, ms)`）。
     pub pull_interval_millis: i64,
-    /// Python `pull_thread_nums` = 1：**本实现恒为单拉取循环**（与四门语言一致），
+    /// `pull_thread_nums` = 1：**本实现恒为单拉取循环**，
     /// 字段只为配置形状保留。
     pub pull_thread_nums: i32,
     /// [`register_topic_message_queue_change_listener`]: DefaultLitePullConsumer::register_topic_message_queue_change_listener
@@ -1118,25 +1100,22 @@ impl Default for LitePullConsumerConfig {
 }
 
 struct LiteState {
-    /// Python `subscription: Dict[topic, sub_expression]`（subscribe 模式）。
+    /// 订阅表 `topic -> sub_expression`（subscribe 模式）。
     subscription: BTreeMap<String, String>,
-    /// Python `subscription_data`：进心跳的订阅集。
+    /// 进心跳的订阅集。
     subscription_data: BTreeMap<String, SubscriptionData>,
-    /// Python `_assign_sub_expr`：assign 模式下的 tag 表达式。
+    /// assign 模式下的 tag 表达式。
     assign_sub_expr: BTreeMap<String, String>,
-    /// Python `_assign_mode`。
     assign_mode: bool,
-    /// Python `_assigned`：当前分配（有序，见模块头差异 2）。
+    /// 当前分配（有序，见模块头差异 2）。
     assigned: BTreeMap<String, MessageQueue>,
     next_offset: BTreeMap<String, i64>,
     consume_offset: BTreeMap<String, i64>,
     offset_table: BTreeMap<String, i64>,
-    /// Python `_seek_offset`：`seek()` 钉住的位点，优先于 `consume_from_where`。
+    /// `seek()` 钉住的位点，优先于 `consume_from_where`。
     seek_offset: BTreeMap<String, i64>,
     next_auto_commit_deadline: i64,
-    /// Python `_paused`。
     paused: BTreeSet<String>,
-    /// Python `_last_rebalance_ts`。
     last_rebalance_ts: i64,
 }
 
@@ -1171,7 +1150,7 @@ struct LiteInner {
     strategy: RwLock<Arc<dyn AllocateMessageQueueStrategy>>,
     listener: Mutex<Option<Arc<dyn MessageQueueListener>>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
-    /// Python `_local_buffer` + `_buffer_cond`。
+    /// 本地缓冲 + 缓冲就绪通知。
     buffer: Mutex<VecDeque<MessageExt>>,
     buffer_signal: Notify,
     topic_listeners: Mutex<BTreeMap<String, Arc<dyn TopicMessageQueueChangeListener>>>,
@@ -1224,9 +1203,9 @@ pub trait TopicMessageQueueChangeListener: Send + Sync {
 ///
 /// 两种模式都由单个后台循环做**短轮询**把消息灌进本地缓冲，`poll()` 只从缓冲取。
 /// 位点默认 auto-commit —— 注意提交点是「拉进缓冲」而非「poll 给用户」，
-/// 进程崩溃会丢掉缓冲里未 poll 的消息（与 Python 同一取舍，见其类文档字符串）。
+/// 进程崩溃会丢掉缓冲里未 poll 的消息（同一取舍）。
 ///
-/// ⚠ subscribe 模式下 `start()` **不**同步重平衡（Python 同）：刚 start 完
+/// ⚠ subscribe 模式下 `start()` **不**同步重平衡：刚 start 完
 /// [`assignment`](Self::assignment) 很可能是空的，要等后台循环第一轮（≤1s）。
 /// 依赖队列分配的调用方（`pause`、按队列 `seek`）先 `rebalance().await` 一次。
 #[derive(Clone)]
@@ -1255,7 +1234,7 @@ impl std::fmt::Debug for DefaultLitePullConsumer {
 }
 
 impl DefaultLitePullConsumer {
-    /// Python `DefaultLitePullConsumer(consumer_group)`。
+    /// 按消费组名构造 lite 消费者。
     pub fn new(consumer_group: &str) -> Result<DefaultLitePullConsumer> {
         DefaultLitePullConsumer::with_config(LitePullConsumerConfig {
             consumer_group: consumer_group.to_string(),
@@ -1263,7 +1242,7 @@ impl DefaultLitePullConsumer {
         })
     }
 
-    /// Python `DefaultLitePullConsumer(consumer_group, rpc_hook=..)`。
+    /// 按消费组名 + RPC 钩子构造 lite 消费者。
     pub fn with_rpc_hook(
         consumer_group: &str,
         rpc_hook: Option<Arc<dyn RPCHook>>,
@@ -1291,7 +1270,7 @@ impl DefaultLitePullConsumer {
         read_cfg(&self.inner.cfg)
     }
 
-    /// 改配置（Python 的直接赋属性 + 一批 `set_*`；钳制规则照抄 setter）。
+    /// 改配置（直接赋属性 + 一批 `set_*`；钳制规则照抄 setter）。
     pub fn update_config(&self, f: impl FnOnce(&mut LitePullConsumerConfig)) {
         {
             let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
@@ -1303,56 +1282,50 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Python `set_pull_batch_size`：`max(1, n)`。
+    /// `max(1, n)`。
     pub fn set_pull_batch_size(&self, n: i32) {
         self.update_config(|c| c.pull_batch_size = n);
     }
 
-    /// Python `set_poll_timeout_millis`：`max(0, ms)`。
+    /// `max(0, ms)`。
     pub fn set_poll_timeout_millis(&self, ms: i64) {
         self.update_config(|c| c.poll_timeout_millis = ms);
     }
 
-    /// Python `set_auto_commit`。
     pub fn set_auto_commit(&self, auto: bool) {
         self.update_config(|c| c.auto_commit = auto);
     }
 
-    /// Python `set_auto_commit_interval_millis`：`max(0, ms)`。
+    /// `max(0, ms)`。
     pub fn set_auto_commit_interval_millis(&self, ms: i64) {
         self.update_config(|c| c.auto_commit_interval_millis = ms);
     }
 
-    /// Python `set_pull_interval_millis`：`max(0, ms)`。
+    /// `max(0, ms)`。
     pub fn set_pull_interval_millis(&self, ms: i64) {
         self.update_config(|self_c| self_c.pull_interval_millis = ms);
     }
 
-    /// Python `set_consume_from_where`。
     pub fn set_consume_from_where(&self, where_: &str) {
         let where_ = where_.to_string();
         self.update_config(|c| c.consume_from_where = where_);
     }
 
-    /// Python `set_consume_timestamp`。
     pub fn set_consume_timestamp(&self, ts: &str) {
         let ts = ts.to_string();
         self.update_config(|c| c.consume_timestamp = ts);
     }
 
-    /// Python `set_namesrv_addr`。
     pub fn set_namesrv_addr(&self, addr: &str) {
         let addrs = split_addrs(addr);
         self.update_config(|c| c.name_server_addrs = addrs);
     }
 
-    /// Python `set_name_server_addresses`。
     pub fn set_name_server_addresses(&self, addrs: &[String]) {
         let addrs = addrs.to_vec();
         self.update_config(|c| c.name_server_addrs = addrs);
     }
 
-    /// Python `set_instance_name`。
     pub fn set_instance_name(&self, name: &str) {
         let name = name.to_string();
         self.update_config(|c| c.instance_name = name);
@@ -1392,19 +1365,16 @@ impl DefaultLitePullConsumer {
         self.update_config(|c| c.poll_name_server_interval_millis = millis);
     }
 
-    /// Python `set_message_model`。
     pub fn set_message_model(&self, model: &str) {
         let model = model.to_string();
         self.update_config(|c| c.message_model = model);
     }
 
-    /// Python `set_namespace`。
     pub fn set_namespace(&self, namespace: &str) {
         let namespace = namespace.to_string();
         self.update_config(|c| c.namespace = namespace);
     }
 
-    /// Python `set_rpc_hook`。
     pub fn set_rpc_hook(&self, hook: Option<Arc<dyn RPCHook>>) {
         *self
             .inner
@@ -1413,7 +1383,6 @@ impl DefaultLitePullConsumer {
             .unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
-    /// Python `set_allocate_message_queue_strategy`。
     pub fn set_allocate_message_queue_strategy(
         &self,
         strategy: Arc<dyn AllocateMessageQueueStrategy>,
@@ -1456,17 +1425,16 @@ impl DefaultLitePullConsumer {
         self.inner.started.load(Ordering::Acquire)
     }
 
-    /// Python `is_running`。
     pub fn is_running(&self) -> bool {
         self.inner.running.load(Ordering::Acquire)
     }
 
     // ---------------- 订阅 / 分配 ----------------
 
-    /// Python `subscribe(topic, sub_expression="*")`：切回 subscribe 模式。
+    /// 切回 subscribe 模式。
     ///
     /// 表达式非法（`FilterAPI` 抛错）时只丢订阅表里的那条
-    /// （Python `consumer.py:2409-2412`），`subscription` 仍记下 —— 与 Python 一致。
+    /// ，`subscription` 仍记下 —— 与线上基准一致。
     pub fn subscribe(&self, topic: &str, sub_expression: &str) {
         let topic = with_namespace(&self.config().namespace, topic);
         {
@@ -1487,13 +1455,12 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Python `subscribe_with_selector`：lite 只认 tag 表达式，`MessageSelector`
-    /// 一律按 tag 处理（`consumer.py:2414-2416`）。
+    /// lite 只认 tag 表达式，`MessageSelector`
+    /// 一律按 tag 处理。
     pub fn subscribe_with_selector(&self, topic: &str, selector: &MessageSelector) {
         self.subscribe(topic, &selector.expression);
     }
 
-    /// Python `unsubscribe`。
     pub fn unsubscribe(&self, topic: &str) {
         let topic = with_namespace(&self.config().namespace, topic);
         let mut state = lock(&self.inner.state);
@@ -1501,7 +1468,7 @@ impl DefaultLitePullConsumer {
         state.subscription_data.remove(&topic);
     }
 
-    /// Python `set_sub_expression_for_assign`：assign 模式下给某 topic 指定 tag
+    /// assign 模式下给某 topic 指定 tag
     /// 表达式，同时登记 `SubscriptionData`（assign 模式 broker 也要订阅信息）。
     pub fn set_sub_expression_for_assign(&self, topic: &str, sub_expression: &str) {
         let topic = with_namespace(&self.config().namespace, topic);
@@ -1520,12 +1487,11 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Python `assign(mqs)`：切到 assign 模式（不走重平衡）。
+    /// 切到 assign 模式（不走重平衡）。
     ///
     /// 初始位点解析需要 RPC，故这里只登记队列，位点留给
-    /// [`start`](Self::start)（Python 在 `assign()` 里同步解析，语义相同、时机后移，
-    /// 因为 Rust 侧 `assign()` 不是 async）。已在 `_next_offset` 里的队列不覆盖，
-    /// 与 Python 的 `if mq not in self._next_offset` 一致。
+    /// [`start`](Self::start)（同步解析语义相同、时机后移，
+    /// 因为 `assign()` 不是 async）。已在 `next_offset` 里的队列不覆盖。
     pub fn assign(&self, message_queues: &[MessageQueue]) {
         let mut state = lock(&self.inner.state);
         state.assign_mode = true;
@@ -1546,7 +1512,7 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// 当前订阅表（topic -> 表达式），Python 直接读 `subscription`。
+    /// 当前订阅表（topic -> 表达式）。
     pub fn subscription(&self) -> Vec<(String, String)> {
         lock(&self.inner.state)
             .subscription
@@ -1555,7 +1521,7 @@ impl DefaultLitePullConsumer {
             .collect()
     }
 
-    /// 当前进入心跳的订阅集，Python 直接读 `subscription_data`。
+    /// 当前进入心跳的订阅集。
     pub fn subscriptions(&self) -> Vec<SubscriptionData> {
         lock(&self.inner.state)
             .subscription_data
@@ -1564,14 +1530,14 @@ impl DefaultLitePullConsumer {
             .collect()
     }
 
-    /// 是否 assign 模式（Python `_assign_mode`）。
+    /// 是否 assign 模式。
     pub fn is_assign_mode(&self) -> bool {
         lock(&self.inner.state).assign_mode
     }
 
     // ---------------- 生命周期 ----------------
 
-    /// Python `start()`：幂等；先查组名，再有 name server，必须已有订阅或 assign；
+    /// 幂等；先查组名，再有 name server，必须已有订阅或 assign；
     /// **先把订阅 topic 的路由缓存进来，再同步发一次心跳**，最后起后台循环。
     ///
     /// 心跳只发给路由表里已知的 broker，所以刷路由必须在那次同步心跳之前
@@ -1665,7 +1631,7 @@ impl DefaultLitePullConsumer {
         client.register_consumer_group(&cfg.consumer_group);
         *lock(&self.inner.client) = Some(client);
 
-        // assign 模式：start 时补齐初始位点（Python `consumer.py:2463-2469`）
+        // assign 模式：start 时补齐初始位点
         let pending: Vec<MessageQueue> = {
             let state = lock(&self.inner.state);
             state
@@ -1688,7 +1654,7 @@ impl DefaultLitePullConsumer {
         Ok(())
     }
 
-    /// Python `shutdown()`：停循环 → 末次 commit（auto_commit 时）→ 唤醒 poll
+    /// 停循环 → 末次 commit（auto_commit 时）→ 唤醒 poll
     /// → 关实例。
     ///
     /// 差别见模块头差异 1：末次提交与 `client.shutdown()` 一起派发到运行时上**串行**
@@ -1710,7 +1676,7 @@ impl DefaultLitePullConsumer {
         for task in lock(&self.inner.tasks).drain(..) {
             task.abort();
         }
-        // 唤醒可能卡在 poll() 里的调用方（Python `notify_all`）
+        // 唤醒可能卡在 poll() 里的调用方
         self.inner.buffer_signal.notify_waiters();
 
         let auto_commit = self.config().auto_commit;
@@ -1741,8 +1707,8 @@ impl DefaultLitePullConsumer {
                 );
             }
             None => {
-                // 无运行时：提交不了，至少把连接关掉（与 Python 的
-                // 「commit 失败只 debug 日志」同级别降级）。
+                // 无运行时：提交不了，至少把连接关掉
+                // （与「commit 失败只 debug 日志」同级别降级）。
                 rmq_warn!("lite shutdown: no tokio runtime, skip final offset commit");
                 self.close_client();
             }
@@ -1777,7 +1743,7 @@ impl DefaultLitePullConsumer {
 
     // ---------------- 心跳 ----------------
 
-    /// Python `_refresh_route_for_heartbeat`：心跳只发给「路由表里已知的 broker」，
+    /// 心跳只发给「路由表里已知的 broker」，
     /// 而自建实例刚 start 时路由表还是空的，那一轮会发 0 份 —— 订阅要等到 5s 心跳
     /// 循环的第一轮才注册上 broker。所以这里先把本实例关注的 topic（订阅的 + assign
     /// 到的）路由拉一遍并登记为在用，让 start() 里那次同步心跳真正到达 broker。
@@ -1803,7 +1769,7 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Python `_send_heartbeat_to_all_broker`：向路由里的每个 broker 发一份，返回成功数。
+    /// 向路由里的每个 broker 发一份，返回成功数。
     pub async fn send_heartbeat_to_all_broker(&self) -> usize {
         send_lite_heartbeat(&self.inner).await
     }
@@ -1847,7 +1813,7 @@ impl DefaultLitePullConsumer {
 
     // ---------------- poll / 位点 ----------------
 
-    /// Python `poll(timeout=None)`：等缓冲非空（最多 `poll_timeout_millis`），
+    /// 等缓冲非空（最多 `poll_timeout_millis`），
     /// 一次最多取 [`MAX_POLL_BATCH_SIZE`] 条。
     pub async fn poll(&self, timeout_millis: Option<i64>) -> Vec<MessageExt> {
         if self.config().auto_commit {
@@ -1856,8 +1822,8 @@ impl DefaultLitePullConsumer {
         let timeout = timeout_millis.unwrap_or_else(|| self.config().poll_timeout_millis);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout.max(0) as u64);
         loop {
-            // 先挂上唤醒再查缓冲（等价于 Python 在 `with self._buffer_cond` 里 check 后
-            // 才 wait）：反过来写时，检查与挂起之间 enqueue 的那次 notify 会丢，
+            // 先挂上唤醒再查缓冲（等价于「check 完才 wait」）：
+            // 反过来写时，检查与挂起之间 enqueue 的那次 notify 会丢，
             // 用户只能白等到一个 deadline。`enable()` 才是真正登记兴趣的点。
             let mut notified = std::pin::pin!(self.inner.buffer_signal.notified());
             notified.as_mut().enable();
@@ -1869,13 +1835,13 @@ impl DefaultLitePullConsumer {
             if remaining.is_zero() {
                 return Vec::new();
             }
-            // 与 Python 的 `Condition.wait(remaining)` 等价：被叫醒就再查一次缓冲，
+            // 等价于带超时的条件等待：被叫醒就再查一次缓冲，
             // 没到 deadline 就继续等（假唤醒无害）。
             let _ = tokio::time::timeout(remaining, notified).await;
         }
     }
 
-    /// 一次性 drain 缓冲（Python `poll` 里 `while self._local_buffer and len(out) < 1024`）。
+    /// 一次性 drain 缓冲（最多 1024 条）。
     /// `None` = 缓冲为空，调用方该继续等。
     fn try_drain(&self) -> Option<Vec<MessageExt>> {
         let mut buffer = lock(&self.inner.buffer);
@@ -1889,7 +1855,7 @@ impl DefaultLitePullConsumer {
     /// 交付出去的这批消息推进**已消费游标**（拉取游标一格都不动）。
     fn advance_consume_offset(&self, msgs: &[MessageExt]) {
         let mut state = lock(&self.inner.state);
-        // Python 同款做法：先把"有拉取记录的队列"按 (topic, brokerName, queueId) 建索引，
+        // 先把「有拉取记录的队列」按 (topic, brokerName, queueId) 建索引，
         // 再用消息自己的坐标反查 mq_key —— 从消息字段拼 key 会绕过持有判断。
         let held: BTreeMap<(String, String, i32), String> = state
             .next_offset
@@ -1917,7 +1883,7 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Python `seek`：钉住游标并丢掉缓冲里该队列早于 `offset` 的消息。
+    /// 钉住游标并丢掉缓冲里该队列早于 `offset` 的消息。
     pub fn seek(&self, mq: &MessageQueue, offset: i64) {
         let key = mq_key(mq);
         {
@@ -1940,7 +1906,6 @@ impl DefaultLitePullConsumer {
         *buffer = kept;
     }
 
-    /// Python `seek_to_begin`。
     pub async fn seek_to_begin(&self, mq: &MessageQueue) -> Result<()> {
         let client = Self::require_client(&self.inner)?;
         let offset = client
@@ -1950,7 +1915,6 @@ impl DefaultLitePullConsumer {
         Ok(())
     }
 
-    /// Python `seek_to_end`。
     pub async fn seek_to_end(&self, mq: &MessageQueue) -> Result<()> {
         let client = Self::require_client(&self.inner)?;
         let offset = client
@@ -2159,7 +2123,6 @@ impl DefaultLitePullConsumer {
             .unwrap_or(-1)
     }
 
-    /// Python `offset_for_timestamp`。
     pub async fn offset_for_timestamp(&self, mq: &MessageQueue, timestamp: i64) -> Result<i64> {
         let client = Self::require_client(&self.inner)?;
         client
@@ -2167,7 +2130,6 @@ impl DefaultLitePullConsumer {
             .await
     }
 
-    /// Python `assignment`。
     pub fn assignment(&self) -> Vec<MessageQueue> {
         lock(&self.inner.state).assigned.values().cloned().collect()
     }
@@ -2198,12 +2160,11 @@ impl DefaultLitePullConsumer {
         Ok(queues)
     }
 
-    /// Python `fetch_subscribe_message_queues`（lite 版 = `fetch_message_queues`）。
+    /// `fetch_subscribe_message_queues`（lite 版 = `fetch_message_queues`）。
     pub async fn fetch_subscribe_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         self.fetch_message_queues(topic).await
     }
 
-    /// Python `pause`。
     pub fn pause(&self, message_queues: &[MessageQueue]) {
         let mut state = lock(&self.inner.state);
         for mq in message_queues {
@@ -2211,7 +2172,6 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Python `resume`。
     pub fn resume(&self, message_queues: &[MessageQueue]) {
         let mut state = lock(&self.inner.state);
         for mq in message_queues {
@@ -2306,14 +2266,14 @@ impl DefaultLitePullConsumer {
         fired
     }
 
-    /// 本地缓冲当前条数（Python 直接读 `len(_local_buffer)`；测试与观测用）。
+    /// 本地缓冲当前条数（测试与观测用）。
     pub fn buffered_message_count(&self) -> usize {
         lock(&self.inner.buffer).len()
     }
 
     // ---------------- 拉取服务的内部件 ----------------
 
-    /// Python `_subscription_for`：subscribe 表 → assign 表达式 → `"*"`。
+    /// subscribe 表 → assign 表达式 → `"*"`。
     fn subscription_for(&self, topic: &str) -> String {
         let state = lock(&self.inner.state);
         if let Some(expr) = state.subscription.get(topic) {
@@ -2325,8 +2285,8 @@ impl DefaultLitePullConsumer {
         FilterAPI::SUB_ALL.to_string()
     }
 
-    /// Python `_resolve_initial_offset` 的批量版：逐队列解析，失败只记日志
-    /// （Python 在 `assign`/`rebalance`/首拉三处都 `try/except` 吞掉）。
+    /// 初始位点解析的批量版：逐队列解析，失败只记日志
+    /// （`assign` / `rebalance` / 首拉三处都吞掉错误）。
     async fn resolve_offsets_for(&self, mqs: &[MessageQueue]) {
         let Ok(client) = Self::require_client(&self.inner) else {
             return;
@@ -2345,9 +2305,9 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Python `_rebalance`（subscribe 模式）：逐 topic 取全部队列 + 消费组实例列表
-    /// → 分配策略 → 并集。查不到实例列表时**保留当前分配**（Python 的
-    /// `or []` + 自己补进列表，等价于「只有我一人时独占」；这里与推送消费者
+    /// 重平衡（subscribe 模式）：逐 topic 取全部队列 + 消费组实例列表
+    /// → 分配策略 → 并集。查不到实例列表时**保留当前分配**
+    /// （等价于「只有我一人时独占」；这里与推送消费者
     /// 同口径，见 [`crate::client::consumer::DefaultMQPushConsumer`] 的说明）。
     pub async fn rebalance(&self) {
         let Ok(client) = Self::require_client(&self.inner) else {
@@ -2470,7 +2430,7 @@ impl DefaultLitePullConsumer {
         }
     }
 
-    /// Python `_pull_one`：短轮询拉一批，命中则过滤 tag → 灌缓冲 → 推游标 →
+    /// 短轮询拉一批，命中则过滤 tag → 灌缓冲 → 推游标 →
     /// 节流 auto-commit。返回 `true` = 本轮有消息进缓冲（退避判断用）。
     async fn pull_one(&self, mq: &MessageQueue) -> bool {
         let Ok(client) = Self::require_client(&self.inner) else {
@@ -2539,7 +2499,7 @@ impl DefaultLitePullConsumer {
         if !intact || result.status != PullStatus::Found || result.msg_found_list.is_empty() {
             return false;
         }
-        // Python `_filter_tags`：按表达式现算 tagsSet 再筛（无集合 = 不筛）
+        // 按表达式现算 tagsSet 再筛（无集合 = 不筛）
         let sub = FilterAPI::build_subscription_data(&mq.topic, Some(&expr)).ok();
         let msgs = client_side_tag_filter(sub.as_ref(), result.msg_found_list);
         if msgs.is_empty() {
@@ -2559,11 +2519,11 @@ impl DefaultLitePullConsumer {
     }
 }
 
-/// Python `_resolve_initial_offset`：`seek` → broker 已提交位点（保证重启续消费）
+/// `seek` → broker 已提交位点（保证重启续消费）
 /// → `CONSUME_FROM_FIRST_OFFSET` ⇒ min → `CONSUME_FROM_TIMESTAMP` ⇒ 按时间查 → 否则 max。
 ///
 /// 与推送消费者的 `resolve_initial_offset` 不同：lite 没有广播模式的本地位点存储、
-/// 没有 SQL92 特例，也不给 `%RETRY%` 特殊起步（Python 亦无，且 lite 不自动订阅重试主题）。
+/// 没有 SQL92 特例，也不给 `%RETRY%` 特殊起步（lite 不自动订阅重试主题）。
 async fn resolve_initial_offset(
     inner: &LiteInner,
     client: &MQClientInstance,
@@ -2603,7 +2563,7 @@ async fn resolve_initial_offset(
         .await
 }
 
-/// Python `_heartbeat_loop` 里那份报文：只带**本消费者自己**的 ConsumerData
+/// 心跳报文：只带**本消费者自己**的 ConsumerData
 /// （lite 不进实例注册表，报文由自己拼）。
 fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
     let cfg = read_cfg(&inner.cfg);
@@ -2624,8 +2584,8 @@ fn build_lite_heartbeat(inner: &LiteInner) -> HeartbeatData {
     hb
 }
 
-/// Python `_send_heartbeat_to_all_broker`：路由里的每个 broker（**含从节点**）发一份。
-/// 没有 client（未 start / 已 shutdown）就发 0 份而不是退出循环 —— Python 同。
+/// 路由里的每个 broker（**含从节点**）发一份。
+/// 没有 client（未 start / 已 shutdown）就发 0 份而不是退出循环。
 async fn send_lite_heartbeat(inner: &LiteInner) -> usize {
     let Some(client) = lock(&inner.client).clone() else {
         return 0;
@@ -2644,8 +2604,8 @@ async fn send_lite_heartbeat(inner: &LiteInner) -> usize {
     ok
 }
 
-/// Python `_heartbeat_loop`：先发一轮（start 里已同步发过一轮，这里紧跟着第二次，
-/// 与 Python 同序），之后每 5s 一轮。
+/// 先发一轮（start 里已同步发过一轮，这里紧跟着第二次，
+/// 与 lite 版同序），之后每 5s 一轮。
 async fn heartbeat_loop(inner: Arc<LiteInner>, mut rx: watch::Receiver<bool>) {
     while inner.running.load(Ordering::Acquire) {
         if *rx.borrow_and_update() {
@@ -2690,7 +2650,7 @@ async fn metadata_loop_after(
     }
 }
 
-/// Python `_pull_service_loop`：单循环轮转所有已分配队列。
+/// 单循环轮转所有已分配队列。
 /// subscribe 模式下每 >1s 重平衡一次；一轮里没有任何消息则退避
 /// `pull_interval_millis`，有消息则 5ms 后立刻续拉。
 async fn pull_service_loop(inner: Arc<LiteInner>, mut rx: watch::Receiver<bool>) {
@@ -2872,7 +2832,7 @@ mod tests {
             e.contains("subscription is not set, call subscribe() or assign() first"),
             "{e}"
         );
-        // 缺 name server 的校验在前，且顺序与 Python 一致
+        // 缺 name server 的校验在前，且顺序固定
         let c2 = DefaultLitePullConsumer::new("LitePG").unwrap();
         c2.subscribe("T", "*");
         let e2 = c2
@@ -2944,7 +2904,7 @@ mod tests {
 
     // ---------------------------------------------------------- 拉取标志位
 
-    /// Python 用 `inspect.getsource` 断言 `suspend=False`；这里直接测位本身。
+    /// 直接测 sysFlag 的 suspend 位本身。
     #[test]
     fn pull_is_short_poll_and_block_is_long_poll() {
         let short = pull_sys_flag(false);
@@ -2988,8 +2948,8 @@ mod tests {
 
     #[test]
     fn bad_tag_expression_drops_only_subscription_data() {
-        // `"||"` 会让 FilterAPI 抛 `subString split error`：Python 保留
-        // `subscription` 条目、丢掉 `subscription_data`（consumer.py:2409-2412）
+        // `"||"` 会让 FilterAPI 抛 `subString split error`：保留
+        // `subscription` 条目、丢掉 `subscription_data`
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.subscribe("T", "||");
         assert_eq!(c.subscription().len(), 1);
@@ -3003,7 +2963,7 @@ mod tests {
         assert!(!c.is_assign_mode());
         c.assign(&[queue("T", "broker-a", 1), queue("T", "broker-a", 0)]);
         assert!(c.is_assign_mode());
-        // 分配快照按 key 有序（Python 是 set，遍历序不定）
+        // 分配快照按 key 有序（遍历序固定）
         assert_eq!(
             c.assignment(),
             vec![queue("T", "broker-a", 0), queue("T", "broker-a", 1)]
@@ -3255,8 +3215,7 @@ mod tests {
 
     // ---------------------------------------------------------- 时间戳解析
 
-    /// 与 Python `test_consume_timestamp_must_be_wall_clock` 同一批向量：
-    /// 该字段**只**是 14 位本地墙钟，纯数字的 epoch 毫秒必须被拒 ——
+    /// 金标向量：该字段**只**是 14 位本地墙钟，纯数字的 epoch 毫秒必须被拒 ——
     /// 旧实现走 `isdigit()` 分支把 "20230101000000" 当 epoch 解释成公元 2611 年。
     #[test]
     fn consume_timestamp_is_wall_clock_only() {
@@ -3318,7 +3277,7 @@ mod tests {
         assert_eq!(
             pull.get_namespace_v2(),
             None,
-            "None = 清除（Java setNamespaceV2(null)）"
+            "None = 清除"
         );
 
         let lite = DefaultLitePullConsumer::new("LitePG").expect("合法组名不该构造失败");
@@ -3410,7 +3369,7 @@ mod tests {
         assert!(!cd.unit_mode);
         assert_eq!(cd.subscription_data_set.len(), 1);
         assert_eq!(cd.subscription_data_set[0].topic, "T");
-        // 没有订阅时仍是一条 ConsumerData（Python 也发）
+        // 没有订阅时仍是一条 ConsumerData
         c.unsubscribe("T");
         assert!(build_lite_heartbeat(&c.inner).consumer_data_set[0]
             .subscription_data_set
@@ -3869,7 +3828,7 @@ mod tests {
         assert_eq!(topics, vec!["T1", "T2"], "订阅集来自 registerTopics");
         for sub in &cd.subscription_data_set {
             assert_eq!(sub.sub_string, "*");
-            assert_eq!(sub.sub_version, 0, "Java 显式 setSubVersion(0L)");
+            assert_eq!(sub.sub_version, 0, "subVersion 显式置 0");
         }
 
         // 没有 registerTopics：照样一份 ConsumerData，订阅集为空
@@ -3908,7 +3867,7 @@ mod tests {
     }
 
     /// 后台循环按 `heartbeat_broker_interval_millis` 重发；`heartbeat_enabled=false`
-    /// 只停发不退出（Python `_heartbeat_loop`：`continue` 而不是 `break`）。
+    /// 只停发不退出（跳过本轮而不是退出循环）。
     #[tokio::test]
     async fn pull_heartbeat_loop_repeats_and_honours_the_disable_switch() {
         let cluster = FakePullCluster::start().await;
@@ -4190,7 +4149,7 @@ mod tests {
         let codes = cluster.master.codes();
         assert!(
             !codes.contains(&request_code::GET_MIN_OFFSET),
-            "FIRST_OFFSET 是字面量 0（Java RebalanceLitePullImpl），一次 minOffset 都不该发：{codes:?}"
+            "FIRST_OFFSET 是字面量 0，一次 minOffset 都不该发：{codes:?}"
         );
         first.shutdown();
         last.shutdown();
@@ -4567,10 +4526,10 @@ mod tests {
         let err = c
             .register_topic_message_queue_change_listener("  ", listener)
             .await
-            .expect_err("空 topic 必须报错（Java 抛 MQClientException）");
+            .expect_err("空 topic 必须报错");
         assert!(
             err.to_string().contains("Topic or listener is null"),
-            "报的是 Java 那句：{err}"
+            "报的是那句固定错误文案：{err}"
         );
         assert_eq!(c.topic_metadata_check_interval_millis(), 30_000);
         c.set_topic_metadata_check_interval_millis(0);
@@ -4635,7 +4594,7 @@ mod tests {
             .expect("未启动也能注册");
         assert!(
             lock(&c.inner.queues_for_topic).is_empty(),
-            "未启动不记快照（Java 只在 RUNNING 记）"
+            "未启动不记快照（只在 RUNNING 记）"
         );
 
         c.start().await.expect("start 成功");

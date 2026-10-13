@@ -221,7 +221,7 @@ mod tests {
         );
         assert_eq!(NamespaceUtil::wrap_namespace_and_retry("", "GID"), "%RETRY%GID");
         assert_eq!(NamespaceUtil::wrap_namespace_and_retry("NS", ""), "");
-        // 传进来的 group 已带 %RETRY%：Python 同理会得到双前缀（调用方应传裸 group），
+        // 传进来的 group 已带 %RETRY%：会拼出双前缀（调用方应传裸 group），
         // 这里把这个行为钉住，别让人「顺手优化」成去重。
         assert_eq!(
             NamespaceUtil::wrap_namespace_and_retry("NS", "%RETRY%GID"),

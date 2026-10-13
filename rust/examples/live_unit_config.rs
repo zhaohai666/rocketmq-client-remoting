@@ -1,7 +1,7 @@
 //! unitName / unitMode / enableStreamRequestType 对**真实 5.5.1 broker** 的联调验证。
 //!
-//! 与 `python/verify_unit_config_live.py`（U1..U5）同题。这三项里 unitName 和
-//! unitMode 都不该只在客户端自 high —— broker 侧有可观测后果，所以全部用真机断言：
+//! 这三项里 unitName 和 unitMode 都不该只在客户端自 high —— broker 侧有可观测
+//! 后果，所以全部用真机断言：
 //! - U1 `unitName` 进 clientId（`ip@instanceName@unitName`），且不影响发送；
 //!   不设 unitName 时 clientId 不能凭空多出一段。
 //! - U2 消费者带 `@unitName@STREAM` 时，**broker 回读到的 clientId 就是这个值**

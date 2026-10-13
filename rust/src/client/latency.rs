@@ -18,13 +18,12 @@ pub type NowFn = fn() -> i64;
 
 pub type QueueFilter<'a> = dyn Fn(&MessageQueue) -> bool + 'a;
 
-/// 发布信息的选队列接口面（对应 Python `TopicPublishInfo` 的
-/// `reset_index` / `select_one_message_queue(*filters)` 两个方法）。
+/// 发布信息的选队列接口面（`reset_index` 与 `select_one_message_queue` 两个方法）。
 pub trait PublishInfo: Send + Sync {
-    /// Python `TopicPublishInfo.reset_index`：把游标清零。
+    /// 把游标清零。
     fn reset_index(&self);
 
-    /// Python `TopicPublishInfo.select_one_message_queue(*filters)`。
+    /// 带过滤器选出一条队列。
     fn select_one_message_queue(&self, filters: &[&QueueFilter<'_>]) -> Result<Option<MessageQueue>>;
 }
 
@@ -43,7 +42,7 @@ pub struct FaultItem {
 }
 
 impl FaultItem {
-    /// 对应 Python `FaultItem(name)`：延迟 0、隔离窗口 0、**可达 = true**。
+    /// 新建项：延迟 0、隔离窗口 0、**可达 = true**。
     pub fn new(name: &str) -> FaultItem {
         FaultItem {
             name: name.to_string(),
@@ -82,7 +81,7 @@ impl FaultItem {
 }
 
 impl fmt::Display for FaultItem {
-    /// 对齐 Python `FaultItem.__repr__`
+    /// 固定展示格式
     /// （`FaultItem{name=broker-a, latency=123, startTs=1700000000123, reachable=true}`）。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -112,7 +111,7 @@ pub trait ServiceDetector: Send + Sync {
 
 #[derive(Debug)]
 pub struct LatencyFaultToleranceImpl {
-    /// Python `_fault_item_table`。
+    /// broker 名 -> FaultItem 表。
     fault_item_table: RwLock<HashMap<String, FaultItem>>,
     /// 时钟注入点（单测用假时钟 pin 隔离窗口）。
     now_millis: NowFn,
@@ -142,8 +141,8 @@ impl LatencyFaultToleranceImpl {
         (self.now_millis)()
     }
 
-    /// 建新项与更新旧项的三步赋值顺序一致（Python 写了两份分支只是为了插入），
-    /// 所以这里用 entry -or-insert 后统一改字段。
+    /// 建新项与更新旧项的三步赋值顺序一致，
+    /// 所以这里用 entry-or-insert 后统一改字段。
     pub fn update_fault_item(
         &self,
         name: &str,
@@ -180,12 +179,12 @@ impl LatencyFaultToleranceImpl {
         write_guard(&self.fault_item_table).remove(name);
     }
 
-    /// 对应 Python `get_fault_item`：返回**快照副本**（见模块头差异 3）。
+    /// 按名查找，返回**快照副本**（见模块头差异 3）。
     pub fn get_fault_item(&self, name: &str) -> Option<FaultItem> {
         read_guard(&self.fault_item_table).get(name).cloned()
     }
 
-    /// 表里当前记录了哪些 broker（仅供排错；Python 无对应方法）。
+    /// 表里当前记录了哪些 broker（仅供排错）。
     pub fn fault_item_names(&self) -> Vec<String> {
         let mut names: Vec<String> = read_guard(&self.fault_item_table)
             .keys()
@@ -253,14 +252,14 @@ pub const ISOLATION_LATENCY: i64 = 10000;
 pub struct MQFaultStrategy {
     send_latency_fault_enable: AtomicBool,
     latency_fault_tolerance: LatencyFaultToleranceImpl,
-    /// 延迟档位表：Python 是实例属性 `latency_max`（可直接改），这里同样留 `pub`。
+    /// 延迟档位表（可直接改，故留 `pub`）。
     pub latency_max: Vec<i64>,
-    /// 隔离时长档位表：Python 的 `not_available_duration`。
+    /// 隔离时长档位表。
     pub not_available_duration: Vec<i64>,
 }
 
 impl Default for MQFaultStrategy {
-    /// Python `MQFaultStrategy(send_latency_fault_enable=False)` 的默认。
+    /// 默认：延迟容错关闭。
     fn default() -> MQFaultStrategy {
         MQFaultStrategy::new(false)
     }
@@ -271,7 +270,7 @@ impl MQFaultStrategy {
         MQFaultStrategy::with_clock(send_latency_fault_enable, current_time_millis)
     }
 
-    /// 带假时钟的构造口（单测 pin 隔离窗口用；等价于 Python 里 monkeypatch `time.time`）。
+    /// 带假时钟的构造口（单测 pin 隔离窗口用）。
     pub fn with_clock(
         send_latency_fault_enable: bool,
         now_millis: NowFn,
@@ -356,8 +355,8 @@ impl MQFaultStrategy {
             .update_fault_item(broker_name, current_latency, duration, reachable);
     }
 
-    /// Python 直接 `not_available_duration[i]` 索引，两表长度不一致时会 `IndexError`；
-    /// 这里按「越界的档位等于 0」处理，以免配置写歪时把发送线程搞崩（唯一的行为差别）。
+    /// 档位表按下标直接索引，两表长度不一致时会越界；
+    /// 这里按「越界的档位等于 0」处理，以免配置写歪时把发送线程搞崩。
     fn compute_not_available_duration(&self, current_latency: i64) -> i64 {
         let latency_max = &self.latency_max;
         for i in (0..latency_max.len()).rev() {
@@ -369,8 +368,8 @@ impl MQFaultStrategy {
     }
 }
 
-/// Python 的最后一档 `tp_info.select_one_message_queue()`：**永不返回 None**
-/// （队列为空时 Python 直接抛 MQClientException）。这里把「实现方违约返回 None」
+/// 最后一档是无过滤器的选择：**永不返回 None**
+/// （队列为空时直接报 MQClientException）。这里把「实现方违约返回 None」
 /// 兜成同一句错误文案，绝不 panic。
 fn select_unfiltered(tp_info: &dyn PublishInfo) -> Result<MessageQueue> {
     match tp_info.select_one_message_queue(&[])? {
@@ -400,7 +399,7 @@ mod tests {
         NOW
     }
 
-    /// Python `TopicPublishInfo` 的测试替身：语义逐条照抄
+    /// [`PublishInfo`] 的测试替身：语义逐条锁定
     /// （空表报错、无过滤器永不返回 None、带过滤器最多试 n 个且每次都推进游标）。
     #[derive(Debug, Default)]
     struct FakePublishInfo {
@@ -544,7 +543,7 @@ mod tests {
         assert_eq!(item.start_timestamp, NOW + 30_000);
         assert!(!item.reachable_flag);
         assert!(!tolerance.is_available("x"));
-        // 建新项与更新旧项的三步赋值等价（Python 两份分支）
+        // 建新项与更新旧项的三步赋值等价
         assert_eq!(item.get_current_latency(), 600);
         assert_eq!(item.get_start_timestamp(), NOW + 30_000);
     }
@@ -552,7 +551,7 @@ mod tests {
     #[test]
     fn compute_not_available_duration_threshold_table() {
         let strategy = MQFaultStrategy::new(true);
-        // 向量由 `python3 /tmp/rmq_probe/probe_latency.py` 打印
+        // 档位→隔离时长的固定金标向量
         for (latency, duration) in [
             (0, 0),
             (49, 0),
@@ -761,7 +760,7 @@ mod tests {
             ("broker-a".into(), 0)
         );
         assert_eq!(tp.index(), 1);
-        // 关闭时 Python 连 reset_index 都不执行（那个分支整体在 enable 判断内）
+        // 关闭时连 reset_index 都不执行（那个分支整体在 enable 判断内）
         let off = MQFaultStrategy::new(false);
         let tp2 = FakePublishInfo::new(queues());
         off.select_one_message_queue(&tp2, None, false).unwrap();
@@ -788,14 +787,14 @@ mod tests {
         strategy.not_available_duration = vec![0, 1, 2, 3, 4, 5, 6];
         assert_eq!(strategy.compute_not_available_duration(100), 1);
         assert_eq!(strategy.compute_not_available_duration(550), 2);
-        // 另一实例仍是默认表（Python 的类常量 vs 实例副本）
+        // 另一实例仍是默认表（档位表是实例副本，不共享）
         let other = MQFaultStrategy::new(true);
         assert_eq!(other.compute_not_available_duration(100), 0);
     }
 
     #[test]
     fn mismatched_table_length_yields_zero_instead_of_panicking() {
-        // Python 这里会 IndexError；Rust 侧按「档位缺失 = 0」处理（见方法文档）
+        // 两表长度不齐会越界；这里按「档位缺失 = 0」处理（见方法文档）
         let mut strategy = MQFaultStrategy::new(true);
         strategy.latency_max = vec![10, 20, 30];
         strategy.not_available_duration = vec![100];
@@ -921,7 +920,7 @@ mod tests {
 
         assert!(
             tolerance.get_fault_item("broker-gone").is_none(),
-            "路由里没有的 broker 要连故障项一起清掉（Java faultItemTable.remove）"
+            "路由里没有的 broker 要连故障项一起清掉（faultItemTable.remove 语义）"
         );
         assert_eq!(detector.calls(), 0, "resolve 不到地址就直接 continue，不探测");
         assert!(tolerance.fault_item_names().is_empty());

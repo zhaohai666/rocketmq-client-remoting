@@ -76,7 +76,7 @@ mod tests {
     }
 
     /// 载荷 `"v1 TopicA broker-a 1700000000000 <UNIQ_KEY>"` 的 base64url，
-    /// 用 `java.util.Base64.getUrlEncoder()` 口径（含填充）算出。
+    /// 用 URL 安全的 Base64 编码器口径（含填充）算出。
     #[test]
     fn encoding_matches_the_wire_vector() {
         assert_eq!(
@@ -90,7 +90,7 @@ mod tests {
     fn padded_and_unpadded_handles_both_decode() {
         let padded = build_handle("TopicA", "broker-a", "1700000000000", UNIQ_KEY);
         let unpadded = padded.trim_end_matches('=').to_string();
-        assert_ne!(padded, unpadded, "Java 的编码器确实会补填充");
+        assert_ne!(padded, unpadded, "URL 安全编码器确实会补填充");
         assert_eq!(
             decode_handle(&unpadded).expect("unpadded"),
             decode_handle(&padded).expect("padded")

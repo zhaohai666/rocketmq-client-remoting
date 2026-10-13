@@ -1,11 +1,11 @@
-//! 移植 `python/remoting/protocol/headers.py` 的 79 个
+//! 本模块是协议里的 79 个
 //! `CommandCustomHeader` 实现：每个结构体都提供
 //!
 //!
 //! ## 长名 vs 短名
 //!
 //!
-//! ## 与 Python 的两处刻意的差异
+//! ## 两处刻意的取舍
 
 use std::any::Any;
 use std::fmt;
@@ -20,13 +20,13 @@ pub fn bool_text(value: bool) -> String {
     }
 }
 
-/// 读字符串扩展字段（对应 Python `ext.get(k)`）。
+/// 读字符串扩展字段（缺失返回 `None`）。
 pub fn ext_str(ext: &ExtFields, key: &str) -> Option<String> {
     ext.get(key).map(|s| s.to_string())
 }
 
-/// 读 `int` 扩展字段；缺失或不是合法数字返回 `None`（Python 的 `int()` 会抛，
-/// 这里按「脏数据不 panic」的要求降级）。
+/// 读 `int` 扩展字段；缺失或不是合法数字返回 `None`
+/// （按「脏数据不 panic」的要求降级）。
 pub fn ext_i32(ext: &ExtFields, key: &str) -> Option<i32> {
     ext.get(key).and_then(|v| v.trim().parse::<i32>().ok())
 }
@@ -36,7 +36,7 @@ pub fn ext_i64(ext: &ExtFields, key: &str) -> Option<i64> {
     ext.get(key).and_then(|v| v.trim().parse::<i64>().ok())
 }
 
-/// 读 `boolean` 扩展字段，对应 Python `_b`（`true` / `1` 为真）。
+/// 读 `boolean` 扩展字段（`true` / `1` 为真）。
 pub fn ext_bool(ext: &ExtFields, key: &str) -> Option<bool> {
     ext.get(key).map(|v| {
         let t = v.trim().to_ascii_lowercase();
@@ -116,20 +116,20 @@ impl fmt::Debug for dyn CustomHeader + '_ {
 }
 
 
-//   GetMaxOffsetRequestHeader: java-only fields ["committed"]
-//   SearchOffsetRequestHeader: java-only fields ["liteTopic"]
-//   QueryMessageResponseHeader: java-only fields ["indexLastUpdatePhyoffset"]
-//   ViewMessageRequestHeader: java-only fields ["topic"]
-//   ConsumeMessageDirectlyResultRequestHeader: java-only fields ["topic", "topicSysFlag", "groupSysFlag"]
-//   ResetOffsetRequestHeader: java-only fields ["queueId", "offset"]
-//   EndTransactionRequestHeader: python-only keys ["bname"]
-//   CheckTransactionStateRequestHeader: python-only keys ["bname"]
-//   CheckTransactionStateResponseHeader: python-only keys ["groupName", "transactionState", "offset"]
-//   CheckTransactionStateResponseHeader: java-only fields ["producerGroup", "tranStateTableOffset", "commitLogOffset", "commitOrRollback"]
-//   GetAllTopicConfigRequestHeader: java-only fields ["topicSeq", "dataVersion", "maxTopicNum"]
-//   GetAllTopicConfigResponseHeader: python-only keys ["dataVersion"]
-//   GetAllTopicConfigResponseHeader: java-only fields ["totalTopicNum"]
-//   GetConsumeStatsRequestHeader: java-only fields ["TOPIC_NAME_SEPARATOR", "topicList"]
+//   GetMaxOffsetRequestHeader: server-side-only fields ["committed"]
+//   SearchOffsetRequestHeader: server-side-only fields ["liteTopic"]
+//   QueryMessageResponseHeader: server-side-only fields ["indexLastUpdatePhyoffset"]
+//   ViewMessageRequestHeader: server-side-only fields ["topic"]
+//   ConsumeMessageDirectlyResultRequestHeader: server-side-only fields ["topic", "topicSysFlag", "groupSysFlag"]
+//   ResetOffsetRequestHeader: server-side-only fields ["queueId", "offset"]
+//   EndTransactionRequestHeader: 客户端额外上报的键 ["bname"]
+//   CheckTransactionStateRequestHeader: 客户端额外上报的键 ["bname"]
+//   CheckTransactionStateResponseHeader: 客户端额外上报的键 ["groupName", "transactionState", "offset"]
+//   CheckTransactionStateResponseHeader: server-side-only fields ["producerGroup", "tranStateTableOffset", "commitLogOffset", "commitOrRollback"]
+//   GetAllTopicConfigRequestHeader: server-side-only fields ["topicSeq", "dataVersion", "maxTopicNum"]
+//   GetAllTopicConfigResponseHeader: 客户端额外上报的键 ["dataVersion"]
+//   GetAllTopicConfigResponseHeader: server-side-only fields ["totalTopicNum"]
+//   GetConsumeStatsRequestHeader: server-side-only fields ["TOPIC_NAME_SEPARATOR", "topicList"]
 header_struct! {
     SendMessageRequestHeader {
         producer_group: s => "producerGroup",
@@ -604,7 +604,7 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: MISSING-IN-JAVA
+/// extFields: MISSING-IN-SERVER
     GetAllSubscriptionGroupConfigRequestHeader {
 
     }
@@ -618,7 +618,7 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: MISSING-IN-JAVA
+/// extFields: MISSING-IN-SERVER
     InterviewGetConsumerStatusRequestHeader {
         consumer_group: s => "consumerGroup",
         topic: s => "topic",
@@ -641,21 +641,21 @@ header_struct! {
 }
 
 header_struct! {
-/// extFields: MISSING-IN-JAVA
+/// extFields: MISSING-IN-SERVER
     GetTopicConfigResponseHeader {
 
     }
 }
 
 header_struct! {
-/// extFields: MISSING-IN-JAVA
+/// extFields: MISSING-IN-SERVER
     GetSubscriptionGroupResponseHeader {
 
     }
 }
 
 header_struct! {
-/// extFields: MISSING-IN-JAVA
+/// extFields: MISSING-IN-SERVER
     GetTopicListResponseHeader {
         broker_addr: s => "brokerAddr",
 
@@ -1011,8 +1011,7 @@ mod tests {
         ext.iter().map(|(k, _)| k.as_str()).collect()
     }
 
-    /// 逐字节守卫：POP 请求头的 12 个长字段名与顺序（`python/tests/test_pop.py`、
-    /// `cpp/tests/test_pop.cpp` 同一组断言）。
+    /// 逐字节守卫：POP 请求头的 12 个长字段名与顺序按协议定义钉死。
     #[test]
     fn pop_message_request_header_ext_keys_exactly_match_protocol() {
         let h = PopMessageRequestHeader {
@@ -1239,7 +1238,7 @@ mod tests {
     }
 
     /// broker 的 `checkFields()` 把 `topicFilterType` 解析成枚举，为空直接抛异常；
-    /// 同时守 `attributes` / `force` 两个后加的字段（`cpp/tests/test_admin.cpp` 同组断言）。
+    /// 同时守 `attributes` / `force` 两个后加的字段。
     #[test]
     fn create_topic_request_header_guards() {
         let h = CreateTopicRequestHeader {
@@ -1271,7 +1270,7 @@ mod tests {
         minimal.to_ext_fields(&mut ext);
         assert_eq!(keys(&ext), vec!["topic"]);
 
-        // Python 的 from_ext_fields 漏了 attributes/force，这里补齐：必须能还原。
+        // attributes / force 是后加的字段，读取侧必须能把它们还原回来。
         let full = CreateTopicRequestHeader {
             topic: Some("attr-topic".into()),
             attributes: Some("+deleteWhen\x1d04".into()),
@@ -1328,7 +1327,7 @@ mod tests {
         assert_eq!(send_resp.batch_uniq_id, None);
     }
 
-    /// `QueryMessageRequestHeader`（`cpp/tests/test_admin.cpp` 的往返守卫）。
+    /// `QueryMessageRequestHeader` 的逐字段往返守卫。
     #[test]
     fn query_message_request_header_round_trip() {
         let h = QueryMessageRequestHeader {
@@ -1490,15 +1489,15 @@ mod tests {
 
     #[test]
     fn test_header_field_names_match_protocol() {
-        let root = match std::env::var("ROCKETMQ_JAVA_SRC") {
+        let root = match std::env::var("ROCKETMQ_SERVER_SRC") {
             Ok(v) if !v.trim().is_empty() => v,
             _ => {
-                eprintln!("ROCKETMQ_JAVA_SRC 未设置，跳过 java 字段名对拍");
+                eprintln!("ROCKETMQ_SERVER_SRC 未设置，跳过服务端字段名对拍");
                 return;
             }
         };
         let root = std::path::PathBuf::from(root);
-        assert!(root.is_dir(), "ROCKETMQ_JAVA_SRC 不是目录: {root:?}");
+        assert!(root.is_dir(), "ROCKETMQ_SERVER_SRC 不是目录: {root:?}");
         for (class, fields) in PROTOCOL_HEADER_FIELDS {
             let declared = java_declared_fields(&root, class, 0);
             if declared.is_empty() {
@@ -1507,7 +1506,7 @@ mod tests {
             for field in *fields {
                 assert!(
                     declared.iter().any(|d| d == field),
-                    "java {class} 已无字段 {field}（当前字段: {declared:?}）"
+                    "服务端 {class} 已无字段 {field}（当前字段: {declared:?}）"
                 );
             }
         }

@@ -1,5 +1,4 @@
-//! 与 `python/verify_pinned_guard_live.py`（S1..S6）、`cpp/examples/live_pinned_guard.cpp`、
-//! `csharp/examples/RocketMQ.Examples/LivePinnedGuard.cs` 同题。
+//! 定点队列守卫（pinned guard）真机验证（S1..S6）。
 //!
 //! 前置：NameServer + Broker 已起，`autoCreateTopicEnable=true`。
 //!
@@ -432,7 +431,7 @@ async fn run(namesrv: &str) -> Checker {
     let single_ms = began.elapsed().as_secs_f64() * 1000.0;
     let single_msg = single.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
     ck.check(
-        "S2a 同步单条拒（Java 原文案）",
+        "S2a 同步单条拒（文案逐字一致）",
         single.is_err() && single_msg.contains(SYNC_WORDING),
         &format!("{single_ms:.2}ms {single_msg}"),
     );
@@ -623,7 +622,7 @@ async fn run(namesrv: &str) -> Checker {
     );
     let b_now = offset_of(&producer, &mq_b).await;
     ck.check(
-        "S5b 目标队列所在的 B 一条都没有（是 Java 的口子，不是漏发）",
+        "S5b 目标队列所在的 B 一条都没有（是本端设计使然，不是漏发）",
         b_now == 0,
         &format!("B maxOffset={b_now}"),
     );

@@ -2,9 +2,6 @@
 //! 配置、订阅组管理、消费者与生产者连接、消费统计、位点管理（含真实 broker 端
 //! 重置）、消息查询（key / uniqKey / msgId / ConsumeQueue）、单条消息试消费
 //! （CONSUME_MESSAGE_DIRECTLY(309) 发起端）。
-//!
-//!
-//! # 与 Python 参考实现的刻意差别
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -43,21 +40,20 @@ use crate::remoting::rpchook::RPCHook;
 use crate::{bail, rmq_warn};
 
 pub const DEFAULT_TIMEOUT_MILLIS: i64 = 5000 * 3;
-/// Python `DefaultMQAdminExt.instance_name = "ADMIN"`。
+/// 管理端默认实例名固定为 `"ADMIN"`。
 pub const DEFAULT_INSTANCE_NAME: &str = "ADMIN";
 const ADMIN_OP_TIMEOUT_MILLIS: i64 = 5000;
-/// Python `query_message_by_key(max_num=32)` 与 `query_message_by_uniq_key` 写死的 32。
+/// `query_message_by_key(max_num=32)` 与 `query_message_by_uniq_key` 写死的 32。
 pub const DEFAULT_QUERY_MESSAGE_MAX_NUM: i32 = 32;
 
-/// Python `NamesrvUtil.NAMESPACE_ORDER_TOPIC_CONFIG`：
 /// 顺序 topic 配置所在的 NameServer KV namespace。
 pub const NAMESPACE_ORDER_TOPIC_CONFIG: &str = "ORDER_TOPIC_CONFIG";
-/// Python `get_all_subscription_group` 的 `maxGroupNum`。
+/// `get_all_subscription_group` 的分页上限 `maxGroupNum`。
 const MAX_GROUP_NUM: i32 = 10_000;
-/// Python `query_message_by_uniq_key` 的查询窗口上界（`now + 60 * 60 * 1000`）。
+/// `query_message_by_uniq_key` 的查询窗口上界（`now + 60 * 60 * 1000`）。
 const UNIQ_QUERY_WINDOW_MILLIS: i64 = 60 * 60 * 1000;
 
-/// 管理端配置（对应 Python `DefaultMQAdminExt.__init__` 的那几个属性）。
+/// 管理端配置。
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
     pub namespace: String,
@@ -107,7 +103,7 @@ fn read_cfg(cfg: &RwLock<AdminConfig>) -> AdminConfig {
     cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Python `set_namesrv_addr`：分号分隔，逐项 trim、丢空。
+/// 分号分隔，逐项 trim、丢空。
 fn split_addrs(addr: &str) -> Vec<String> {
     addr.split(';')
         .map(str::trim)
@@ -116,7 +112,7 @@ fn split_addrs(addr: &str) -> Vec<String> {
         .collect()
 }
 
-/// Python `RemotingCommand.create_request_command(code, None)` + 填 extFields/body。
+/// 用 `RemotingCommand::create_request_command(code, None)` 建请求，再填 extFields/body。
 fn build_request(code: i32, ext: &StringMap, body: Option<Vec<u8>>) -> RemotingCommand {
     let mut request = RemotingCommand::create_request_command(code, None);
     for (key, value) in ext.iter() {
@@ -166,7 +162,7 @@ fn reset_offset_ext_pairs(
     ext_pairs(&pairs)
 }
 
-/// Python `response.ext_fields.get(k, 0) or 0`：缺字段/非数字都当 0。
+/// 缺字段/非数字都当 0。
 fn ext_int(response: &RemotingCommand, key: &str) -> i64 {
     response
         .get_ext_field(key)
@@ -177,7 +173,7 @@ fn ext_int(response: &RemotingCommand, key: &str) -> i64 {
 // ---------------------------------------------------------------- 纯逻辑 helper
 // 抽出来只为让「Vec 表」这几个最容易写错的地方能离线锁死；调用方只有一处。
 
-/// Python `_broker_addrs_of_cluster`：不给集群名回全部 broker；给了就按
+/// 不给集群名回全部 broker；给了就按
 /// `clusterAddrTable[cluster]` 的 brokerName（排序、去重）取地址（每台 broker 的
 /// 地址按字符串排序），一个都没取到再退回全量。
 fn cluster_broker_addrs(cluster: &ClusterInfo, cluster_name: Option<&str>) -> Vec<String> {
@@ -219,7 +215,7 @@ fn cluster_broker_addrs(cluster: &ClusterInfo, cluster_name: Option<&str>) -> Ve
     addrs
 }
 
-/// Python `get_userTopicConfig` 的过滤：系统 topic（broker 上报的 + 本地判定）
+/// 用户 topic 配置的过滤：系统 topic（broker 上报的 + 本地判定）
 /// 一律剔除；`special_topic=false` 时再剔除 `%RETRY%` / `%DLQ%`。
 fn filter_user_topic_configs(
     mut wrapper: TopicConfigSerializeWrapper,
@@ -242,7 +238,7 @@ fn filter_user_topic_configs(
     wrapper
 }
 
-/// Python `getAllSubscriptionGroup` 里的 `table.update(part)`：同名覆盖、保持首现顺序。
+/// 合并分页返回的订阅组表：同名覆盖、保持首现顺序。
 fn merge_group_table(
     table: &mut Vec<(String, SubscriptionGroupConfig)>,
     part: Vec<(String, SubscriptionGroupConfig)>,
@@ -255,7 +251,7 @@ fn merge_group_table(
     }
 }
 
-/// Python `forbidden.update(part)`：两边都是 JSON object 时按键覆盖。
+/// 两边都是 JSON object 时按键覆盖。
 fn merge_json_map(dst: &mut Value, src: Value) {
     let mut merged = false;
     if let (Some(dst_map), Some(src_map)) = (dst.as_object_mut(), src.as_object()) {
@@ -269,7 +265,7 @@ fn merge_json_map(dst: &mut Value, src: Value) {
     }
 }
 
-/// Python `examineTopicStats` 的合并：`offset_table.update(part)` + `topicPutTps += part`。
+/// topic 统计合并：位点表按 key 覆盖，`topic_put_tps` 累加。
 fn merge_topic_stats(merged: &mut TopicStatsTable, part: TopicStatsTable) {
     for (key, offset) in part.offset_table {
         match merged.offset_table.iter_mut().find(|(k, _)| *k == key) {
@@ -280,7 +276,7 @@ fn merge_topic_stats(merged: &mut TopicStatsTable, part: TopicStatsTable) {
     merged.topic_put_tps += part.topic_put_tps;
 }
 
-/// Python `resetOffsetByTimestampOld` 里的 `route.queue_datas` 按 brokerName 过滤后
+/// 按 brokerName 过滤 `route.queue_datas` 后
 /// 展开 `range(read_queue_nums)`。
 fn queues_of_broker(route: &TopicRouteData, topic: &str, broker_name: &str) -> Vec<MessageQueue> {
     let mut queues = Vec::new();
@@ -296,8 +292,7 @@ fn queues_of_broker(route: &TopicRouteData, topic: &str, broker_name: &str) -> V
     queues
 }
 
-/// 真正的请求超时：显式给了用给的，否则用配置的 `timeout_millis`
-/// （Python 的 `timeout_millis or self.timeout_millis`）。
+/// 真正的请求超时：显式给了用给的，否则用配置的 `timeout_millis`。
 fn effective_timeout(configured: i64, explicit: Option<i64>) -> i64 {
     explicit.filter(|t| *t > 0).unwrap_or(configured)
 }
@@ -370,12 +365,12 @@ impl Default for DefaultMQAdminExt {
 }
 
 impl DefaultMQAdminExt {
-    /// Python `DefaultMQAdminExt()`。
+/// 默认配置构造管理端。
     pub fn new() -> DefaultMQAdminExt {
         DefaultMQAdminExt::with_config(AdminConfig::default())
     }
 
-    /// Python `DefaultMQAdminExt(rpc_hook=..)`。
+/// 带 RPC 钩子构造管理端。
     pub fn with_rpc_hook(rpc_hook: Option<Arc<dyn RPCHook>>) -> DefaultMQAdminExt {
         let admin = DefaultMQAdminExt::new();
         admin.set_rpc_hook(rpc_hook);
@@ -394,12 +389,12 @@ impl DefaultMQAdminExt {
 
     // ---------------- 配置与生命周期 ----------------
 
-    /// 当前配置快照（Python 直接读属性）。
+/// 当前配置快照。
     pub fn config(&self) -> AdminConfig {
         read_cfg(&self.inner.cfg)
     }
 
-    /// 改配置（Python 的直接赋属性）。
+/// 用闭包就地改配置。
     pub fn update_config(&self, f: impl FnOnce(&mut AdminConfig)) {
         {
             let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
@@ -407,19 +402,16 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `set_namesrv_addr`。
     pub fn set_namesrv_addr(&self, addr: &str) {
         let addrs = split_addrs(addr);
         self.update_config(|c| c.name_server_addrs = addrs);
     }
 
-    /// Python `set_name_server_addresses`。
     pub fn set_name_server_addresses(&self, addrs: &[String]) {
         let addrs = addrs.to_vec();
         self.update_config(|c| c.name_server_addrs = addrs);
     }
 
-    /// Python `set_instance_name`。
     pub fn set_instance_name(&self, name: &str) {
         let name = name.to_string();
         self.update_config(|c| c.instance_name = name);
@@ -451,12 +443,10 @@ impl DefaultMQAdminExt {
         self.update_config(|c| c.poll_name_server_interval_millis = millis);
     }
 
-    /// Python `set_timeout_millis`。
     pub fn set_timeout_millis(&self, timeout_millis: i64) {
         self.update_config(|c| c.timeout_millis = timeout_millis);
     }
 
-    /// Python `set_rpc_hook`。
     pub fn set_rpc_hook(&self, hook: Option<Arc<dyn RPCHook>>) {
         *self
             .inner
@@ -465,12 +455,11 @@ impl DefaultMQAdminExt {
             .unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
-    /// Python `get_name_server_addr`（分号拼回）。
+/// 地址列表用分号拼回成单串。
     pub fn get_name_server_addr(&self) -> String {
         read_cfg(&self.inner.cfg).name_server_addrs.join(";")
     }
 
-    /// Python `get_name_server_address_list`。
     pub fn get_name_server_address_list(&self) -> Vec<String> {
         read_cfg(&self.inner.cfg).name_server_addrs
     }
@@ -487,11 +476,11 @@ impl DefaultMQAdminExt {
         self.inner.started.load(Ordering::Acquire)
     }
 
-    /// Python `start()`：幂等、必须有 name server，`client_id` 缺省时现造。
+    /// 幂等、必须有 name server，`client_id` 缺省时现造。
     ///
-    /// admin 的 clientId 也是秒级 `instanceName@yyyyMMddHHmmss`（`admin.py:91`）；
-    /// 同一秒起两个 admin 会撞 clientId，但 admin 用的是**私有实例**（见模块头差异 2），
-    /// 后建的会直接覆盖实例表里的登记（Python 同语义），互不影响收发。
+    /// admin 的 clientId 同样是秒级 `instanceName@yyyyMMddHHmmss`；
+    /// 同一秒起两个 admin 会撞 clientId，但 admin 用的是**私有实例**，
+    /// 后建的会直接覆盖实例表里的登记，互不影响收发。
     pub async fn start(&self) -> Result<()> {
         if self
             .inner
@@ -519,7 +508,7 @@ impl DefaultMQAdminExt {
             c.instance_name = instance_name;
         });
 
-        // Python `admin.py:92`：直接构造私有实例（见模块头差异 2）。
+        // 直接构造私有实例（见模块头差异 2）。
         let client = MQClientInstance::with_config(
             &client_id,
             cfg.name_server_addrs.clone(),
@@ -544,7 +533,7 @@ impl DefaultMQAdminExt {
             self.inner.started.store(false, Ordering::Release);
             return Err(e);
         }
-        // 动态 name server：实例可能已从地址服务器拿到地址，回填（Python 同）。
+        // 动态 name server：实例可能已从地址服务器拿到地址，回填。
         let addrs = client.name_server_addrs();
         if !addrs.is_empty() {
             self.update_config(|c| c.name_server_addrs = addrs);
@@ -553,7 +542,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `shutdown()`：幂等，只拆自己那份私有实例。
+    /// 幂等，只拆自己那份私有实例。
     pub fn shutdown(&self) {
         if !self.inner.started.swap(false, Ordering::AcqRel) {
             return;
@@ -563,7 +552,6 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `get_mq_client_instance`。
     pub fn get_mq_client_instance(&self) -> Result<MQClientInstance> {
         self.require_client()
     }
@@ -579,7 +567,7 @@ impl DefaultMQAdminExt {
 
     // ---------------- 底层调用助手 ----------------
 
-    /// Python `_invoke_broker`：发到指定 Broker/NameServer 并校验 SUCCESS。
+    /// 发到指定 Broker/NameServer 并校验 SUCCESS。
     async fn invoke_broker(
         &self,
         addr: &str,
@@ -647,7 +635,7 @@ impl DefaultMQAdminExt {
         bail!("all name servers unreachable: {reason}")
     }
 
-    /// Python `_first_broker_addr`：从集群信息里取第一台 broker 地址。
+    /// 从集群信息里取第一台 broker 地址。
     async fn first_broker_addr(&self) -> Result<String> {
         let client = self.require_client()?;
         let timeout = self.timeout_millis();
@@ -659,7 +647,6 @@ impl DefaultMQAdminExt {
         bail!("no broker address available")
     }
 
-    /// Python `_broker_addrs_of_cluster`。
     async fn broker_addrs_of_cluster(&self, cluster_name: Option<&str>) -> Result<Vec<String>> {
         let client = self.require_client()?;
         let timeout = self.timeout_millis();
@@ -669,7 +656,6 @@ impl DefaultMQAdminExt {
 
     // ---------------- Topic 管理 ----------------
 
-    /// Python `create_topic(key, new_topic, queue_num, topic_sys_flag)`：
     /// 走默认 topic 的路由逐 broker 下发（一台成功即可）。
     pub async fn create_topic(
         &self,
@@ -717,7 +703,6 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `create_topic_in_broker`。
     pub async fn create_topic_in_broker(
         &self,
         broker_addr: &str,
@@ -745,7 +730,6 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `delete_topic_in_broker`。
     pub async fn delete_topic_in_broker(&self, broker_addr: &str, topic: &str) -> Result<()> {
         let client = self.require_client()?;
         client
@@ -770,7 +754,7 @@ impl DefaultMQAdminExt {
         Ok(response)
     }
 
-    /// Python `delete_topic_in_name_server`：不给地址列表就清自己配的全部 NameServer。
+    /// 不给地址列表就清自己配的全部 NameServer。
     pub async fn delete_topic_in_name_server(
         &self,
         addrs: Option<&[String]>,
@@ -788,7 +772,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `delete_topic_in_namesrv`（旧名兼容）：任取一台成功的 NameServer。
+    /// 旧名兼容：任取一台成功的 NameServer 删除 topic 路由。
     pub async fn delete_topic_in_namesrv(&self, topic: &str) -> Result<()> {
         let client = self.require_client()?;
         client
@@ -796,7 +780,7 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `delete_topic`：先清各 broker，再清 NameServer 路由，最后清 KV namespace；
+    /// 先清各 broker，再清 NameServer 路由，最后清 KV namespace；
     /// 三段都是「失败只告警、继续往下走」。
     pub async fn delete_topic(&self, topic: &str, cluster_name: Option<&str>) -> Result<()> {
         let client = self.require_client()?;
@@ -817,7 +801,6 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `fetch_all_topic_list`。
     pub async fn fetch_all_topic_list(&self) -> Result<TopicList> {
         let client = self.require_client()?;
         client
@@ -825,7 +808,7 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `fetch_topics_by_cluster`（`GET_TOPICS_BY_CLUSTER` 打到 NameServer）。
+    /// `GET_TOPICS_BY_CLUSTER` 打到 NameServer，按集群名取 topic 列表。
     pub async fn fetch_topics_by_cluster(&self, cluster_name: &str) -> Result<Vec<String>> {
         let ext = ext_pairs(&[("cluster", cluster_name.to_string())]);
         let response = self
@@ -841,7 +824,7 @@ impl DefaultMQAdminExt {
         Ok(topics)
     }
 
-    /// Python `get_cluster_list`：含该 topic 路由 broker 的集群名集合。
+    /// 含该 topic 路由 broker 的集群名集合。
     pub async fn get_cluster_list(&self, topic: &str) -> Result<Vec<String>> {
         let client = self.require_client()?;
         let timeout = self.timeout_millis();
@@ -867,12 +850,12 @@ impl DefaultMQAdminExt {
         Ok(clusters)
     }
 
-    /// Python `get_topic_cluster_list`（别名）。
+    /// `get_cluster_list` 的别名。
     pub async fn get_topic_cluster_list(&self, topic: &str) -> Result<Vec<String>> {
         self.get_cluster_list(topic).await
     }
 
-    /// Python `fetch_all_topic_route`：遍历 NameServer 的 topic 列表逐个拉路由，
+    /// 遍历 NameServer 的 topic 列表逐个拉路由，
     /// 单个失败直接跳过。
     pub async fn fetch_all_topic_route(&self) -> Result<Vec<TopicRouteData>> {
         let client = self.require_client()?;
@@ -887,7 +870,6 @@ impl DefaultMQAdminExt {
         Ok(result)
     }
 
-    /// Python `examine_topic_route`。
     pub async fn examine_topic_route(&self, topic: &str) -> Result<TopicRouteData> {
         let client = self.require_client()?;
         client
@@ -896,7 +878,7 @@ impl DefaultMQAdminExt {
             .ok_or_else(|| Error::client(format!("topic {topic} not exist")))
     }
 
-    /// Python `examine_topic_config`（`GET_TOPIC_CONFIG`，body 为 TopicConfig JSON）。
+    /// `GET_TOPIC_CONFIG` 单查 topic 配置，body 为 TopicConfig JSON。
     pub async fn examine_topic_config(&self, addr: &str, topic: &str) -> Result<TopicConfig> {
         let ext = ext_pairs(&[("topic", topic.to_string()), ("lo", "true".to_string())]);
         let response = self
@@ -914,7 +896,6 @@ impl DefaultMQAdminExt {
         TopicConfig::from_json_value(&obj)
     }
 
-    /// Python `get_all_topic_config`。
     pub async fn get_all_topic_config(
         &self,
         broker_addr: &str,
@@ -935,7 +916,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `get_user_topic_config`：剔除系统 topic 与 `%RETRY%` / `%DLQ%`。
+    /// 剔除系统 topic 与 `%RETRY%` / `%DLQ%`。
     pub async fn get_user_topic_config(
         &self,
         broker_addr: &str,
@@ -955,7 +936,6 @@ impl DefaultMQAdminExt {
         ))
     }
 
-    /// Python `get_system_topic_list_from_broker`。
     pub async fn get_system_topic_list_from_broker(
         &self,
         broker_addr: &str,
@@ -976,7 +956,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `examine_topic_stats`：遍历该 topic 全部 broker 合并统计。
+    /// 遍历该 topic 全部 broker 合并统计。
     pub async fn examine_topic_stats(&self, topic: &str) -> Result<TopicStatsTable> {
         let route = self.examine_topic_route(topic).await?;
         let mut merged = TopicStatsTable::new();
@@ -987,7 +967,7 @@ impl DefaultMQAdminExt {
             let part = match self.examine_topic_stats_by_broker(&addr, topic).await {
                 Ok(part) => part,
                 Err(e) => {
-                    // Python 只 warn 后继续（broker 可能没开统计）。
+                    // 只 warn 后继续（broker 可能没开统计）。
                     rmq_warn!("getTopicStatsInfo error. topic={topic} broker={addr}: {e}");
                     continue;
                 }
@@ -1000,7 +980,6 @@ impl DefaultMQAdminExt {
         Ok(merged)
     }
 
-    /// Python `examine_topic_stats_by_broker`。
     pub async fn examine_topic_stats_by_broker(
         &self,
         broker_addr: &str,
@@ -1024,18 +1003,16 @@ impl DefaultMQAdminExt {
 
     // ---------------- 集群 / Broker ----------------
 
-    /// Python `fetch_broker_cluster_info`。
     pub async fn fetch_broker_cluster_info(&self) -> Result<ClusterInfo> {
         let client = self.require_client()?;
         client.get_broker_cluster_info(self.timeout_millis()).await
     }
 
-    /// Python `examine_broker_cluster_info`（别名）。
+    /// `fetch_broker_cluster_info` 的别名。
     pub async fn examine_broker_cluster_info(&self) -> Result<ClusterInfo> {
         self.fetch_broker_cluster_info().await
     }
 
-    /// Python `fetch_broker_runtime_stats`。
     pub async fn fetch_broker_runtime_stats(
         &self,
         broker_addr: &str,
@@ -1065,7 +1042,7 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `get_broker_config`：响应体是 **properties 文本**，不是 JSON/KVTable。
+    /// 响应体是 **properties 文本**，不是 JSON/KVTable。
     pub async fn get_broker_config(
         &self,
         broker_addr: &str,
@@ -1087,10 +1064,9 @@ impl DefaultMQAdminExt {
         Ok(MixAll::string_to_properties(&text))
     }
 
-    /// Python `update_broker_config`（含 `Validators.checkBrokerConfig` 的
-    /// brokerPermission 校验）。
+    /// 更新 broker 配置（含 brokerPermission 合法性校验）。
     ///
-    /// 校验排在任何 IO 之前（Python 同理：`_invoke_broker` 是该函数最后一句），
+    /// 校验排在任何 IO 之前（发请求是整个流程的最后一步），
     /// 所以非法值在未 start 时也会以 `NO_PERMISSION`(16) 报出来。
     pub async fn update_broker_config(
         &self,
@@ -1121,7 +1097,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `wipe_write_perm_of_broker`：读响应头的 `wipeTopicCount`。
+    /// 读响应头的 `wipeTopicCount`。
     pub async fn wipe_write_perm_of_broker(
         &self,
         namesrv_addr: &str,
@@ -1139,7 +1115,7 @@ impl DefaultMQAdminExt {
         Ok(ext_int(&response, "wipeTopicCount"))
     }
 
-    /// Python `add_write_perm_of_broker`：读响应头的 `addTopicCount`。
+    /// 读响应头的 `addTopicCount`。
     pub async fn add_write_perm_of_broker(
         &self,
         namesrv_addr: &str,
@@ -1157,7 +1133,7 @@ impl DefaultMQAdminExt {
         Ok(ext_int(&response, "addTopicCount"))
     }
 
-    /// Python `clean_unused_topic`：逐 broker 下发 `CLEAN_UNUSED_TOPIC`，
+    /// 逐 broker 下发 `CLEAN_UNUSED_TOPIC`，
     /// 任一失败（含非 SUCCESS）则整体回 `false`（不抛）。
     pub async fn clean_unused_topic(&self, cluster_name: Option<&str>) -> Result<bool> {
         let mut ok = true;
@@ -1179,7 +1155,6 @@ impl DefaultMQAdminExt {
         Ok(ok)
     }
 
-    /// Python `view_broker_stats_data`。
     pub async fn view_broker_stats_data(
         &self,
         broker_addr: &str,
@@ -1227,7 +1202,7 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `get_kv_config`：非 SUCCESS 回 `None`（不抛）。
+    /// 非 SUCCESS 回 `None`（不抛）。
     pub async fn get_kv_config(&self, namespace: &str, key: &str) -> Result<Option<String>> {
         let ext = ext_pairs(&[
             ("namespace", namespace.to_string()),
@@ -1242,7 +1217,7 @@ impl DefaultMQAdminExt {
         Ok(None)
     }
 
-    /// Python `delete_kv_config`（广播全部 NameServer）。
+    /// 广播全部 NameServer 删除 KV 配置。
     pub async fn delete_kv_config(&self, namespace: &str, key: &str) -> Result<()> {
         let ext = ext_pairs(&[
             ("namespace", namespace.to_string()),
@@ -1252,7 +1227,6 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `get_kv_list_by_namespace`。
     pub async fn get_kv_list_by_namespace(&self, namespace: &str) -> Result<KVTable> {
         let ext = ext_pairs(&[("namespace", namespace.to_string())]);
         let response = self
@@ -1266,7 +1240,7 @@ impl DefaultMQAdminExt {
 
     // ---------------- 订阅组管理 ----------------
 
-    /// Python `create_and_update_subscription_group_config`：body 为 config JSON。
+    /// body 为 config JSON。
     pub async fn create_and_update_subscription_group_config(
         &self,
         addr: &str,
@@ -1283,7 +1257,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `examine_subscription_group_config`：拉全部订阅组后取目标 group。
+    /// 拉全部订阅组后取目标 group。
     pub async fn examine_subscription_group_config(
         &self,
         addr: &str,
@@ -1293,7 +1267,7 @@ impl DefaultMQAdminExt {
         Ok(wrapper.get(group).cloned())
     }
 
-    /// Python `get_subscription_group_config`（`GET_SUBSCRIPTIONGROUP_CONFIG` 单查）。
+    /// `GET_SUBSCRIPTIONGROUP_CONFIG` 单查订阅组配置。
     pub async fn get_subscription_group_config(
         &self,
         addr: &str,
@@ -1315,7 +1289,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `get_all_subscription_group`：**分页**累积，直到 `groupSeq >= totalGroupNum-1`。
+    /// **分页**累积，直到 `groupSeq >= totalGroupNum-1`。
     pub async fn get_all_subscription_group(
         &self,
         broker_addr: &str,
@@ -1398,7 +1372,7 @@ impl DefaultMQAdminExt {
         })
     }
 
-    /// Python `get_user_subscription_group`：剔掉系统组与预定义组。
+    /// 剔掉系统组与预定义组。
     pub async fn get_user_subscription_group(
         &self,
         broker_addr: &str,
@@ -1414,7 +1388,6 @@ impl DefaultMQAdminExt {
         Ok(wrapper)
     }
 
-    /// Python `delete_subscription_group`。
     pub async fn delete_subscription_group(
         &self,
         addr: &str,
@@ -1438,7 +1411,6 @@ impl DefaultMQAdminExt {
 
     // ---------------- 消费者 / 生产者连接 ----------------
 
-    /// Python `examine_consumer_connection_info`。
     pub async fn examine_consumer_connection_info(
         &self,
         consumer_group: &str,
@@ -1466,7 +1438,7 @@ impl DefaultMQAdminExt {
         ConsumerConnection::decode(body)
     }
 
-    /// Python `examine_consumer_connection`（别名）。
+    /// `examine_consumer_connection_info` 的别名。
     pub async fn examine_consumer_connection(
         &self,
         consumer_group: &str,
@@ -1476,7 +1448,6 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `examine_producer_connection_info`。
     pub async fn examine_producer_connection_info(
         &self,
         producer_group: &str,
@@ -1502,7 +1473,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `examine_consumer_running_info`（broker 转发给目标客户端的 38 号请求，
+    /// 拉消费者运行信息（broker 转发给目标客户端的 38 号请求，
     /// 本实例侧由 `MQClientInstance` 的 307 处理器应答，见 `live_client_modules`）。
     pub async fn examine_consumer_running_info(
         &self,
@@ -1537,7 +1508,7 @@ impl DefaultMQAdminExt {
         ConsumerRunningInfo::decode(body)
     }
 
-    /// Python `get_consumer_running_info`（别名）。
+    /// `examine_consumer_running_info` 的别名。
     pub async fn get_consumer_running_info(
         &self,
         consumer_group: &str,
@@ -1549,7 +1520,6 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `get_consumer_list_by_group`。
     pub async fn get_consumer_list_by_group(
         &self,
         consumer_group: &str,
@@ -1567,7 +1537,6 @@ impl DefaultMQAdminExt {
 
     // ---------------- 消费统计 ----------------
 
-    /// Python `examine_consume_stats`。
     pub async fn examine_consume_stats(
         &self,
         broker_addr: &str,
@@ -1597,7 +1566,6 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `fetch_consume_stats_in_broker`。
     pub async fn fetch_consume_stats_in_broker(
         &self,
         broker_addr: &str,
@@ -1620,7 +1588,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `query_topic_consume_by_who`（300 → `groupList`）。
+    /// 300 号请求，取响应头 `groupList`。
     pub async fn query_topic_consume_by_who(
         &self,
         broker_addr: &str,
@@ -1807,7 +1775,6 @@ impl DefaultMQAdminExt {
     /// broker 端走 `AdminBrokerProcessor#queryTopicsByConsumer:2421` →
     /// `ConsumerOffsetManager#whichTopicByConsumer`：**从位点表**（`topic@group` 键）反查该组
     /// 消费过哪些 topic。所以组从没提交过位点时回空表，这是预期而不是 bug。
-    /// Python `query_topics_by_consumer_to_broker`。
     pub async fn query_topics_by_consumer_to_broker(
         &self,
         broker_addr: &str,
@@ -1853,7 +1820,7 @@ impl DefaultMQAdminExt {
         Ok(result)
     }
 
-    /// Python `query_subscription`（345）。
+    /// 345 号请求：查订阅关系是否一致。
     pub async fn query_subscription(
         &self,
         broker_addr: &str,
@@ -1876,7 +1843,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `get_consume_status`（223 → `consumerTable`）。
+    /// 223 号请求，取响应头 `consumerTable`。
     pub async fn get_consume_status(
         &self,
         broker_addr: &str,
@@ -1907,7 +1874,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `clone_group_offset`（314）。
+    /// 314 号请求：克隆消费组位点。
     pub async fn clone_group_offset(
         &self,
         broker_addr: &str,
@@ -1935,21 +1902,18 @@ impl DefaultMQAdminExt {
 
     // ---------------- Offset 管理 ----------------
 
-    /// Python `max_offset`。
     pub async fn max_offset(&self, mq: &MessageQueue) -> Result<i64> {
         self.require_client()?
             .get_max_offset(mq, self.timeout_millis(), None)
             .await
     }
 
-    /// Python `min_offset`。
     pub async fn min_offset(&self, mq: &MessageQueue) -> Result<i64> {
         self.require_client()?
             .get_min_offset(mq, self.timeout_millis(), None)
             .await
     }
 
-    /// Python `search_offset`。
     pub async fn search_offset(&self, mq: &MessageQueue, timestamp: i64) -> Result<i64> {
         self.search_lower_boundary_offset(mq, timestamp).await
     }
@@ -1988,14 +1952,13 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `earliest_msg_store_time`。
     pub async fn earliest_msg_store_time(&self, mq: &MessageQueue) -> Result<i64> {
         self.require_client()?
             .get_earliest_msg_store_time(mq, self.timeout_millis(), None)
             .await
     }
 
-    /// Python `examine_consumer_offset`：没提交过位点回 `None`（`QUERY_NOT_FOUND`）。
+    /// 没提交过位点回 `None`（`QUERY_NOT_FOUND`）。
     pub async fn examine_consumer_offset(
         &self,
         consumer_group: &str,
@@ -2006,7 +1969,7 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `update_consumer_offset`（addr 由路由解析）。
+    /// 更新消费者位点（addr 由路由解析）。
     pub async fn update_consumer_offset(
         &self,
         consumer_group: &str,
@@ -2018,7 +1981,7 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `update_consumer_offset_to_broker`（指定 addr）。
+    /// 更新消费者位点（指定 addr）。
     pub async fn update_consumer_offset_to_broker(
         &self,
         broker_addr: &str,
@@ -2047,7 +2010,7 @@ impl DefaultMQAdminExt {
         cluster_name: Option<&str>,
         is_cpp: bool,
     ) -> Result<Vec<(MessageQueueKey, i64)>> {
-        // Python：LMQ / wheel_timer 这类没有独立路由的 topic，按集群名去查路由，
+        // LMQ / wheel_timer 这类没有独立路由的 topic，按集群名去查路由，
         // 但下发给 broker 的 `topic` 仍是原值。
         let route_topic = if !topic.is_empty()
             && (MixAll::is_lmq(Some(topic))
@@ -2156,7 +2119,7 @@ impl DefaultMQAdminExt {
         .await
     }
 
-    /// Python `reset_offset_new`：先试新版（broker 端重置），消费者不在线再退化到旧版。
+    /// 先试新版（broker 端重置），消费者不在线再退化到旧版。
     pub async fn reset_offset_new(
         &self,
         consumer_group: &str,
@@ -2176,7 +2139,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `reset_offset_by_timestamp_old`：逐队列 `searchOffset` 后按 force 决策写回。
+    /// 逐队列 `searchOffset` 后按 force 决策写回。
     pub async fn reset_offset_by_timestamp_old(
         &self,
         consumer_group: &str,
@@ -2192,7 +2155,7 @@ impl DefaultMQAdminExt {
                 continue;
             };
             for mq in queues_of_broker(&route, topic, &bd.broker_name) {
-                // Python：查位点失败当 0（该队列压根没提交过位点是常态）。
+                // 查位点失败当 0（该队列压根没提交过位点是常态）。
                 let consumer_offset = match client
                     .query_consumer_offset(
                         consumer_group,
@@ -2243,7 +2206,7 @@ impl DefaultMQAdminExt {
 
     // ---------------- 消息查询 ----------------
 
-    /// Python `query_message`（正常 key：查所有 broker + 客户端侧 key 二次校验）。
+    /// 按 key 查消息（查所有 broker + 客户端侧 key 二次校验）。
     pub async fn query_message(
         &self,
         topic: &str,
@@ -2256,7 +2219,7 @@ impl DefaultMQAdminExt {
             .await
     }
 
-    /// Python `query_message_by_uniq_key`：`indexType="U"` + `_UNIQUE_KEY_QUERY="true"`。
+    /// `indexType="U"` + `_UNIQUE_KEY_QUERY="true"`。
     ///
     /// 注意：broker 侧 uniqKey 索引只有 RocksDB 索引实现（`IndexRocksDBStore`）支持；
     /// 默认的文件索引下该查询可能返回空，这属于 broker 配置差异而非客户端问题。
@@ -2278,7 +2241,7 @@ impl DefaultMQAdminExt {
         Ok(messages.into_iter().next())
     }
 
-    /// Python `query_message_by_key`（工具 `queryMsgByKey` 的 NORMAL 模式）。
+    /// 按 key 查消息（NORMAL 索引模式）。
     pub async fn query_message_by_key(
         &self,
         topic: &str,
@@ -2296,9 +2259,9 @@ impl DefaultMQAdminExt {
         .await
     }
 
-    /// `MQClientInstance::query_message_all_brokers` 的门面壳。未 start 时按 Python
-    /// `_require_client` 的口径直接抛错；indexType 由 `uniq_key` 唯一决定
-    /// （Python 的三个入口也只有这两种组合）。
+    /// `MQClientInstance::query_message_all_brokers` 的门面壳。未 start 时
+    /// 直接抛错；indexType 由 `uniq_key` 唯一决定，
+    /// 三个查询入口也只有这两种组合。
     async fn query_message_brokers(
         &self,
         topic: &str,
@@ -2356,7 +2319,7 @@ impl DefaultMQAdminExt {
             Err(e) => by_id_error = Some(e.to_string()),
         }
 
-        // Python 同样把 uniq 查询放在 try/except 之外：该路径真抛时直接透传，
+        // uniq 查询放在错误兜底之外：该路径真抛时直接透传，
         // 只有「查到了但为空」才落到最终的 NO_MESSAGE。
         if let Some(found) = self.query_message_by_uniq_key(topic, msg_id).await? {
             return Ok(found);
@@ -2403,7 +2366,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `query_consume_queue`（321）。
+    /// 321 号请求：查 ConsumeQueue。
     pub async fn query_consume_queue(
         &self,
         broker_addr: &str,
@@ -2436,7 +2399,7 @@ impl DefaultMQAdminExt {
     }
 
 
-    /// Python `create_and_update_topic_config_list` → UPDATE_AND_CREATE_TOPIC_LIST(18)。
+    /// `UPDATE_AND_CREATE_TOPIC_LIST(18)`。
     ///
     /// wire 事实：custom header 为**空**（topic 名在 body 里做授权资源），
     /// body 是 CreateTopicListRequestBody JSON：{"topicConfigList": [...]}。
@@ -2462,7 +2425,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `create_and_update_subscription_group_config_list` → 225。
+    /// 225 号请求：批量更新订阅组配置。
     /// 与 topic-list 同形，但 body key 是 `groupConfigList`。
     pub async fn create_and_update_subscription_group_config_list(
         &self,
@@ -2486,7 +2449,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `create_static_topic` → UPDATE_AND_CREATE_STATIC_TOPIC(513)：
+    /// `UPDATE_AND_CREATE_STATIC_TOPIC(513)`：
     /// header 复用 CreateTopicRequestHeader 字段，body 是 TopicQueueMappingDetail JSON。
     pub async fn create_static_topic(
         &self,
@@ -2530,7 +2493,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `update_and_get_group_read_forbidden` → UPDATE_AND_GET_GROUP_FORBIDDEN(353)。
+    /// `UPDATE_AND_GET_GROUP_FORBIDDEN(353)`。
     /// `readable=None` 表示仅查询；响应体是 GroupForbidden JSON。
     pub async fn update_and_get_group_read_forbidden(
         &self,
@@ -2563,7 +2526,7 @@ impl DefaultMQAdminExt {
         }
     }
 
-    /// Python `resume_check_half_message` → RESUME_CHECK_HALF_MESSAGE(323)。
+    /// `RESUME_CHECK_HALF_MESSAGE(323)`。
     pub async fn resume_check_half_message(
         &self,
         broker_addr: &str,
@@ -2588,7 +2551,7 @@ impl DefaultMQAdminExt {
         Ok(response.code == response_code::SUCCESS)
     }
 
-    /// Python `create_or_update_order_conf`：**不是独立请求**，是 NameServer KV
+    /// **不是独立请求**，是 NameServer KV
     /// namespace=ORDER_TOPIC_CONFIG 上的读改写。非集群模式把存储值当作 ";"
     /// 分隔的 "topic:conf" 列表，替换匹配条目后整体写回。
     pub async fn create_or_update_order_conf(
@@ -2642,7 +2605,7 @@ impl DefaultMQAdminExt {
 
     // ---------------- 运维清理类 ----------------
 
-    /// Python `clean_expired_consumer_queue` → CLEAN_EXPIRED_CONSUMEQUEUE(306)。
+    /// `CLEAN_EXPIRED_CONSUMEQUEUE(306)`。
     pub async fn clean_expired_consumer_queue(
         &self,
         broker_addr: &str,
@@ -2660,7 +2623,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `clean_expired_consumer_queue_by_addr`：逐个地址执行，返回**失败的地址**。
+    /// 逐个地址执行，返回**失败的地址**。
     pub async fn clean_expired_consumer_queue_by_addr(
         &self,
         addrs: &[String],
@@ -2679,7 +2642,7 @@ impl DefaultMQAdminExt {
         failed
     }
 
-    /// Python `delete_expired_commit_log` → DELETE_EXPIRED_COMMITLOG(329)。
+    /// `DELETE_EXPIRED_COMMITLOG(329)`。
     pub async fn delete_expired_commit_log(
         &self,
         broker_addr: &str,
@@ -2697,7 +2660,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `delete_expired_commit_log_by_addr`：逐个地址执行，返回**失败的地址**。
+    /// 逐个地址执行，返回**失败的地址**。
     pub async fn delete_expired_commit_log_by_addr(
         &self,
         addrs: &[String],
@@ -2716,8 +2679,8 @@ impl DefaultMQAdminExt {
         failed
     }
 
-    /// Python `clean_unused_topic_by_addr` → MQClientAPIImpl:2696：**单请求**
-    /// CLEAN_UNUSED_TOPIC(316)，由 broker 自行清理未使用 topic。
+    /// **单请求** CLEAN_UNUSED_TOPIC(316)，
+    /// 由 broker 自行清理未使用 topic。
     pub async fn clean_unused_topic_by_addr(&self, broker_addr: &str) -> Result<()> {
         self.invoke_broker(
             broker_addr,
@@ -2730,7 +2693,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `query_consume_time_span` → QUERY_CONSUME_TIME_SPAN(303)：
+    /// `QUERY_CONSUME_TIME_SPAN(303)`：
     /// 按路由遍历 master，聚合各 broker 的 consumeTimeSpanSet。
     pub async fn query_consume_time_span(&self, topic: &str, group: &str) -> Result<Vec<Value>> {
         let route = self.examine_topic_route(topic).await?;
@@ -2762,7 +2725,7 @@ impl DefaultMQAdminExt {
 
     // ---------------- NameServer 配置（318/319） ----------------
 
-    /// Python `update_name_server_config` → UPDATE_NAMESRV_CONFIG(318)：
+    /// `UPDATE_NAMESRV_CONFIG(318)`：
     /// properties 以 k=v\n 文本进 body，广播每个 NameServer，任一失败即抛。
     pub async fn update_name_server_config(
         &self,
@@ -2798,7 +2761,7 @@ impl DefaultMQAdminExt {
         Ok(())
     }
 
-    /// Python `get_name_server_config` → GET_NAMESRV_CONFIG(319)：逐个 NameServer
+    /// `GET_NAMESRV_CONFIG(319)`：逐个 NameServer
     /// 查询，body 是 properties 文本；返回 {地址: properties}。
     pub async fn get_name_server_config(
         &self,
@@ -2839,7 +2802,7 @@ impl DefaultMQAdminExt {
         Ok(result)
     }
 
-    /// Python `set_message_request_mode` → SET_MESSAGE_REQUEST_MODE(401)。
+    /// `SET_MESSAGE_REQUEST_MODE(401)`。
     pub async fn set_message_request_mode(
         &self,
         broker_addr: &str,
@@ -2869,7 +2832,7 @@ impl DefaultMQAdminExt {
     }
 }
 
-/// Python `RemotingSerializable.decode_json(body).get(key, [])` 里取字符串数组。
+/// 从 JSON body 的 `key` 里取字符串数组，缺字段当空表。
 fn string_list(value: &Value, key: &str) -> Vec<String> {
     value
         .get(key)
@@ -2946,7 +2909,7 @@ mod tests {
         assert_eq!(
             admin.get_namespace_v2(),
             None,
-            "None = 清除（Java setNamespaceV2(null)）"
+            "None = 清除"
         );
     }
 
@@ -2981,7 +2944,7 @@ mod tests {
 
     #[test]
     fn namesrv_addr_splits_trims_and_drops_empty() {
-        // Python `set_namesrv_addr`：`[a.strip() for a in addr.split(";") if a.strip()]`
+        // 分号分隔，逐项 trim、丢空
         let admin = DefaultMQAdminExt::new();
         admin.set_namesrv_addr(" 127.0.0.1:9876 ; ;127.0.0.1:9877;");
         assert_eq!(
@@ -2998,7 +2961,7 @@ mod tests {
     fn reset_offset_ext_key_is_isforce() {
         let ext = reset_offset_ext_pairs("T", "G", -1, true, None, None);
         assert_eq!(ext.get("isForce"), Some("true"));
-        assert!(!ext.contains_key("force"), "force 不是 Java 的字段名");
+        assert!(!ext.contains_key("force"), "force 不是服务端的字段名");
         assert_eq!(ext.get("timestamp"), Some("-1"));
         assert_eq!(ext.get("offset"), Some("-1"));
         assert!(
@@ -3015,7 +2978,7 @@ mod tests {
         assert_eq!(single.get("timestamp"), Some("0"));
     }
 
-    /// Python `start()` 在没有 name server 时抛、且**不**留在 started。
+    /// 未配 name server 时 `start()` 抛错、且**不**留在 started。
     #[tokio::test]
     async fn start_without_namesrv_rolls_back() {
         let admin = DefaultMQAdminExt::new();
@@ -3068,14 +3031,14 @@ mod tests {
                 }
             ));
         }
-        // 查询类同样要 start（Python `_require_client` 直接 raise），不能静默回空集。
+        // 查询类同样要 start（未 start 直接报错），不能静默回空集。
         assert!(admin.query_message("T", "k", 32, 0, 1).await.is_err());
         assert!(admin.query_message_by_uniq_key("T", "k").await.is_err());
         assert!(admin.query_message_by_key("T", "k", 32).await.is_err());
     }
 
-    /// 非法 brokerPermission 必须**在任何 IO 之前**报出来（Python 同理：
-    /// `_invoke_broker` 是该函数最后一句），所以未 start 的 admin 也给 16。
+    /// 非法 brokerPermission 必须**在任何 IO 之前**报出来（校验先于发请求），
+    /// 所以未 start 的 admin 也给 16。
     #[tokio::test]
     async fn update_broker_config_validates_perm_locally() {
         let admin = DefaultMQAdminExt::new();
@@ -3106,7 +3069,7 @@ mod tests {
             .expect_err("not started yet");
         assert!(err.to_string().contains("admin not started"));
 
-        // 空 properties：Python 直接 return，不发请求也不报错。
+        // 空 properties：直接 return，不发请求也不报错。
         assert!(admin
             .update_broker_config("127.0.0.1:10911", &StringMap::new(), None)
             .await
@@ -3116,7 +3079,7 @@ mod tests {
     #[test]
     fn cluster_broker_addrs_covers_python_branches() {
         let info = cluster();
-        // 不给集群名：Python 回 `cluster.get_broker_addrs()`（全量）。
+        // 不给集群名：回 `cluster.get_broker_addrs()`（全量）。
         assert_eq!(
             cluster_broker_addrs(&info, None),
             info.get_broker_addrs(),
@@ -3131,7 +3094,7 @@ mod tests {
                 "10.0.0.21:10911".to_string(),
             ]
         );
-        // 未知集群名 / 空串都退回全量（Python 的 `or []` + `result or all`）。
+        // 未知集群名 / 空串都退回全量。
         assert_eq!(
             cluster_broker_addrs(&info, Some("Nope")),
             info.get_broker_addrs()
@@ -3154,8 +3117,8 @@ mod tests {
 
     #[test]
     fn user_topic_config_drops_sys_retry_and_dlq() {
-        // Python 的过滤条件是「broker 上报的系统 topic 列表 ∪ MixAll.is_sys_topic」，
-        // 而 is_sys_topic 只认 `rmq_sys_` 前缀（与 Python 完全一致），所以
+        // 过滤条件是「broker 上报的系统 topic 列表 ∪ `MixAll::is_sys_topic`」，
+        // 而 is_sys_topic 只认 `rmq_sys_` 前缀，所以
         // TBW102 / SCHEDULE_TOPIC_XXXX 只能靠 GET_SYSTEM_TOPIC_LIST_FROM_BROKER 剔除。
         let sys = vec!["TBW102".to_string(), "SCHEDULE_TOPIC_XXXX".to_string()];
         let all = wrapper_with(&[
@@ -3194,7 +3157,7 @@ mod tests {
             ]
         );
 
-        // 不在 broker 系统列表、也不带 rmq_sys_ 前缀的裸名会保留（Python 同行为）。
+        // 不在 broker 系统列表、也不带 rmq_sys_ 前缀的裸名会保留。
         let loose = filter_user_topic_configs(wrapper_with(&["SCHEDULE_TOPIC_XXXX"]), &[], false)
             .topic_config_table;
         assert!(loose.iter().any(|(n, _)| n == "SCHEDULE_TOPIC_XXXX"));
@@ -3213,7 +3176,7 @@ mod tests {
         let mut updated = SubscriptionGroupConfig::new("g1");
         updated.retry_max_times = 9;
         merge_group_table(&mut table, vec![("g1".to_string(), updated)]);
-        // 同名覆盖、顺序保持首现（Python dict.update 同语义）。
+        // 同名覆盖、顺序保持首现。
         assert_eq!(
             table.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
             vec!["g1", "g2"]
@@ -3276,14 +3239,14 @@ mod tests {
 
     #[test]
     fn small_helpers_match_python_semantics() {
-        // Python `timeout_millis or self.timeout_millis`
+        // 显式超时优先，0/缺省回落配置值
         assert_eq!(effective_timeout(15_000, Some(3_000)), 3_000);
         assert_eq!(effective_timeout(15_000, Some(0)), 15_000);
         assert_eq!(effective_timeout(15_000, None), 15_000);
-        // Python `"true" if x else "false"`
+        // 布尔转 `"true"` / `"false"`
         assert_eq!((bool_flag(true), bool_flag(false)), ("true", "false"));
 
-        // Python `response.ext_fields.get(k, 0) or 0`：缺字段与非数字都是 0
+        // 缺字段与非数字都是 0
         let mut cmd = RemotingCommand::new();
         assert_eq!(ext_int(&cmd, "wipeTopicCount"), 0);
         cmd.add_ext_field("wipeTopicCount", " 12 ");
@@ -3291,7 +3254,7 @@ mod tests {
         cmd.add_ext_field("addTopicCount", "abc");
         assert_eq!(ext_int(&cmd, "addTopicCount"), 0);
 
-        // Python `obj.get("groupList", [])`
+        // 只收字符串元素，缺字段当空表
         assert_eq!(
             string_list(&json!({"groupList": ["a", 1, "b"]}), "groupList"),
             vec!["a".to_string(), "b".to_string()]
@@ -3311,7 +3274,7 @@ mod tests {
             .view_message("T", "not-hex")
             .await
             .expect_err("not started");
-        // Python 把 uniqKey 兜底放在 try/except **之外**：未 start 时透传
+        // uniqKey 兜底放在错误吞掉之外：未 start 时透传
         // `_require_client` 的客户端错，而不是 NO_MESSAGE(208)。208 只在真正
         // 查不到消息时出现，那条断言放在 live_admin 示例里（需要真实 broker）。
         assert_eq!(view_err.response_code(), None);
@@ -3498,7 +3461,7 @@ mod tests {
             .await
             .expect("309 全链路应当成功");
         assert_eq!(result.consume_result.as_deref(), Some(CMResult::CR_SUCCESS));
-        assert!(result.auto_commit, "Java 初值 autoCommit=true");
+        assert!(result.auto_commit, "autoCommit 初值 true");
         assert_eq!(result.spent_time_mills, 42);
         assert_eq!(result.remark.as_deref(), Some("ok"));
 

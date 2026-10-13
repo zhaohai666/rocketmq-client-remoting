@@ -1,5 +1,4 @@
-//! ACL 鉴权对**真实 5.5.1 broker** 的联调验证（对齐 `python/verify_acl_live.py` S1..S7，
-//! 另补 Python 没测的拉模式签名链路 S8）。
+//! ACL 鉴权对**真实 5.5.1 broker** 的联调验证（覆盖 S1..S8，其中 S8 是拉模式签名链路）。
 //!
 //!
 //! 断言的都是「签名真的被 broker 认/不认」，而不是本地编解码：
@@ -12,18 +11,18 @@
 //!   任一漏签都收不到消息。
 //! - S6 **不带凭据**的原始 broker RPC（GET_CONSUMER_LIST_BY_GROUP）→ 16。
 //!   注意必须走显式给 addr 的 [`get_consumer_list_by_group`]，不能用
-//!   [`get_consumer_id_list_by_group`]：后者照 Python 把异常吞掉回 `None`，
+//!   [`get_consumer_id_list_by_group`]：后者把异常吞掉回 `None`，
 //!   「被拒」和「成功」在调用方看来一模一样。
 //! - S7 不带凭据查 **NameServer** 路由仍成功 —— 鉴权只在 broker 侧，
 //!   反证钩子没把 namesrv 路径打坏。
 //! - S8 带凭据的 pull 消费者：`fetch_subscribe_message_queues` / `pull` /
 //!   `update_consume_offset` / `fetch_consume_offset` 四条签名 RPC 闭环。
-//!   Python 的 ACL 验证只测了 push，拉模式的位点 RPC 是另一套请求码，这里补上。
+//!   拉模式的位点 RPC 用的是另一套请求码，这里单独补上。
 //! - S9 清理：带凭据删掉本次建的 topic。
 //!
-//! ⚠ S4/S5 必须**先起消费者再发送**（Python 同一时序约束）：push 消费者默认
+//! ⚠ S4/S5 必须**先起消费者再发送**：push 消费者默认
 //! `CONSUME_FROM_LAST_OFFSET` 会把新消费组的初始位点解析成该队列**当时的** maxOffset，
-//! 而 broker 的 consumequeue 是异步分发的，「先发再收」在三种语言之间结果不确定。
+//! 而 broker 的 consumequeue 是异步分发的，「先发再收」的结果并不稳定。
 //! 这里既先起消费者、又显式用 `CONSUME_FROM_FIRST_OFFSET`，两道保险都留着。
 //!
 //! ⚠ 每个角色都用自己的 `instance_name`（→ 独立 clientId → 独立 [`MQClientInstance`]
@@ -61,7 +60,7 @@ use rocketmq_client_remoting::remoting::protocol::heartbeat::ConsumeFromWhere;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::rpchook::{AclClientRPCHook, RPCHook, SessionCredentials};
 
-/// 建出来的 topic 队列数（与 Python 的 `create_topic(.., 4)` 一致）。
+/// 建出来的 topic 队列数（默认 4）。
 const QUEUE_NUMS: i32 = 4;
 /// S4 发送条数。
 const N_MSG: usize = 3;
@@ -221,7 +220,7 @@ impl Fixture {
 
     /// 起一个**带凭据**的裸实例（当作 admin 用：建/删 topic）。
     ///
-    /// Python 用 `DefaultMQAdminExt(rpc_hook=..)`；Rust 的 admin 层还没移植，
+    /// Rust 的 admin 层还没移植，
     /// 而 producer 内部做的正是「建实例 → 把钩子注册到 remoting 通道」，
     /// 这里直接照那两步做，语义等价。
     async fn signed_admin(&self, kind: &str) -> Result<MQClientInstance, String> {
@@ -543,7 +542,7 @@ async fn s8_signed_pull(ck: &mut Checker, fx: &Fixture, bodies: &[String]) {
     let mut commit_failed: Vec<String> = Vec::new();
     let mut readback_failed: Vec<String> = Vec::new();
     for mq in &mqs {
-        // 未提交过的组位点为 None（Python 同：`setZeroIfNotFound=false`），从 0 起拉。
+        // 未提交过的组位点为 None（setZeroIfNotFound=false 口径），从 0 起拉。
         let offset = consumer
             .fetch_consume_offset(mq)
             .await

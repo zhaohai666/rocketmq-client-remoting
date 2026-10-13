@@ -7,11 +7,11 @@ pub const YYYY_MM_DD_HH_MM_SS: &str = "%Y-%m-%d %H:%M:%S";
 
 const HEX_ARRAY: &[u8; 16] = b"0123456789ABCDEF";
 
-/// [`monotonic_millis`] 的原点，首次调用时锚定（对应 `time.monotonic()` 的进程起点）。
+/// [`monotonic_millis`] 的原点，首次调用时锚定（进程起点）。
 static MONOTONIC_ORIGIN: OnceLock<Instant> = OnceLock::new();
 
-/// 对应 Python `time.monotonic() * 1000` / C# `UtilAll.MonotonicMillis`：
-/// **单调递增**的毫秒数，不受系统时间被回拨/NTP 校正影响。
+/// 单调时钟换算的毫秒数：
+/// **单调递增**，不受系统时间被回拨/NTP 校正影响。
 ///
 /// 为什么不能像 [`current_time_millis`] 那样用挂钟：发送重试预算和 broker 延迟
 /// 故障规避都要算「两次事件之间隔了多久」，挂钟一旦回退就会算出负延迟，
@@ -187,15 +187,15 @@ pub fn current_day_millis() -> u32 {
     secs * 1000 + now.nanosecond() / 1_000_000
 }
 
-/// ⚠ 与 Python 的一处确定性差异：Python 的「类加载 hash」是
-/// `abs(hash("RocketMQClient"))`，受 `PYTHONHASHSEED` 影响每进程随机；这里换成跨进程
-/// 稳定的 [`java_string_hash`]。长度与字符集不变，唯一性仍由 IP/PID/时间/自增保证。
+/// ⚠ 确定性要求：「类加载 hash」这一段不能用运行时的随机化字符串 hash（每进程不同
+/// 会让同一实例的 ID 漂移），这里换成跨进程稳定的 [`java_string_hash`]。
+/// 长度与字符集不变，唯一性仍由 IP/PID/时间/自增保证。
 pub fn create_uniq_id() -> String {
     use std::net::IpAddr;
     use std::sync::atomic::{AtomicU16, Ordering};
 
     static COUNTER: AtomicU16 = AtomicU16::new(0);
-    // Python 先 `+= 1` 再取 `& 0xFFFF`，即首个 ID 的 counter 为 1；这里同样从 1 起。
+    // 先 `+= 1` 再取 `& 0xFFFF`，即首个 ID 的 counter 为 1；这里同样从 1 起。
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
 
     let mut bytes: Vec<u8> = Vec::with_capacity(16);

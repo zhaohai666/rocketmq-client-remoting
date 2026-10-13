@@ -1,5 +1,4 @@
-//! 发送延迟故障容错（sendLatencyFaultEnable）真机验证
-//! （与 python/verify_latency_live.py、cpp/examples/live_latency.cpp 的 S1–S5 同套场景）。
+//! 发送延迟故障容错（sendLatencyFaultEnable）真机验证（覆盖 S1–S5 五场景）。
 //!
 //! 用法（先按 runbook 起本地单 broker 集群）：
 //! ```text
@@ -56,7 +55,7 @@ impl Checker {
     }
 }
 
-/// 逐条同步发送，返回成功条数（对齐 python `send_ok` / cpp 循环）。
+/// 逐条同步发送，返回成功条数。
 async fn send_ok(p: &DefaultMQProducer, topic: &str, count: usize, key: &str) -> usize {
     let mut ok = 0;
     for i in 0..count {

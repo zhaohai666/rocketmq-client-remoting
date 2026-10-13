@@ -1,7 +1,7 @@
 //! `RocketMQSerializable` 用到的 extFields 容器。
 //!
 //! 必须保序：`map_serialize` 按插入顺序写二进制，ACL 签名按 key 字典序拼接，两条路径
-//! 都依赖同一份内容，用 `HashMap` 会让逐字节对拍失效。
+//! 都依赖同一份内容，用 `HashMap` 会让逐字节比对失效。
 
 use std::any::Any;
 

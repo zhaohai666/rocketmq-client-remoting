@@ -178,7 +178,7 @@ impl Env {
         lock(&self.broker_name).clone()
     }
 
-    /// 集群探活：端口开着 != broker 已注册到 nameServer，所以按 Python 那样轮询。
+    /// 集群探活：端口开着 != broker 已注册到 nameServer，所以要轮询等待。
     async fn start(&self, ck: &mut Checker) -> bool {
         if let Err(e) = self.admin.start().await {
             ck.abort("admin start", &e.to_string());
@@ -1229,7 +1229,7 @@ async fn a9_message_query(ck: &mut Checker, env: &Env, sent: &[SentMsg]) {
     let now = now_millis();
     // queryMessage 只断言「请求可达、broker 正常应答、返回类型正确」：msgId 属于
     // uniqKey，broker 侧的 uniqKey 倒排索引只有 RocksDB 索引实现支持，本机是默认
-    // 文件索引 ⇒ 查不到是 broker 配置差异，不是客户端 bug（Python 同口径显式 SKIP）。
+    // 文件索引 ⇒ 查不到是 broker 配置差异，不是客户端 bug。
     let by_key = admin
         .query_message(&topic, &first.uniq_key, 32, now - 60_000, now + 60_000)
         .await;
@@ -1631,7 +1631,7 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
             "A12 resetOffsetByQueueId 打到 broker 成功",
             table.is_empty()
                 || table.iter().any(|(k, _)| k.queue_id == mq.queue_id),
-            &format!("returnedTable={}（Java 为 void，可为空）", table.len()),
+            &format!("returnedTable={}（可为空）", table.len()),
         ),
         Err(e) => {
             ck.abort("A12 resetOffsetByQueueId", &e.to_string());
@@ -1706,7 +1706,7 @@ async fn a12_reset_offset(ck: &mut Checker, env: &Env) {
     );
     match admin.examine_consumer_offset(&group, &mq).await {
         Ok(offset) => ck.check(
-            "A12 越界 reset 停留在第 1 笔写入的非法位点（Java 两笔 RPC 非原子）",
+            "A12 越界 reset 停留在第 1 笔写入的非法位点（两笔 RPC 非原子）",
             offset == Some(bad_target),
             &format!("consumerOffset={offset:?} badTarget={bad_target}"),
         ),

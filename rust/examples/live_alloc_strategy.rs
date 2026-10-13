@@ -83,7 +83,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 队列 key 集合（`brokerName#queueId`），与其余三门语言的 queueKeys 同口径。
+/// 队列 key 集合（`brokerName#queueId`），分配结果按它比对。
 fn queue_keys(mqs: &[MessageQueue]) -> BTreeSet<String> {
     mqs.iter()
         .map(|mq| format!("{}#{}", mq.get_broker_name(), mq.get_queue_id()))
@@ -433,7 +433,7 @@ async fn a1_default_strategy(ck: &mut Checker, fx: &Fixture) {
         }
     };
     ck.check(
-        "A1 默认策略名 = AVG（Java 字段初值）",
+        "A1 默认策略名 = AVG（字段初值）",
         c.allocate_message_queue_strategy().get_name() == "AVG",
         c.allocate_message_queue_strategy().get_name(),
     );

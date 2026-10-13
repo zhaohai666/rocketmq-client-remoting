@@ -56,7 +56,7 @@ const HEADER_WITHOUT_BODY_LEN: usize = 4 + 4 + 4 + 4 + 4 + 8 + 8 + 4 + 8 + 8 + 4
 
 pub use crate::common::util_all::crc32;
 
-/// 对应 Python `string2bytes`：UTF-8 编码。
+/// 字符串按 UTF-8 直接转字节（协议属性区、topic 域都用这种编码）。
 pub fn string2bytes(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
@@ -69,14 +69,14 @@ pub fn string2bytes_hex(hex_string: &str) -> Option<Vec<u8>> {
     util_all::string_2_bytes(hex_string)
 }
 
-/// 对应 Python `ip_and_port_to_bytes`：ip 字节 + 4 字节大端端口。
+/// 帧内 host 域：ip 字节 + 4 字节大端端口。
 pub fn ip_and_port_to_bytes(ip: &str, port: u32, v6: bool) -> Result<Vec<u8>> {
     let mut out = ip_to_bytes(ip, v6)?;
     out.extend_from_slice(&port.to_be_bytes());
     Ok(out)
 }
 
-/// 对应 Python `_ip_to_bytes`：`socket.inet_pton`。
+/// ip 按 inet_pton 语义解析成 4 或 16 字节。
 pub fn ip_to_bytes(ip: &str, v6: bool) -> Result<Vec<u8>> {
     let addr: IpAddr = ip
         .parse()
@@ -100,7 +100,7 @@ fn to_v6_compatible(v4: &Ipv4Addr) -> Ipv6Addr {
         u16::from_be_bytes([octets[2], octets[3]]))
 }
 
-/// 对应 Python `bytes_to_ip_and_port`：8 字节 = ipv4+port，20 字节 = ipv6+port。
+/// 帧内 host 域的反向解析：8 字节 = ipv4+port，20 字节 = ipv6+port。
 pub fn bytes_to_ip_and_port(raw: &[u8]) -> Result<(String, u32)> {
     let (ip_len, family_v6) = match raw.len() {
         8 => (4, false),
@@ -128,7 +128,7 @@ fn bytes_to_ip(bytes: &[u8], v6: bool) -> Result<String> {
     }
 }
 
-/// 对应 Python `create_message_id`：`addr(8|20B) + commitLogOffset(8B)` -> 大写十六进制。
+/// 消息 ID：`addr(8|20B) + commitLogOffset(8B)` 拼成字节后转大写十六进制。
 pub fn create_message_id(addr_bytes: &[u8], offset: i64) -> String {
     let mut raw = addr_bytes.to_vec();
     raw.extend_from_slice(&offset.to_be_bytes());
@@ -196,7 +196,7 @@ fn find_char(chars: &[char], from: usize, length: usize, target: char) -> Option
     (from..length).find(|&i| chars[i] == target)
 }
 
-/// `MessageDecoder#decode` 的四个开关（Python `decode_message` 的同名参数）。
+/// 解码 17 段帧时的四个开关。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeOptions {
     pub read_body: bool,
@@ -595,7 +595,7 @@ mod tests {
         ext
     }
 
-    /// `test_message_codec.py::build_ext` 编码出来的 139 字节帧（Python 生成的真值）。
+    /// 线上记录的 139 字节扩展消息帧（v1 十七段编码的真值）。
     const EXT_HEX: &str = "0000008bdaa320a7f3307b09000000030000000200000000000000580000000000000400\
                            000000000000018bcfe568007f0000010000d4310000018bcfe5687b7f00000100002a9f\
                            0000000100000000000000000000000e68656c6c6f20726f636b65746d7109546f706963\
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn properties_none_value_never_encoded() {
-        // Rust 的 StringMap 存 String，「null 值」等价于「键不存在」
+        // StringMap 存 String，「null 值」等价于「键不存在」
         let empty = StringMap::new();
         assert_eq!(message_properties_2_string(&empty), "");
     }
@@ -799,7 +799,7 @@ mod tests {
 
     #[test]
     fn empty_body_decodes_to_none_body() {
-        // Python 真值：body 长度为 0 的 100 字节帧
+        // 线上记录的真值：body 长度为 0 的 100 字节帧
         let hex = "00000064DAA320A700000000000000030000000200000000000000580000000000000400\
                    000000000000018BCFE568007F0000010000D4310000018BCFE5687B7F00000100002A9F\
                    0000000100000000000000000000000009546F706963546573740000";
@@ -842,7 +842,7 @@ mod tests {
                 64
             ).as_str())
         );
-        // Python 真值（156 字节）
+        // 线上记录的真值（156 字节）
         assert_eq!(
             got.get_msg_id(),
             Some("20010DB800000000000000000000000200002A9F0000000000000040")
@@ -1009,7 +1009,7 @@ mod tests {
         assert_eq!(got.get_body(), b"body");
         assert_eq!(got.get_flag(), msg.get_flag());
         assert_eq!(got.get_properties(), msg.get_properties());
-        // Python 真值
+        // 线上记录的字节串
         assert_eq!(
             bytes2string(&encode_message(&msg)),
             "0000002C00000000000000000000000700000004626F64790012544147530154616741024B455953016B\
@@ -1038,7 +1038,7 @@ mod tests {
             Message::new("T", Some(b"m1")),
             Message::with_tags_and_keys("T", Some(b"m2"), Some("TagA"), None, 0),
         ];
-        // Python: encode_messages([Message("T", b"m1"), Message("T", b"m2", tags=TagA)])
+        // 线上记录的批量帧字节串：无属性的 m1 + 带 TagA 的 m2
         assert_eq!(
             bytes2string(&encode_messages(&msgs)),
             "00000018000000000000000000000000000000026D310000000000220000000000000000000000000000\

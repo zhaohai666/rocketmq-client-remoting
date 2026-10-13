@@ -1,4 +1,4 @@
-//! Request-Reply（5.x）客户端侧支撑，逐条对齐 `python/client/request_reply.py`。
+//! Request-Reply（5.x）客户端侧支撑。
 //!
 //!
 //!
@@ -22,10 +22,9 @@
 //! 2. `REPLY_TO_CLIENT` 是**请求方的 clientId**，broker 用它在 producerManager 里
 //!    反查 channel 才能把应答推回来 —— 所以请求方必须发过心跳（已注册为 producer）。
 //!
-//! 与 Python 的有意差异：Python 用 `threading.Event` 唤醒同步等待方；本实现整体是
-//! tokio 异步的，等待方换成 [`tokio::sync::Notify`]（sticky 标志 + `notify_waiters`），
-//! 唤醒语义与 Event 一致。Python 的 `react_callback`（把回调适配成 `(response, cause)`
-//! 的脚本便捷函数）在本仓库无任何调用点，未移植。
+//! 等待与唤醒：本实现整体是 tokio 异步的，同步等待方用
+//! [`tokio::sync::Notify`]（sticky 标志 + `notify_waiters`）唤醒，
+//! 唤醒语义与 sticky event 一致。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -62,7 +61,7 @@ pub struct RequestResponseFuture {
     pub begin_timestamp: i64,
     request_callback: Option<std::sync::Arc<dyn RequestCallback>>,
     send_request_ok: AtomicBool,
-    /// 已投递过应答（对应 Python `_event` 的 sticky 语义）。
+    /// 已投递过应答（sticky：后到的等待不会再阻塞）。
     responded: AtomicBool,
     callback_fired: AtomicBool,
     state: Mutex<FutureState>,
@@ -76,7 +75,7 @@ struct FutureState {
 }
 
 impl RequestResponseFuture {
-    /// Python `RequestResponseFuture(correlation_id, timeout_millis, request_callback=None)`。
+    /// 新建等待中的请求-应答 future（不带回调）。
     pub fn new(correlation_id: &str, timeout_millis: i64) -> RequestResponseFuture {
         RequestResponseFuture::with_callback(correlation_id, timeout_millis, None)
     }
@@ -114,7 +113,7 @@ impl RequestResponseFuture {
                 return Some(msg);
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                // 超时：与 Python 一样返回当时的值（没来过应答就是 None）
+                // 超时：返回当时的值（没来过应答就是 None）
                 return self.response_message();
             }
         }
@@ -391,7 +390,7 @@ pub fn create_reply_message(request_message: &Message, body: &[u8]) -> Result<Me
         PROPERTY_MESSAGE_REPLY_TO_CLIENT,
         PROPERTY_MESSAGE_TTL,
     ] {
-        // Python 用 get_property 原样带回；请求消息缺某项时不写该属性（不给 "None"）。
+        // 三个关联属性原样带回；请求消息缺某项时不写该属性（不给 "None"）。
         if let Some(value) = request_message.get_property(name) {
             reply.put_property(name, value);
         }
@@ -523,7 +522,7 @@ mod tests {
         handle.await.unwrap();
     }
 
-    /// 应答先到、等待后起：sticky 语义（Python 的 `Event`）不允许丢唤醒。
+    /// 应答先到、等待后起：sticky 语义不允许丢唤醒。
     #[tokio::test]
     async fn response_before_wait_is_not_lost() {
         let f = RequestResponseFuture::new("c1", 1000);
@@ -623,7 +622,7 @@ mod tests {
             &f
         ));
         assert!(holder.get_request("c1").is_none());
-        // 重复应答：摘不到了，只记日志（Python 同语义）
+        // 重复应答：摘不到了，只记日志
         assert!(holder.put_response(Some("c1"), msg).is_none());
     }
 

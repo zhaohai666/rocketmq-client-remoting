@@ -14,7 +14,7 @@ impl MessageType {
         self as i32
     }
 
-    /// `value()` 的逆运算；越界返回 `None`（Python 侧没有对应函数，不 panic）。
+    /// `value()` 的逆运算；越界返回 `None`，不 panic。
     pub fn from_value(value: i32) -> Option<MessageType> {
         match value {
             0 => Some(MessageType::NormalMsg),

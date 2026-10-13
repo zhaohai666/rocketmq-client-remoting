@@ -244,7 +244,7 @@ async fn wait_for(cond: impl Fn() -> bool, what: &str) {
 #[test]
 fn detector_config_defaults_match_java_client_config() {
     let cfg = ProducerConfig::default();
-    assert!(!cfg.start_detector_enable, "Java 默认 false");
+    assert!(!cfg.start_detector_enable, "startDetectorEnable 默认 false");
     assert_eq!(cfg.detect_timeout, 200);
     assert_eq!(cfg.detect_interval, 2 * 1000);
 

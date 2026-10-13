@@ -1,5 +1,4 @@
-//! W3C Trace Context（traceparent）透传（OpenTracing/OTel 场景的消息级上下文），
-//! 逐条对齐 `python/client/trace_context.py`。
+//! W3C Trace Context（traceparent）透传（OpenTracing/OTel 场景的消息级上下文）。
 //!
 //! 格式（W3C Trace Context，<https://www.w3.org/TR/trace-context/>）：
 //!
@@ -8,11 +7,10 @@
 //! ```
 //!
 //!
-//! 与本仓库 Python / C# 端一致的**有意差异**：Python 用 `secrets.token_hex`
-//! （CSPRNG），本 crate 不引第三方随机数依赖，改用「纳秒时间 + PID + 进程内自增
+//! **有意差异**：id 生成不引第三方 CSPRNG 依赖，改用「纳秒时间 + PID + 进程内自增
 //! 经 splitmix64 打散」——与 [`crate::common::mix_all::MixAll::create_uniq_name`]
 //! 同一口径。对 traceparent 而言要求的只是「唯一且不可预测性足够低的 32/16 hex」，
-//! 线上语义（长度、字符集、非全 0）与 Python 完全一致。
+//! 线上语义（长度、字符集、非全 0）不变。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,7 +30,7 @@ const HEX_ARRAY: &[u8; 16] = b"0123456789abcdef";
 const TRACE_ID_HEX_LEN: usize = 32;
 /// parent-id / span-id 长度（hex 字符数）。
 const PARENT_ID_HEX_LEN: usize = 16;
-/// version 00 下固定的采样标记（`01` = sampled，与 Python 生成端一致）。
+/// version 00 下固定的采样标记（`01` = sampled）。
 const SAMPLED_FLAGS: &str = "01";
 
 /// 生成合法的根 traceparent：`00-<32hex>-<16hex>-01`（记录采样）。
@@ -57,8 +55,8 @@ pub fn is_valid_traceparent(value: Option<&str>) -> bool {
     if version != "00" && !(version.len() == 2 && is_hex(version)) {
         return false;
     }
-    // ⚠ 大小写敏感：Python 参考实现只拦字面量 "ff"，"FF" 会放过。
-    // 保留该行为（三语言端口一致优先于「顺手修正」），改它会与 Python/C# 对不上。
+    // ⚠ 大小写敏感：只拦字面量 "ff"，"FF" 会放过。
+    // 保留该行为，勿「顺手修正」成大小写不敏感。
     if version == "ff" {
         return false;
     }
@@ -126,7 +124,7 @@ fn env_value_means_on(raw: &str) -> bool {
     )
 }
 
-/// 十六进制字符集校验（大小写均可，对应 Python 的 `part.lower()` 后查表）。
+/// 十六进制字符集校验（大小写均可，先转小写再查表）。
 fn is_hex(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|b| b.is_ascii_hexdigit())
 }

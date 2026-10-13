@@ -5,8 +5,8 @@
 //!
 //! # 分发器依赖：[`TraceReportSink`]
 //!
-//! Python 的三个钩子构造时收一个 `AsyncTraceDispatcher`，但**只用到它的三个方法**
-//! （`get_trace_topic_name()` / `append(ctx)` / `_client_id()`）。Rust 侧的攒批、发送、
+//! 三个钩子对分发器的依赖**只有三个方法**
+//! （`get_trace_topic_name()` / `append(ctx)` / `client_id()`）。攒批、发送、
 //! 生命周期都在 `client::trace_dispatcher`（另有人移植），所以这里只打一个依赖倒置的缝：
 //! 本模块声明 [`TraceReportSink`]，**不** stub 分发器、也不碰 topic 选择与攒批。
 
@@ -63,7 +63,7 @@ impl SendMessageTraceHook {
         SendMessageTraceHook { sink }
     }
 
-    /// 交出钩子持有的通道（Python 的公有属性 `local_dispatcher`）。
+    /// 交出钩子持有的通道。
     pub fn sink(&self) -> &Arc<dyn TraceReportSink> {
         &self.sink
     }
@@ -79,7 +79,7 @@ impl SendMessageHook for SendMessageTraceHook {
     /// 此处只填「发送前就知道的」字段（topic / tags / keys / storeHost / bodyLength /
     /// msgType），`msgId` 留空等 `after` 用 SendResult 覆盖。
     fn send_message_before(&self, context: &mut SendMessageContext) -> Result<()> {
-        // Python: `if context is None or context.message is None: return`
+        // context 或 message 缺失时直接返回
         let Some(message) = context.message.as_ref() else {
             return Ok(());
         };
@@ -102,7 +102,7 @@ impl SendMessageHook for SendMessageTraceHook {
         Ok(())
     }
 
-    /// 跳过条件与 Python 逐条对齐（连顺序一致）：无 message / 是轨迹 topic /
+    /// 跳过条件逐条锁定（连顺序一致）：无 message / 是轨迹 topic /
     /// before 没建过 context / 没有 sendResult / broker 侧 `TRACE_ON=false` 或没回
     /// `MSG_REGION` / beans 为空。
     fn send_message_after(&self, context: &mut SendMessageContext) -> Result<()> {
@@ -174,7 +174,7 @@ impl ConsumeMessageHook for ConsumeMessageTraceHook {
         let mut trace_context = TraceContext::new();
         trace_context.trace_type = Some(TraceType::SubBefore);
         trace_context.group_name = strip_namespace(&context.consumer_group);
-        // Python 在建好 beans 之前就把（此时还是空壳的）context 挂上去：
+        // 在建好 beans 之前就把（此时还是空壳的）context 挂上去：
         // 一条都没记上时 `consume_message_after` 仍能拿到它并因 beans 为空而跳过。
         context.mq_trace_context = Some(Arc::new(trace_context.clone()));
         let mut beans: Vec<TraceBean> = Vec::with_capacity(context.msg_list.len());
@@ -192,7 +192,7 @@ impl ConsumeMessageHook for ConsumeMessageTraceHook {
             bean.store_time = msg.store_timestamp;
             bean.body_length = msg.store_size;
             bean.retry_times = msg.reconsume_times;
-            // Python `region_id or ""`：属性缺失/空串都写空串，且会覆盖前一条的值
+            // region 属性缺失/空串都写空串，且会覆盖前一条的值
             trace_context.region_id = region_id.unwrap_or("").to_string();
             beans.push(bean);
         }
@@ -226,7 +226,7 @@ impl ConsumeMessageHook for ConsumeMessageTraceHook {
             sub_before.time_stamp,
             context.msg_list.len(),
         );
-        // Python: `sub_after.trace_beans = sub_before.trace_beans`（同一个 list 对象）；
+        // sub_after 与 sub_before 共享同一批 beans（原本就是同一个对象）；
         // append 之后再没人改它，克隆等价。
         sub_after.trace_beans = sub_before.trace_beans.clone();
         if let Some(props) = context.props.as_ref() {
@@ -294,7 +294,7 @@ impl EndTransactionHook for EndTransactionTraceHook {
         let region_id = message.get_property(PROPERTY_MSG_REGION);
         trace_context.region_id = match region_id {
             Some(region) if !region.is_empty() => region.to_string(),
-            // Python `region_id if region_id else MixAll.DEFAULT_TRACE_REGION_ID`
+            // region 为空时回落默认 region
             _ => MixAll::DEFAULT_TRACE_REGION_ID.to_string(),
         };
         trace_context.trace_beans = vec![bean];
@@ -306,7 +306,7 @@ impl EndTransactionHook for EndTransactionTraceHook {
 
 // ------------------------------------------------------------------ 内部工具
 
-/// Python `NamespaceUtil.without_namespace(x)`（单参重载 = 命名空间传空串）。
+/// 剥掉命名空间前缀（命名空间按空串处理）。
 ///
 /// `NS1%TopicTest` → `TopicTest`；`%RETRY%NS1%GID_test` → `%RETRY%GID_test`；
 /// 系统资源（`rmq_sys_` / `CID_RMQ_SYS_` 前缀）原样返回。
@@ -327,7 +327,7 @@ fn held_trace_context(holder: &Option<AnyHolder>) -> Option<TraceContext> {
     }
 }
 
-/// 交出一条记录，并把它同步回 `mq_trace_context`（Python 改的就是挂在上面的那个对象，
+/// 交出一条记录，并把它同步回 `mq_trace_context`（调用方读的就是挂在上面的那个对象，
 /// 所以钩子跑完后调用方看到的状态必须是「已填好」的那一份）。
 fn publish(
     sink: &Arc<dyn TraceReportSink>,
@@ -359,9 +359,9 @@ fn half_floor(cost_time: i32) -> i64 {
 /// [`ConsumeMessageContext::access_channel`] 存的是名字串（见该模块头差异说明 3），
 /// 这里换回 [`AccessChannel`] 交给编码器判断。
 ///
-/// Python 里该字段本身就是 `Optional[AccessChannel]`：`None` → 编码器按 LOCAL 处理；
-/// `"CLOUD"` → CLOUD；其它值都不等于 `AccessChannel.CLOUD`，编码效果与 LOCAL 相同 ——
-/// 所以无法识别的名字映射成 `None`，字节输出与 Python 一致。
+/// 该字段本身就是可选的：`None` → 编码器按 LOCAL 处理；
+/// `"CLOUD"` → CLOUD；其它值都不等于 CLOUD，编码效果与 LOCAL 相同 ——
+/// 所以无法识别的名字映射成 `None`，字节输出与线上基准一致。
 fn access_channel_of(name: Option<&str>) -> Option<AccessChannel> {
     match name? {
         "CLOUD" => Some(AccessChannel::Cloud),
@@ -370,8 +370,8 @@ fn access_channel_of(name: Option<&str>) -> Option<AccessChannel> {
     }
 }
 
-/// [`crate::client::result::ConsumeReturnType`] 没有 `from_name`（Python 用的是下标查表，
-/// Rust 侧调用方都持强类型枚举），故在本模块内做名字 → 既有枚举的映射，不重复定义枚举；
+/// [`crate::client::result::ConsumeReturnType`] 没有 `from_name`（调用方都持强类型枚举），
+/// 故在本模块内做名字 → 既有枚举的映射，不重复定义枚举；
 /// 未知名返回 `None`，调用方据此保持 `contextCode = 0`。
 fn consume_return_code(name: &str) -> Option<i32> {
     use crate::client::result::ConsumeReturnType as T;
@@ -463,7 +463,7 @@ mod tests {
     const OFFSET_MSG_ID: &str = "AC1400A1000027100000000000000001";
     const BROKER: &str = "127.0.0.1:10911";
 
-    /// 把 Python 产出的 golden 模板里的占位符换成实际值。
+    /// 把 golden 模板里的占位符换成实际值。
     ///
     /// 时钟相关的三个数（time_stamp / cost_time / store_time）与 `request_id` 在两侧
     /// 不可能相同（Rust 用真实时钟 + 随机 uniqId），所以模板里留占位；它们的**取值规则**
@@ -536,9 +536,9 @@ mod tests {
         }
     }
 
-    /// 一条拉取到的消息（Python `make_ext` 的等价物）。
+    /// 一条拉取到的消息。
     ///
-    /// 参数表与 Python `make_ext` 的字段一一对应（golden 用例逐字段对拍），合并参数会破坏可读性。
+    /// 参数表与 golden 用例逐字段一一对应，合并参数会破坏可读性。
     #[allow(clippy::too_many_arguments)]
     fn ext(
         topic: &str,
@@ -572,7 +572,7 @@ mod tests {
         msg
     }
 
-    /// Python `scenario_sub` 里的同一批消息（第三条被 `TRACE_ON=false` 挡掉）。
+    /// 固定的一批消费消息（第三条被 `TRACE_ON=false` 挡掉）。
     fn python_scenario_msgs() -> Vec<MessageExt> {
         vec![
             ext(
@@ -621,7 +621,7 @@ mod tests {
 
     // ------------------------------------------------ 发送钩子
 
-    /// Python `scenario_pub` 打印的 Pub 记录（时钟两段留占位）。
+    /// Pub 记录金标准（时钟两段留占位）。
     const GOLDEN_PUB: &str = "Pub\u{1}{TS}\u{1}DefaultRegion\u{1}GID_test\u{1}TopicTest\
          \u{1}AC1400A1F0A018B4AAC2A1B2C3D4E5F6\u{1}TagA\u{1}KeyA KeyB\u{1}127.0.0.1:10911\
          \u{1}42\u{1}{COST}\u{1}0\u{1}AC1400A1000027100000000000000001\u{1}true\u{2}";
@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(send.hook_name(), "SendMessageTraceHook");
         assert_eq!(consume.hook_name(), "ConsumeMessageTraceHook");
         assert_eq!(end.hook_name(), "EndTransactionTraceHook");
-        // 钩子持有的通道可取回（Python 的 `hook.local_dispatcher`）
+        // 钩子持有的通道可取回
         assert_eq!(send.sink().trace_topic_name(), TRACE_TOPIC.to_string());
         assert_eq!(consume.sink().client_id(), CLIENT_ID.to_string());
         assert_eq!(end.sink().trace_topic_name(), TRACE_TOPIC.to_string());
@@ -669,7 +669,7 @@ mod tests {
         let (data, keys) = transfer(&emitted);
         assert_eq!(data, render(GOLDEN_PUB, &emitted));
         assert_eq!(keys, vec![MSG_ID.to_string(), "KeyA".to_string(), "KeyB".to_string()]);
-        // 挂在上下文里的那份必须与交出去的那份一致（Python 改的是同一个对象）
+        // 挂在上下文里的那份必须与交出去的那份一致（同一个对象）
         assert_eq!(held_trace_context(&context.mq_trace_context), Some(emitted));
     }
 
@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(held.trace_type, Some(TraceType::Pub));
         assert_eq!(held.group_name, "GID_test", "producerGroup 剥掉 NS1%");
         assert_eq!(held.region_id, "", "region 要等 SendResult 回填");
-        assert!(held.is_success, "Java isSuccess 默认 true");
+        assert!(held.is_success, "isSuccess 默认 true");
         assert_eq!(held.cost_time, 0);
         let bean = &held.trace_beans[0];
         assert_eq!(bean.topic, "TopicTest");
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(bean.msg_id, "", "msgId 要等 after");
         assert_eq!(bean.offset_msg_id, "");
 
-        // 无 tags / keys / body 的裸消息：Python 的 `or ""` 语义 => 空串
+        // 无 tags / keys / body 的裸消息：属性缺失 => 空串
         let mut bare = SendMessageContext {
             message: Some(Message::new("TopicTest", None)),
             ..Default::default()
@@ -732,8 +732,8 @@ mod tests {
         assert!(context.mq_trace_context.is_none());
         assert_eq!(cloud.count(), 0);
 
-        // 分发器没配 topic（空前缀）时 Python 的 `topic.startswith("")` 恒真 =>
-        // 整条轨迹链路关掉，Rust 一致
+        // 分发器没配 topic（空前缀）时轨迹 topic 前缀判断恒真 =>
+        // 整条轨迹链路关掉
         let empty = Arc::new(RecordingSink::new("", CLIENT_ID));
         let hook = SendMessageTraceHook::new(empty.clone());
         let mut context = send_context("TopicTest");
@@ -828,17 +828,17 @@ mod tests {
 
     #[test]
     fn pub_cost_and_store_time_follow_python_rules() {
-        // Python `int((now*1000 - ts) / len(beans))` 向零取整；ts + cost // 2 向下取整
+        // 均摊耗时 (now*1000 - ts) / len(beans) 向零取整；storeTime = ts + cost/2 向下取整
         assert_eq!(elapsed_per(1_700_000_000_042, 1_700_000_000_000, 1), 42);
         assert_eq!(elapsed_per(1_700_000_000_042, 1_700_000_000_000, 2), 21);
         assert_eq!(elapsed_per(1_700_000_000_000, 1_700_000_000_000, 3), 0);
-        // 时钟回拨：Python `int(-3 / 1) == -3`（向零）、`-3 // 2 == -2`（向下）
+        // 时钟回拨：向零取整是 -3，向下取整是 -2
         assert_eq!(elapsed_per(1_699_999_999_997, 1_700_000_000_000, 1), -3);
-        assert_eq!(half_floor(-3), -2, "Python -3//2 == -2，Java -3/2 == -1");
+        assert_eq!(half_floor(-3), -2, "half_floor 向下取整：-3/2 == -2");
         assert_eq!(half_floor(-4), -2);
         assert_eq!(half_floor(3), 1);
         assert_eq!(half_floor(42000), 21000);
-        // Python scenario_pub_negative_clock 的实测 storeTime
+        // 时钟回拨场景下预期的 storeTime
         assert_eq!(1_700_000_000_000 + half_floor(-3), 1_699_999_999_998);
 
         // 真实钩子跑完也必须满足同一关系
@@ -871,7 +871,7 @@ mod tests {
         assert!(back.trace_beans[0].store_time <= back.time_stamp - 2);
     }
 
-    /// 用 Python 的规则独立重算一遍 storeTime（不依赖钩子内部变量）。
+    /// 用同样的取整规则独立重算一遍 storeTime（不依赖钩子内部变量）。
     fn render_store(ctx: &TraceContext) -> i64 {
         let cost = ctx.cost_time;
         ctx.time_stamp + if cost >= 0 { (cost / 2) as i64 } else { -(((-cost + 1) / 2) as i64) }
@@ -891,13 +891,13 @@ mod tests {
 
     // ------------------------------------------------ 消费钩子
 
-    /// Python `scenario_sub` 打印的 SubBefore 两段（时钟 / uniqId 段留占位）。
+    /// SubBefore 两段金标准（时钟 / uniqId 段留占位）。
     const GOLDEN_SUB_BEFORE: &str = "SubBefore\u{1}{TS}\u{1}cn-shanghai\u{1}GID_test\
          \u{1}{REQ}\u{1}MSGID-1\u{1}0\u{1}KeyA KeyB\
          \u{2}SubBefore\u{1}{TS}\u{1}cn-shanghai\u{1}GID_test\
          \u{1}{REQ}\u{1}MSGID-2\u{1}3\u{1}KeyC\u{2}";
 
-    /// Python `scenario_sub` 打印的 SubAfter 两段（LOCAL 通道，9 字段）。
+    /// SubAfter 两段金标准（LOCAL 通道，9 字段）。
     const GOLDEN_SUB_AFTER: &str = "SubAfter\u{1}{REQ}\u{1}MSGID-1\u{1}{COST}\u{1}false\
          \u{1}KeyA KeyB\u{1}3\u{1}{TS}\u{1}GID_test\
          \u{2}SubAfter\u{1}{REQ}\u{1}MSGID-2\u{1}{COST}\u{1}false\
@@ -1011,7 +1011,7 @@ mod tests {
             None,
         );
         hook.consume_message_before(&mut context).unwrap();
-        // Python scenario_sub_cloud_and_bogus_type 的 SubBefore 单段
+        // 云端通道 + 无法识别返回类型的场景，SubBefore 单段
         assert_eq!(
             encode(&sink.last().expect("test-only")),
             render(
@@ -1040,7 +1040,7 @@ mod tests {
         let fields = records(&encode(&after)).remove(0);
         assert_eq!(fields.len(), 7, "{fields:?}");
 
-        // 名字串无法识别 => 编码效果与 LOCAL 相同（Python 里就是 `!= AccessChannel.CLOUD`）
+        // 名字串无法识别 => 编码效果与 LOCAL 相同（不等于 CLOUD 即是）
         let mut context = ConsumeMessageContext::new(
             "G",
             Some(vec![ext("T", "M", None, None, Some("r"), None, 1, 1, 0)]),
@@ -1102,7 +1102,7 @@ mod tests {
         hook.consume_message_after(&mut context).unwrap();
         assert_eq!(sink.count(), 0);
 
-        // 消息没有 MSG_REGION 属性 => region 为空串（Python `region_id or ""`）；
+        // 消息没有 MSG_REGION 属性 => region 为空串；
         // 没有 tags / keys => 空串，SubBefore 只剩 7 段（java_split 丢掉末尾空段）
         let mut context = ConsumeMessageContext::new(
             "G",
@@ -1143,12 +1143,12 @@ mod tests {
 
     // ------------------------------------------------ 事务收尾钩子
 
-    /// Python `scenario_end_tx` 打印的 EndTransaction 记录（时钟段留占位）。
+    /// EndTransaction 记录金标准（时钟段留占位）。
     const GOLDEN_END_TX: &str = "EndTransaction\u{1}{TS}\u{1}NS1%cn-hangzhou\u{1}GID_test\
          \u{1}TopicTest\u{1}AC1400A1F0A018B4AAC2A1B2C3D4E5F6\u{1}TagA\u{1}KeyA KeyB\
          \u{1}127.0.0.1:10911\u{1}2\u{1}TRAN-001\u{1}COMMIT_MESSAGE\u{1}true\u{2}";
 
-    /// Python 第二次 `scenario_end_tx`（region 空 => DefaultRegion、状态 UNKNOW）。
+    /// 第二组 EndTransaction 金标准（region 空 => DefaultRegion、状态 UNKNOW）。
     const GOLDEN_END_TX_DEFAULT_REGION: &str =
         "EndTransaction\u{1}{TS}\u{1}DefaultRegion\u{1}GID_test\u{1}TopicTest\
          \u{1}AC1400A1F0A018B4AAC2A1B2C3D4E5F6\u{1}TagA\u{1}KeyA KeyB\u{1}127.0.0.1:10911\
@@ -1271,7 +1271,7 @@ mod tests {
             ..Default::default()
         };
         cloud_hook.end_transaction(&mut context).unwrap();
-        // 没有 message（Python 的 `context.message is None`）
+        // 没有 message
         let mut context = EndTransactionContext::default();
         hook.end_transaction(&mut context).unwrap();
         assert_eq!(sink.count(), 0, "轨迹 topic 与无 message 都不记");

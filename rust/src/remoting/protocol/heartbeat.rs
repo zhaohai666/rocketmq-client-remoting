@@ -1,6 +1,5 @@
-//! 移植 `python/remoting/protocol/heartbeat.py`：`ProducerData` /
-//! `ConsumerData` / `HeartbeatData`，以及 `ConsumerData.subscriptionDataSet` 需要的
-//! [`SubscriptionData`]。
+//! 心跳报文模型：`ProducerData` / `ConsumerData` / `HeartbeatData`，以及
+//! `ConsumerData.subscriptionDataSet` 需要的 [`SubscriptionData`]。
 //!
 //! ## 为什么本层自带 `SubscriptionData`
 //!
@@ -77,7 +76,7 @@ pub struct SubscriptionData {
 
 impl Default for SubscriptionData {
     fn default() -> Self {
-        // Python: sub_version = int(time.time() * 1000)，即当前毫秒时间戳。
+        // subVersion 取当前毫秒时间戳。
         SubscriptionData {
             class_filter_mode: false,
             topic: String::new(),
@@ -99,7 +98,7 @@ impl SubscriptionData {
         }
     }
 
-    /// 一次性设置 tag 集合与对应哈希集合：去重 + 升序，等价 Python 的 `sorted(set)`。
+    /// 一次性设置 tag 集合与对应哈希集合：**去重 + 升序**（顺序会进报文）。
     pub fn set_tags(&mut self, tags: Vec<String>, codes: Vec<i32>) {
         let mut tags: Vec<String> = tags;
         tags.sort();
@@ -147,7 +146,7 @@ impl SubscriptionData {
         }
         let mut code_set: Vec<i32> = Vec::new();
         for item in jarray(value, "codeSet")? {
-            // Python: `int(v)` —— 数字与数字字符串都能读。
+            // broker 回的 codeSet 里数字和数字字符串都会出现，两种都读。
             let code = match item {
                 Value::Number(n) => n
                     .as_i64()
@@ -165,7 +164,7 @@ impl SubscriptionData {
         code_set.sort();
         code_set.dedup();
         Ok(SubscriptionData {
-            // Python: bool(sd.get("classFilterMode", False))
+            // classFilterMode 缺省为 false（只认真值 true / 非零）
             class_filter_mode: jboolean(value, "classFilterMode", false),
             topic: jstring_or(value, "topic", ""),
             sub_string: jstring_or(value, "subString", ""),
@@ -213,7 +212,7 @@ impl FilterAPI {
                 codes.push(crate::common::util_all::java_string_hash(tag));
             }
         }
-        // set_tags 负责去重 + 升序（等价 Python 的 sorted(set)）。
+        // set_tags 负责去重 + 升序。
         sub.set_tags(tags, codes);
         Ok(sub)
     }
@@ -294,7 +293,7 @@ impl ConsumerData {
         }
     }
 
-    /// 加入订阅（Python 用 `set`，重复元素会被折叠；这里同样去重）。
+    /// 加入订阅（集合语义：重复元素会被折叠掉）。
     pub fn add_subscription_data(&mut self, data: SubscriptionData) {
         if !self.subscription_data_set.contains(&data) {
             self.subscription_data_set.push(data);
@@ -374,7 +373,7 @@ impl HeartbeatData {
         }
     }
 
-    /// Python 用 `set`，重复 group / 重复 consumer 会被折叠。
+    /// 集合语义：重复 group / 重复 consumer 会被折叠。
     pub fn add_producer_data(&mut self, data: ProducerData) {
         if !self.producer_data_set.contains(&data) {
             self.producer_data_set.push(data);
@@ -443,7 +442,6 @@ impl HeartbeatData {
 }
 
 /// 把 `subscriptionDataSet` 之外的标量字段读出来，供上层日志/调试用。
-/// （与 Python `ConsumerData.__repr__` 等价的诊断辅助。）
 pub fn consumer_data_summary(data: &ConsumerData) -> String {
     format!(
         "ConsumerData [groupName={}, consumeType={}, messageModel={}, consumeFromWhere={}]",
@@ -489,7 +487,7 @@ mod tests {
         assert!(fresh.tags_set.is_empty() && fresh.code_set.is_empty());
     }
 
-    /// cpp/tests/test_route_heartbeat.cpp 的黄金报文，逐字节。
+    /// 心跳 JSON 的逐字节守卫：键序与字段都按报文钉死。
     #[test]
     fn heartbeat_exact_json_matches_fastjson2() {
         let mut hb = HeartbeatData::new("cid");
@@ -523,8 +521,8 @@ mod tests {
         assert!(text.contains(r#""consumeFromWhere":"CONSUME_FROM_LAST_OFFSET""#));
         assert!(text.contains(r#""unitMode":false"#));
         assert!(text.contains(r#""subscriptionDataSet":["#));
-        assert!(!text.contains("consumeTimestamp"), "Java 5.x 无此字段");
-        assert!(!text.contains("maxReconsumeTimes"), "Java 5.x 无此字段");
+        assert!(!text.contains("consumeTimestamp"), "服务端 5.x 无此字段");
+        assert!(!text.contains("maxReconsumeTimes"), "服务端 5.x 无此字段");
         assert_eq!(ConsumerData::from_json_value(&cd.to_json_value()).unwrap(), cd);
         assert_eq!(
             consumer_data_summary(&cd),
@@ -586,7 +584,7 @@ mod tests {
             &serde_json::json!({"groupName":"g","unitMode":1,"subscriptionDataSet":[{"subVersion":"5","codeSet":["7"],"tagsSet":["A"],"classFilterMode":"no"}]}),
         )
         .unwrap();
-        assert!(cd.unit_mode, "数字 1 视为 true（Java 宽松语义）");
+        assert!(cd.unit_mode, "数字 1 视为 true（宽松布尔语义）");
         assert_eq!(cd.subscription_data_set[0].sub_version, 5);
         assert_eq!(cd.subscription_data_set[0].code_set, vec![7]);
         assert!(!cd.subscription_data_set[0].class_filter_mode, "\"no\" 不是 true");
@@ -611,8 +609,7 @@ mod tests {
         }
     }
 
-    /// 黄金向量取自**跑起来的 Python 参考实现**
-    /// （`python/common/subscription_data.FilterAPI`），不是手推的。
+    /// 黄金向量取自**线上记录的真实行为**，不是按规则手推的。
     #[test]
     fn filter_api_matches_the_python_reference_vector_by_vector() {
         /// (用例名, 订阅表达式, 期望 subString, 期望 tagsSet, 期望 codeSet)
@@ -649,7 +646,7 @@ mod tests {
             assert_eq!(&sub.sub_string, sub_string, "{what} subString");
             assert_eq!(&sub.tags_set, tags, "{what} tagsSet");
             assert_eq!(&sub.code_set, codes, "{what} codeSet");
-            // Python 的 build_subscription_data 从不改 expressionType / classFilterMode。
+            // 构建订阅数据时不会改写 expressionType / classFilterMode。
             assert_eq!(sub.expression_type, ExpressionType::TAG, "{what}");
             assert!(!sub.class_filter_mode, "{what}");
         }

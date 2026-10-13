@@ -1,7 +1,6 @@
 //! `Validators` / `TopicValidator` 对**真实 5.5.1 集群**的联调验证。
 //!
-//! 与 `python/verify_validators_live.py`、`cpp/examples/validators_live.cpp`、
-//! `csharp/examples/RocketMQ.Examples/LiveValidators.cs` 同一套断言（四语言对拍）。
+//! 逐项验证命名与消息体大小等校验的边界判定。
 //!
 //!
 //! 用法（先按项目记忆里记的 runbook 起本地集群）：
@@ -220,7 +219,7 @@ async fn v2_boundary(ck: &mut Checker, p: &DefaultMQProducer) {
     let ms = elapsed_ms(began);
     let text = err.map(|e| e.to_string()).unwrap_or_default();
     ck.check(
-        "V2 等于上限不报 oversize（Java 的 > 判定）",
+        "V2 等于上限不报 oversize（> 判定）",
         !text.contains("over max value"),
         &format!("{text} in {ms:.1}ms"),
     );

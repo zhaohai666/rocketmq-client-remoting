@@ -1,8 +1,8 @@
 //! 验证 Rust 轨迹默认自建 producer 真的把轨迹发到了 RMQ_SYS_TRACE_TOPIC。
 //!
 //! 修复前：未注入 `TraceDispatcherConfig::producer` 时兜底
-//! `DisabledTraceProducer`，轨迹链路默认**静默断开**（其他端都没这个问题）。
-//! 修复后：与 Python `_get_and_create_trace_producer` 对齐，自建真实
+//! `DisabledTraceProducer`，轨迹链路默认**静默断开**。
+//! 修复后：未注入时自建真实
 //! DefaultMQProducer。本工具发 3 条业务消息后用 admin 查 RMQ_SYS_TRACE_TOPIC
 //! 的 maxOffset，> 0 即轨迹链路真的通了。
 //!

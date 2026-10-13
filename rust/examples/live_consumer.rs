@@ -714,7 +714,7 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     }
     ck.check("C1 start() succeeded", c.is_started(), "started flag false");
     ck.check(
-        "C1 start() stamped a clientId (<clientIP>@<instanceName>, Java buildMQClientId)",
+        "C1 start() stamped a clientId (<clientIP>@<instanceName>)",
         c.client_id()
             .split_once('@')
             .is_some_and(|(ip, instance)| !ip.is_empty() && instance.contains("live-")),
@@ -734,7 +734,7 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     let subs: Vec<SubscriptionData> = c.subscriptions();
     let sub_topics: BTreeSet<String> = subs.iter().map(|s| s.topic.clone()).collect();
     ck.check(
-        "C1 start() subscribes the business topic and %RETRY%<group> (Java copySubscription)",
+        "C1 start() subscribes the business topic and %RETRY%<group>",
         sub_topics.contains(&topic) && sub_topics.contains(&MixAll::get_retry_topic(&group)),
         &format!("{subs:?}"),
     );
@@ -755,7 +755,7 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     let late = fx.topic_name("Late");
     let accepted = c.subscribe(&late, "*").is_ok();
     ck.check(
-        "C1 subscribe() after start() is accepted (Java has no already-started guard)",
+        "C1 subscribe() after start() is accepted (no already-started guard)",
         accepted && c.subscriptions().iter().any(|s| s.topic == late),
         &format!("{accepted:?} subs={:?}", c.subscriptions()),
     );
@@ -778,7 +778,7 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     c.shutdown();
     ck.check("C1 shutdown() clears the started flag", !c.is_started(), "still started");
     ck.check(
-        "C1 shutdown() removes the consumer from its MQClientInstance registry (Java unregisterConsumer)",
+        "C1 shutdown() removes the consumer from its MQClientInstance registry",
         MQClientInstance::find_instance(&client_id)
             .and_then(|i| i.find_consumer(&group))
             .is_none(),
@@ -869,7 +869,7 @@ async fn c2_pull_consume_and_offset_persist(ck: &mut Checker, fx: &Fixture) {
         &format!("{:?}", got.first()),
     );
     ck.check(
-        "C2 (documented gap vs Java PullAPIWrapper:133-140) the pull path stamps no MIN/MAX_OFFSET, so msgAccCnt stays 0",
+        "C2 the pull path stamps no MIN/MAX_OFFSET, so msgAccCnt stays 0",
         got.iter().all(|d| d.max_offset_prop.is_none()) && c.msg_acc_cnt(None) == 0,
         &format!(
             "maxOffsetProp={:?} msgAccCnt={}",
@@ -924,7 +924,7 @@ async fn c2_pull_consume_and_offset_persist(ck: &mut Checker, fx: &Fixture) {
         .filter(|k| k.starts_with(MixAll::RETRY_GROUP_TOPIC_PREFIX))
         .collect();
     ck.check(
-        "C2 consumerRunningInfo reports one ProcessQueueInfo per assigned queue (business + the %RETRY% queue, Java processQueueTable)",
+        "C2 consumerRunningInfo reports one ProcessQueueInfo per assigned queue (business + the %RETRY% queue)",
         business.len() == QUEUE_NUMS as usize && retry_entries.len() == 1,
         &format!(
             "business={} retry={:?}",
@@ -1713,7 +1713,7 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
             Ok(text) => {
                 let offsets = canonical_format_offsets(&text);
                 ck.check(
-                    "C6 the local offset file uses Java's object-as-key offsetTable format with 2 entries summing to 8",
+                    "C6 the local offset file uses the object-as-key offsetTable format with 2 entries summing to 8",
                     matches!(&offsets, Some(v) if v.len() == 2 && v.iter().sum::<i64>() == 8),
                     &format!("{offsets:?} raw={text}"),
                 );
@@ -2223,7 +2223,7 @@ async fn c11_pull_stall_self_heal(ck: &mut Checker, fx: &Fixture) {
         &format!("sent={sent} arrivals={} committed={committed}", inbox.count()),
     );
     ck.check(
-        "C11 consumerRunningInfo reports the real lastPullTimestamp (Java ProcessQueue#fillOutRunningInfo:456)",
+        "C11 consumerRunningInfo reports the real lastPullTimestamp",
         pull_clock_age_ms(&c.consumer_running_info())
             .is_some_and(|age| (0..60_000).contains(&age)),
         &format!("ageMs={:?}", pull_clock_age_ms(&c.consumer_running_info())),
@@ -2611,10 +2611,9 @@ fn median(xs: &[f64]) -> f64 {
 ///
 ///
 /// 钳位的两个端点用同一条链路的间隔只能兜「不忙等」（`>= 10ms`）：分发循环本身有 50ms 固定
-/// 节拍，间隔法分不出 10ms 与 1ms —— 精确值由 `orderly_suspend_millis` 的离线矩阵锁死
-/// （Python 侧另有拦 `time.sleep` 的真机判据可以直接读到请求值）。
+/// 节拍，间隔法分不出 10ms 与 1ms —— 精确值由 `orderly_suspend_millis` 的离线矩阵锁死。
 async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
-    println!("-- C12c context 上的挂起时长优先于消费者配置（Java submitConsumeRequestLater）");
+    println!("-- C12c context 上的挂起时长优先于消费者配置（submitConsumeRequestLater 语义）");
     let topic = fx.topic_name("OrdSuspend");
     let group = fx.group_name("ordsusp");
     if let Err(e) = fx.create_topic(&topic, 1).await {

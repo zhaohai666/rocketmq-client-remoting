@@ -1,5 +1,4 @@
-//! 与 `python/verify_flow_control_live.py`（S0..S5）、`cpp/examples/live_flow_control.cpp`、
-//! `csharp/examples/RocketMQ.Examples/LiveFlowControl.cs` 同题、逐条对应。
+//! 流控闸门真机验证（覆盖 S0..S5 六项场景）。
 //!
 //! 离线单测（`src/client/consumer.rs` 的 `flow_control_hits_each_threshold`）锁的是**判据
 //! 本身**；这里锁真机上两件离线永远锁不住的事：
@@ -13,7 +12,7 @@
 //!
 //! ⚠ 大消息必须是**不可压缩**的伪随机字节：生产者对超过压缩阈值的 body 先试压，全同字节
 //!   的 payload 会被压到几百字节，broker 落盘的 `storeSize` 跟着变几百字节 —— "size 闸门
-//!   永不命中"就成了夹具问题（Python 侧第一次跑正是这么踩到的）。
+//!   永不命中"就成了夹具问题。
 //! ⚠ S1/S4 的 topic 必须只有 **1 条队列**：8 条 400KB 摊到 4 条队列上每条才 800KB，
 //!   永远够不到 1MiB 这道**队列级**闸门。
 //! ⚠ 大消息必须**并发投递**（见 `Fixture::produce`）：闸门看的是"进比出快"堆出来的缓冲，
@@ -281,9 +280,8 @@ impl Fixture {
     /// 字节闸门的输入是"已拉未消费"缓冲，而缓冲堆不堆得起来取决于**进比出快**。
     /// 串行 send 每条 400KB 实测要 ~190ms，和 300ms/批的慢 listener 差不多同步，
     /// 缓冲只堆到 1~2 条（≈0.8MiB）就停下来等下一条：闸门"真机上永不命中"其实是
-    /// 投递节奏的问题，不是判据错（同一份判据在 Python 里命中 15 次，因为它的 send
-    /// 只有几十毫秒）。并发投递后 8 条在 ~100ms 内全部落盘，缓冲必然越过 1MiB，
-    /// 判据于是与线程/网络节奏解耦，四语言跑的是同一条断言。
+    /// 投递节奏的问题，不是判据错。并发投递后 8 条在 ~100ms 内全部落盘，缓冲必然越过
+    /// 1MiB，判据于是与线程/网络节奏解耦。
     async fn produce(&self, topic: &str, bodies: Vec<Vec<u8>>) -> Result<(), String> {
         let mut set: JoinSet<Result<(), String>> = JoinSet::new();
         for body in bodies {

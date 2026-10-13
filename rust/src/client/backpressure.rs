@@ -7,7 +7,7 @@
 //! `Error::TooMuchRequest("send message tryAcquire semaphoreAsyncNum timeout")`
 //! （第二个是 `...semaphoreAsyncSize timeout`），一次请求都不会发出去。
 //!
-//! # 与 Python/C++/C# 端口的两处结构差别
+//! # FairSemaphore 的两处设计取舍
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,7 +41,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// * 改容量不会把等待者丢在旧对象上，改完它们会带着新容量继续等。
 pub struct FairSemaphore {
     state: Mutex<State>,
-    /// 对应 Python 的 `threading.Condition`：这里「广播」= `notify_waiters`，
+    /// 条件变量式的唤醒：「广播」= `notify_waiters`，
     /// 每个等待者被叫醒后自己重看队列（只有队首能过）。
     wake: tokio::sync::Notify,
     next_id: AtomicU64,
@@ -328,8 +328,6 @@ mod tests {
         assert_eq!(sem.available_permits(), 0);
     }
 
-    /// Python `test_a_granted_head_still_feeds_the_waiter_behind_it`。
-    ///
     /// 空闲 6、队首要 5、第二个人要 1：两个人都该拿到，且都不该等到超时。
     /// 锁的是「队首离场时也必须叫醒后面的人」——`release` 早就跑完了，没人再喊第二
     /// 个人的话，他明明够用却能睡满 3000ms。
@@ -355,8 +353,6 @@ mod tests {
         assert_eq!(sem.available_permits(), 0); // 6 - 5 - 1
     }
 
-    /// Python `test_a_timed_out_head_wakes_the_waiter_behind_it`。
-    ///
     /// 丢唤醒的回归守卫：队首要的比总容量还多，永远拿不到，只能等满自己的预算走人 ——
     /// 他离场时必须叫醒后面的人，否则第二个人明明能过却要睡满 3000ms。真机上的表现是
     /// 异步发送白等满预算，再回调一个 `semaphoreAsyncNum timeout`，而许可早就空了。
@@ -400,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_budget_grants_only_when_the_head_is_clear() {
         let sem = semaphore(2);
-        // 预算 0 但队首无人、许可够：与 Python 一致，仍然给（先看队列再看时限）
+        // 预算 0 但队首无人、许可够：仍然给（先看队列再看时限）
         assert!(sem.try_acquire(1, 0).await);
         assert!(sem.try_acquire(1, 0).await);
         // 此时空闲 0：0 预算立刻失败

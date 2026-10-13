@@ -1,5 +1,4 @@
-//! 路由刷新周期 / 位点落盘周期 真机验证（Rust 对齐 `cpp/examples/live_scheduled_intervals.cpp`
-//! 与 `csharp/examples/RocketMQ.Examples/LiveScheduledIntervals.cs` 的 I1–I3）。
+//! 路由刷新周期 / 位点落盘周期 真机验证（覆盖 I1–I3 三项场景）。
 //!
 //! 离线单测（`src/client/mq_client.rs` 的 `mod tests`）只能证明**首跳**落在 initialDelay；
 //! 周期本身必须用**真集群**才量得出来：路由刷新要用一个"先不存在、后由 admin 建出来"的
@@ -449,7 +448,7 @@ async fn run_all(
         &format!("dt={} 周期={FAST_PERSIST_MS}ms", secs(dt_first)),
     );
     ck.check(
-        "I2 首笔落盘不早于 Java 的 initialDelay 10s",
+        "I2 首笔落盘不早于 initialDelay 10s",
         dt_first >= Duration::from_millis(9_500),
         &format!("dt={} initialDelay={PERSIST_INITIAL_DELAY_MS}ms", secs(dt_first)),
     );
@@ -501,7 +500,7 @@ async fn run_all(
     slow_c.shutdown();
     let slow_flushed = wait_offset_at_least(fx, g_persist_slow, &mq, 6, 10_000).await;
     ck.check(
-        "I2 60s 组 shutdown() 时把 6 落盘（Java persistConsumerOffset 收尾）",
+        "I2 60s 组 shutdown() 时把 6 落盘（persistConsumerOffset 收尾）",
         slow_flushed,
         &format!("broker={}", fx.read_offset(g_persist_slow, &mq).await?),
     );

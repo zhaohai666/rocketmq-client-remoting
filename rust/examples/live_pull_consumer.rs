@@ -315,7 +315,7 @@ async fn p1_lifecycle(ck: &mut Checker, fx: &Fixture) {
     ck.check("P1 重复 start 幂等", c.start().await.is_ok(), "");
     let client_id = c.client_id();
     ck.check(
-        "P1 start 时现造 client_id（本机IP@instanceName，Java buildMQClientId）",
+        "P1 start 时现造 client_id（本机IP@instanceName，buildMQClientId 语义）",
         client_id
             .split_once('@')
             .is_some_and(|(ip, instance)| !ip.is_empty() && instance.starts_with("live-pull-life")),

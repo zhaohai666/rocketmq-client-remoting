@@ -1,5 +1,5 @@
 //! 属性容器一律用 [`StringMap`]（保序）：17 段格式第 17 项是按插入顺序拼出来的
-//! `k\x01v\x02` 字节串，换成 `HashMap` 会直接破坏逐字节对拍。
+//! `k\x01v\x02` 字节串，换成 `HashMap` 会直接破坏逐字节一致性。
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -12,8 +12,8 @@ use crate::common::mix_all::MixAll;
 use crate::error::{Error, Result};
 use crate::remoting::protocol::ext_fields::StringMap;
 
-/// 四端共用同一条判据（Python `message.is_wait_store_msg_ok`、C# `Message.WaitStoreMsgOk`、
-/// C++ `Message::isWaitStoreMsgOk`）—— 所有写 `WAIT` 的地方（`MessageBatch::generate_from_list`、
+/// `WAIT` 的唯一判据：属性缺失按 true，否则只认大小写不敏感的 `true`。
+/// 所有写 `WAIT` 的地方（`MessageBatch::generate_from_list`、
 /// `AggregateKey::of_message`）都必须走它，见 [`Message::is_wait_store_msg_ok`] 的注释。
 pub fn wait_store_msg_ok_of(raw: Option<&str>) -> bool {
     match raw {
@@ -123,7 +123,7 @@ pub struct Message {
 }
 
 impl Message {
-    /// 对应 Python `Message(topic, body)`：`body=None` 时置空串（Python 亦如此）。
+    /// `body=None` 时置空串（协议侧 body 长度域写 0，而不是省略正文）。
     pub fn new(topic: &str, body: Option<&[u8]>) -> Message {
         Message {
             topic: topic.to_string(),
@@ -134,8 +134,7 @@ impl Message {
         }
     }
 
-    /// 对应 Python `Message(topic, body, tags, keys, flag)`：**空 tags / keys 不写入属性**
-    /// （Python 的 `if tags is not None and tags`）。
+    /// **空 tags / keys 不写入属性**：只有非空字符串才落到 `TAGS` / `KEYS` 上。
     pub fn with_tags_and_keys(
         topic: &str,
         body: Option<&[u8]>,
@@ -171,7 +170,7 @@ impl Message {
         self.topic = topic.to_string();
     }
 
-    /// 无正文时返回空切片（Python 的 `get_body()` 同理，构造期已兜底为 `b""`）。
+    /// 无正文时返回空切片（构造期已兜底成空串，不会返回 `None`）。
     pub fn get_body(&self) -> &[u8] {
         self.body.as_deref().unwrap_or(&[])
     }
@@ -221,10 +220,10 @@ impl Message {
     }
 
     /// ⚠ 千万别写成 `get_wait_store_msg_ok() == Some("true")`。本端口的 `Message::new`
-    /// （与 Python 的 `Message.__init__` 一样）**不**预先写 `WAIT`，所以"属性缺省"是
+    /// **不**预先写 `WAIT`，所以"属性缺省"是
     /// **常态而不是边角**：按 `== Some("true")` 判会让一条普通消息变成 `WAIT=false`，
     /// 批量发送时就会以 `WAIT=false` 下发 —— broker 不等刷盘就回 `SEND_OK`，
-    /// 持久性悄悄降级，而客户端侧一切正常。Python / C# / C++ 三端统一用本函数的语义。
+    /// 持久性悄悄降级，而客户端侧一切正常。判据统一走 [`wait_store_msg_ok_of`]。
     pub fn is_wait_store_msg_ok(&self) -> bool {
         wait_store_msg_ok_of(self.get_wait_store_msg_ok())
     }
@@ -234,7 +233,7 @@ impl Message {
             .insert(PROPERTY_DELAY_TIME_LEVEL, level.to_string());
     }
 
-    /// Python 返回原始字符串（可能是 `None`）。
+    /// 返回属性里的原始字符串（缺失时为 `None`，不做数值转换）。
     pub fn get_delay_time_level(&self) -> Option<&str> {
         self.properties.get(PROPERTY_DELAY_TIME_LEVEL)
     }
@@ -332,7 +331,7 @@ impl fmt::Display for Message {
 pub struct MessageExt {
     pub topic: String,
     pub flag: i32,
-    /// 17 段格式里 `bodyLen <= 0` 或 `readBody=false` 时为 `None`（Python 同语义）。
+    /// 17 段格式里 `bodyLen <= 0` 或 `readBody=false` 时为 `None`（与「空正文」区分）。
     pub body: Option<Vec<u8>>,
     pub properties: StringMap,
     pub transaction_id: Option<String>,
@@ -358,7 +357,7 @@ pub struct MessageExt {
 }
 
 impl MessageExt {
-    /// 空消息（对应 Python `MessageExt()`）。
+    /// 空消息（各字段取协议默认值，正文是空串而不是 `None`）。
     pub fn new() -> MessageExt {
         MessageExt {
             topic: String::new(),
@@ -616,12 +615,12 @@ impl MessageExt {
         self.msg_type = msg_type.map(|s| s.to_string());
     }
 
-    /// 对应 Python `get_born_host_string`：端口为 0 时只返回 IP。
+    /// 组装 born host 文本：端口为 0 时只返回 IP。
     pub fn get_born_host_string(&self) -> Option<String> {
         host_with_port(self.born_host.as_deref(), self.born_host_port)
     }
 
-    /// 对应 Python `get_store_host_string`。
+    /// 组装 store host 文本：规则同 born host。
     pub fn get_store_host_string(&self) -> Option<String> {
         host_with_port(self.store_host.as_deref(), self.store_host_port)
     }
@@ -761,13 +760,13 @@ mod tests {
 
     #[test]
     fn message_queue_hashcode_matches_contract() {
-        // 与 Python tests/test_message_model.py 的字面量一致（rebalance 依赖它）
+        // 与线上记录的字面量一致（rebalance 依赖它）
         let cases = [
             ("TopicTest", "BrokerA", 0, -1229861880i32),
             ("TopicTest", "BrokerA", 3, -1229861787),
             ("", "", 0, 29791),
             ("%RETRY%GroupA", "BrokerB", 1, 566955243),
-            ("A", "B", 0, 93282), // cpp/tests/test_codec.cpp 同一条
+            ("A", "B", 0, 93282), // 最短串的组合
         ];
         for (topic, broker, qid, expected) in cases {
             assert_eq!(MessageQueue::new(topic, broker, qid).hashcode(), expected);
@@ -955,7 +954,7 @@ mod tests {
                 msg.get_deliver_time_ms()
             ),
             (0, 0, 0),
-            "缺属性时三个 getter 都是 0（Java return 0）"
+            "缺属性时三个 getter 都是 0"
         );
         msg.set_delay_time_sec(10);
         msg.set_delay_time_ms(10_000);
@@ -1020,7 +1019,7 @@ mod tests {
         let mut w2 = Message::new("T", Some(b"b"));
         w2.set_wait_store_msg_ok(false);
         assert!(MessageBatch::generate_from_list(vec![w1, w2]).is_err());
-        // 错误消息与 Python 保持一致（上层按字符串匹配日志）
+        // 错误消息字面量固定不动（上层按字符串匹配日志）
         let err = MessageBatch::generate_from_list(vec![])
             .unwrap_err()
             .to_string();
@@ -1052,7 +1051,7 @@ mod tests {
     #[test]
     fn batch_defaults_wait_store_msg_ok_to_true() {
         let messages = vec![Message::new("T", Some(b"a")), Message::new("T", Some(b"b"))];
-        // 前提：Message::new（同 Python）不预写 WAIT
+        // 前提：Message::new 不预写 WAIT
         assert_eq!(messages[0].get_wait_store_msg_ok(), None);
         let batch = MessageBatch::generate_from_list(messages).unwrap();
         assert_eq!(batch.get_property(PROPERTY_WAIT_STORE_MSG_OK), Some("true"));

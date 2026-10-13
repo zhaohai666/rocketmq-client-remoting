@@ -1,6 +1,6 @@
 //! * [`StatsItem`] 持有**累计值** value / times（只增不减），以及两条采样快照链：
 //!   `minute`（每 10s 采一个累计点）与 `hour`（每 10 分钟采一个累计点）；
-//! * 快照计算 [`compute_stats_data`]（StatsItem.java:53-79）：
+//! * 快照计算 [`compute_stats_data`]：
 //!
 //!   ```text
 //!   sum       = last.value - first.value             # 窗口内的增量
@@ -28,7 +28,7 @@ pub const HOUR_SAMPLING_INTERVAL_SECONDS: f64 = 600.0;
 pub const MINUTE_LIST_MAX: usize = 60;
 /// 小时快照链长度。
 pub const HOUR_LIST_MAX: usize = 60;
-/// 每多少轮分钟采样做一次小时采样：`600s / 10s = 60`（Python 里写死的 `% 60`）。
+/// 每多少轮分钟采样做一次小时采样：`600s / 10s = 60`（写死的 `% 60`）。
 pub const HOUR_SAMPLING_ROUNDS: u64 =
     (HOUR_SAMPLING_INTERVAL_SECONDS / SAMPLING_INTERVAL_SECONDS) as u64;
 
@@ -52,7 +52,7 @@ pub struct StatsSnapshot {
 }
 
 impl fmt::Display for StatsSnapshot {
-    /// 与 Python `StatsSnapshot.__repr__` 逐字对齐（tps/avgpt 保留两位小数）。
+    /// 固定展示格式，逐字校验（tps/avgpt 保留两位小数）。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -102,7 +102,7 @@ struct ItemState {
 }
 
 impl StatsItem {
-    /// 对应 Python `StatsItem(stats_name, stats_key)`，key 一般是 `topic@group`。
+    /// 新建统计项：`stats_name` + `stats_key`（key 一般是 `topic@group`）。
     pub fn new(stats_name: impl Into<String>, stats_key: impl Into<String>) -> StatsItem {
         StatsItem {
             stats_name: stats_name.into(),
@@ -127,26 +127,26 @@ impl StatsItem {
         state.times += inc_times;
     }
 
-    /// 当前累计 value（Python 的 `value` property）。
+    /// 当前累计 value。
     pub fn value(&self) -> i64 {
         lock(&self.state).value
     }
 
-    /// 当前累计 times（Python 的 `times` property）。
+    /// 当前累计 times。
     pub fn times(&self) -> i64 {
         lock(&self.state).times
     }
 
     /// 追加分钟级采样点（每 10s 由采样任务调用），时钟取 `current_time_millis()`。
     ///
-    /// 与 Python 的细微差别：Python 在锁内读时钟，这里先读时钟再取锁 —— 采样点内容
+    /// 细微差别：先读时钟再取锁 —— 采样点内容
     /// （累计 value/times）仍在锁内取，口径不变。
     pub fn sample(&self) {
         let ts = current_time_millis();
         self.sample_at(ts);
     }
 
-    /// [`StatsItem::sample`] 的显式时钟版本（C++/C# 端的 `appendSampleForTest` 钩子）：
+    /// [`StatsItem::sample`] 的显式时钟版本（供单测注入采样时刻）：
     /// 单测与"补采历史点"都靠它，无需睡墙钟。
     pub fn sample_at(&self, ts_ms: i64) {
         let mut state = lock(&self.state);
@@ -183,7 +183,7 @@ impl StatsItem {
         compute_stats_data_pair(state.hour.front(), state.hour.back())
     }
 
-    /// 分钟链当前长度（Python 测试里直接看 `len(it._minute)`）。
+    /// 分钟链当前长度。
     pub fn minute_len(&self) -> usize {
         lock(&self.state).minute.len()
     }
@@ -212,7 +212,7 @@ impl fmt::Debug for StatsItemSet {
 }
 
 impl StatsItemSet {
-    /// 对应 Python `StatsItemSet(stats_name)`。
+    /// 按名字建 item 集合。
     pub fn new(stats_name: impl Into<String>) -> StatsItemSet {
         StatsItemSet {
             stats_name: stats_name.into(),
@@ -224,7 +224,7 @@ impl StatsItemSet {
         &self.stats_name
     }
 
-    /// 对应 Python `get_and_create`：不存在就建，存在就返回同一个 item。
+    /// 不存在就建，存在就返回同一个 item。
     pub fn get_and_create(&self, key: &str) -> Arc<StatsItem> {
         let mut items = lock(&self.items);
         items
@@ -233,12 +233,12 @@ impl StatsItemSet {
             .clone()
     }
 
-    /// 对应 Python `find`：不存在返回 None（**不**创建，consume_status 就靠这点跳过零值）。
+    /// 只查不建：不存在返回 None（**不**创建，consume_status 就靠这点跳过零值）。
     pub fn find(&self, key: &str) -> Option<Arc<StatsItem>> {
         lock(&self.items).get(key).cloned()
     }
 
-    /// 对应 Python `add_value`：取或建，然后累加。
+    /// 取或建，然后累加。
     pub fn add_value(&self, key: &str, inc_value: i64, inc_times: i64) {
         self.get_and_create(key).add_value(inc_value, inc_times);
     }
@@ -267,7 +267,7 @@ impl StatsItemSet {
     }
 }
 
-/// 五个 set 的集合，字段顺序与 Python `_sets` 元组一致（巡采顺序照抄）。
+/// 五个 set 的集合，字段顺序即巡采顺序。
 #[derive(Debug, Clone)]
 struct Sets {
     topic_and_group_pull_rt: StatsItemSet,
@@ -289,7 +289,7 @@ impl Sets {
     }
 }
 
-/// 采样线程的退出信号（对应 Python 的 `threading.Event`）。
+/// 采样线程的退出信号。
 #[derive(Debug, Default)]
 struct StopSignal {
     stopped: AtomicBool,
@@ -357,7 +357,7 @@ impl Default for ConsumerStatsManager {
 }
 
 impl ConsumerStatsManager {
-    /// 对应 Python `ConsumerStatsManager()`：五个 set + 默认 10s/600s 采样参数。
+    /// 五个 set + 默认 10s/600s 采样参数。
     pub fn new() -> ConsumerStatsManager {
         ConsumerStatsManager::with_sampling(
             Duration::from_secs_f64(SAMPLING_INTERVAL_SECONDS),
@@ -391,10 +391,10 @@ impl ConsumerStatsManager {
 
     // ---------------- 生命周期 ----------------
 
-    /// 对应 Python `start()`：起统一采样任务。
+    /// 起统一采样任务。
     ///
     /// 需要当前线程在 tokio 运行时里（`MQClientInstance` 的 start 本来就跑在异步上下文）；
-    /// 不在运行时里时**返回 Err**（Python 是 daemon 线程，无此约束）。
+    /// 不在 tokio 运行时里时**返回 Err**（后台任务必须有宿主运行时）。
     pub fn start(&self) -> Result<()> {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -409,7 +409,7 @@ impl ConsumerStatsManager {
     }
 
     /// 显式给运行时的 [`crate::remoting::client::RemotingClient::runtime_handle`]。
-    /// 重复调用是 no-op（Python `start()` 见到已有线程就直接 return）。
+    /// 重复调用是 no-op。
     pub fn start_with_handle(&self, handle: &tokio::runtime::Handle) {
         let mut slot = lock(&self.inner.sampler);
         if slot.as_ref().is_some_and(|task| !task.is_finished()) {
@@ -424,9 +424,9 @@ impl ConsumerStatsManager {
         rmq_debug!("consumer stats sampler started, interval={interval:?}");
     }
 
-    /// 对应 Python `shutdown()`：置停止位、唤醒并 abort 采样任务。
+    /// 置停止位、唤醒并 abort 采样任务。
     ///
-    /// Python 是 `join(timeout=3)`；这里不阻塞（同步上下文不能 block_on），
+    /// 这里不阻塞（同步上下文不能 block_on），
     /// abort 后任务立即消失，之后再 `start()` 会重新起一个。
     pub fn shutdown(&self) {
         self.inner.stop.stop();
@@ -437,14 +437,14 @@ impl ConsumerStatsManager {
         rmq_debug!("consumer stats sampler shutdown");
     }
 
-    /// 采样任务是否在跑（Python 测试里的 `_thread is not None`）。
+    /// 采样任务是否在跑。
     pub fn is_running(&self) -> bool {
         lock(&self.inner.sampler)
             .as_ref()
             .is_some_and(|task| !task.is_finished())
     }
 
-    // ---------------- 巡采（Python `_sample_loop` 的循环体） ----------------
+    // ---------------- 巡采（循环体） ----------------
 
     /// 全量巡采一轮分钟点。
     pub fn sample_all(&self) {
@@ -461,7 +461,7 @@ impl ConsumerStatsManager {
     }
 
 
-    /// Python `_key(topic, group)`：`"%s@%s" % (topic, group)`，注意是 **topic 在前**。
+    /// 统计键：`topic@group`，注意是 **topic 在前**。
     pub fn key(topic: &str, group: &str) -> String {
         format!("{topic}@{group}")
     }
@@ -503,7 +503,7 @@ impl ConsumerStatsManager {
 
     // ---------------- 查询 ----------------
 
-    /// 五个 set 的句柄（Python 的同名公开属性）。
+    /// 五个 set 的句柄（公开属性）。
     pub fn topic_and_group_pull_rt(&self) -> StatsItemSet {
         self.inner.sets.topic_and_group_pull_rt.clone()
     }
@@ -552,7 +552,7 @@ impl ConsumerStatsManager {
 }
 
 /// 一轮巡采：分钟点必采，小时点按 `rounds % hour_every_rounds == 0` 决定
-/// （Python `_sample_loop` 的循环体，`rounds` 从 1 开始）。
+/// （`rounds` 从 1 开始）。
 fn sample_round(inner: &Inner, rounds: u64) {
     for set in inner.sets.as_slice() {
         set.sample_all();
@@ -564,10 +564,10 @@ fn sample_round(inner: &Inner, rounds: u64) {
     }
 }
 
-/// 采样任务主体：先等一个周期再巡采（Python `_stop.wait(10)` 是"先等后采"的次序）。
+/// 采样任务主体：先等一个周期再巡采（"先等后采"的次序）。
 ///
 /// 只强引用 `StopSignal`、弱引用 `Inner`：manager 被丢弃后任务自行退出，
-/// 对应 Python 的 daemon 线程不会把进程拖住。
+/// 不把进程拖住。
 async fn sample_loop(
     inner: Weak<Inner>,
     stop: Arc<StopSignal>,
@@ -589,7 +589,7 @@ async fn sample_loop(
             break;
         }
         let Some(inner) = inner.upgrade() else {
-            // manager 已丢弃 —— 等价于 Python daemon 线程随进程退出
+            // manager 已丢弃 —— 任务自行退出，不 panic
             rmq_debug!("consumer stats sampler exits: manager dropped");
             return;
         };
@@ -634,7 +634,7 @@ mod tests {
         assert!(almost(ss.tps, 3.0));
         assert!(almost(ss.avgpt, 10.0));
         assert_eq!(ss.times, 3);
-        // Python __repr__ 对拍
+        // 展示格式金标向量
         assert_eq!(
             ss.to_string(),
             "StatsSnapshot(sum=30, tps=3.00, avgpt=10.00, times=3)"
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn reversed_chain_keeps_negative_sums_but_zero_rates() {
-        // 对拍 python: compute_stats_data([(10000,130,13),(0,100,10)])
+        // 金标向量：compute_stats_data([(10000,130,13),(0,100,10)])
         // -> sum=-30 tps=0.00 avgpt=0.00 times=-3
         let ss = compute_stats_data(&[(10_000, 130, 13), (0, 100, 10)]);
         assert_eq!(ss.sum, -30);
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn zero_times_diff_gives_zero_avgpt_even_with_positive_sum() {
-        // 对拍 python: [(0,100,10),(1000,400,10)] -> sum=300 tps=300 avgpt=0 times=0
+        // 金标向量：[(0,100,10),(1000,400,10)] -> sum=300 tps=300 avgpt=0 times=0
         let ss = compute_stats_data(&[(0, 100, 10), (1_000, 400, 10)]);
         assert_eq!(ss.sum, 300);
         assert!(almost(ss.tps, 300.0));
@@ -673,7 +673,7 @@ mod tests {
 
     #[test]
     fn fractional_rates_are_plain_float_division() {
-        // 对拍 python: [(0,0,0),(3000,10,3)] -> tps=3.33.. avgpt=3.33..
+        // 金标向量：[(0,0,0),(3000,10,3)] -> tps=3.33.. avgpt=3.33..
         let ss = compute_stats_data(&[(0, 0, 0), (3_000, 10, 3)]);
         assert!(almost(ss.tps, 10.0 / 3.0), "{ss}");
         assert!(almost(ss.avgpt, 10.0 / 3.0), "{ss}");
@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn both_chains_are_capped_and_oldest_points_are_dropped() {
-        // 对拍 python（80 轮，每轮 add_value(1,1) 后按 ts=i 采样）：
+        // 固定场景（80 轮，每轮 add_value(1,1) 后按 ts=i 采样）：
         //   链封顶 60 个点，first=(20,21,21)、last=(79,80,80)
         //   -> sum=59 tps=1000.00 avgpt=1.00 times=59
         let it = StatsItem::new("PULL_TPS", "T@G");
@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn consume_status_maps_rt_to_avgpt_and_tps_to_tps() {
-        // 对拍 python/tests/test_consumer_stats.py 的同名用例：
+        // 协议对齐用例：
         //   pull_rt value=200/times=4 -> avgpt=50ms
         //   consume_rt value=40/times=4 -> avgpt=10ms
         //   pull_tps value=20 -> tps=20/s（消息每秒）
@@ -1027,7 +1027,7 @@ mod tests {
         assert!(!m.is_running());
         m.start().expect("start inside a tokio runtime");
         assert!(m.is_running());
-        // 重复 start 是 no-op（Python: _thread 已存在就直接 return）
+        // 重复 start 是 no-op（已有任务就直接返回）
         m.start().expect("start inside a tokio runtime");
         assert!(m.is_running());
 
@@ -1041,7 +1041,7 @@ mod tests {
         task.await.expect("sampler exits without panic");
         let after_stop = minute_points(&m);
 
-        // shutdown 之后可以重新 start（Python 里 _thread 被清空、_stop 被 clear）
+        // shutdown 之后可以重新 start（任务句柄与停止位都被清空）
         m.start().expect("start inside a tokio runtime");
         assert!(m.is_running());
         assert!(!m.inner.stop.is_stopped());
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[tokio::test]
     async fn sampler_task_exits_when_manager_is_dropped() {
-        // manager 被丢弃后任务自行退出（Python daemon 线程语义）：不 panic、不吊着内存
+        // manager 被丢弃后任务自行退出：不 panic、不吊着内存
         let m = ConsumerStatsManager::with_sampling(Duration::from_millis(1), 60);
         m.inc_pull_tps(GROUP, TOPIC, 1);
         m.start_with_handle(&tokio::runtime::Handle::current());

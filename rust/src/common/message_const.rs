@@ -1,6 +1,6 @@
 //! 这些字符串就是 broker 与客户端之间的**协议字面量**（写进 17 段消息的第 17 项
 //! 属性区，也被 broker 侧过滤/轨迹/事务逻辑按名字读取），所以取值一个字符都不能改；
-//! 常量名沿用 Python（去掉 `PROPERTY_` 前缀会丢语义，故保留）。
+//! 常量名保留 `PROPERTY_` 前缀（去掉会丢语义，故不改）。
 
 /// `MessageConst.PROPERTY_KEYS`
 pub const PROPERTY_KEYS: &str = "KEYS";

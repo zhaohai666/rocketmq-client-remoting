@@ -1,4 +1,4 @@
-//! 与 `python/verify_reset_offset_live.py` 同题逐条对应，另三端（cpp/csharp）各有同名脚本。
+//! 重置位点（RESET_CONSUMER_OFFSET）真机验证。
 //!
 //! 220 是 broker 推给**消费端**的重置指令；管理端那笔 `INVOKE_BROKER_TO_RESET_OFFSET(222)`
 //! 的响应只是一张「每个队列重置到哪」的表，真正让消费端改位点的是 broker 随后 oneway 推的
@@ -188,7 +188,7 @@ impl MessageListenerConcurrently for SteppingListener {
         let mut st = lock(&self.state);
         st.batches.push(msgs.iter().map(|m| m.queue_offset).collect());
         // 上限只防死锁：正常路径由测试逐批 release()；醒来的那个把闸门复位（语义同
-        // Python `Event.set()` + `clear()`）。
+        // 一次性事件的 set() + clear()）。
         let deadline = Instant::now() + Duration::from_secs(90);
         while !st.released {
             let now = Instant::now();
@@ -269,7 +269,7 @@ impl Fixture {
             .await
             .map_err(|e| format!("producer start failed: {e}"))?;
 
-        // 端口开着 != broker 已注册到 nameServer：按 Python 那样轮询
+        // 端口开着 != broker 已注册到 nameServer：这里轮询等待
         let deadline = Instant::now() + Duration::from_secs(40);
         let broker_addr = loop {
             if let Ok(info) = admin.fetch_broker_cluster_info().await {
@@ -602,7 +602,7 @@ async fn s1_backward_reset(fx: &Fixture, ck: &mut Checker) {
 
     let off = local_offset(&c, &topic);
     ck.check(
-        "S1-重置后本地表里没有旧位点（Java removeOffset；新位点经撤销尾巴出去）",
+        "S1-重置后本地表里没有旧位点（removeOffset；新位点经撤销尾巴出去）",
         off.is_none(),
         &format!("local_offset={off:?} epoch={}", c.queue_epoch(&key)),
     );

@@ -1,5 +1,5 @@
 //! 批量/静态 topic/读禁配/半消息/顺序配置等 admin 方法对**真实 5.5.0 broker**
-//! 的联调验证，对标 `go/examples/live_admin_batch` 与 `python/verify_admin_batch_live.py`。
+//! 的联调验证。
 //!
 //! 这些方法此前在 Rust 侧只有 RequestCode 常量、没有任何业务实现；报文编码
 //! 错误 mock 层看不见，必须打真实 broker。
@@ -356,8 +356,8 @@ async fn main() -> ExitCode {
     }
 
     // ---- 9. nameserver 配置(318/319) ---------------------------------------
-    // namesrv 的 Configuration.update 只认真实字段：未知键被**静默丢弃**
-    // （nodeJs/Go/Python 侧均已确认），所以用 orderMessageEnable 做回环并还原。
+    // namesrv 的 Configuration.update 只认真实字段：未知键被**静默丢弃**，
+    // 所以用 orderMessageEnable 做回环并还原。
     match admin.get_name_server_config(None).await {
         Ok(before) => {
             let old_val = before

@@ -1,6 +1,4 @@
-//! `ProduceAccumulator`（自动攒批）单测 —— 与
-//! `python/tests/test_produce_accumulator.py`（18 例）、
-//! `csharp/tests/RocketMQ.Client.Tests/ProduceAccumulatorTests.cs`（17 例）同题。
+//! `ProduceAccumulator`（自动攒批）单测 —— 协议对齐用例。
 //!
 //!
 //! * 参数三档校验，与「累加器未建时 producer 的 getter 返回 0」的语义；
@@ -76,7 +74,7 @@ impl FakeSender {
         sender.into()
     }
 
-    /// 未指定结果时的兜底：`SEND_OK` + `123`，与 Python 的 `FakeProducer` 一致。
+    /// 未指定结果时的兜底：`SEND_OK` + `123`。
     fn resolve(&self, mq: Option<&MessageQueue>) -> SendResult {
         if let Some(result) = self.result.lock().unwrap().clone() {
             return result;
@@ -159,7 +157,7 @@ impl AccumulatorSender for FakeSender {
     }
 }
 
-/// 收集回调（Python `CollectingCallback` 同款）。
+/// 收集回调。
 #[derive(Default)]
 struct CollectingCallback {
     results: Mutex<Vec<SendResult>>,

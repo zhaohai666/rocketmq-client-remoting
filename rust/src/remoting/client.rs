@@ -184,7 +184,7 @@ struct Inner {
     processors: RwLock<HashMap<i32, Arc<dyn RequestProcessor>>>,
     running: AtomicBool,
     /// 首次需要 spawn 时才绑定的 tokio 句柄（`None` 表示还没绑定）。
-    /// 构造 `RemotingClient` 可能在运行时之外（Python 的构造与运行时无关），
+    /// 构造 `RemotingClient` 可能在 tokio 运行时之外，
     /// 所以这里不能急切 `Handle::current()`；所有 spawn 点都在运行时内部。
     handle: OnceLock<tokio::runtime::Handle>,
 }
@@ -224,8 +224,8 @@ impl RemotingClient {
         &self.inner.config
     }
 
-    /// 当前 tokio 句柄；不在运行时上下文里时返回 `None`（Python 的构造与运行时无关，
-    /// 这里同样不假设构造点有运行时）。
+    /// 当前 tokio 句柄；不在运行时上下文里时返回 `None`
+    /// （构造点不假设一定有运行时，句柄延迟到首次 spawn 时绑定）。
     pub fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
         self.inner.runtime_handle()
     }
@@ -589,7 +589,7 @@ fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
     let opaque = cmd.opaque;
     let pending = {
         let mut state = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        // Python `_dispatch`：响应按 opaque pop；带不上响应标志但 opaque 撞上在途请求
+        // 响应按 opaque pop；带不上响应标志但 opaque 撞上在途请求
         // 的那条「异常兜底」分支做的是同一个 pop。两条分支动作一致，故只查一次。
         state.pending.remove(&opaque)
     };
@@ -624,7 +624,7 @@ fn dispatch(inner: &Arc<Inner>, addr: &str, frame: Vec<u8>) {
         opaque,
         wants_reply: !cmd.is_oneway_rpc(),
     };
-    // 处理器 panic 不能带走读线程：与 Python 的 try/except 等价，回一条 SYSTEM_ERROR。
+    // 处理器 panic 不能带走读线程：捕获后回一条 SYSTEM_ERROR。
     let panic_sink = sink.clone();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         processor.process(cmd, addr.to_string(), sink)
@@ -1281,7 +1281,7 @@ mod tests {
         assert!(matches!(err, Error::SendRequest { .. }), "got {err}");
         assert!(
             err.to_string().contains("GO_AWAY twice"),
-            "文案要对齐 Java RemotingSendRequestException: {err}"
+            "文案对齐 RemotingSendRequestException 的口径: {err}"
         );
         assert_eq!(conns.load(Ordering::SeqCst), 2, "只重发一次，不能无限重连");
         assert_eq!(client.in_flight_count(), 0);
@@ -1432,7 +1432,7 @@ mod tests {
         );
         assert!(
             err.to_string().contains("connection closed"),
-            "文案对齐 Java requestFail: {err}"
+            "文案对齐 requestFail 的口径: {err}"
         );
         assert!(
             cost < Duration::from_secs(5),
@@ -1701,8 +1701,8 @@ mod tests {
     //   * socket 握手后置非阻塞，`tls_read_exact` / `tls_write_all` 必须自己续读续写，
     //     少写一次进度就把帧读废了。
     // 这两条靠真机 TLS broker 验代价高（要起带证书的 broker），且 CI 上根本没那台机器；
-    // 本地用 openssl 现造一张自签证书 + 进程内 TLS 服务端就能锁死，口径与
-    // python/tests/test_tls_trace.py 一致。
+    // 本地用 openssl 现造一张自签证书 + 进程内 TLS 服务端就能把这两条钉死，
+    // 不依赖真机 broker。
 
     const TLS_P12_PASSWORD: &str = "rmq-rust-test";
 

@@ -803,7 +803,7 @@ mod tests {
         assert_eq!(
             v5.version_and_addr(),
             (SocksVersion::V5, "10.0.0.1:1080"),
-            "缺省就是 SOCKS5（对齐 Java Socks5ProxyHandler）"
+            "缺省就是 SOCKS5"
         );
         let explicit = SocksProxyConfig::new("socks5://10.0.0.1:1080");
         assert_eq!(explicit.version_and_addr().1, "10.0.0.1:1080");

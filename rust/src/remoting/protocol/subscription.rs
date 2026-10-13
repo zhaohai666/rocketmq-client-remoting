@@ -1,4 +1,4 @@
-//! 移植 `python/remoting/protocol/subscription.py`：
+//! 订阅组配置的报文模型：
 //! [`SubscriptionGroupConfig`] / [`GroupRetryPolicy`] / [`SimpleSubscriptionData`] /
 //! [`SubscriptionGroupWrapper`]。admin（`examineSubscriptionGroupConfig` 等）与
 //! broker 侧返回体都走这里。
@@ -371,7 +371,7 @@ impl TopicQueueCountTable {
 mod tests {
     use super::*;
 
-    /// Python `SubscriptionGroupConfig('MyGroup').encode()` 的紧凑形式。
+    /// 默认订阅组配置（groupName=MyGroup）的紧凑 JSON 真值。
     const GOLDEN_CONFIG: &str = r#"{"groupName":"MyGroup","consumeEnable":true,"consumeFromMinEnable":true,"consumeBroadcastEnable":true,"consumeMessageOrderly":false,"retryQueueNums":1,"retryMaxTimes":16,"groupRetryPolicy":{"type":"CUSTOMIZED"},"brokerId":0,"whichBrokerWhenConsumeSlowly":1,"notifyConsumerIdsChangedEnable":true,"groupSysFlag":0,"consumeTimeoutMinute":15,"attributes":{}}"#;
 
     #[test]
