@@ -1383,9 +1383,14 @@ fn body_of(len: usize) -> Message {
     Message::new("T1", Some(&body))
 }
 
-/// 轮询等待条件成立（最多约 3s），避免用固定 sleep 猜时长。
+/// 轮询等待条件成立（最多约 15s），避免用固定 sleep 猜时长。
+///
+/// 预算给到 15s 而不是 3s：这类用例跑在 32 个 worker 线程的多样本运行时上，低配 CI
+/// runner 只有两三个核，光是"被调度到"就是几百毫秒量级（同一条链路在 CI 上实测到过
+/// 601ms）。条件一满足就立刻返回，宽预算只会拖慢真失败的上报，不会拖慢绿跑；反过来
+/// 押 3s 只会把"调度慢"报成"回归"。
 async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
-    for _ in 0..300 {
+    for _ in 0..1500 {
         if cond() {
             return true;
         }
