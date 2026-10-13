@@ -40,7 +40,7 @@ cd php
 # 改动后对相关文件做语法检查
 php -l src/Client/Producer.php
 
-# 离线自测入口：静态守卫 + 10 个套件顺序执行，不连真机
+# 离线自测入口：静态守卫 + 13 个套件顺序执行，不连真机
 php tests/run_all.php
 
 # 单个套件
@@ -53,7 +53,7 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 
 `tests/run_all.php` 是**离线**套件：跑之前先做一道全仓**重复类名静态守卫**（PHP 没有
 模块隔离，同一 FQCN 在两个文件声明时先被 autoload 命中的胜出、另一个静默失效，所以这道
-守卫不能省），然后串起 10 个套件。当前实测：**守卫 CLEAN，10 个套件 1,674 项断言全部
+守卫不能省），然后串起 13 个套件。当前实测：**守卫 CLEAN，13 个套件 2,117 项断言全部
 通过**，任一失败即以非零码退出。
 
 ## 快速上手
@@ -382,7 +382,7 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
   SOCKS 代理（SOCKS4/5 + 用户名密码，握手后 TLS）、故障规避选队列、`Validators` 本地校验前置
 - ✅ 压缩：ZLIB（`gzcompress`）、纯 PHP LZ4 Frame、ZSTD（CLI 优先，纯 PHP 兜底）
 - ✅ TLS：CA 校验 / mTLS / SNI
-- ✅ 离线自测：10 套件 1,674 项断言 + 重复类名静态守卫（实测全绿）
+- ✅ 离线自测：13 套件 2,117 项断言 + 重复类名静态守卫（实测全绿）
 - ✅ 真机联调：`examples/live_*.php` 8 条用例覆盖管理端 / 重投死信 / 拉模式 / 队列变更监听 /
   POP / TLS / Request-Reply / 压缩冒烟
 

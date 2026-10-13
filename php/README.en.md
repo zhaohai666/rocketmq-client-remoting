@@ -60,7 +60,7 @@ bash scripts/run_php_live.sh compression 127.0.0.1:9876
 repository-wide **duplicate-class-name static guard** (PHP has no module isolation, so
 when the same FQCN is declared in two files the one autoloaded first silently wins and
 the other dies — this guard cannot be skipped), then chains 10 suites. Measured today:
-**guard CLEAN, all 1,674 assertions across the 10 suites pass**; any failure exits with a
+**guard CLEAN, all 2,117 assertions across the 13 suites pass**; any failure exits with a
 non-zero code.
 
 ## Examples
@@ -415,7 +415,7 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ Compression: ZLIB (`gzcompress`), pure-PHP LZ4 Frame, ZSTD (CLI preferred, pure-PHP
   fallback)
 - ✅ TLS: CA verification / mTLS / SNI
-- ✅ Offline self-test: 10 suites with 1,674 assertions + the duplicate-class-name static
+- ✅ Offline self-test: 13 suites with 2,117 assertions + the duplicate-class-name static
   guard (measured all green)
 - ✅ Live-cluster verification: the 8 `examples/live_*.php` cases cover the admin surface,
   redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply and

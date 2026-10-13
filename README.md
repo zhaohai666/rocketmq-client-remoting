@@ -43,9 +43,9 @@ Node.js(TypeScript) / PHP** 七种语言。每份实现都直连 **NameServer + 
 | --- | --- | --- | --- | --- |
 | Python | [`python/`](python/README.md) | 同步 API（内部线程） | zlib / LZ4 / ZSTD | `pytest -q`：1300 passed + 4 skipped |
 | C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | zlib / LZ4 / ZSTD | `ctest`：57 个用例全绿（4261 项断言） |
-| C# | [`csharp/`](csharp/README.md) | .NET 10，零 NuGet 依赖 | zlib / LZ4 / ZSTD | `dotnet test`：808 passed |
+| C# | [`csharp/`](csharp/README.md) | .NET 10，零 NuGet 依赖 | zlib / LZ4 / ZSTD | `dotnet test`：856 passed |
 | Rust | [`rust/`](rust/README.md) | tokio 异步 API | zlib / LZ4 / ZSTD | `cargo test`：982 passed；`cargo clippy --all-targets` 零 warning |
-| Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖 | zlib / LZ4 双向；ZSTD 解码全格式、编码为 store-only 合法帧 | `go test ./...`：584 个测试函数（client 313 / common 134 / remoting 137）；`go vet` / `gofmt` 零告警 |
+| Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖 | zlib / LZ4 双向；ZSTD 解码全格式、编码为 store-only 合法帧 | `go test ./...`：626 个测试函数（client 340 / common 134 / remoting 152）；`go vet` / `gofmt` 零告警 |
 | Node.js | [`nodeJs/`](nodeJs/README.md) | TypeScript 免构建直接运行（`node --experimental-strip-types`），零第三方依赖 | zlib / LZ4 双向手写 frame；ZSTD 走 `node:zlib`（≥ 23.8），低版本退回 Raw/RLE 手写 | `node selfcheck.ts`：加载 63 个模块 + 14 套冒烟共 301 项检查全绿 |
 | PHP | [`php/`](php/README.md) | PHP 8.1+，单线程 `tick()` 驱动，零 composer 依赖 | zlib 走 `gzcompress`；LZ4 纯 PHP frame；ZSTD 优先 `zstd` CLI，退回纯 PHP Raw/RLE | `php tests/run_all.php`：2117 项断言 + 重复类名守卫 |
 

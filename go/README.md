@@ -12,7 +12,7 @@ RocketMQ 经典 remoting 协议的 Go 客户端 SDK。直连 NameServer 取路�
 - 依赖：**零第三方依赖**，`go.mod` 里没有 `require` 段；LZ4 / ZSTD / 日志轮转全部手写
 - 分层：`remoting`（线协议与长连接传输）→ `common`（消息模型、编解码、压缩、常量）→
   `client`（Producer / Push / Pull / LitePull / Admin / 事务 / 轨迹）
-- 已在 **RocketMQ 5.5.1** 集群上跑通 13 个真机联调工具与 584 个单测
+- 已在 **RocketMQ 5.5.1** 集群上跑通 13 个真机联调工具与 626 个单测
 
 ## 先决条件
 
@@ -51,10 +51,10 @@ go test ./... -count=1
 
 | 包 | 测试函数数 | 耗时 |
 | --- | --- | --- |
-| `client` | 313 | 12.9s |
-| `common` | 134 | 6.0s |
-| `remoting` | 137 | 1.6s |
-| **合计** | **584**（50 个 `*_test.go`） | ~20s |
+| `client` | 340 | 15.7s |
+| `common` | 134 | 1.9s |
+| `remoting` | 152 | 1.0s |
+| **合计** | **626**（56 个 `*_test.go`） | ~19s |
 
 计数用 `go test ./client/ -list '.*' | grep -c '^Test'`。并发回归单独跑：
 
@@ -543,7 +543,7 @@ go/
 │   ├── trace.go · trace_hook.go · trace_dispatcher.go · trace_context.go
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
-│   └── *_test.go                   50 个测试文件，584 个测试函数
+│   └── *_test.go                   56 个测试文件，626 个测试函数
 └── examples/                   13 个可执行工具（见「真实集群联调」）
 ```
 
