@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn request_body_encodes_java_property_names() {
+    fn request_body_encodes_wire_property_names() {
         let body = QueryAssignmentRequestBody::new(
             "T1",
             "GID_g",

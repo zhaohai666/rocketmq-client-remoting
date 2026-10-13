@@ -593,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn communication_mode_names_match_python_constants() {
+    fn communication_mode_names_match_golden_constants() {
         assert_eq!(CommunicationMode::Sync.name(), "SYNC");
         assert_eq!(CommunicationMode::Async.to_string(), "ASYNC");
         assert_eq!(CommunicationMode::Oneway.to_string(), "ONEWAY");
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn send_message_context_defaults_match_python() {
+    fn send_message_context_defaults_match_golden() {
         let context = SendMessageContext::default();
         assert_eq!(context.producer_group, "");
         assert!(context.message.is_none());
@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn end_transaction_context_defaults_match_python() {
+    fn end_transaction_context_defaults_match_golden() {
         let context = EndTransactionContext::default();
         assert_eq!(context.producer_group, "");
         assert!(context.message.is_none());
@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn consume_context_success_defaults_true_like_python_init() {
+    fn consume_context_success_defaults_true_like_golden_init() {
         // 构造时 success 是 true；投递路径上 consumer 侧会显式改成 false。
         let context = ConsumeMessageContext::new("GID_test", None, None);
         assert!(context.success);

@@ -209,7 +209,7 @@ pub trait TraceProducer: Send + Sync {
         timeout_millis: i64,
     ) -> TraceProducerFuture<Result<()>>;
 
-    /// 定点发送（把消息钉在选中的队列上，见模块差异 2）：
+    /// 定点发送（把消息钉在选中的队列上，见设计要点 2）：
     /// `mq` 是 [`Self::publish_queues`] 里挑出来的队列。
     fn send_to_queue(
         self: Arc<Self>,
@@ -224,7 +224,7 @@ pub trait TraceProducer: Send + Sync {
     ) -> TraceProducerFuture<Result<Vec<MessageQueue>>>;
 }
 
-/// [`TraceProducer`] 的「未接线」实现（模块差异 1）：什么都不发，只记日志。
+/// [`TraceProducer`] 的「未接线」实现（设计要点 1）：什么都不发，只记日志。
 /// 内部生产者改为注入，未注入时用本类型兜底。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DisabledTraceProducer;
@@ -308,7 +308,7 @@ impl TraceHost for MQClientInstance {
 /// [`AsyncTraceDispatcher`] 的构造参数（默认值即分发器的固定常量）。
 #[derive(Clone)]
 pub struct TraceDispatcherConfig {
-    /// 内部轨迹生产者（模块差异 1）。`None` ⇒ [`DisabledTraceProducer`]。
+    /// 内部轨迹生产者（设计要点 1）。`None` ⇒ [`DisabledTraceProducer`]。
     pub producer: Option<Arc<dyn TraceProducer>>,
     /// 内部生产者组名。`None` ⇒ 由 [`AsyncTraceDispatcher::next_trace_producer_group`]
     /// 现生成（固定前缀 + 进程级自增号）。
@@ -399,7 +399,7 @@ impl BrokerSetSelector {
 ///
 /// 之所以拆成 `Arc<Inner>` + 句柄：分发器要同时被钩子、宿主生产者、后台任务共享，
 /// Rust 侧 [`TraceReportSink`] / [`TraceDispatcher`] 两个接缝都要 `Arc<dyn ...>`，
-/// 而后台任务又需要「不阻止回收」的弱引用（模块差异 6）。
+/// 而后台任务又需要「不阻止回收」的弱引用（设计要点 6）。
 struct Inner {
     group: String,
     dispatcher_type: TraceDispatcherType,
@@ -436,7 +436,7 @@ struct Inner {
     /// 内部生产者上的 5000 + 发送时传的 `5000`。
     send_msg_timeout_millis: i64,
     wait_for_shutdown_millis: u64,
-    /// 惰性绑定的 tokio 运行时句柄（模块差异 4）。
+    /// 惰性绑定的 tokio 运行时句柄（设计要点 4）。
     handle: OnceLock<Handle>,
     /// 指向自己的弱引用，供 `submit` 造 `'static` future 用。
     this: Weak<Inner>,
@@ -470,7 +470,7 @@ impl Inner {
 
 impl AsyncTraceDispatcher {
     /// 便捷构造：`batch_num = 10`、`trace_topic_name = None`；
-    /// `producer` 就是内部生产者（模块差异 1）。
+    /// `producer` 就是内部生产者（设计要点 1）。
     pub fn new(
         group: &str,
         dispatcher_type: TraceDispatcherType,
@@ -570,7 +570,7 @@ impl AsyncTraceDispatcher {
 
     /// 与实例方法版 [`Self::trace_producer_group`] 的区别：这里是**模块函数**，
     /// 让调用方能在构造内部生产者之前先把名字算出来（内部生产者自己建时是现算，
-    /// 顺序无从外置 —— 见模块差异 1）。
+    /// 顺序无从外置 —— 见设计要点 1）。
     pub fn next_trace_producer_group(group: &str, dispatcher_type: TraceDispatcherType) -> String {
         format_trace_producer_group(group, dispatcher_type, next_group_counter())
     }
@@ -598,7 +598,7 @@ impl AsyncTraceDispatcher {
         self.inner.batch_num
     }
 
-    /// 切块阈值（码点，模块差异 11）。
+    /// 切块阈值（码点，设计要点 11）。
     pub fn max_msg_size(&self) -> usize {
         self.inner.max_msg_size.load(Ordering::Acquire)
     }
@@ -690,11 +690,11 @@ impl AsyncTraceDispatcher {
     /// 固定顺序：锁内（`is_started` 为假时）设 namesrv / instanceName /
     /// `enable_trace = false` 并启动内部生产者 ⇒ 覆盖 `access_channel` ⇒
     /// worker 未起时拉起后台任务。进程退出钩子（atexit）无等价物
-    /// （模块差异 6）。
+    /// （设计要点 6）。
     ///
     /// 失败：内部生产者启动失败 ⇒ 原样上抛 `Err`（宿主接线处只记 warning），此时
     /// `is_started` 仍为 `false`。必须在一个 tokio 运行时上下文里调用
-    /// （模块差异 4）。
+    /// （设计要点 4）。
     pub async fn start(
         &self,
         name_server_addr: &str,
@@ -768,12 +768,12 @@ impl AsyncTraceDispatcher {
 //
 // 以下都是 `Inner` 的方法，覆盖攒批 / 分组 / 切块 / 选队 / 发送链路；
 // 之所以写在 `Inner` 上：后台任务与发送链路只持 `Weak<Inner>`/`Arc<Inner>`，
-// 不依赖对外的 [`AsyncTraceDispatcher`] 句柄（模块差异 6）。
+// 不依赖对外的 [`AsyncTraceDispatcher`] 句柄（设计要点 6）。
 
 impl Inner {
     /// 每轮 `flush_trace_context(false)`，本轮没刷出批次时睡 5ms
-    /// （模块差异 7）；`stopped` 置位后退出。只持 `Weak`，宿主句柄全释放后自动退出
-    /// （模块差异 6）。
+    /// （设计要点 7）；`stopped` 置位后退出。只持 `Weak`，宿主句柄全释放后自动退出
+    /// （设计要点 6）。
     async fn async_run(inner: Weak<Inner>) {
         loop {
             let Some(inner) = inner.upgrade() else {
@@ -794,7 +794,7 @@ impl Inner {
     ///
     /// 返回值是本轮真正取走的条数（0 ⇒ 什么都没刷出去，由调用方睡 5ms）。
     /// 防忙等 sleep 与异常吞掉分别由 [`Self::async_run`] 和
-    /// [`Inner::async_send_trace_message`] 内部记日志替代（模块差异 7）。
+    /// [`Inner::async_send_trace_message`] 内部记日志替代（设计要点 7）。
     fn flush_trace_context(&self, force_flush: bool) -> usize {
         let size = self.queue_len();
         if size != 0 {
@@ -859,7 +859,7 @@ impl Inner {
         std::mem::take(&mut *pending)
     }
 
-    /// 惰性绑定运行时句柄（模块差异 4）：构造时不碰 `Handle`，只在真正要派发动作时
+    /// 惰性绑定运行时句柄（设计要点 4）：构造时不碰 `Handle`，只在真正要派发动作时
     /// 取一次并缓存。
     fn bind_handle(&self) -> Option<Handle> {
         if let Some(handle) = self.handle.get() {
@@ -888,7 +888,7 @@ impl Inner {
                 None => return,
             };
             // 线程名 "MQ-AsyncArrayDispatcher-Thread<id>" 无法在
-            // tokio 任务上复刻（模块差异 5）；这里只把实例号打进调试日志。
+            // tokio 任务上复刻（设计要点 5）；这里只把实例号打进调试日志。
             rmq_debug!("start trace worker for instance {}", self.trace_instance_id);
             *worker = Some(tokio::spawn(Inner::async_run(weak)));
         }
@@ -953,7 +953,7 @@ impl Inner {
         self.flush();
         if self.finalizing.swap(true, Ordering::AcqRel) {
             // 收尾已在跑/已完成：二次 shutdown 不再重复关生产者
-            // 的原样行为（模块差异 14），但这里若重复挂收尾，会把第一轮还没等完
+            // 的原样行为（设计要点 14），但这里若重复挂收尾，会把第一轮还没等完
             // 的在途发送从中间掐掉。
             return;
         }
@@ -987,11 +987,11 @@ impl Inner {
         if self.is_started.load(Ordering::Acquire) {
             self.trace_producer.shutdown();
         }
-        // 进程退出钩子（atexit）无对应物（模块差异 6）
+        // 进程退出钩子（atexit）无对应物（设计要点 6）
         self.stored_stop();
     }
 
-    /// 置 `stopped` + 终止后台任务（模块差异 9）。
+    /// 置 `stopped` + 终止后台任务（设计要点 9）。
     fn stored_stop(&self) {
         self.stopped.store(true, Ordering::Release);
         if let Some(handle) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -1198,7 +1198,7 @@ impl Inner {
 
 impl TraceDispatcher for AsyncTraceDispatcher {
     /// `start(name_srv_addr, access_channel)` 的**同步**入口
-    /// （对象安全要求，见模块差异 4）：整段启动逻辑交给 tokio 任务，
+    /// （对象安全要求，见设计要点 4）：整段启动逻辑交给 tokio 任务，
     /// 因此本方法返回 `Ok` 只保证「任务已排队」，内部生产者起没起来要看日志。
     ///
     /// 唯一的同步可见错误：当前线程不在 tokio 运行时上下文里且此前没绑定过句柄
@@ -1240,7 +1240,7 @@ impl TraceReportSink for AsyncTraceDispatcher {
     }
 }
 
-/// `AccessChannel` 的可表示形式（这里用原子量存，见模块差异 15）。
+/// `AccessChannel` 的可表示形式（这里用原子量存，见设计要点 15）。
 fn access_channel_to_u8(channel: AccessChannel) -> u8 {
     match channel {
         AccessChannel::Local => 0,
@@ -1548,7 +1548,7 @@ mod tests {
     // ---------------- 默认值 / 常量（探针第 1 节） ----------------
 
     #[test]
-    fn defaults_match_python_reference() {
+    fn defaults_match_golden_reference() {
         let (d, recorder) = dispatcher();
         assert_eq!(d.batch_num(), 10);
         assert_eq!(d.max_msg_size(), 128_000);
@@ -1638,7 +1638,7 @@ mod tests {
 
     #[test]
     fn injected_group_name_is_used_verbatim() {
-        // 模块差异 1：调用方先把名字算出来（建内部生产者要用），构造分发器时注入回去
+        // 设计要点 1：调用方先把名字算出来（建内部生产者要用），构造分发器时注入回去
         let group = format_trace_producer_group("G", TraceDispatcherType::Produce, 999);
         let d = AsyncTraceDispatcher::with_config(
             "G",
@@ -1721,7 +1721,7 @@ mod tests {
     // ---------------- 发送：逐字节对齐金标准 ----------------
 
     #[tokio::test]
-    async fn send_trace_data_single_pub_matches_python_golden() {
+    async fn send_trace_data_single_pub_matches_golden() {
         let (d, recorder) = dispatcher();
         d.inner.send_trace_data(vec![simple_pub()]).await;
         let records = recorder.records();
@@ -1958,7 +1958,7 @@ mod tests {
     // ---------------- broker 集合选队（探针第 10 节） ----------------
 
     #[tokio::test]
-    async fn broker_set_round_robin_matches_python() {
+    async fn broker_set_round_robin_matches_golden() {
         let (d, recorder) = dispatcher();
         recorder.set_queues(vec![
             MessageQueue::new("RMQ_SYS_TRACE_TOPIC", "broker-a", 0),
@@ -2106,7 +2106,7 @@ mod tests {
 
     #[test]
     fn submit_without_runtime_only_logs() {
-        // 模块差异 4：不在运行时上下文里 submit ⇒ 批次丢弃并记 ERROR（不 panic）
+        // 设计要点 4：不在运行时上下文里 submit ⇒ 批次丢弃并记 ERROR（不 panic）
         let (d, recorder) = dispatcher_with(1, None);
         d.append(simple_pub());
         assert!(d.inner.submit(vec![simple_pub()]).is_err());
@@ -2117,7 +2117,7 @@ mod tests {
 
     #[test]
     fn zero_batch_num_does_not_spin_forever() {
-        // 模块差异 10
+        // 设计要点 10
         let (d, _) = dispatcher_with(0, None);
         d.append(simple_pub());
         d.flush();
@@ -2177,7 +2177,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_without_namespace_v2_skips_the_setter() {
-        // 未配置 ⇒ 不打空 setter（模块差异 15 的空串跳过分支）
+        // 未配置 ⇒ 不打空 setter（设计要点 15 的空串跳过分支）
         let (d, recorder) = dispatcher();
         d.start("127.0.0.1:9876", None).await.unwrap();
         assert!(
@@ -2336,7 +2336,7 @@ mod tests {
 
     #[tokio::test]
     async fn trait_start_requires_and_uses_runtime() {
-        // 模块差异 4：同步入口把整段 start 丢进 tokio 任务
+        // 设计要点 4：同步入口把整段 start 丢进 tokio 任务
         let (d, recorder) = dispatcher();
         TraceDispatcher::start(&d, "127.0.0.1:9876").unwrap();
         for _ in 0..100 {
@@ -2452,7 +2452,7 @@ mod tests {
         // 宿主存在但 clientId 为空 ⇒ 返回空串，不再回落到 consumer
         d.set_host_producer(Arc::new(Host(FakeClientId(""))));
         assert_eq!(TraceReportSink::client_id(&d), "");
-        // MQClientInstance 直接当宿主（模块差异 16）
+        // MQClientInstance 直接当宿主（设计要点 16）
         let client = MQClientInstance::new("10.0.0.1@inst", vec!["127.0.0.1:9876".to_string()]);
         d.set_host_producer(Arc::new(client));
         assert_eq!(TraceReportSink::client_id(&d), "10.0.0.1@inst");

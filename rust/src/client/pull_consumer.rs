@@ -1107,7 +1107,7 @@ struct LiteState {
     /// assign 模式下的 tag 表达式。
     assign_sub_expr: BTreeMap<String, String>,
     assign_mode: bool,
-    /// 当前分配（有序，见模块头差异 2）。
+    /// 当前分配（`BTreeMap` 保证按队列名有序）。
     assigned: BTreeMap<String, MessageQueue>,
     next_offset: BTreeMap<String, i64>,
     consume_offset: BTreeMap<String, i64>,
@@ -1657,7 +1657,7 @@ impl DefaultLitePullConsumer {
     /// 停循环 → 末次 commit（auto_commit 时）→ 唤醒 poll
     /// → 关实例。
     ///
-    /// 差别见模块头差异 1：末次提交与 `client.shutdown()` 一起派发到运行时上**串行**
+    /// 末次提交与 `client.shutdown()` 一起派发到运行时上**串行**
     /// 执行（提交要发 RPC，必须发生在实例关闭之前），且本方法**阻塞等它落地**
     /// （上限 [`SHUTDOWN_FINALIZE_BUDGET`]，「shutdown 后立刻退进程」不会再丢末次
     /// 提交）；current_thread 运行时里退化为游离任务并告警（见
@@ -2848,7 +2848,7 @@ mod tests {
     // ---------------------------------------------------------- 配置形状
 
     #[test]
-    fn config_defaults_match_the_python_reference() {
+    fn config_defaults_match_the_golden_reference() {
         let p = PullConsumerConfig::default();
         assert_eq!(p.instance_name, "DEFAULT");
         assert_eq!(p.message_model, MessageModel::CLUSTERING);
@@ -2876,7 +2876,7 @@ mod tests {
     }
 
     #[test]
-    fn setters_clamp_like_the_python_setters() {
+    fn setters_clamp_like_the_golden_setters() {
         let c = DefaultLitePullConsumer::new("LitePG").unwrap();
         c.set_pull_batch_size(0);
         assert_eq!(c.config().pull_batch_size, 1);

@@ -657,7 +657,7 @@ mod tests {
     // ------------------------------------------------------ 17 段编解码
 
     #[test]
-    fn encode_matches_python_bytes() {
+    fn encode_matches_golden_bytes() {
         let raw = encode_message_ext(&build_ext(&[]), false).unwrap();
         assert_eq!(bytes2string(&raw), bytes2string(&unhex(EXT_HEX)));
         assert_eq!(raw.len(), 139);
@@ -954,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_msg_id_and_python_fixture() {
+    fn v2_msg_id_and_golden_fixture() {
         let topic = "L".repeat(200);
         let raw = build_v2_frame(&topic, b"x", b"");
         let got = decode_message(&raw).unwrap();
@@ -1033,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_messages_fixture_matches_python() {
+    fn batch_messages_fixture_matches_golden() {
         let msgs = vec![
             Message::new("T", Some(b"m1")),
             Message::with_tags_and_keys("T", Some(b"m2"), Some("TagA"), None, 0),

@@ -467,7 +467,7 @@ mod tests {
     ///
     /// 时钟相关的三个数（time_stamp / cost_time / store_time）与 `request_id` 在两侧
     /// 不可能相同（Rust 用真实时钟 + 随机 uniqId），所以模板里留占位；它们的**取值规则**
-    /// 由 `pub_cost_and_store_time_follow_python_rules` 等用例单独钉住。
+    /// 由 `pub_cost_and_store_time_follows_golden_rules` 等用例单独钉住。
     fn render(template: &str, ctx: &TraceContext) -> String {
         let store_time = ctx
             .trace_beans
@@ -573,7 +573,7 @@ mod tests {
     }
 
     /// 固定的一批消费消息（第三条被 `TRACE_ON=false` 挡掉）。
-    fn python_scenario_msgs() -> Vec<MessageExt> {
+    fn scenario_msgs_for_reference_vector() -> Vec<MessageExt> {
         vec![
             ext(
                 "NS1%TopicTest",
@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn send_pub_record_matches_python_golden() {
+    fn send_pub_record_matches_golden() {
         let sink = Arc::new(RecordingSink::new(TRACE_TOPIC, CLIENT_ID));
         let hook = SendMessageTraceHook::new(sink.clone());
 
@@ -827,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn pub_cost_and_store_time_follow_python_rules() {
+    fn pub_cost_and_store_time_follows_golden_rules() {
         // 均摊耗时 (now*1000 - ts) / len(beans) 向零取整；storeTime = ts + cost/2 向下取整
         assert_eq!(elapsed_per(1_700_000_000_042, 1_700_000_000_000, 1), 42);
         assert_eq!(elapsed_per(1_700_000_000_042, 1_700_000_000_000, 2), 21);
@@ -904,10 +904,10 @@ mod tests {
          \u{1}KeyC\u{1}3\u{1}{TS}\u{1}GID_test\u{2}";
 
     #[test]
-    fn consume_before_and_after_records_match_python_golden() {
+    fn consume_before_and_after_records_match_golden() {
         let sink = Arc::new(RecordingSink::new(TRACE_TOPIC, CLIENT_ID));
         let hook = ConsumeMessageTraceHook::new(sink.clone());
-        let mut context = consume_context(python_scenario_msgs());
+        let mut context = consume_context(scenario_msgs_for_reference_vector());
         context.success = false;
         context.access_channel = Some("LOCAL".to_string());
         let mut props = HashMap::new();
@@ -973,7 +973,7 @@ mod tests {
     fn consume_after_cost_time_divides_whole_batch() {
         let sink = Arc::new(RecordingSink::new(TRACE_TOPIC, CLIENT_ID));
         let hook = ConsumeMessageTraceHook::new(sink.clone());
-        let mut context = consume_context(python_scenario_msgs());
+        let mut context = consume_context(scenario_msgs_for_reference_vector());
         hook.consume_message_before(&mut context).unwrap();
         let before = sink.last().expect("test-only");
         assert_eq!(before.trace_beans.len(), 2, "第三条被 TRACE_ON 挡掉");
@@ -1168,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn end_transaction_record_matches_python_golden() {
+    fn end_transaction_record_matches_golden() {
         let sink = Arc::new(RecordingSink::new(TRACE_TOPIC, CLIENT_ID));
         let hook = EndTransactionTraceHook::new(sink.clone());
         let mut message = pub_message("NS1%TopicTest");

@@ -611,7 +611,7 @@ mod tests {
 
     /// 黄金向量取自**线上记录的真实行为**，不是按规则手推的。
     #[test]
-    fn filter_api_matches_the_python_reference_vector_by_vector() {
+    fn filter_api_matches_the_golden_reference_vector_by_vector() {
         /// (用例名, 订阅表达式, 期望 subString, 期望 tagsSet, 期望 codeSet)
         type Case = (&'static str, Option<&'static str>, &'static str, &'static [&'static str], &'static [i32]);
         let cases: &[Case] = &[

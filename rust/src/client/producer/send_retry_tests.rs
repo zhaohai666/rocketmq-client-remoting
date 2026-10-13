@@ -370,7 +370,7 @@ fn default_retry_response_codes_match_protocol() {
 
 /// 三档异常在故障表和重试决策上各不相同，不能合成一个 `retryable`。
 #[test]
-fn send_errors_classify_like_python_except_arms() {
+fn send_errors_classify_by_variant_arms() {
     let cases: [(&Error, Option<SendErrorKind>); 9] = [
         (
             &Error::Broker { response_code: 2, message: "busy".into() },

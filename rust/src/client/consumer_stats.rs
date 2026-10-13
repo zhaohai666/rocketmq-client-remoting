@@ -1118,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_snapshot_display_matches_python_repr() {
+    fn stats_snapshot_display_matches_golden_repr() {
         assert_eq!(
             StatsSnapshot::default().to_string(),
             "StatsSnapshot(sum=0, tps=0.00, avgpt=0.00, times=0)"

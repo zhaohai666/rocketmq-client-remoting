@@ -8,7 +8,7 @@
 //! 发送前拦截钩子、W3C traceparent 注入、消息轨迹、Request-Reply、事务消息
 //! （半消息 + 本地事务 + END_TRANSACTION + broker 回查）与几个管理类便捷方法。
 //!
-//! ## 运行时与实现形态说明（均在对应条目 doc 上再次标注）
+//! ## 实现说明（逐条在对应条目 doc 上再次标注）
 //!
 //! 1. **句柄可克隆**：生产者句柄常被回调/处理器共享；Rust 里
 //!    [`DefaultMQProducer`] 是 `Clone` 的 `Arc<Inner>`，配置走 `RwLock` 内部可变，
@@ -23,7 +23,7 @@
 //!    [`AsyncSenderExecutor`]），这里的「线程」是任务：没有名字，也不与核绑定。
 //! 4. **轨迹分发器：注入或自动桥接**（[`DefaultMQProducer::set_trace_dispatcher`]）：
 //!    典型做法是在 `start()` 里直接创建 `AsyncTraceDispatcher`（含真实内部生产者）。
-//!    本 crate 允许调用方注入现成分发器（见 `mq_client.rs` 模块头差异 2），但
+//!    本 crate 允许调用方注入现成分发器（`crate::client::mq_client::TraceDispatcher` 接缝），但
 //!    `enable_trace=true` 且未注入时，`start()` 会经 [`auto_bridged_dispatcher`]
 //!    自动建一套（含真实内部生产者），轨迹开箱即用。
 //!    注入或桥接后 `start()` 都会先注册 `SendMessageTraceHook` /
@@ -557,7 +557,7 @@ struct Inner {
     /// 客户端实例。
     client: Mutex<Option<MQClientInstance>>,
     started: AtomicBool,
-    /// 差异 3：`start()` 时惰性绑定的运行时句柄，`send_async` 与心跳任务用它派发。
+    /// 实现说明 3：`start()` 时惰性绑定的运行时句柄，`send_async` 与心跳任务用它派发。
     runtime: OnceLock<tokio::runtime::Handle>,
     /// 心跳停止标志（true = 停）。
     stop: watch::Sender<bool>,
@@ -572,7 +572,7 @@ struct Inner {
     /// 发送前拦截钩子表。
     check_forbidden_hooks: CheckForbiddenHookList,
     transaction_listener: RwLock<Option<Arc<dyn TransactionListener>>>,
-    /// 轨迹分发器；差异 4：由调用方注入。
+    /// 轨迹分发器；实现说明 4：由调用方注入。
     trace: Mutex<Option<Arc<dyn TraceDispatcherChannel>>>,
     rpc_hook: RwLock<Option<Arc<dyn RPCHook>>>,
     /// 异步发送在途**条数**的公平信号量（`_semaphore_async_send_num`）：
@@ -770,7 +770,7 @@ impl Drop for Inner {
 /// 默认生产者：实现经典 remoting 协议的生产者完整形态
 /// （配置 + 生命周期 + 各类发送入口 + 事务/攒批/轨迹）。
 ///
-/// 克隆得到的副本与原对象**共享同一份状态**（差异 1）：引用语义
+/// 克隆得到的副本与原对象**共享同一份状态**（实现说明 1）：引用语义
 /// 在 Rust 里靠 `Arc<Inner>` 落地，所以把生产者交给回调/处理器
 /// 之后仍可继续 `set_xxx`，副本立即可见。
 ///
@@ -1175,8 +1175,7 @@ impl DefaultMQProducer {
 
     // ---------------- 消息轨迹配置 ----------------
 
-    ///
-    /// ⚠ 轨迹分发器本身**不在这里新建**（差异 4）：先
+    /// ⚠ 轨迹分发器本身**不在这里新建**（实现说明 4）：先
     /// [`set_trace_dispatcher`](Self::set_trace_dispatcher) 注入，`start()` 才会
     /// 按固定顺序注册两个轨迹钩子并启动它。
     pub fn set_enable_trace(&self, enable: bool) {
@@ -1202,7 +1201,7 @@ impl DefaultMQProducer {
         self.write_cfg(|c| c.trace_msg_batch_num = n);
     }
 
-    /// 注入轨迹分发器（差异 4）。传 `None` 撤销注入。
+    /// 注入轨迹分发器（实现说明 4）。传 `None` 撤销注入。
     pub fn set_trace_dispatcher(&self, dispatcher: Option<Arc<dyn TraceDispatcherChannel>>) {
         *self.inner.trace.lock().unwrap_or_else(|e| e.into_inner()) = dispatcher;
     }
@@ -1287,7 +1286,6 @@ impl DefaultMQProducer {
 
     // ---------------- 生命周期 ----------------
 
-    ///
     /// 启动步骤逐条固定：校验地址 → 生成 clientId →
     /// 生产者组拼命名空间 → 建/复用 [`MQClientInstance`] → 注册 RPC 钩子 →
     /// 启动实例 → 回填动态拿到的 namesrv → 注册事务回查处理器 → 起心跳任务。
@@ -1566,7 +1564,7 @@ impl DefaultMQProducer {
             .ok_or_else(|| Error::client("producer not started, call start() first"))
     }
 
-    /// 差异 3：与 `remoting::client` 同样的惰性绑定 —— 已有缓存就用缓存，否则从当前
+    /// 实现说明 3：与 `remoting::client` 同样的惰性绑定 —— 已有缓存就用缓存，否则从当前
     /// 运行时上下文取（`start()` 是 async，必然在运行时里）。
     fn runtime_handle(&self) -> Option<tokio::runtime::Handle> {
         if let Some(handle) = self.inner.runtime.get() {
@@ -1585,7 +1583,7 @@ impl DefaultMQProducer {
             .push(task);
     }
 
-    /// 注入优先（[`set_trace_dispatcher`](Self::set_trace_dispatcher)，原差异 4）；
+    /// 注入优先（[`set_trace_dispatcher`](Self::set_trace_dispatcher)，实现说明 4）；
     /// `enable_trace=true` 且未注入时经 [`auto_bridged_dispatcher`] 自动建一套
     /// —— 与宿主侧自动接线行为一致。任何失败都只记日志 —— 轨迹挂了不能影响正常发送。
     fn start_trace_dispatcher(&self) {
@@ -1707,7 +1705,7 @@ impl ServiceDetector for MaxOffsetServiceDetector {
 /// `send_msg_timeout=5000` / `max_msg_size=128000` / `enable_trace=false` 三项
 /// 由 [`AsyncTraceDispatcher::with_config`] 按固定顺序打在生产者上，这里不重复。
 ///
-/// 与注入式用法的分工：调用方注入的 [`TraceDispatcherChannel`] 优先（原差异 4 约定）；
+/// 与注入式用法的分工：调用方注入的 [`TraceDispatcherChannel`] 优先（实现说明 4 约定）；
 /// `enable_trace=true` 且未注入时，`start_trace_dispatcher` 走这里自动建一套，
 /// 与生产/消费两侧的自动接线行为一致 —— 轨迹开箱即用，不再要求手写桥接。
 pub fn auto_bridged_dispatcher(
@@ -2782,8 +2780,6 @@ impl DefaultMQProducer {
     }
 
     /// 把**已经编码好的批量**投出去 —— 攒批（[`ProduceAccumulator`]）那条路专用的发送尾巴。
-    ///
-    ///
     ///
     /// ⚠ 这里**不**重做命名空间、`checkMessage`、`setUniqID`、编码 —— 那些在
     /// `sendByAccumulator`（逐条）与 `MessageBatch::generate_from_list`（批量自身）里就已经
@@ -3889,9 +3885,6 @@ impl RequestProcessor for CheckTransactionStateProcessor {
 impl DefaultMQProducer {
     /// Request-Reply（5.x）：发一条请求消息并**同步等应答**，返回应答消息。
     ///
-    ///
-    ///
-    ///
     /// ⚠ 差别：原语义用空回调把「发送失败」写回等待槽；这里发送
     /// 就在本函数内 `await`，直接拿返回值调
     /// [`RequestResponseFuture::set_failed`]，效果一致（少一个只在内部用的回调类型）。
@@ -4216,7 +4209,7 @@ mod tests {
     // ---------------- 构造 / 配置默认值 ----------------
 
     #[test]
-    fn config_defaults_match_python() {
+    fn config_defaults_match_golden() {
         let cfg = ProducerConfig::default();
         assert_eq!(cfg.producer_group, MixAll::DEFAULT_PRODUCER_GROUP);
         assert_eq!(cfg.instance_name, DEFAULT_INSTANCE_NAME);
@@ -4591,7 +4584,7 @@ mod tests {
     // ---------------- 钩子上下文 ----------------
 
     #[test]
-    fn send_context_msg_type_follows_python_priority() {
+    fn send_context_msg_type_follows_golden_priority() {
         let p = producer("GID_ctx");
         let m = mq("broker-a", 0);
 

@@ -13,7 +13,7 @@ use crate::common::message::MessageQueue;
 use crate::common::util_all::current_time_millis;
 use crate::error::{Error, Result};
 
-/// 可注入时钟（见模块头差异 2）。签名固定为无参函数指针，便于 `Default` 与 `Clone`。
+/// 可注入时钟。签名固定为无参函数指针，便于 `Default` 与 `Clone`。
 pub type NowFn = fn() -> i64;
 
 pub type QueueFilter<'a> = dyn Fn(&MessageQueue) -> bool + 'a;
@@ -128,7 +128,7 @@ impl LatencyFaultToleranceImpl {
         LatencyFaultToleranceImpl::with_clock(current_time_millis)
     }
 
-    /// 用指定时钟构造（对应模块头差异 2；生产走 [`LatencyFaultToleranceImpl::new`]）。
+    /// 用指定时钟构造（测试可注入假时钟；生产走 [`LatencyFaultToleranceImpl::new`]）。
     pub fn with_clock(now_millis: NowFn) -> LatencyFaultToleranceImpl {
         LatencyFaultToleranceImpl {
             fault_item_table: RwLock::new(HashMap::new()),
@@ -179,7 +179,7 @@ impl LatencyFaultToleranceImpl {
         write_guard(&self.fault_item_table).remove(name);
     }
 
-    /// 按名查找，返回**快照副本**（见模块头差异 3）。
+    /// 按名查找，返回**快照副本**（读锁守卫不能逃出函数，只能 clone 出来）。
     pub fn get_fault_item(&self, name: &str) -> Option<FaultItem> {
         read_guard(&self.fault_item_table).get(name).cloned()
     }
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn fault_item_defaults_and_reachable_true_follows_python() {
+    fn fault_item_defaults_and_reachable_true_follows_golden() {
         let item = FaultItem::new("broker-a");
         assert_eq!(item.current_latency, 0);
         assert_eq!(item.start_timestamp, 0);
@@ -472,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn fault_item_display_matches_python_repr() {
+    fn fault_item_display_matches_golden_repr() {
         assert_eq!(
             FaultItem::new("broker-a").to_string(),
             "FaultItem{name=broker-a, latency=0, startTs=0, reachable=true}"

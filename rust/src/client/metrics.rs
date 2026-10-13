@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_snapshot_is_all_zero_and_matches_python_dict() {
+    fn fresh_snapshot_is_all_zero_and_matches_golden_dict() {
         let snapshot = ClientMetrics::new().snapshot();
         assert_eq!(snapshot, MetricsSnapshot::default());
         // 空快照的键名与顺序是固定的
@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn round3_matches_python_on_half_way_vectors() {
+    fn round3_matches_golden_on_half_way_vectors() {
         // 固定向量：二进制真值 + 四舍六入五成双
         for (v, want) in [
             (1.0005_f64, 1.0_f64),

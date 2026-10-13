@@ -1,4 +1,4 @@
-//! 轨迹 dispatcher **自动桥接**对真实 5.5.1 broker 的联调验证（任务 #24）。
+//! 轨迹 dispatcher **自动桥接**对真实 5.5.1 broker 的联调验证。
 //!
 //! 与 `live_rebalance_and_trace.rs`（R3：手工构造 TraceContext + 手工挂钩子）和
 //! `live_producer.rs`（P4：调用方注入 dispatcher）互补：这里验证的是

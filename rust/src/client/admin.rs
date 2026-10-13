@@ -508,7 +508,7 @@ impl DefaultMQAdminExt {
             c.instance_name = instance_name;
         });
 
-        // 直接构造私有实例（见模块头差异 2）。
+        // 直接构造私有实例。
         let client = MQClientInstance::with_config(
             &client_id,
             cfg.name_server_addrs.clone(),
@@ -2884,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_match_python() {
+    fn config_defaults_match_golden() {
         let admin = DefaultMQAdminExt::new();
         let cfg = admin.config();
         assert_eq!(cfg.instance_name, "ADMIN");
@@ -3077,7 +3077,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_broker_addrs_covers_python_branches() {
+    fn cluster_broker_addrs_covers_recorded_branches() {
         let info = cluster();
         // 不给集群名：回 `cluster.get_broker_addrs()`（全量）。
         assert_eq!(
@@ -3238,7 +3238,7 @@ mod tests {
     }
 
     #[test]
-    fn small_helpers_match_python_semantics() {
+    fn small_helpers_match_golden_semantics() {
         // 显式超时优先，0/缺省回落配置值
         assert_eq!(effective_timeout(15_000, Some(3_000)), 3_000);
         assert_eq!(effective_timeout(15_000, Some(0)), 15_000);

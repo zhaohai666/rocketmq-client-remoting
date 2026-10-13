@@ -662,7 +662,7 @@ mod tests {
     // ---------------------------------------------------- 参数夹取 / 守卫 / 边界
 
     #[test]
-    fn sizes_are_clamped_like_python() {
+    fn sizes_are_clamped_like_golden() {
         // core = max(0, core)；max = max(core, max)
         let ex = ConsumeExecutor::new(-3, -7);
         assert_eq!(ex.get_core_pool_size(), 0);

@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_namespace_matches_python_cases() {
+    fn wrap_namespace_matches_golden_cases() {
         assert_eq!(NamespaceUtil::wrap_namespace("MQ_INST_XX", "Topic"), "MQ_INST_XX%Topic");
         assert_eq!(
             NamespaceUtil::wrap_namespace("MQ_INST_XX", "%RETRY%GID"),
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn without_namespace_matches_python_cases() {
+    fn without_namespace_matches_golden_cases() {
         assert_eq!(NamespaceUtil::without_namespace("MQ_INST_XX%Topic", ""), "Topic");
         assert_eq!(
             NamespaceUtil::without_namespace("%RETRY%MQ_INST_XX%GID", ""),

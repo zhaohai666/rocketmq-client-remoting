@@ -695,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn consume_stats_fixture_matches_python() {
+    fn consume_stats_fixture_matches_golden() {
         let text = concat!(
             r#"{"consumeTps":0.0,"offsetTable":{{"brokerName":"broker-a","queueId":0,"topic":"T"}:"#,
             r#"{"brokerOffset":8,"consumerOffset":5,"lastTimestamp":1,"pullOffset":7}}}"#

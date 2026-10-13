@@ -132,7 +132,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_timeout_text_matches_python() {
+    fn request_timeout_text_matches_golden() {
         // 运行时错误文本是字面量契约，一个字符都不能改
         let e = Error::request_timeout("TopicTest", 3000);
         assert_eq!(

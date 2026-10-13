@@ -601,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn tolerant_json_parses_numbers_like_python() {
+    fn tolerant_json_parses_numbers_like_golden() {
         let v = fastjson::from_str(r#"{"i":-7,"f":1.5,"e":1e3,"big":18446744073709551615}"#).unwrap();
         assert_eq!(v["i"], -7);
         assert_eq!(v["f"].as_f64(), Some(1.5));

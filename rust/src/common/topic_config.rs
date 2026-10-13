@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_uses_python_key_order() {
+    fn encode_uses_recorded_key_order() {
         let mut cfg = TopicConfig::new("t");
         cfg.attributes.insert("+cgt", "10");
         cfg.attributes.insert("-delete", "true");

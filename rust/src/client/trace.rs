@@ -1206,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn trace_context_display_matches_python_repr() {
+    fn trace_context_display_matches_golden_repr() {
         let ctx = ctx_of(TraceType::Pub, vec![bean(MSG_ID_1, "", 0)]);
         assert_eq!(
             ctx.to_string(),

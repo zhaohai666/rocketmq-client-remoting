@@ -1,7 +1,7 @@
 //! 拉模式消费者（`DefaultMQPullConsumer`）的心跳必须把消费组注册进 broker（#98）——
 //! 对真实 5.5.1 集群的验证。
 //!
-//! 为什么必须真机：离线单测只能证明报文形状（`pull_heartbeat_matches_the_java_shape` 等），
+//! 为什么必须真机：离线单测只能证明报文形状（`pull_heartbeat_matches_the_wire_shape` 等），
 //! 证明不了 broker 的 `ConsumerManager.consumerTable` 真的登记了本组，也证明不了 35 之后
 //! 立刻摘除 —— 这两件事只有真 broker 有。
 //!

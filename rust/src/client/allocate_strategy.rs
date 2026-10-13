@@ -1070,9 +1070,9 @@ mod tests {
     /// 差分测试：独立转写一份纯算式实现，与本模块实现在 0..12 × 0..5 规模、
     /// 含探针 cid（组内 / 组外 / 空串）全组合下逐值一致。
     #[test]
-    fn matches_python_reference_arithmetic() {
+    fn matches_golden_reference_arithmetic() {
         // 独立转写的算式（不共享本模块代码），仅用于差分测试。
-        fn python_averagely(mq_all: &[i32], cid_all: &[String], current_cid: &str) -> Vec<i32> {
+        fn averagely_reference_allocation(mq_all: &[i32], cid_all: &[String], current_cid: &str) -> Vec<i32> {
             if mq_all.is_empty() {
                 return vec![];
             }
@@ -1106,7 +1106,7 @@ mod tests {
             mq_all[start_index..end].to_vec()
         }
 
-        fn python_circle(mq_all: &[i32], cid_all: &[String], current_cid: &str) -> Vec<i32> {
+        fn circle_reference_allocation(mq_all: &[i32], cid_all: &[String], current_cid: &str) -> Vec<i32> {
             if mq_all.is_empty() {
                 return vec![];
             }
@@ -1142,7 +1142,7 @@ mod tests {
                 for cid in &probes {
                     assert_eq!(
                         allocate_ids(&AllocateMessageQueueAveragely, "G", cid, &mq_all, &cid_all),
-                        python_averagely(&ids, &cid_all, cid),
+                        averagely_reference_allocation(&ids, &cid_all, cid),
                         "差分算式不一致 AVG {}×{} cid={:?}",
                         mq_size,
                         cid_size,
@@ -1156,7 +1156,7 @@ mod tests {
                             &mq_all,
                             &cid_all
                         ),
-                        python_circle(&ids, &cid_all, cid),
+                        circle_reference_allocation(&ids, &cid_all, cid),
                         "差分算式不一致 CIRCLE {}×{} cid={:?}",
                         mq_size,
                         cid_size,

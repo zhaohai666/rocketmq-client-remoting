@@ -396,7 +396,7 @@ pub struct ConsumerConfig {
     /// TLS 开关；`None` = 交给环境变量 `ROCKETMQ_TLS_ENABLE`。
     pub tls_enable: Option<bool>,
     pub socks_proxy: Option<SocksProxyConfig>,
-    /// Python `message_model`（[`MessageModel`] 里的常量）。
+    /// 消费模式（[`MessageModel`] 里的常量）。
     pub message_model: String,
     /// 起始位点策略（[`ConsumeFromWhere`] 里的常量）。
     pub consume_from_where: String,
@@ -443,7 +443,7 @@ pub struct ConsumerConfig {
     pub heartbeat_interval_millis: i64,
     /// 是否发心跳。
     pub heartbeat_enabled: bool,
-    /// Python `pop_mode`：true 走 POP + ack（且队列分配改走 broker 侧 QUERY_ASSIGNMENT），
+    /// true 走 POP + ack（且队列分配改走 broker 侧 QUERY_ASSIGNMENT），
     /// false 走长轮询 + 位点（本地 rebalance 不变）。
     pub pop_mode: bool,
     /// POP 不可见时间（默认 60000ms）。
@@ -831,7 +831,7 @@ pub fn mq_key(mq: &MessageQueue) -> String {
 /// 推模式消费者：订阅 + 重平衡 + 拉取/POP 消费循环的门面句柄。
 ///
 /// 生命周期：`subscribe(..)` → [`start`](Self::start) → 后台重平衡 + 消费 →
-/// [`shutdown`](Self::shutdown)。克隆得到的副本共享同一份状态（模块头差异 2）。
+/// [`shutdown`](Self::shutdown)。克隆得到的副本共享同一份状态（结构取舍 2）。
 #[derive(Clone)]
 pub struct DefaultMQPushConsumer {
     inner: Arc<Inner>,
@@ -858,7 +858,7 @@ impl std::fmt::Debug for DefaultMQPushConsumer {
 }
 
 impl DefaultMQPushConsumer {
-    /// Python `DefaultMQPushConsumer(consumer_group)`；组名空白则报错
+    /// 只给消费组构造；组名空白则报错
     /// （`MQClientException("consumerGroup is empty")`）。
     pub fn new(consumer_group: &str) -> Result<DefaultMQPushConsumer> {
         let cfg = ConsumerConfig {
@@ -868,7 +868,7 @@ impl DefaultMQPushConsumer {
         DefaultMQPushConsumer::with_config(cfg)
     }
 
-    /// Python `DefaultMQPushConsumer(consumer_group, rpc_hook=..)`。
+    /// 附带 RPC 钩子（请求签名）构造。
     pub fn with_rpc_hook(
         consumer_group: &str,
         rpc_hook: Option<Arc<dyn RPCHook>>,
@@ -911,7 +911,7 @@ impl DefaultMQPushConsumer {
             pause: AtomicBool::new(false),
         });
         let consumer = DefaultMQPushConsumer { inner };
-        // Python `__init__` 里 `self._core_pool_size = self.consume_thread_min`
+        // 声明的核心池容量初始等于 consume_thread_min
         let min = consumer.config().consume_thread_min;
         consumer
             .inner
@@ -920,18 +920,18 @@ impl DefaultMQPushConsumer {
         Ok(consumer)
     }
 
-    /// 当前配置快照（Python 直接读属性）。
+    /// 当前配置快照。
     pub fn config(&self) -> ConsumerConfig {
         read_cfg(&self.inner)
     }
 
-    /// 改配置（Python 的直接赋属性）。`start()` 之后除少数运行期可调项外应拒绝。
+    /// 改配置。`start()` 之后除少数运行期可调项外应拒绝。
     pub fn update_config(&self, f: impl FnOnce(&mut ConsumerConfig)) {
         {
             let mut w = self.inner.cfg.write().unwrap_or_else(|e| e.into_inner());
             f(&mut w);
         }
-        // Python 的 set_consume_thread_* 会顺带同步声明的 core size
+        // 改线程上下限时顺带同步声明的核心池容量
         let cfg = self.config();
         let cur = self.inner.core_pool_size.load(Ordering::SeqCst);
         if cur < cfg.consume_thread_min {
@@ -954,7 +954,7 @@ impl DefaultMQPushConsumer {
         self.inner.started.load(Ordering::Acquire)
     }
 
-    /// [`MQClientInstance`]（Python `_mq_client`、C++ `client()`），未启动时 `None`。
+    /// 共享的 [`MQClientInstance`] 句柄，未启动时 `None`。
     pub fn client(&self) -> Option<MQClientInstance> {
         lock(&self.inner.client).clone()
     }
@@ -1046,8 +1046,7 @@ impl DefaultMQPushConsumer {
         self.update_config(|c| c.persist_consumer_offset_interval_millis = millis);
     }
 
-    /// 只读访问共享的 [`MQClientInstance`]（node `consumer.mqClient`、python
-    /// `_mq_client` 同形）：静态主题腿用它读端点重写结果；未启动报错。
+    /// 只读访问共享的 [`MQClientInstance`]：静态主题腿用它读端点重写结果；未启动报错。
     pub fn mq_client(&self) -> Result<MQClientInstance> {
         if !self.inner.started.load(Ordering::Acquire) {
             return Err(Error::client("consumer not started, call start() first"));
@@ -1112,7 +1111,7 @@ impl DefaultMQPushConsumer {
             .clone()
     }
 
-    /// 注入轨迹分发器（模块头差异 5）。
+    /// 注入轨迹分发器（结构取舍 5）。
     pub fn set_trace_dispatcher(&self, dispatcher: Option<Arc<dyn TraceDispatcherChannel>>) {
         *lock(&self.inner.trace) = dispatcher;
     }
@@ -1367,7 +1366,7 @@ impl DefaultMQPushConsumer {
             return Err(e);
         }
         *lock(&self.inner.client) = Some(client.clone());
-        // 动态 name server：实例可能已从地址服务器拿到地址，回填（Python 同）。
+        // 动态 name server：实例可能已从地址服务器拿到地址，回填。
         if cfg.name_server_addrs.is_empty() {
             let addrs = client.name_server_addrs();
             if !addrs.is_empty() {
@@ -1415,7 +1414,7 @@ impl DefaultMQPushConsumer {
             }
         }
 
-        // 拉一次路由 → 同步首轮心跳 → 同步首轮重平衡 → 起循环（顺序照 Python）
+        // 拉一次路由 → 同步首轮心跳 → 同步首轮重平衡 → 起循环（顺序固定）
         self.refresh_routes().await;
         if let Err(e) = client.check_client_in_broker().await {
             self.shutdown();
@@ -1433,7 +1432,7 @@ impl DefaultMQPushConsumer {
         Ok(())
     }
 
-    /// Python `shutdown()`。
+    /// 停机：清退在途批次、刷位点、解锁队列、注销实例。
     ///
     /// ⚠ 与「spawn 后立即返回」的旧形态不同：清退（等在途批次 → 刷位点/解锁 →
     /// 35 号注销 → 拆实例）挂在运行时上跑，但本方法**阻塞等它落地**（上限
@@ -1461,7 +1460,7 @@ impl DefaultMQPushConsumer {
                 state.pop_queues.clear();
             }
             state.queue_owners.clear();
-            // Python `self._last_pull_table.clear()`：停机后残留的时刻会让下次
+            // 停机后残留的时刻会让下次
             // start() 的自愈判定读到旧实例的盖章。
             state.last_pull_at.clear();
         }
@@ -1581,7 +1580,7 @@ impl DefaultMQPushConsumer {
                     finalize,
                 );
             } else {
-                // 无运行时：末次持久化与注销都发不出去（Python 那里线程照起），
+                // 无运行时：末次持久化与注销都发不出去，
                 // 但至少把该还的还掉。
                 rmq_warn!(
                     "push shutdown: no tokio runtime, skip final offset persist and \
@@ -1608,7 +1607,7 @@ impl DefaultMQPushConsumer {
 
     /// `enable_trace` 时注册消费轨迹钩子并启动通道。
     ///
-    /// 注入优先（[`set_trace_dispatcher`](Self::set_trace_dispatcher)，模块头差异 5）；
+    /// 注入优先（[`set_trace_dispatcher`](Self::set_trace_dispatcher)，结构取舍 5）；
     /// `enable_trace=true` 且未注入时经 [`auto_bridged_dispatcher`] 自动建一套
     /// （Type=CONSUME + 真实内部生产者）。
     fn start_trace_dispatcher(&self) {
@@ -1663,7 +1662,7 @@ impl DefaultMQPushConsumer {
 
     // ---------------- 心跳 ----------------
 
-    /// Python `_refresh_routes`：把订阅 topic 登记为「在用」并各拉一次路由。
+    /// 把订阅 topic 登记为「在用」并各拉一次路由。
     async fn refresh_routes(&self) {
         let Ok(client) = require_client(&self.inner) else {
             return;
@@ -1681,27 +1680,27 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// Python `_send_heartbeat_to_all_broker`：返回成功的 broker 台数。
+    /// 返回成功的 broker 台数。
     pub async fn send_heartbeat_to_all_broker(&self) -> usize {
         heartbeat_once(&self.inner).await
     }
 
-    /// Python `heartbeat_count`（真机验证用）。
+    /// 累计成功心跳次数（真机验证用）。
     pub fn heartbeat_count(&self) -> usize {
         self.inner.heartbeat_count.load(Ordering::SeqCst)
     }
 
-    /// Python `flow_control_triggered`（真机验证流控是否生效）。
+    /// 累计触发流控的次数（真机验证流控是否生效）。
     pub fn flow_control_triggered(&self) -> usize {
         self.inner.flow_control_triggered.load(Ordering::SeqCst)
     }
 
-    /// Python `assigned_queue_count`。
+    /// 当前分配到的队列数。
     pub fn assigned_queue_count(&self) -> usize {
         lock(&self.inner.state).assigned.len()
     }
 
-    /// Python `assigned_queue_keys`（多实例分配「不重不漏」验证用）。
+    /// 当前分配到的队列 key（多实例分配「不重不漏」验证用）。
     pub fn assigned_queue_keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = lock(&self.inner.state)
             .assigned
@@ -1895,7 +1894,7 @@ impl DefaultMQPushConsumer {
                 ) {
                     Ok(got) => assigned.extend(got),
                     Err(e) => {
-                        // Python 在这里直接 `return`：本轮分配结果整个作废，
+                        // 这里直接放弃本轮：分配结果整个作废，
                         // 连已算好的 topic 都不写入（下一轮 20s 后再试）。照抄。
                         rmq_error!(
                             "allocate message queue exception. strategy name: {}, ex: {}",
@@ -2021,7 +2020,7 @@ impl DefaultMQPushConsumer {
         Some(out)
     }
 
-    /// Python `_rebalance_pull_threads`：按当前分配同步循环任务集，并清理被撤销队列。
+    /// 按当前分配同步循环任务集，并清理被撤销队列。
     ///
     /// 队列被撤走时必须 ①持久化已消费位点 ②丢弃缓冲（在途消息不再消费）
     /// ③顺序消费还要 UNLOCK_BATCH_MQ —— 少任何一步，被撤销队列里的在途消息会被
@@ -2074,7 +2073,7 @@ impl DefaultMQPushConsumer {
                 state.frozen_offsets.remove(key);
                 let token = self.inner.next_token.fetch_add(1, Ordering::SeqCst);
                 state.queue_owners.insert(key.clone(), token);
-                // Python 在分配那一刻就把 `_mq_map[key] = mq` 登记好：队列即使一条消息都没
+                // 分配那一刻就把 `_mq_map[key] = mq` 登记好：队列即使一条消息都没
                 // 拉到，也要能在 307/220 里看到、位点也能持久化。
                 state.mq_map.insert(key.clone(), mq.clone());
                 // 新循环的第一次盖章由它自己在发起拉取时打；这里先给个起点，
@@ -2108,7 +2107,7 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// Python `_retire_queue_locked`：把一把队列的所有痕迹摘干净，并把它要持久化的
+    /// 把一把队列的所有痕迹摘干净，并把它要持久化的
     /// 已消费位点交给 `revoked` 列表。
     ///
     /// `fallback_mq` 是停摆自愈用的：队列仍在分配里（`mq_map` 不能留成脏），
@@ -2143,7 +2142,7 @@ impl DefaultMQPushConsumer {
         revoke_queues(&self.inner, revoked).await;
     }
 
-    /// Python `_on_consumer_ids_changed`（40 的处理）。
+    /// broker 通知消费组实例变化（响应码 40）→ 请求立刻重平衡。
     fn request_rebalance(&self) {
         self.inner.rebalance_now.store(true, Ordering::SeqCst);
         self.inner.rebalance_signal.notify_waiters();
@@ -2152,7 +2151,7 @@ impl DefaultMQPushConsumer {
 
 // ---------------- 位点解析 ----------------
 
-/// 自由函数：拉取循环只持有 `Arc<Inner>`（模块头差异 4），拿不到消费者句柄。
+/// 自由函数：拉取循环只持有 `Arc<Inner>`（结构取舍 4），拿不到消费者句柄。
 async fn resolve_initial_offset(
     inner: &Inner,
     client: &MQClientInstance,
@@ -2264,7 +2263,7 @@ async fn handle_offset_illegal(inner: &Arc<Inner>, key: &str) {
 
 // ================================================================ 后台循环
 //
-// 拆成自由函数而不是 `&self` 方法：任务只持 `Weak<Inner>`（模块头差异 4），
+// 拆成自由函数而不是 `&self` 方法：任务只持 `Weak<Inner>`（结构取舍 4），
 // 否则 `实例 → 传输 → 任务 → 消费者` 成环，消费者永不释放。
 
 /// `stop` 通道是否已置位（含发送端已释放）。
@@ -2272,7 +2271,7 @@ fn stopped(rx: &watch::Receiver<bool>) -> bool {
     *rx.borrow() || rx.has_changed().is_err()
 }
 
-/// Python 的 `Event.wait(timeout)`：到点返回 false，收到停止信号返回 true。
+/// 等一个超时窗口：到点返回 false，收到停止信号返回 true。
 async fn wait_or_stop(rx: &mut watch::Receiver<bool>, millis: u64) -> bool {
     match tokio::time::timeout(Duration::from_millis(millis), rx.changed()).await {
         Ok(Ok(())) => stopped(rx),
@@ -2282,7 +2281,7 @@ async fn wait_or_stop(rx: &mut watch::Receiver<bool>, millis: u64) -> bool {
     }
 }
 
-/// Python `_owns_queue`：本循环是否仍持有该队列。
+/// 本循环是否仍持有该队列。
 fn owns_queue(inner: &Inner, key: &str, token: u64) -> bool {
     lock(&inner.state)
         .queue_owners
@@ -2290,7 +2289,7 @@ fn owns_queue(inner: &Inner, key: &str, token: u64) -> bool {
         .is_some_and(|t| *t == token)
 }
 
-/// Python 里循环入口的 `self._last_pull_table[key] = time.time()` +
+/// 循环入口的两处盖章：`last_pull_table[key]` +
 /// `pq.last_pop_timestamp = now`：在**发起**本轮拉取/弹出前盖章。
 ///
 /// POP 模式下两处时间一起写：`_last_pull_table` 供 rebalance 判停摆，
@@ -2349,13 +2348,13 @@ fn update_pull_from_which_node(state: &mut State, mq: &MessageQueue, suggest: Op
         .insert(mq.clone(), suggest.unwrap_or(MixAll::MASTER_ID as i64));
 }
 
-/// Python `_queue_pull_loop`：单队列长轮询拉取 → 推入待消费缓冲。
+/// 单队列长轮询拉取 → 推入待消费缓冲。
 ///
 /// 每队列一个循环（不是共享线程池），因为 broker 为每个队列各挂起一个长轮询；
 /// 共用一个循环会让空队列的 ~15s 挂起阻塞其余队列的投递。
 ///
 /// 这层壳只负责收尾：任务体无论从哪里 `return`，只要还占着归属就留下停摆哨兵，
-/// 下一轮 rebalance 会重建它（Python 靠 `thread.is_alive()`，tokio 任务没这个问法）。
+/// 下一轮 rebalance 会重建它（tokio 任务没有 `thread.is_alive()` 这种问法）。
 async fn queue_pull_loop(inner: Arc<Inner>, mq: MessageQueue, token: u64) {
     let key = mq_key(&mq);
     run_queue_pull_loop(inner.clone(), mq, token).await;
@@ -2677,7 +2676,7 @@ async fn heartbeat_once(inner: &Arc<Inner>) -> usize {
     ok
 }
 
-/// Python `_heartbeat_loop`（消费者**必须**注册到 broker，否则 rebalance 的
+/// 心跳循环：消费者**必须**注册到 broker，否则重平衡的
 /// GET_CONSUMER_LIST_BY_GROUP 拿不到列表）。
 async fn heartbeat_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     loop {
@@ -2724,7 +2723,7 @@ async fn lock_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     }
 }
 
-/// Python `_dispatch_loop`：串行地把各队列缓冲里的批次交给监听器消费。
+/// 串行地把各队列缓冲里的批次交给监听器消费。
 async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
     loop {
         if stopped(&rx) || !inner.started.load(Ordering::Acquire) {
@@ -2804,7 +2803,7 @@ async fn dispatch_loop(inner: Arc<Inner>, mut rx: watch::Receiver<bool>) {
 }
 
 impl DefaultMQPushConsumer {
-    /// 起全部后台循环（Python `_start_*_loop` 的集合）。
+    /// 起全部后台循环。
     fn spawn_loops(&self) {
         let Some(handle) = self.runtime_handle() else {
             rmq_warn!("consumer: no tokio runtime, background loops disabled");
@@ -2862,7 +2861,7 @@ fn shutdown_persist_items(inner: &Inner) -> Vec<(MessageQueue, i64)> {
         .collect()
 }
 
-/// Python `_persist_offsets_once`（集群模式刷 broker / 广播模式刷本地）。
+/// 位点持久化一轮（集群模式刷 broker / 广播模式刷本地）。
 async fn persist_offsets_once(inner: &Arc<Inner>, client: &MQClientInstance) {
     let cfg = read_cfg(inner);
     if cfg.message_model == MessageModel::BROADCASTING {
@@ -3161,7 +3160,7 @@ fn save_local_offsets_at(
     Ok(())
 }
 
-/// Python `_load_local_offsets`：主文件缺失/损坏时回退 `.bak`，都失败当「没有
+/// 主文件缺失/损坏时回退 `.bak`，都失败当「没有
 /// 本地位点」。
 fn load_local_offsets(inner: &Inner) -> BTreeMap<String, i64> {
     let Some(path) = local_offset_path(inner) else {
@@ -3553,8 +3552,8 @@ async fn process_pop_consume_result(
         // RECONSUME_LATER：一条都不 ack
         ack_index = -1;
     }
-    // `acked` 既是「前 acked 条成功、逐条 ack」的边界，也是 Python 第二个
-    // `range(ack_index + 1, len(msgs))` 的起点：ack_index == -1 时它是 0，
+    // `acked` 既是「前 acked 条成功、逐条 ack」的边界，也是第二批逐条 ack
+    // 的起点：ack_index == -1 时它是 0，
     // 剩下的每一条仍要 pq.ack() 并延长不可见时间。
     let acked = if ack_index >= 0 {
         usize::try_from(ack_index).unwrap_or(0) + 1
@@ -3576,7 +3575,7 @@ async fn process_pop_consume_result(
     }
 }
 
-/// Python `_check_need_ack_or_delay`：重试次数用尽后的兜底。
+/// 重试次数用尽后的兜底。
 fn check_need_ack_or_delay(inner: &Inner, msg: &MessageExt, cfg: &ConsumerConfig) {
     let table = &cfg.pop_delay_level;
     let Some((last_second,)) = table.last().map(|v| (*v,)) else {
@@ -3602,7 +3601,7 @@ fn check_need_ack_or_delay(inner: &Inner, msg: &MessageExt, cfg: &ConsumerConfig
     change_pop_invisible_time(inner, msg, level, cfg);
 }
 
-/// Python `_pop_ck_target`：从 POP_CK 解出 ack/延长不可见时间需要的五元组。
+/// 从 POP_CK 解出 ack/延长不可见时间需要的五元组。
 ///
 /// 两处都不能想当然：① topic 要按 CK 的 retryFlag 用 `getRealTopic` 还原（复活消息的
 /// 真实 topic 是 `%RETRY%<group>_<topic>`，不是消息上的 topic）；② 地址要按 CK 里的
@@ -3676,7 +3675,7 @@ fn ack_pop_msg(inner: &Inner, msg: &MessageExt) {
     });
 }
 
-/// Python `_change_pop_invisible_time`：`delay_level == 0` 时用消息已重试次数当档位；
+/// `delay_level == 0` 时用消息已重试次数当档位；
 /// 档位表单位是**秒**，接口要毫秒。
 fn change_pop_invisible_time(
     inner: &Inner,
@@ -3775,9 +3774,9 @@ fn build_consume_hook_context(
     context
 }
 
-/// Python `_consume_return_type`（决定轨迹的 contextCode）。
+/// 消费返回类型（决定轨迹的 contextCode）。
 ///
-/// Python 的 `succeeded` 形参在这里用不到 —— 非 failed 的两种情况都返回 SUCCESS，
+/// 「是否成功」这个入参在这里用不到 —— 非 failed 的两种情况都返回 SUCCESS，
 /// 故本函数不收这个参数。
 fn consume_return_type(
     status: Option<&str>,
@@ -3799,7 +3798,7 @@ fn consume_return_type(
     if failed {
         ConsumeReturnType::Failed
     } else {
-        // Python 这里还写了 `if succeeded: SUCCESS`，两条分支同值，故合并
+        // 两条分支同值，故合并
         ConsumeReturnType::Success
     }
 }
@@ -3839,7 +3838,7 @@ fn record_consume_rt(inner: &Inner, topic: &str, begin_ms: i64) {
     stats.inc_consume_rt(&read_cfg(inner).consumer_group, topic, rt);
 }
 
-/// Python `_finish_consume_hook`：把 returnType/status/success 写回上下文并触发 after 钩子。
+/// 把 returnType/status/success 写回上下文并触发 after 钩子。
 #[allow(clippy::too_many_arguments)]
 fn finish_consume_hook(
     inner: &Inner,
@@ -3886,7 +3885,7 @@ async fn call_concurrently_listener(
     let listener = match lock(&inner.listener).as_ref().cloned() {
         Some(MessageListener::Concurrently(l)) => l,
         Some(MessageListener::Orderly(_)) => {
-            // 顺序监听器 + 并发调用：Python 里 isinstance 判过，不会走到这里
+            // 顺序监听器 + 并发调用：调用方已按监听器类型分流，不会走到这里
             return (None, true);
         }
         None => return (None, true),
@@ -3939,7 +3938,7 @@ async fn call_orderly_listener(
     }
 }
 
-/// Python `_consume_batch`：消费一个批次并处理回投/挂起，返回位点是否前进。
+/// 消费一个批次并处理回投/挂起，返回位点是否前进。
 async fn consume_batch(
     inner: &Arc<Inner>,
     key: &str,
@@ -4231,7 +4230,7 @@ async fn send_back_batch(
     failed
 }
 
-/// Python `_advance_consume_offset`：取本批最大 queueOffset + 1，且**不回退**。
+/// 取本批最大 queueOffset + 1，且**不回退**。
 /// `floor` 是「不能越过的位点」（回投失败被塞回队首的那几条里最小的 offset）。
 fn advance_consume_offset(
     inner: &Inner,
@@ -4498,7 +4497,7 @@ fn orderly_suspend_millis(cfg: &ConsumerConfig, ctx: &ConsumeOrderlyContext) -> 
     ms.clamp(10, 30000) as u64
 }
 
-/// Python `send_message_back`（CONSUMER_SEND_MSG_BACK=36）。
+/// 回投重试队列（CONSUMER_SEND_MSG_BACK=36）。
 async fn send_message_back(
     inner: &Arc<Inner>,
     msg: &MessageExt,
@@ -4637,15 +4636,15 @@ fn build_retry_message(cfg: &ConsumerConfig, msg: &MessageExt, max_times: i32) -
 // **对应的**消费者），这里只实现被回调的那一侧。40 是唯一由消费者自己注册的，
 // 因为它的动作就是「叫醒本消费者的 rebalance 循环」。
 
-/// Python `set_host_consumer(self)`（`trace_dispatcher.py:117-118`）的宿主端：
-/// 分发器 `_client_id` 读的就是宿主 `_mq_client.client_id`，未启动时是空串。
+/// 轨迹分发器的宿主端：
+/// 分发器取的 `client_id` 就是宿主这里持有实例的 `client_id`，未启动时是空串。
 impl TraceHost for DefaultMQPushConsumer {
     fn client_id(&self) -> String {
         DefaultMQPushConsumer::client_id(self)
     }
 }
 
-/// Python `_on_consumer_ids_changed`：broker 通知消费组实例变化 → 立即重算。
+/// broker 通知消费组实例变化 → 立即重算。
 impl RegisteredConsumer for DefaultMQPushConsumer {
     fn client_id(&self) -> String {
         self.client_id()
@@ -4905,7 +4904,7 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
                     ConsumeOrderlyStatus::Rollback => CMResult::CR_ROLLBACK,
                 }
             }
-            // Python 的 `else None`：没有监听器 → 状态为 None → CR_RETURN_NULL
+            // 没有监听器 → 状态为 None → CR_RETURN_NULL
             None => CMResult::CR_RETURN_NULL,
         };
         result.consume_result = Some(status.to_string());
@@ -4927,18 +4926,18 @@ impl RegisteredConsumer for DefaultMQPushConsumer {
 // ================================================================ 对外能力与弹性
 
 impl DefaultMQPushConsumer {
-    /// Python `get_consumer_group`。
+    /// 消费组名（保留历史命名的别名）。
     pub fn get_consumer_group(&self) -> String {
         self.consumer_group()
     }
 
-    /// Python `fetch_subscribe_message_queues`。
+    /// 取订阅 topic 当前的队列列表。
     pub async fn fetch_subscribe_message_queues(&self, topic: &str) -> Result<Vec<MessageQueue>> {
         let client = require_client(&self.inner)?;
         Ok(client.get_topic_subscribe_info(topic).await)
     }
 
-    /// Python `msg_acc_cnt(key=None)`：给 key 读单队列，不给则求和。
+    /// 给 key 读单队列，不给则求和。
     pub fn msg_acc_cnt(&self, key: Option<&str>) -> i64 {
         let state = lock(&self.inner.state);
         match key {
@@ -4947,7 +4946,7 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// Python `compute_accumulation_total`：所有 ProcessQueue 的 `msgAccCnt` 之和。
+    /// 所有 ProcessQueue 的 `msgAccCnt` 之和。
     pub fn compute_accumulation_total(&self) -> i64 {
         self.msg_acc_cnt(None)
     }
@@ -4999,7 +4998,7 @@ impl DefaultMQPushConsumer {
         true
     }
 
-    /// Python `get_core_pool_size`：非自建执行器时返回 -1。
+    /// 非自建执行器时返回 -1。
     pub fn get_core_pool_size(&self) -> i32 {
         if !self.inner.owns_consume_executor.load(Ordering::SeqCst) {
             return -1;
@@ -5010,7 +5009,7 @@ impl DefaultMQPushConsumer {
         }
     }
 
-    /// Python `_apply_core_pool_size`：把声明值落到真实执行器（没有就只记声明值）。
+    /// 把声明值落到真实执行器（没有就只记声明值）。
     fn apply_core_pool_size(&self) {
         let core = self.inner.core_pool_size.load(Ordering::SeqCst);
         if let Some(executor) = lock(&self.inner.pop_executor).as_ref() {
@@ -5271,7 +5270,7 @@ mod tests {
 
     /// 默认值逐项对照 `python/client/consumer.py`（`DefaultMQPushConsumer.__init__`）。
     #[test]
-    fn config_defaults_match_the_python_reference() {
+    fn config_defaults_match_the_golden_reference() {
         let cfg = ConsumerConfig::default();
         assert_eq!(cfg.consumer_group, MixAll::DEFAULT_CONSUMER_GROUP);
         assert_eq!(cfg.instance_name, "DEFAULT");
@@ -5354,7 +5353,7 @@ mod tests {
 
     #[test]
     fn blank_consumer_group_is_rejected() {
-        // Python：`MQClientException("consumerGroup is empty")`
+        // 拒绝文案逐字校验："consumerGroup is empty"
         for group in ["", "   ", "\t\n"] {
             assert!(
                 DefaultMQPushConsumer::new(group).is_err(),
@@ -5430,7 +5429,7 @@ mod tests {
         );
     }
 
-    /// Python `getMQQueueCacheKey`：三段**直接拼接**，无分隔符。
+    /// 三段**直接拼接**，无分隔符。
     #[test]
     fn mq_key_concatenates_topic_broker_and_queue_id() {
         assert_eq!(
@@ -5989,7 +5988,7 @@ mod tests {
         assert_eq!(subs[0].sub_string, "TagA||TagB");
         assert_eq!(subs[0].expression_type, ExpressionType::TAG);
 
-        // 同 topic 再订阅是**替换**，不是追加（Python `_subscription_data[topic] = ..`）
+        // 同 topic 再订阅是**替换**，不是追加
         consumer
             .subscribe_with_selector("T", &MessageSelector::by_sql("a > 1"))
             .unwrap();
@@ -5999,7 +5998,7 @@ mod tests {
         assert_eq!(subs[0].expression_type, ExpressionType::SQL92);
         assert!(lock(&consumer.inner.state).subscription("T").is_some());
 
-        // 命名空间在订阅时就拼进 topic（Python `_with_namespace`）
+        // 命名空间在订阅时就拼进 topic
         consumer.update_config(|c| c.namespace = "Ns".to_string());
         consumer.subscribe("Other", "*").unwrap();
         assert!(lock(&consumer.inner.state)
@@ -6093,7 +6092,7 @@ mod tests {
         stage(&consumer, &mq, vec![sized_msg(1, 0), sized_msg(1, 1)]);
         assert!(flow_control_hit(&consumer.inner, &mq, &key), "2 >= 2");
 
-        // 主题级大小：闸门只看 pullThresholdSizeForTopic（Python 同一判据），
+        // 主题级大小：闸门只看 pullThresholdSizeForTopic，
         // 队列级那道关掉（0）时主题级那道必须照常生效 —— 复用队列级开关会让它静默失效
         only(&consumer, |c| {
             c.pull_threshold_size_for_queue = 100;
@@ -6795,7 +6794,7 @@ mod tests {
         assert_eq!(tps().times(), 1);
     }
 
-    /// Python `_is_pop_timeout`：拿不到 popTime/invisibleTime 时**一律算超时**，
+    /// 拿不到 popTime/invisibleTime 时**一律算超时**，
     /// 于是走「重新计算可见性」而不是「原样重投」。
     #[test]
     fn pop_timeout_compares_the_invisible_window() {
@@ -6808,7 +6807,7 @@ mod tests {
         assert!(is_pop_timeout(&one(), now - 60_000, 60_000), "窗口已过");
     }
 
-    /// Python `_process_pop_consume_result` 的两段 `range`：无论消费结果如何，
+    /// POP 消费结果处理的两段遍历：无论消费结果如何，
     /// 每条消息都必须**恰好** `pq.ack()` 一次 —— 漏一条，`waitAckCounter` 就永久
     /// 泄漏，攒到 `popThresholdForQueue` 后该队列再也不弹新消息。
     #[tokio::test]
@@ -6819,7 +6818,7 @@ mod tests {
             (ConsumeConcurrentlyStatus::ConsumeSuccess, 99, 3),
             // 默认 -1：一条都不算「成功 ack」，但其余每条仍要延长不可见时间
             (ConsumeConcurrentlyStatus::ConsumeSuccess, -1, 3),
-            // RECONSUME_LATER：Python 依然遍历每一条
+            // RECONSUME_LATER 依然遍历每一条
             (ConsumeConcurrentlyStatus::ReconsumeLater, -1, 3),
             (ConsumeConcurrentlyStatus::ReconsumeLater, 0, 1),
         ] {
@@ -6840,7 +6839,7 @@ mod tests {
         }
     }
 
-    /// Python `_pop_ck_target`：POP_CK 缺失/畸形都当「无法 ack」，不 panic。
+    /// POP_CK 缺失/畸形都当「无法 ack」，不 panic。
     #[test]
     fn pop_ck_target_rejects_missing_or_malformed_ck() {
         let consumer = DefaultMQPushConsumer::new("G").unwrap();
@@ -7054,9 +7053,9 @@ mod tests {
 
     // ---------------- 消费结果与投递前还原 ----------------
 
-    /// Python `_consume_return_type`（决定轨迹 contextCode）。
+    /// 消费返回类型（决定轨迹 contextCode）。
     #[test]
-    fn consume_return_type_follows_the_python_branches() {
+    fn consume_return_type_follows_the_recorded_branches() {
         // status 为 None：有异常 → EXCEPTION，无异常 → RETURNNULL
         assert_eq!(
             consume_return_type(None, true, 0, 15, true),
@@ -7090,7 +7089,7 @@ mod tests {
         assert_eq!(ConsumeReturnType::Failed.code(), 4);
     }
 
-    /// Python `_reset_retry_topic_and_namespace`：交给 listener 之前还原 topic。
+    /// 交给 listener 之前还原 topic。
     #[test]
     fn retry_topic_and_namespace_are_reset_before_delivery() {
         let consumer = DefaultMQPushConsumer::new("MyGroup").unwrap();
@@ -7123,7 +7122,7 @@ mod tests {
 
     // ---------------- 本地（BROADCASTING）位点 ----------------
 
-    /// 位点文件是「队列 key -> offset」的扁平 JSON 对象（Python `json.dump(dict)`）。
+    /// 位点文件是「队列 key -> offset」的扁平 JSON 对象。
     #[test]
     fn local_offsets_are_a_flat_json_object_of_queue_key() {
         let consumer = DefaultMQPushConsumer::new("RustTestNeverWrittenGroup").unwrap();
@@ -7134,7 +7133,7 @@ mod tests {
         };
         assert!(path.ends_with("RustTestNeverWrittenGroup/offsets.json"));
         assert!(!path.exists(), "本测试不写文件");
-        // 文件不存在 → 空表（Python：任何读失败都当「没有位点」，不抛异常）
+        // 文件不存在 → 空表（任何读失败都当「没有位点」，不抛异常）
         assert!(load_local_offsets(&consumer.inner).is_empty());
 
         let items: BTreeMap<String, i64> =
@@ -7143,7 +7142,7 @@ mod tests {
         assert_eq!(text, r#"{"Tbroker-a0":42}"#);
         let back: BTreeMap<String, i64> = serde_json::from_str(&text).unwrap();
         assert_eq!(back.get("Tbroker-a0"), Some(&42));
-        // 坏 JSON 会让读取失败 → Python 的 try/except 语义下退化成空表
+        // 坏 JSON 会让读取失败 → 退化成空表
         assert!(serde_json::from_str::<BTreeMap<String, i64>>("[not, an, object]").is_err());
     }
 
@@ -7698,7 +7697,7 @@ mod tests {
     #[test]
     fn local_offsets_load_reads_contract_written_file() {
         let dir = std::env::temp_dir().join(format!(
-            "rmq_rust_offsets_java_{}_{}",
+            "rmq_rust_offsets_wire_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -8915,7 +8914,7 @@ mod tests {
     #[test]
     fn trace_host_reports_empty_client_id_before_start() {
         let c = DefaultMQPushConsumer::new("GID_trace_host").expect("合法组名不该构造失败");
-        // Python `_client_id`：宿主没有 _mq_client 时返回空串
+        // 宿主没有 _mq_client 时返回空串
         assert_eq!(TraceHost::client_id(&c), "");
     }
 

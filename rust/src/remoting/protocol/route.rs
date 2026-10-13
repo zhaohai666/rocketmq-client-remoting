@@ -512,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn topic_route_data_golden_json_matches_python() {
+    fn topic_route_data_matches_golden_json() {
         let trd = TopicRouteData::from_json_value(&value(TOPIC_ROUTE)).unwrap();
         assert_eq!(
             RemotingSerializable::to_json_string(&trd.to_json_value()),
@@ -665,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn clone_and_change_detection_match_python() {
+    fn clone_and_change_detection_match_golden() {
         let trd = TopicRouteData::from_json_value(&value(TOPIC_ROUTE)).unwrap();
         assert!(!trd.topic_route_data_changed(Some(&trd.clone_topic_route_data())));
         assert!(trd.topic_route_data_changed(None));

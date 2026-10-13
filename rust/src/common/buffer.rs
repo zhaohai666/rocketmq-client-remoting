@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn decimal_long_matches_python() {
+    fn decimal_long_matches_golden() {
         // 线上格式：8 位十进制长度前缀 + ASCII 数字，如 0 -> 0000000130
         let vectors = [
             (0i64, "0000000130"),
