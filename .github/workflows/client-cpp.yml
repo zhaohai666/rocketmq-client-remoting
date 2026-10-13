@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - 'cpp/**'
+      - 'scripts/check_cpp_portable_includes.py'
       - '.github/workflows/client-cpp.yml'
   pull_request:
     paths:
       - 'cpp/**'
+      - 'scripts/check_cpp_portable_includes.py'
       - '.github/workflows/client-cpp.yml'
 
 concurrency:
@@ -24,6 +26,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build zlib1g-dev g++
+
+      # 放在编译之前：CI 的标准库裁剪了头文件间的传递包含，缺直接包含的文件会
+      # 「编到第 N 个目标才报错、一次只暴露一个」。这里静态扫一遍全部一次列出来。
+      - name: Check direct standard-library includes
+        run: python3 scripts/check_cpp_portable_includes.py cpp
 
       - name: Configure
         run: cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release
