@@ -69,6 +69,7 @@ import { decodeMessages } from '../common/messageDecoder.ts';
 import { Validators } from '../common/validators.ts';
 import { DefaultMQProducer } from './producer.ts';
 import { registerRpcHooks } from '../remoting/rpc_hooks.ts';
+import { AclRPCHook } from '../remoting/acl.ts';
 import type { SocksProxyConfig } from '../remoting/socks_proxy.ts';
 import { getLogger } from '../logging.ts';
 import { RemotingTimeoutException } from '../remoting/exception.ts';
@@ -132,6 +133,11 @@ export class DefaultMQPushConsumer {
   // Server-side namespaceV2 — the `nsd`/`ns` extFields stamped by
   // NamespaceRpcHook, independent from `namespace`.
   namespaceV2: string | null = null;
+  // User RPCHook (e.g. AclRPCHook for broker-side ACL signing), installed on
+  // the MQClientInstance's remoting client at creation, exactly like the
+  // producer's `rpcHook`. Registered AFTER the namespace hook so the ACL
+  // signature covers every extField the namespace hook stamps.
+  rpcHook: AclRPCHook | null = null;
   instanceName = 'DEFAULT';
   clientID = '';
   unitMode = false;
@@ -428,7 +434,10 @@ export class DefaultMQPushConsumer {
       if (this.tlsEnable != null) client.remotingClient.tlsEnable = this.tlsEnable;
       if (this.tlsOptions != null) client.remotingClient.tlsOptions = this.tlsOptions;
       if (this.socksProxyConfig != null) client.remotingClient.socksProxyConfig = this.socksProxyConfig;
-      registerRpcHooks(client.remotingClient, { namespaceV2: () => this.namespaceV2 });
+      registerRpcHooks(client.remotingClient, {
+        namespaceV2: () => this.namespaceV2,
+        userHook: this.rpcHook,
+      });
     }
     manager.registerClient(this.clientID, client);
     this.mqClient = client;

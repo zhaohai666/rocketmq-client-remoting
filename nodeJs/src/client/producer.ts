@@ -732,6 +732,11 @@ export class DefaultMQProducer {
     }
     let lastBrokerName: string | null = null;
     let sendResult: SendResult | null = null;
+    // When every attempt failed with a broker ANSWER (not a transport error),
+    // the caller needs that answer — response code and remark — not a generic
+    // retry-exhausted message. Auth rejections (NO_PERMISSION) in particular
+    // are only provable through the code.
+    let lastBrokerErr: MQBrokerException | null = null;
     // Contract: `timesTotal = SYNC ? 1 + retryTimesWhenSendFailed : 1` — only
     // the SYNC path retries inside this loop. ASYNC owns its own chain
     // (_sendAsyncKernel, retryTimesWhenSendAsyncFailed); ONEWAY never retries.
@@ -758,6 +763,7 @@ export class DefaultMQProducer {
         }
       } catch (e) {
         logger.warn(`send to ${mq.toString()} failed (attempt ${times + 1}): ${(e as Error).message}`);
+        if (e instanceof MQBrokerException) lastBrokerErr = e;
         if (this.sendLatencyFaultEnable) {
           this.mqFaultStrategy.updateFaultItem(mq.getBrokerName(), this.sendMsgTimeout, true, false);
         }
@@ -775,6 +781,11 @@ export class DefaultMQProducer {
       }
     }
     if (sendResult == null) {
+      // Surface the broker's own answer (response code + remark) when every
+      // attempt was rejected BY THE BROKER — a generic "retries exhausted"
+      // would erase the reason (e.g. ACL NO_PERMISSION 16) that the caller
+      // must assert on. Transport-style failures keep the original message.
+      if (lastBrokerErr != null) throw lastBrokerErr;
       throw new MQClientException('failed to send message after retries');
     }
     return sendResult;

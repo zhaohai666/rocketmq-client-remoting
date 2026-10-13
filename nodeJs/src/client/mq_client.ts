@@ -497,6 +497,10 @@ export class MQClient {
     header.unitMode = false;
     header.maxReconsumeTimes = null;
     header.brokerName = mq.getBrokerName();
+    // The broker only takes the batch path when the header says so: requestCode
+    // alone leaves the packed body stored as ONE ordinary message, which no
+    // consumer can read back as its individual members.
+    header.batch = isBatch;
 
     if (MixAll.isRetryTopic(topic)) {
       const rt = msg.getProperty(MessageConst.PROPERTY_RECONSUME_TIME);
