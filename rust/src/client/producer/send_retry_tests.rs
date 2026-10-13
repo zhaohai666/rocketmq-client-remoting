@@ -1249,13 +1249,19 @@ impl SendMessageHook for ParkingSendHook {
         let began = lock(&self.clock).unwrap_or_else(Instant::now);
         lock(&self.entries).push((label, began.elapsed().as_millis()));
         // 30s 兜底：用例中途 panic 时不能让池消费者永久卡住，否则测试进程挂死。
+        // 必须读 WaitTimeoutResult：把它丢掉就等于重新无超时等待，兜底形同虚设。
         let mut guard = self
             .gate
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         while !*guard {
             match self.opened.wait_timeout(guard, Duration::from_secs(30)) {
-                Ok((next, _)) => guard = next,
+                Ok((next, timed_out)) => {
+                    guard = next;
+                    if timed_out.timed_out() {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
@@ -1298,16 +1304,32 @@ async fn backpressure_producer_with_hook(
     producer
 }
 
-/// 真机验证 B3 的离线对拍（`examples/live_backpressure.rs`）：**池子消费者全被在途占住
-/// 时，运行时扩容仍然要把卡在闸上的那一笔叫醒并真的发出去**。
+/// 卡在 before 钩子里的在途笔数：比条数闸少一份，缺的那一份由测试自己占住。
+///
+/// 为什么要测试代占这一份：条数闸的下限和**池并发额度的下限**是同一个数
+/// （[`MIN_ASYNC_SEND_NUM`]，见 [`async_sender_worker_count`]），两核机器上都是 10。
+/// 让 10 笔全卡进钩子，第 11 笔就只能在池队列里等一个额度、永远走不到闸上 —— 用例
+/// 变成赌宿主有几个核。占住一份后卡钩子的只有 9 笔，额度恒 ≥ 10，第 10 笔必然能在
+/// 池里跑起来并停在闸上，形状与核数无关。
+const PARKED_IN_HOOK: usize = MIN_ASYNC_SEND_NUM as usize - 1;
+
+/// 真机验证 B3 的离线对拍（`examples/live_backpressure.rs`）：**池内消费者都被同步钩子
+/// 按住时，运行时扩容仍然要把卡在闸上的那一笔叫醒并真的发出去**。
 ///
 /// 单线程运行时测不出这件事——那里池任务只在调用方 await 时才跑，闸和池纠缠不到一起，
 /// 所以这一条要显式多样本运行时（与真机脚本同样的形状）。丢唤醒如果回归，这里会先红。
 ///
-/// 10 笔在途全部卡在 before 钩子里、测试不放行就谁也归还不了许可，因此第 11 笔过闸
-/// 这件事本身就是「扩容抬了闸」的证据，不需要拿时长去猜。
+/// 判定不看时长：9 笔卡在 before 钩子里、测试不放行就谁也归还不了许可，闸上缺的那一份
+/// 又由测试自己占着，所以第 10 笔「出现在钩子里」这件事本身就只能扩容抬了闸。
 #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
-async fn resize_wakes_the_parked_sender_while_the_pool_is_saturated() {
+async fn resize_wakes_the_gate_waiter_while_pool_workers_are_parked() {
+    let workers = async_sender_worker_count();
+    assert!(
+        workers > PARKED_IN_HOOK,
+        "池并发额度({workers})容不下 {} 笔卡进钩子再加第 {} 笔停在闸上",
+        PARKED_IN_HOOK,
+        PARKED_IN_HOOK + 1
+    );
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
     let hook = Arc::new(ParkingSendHook::new());
@@ -1316,37 +1338,63 @@ async fn resize_wakes_the_parked_sender_while_the_pool_is_saturated() {
             .await;
     hook.begin();
 
+    // 闸差一份就满，这一份由测试占住，于是卡钩子的笔数就此与核数无关。
+    assert!(
+        producer
+            .inner
+            .semaphore_async_send_num
+            .try_acquire(1, 0)
+            .await,
+        "起手时条数闸应当有空闲许可可占"
+    );
+
     let held = Arc::new(Recorder::default());
-    for _ in 0..MIN_ASYNC_SEND_NUM {
+    for _ in 0..PARKED_IN_HOOK {
         producer
             .send_async(labelled(8, "held"), held.clone(), Some(15_000), None)
-            .expect("10 笔都该排进池队列");
+            .expect("9 笔都该排进池队列");
     }
-    // 必须等闸门真的被占满再补第 11 笔：池子里的任务和主任务并发，谁先到闸口不一定。
-    // 先过闸的那笔会拿到许可，于是「卡住的第 11 笔」会变成「卡住的第 11 笔 held」，
-    // 下面的判定就只是运气了（真机 B3 用看门线程盯同一件事）。
+    // 必须等 9 笔真的卡进钩子再补第 10 笔：池里的任务和主任务并发，谁先到闸口不一定。
+    // 先过闸的那笔会拿到许可，「卡住的第 10 笔」就变成「卡住的第 10 笔 held」，
+    // 下面的判定只是运气（真机 B3 用看门线程盯同一件事）。
     assert!(
-        wait_until(|| producer.semaphore_async_send_num_available_permits() == 0).await,
-        "10 笔没能占满条数闸（空闲 {}）",
-        producer.semaphore_async_send_num_available_permits()
+        wait_until(|| hook.count_of("held") == PARKED_IN_HOOK).await,
+        "{} 笔没能全部卡进钩子（已记录 {}）",
+        PARKED_IN_HOOK,
+        hook.dump()
+    );
+    assert_eq!(
+        producer.semaphore_async_send_num_available_permits(),
+        0,
+        "{} 笔在途 + 测试占的 1 份要把条数闸压到刚好空",
+        PARKED_IN_HOOK
     );
 
     let woken = Arc::new(Recorder::default());
     producer
         .send_async(labelled(8, "woken"), woken.clone(), Some(15_000), None)
-        .expect("第 11 笔也该排进池队列");
+        .expect("第 10 笔也该排进池队列");
 
-    // 扩容前第 11 笔过不了闸：10 笔全都卡在钩子里，一个许可都还不回来。
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 它停在闸上（而不是还排在池队列里）是有凭据的：公平队列里多了一张票据。
+    assert!(
+        wait_until(|| producer
+            .inner
+            .semaphore_async_send_num
+            .waiting_count()
+            >= 1)
+            .await,
+        "第 10 笔没能排到闸上（钩子记录: {}）",
+        hook.dump()
+    );
     assert_eq!(
         hook.count_of("woken"),
         0,
-        "扩容之前第 11 笔不该过闸（钩子记录: {}）",
+        "扩容之前第 10 笔不该过闸（钩子记录: {}）",
         hook.dump()
     );
     producer.set_back_pressure_for_async_send_num(MIN_ASYNC_SEND_NUM + 2);
 
-    // 叫醒它的只可能是扩容：此刻 10 笔在途还全卡在钩子里，没有许可被归还过。
+    // 叫醒它的只可能是扩容：此刻 9 笔在途还全卡在钩子里，没有许可被归还过。
     assert!(
         wait_until(|| hook.count_of("woken") == 1).await,
         "扩容没把卡在闸上的那笔叫醒: {:?}",
@@ -1354,26 +1402,28 @@ async fn resize_wakes_the_parked_sender_while_the_pool_is_saturated() {
     );
     assert_eq!(
         hook.count_of("held"),
-        MIN_ASYNC_SEND_NUM as usize,
-        "10 笔并非全都卡在钩子里，第 11 笔过闸就不算扩容抬闸的证据"
+        PARKED_IN_HOOK,
+        "{} 笔并非全都卡在钩子里，第 10 笔过闸就不算扩容抬闸的证据",
+        PARKED_IN_HOOK
     );
 
     hook.open();
     assert!(
         wait_until(|| woken.done.load(Ordering::SeqCst) == 1).await,
-        "放行后第 11 笔没落地: {:?}",
+        "放行后第 10 笔没落地: {:?}",
         woken.errors()
     );
     assert_eq!(woken.ok.load(Ordering::SeqCst), 1, "{:?}", woken.errors());
 
     assert!(wait_until(|| held.done.load(Ordering::SeqCst)
-        == MIN_ASYNC_SEND_NUM as usize)
+        == PARKED_IN_HOOK)
         .await);
-    assert_eq!(cluster.requests(0), MIN_ASYNC_SEND_NUM as usize + 1);
+    assert_eq!(cluster.requests(0), PARKED_IN_HOOK + 1);
+    producer.inner.semaphore_async_send_num.release(1);
     assert_eq!(
         producer.semaphore_async_send_num_available_permits(),
         MIN_ASYNC_SEND_NUM + 2,
-        "全部落地后空闲许可 = 新容量"
+        "全部落地、测试占的那份也归还后空闲许可 = 新容量"
     );
     producer.shutdown();
 }
@@ -1385,10 +1435,13 @@ fn body_of(len: usize) -> Message {
 
 /// 轮询等待条件成立（最多约 15s），避免用固定 sleep 猜时长。
 ///
-/// 预算给到 15s 而不是 3s：这类用例跑在 32 个 worker 线程的多样本运行时上，低配 CI
-/// runner 只有两三个核，光是"被调度到"就是几百毫秒量级（同一条链路在 CI 上实测到过
-/// 601ms）。条件一满足就立刻返回，宽预算只会拖慢真失败的上报，不会拖慢绿跑；反过来
-/// 押 3s 只会把"调度慢"报成"回归"。
+/// 预算给到 15s 而不是 3s：CI runner 只有两四个核，却要跑 32 个 worker 线程的运行时和
+/// 整套并发用例，光"被调度到"就是几百毫秒量级。条件一满足就立刻返回，宽预算只会拖慢
+/// 真失败的上报，不会拖慢绿跑；反过来押 3s 只会把"调度慢"报成"回归"。
+///
+/// ⚠ 反过来也别拿时长当判据：这条链路上真出过的事是「池额度被卡在钩子里的在途占满，
+/// 第 N+1 笔根本没被派发」，放大时长窗口永远修不掉它，只能换成状态判据（见
+/// `resize_wakes_the_gate_waiter_while_pool_workers_are_parked`）。
 async fn wait_until<F: Fn() -> bool>(cond: F) -> bool {
     for _ in 0..1500 {
         if cond() {
