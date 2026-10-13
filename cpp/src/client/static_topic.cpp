@@ -1,6 +1,8 @@
 // 静态主题路由：类型化解析 + 端点推导（见 static_topic.h 的 wire 事实说明）。
 #include "rocketmq/client/static_topic.h"
 
+#include <algorithm>
+
 namespace rocketmq {
 namespace static_topic {
 
