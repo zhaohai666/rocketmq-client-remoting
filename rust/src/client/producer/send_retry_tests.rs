@@ -1188,22 +1188,25 @@ impl CheckForbiddenHook for SleepingForbiddenHook {
     }
 }
 
-/// 一个**阻塞式**的 before 钩子：既把「在途」占住（许可要到链终点才归还），又按标签记下
+/// 一个**阻塞式**的 before 钩子：把每一笔发送卡在钩子里，直到测试放行；同时按标签记下
 /// 每笔进钩子的相对时刻 —— 真机验证脚本里的 `SlowHook` 同构。
 ///
-/// 占住的是**池消费者所在的线程**，所以这个钩子同时测到「池子被在途占满」这一维。
+/// 卡住的笔归还不了任何许可，所以「某笔过了闸」只可能是闸被抬大，判定不用猜时长。
+/// 占住的是**池消费者所在的线程**，因此这个钩子同时测到「池子被在途占满」这一维。
 struct ParkingSendHook {
-    millis: std::sync::atomic::AtomicI64,
     clock: Mutex<Option<Instant>>,
     entries: Mutex<Vec<(String, u128)>>,
+    gate: Mutex<bool>,
+    opened: std::sync::Condvar,
 }
 
 impl ParkingSendHook {
-    fn new(millis: i64) -> ParkingSendHook {
+    fn new() -> ParkingSendHook {
         ParkingSendHook {
-            millis: std::sync::atomic::AtomicI64::new(millis),
             clock: Mutex::new(None),
             entries: Mutex::new(Vec::new()),
+            gate: Mutex::new(false),
+            opened: std::sync::Condvar::new(),
         }
     }
 
@@ -1213,16 +1216,14 @@ impl ParkingSendHook {
         lock(&self.entries).clear();
     }
 
-    fn count_of(&self, label: &str) -> usize {
-        lock(&self.entries).iter().filter(|(l, _)| l == label).count()
+    /// 放行所有卡在钩子里的发送。
+    fn open(&self) {
+        *lock(&self.gate) = true;
+        self.opened.notify_all();
     }
 
-    fn first_entry_of(&self, label: &str) -> Option<u128> {
-        lock(&self.entries)
-            .iter()
-            .filter(|(l, _)| l == label)
-            .map(|(_, at)| *at)
-            .min()
+    fn count_of(&self, label: &str) -> usize {
+        lock(&self.entries).iter().filter(|(l, _)| l == label).count()
     }
 
     fn dump(&self) -> String {
@@ -1248,9 +1249,16 @@ impl SendMessageHook for ParkingSendHook {
             .to_string();
         let began = lock(&self.clock).unwrap_or_else(Instant::now);
         lock(&self.entries).push((label, began.elapsed().as_millis()));
-        let millis = self.millis.load(Ordering::SeqCst);
-        if millis > 0 {
-            std::thread::sleep(Duration::from_millis(millis as u64));
+        // 30s 兜底：用例中途 panic 时不能让池消费者永久卡住，否则测试进程挂死。
+        let mut guard = self
+            .gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        while !*guard {
+            match self.opened.wait_timeout(guard, Duration::from_secs(30)) {
+                Ok((next, _)) => guard = next,
+                Err(_) => break,
+            }
         }
         Ok(())
     }
@@ -1296,14 +1304,14 @@ async fn backpressure_producer_with_hook(
 ///
 /// 单线程运行时测不出这件事——那里池任务只在调用方 await 时才跑，闸和池纠缠不到一起，
 /// 所以这一条要显式多样本运行时（与真机脚本同样的形状）。丢唤醒如果回归，这里会先红。
+///
+/// 10 笔在途全部卡在 before 钩子里、测试不放行就谁也归还不了许可，因此第 11 笔过闸
+/// 这件事本身就是「扩容抬了闸」的证据，不需要拿时长去猜。
 #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
 async fn resize_wakes_the_parked_sender_while_the_pool_is_saturated() {
-    const HOLD_MS: i64 = 600;
-    const RESIZE_AT: u64 = 100;
-
     let cluster = MockCluster::start(1, true).await;
     cluster.script(0, vec![], (response_code::SUCCESS, 0));
-    let hook = Arc::new(ParkingSendHook::new(HOLD_MS));
+    let hook = Arc::new(ParkingSendHook::new());
     let producer =
         backpressure_producer_with_hook("resize_in_pool", &cluster, MIN_ASYNC_SEND_NUM, hook.clone())
             .await;
@@ -1329,7 +1337,8 @@ async fn resize_wakes_the_parked_sender_while_the_pool_is_saturated() {
         .send_async(labelled(8, "woken"), woken.clone(), Some(15_000), None)
         .expect("第 11 笔也该排进池队列");
 
-    tokio::time::sleep(Duration::from_millis(RESIZE_AT)).await;
+    // 扩容前第 11 笔过不了闸：10 笔全都卡在钩子里，一个许可都还不回来。
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         hook.count_of("woken"),
         0,
@@ -1338,18 +1347,25 @@ async fn resize_wakes_the_parked_sender_while_the_pool_is_saturated() {
     );
     producer.set_back_pressure_for_async_send_num(MIN_ASYNC_SEND_NUM + 2);
 
+    // 叫醒它的只可能是扩容：此刻 10 笔在途还全卡在钩子里，没有许可被归还过。
     assert!(
-        wait_until(|| woken.done.load(Ordering::SeqCst) == 1).await,
+        wait_until(|| hook.count_of("woken") == 1).await,
         "扩容没把卡在闸上的那笔叫醒: {:?}",
         woken.errors()
     );
-    assert_eq!(woken.ok.load(Ordering::SeqCst), 1, "{:?}", woken.errors());
-    // 放行它的只可能是扩容：那一刻既晚于扩容、又早于 10 笔在途归还。
-    let entered = hook.first_entry_of("woken");
-    assert!(
-        entered.is_some_and(|at| at as u64 >= RESIZE_AT && (at as i64) < HOLD_MS),
-        "第 11 笔进内核于 {entered:?}ms（扩容在 {RESIZE_AT}ms、在途到 ≈{HOLD_MS}ms 才归还）",
+    assert_eq!(
+        hook.count_of("held"),
+        MIN_ASYNC_SEND_NUM as usize,
+        "10 笔并非全都卡在钩子里，第 11 笔过闸就不算扩容抬闸的证据"
     );
+
+    hook.open();
+    assert!(
+        wait_until(|| woken.done.load(Ordering::SeqCst) == 1).await,
+        "放行后第 11 笔没落地: {:?}",
+        woken.errors()
+    );
+    assert_eq!(woken.ok.load(Ordering::SeqCst), 1, "{:?}", woken.errors());
 
     assert!(wait_until(|| held.done.load(Ordering::SeqCst)
         == MIN_ASYNC_SEND_NUM as usize)
