@@ -5,7 +5,7 @@ import "testing"
 // The vectors below are recorded reference fixtures, captured from a measured
 // run of the namespace utility; they pin this port's answers directly.
 
-func TestWrapNamespaceVectorsMatchPython(t *testing.T) {
+func TestWrapNamespaceVectorsMatchGolden(t *testing.T) {
 	cases := []struct {
 		namespace, resource, want string
 	}{
@@ -29,7 +29,7 @@ func TestWrapNamespaceVectorsMatchPython(t *testing.T) {
 	}
 }
 
-func TestWithoutNamespaceVectorsMatchPython(t *testing.T) {
+func TestWithoutNamespaceVectorsMatchGolden(t *testing.T) {
 	cases := []struct {
 		resource, namespace, want string
 	}{
@@ -60,7 +60,7 @@ func TestNamespaceRoundTrip(t *testing.T) {
 	}
 }
 
-func TestIsSystemResourceVectorsMatchPython(t *testing.T) {
+func TestIsSystemResourceVectorsMatchGolden(t *testing.T) {
 	cases := []struct {
 		resource string
 		want     bool
@@ -77,7 +77,7 @@ func TestIsSystemResourceVectorsMatchPython(t *testing.T) {
 	}
 }
 
-func TestGetNamespaceFromResourceVectorsMatchPython(t *testing.T) {
+func TestGetNamespaceFromResourceVectorsMatchGolden(t *testing.T) {
 	cases := []struct {
 		resource, want string
 	}{

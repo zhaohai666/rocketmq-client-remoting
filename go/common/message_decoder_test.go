@@ -56,7 +56,7 @@ func buildExt() *MessageExt {
 	return ext
 }
 
-func TestEncodeMessageExtMatchesPythonFixture(t *testing.T) {
+func TestEncodeMessageExtMatchesGoldenFixture(t *testing.T) {
 	raw, err := EncodeMessageExt(buildExt(), false)
 	if err != nil {
 		t.Fatal(err)

@@ -208,7 +208,7 @@ func TestDetectByOneRoundCoversRouteGoneAndSelection(t *testing.T) {
 	}
 }
 
-func TestDetectorConfigDefaultsMatchJavaClientConfig(t *testing.T) {
+func TestDetectorConfigDefaultsMatchGoldenConfig(t *testing.T) {
 	strategy := newMQFaultStrategy(false)
 	tol := strategy.latencyFaultTolerance
 	if got := tol.detectTimeout; got != 200 {

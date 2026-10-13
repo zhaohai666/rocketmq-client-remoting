@@ -41,7 +41,7 @@ func TestResetOffsetBodyRoundTrip(t *testing.T) {
 	}
 }
 
-func TestParseResetOffsetTableCppArrayShape(t *testing.T) {
+func TestParseResetOffsetTableArrayShape(t *testing.T) {
 	// language=CPP 发起方的数组体：offsetTable 是数组，每条自带 offset。
 	text := `{"offsetTable":[{"topic":"Tt","brokerName":"broker-a","queueId":2,"offset":31}]}`
 	table, err := ParseResetOffsetTable([]byte(text))

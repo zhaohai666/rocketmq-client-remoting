@@ -1005,7 +1005,7 @@ func TestAdminResetOffsetByTimestampSendsIsForce(t *testing.T) {
 	}
 }
 
-func TestAdminResetOffsetByTimestampCppLanguageAndQueueID(t *testing.T) {
+func TestAdminResetOffsetByTimestampLanguageAndQueueID(t *testing.T) {
 	c := newAdminCluster(t)
 	_, err := c.admin.ResetOffsetByTimestamp("MyTopic", "G1", -1, true, "", true)
 	requireNoError(t, "resetOffsetByTimestamp(cpp)", err)

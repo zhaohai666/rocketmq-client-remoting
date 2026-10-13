@@ -60,7 +60,7 @@ func TestStringNoneOnZeroLength(t *testing.T) {
 	}
 }
 
-func TestDecimalLongMatchesPython(t *testing.T) {
+func TestDecimalLongMatchesGolden(t *testing.T) {
 	vectors := []struct {
 		value int64
 		hex   string
