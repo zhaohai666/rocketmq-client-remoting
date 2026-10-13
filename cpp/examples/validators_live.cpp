@@ -1,4 +1,4 @@
-// Validators / TopicValidator 真机验证（任务 #32）。
+// Validators / TopicValidator 真机验证。
 // 用法：rmq_validators_live 127.0.0.1:9876
 //
 // 逐条断言证明「非法名字在本地第一行就被拦掉，合法名字照常在集群收发」。

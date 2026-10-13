@@ -384,7 +384,7 @@ void testPublicBodies() {
 // ---------------------------------------------------------------- 7. MixAll properties
 
 void testTopicConfigPropertiesWireSemantics() {
-    // 与 Python test_properties_text_round_trip_matches_java 同一夹具
+    // properties 文本夹具：空白剔除、注释行、续行与空值一次覆盖
     const char* text = "a = b\n  c : d  \nk=v\n#comment\n!c2\nempty=\ncont=first\\\n    second\n";
     PropertyMap p = MixAll::string2Properties(text);
     CHECK_EQ(p["a"], std::string("b"), "properties: 键去空白、值去左空白");
@@ -462,7 +462,7 @@ void testPermAndGroupHelpers() {
 
 void testCreateTopicRequestHeaderSendsTopicFilterType() {
     // broker 的 CreateTopicRequestHeader.checkFields() 会拒绝 topicFilterType 为空：
-    // "topicFilterType = [null] value invalid"。这条曾在 Python 侧被真实 broker 打回。
+    // "topicFilterType = [null] value invalid" —— 留空时真机 broker 就是这样打回。
     CreateTopicRequestHeader h;
     h.topic = "t";
     h.defaultTopic = "TBW102";

@@ -39,14 +39,14 @@ MessageQueue SelectMessageQueueByRandom::select(const std::vector<MessageQueue>&
 
 // SelectMessageQueueByMachineRoom 在本 SDK 中是未实现的桩：MessageQueue 是值类型、
 // 无法表达"返回 null 让下游空指针"，这里直接抛 —— 用它发送必然失败，只是失败得更早、
-// 信息更明确。异常文案里的 stub 说明是与调用方约定的匹配内容，保持不变。
+// 信息更明确。
 MessageQueue SelectMessageQueueByMachineRoom::select(const std::vector<MessageQueue>& mqs,
                                                      const Message& /*msg*/,
                                                      const std::string& /*arg*/) const {
     (void)mqs;
     throw MQClientException(
-        "SelectMessageQueueByMachineRoom.select() is not implemented: Java stub "
-        "returns null (send would fail with NPE)");
+        "SelectMessageQueueByMachineRoom.select() is not implemented "
+        "(this selector has no machine-room metadata to route on)");
 }
 
 }  // namespace rocketmq

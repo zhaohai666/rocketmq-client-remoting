@@ -163,7 +163,7 @@ std::string topAddrDomain(const MockAddrServer& s) {
     return "127.0.0.1:" + std::to_string(s.port());
 }
 
-// C++ 构造函数第一个参数是 **wsAddr**（与 Python 的 domain= 关键字不同），
+// 构造函数第一个参数是 **wsAddr**（不是 domain 关键字），
 // 这里统一用 getWsAddr 生成完整 URL。
 std::string topAddrWs(const MockAddrServer& s) {
     return DefaultTopAddressing::getWsAddr(topAddrDomain(s));

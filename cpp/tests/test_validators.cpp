@@ -1,9 +1,9 @@
-// Validators / TopicValidator 单测（任务 #32 "Validators fast-fail"）。
+// Validators / TopicValidator 单测：非法入参 fast-fail。
 //
 // 锁定三件事：
 //   1. **文案与判定顺序**按线上记录逐字钉死；
 //   2. body/大小/INNER_MULTI_DISPATCH 三档带 MESSAGE_ILLEGAL(13)，topic/group 三档
-//      用默认码（Python 的 UNKNOWN=1）；
+//      用默认码 UNKNOWN=1；
 //   3. 生产者/消费者 start() 的组名守卫在**建客户端实例之前**跑完——非法/保留组
 //      失败时不碰网络（namesrv 指向 127.0.0.1:1 也不会发起连接）。
 #include <cstdint>
@@ -132,7 +132,7 @@ void testTopicClassification() {
     CHECK(!TopicValidator::isNotAllowedSendTopic("TBW102"), "TBW102 不在禁发名单");
     CHECK(!TopicValidator::isNotAllowedSendTopic("BenchmarkTest"), "BenchmarkTest 不在禁发名单");
     // ⚠ %RETRY% 必须在允许侧：broker 的 sendMessageBack 就是往 %RETRY%group 写的，
-    // 禁掉会打断重投链路（Python validators.py 的模块注释专门点了这条）。
+    // 禁掉会打断重投链路。
     CHECK(!TopicValidator::isNotAllowedSendTopic("%RETRY%grp"), "%RETRY% 允许发送（重投链路）");
 }
 

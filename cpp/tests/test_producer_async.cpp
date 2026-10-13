@@ -1300,7 +1300,7 @@ void testBatchAsyncOneRequestOneCallback() {
     p.shutdown();
 }
 
-// 19. 批量消息过字节闸时按**整批**扣（Python _back_pressure_msg_len 的 list 分支）。
+// 19. 批量消息过字节闸时按**整批**逐条累加长度扣。
 //     写成「1 份」不会让任何一笔发送失败，只会让一批 100 条只占 1 格容量 ——
 //     字节闸对批量形同虚设，得等长跑把队列打爆才暴露。
 void testBatchAsyncChargesTheWholeBatchToTheSizeGate() {

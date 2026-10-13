@@ -158,7 +158,7 @@ void testTopicSizeGate() {
     const MessageQueue q0 = queueOf(kTopic, 0);
     const MessageQueue q1 = queueOf(kTopic, 1);
     gatesOffExceptCounts(c);
-    // 队列级字节闸门**关掉**（0），只留 topic 级：Rust 曾误用队列级开关当闸门，会让这条静默失效
+    // 队列级字节闸门**关掉**（0），只留 topic 级：误把队列级开关当闸门会让这条静默失效
     c.setPullThresholdSizeForTopic(1);
     stage(c, q0, {sized(kTopic, kMiB / 2, 0)});
     expect(!c.flowControlHit(q0, DefaultMQPushConsumer::offsetKey(q0)), "topicSize.halfMiB");

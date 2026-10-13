@@ -26,11 +26,11 @@ void expect(bool ok, const std::string& name, const std::string& detail = "") {
 }
 
 // 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
-const char* kJavaCompact =
+const char* kWireCompact =
     "{\"offsetTable\":{{\"brokerName\":\"broker-a\",\"queueId\":1,\"topic\":\"Tt\"}:9,"
     "{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"Tt\"}:7}}";
 
-const char* kJavaPretty =
+const char* kWirePretty =
     "{\n\t\"offsetTable\":{\n\t\t{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"Tt\"}:7\n\t}\n}";
 
 std::map<std::string, MessageQueue> mqMap() {
@@ -81,11 +81,11 @@ void testBuildSkipsEntriesWithoutQueueInfo() {
 }
 
 void testParseCompatFormatCompactAndPretty() {
-    auto compact = DefaultMQPushConsumer::parseLocalOffsetsText(kJavaCompact);
+    auto compact = DefaultMQPushConsumer::parseLocalOffsetsText(kWireCompact);
     expect(compact.has_value() && (*compact)["Ttbroker-a1"] == 9 && (*compact)["Ttbroker-a0"] == 7,
-           "parse_java_compact");
-    auto pretty = DefaultMQPushConsumer::parseLocalOffsetsText(kJavaPretty);
-    expect(pretty.has_value() && (*pretty)["Ttbroker-a0"] == 7, "parse_java_pretty");
+           "parse_compact_fastjson2_shape");
+    auto pretty = DefaultMQPushConsumer::parseLocalOffsetsText(kWirePretty);
+    expect(pretty.has_value() && (*pretty)["Ttbroker-a0"] == 7, "parse_pretty_fastjson2_shape");
 }
 
 void testParseAcceptsLegacyFlatMap() {
@@ -118,7 +118,7 @@ void testSaveWritesCompatFormatAndRollsBak() {
     DefaultMQPushConsumer::saveLocalOffsetsAt(
         path, items({{"Ttbroker-a0", 7}, {"Ttbroker-a1", 9}, {"Ttbroker-a2", 11}}), map);
     std::string raw = readFile(path);
-    expect(raw.rfind("{\"offsetTable\":{", 0) == 0, "save_java_format_prefix", raw);
+    expect(raw.rfind("{\"offsetTable\":{", 0) == 0, "save_wire_format_prefix", raw);
     expect(!std::filesystem::exists(path + ".bak"), "save_first_no_bak");
 
     DefaultMQPushConsumer::saveLocalOffsetsAt(path, items({{"Ttbroker-a0", 99}}), map);
@@ -148,10 +148,10 @@ void testLoadReadsCompatWrittenFile() {
     std::filesystem::create_directories(dir, ec);
     {
         std::ofstream f(path, std::ios::trunc);
-        f << kJavaCompact;
+        f << kWireCompact;
     }
     std::map<std::string, int64_t> loaded = DefaultMQPushConsumer::loadLocalOffsetsAt(path);
-    expect(loaded["Ttbroker-a1"] == 9 && loaded["Ttbroker-a0"] == 7, "load_java_written");
+    expect(loaded["Ttbroker-a1"] == 9 && loaded["Ttbroker-a0"] == 7, "load_wire_written");
 
     std::filesystem::remove_all(dir, ec);
 }

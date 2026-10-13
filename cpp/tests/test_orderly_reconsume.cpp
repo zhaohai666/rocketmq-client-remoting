@@ -11,8 +11,7 @@
 //
 // ⚠ 离线只能锁「回投失败」那一支：未 start 的消费者拿不到内部生产者，
 // orderlySendMessageBack 必返 false。「回投成功 → 位点前进、队列不再被堵住」由真机
-// examples/live_redelivery.cpp 的 S12 证明。与 Python 的 tests/test_orderly_reconsume.py
-// 逐条对应。
+// examples/live_redelivery.cpp 的 S12 证明。
 #include <cstdint>
 #include <cstdio>
 #include <limits>

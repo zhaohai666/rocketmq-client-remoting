@@ -120,7 +120,7 @@ std::string describe(const std::vector<MessageQueue>& mqs) {
     return s + "]";
 }
 
-// 与 rust allocate_strategy.rs 的 AVERAGELY_CASES / CIRCLE_CASES 同一张表
+// 平均分配用例表：队列数 × 消费者数交叉覆盖
 const std::vector<Case>& averagelyCases() {
     static const std::vector<Case> kCases = {
         {10, 4, {{0, 1, 2}, {3, 4, 5}, {6, 7}, {8, 9}}},
@@ -278,9 +278,9 @@ void testPartitionCoversEveryQueueOnce() {
     }
 }
 
-void testCrossCheckAgainstPythonFormula() {
-    // Python consumer.py:188-214 的算式（start/end 双分支 + 切片）
-    auto pythonAveragely = [](const std::vector<int32_t>& mq, const std::vector<std::string>& cid,
+void testCrossCheckAgainstReferenceFormula() {
+    // 参照算式（独立实现一遍 start/end 双分支 + 切片，用来交叉校验）
+    auto formulaAveragely = [](const std::vector<int32_t>& mq, const std::vector<std::string>& cid,
                               const std::string& current) {
         std::vector<int32_t> out;
         if (mq.empty() || cid.empty()) return out;
@@ -307,7 +307,7 @@ void testCrossCheckAgainstPythonFormula() {
         for (int32_t i = start; i < end; ++i) out.push_back(mq[static_cast<size_t>(i)]);
         return out;
     };
-    auto pythonCircle = [](const std::vector<int32_t>& mq, const std::vector<std::string>& cid,
+    auto formulaCircle = [](const std::vector<int32_t>& mq, const std::vector<std::string>& cid,
                            const std::string& current) {
         std::vector<int32_t> out;
         if (mq.empty() || cid.empty()) return out;
@@ -333,8 +333,8 @@ void testCrossCheckAgainstPythonFormula() {
             probes.push_back("CID_NOT_IN_LIST");
             probes.push_back("");
             for (const std::string& cid : probes) {
-                std::string avgExpect = join(pythonAveragely(ids, cidAll, cid));
-                std::string circleExpect = join(pythonCircle(ids, cidAll, cid));
+                std::string avgExpect = join(formulaAveragely(ids, cidAll, cid));
+                std::string circleExpect = join(formulaCircle(ids, cidAll, cid));
                 CHECK(join(allocateIds(avg, cid, mqAll, cidAll)) == avgExpect,
                       "AVG 与算式预期不一致 " + std::to_string(mqSize) + "x"
                           + std::to_string(cidSize) + " cid=" + cid);
@@ -885,7 +885,7 @@ int main() {
     testByConfigDefaultsEmptyAndReturnsCopy();
     testStrategyNamesMatchProtocol();
     testPartitionCoversEveryQueueOnce();
-    testCrossCheckAgainstPythonFormula();
+    testCrossCheckAgainstReferenceFormula();
     testRealQueuesFromMultipleBrokers();
     testConsistentHashRingTableLayout();
     testConsistentHashCoversEveryQueueOnce();

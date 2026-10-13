@@ -29,7 +29,7 @@ static int g_fail = 0;
 
 namespace {
 
-// 与 Python 侧生成 zlib 真值时使用的同一段明文
+// zlib 真值与下面用例共用的明文
 std::string repeatedPayload() {
     std::string s;
     for (int i = 0; i < 40; ++i) {
@@ -38,7 +38,7 @@ std::string repeatedPayload() {
     return s;
 }
 
-// Python: zlib.compress(b"rocketmq-compressed-payload-"*40, 5)  —— 1120B -> 47B
+// zlib level 5 压 "rocketmq-compressed-payload-"*40（1120B）得到 47B 的真值
 const char* kZlibHex =
     "785e2bca4fce4e2dc92dd44dcecf2d284a2d2e4e4dd12d48acccc94f4cd12d1a951b951b951b95a3400e"
     "0058e0b9f0";
@@ -52,7 +52,7 @@ const char* kZstdExternalHex =
     "ff7402010000";
 
 // 确定性可压缩载荷：重复一行固定文本到 size 字节
-// （与 examples/compression_live.cpp、rust live_compression_matrix.rs 同配方）
+// （与 examples/compression_live.cpp 同配方）
 std::string bigPayload(size_t size) {
     const std::string line = "rocketmq-compress-interop-payload-line-0123456789\n";
     std::string s;
@@ -162,12 +162,12 @@ static void testZlibRoundTrip() {
     CHECK(CompressorFactory::decompress(compressed, 0) == payload,
           "decompress with type 0 falls back to ZLIB");
 
-    // 外部真值：Python 生成的 zlib 字节必须能被解开
+    // 外部真值：另一路 zlib 实现产出的字节必须能被解开
     Bytes external = UtilAll::string2Bytes(kZlibHex);
     CHECK(!external.empty(), "external zlib fixture decoded from hex");
     CHECK(external.size() == 47, "external zlib fixture length == 47");
     Bytes restored = CompressorFactory::decompress(external, CompressionType::ZLIB);
-    CHECK(restored == payload, "decompress external (Python-produced) zlib bytes");
+    CHECK(restored == payload, "decompress external zlib bytes");
 }
 
 // ---------------------------------------------------------------- LZ4 Frame
