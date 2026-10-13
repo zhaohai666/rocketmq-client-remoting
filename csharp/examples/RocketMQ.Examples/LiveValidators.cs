@@ -1,4 +1,4 @@
-// Validators / TopicValidator 真机验证（任务 #32）。
+// Validators / TopicValidator 真机验证。
 // 用法：rmq validators-live [namesrv]
 //
 // 本工具用同一套断言证明

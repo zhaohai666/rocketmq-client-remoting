@@ -67,7 +67,7 @@ public class PullConsumerScheduleServiceTests
     // ---------------------------------------------------------------- 1. 配置默认值与守卫（离线）
 
     [Fact]
-    public void Defaults_MatchJava()
+    public void Defaults_MatchGoldenConfig()
     {
         var svc = new PullConsumerScheduleService("GID_sched_defaults");
         Assert.Equal(20, svc.PullThreadNums);
@@ -166,7 +166,7 @@ public class PullConsumerScheduleServiceTests
             Assert.True(WaitFor(() => svc.TaskCount == 3), "TaskCount=3, actual=" + svc.TaskCount);
             Assert.True(WaitFor(() => seen.Count == 3 && seen.Values.All(v => v > 0)),
                 "三把队列都被回调点到");
-            // 键就是平衡视图的裸名队列（差异 2）：topic 不带命名空间
+            // 键就是平衡视图的裸名队列：topic 不带命名空间
             Assert.Equal(new[] { "broker-0", "broker-1", "broker-2" },
                 seen.Keys.Select(k => k.Split(':')[0]).Distinct().OrderBy(k => k).ToArray());
         }
@@ -224,7 +224,7 @@ public class PullConsumerScheduleServiceTests
     {
         using var cluster = MockCluster.Start(3);
         // Start 前一条回调都没注册 → 空表空跑；Start 之后注册也生效 ——
-        // 差异 1 的口径：下一轮扫描（≤ RebalanceScanIntervalMillis）就为新 topic 展开任务。
+        // 下一轮扫描（≤ RebalanceScanIntervalMillis）就为新 topic 展开任务。
         var svc = new PullConsumerScheduleService("GID_sched_late");
         svc.PullConsumer.SetNamesrvAddr(cluster.NamesrvAddr);
         svc.PullConsumer.SetInstanceName("sched_late");

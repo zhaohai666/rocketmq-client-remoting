@@ -72,7 +72,7 @@ public class ConsumeMessageDirectlyTests
     // ---------------------------------------------------------------- 报文形状 + 结果解码
 
     [Fact]
-    public void SendsTheJavaHeaderFieldsToTheStoreHostAndDecodesTheResult()
+    public void SendsTheExpectedHeaderFieldsToTheStoreHostAndDecodesTheResult()
     {
         using var cluster = MockCluster.Start(1);
         string brokerAddr = cluster.BrokerAddrs[0];

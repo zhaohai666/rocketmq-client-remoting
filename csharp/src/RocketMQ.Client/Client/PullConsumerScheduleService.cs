@@ -90,7 +90,7 @@ public sealed class PullConsumerScheduleService : IDisposable
         set => _pullThreadNums = Math.Max(1, value);
     }
 
-    /// <summary>扫描周期毫秒（差异 1 的旋钮，默认 20000，下限钳 100）。改在下一圈生效。</summary>
+    /// <summary>扫描周期毫秒（默认 20000，下限钳 100）。改在下一圈生效。</summary>
     public int RebalanceScanIntervalMillis
     {
         get => _rebalanceScanIntervalMillis;

@@ -282,7 +282,7 @@ public class CompressionTests
     }
 
     [Fact]
-    public void Lz4_Decompress_PythonFrame()
+    public void Lz4_Decompress_ExternalFrame()
     {
         // 外部实现（官方 lz4.frame ⇒ 上游 C lz4）产出的帧必须能解，
         // 它的帧头 15 字节（比我们的多一个 content-size 字段），HC 也不同。
@@ -293,7 +293,7 @@ public class CompressionTests
     }
 
     [Fact]
-    public void Lz4_Decompress_RustLz4FlexFrame()
+    public void Lz4_Decompress_Lz4FlexFrame()
     {
         // lz4_flex 是**纯 Rust** 实现，和 liblz4 没有任何代码关系，
         // 能互解才说明我们写的是规范格式而不是「liblz4 私有口味」。
@@ -380,7 +380,7 @@ public class CompressionTests
     }
 
     [Fact]
-    public void Zstd_Decompress_RustCrateFrame()
+    public void Zstd_Decompress_ExternalCrateFrame()
     {
         byte[] external = Unhex(RS_ZSTD_FRAME);
         Assert.Equal(45, external.Length);

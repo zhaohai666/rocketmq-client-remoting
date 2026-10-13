@@ -73,7 +73,7 @@ public class AllocateStrategyTests
     }
 
     [Fact]
-    public void Averagely_matches_java_unit_test_sizes()
+    public void Averagely_matches_golden_test_sizes()
     {
         List<MessageQueue> mqAll = QueuesOf(10);
         List<string> cidAll = CidsOf(4);
@@ -103,7 +103,7 @@ public class AllocateStrategyTests
     }
 
     [Fact]
-    public void ByConfig_matches_java_unit_test()
+    public void ByConfig_matches_golden_unit_test()
     {
         List<MessageQueue> mqAll = QueuesOf(4);
         List<string> cidAll = CidsOf(2);
@@ -140,7 +140,7 @@ public class AllocateStrategyTests
     }
 
     [Fact]
-    public void Names_match_java()
+    public void Names_match_golden_names()
     {
         IAllocateMessageQueueStrategy[] strategies =
         {
@@ -186,7 +186,7 @@ public class AllocateStrategyTests
     /// 差分测试：averagely 与 bycircle 两种策略的算式逐值比对，
     /// 本地参考实现与策略实现必须逐值一致。
     [Fact]
-    public void Matches_python_reference_arithmetic()
+    public void Matches_golden_arithmetic()
     {
         for (int mqSize = 0; mqSize <= 12; mqSize++)
         {
@@ -198,9 +198,9 @@ public class AllocateStrategyTests
                 List<string> probes = new List<string>(cidAll) { "CID_NOT_IN_LIST", "" };
                 foreach (string cid in probes)
                 {
-                    Assert.Equal(PythonAveragely(ids, cidAll, cid),
+                    Assert.Equal(ReferenceAveragely(ids, cidAll, cid),
                         Ids(new AllocateMessageQueueAveragely().Allocate("G", cid, mqAll, cidAll)));
-                    Assert.Equal(PythonCircle(ids, cidAll, cid),
+                    Assert.Equal(ReferenceCircle(ids, cidAll, cid),
                         Ids(new AllocateMessageQueueAveragelyByCircle().Allocate("G", cid, mqAll, cidAll)));
                 }
             }
@@ -208,7 +208,7 @@ public class AllocateStrategyTests
     }
 
     // averagely 策略的参考算式，不参与实现，只用于差分测试
-    private static List<int> PythonAveragely(List<int> mqAll, List<string> cidAll, string currentCid)
+    private static List<int> ReferenceAveragely(List<int> mqAll, List<string> cidAll, string currentCid)
     {
         if (mqAll.Count == 0) return new List<int>();
         int index = cidAll.FindIndex(cid => string.Equals(cid, currentCid, StringComparison.Ordinal));
@@ -234,7 +234,7 @@ public class AllocateStrategyTests
     }
 
     // bycircle 策略的参考算式
-    private static List<int> PythonCircle(List<int> mqAll, List<string> cidAll, string currentCid)
+    private static List<int> ReferenceCircle(List<int> mqAll, List<string> cidAll, string currentCid)
     {
         var result = new List<int>();
         if (mqAll.Count == 0) return result;
@@ -335,7 +335,7 @@ public class AllocateStrategyTests
 
     [Theory]
     [MemberData(nameof(ConsistentHashCases))]
-    public void Consistent_hash_matches_java_ring_table(int mqSize, int cidSize, int[][] expect)
+    public void Consistent_hash_matches_golden_ring_table(int mqSize, int cidSize, int[][] expect)
     {
         RunConsistentHashTable(new AllocateMessageQueueConsistentHash(3), mqSize, cidSize, expect);
     }
@@ -348,7 +348,7 @@ public class AllocateStrategyTests
 
     [Theory]
     [MemberData(nameof(ConsistentHashDefaultVcCases))]
-    public void Consistent_hash_with_default_virtual_node_count_matches_java(int mqSize, int cidSize,
+    public void Consistent_hash_with_default_virtual_node_count_matches_golden_ring_table(int mqSize, int cidSize,
         int[][] expect)
     {
         RunConsistentHashTable(new AllocateMessageQueueConsistentHash(), mqSize, cidSize, expect);
@@ -492,7 +492,7 @@ public class AllocateStrategyTests
         Enumerable.Range(from, to - from).Select(i => new MessageQueue("topic", brokerName, i)).ToList();
 
     [Fact]
-    public void ByMachineRoom_matches_java_unit_test()
+    public void ByMachineRoom_matches_golden_unit_test()
     {
         List<MessageQueue> mqAll = Enumerable.Range(0, 10)
             .Select(i => new MessageQueue("topic", i < 5 ? "room1@broker-a" : "room2@broker-b", i))
@@ -518,10 +518,10 @@ public class AllocateStrategyTests
 
     [Theory]
     [MemberData(nameof(LegacySplitCases))]
-    public void ByMachineRoom_uses_java_split_on_the_broker_name(string broker, int javaParts,
+    public void ByMachineRoom_uses_dropping_split_on_the_broker_name(string broker, int splitParts,
         bool allocated)
     {
-        Assert.Equal(javaParts, AllocateMessageQueueStrategyUtil.Split(broker, '@').Length);
+        Assert.Equal(splitParts, AllocateMessageQueueStrategyUtil.Split(broker, '@').Length);
         List<string> cidAll = CidsOf(1);
         var strategy = new AllocateMessageQueueByMachineRoom(new[] { "room1" });
         Assert.Equal(allocated,

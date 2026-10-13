@@ -144,7 +144,7 @@ public class LocalOffsetsTests
     public void Load_ReadsLegacyWrittenFile()
     {
         string dir = Path.Combine(Path.GetTempPath(),
-            "rmq_dotnet_offsets_java_" + Guid.NewGuid().ToString("N"));
+            "rmq_dotnet_offsets_wire_" + Guid.NewGuid().ToString("N"));
         string path = Path.Combine(dir, "offsets.json");
         try
         {
