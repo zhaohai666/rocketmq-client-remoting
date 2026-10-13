@@ -108,7 +108,7 @@ done
 echo ""
 echo "=== 收工 ==="
 for end in "${ENDS[@]}"; do
-    sum=$(grep -E "PASS=|FAIL=|passed|ok$" "$LOGDIR/$end.log" 2>/dev/null | tail -1)
+    sum=$(grep -E "PASS=|FAIL=|passed|ok$|结果:" "$LOGDIR/$end.log" 2>/dev/null | tail -1)
     echo "$end: ${sum:-无输出}"
 done
 exit $rc
