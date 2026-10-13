@@ -6,7 +6,7 @@
 // 约束：
 //   - Object 保序（vector + 覆盖式插入），因此 encode -> decode 的键顺序稳定；
 //   - 数字区分 int64 与 double：整数字段原样输出，避免 long 型 timestamp 被写成浮点；
-//   - 字符串默认按 UTF-8 原样输出（与 Python ensure_ascii=False 一致）。
+//   - 字符串默认按 UTF-8 原样输出（不做 \uXXXX 转义）。
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_JSON_H
 #define ROCKETMQ_REMOTING_PROTOCOL_JSON_H
 

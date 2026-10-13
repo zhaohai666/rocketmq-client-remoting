@@ -1,8 +1,6 @@
 // 职责：NameServer 地址管理、Topic 路由获取与缓存、Broker 地址解析、
 // 消息发送（SEND_MESSAGE_V2）、拉取（PULL_MESSAGE）、offset 查询/更新、心跳、
 // 按 Key 查询消息、创建 Topic。
-//
-// 与 Python 参考实现（python/client/mq_client.py）逐项对齐。
 #ifndef ROCKETMQ_CLIENT_MQ_CLIENT_H
 #define ROCKETMQ_CLIENT_MQ_CLIENT_H
 
@@ -59,13 +57,13 @@ public:
     MessageQueue selectOneMessageQueue();
     MessageQueue selectOneMessageQueue(const std::string& lastBrokerName);
 
-    // 带过滤器的轮询（对应 Python select_one_message_queue(*filters)）：游标照常推进，
+    // 带过滤器的轮询：游标照常推进，
     // 一轮内全部不匹配返回 nullopt，由调用方退化选择。
     // 全部过滤器都通过才选中。
     std::optional<MessageQueue> selectOneMessageQueue(
         const std::function<bool(const MessageQueue&)>& filter,
         const std::function<bool(const MessageQueue&)>& brokerFilter);
-    // 重置轮询游标（对应 Python reset_index，故障规避 resetIndex 用）
+    // 重置轮询游标（故障规避 resetIndex 用）
     void resetIndex() { index_.store(0); }
 
 private:
@@ -361,7 +359,7 @@ public:
     // （brokerName 为空时用它去反构 POP_CK，retryFlag 会算错）；addrIn 非空则原样返回。
     std::string resolvePopAddr(const std::string& topic, std::string& brokerName,
                                const std::string& addrIn);
-    // POP 的 ack / changeInvisibleTime 地址解析（Go popAckAddress 同形）。
+    // POP 的 ack / changeInvisibleTime 地址解析。
     std::string popAckAddrFor(const std::string& topic, const std::string& brokerName,
                               int32_t queueId, const std::string& addrIn);
     std::vector<std::string> getRouteOfAllBrokers();

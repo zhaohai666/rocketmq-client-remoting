@@ -146,7 +146,7 @@ private:
 int main(int argc, char** argv) {
     std::string namesrv = argc > 1 ? argv[1] : "127.0.0.1:9876";
     int64_t stamp = UtilAll::currentTimeMillis();
-    // topic 与业务消费组都带 stamp：`run_trace_live.sh all` 会让三语言**依次**跑在同一个 broker 上，
+    // topic 与业务消费组都带 stamp：三语言真机工具会**依次**跑在同一个 broker 上，
     // 固定名会让第二个语言继承上一轮的位点与残留消息，使断言结果依赖运行顺序。全新 topic + 全新组
     // 才能让每次运行的起点一致（真正的鲁棒性另有保障，见 S6 的 body 过滤）。
     const std::string TOPIC = "TraceTopicLive_" + std::to_string(stamp);
@@ -368,7 +368,7 @@ int main(int argc, char** argv) {
         for (const TraceCollector::Raw& r : raw) {
             if (r.topic == MixAll::TRACE_TOPIC) segments += countOf(r.text, TraceConstants::FIELD_SPLITOR);
         }
-        check("S16 轨迹文本记录数（STX 计数）== 解码出的记录数（Java split 语义）",
+        check("S16 轨迹文本记录数（STX 计数）== 解码出的记录数（split 语义）",
               segments == static_cast<int64_t>(records.size()) && !records.empty(),
               "segments=" + std::to_string(segments) +
                   " decoded=" + std::to_string(records.size()));

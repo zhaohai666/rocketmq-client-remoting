@@ -1887,7 +1887,7 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
             // 注册表（自愈、位点持久化都靠它），两种模式都写，所以这里按模式过滤而不是不写。
             if (popMode_ && popQueues_.find(kv.first) != popQueues_.end()) continue;
             const MessageQueue& mq = kv.second;
-            // fastjson2 内联对象键（键按字母序），与 Python message_queue_key 同款
+            // fastjson2 内联对象键（键按字母序）
             const std::string mqKey = "{\"brokerName\":\"" + mq.brokerName + "\",\"queueId\":"
                 + std::to_string(mq.queueId) + ",\"topic\":\"" + mq.topic + "\"}";
             int64_t commit = 0;

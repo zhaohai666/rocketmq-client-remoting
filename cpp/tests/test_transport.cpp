@@ -447,7 +447,7 @@ int main() {
         }
         CHECK(threw, "GO_AWAY twice -> RemotingSendRequestException");
         CHECK(what.find("GO_AWAY twice") != std::string::npos,
-              "GO_AWAY twice: message matches Java (" + what + ")");
+              "GO_AWAY twice: message matches the recorded text (" + what + ")");
         CHECK(server.connections() == 2, "GO_AWAY twice: retries exactly once");
         client.shutdown();
     }
@@ -468,7 +468,7 @@ int main() {
         }
         CHECK(threw, "GO_AWAY with the flag off -> RemotingSendRequestException");
         CHECK(what.find("Receive GO_AWAY from channel") != std::string::npos,
-              "GO_AWAY flag off: message matches Java (" + what + ")");
+              "GO_AWAY flag off: message matches the recorded text (" + what + ")");
         CHECK(server.connections() == 1, "GO_AWAY flag off: no reconnect at all");
         client.shutdown();
     }
@@ -519,7 +519,7 @@ int main() {
         }
         CHECK(done.load(), "async GO_AWAY twice: callback fires");
         CHECK(error.find("GO_AWAY twice") != std::string::npos,
-              "async GO_AWAY twice: error carries the Java message (" + error + ")");
+              "async GO_AWAY twice: error carries the recorded text (" + error + ")");
         CHECK(server.connections() == 2, "async GO_AWAY twice: retries exactly once");
         client.shutdown();
     }

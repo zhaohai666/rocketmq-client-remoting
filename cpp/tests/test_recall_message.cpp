@@ -49,8 +49,8 @@ void testCodec() {
     const std::string handle = buildRecallHandle(kTopic, kBroker, "1700000000000", kUniqKey);
     expect(handle == "djEgVG9waWNSZWNhbGxVbml0IGJyb2tlci1hIDE3MDAwMDAwMDAwMDAg"
                      "MDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlhYmNkZWY=",
-           "buildHandle 与 Java 向量一致", handle);
-    expect(handle.size() % 4 == 0, "buildHandle 保留 Java 的 '=' 填充");
+           "buildHandle 与已知向量一致", handle);
+    expect(handle.size() % 4 == 0, "buildHandle 保留 '=' 填充");
 
     const HandleV1 parsed = decodeRecallHandle(handle);
     expect(parsed.topic == kTopic && parsed.brokerName == kBroker &&
@@ -63,7 +63,7 @@ void testCodec() {
     const HandleV1 truncated =
         decodeRecallHandle("djEgVG9waWNBIGJyb2tlci1hIDE3MDAwMDAwMDAwMDAgYWJjIGp1bms=");
     expect(truncated.topic == "TopicA" && truncated.messageId == "abc",
-           "多余分段被忽略（与 Java 一致）", truncated.messageId);
+           "多余分段被忽略", truncated.messageId);
 
     expect(catchMessage([] { decodeRecallHandle(""); }) == kInvalid, "空句柄被拒");
     expect(catchMessage([] { decodeRecallHandle("not-a-handle"); }) == kInvalid,
@@ -90,7 +90,7 @@ void testHeaders() {
     const PropertyMap ext = header.toExtFields();
     expect(ext.size() == 4 && ext.count("producerGroup") == 1 && ext.count("topic") == 1 &&
                ext.count("recallHandle") == 1 && ext.count("bname") == 1,
-           "撤回请求头用 Java 的键名（brokerName 反射名是 bname）");
+           "撤回请求头用协议键名（brokerName 反射名是 bname）");
     expect(ext.at("bname") == kBroker, "bname 落盘", ext.count("bname") ? ext.at("bname") : "");
 
     RecallMessageRequestHeader decoded;
@@ -135,10 +135,10 @@ void testProducerValidation() {
 
     expect(catchMessage([&] { (void)p.recallMessage("%RETRY%PG_recall_unit", "djEg"); }) ==
                "topic is not supported",
-           "%RETRY% topic 在本地就被拒（Java 文案）");
+           "%RETRY% topic 在本地就被拒（文案逐字校验）");
     expect(catchMessage([&] { (void)p.recallMessage("%DLQ%PG_recall_unit", "djEg"); }) ==
                "topic is not supported",
-           "%DLQ% topic 在本地就被拒（Java 文案）");
+           "%DLQ% topic 在本地就被拒（文案逐字校验）");
     expect(catchMessage([&] { (void)p.recallMessage("bad topic!", "djEg"); }) !=
                "<no exception>",
            "非法 topic 名被拒");

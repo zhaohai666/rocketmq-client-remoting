@@ -1,4 +1,4 @@
-// 订阅组模型实现（对应 Python remoting/protocol/subscription.py）。
+// 订阅组模型实现。
 #include "rocketmq/remoting/protocol/subscription.h"
 
 #include <string>

@@ -1,5 +1,4 @@
-// 真机静态主题腿（七端口径的 cpp 版，与 `python/verify_static_topic_live.py`
-// 同场景、逐条同断言）：
+// 真机静态主题腿，五个场景逐条断言：
 //   S1 createStaticTopic(513)：单 broker，totalQueues=8，物理 4 队列；
 //   S2 路由回读 TopicQueueMappingByBroker；
 //   S3 topicRouteData2EndpointsForStaticTopic：8 条端点（0-3 → broker，

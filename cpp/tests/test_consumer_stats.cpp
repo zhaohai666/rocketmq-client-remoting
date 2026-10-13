@@ -74,7 +74,7 @@ void testStatsItemSampling() {
 
 void testManagerConsumeStatus() {
     ConsumerStatsManager m;
-    // 直接注入相隔 1s 的两个采样点（与 Python 测试同款做法，不依赖真实时钟）
+    // 直接注入相隔 1s 的两个采样点（不依赖真实时钟）
     const int64_t now = UtilAll::currentTimeMillis();
     auto feed = [&](StatsItemSet& set, int64_t v, int64_t t) {
         set.getAndCreate("StatsTopic@GID_StatsUnit")

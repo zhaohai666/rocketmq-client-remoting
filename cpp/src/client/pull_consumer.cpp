@@ -55,8 +55,8 @@ int64_t extInt(const RemotingCommand& r, const std::string& key, int64_t fallbac
 
 DefaultMQPullConsumer::DefaultMQPullConsumer(const std::string& consumerGroup) {
     // 与 push/lite-pull 生产者同款首道守卫：只挡空白组名。完整校验
-    // （长度/字符表/DEFAULT_CONSUMER 保留名）在 start() 里走 Validators::checkGroup，
-    // 与 Python 一致。⚠ 旧实现用 empty()，纯空白组名会漏过——改为 UtilAll::isBlank。
+    // （长度/字符表/DEFAULT_CONSUMER 保留名）在 start() 里走 Validators::checkGroup。
+    // ⚠ 旧实现用 empty()，纯空白组名会漏过——改为 UtilAll::isBlank。
     if (UtilAll::isBlank(consumerGroup)) {
         throw MQClientException("consumerGroup is empty");
     }

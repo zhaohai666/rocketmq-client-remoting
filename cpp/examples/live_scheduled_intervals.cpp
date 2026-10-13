@@ -1,4 +1,4 @@
-// 路由刷新周期 / 位点落盘周期 真机验证（C++ 参考 python/verify_interval_live.py 的 I1–I3）。
+// 路由刷新周期 / 位点落盘周期 真机验证（场景 I1–I3 逐条断言）。
 //
 //
 //
@@ -99,8 +99,8 @@ private:
     BodySink& sink_;
 };
 
-// broker 上该 group 这条队列的已提交位点（`setZeroIfNotFound=true` ⇒ 没提交过回 0，
-// 与 Python `_broker_offset` 同口径）。判据是「broker 侧真的收到了位点」，所以只能查 broker。
+// broker 上该 group 这条队列的已提交位点（`setZeroIfNotFound=true` ⇒ 没提交过回 0）。
+// 判据是「broker 侧真的收到了位点」，所以只能查 broker。
 int64_t brokerOffset(DefaultMQAdminExt& admin, const std::string& group, const MessageQueue& mq) {
     int64_t off = 0;
     if (!admin.client().queryConsumerOffset(group, mq, off, 5000, std::string(), true)) {
@@ -286,7 +286,7 @@ int main(int argc, char* argv[]) {
         check("I2 1s 组首次落盘发生在 initialDelay(~10s) 之后", fastFirst,
               "dt=" + secs(0, dtFastFirst) + " 周期=" + std::to_string(kFastPersistMs) + "ms");
         const double fastFirstSec = static_cast<double>(dtFastFirst) / 1000.0;
-        check("I2 首笔落盘不早于 Java 的 initialDelay 10s",
+        check("I2 首笔落盘不早于 initialDelay 10s",
               fastFirst && fastFirstSec >= kPersistInitialDelaySec - 0.5,
               "dt=" + secs(0, dtFastFirst));
         check("I2 60s 组同样在 ~10s 完成首笔落盘（周期未到，先走 initialDelay）", slowFirst,
@@ -318,7 +318,7 @@ int main(int argc, char* argv[]) {
         consumers.erase(consumers.begin() + 1);
         const bool slowSecond =
             waitUntil([&] { return brokerOffset(admin, gSlow, mq) == 6; }, 10000, 300);
-        check("I2 60s 组 shutdown() 时把 6 落盘（Java persistConsumerOffset 收尾）", slowSecond,
+        check("I2 60s 组 shutdown() 时把 6 落盘（persistAllConsumerOffset 收尾）", slowSecond,
               "broker=" + std::to_string(brokerOffset(admin, gSlow, mq)));
     } catch (const std::exception& e) {
         check("验证过程抛出异常", false, e.what());

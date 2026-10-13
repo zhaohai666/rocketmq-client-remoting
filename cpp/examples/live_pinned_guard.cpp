@@ -1,5 +1,4 @@
-// 与 `python/verify_pinned_guard_live.py`（S1..S6）、`rust/examples/live_pinned_guard.rs`、
-// `csharp/examples/RocketMQ.Examples/LivePinnedGuard.cs` 同题。
+// 定点（指定队列）发送守卫真机联调（场景 S1..S6 逐条断言）。
 //
 // 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
 #include <algorithm>
@@ -270,7 +269,7 @@ int main(int argc, char* argv[]) {
                 msg = e.what();
             }
             const double ms = static_cast<double>(nowMs() - began);
-            check("S2a 同步单条拒（Java 原文案）", threw && msg == syncWording,
+            check("S2a 同步单条拒（协议原文案）", threw && msg == syncWording,
                   std::to_string(ms) + "ms " + (threw ? msg : "没有抛异常"));
             check("S2b 拒在本端：亚毫秒（不是超时、不是 broker remark）",
                   threw && ms < localBudgetMs, std::to_string(ms) + "ms");
@@ -421,7 +420,7 @@ int main(int argc, char* argv[]) {
                   offAfterOw == offAfterAsync + 1,
                   "A maxOffset=" + std::to_string(offAfterOw));
             const int64_t bNow = producer->maxOffset(mqB);
-            check("S5b 目标队列所在的 B 一条都没有（是 Java 的口子，不是漏发）", bNow == 0,
+            check("S5b 目标队列所在的 B 一条都没有（是设计上的口子，不是漏发）", bNow == 0,
                   "B maxOffset=" + std::to_string(bNow));
 
             // ---------------- S6 正腿收尾：消息一条不少 ----------------

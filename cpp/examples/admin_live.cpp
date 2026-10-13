@@ -1,4 +1,4 @@
-// C++ 管理客户端（DefaultMQAdminExt）的**真实集群**联调（对应 python/verify_admin_live.py）。
+// C++ 管理客户端（DefaultMQAdminExt）的**真实集群**联调。
 //
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
@@ -600,7 +600,7 @@ int main(int argc, char** argv) {
                     table.begin()->first.getQueueId() == queueId;
                 check("resetOffsetByQueueId(回到 minOffset)", consistent,
                       "returnedTable=" + std::to_string(table.size()) +
-                          "（Java 为 void，可为空）");
+                          "（应答为 void，可为空）");
                 int64_t off = -1;
                 bool found = admin.examineConsumerOffset(group, mq, off);
                 check("resetOffsetByQueueId 后位点==目标 offset", found && off == minReset,
@@ -644,7 +644,7 @@ int main(int argc, char** argv) {
                       "badTarget=" + std::to_string(badTarget) + " " + remark.substr(0, 120));
                 int64_t off = -1;
                 bool found = admin.examineConsumerOffset(group, mq, off);
-                check("越界 reset 停留在第 1 笔写入的非法位点（Java 两笔 RPC 非原子）",
+                check("越界 reset 停留在第 1 笔写入的非法位点（两笔 RPC 非原子）",
                       found && off == badTarget,
                       "consumerOffset=" + std::to_string(off));
             } catch (const std::exception& e) {

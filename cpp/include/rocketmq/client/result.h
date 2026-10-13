@@ -224,7 +224,7 @@ struct ConsumeOrderlyContext {
 class MessageListener {
 public:
     virtual ~MessageListener() = default;
-    // true 表示顺序消费（对应 Python 的 MessageListenerOrderly）
+    // true 表示顺序消费，false 表示并发消费
     virtual bool orderly() const = 0;
 };
 

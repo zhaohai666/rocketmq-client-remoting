@@ -1,4 +1,4 @@
-// 管理客户端实现（对应 Python client/admin.py）。
+// 管理客户端实现。
 #include "rocketmq/client/admin.h"
 
 #include <algorithm>

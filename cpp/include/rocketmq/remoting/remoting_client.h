@@ -1,7 +1,7 @@
 // 提供：连接管理（惰性建连 + 复用 + TCP_NODELAY）、invokeSync / invokeAsync /
 // invokeOneway、opaque -> 响应回调分发、超时控制、连接状态探活。
 //
-// 线程模型（与 Python 参考实现一致，读线程每连接一个）：
+// 线程模型（读线程每连接一个）：
 //   - 调用线程：encode -> 加写锁 -> sendall；随后在 invokeSync 里等条件变量
 //   - 读线程：select(300ms) -> recv -> 按 totalLength(4) 分帧 -> decode ->
 //             按 opaque 从响应表取出 future -> 唤醒调用线程 / 触发回调
@@ -66,7 +66,7 @@ public:
 
     static constexpr int32_t MAX_FRAME_LENGTH = 16 * 1024 * 1024;
 
-    // 默认 3s 建连、15s 调用超时（对应 Python RemotingClient 默认值）
+    // 默认 3s 建连、15s 调用超时
     explicit RemotingClient(int32_t connectTimeoutMillis = 3000,
                             int32_t invokeTimeoutMillis = 15000);
     ~RemotingClient();

@@ -540,7 +540,7 @@ void testLitePullCarriesTheLiteCodeAndFlag() {
     expect(!PullSysFlag::hasCommitOffsetFlag(flag0) && !PullSysFlag::hasSuspendFlag(flag0) &&
                PullSysFlag::hasSubscriptionFlag(flag0) &&
                !PullSysFlag::hasClassFilterFlag(flag0),
-           "lite 拉取的其余标志位与 Java pullSyncImpl:1058 逐位一致");
+           "lite 拉取的其余标志位与参考实现逐位一致");
     const size_t liteCount = cluster.pullReqCodeCount();
     c->shutdown();
     expect(liteCount >= 1, "lite 消费者至少发出过一笔拉取（下面 11 的对照才有意义）");
@@ -565,7 +565,7 @@ void testLitePullCarriesTheLiteCodeAndFlag() {
         const int32_t clFlag = static_cast<int32_t>(MockEndpoint::extInt(
             cluster.pullExt(static_cast<size_t>(classicIdx)), "sysFlag", -1));
         expect(!PullSysFlag::hasLitePullFlag(clFlag),
-               "经典拉取的 sysFlag 不带 lite 位（Java :248 的 4 参 build）");
+               "经典拉取的 sysFlag 不带 lite 位（参考实现的 4 参 build）");
     }
 }
 

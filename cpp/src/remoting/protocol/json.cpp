@@ -1,10 +1,10 @@
 // 极简 JSON 解析 / 生成实现（零第三方依赖）。
 //
-// 与 python/remoting/protocol 的 JSON 行为对齐：
-//   - Object 保序：底层用 vector<pair>，set() 覆盖同名键时**保留原位置**（与 Python dict 一致）；
+// 行为约定：
+//   - Object 保序：底层用 vector<pair>，set() 覆盖同名键时**保留原位置**（线上解析器即如此）；
 //   - 数字区分 int64 / double：整数字段原样输出，避免 long 型 timestamp 被写成浮点；
 //   - 字符串按 UTF-8 原样输出（不解码为 \uXXXX），解析时兼容 \uXXXX 与代理对；
-//   - 解析对 fastjson2 的非标准写法宽容（对齐 Python _FastJsonParser）：
+//   - 解析对 fastjson2 的非标准写法宽容：
 //       * {0:"x"} 这类**无引号数字键**；
 //       * {{"k":"v"}:{...}} 这类**对象作为 map 键**（非法 JSON，管理端 offsetTable 必现）——
 //         键名保留原始 JSON 文本，由 parseMessageQueueKey() 还原；
@@ -42,7 +42,7 @@ void appendUtf8Escaped(std::string& out, const std::string& s) {
                     std::snprintf(buf, sizeof(buf), "\\u%04x", c);
                     out += buf;
                 } else {
-                    // UTF-8 字节原样输出（与 Python ensure_ascii=False 一致）
+                    // UTF-8 字节原样输出，不做 \uXXXX 转义
                     out.push_back(static_cast<char>(c));
                 }
         }
@@ -431,7 +431,7 @@ private:
         }
     }
 
-    // 宽容读取键名，覆盖 fastjson2 的两种非标准写法（对齐 Python _FastJsonParser._key）：
+    // 宽容读取键名，覆盖 fastjson2 的两种非标准写法：
     //   1) 无引号数字键：{"offsetTable":{0:1,1:2}}；
     //   2) **对象/数组作为 map 键**（非法 JSON，管理端必现）：MessageQueue 会被内联成
     //      {"offsetTable":{{"brokerName":"b","queueId":3,"topic":"t"}:{...}}}。

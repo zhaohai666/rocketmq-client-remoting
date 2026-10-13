@@ -38,7 +38,7 @@ enum class TraceDispatcherType {
     CONSUME = 1,
 };
 
-// 异步轨迹分发器。C++ 移植版：全内存、单后台刷写线程、独立的内部生产者不追踪自身。
+// 异步轨迹分发器：全内存、单后台刷写线程、独立的内部生产者不追踪自身。
 class AsyncTraceDispatcher : public TraceDispatcher {
 public:
     static constexpr int32_t QUEUE_CAPACITY = 2048;

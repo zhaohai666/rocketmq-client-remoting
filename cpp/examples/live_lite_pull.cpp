@@ -1,7 +1,5 @@
 // 轻量拉取消费者（DefaultLitePullConsumer）真机验证。
 // 用法：rmq_live_lite_pull 127.0.0.1:9876
-//
-// 与 Python verify_lite_pull_live.py 完全同场景（三语言对拍用同一套断言）。
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -158,7 +156,7 @@ std::string snapshotText(const std::vector<DefaultLitePullConsumer*>& asserted,
 ///
 /// 为什么以预测为收敛条件，而不是「先等不重不漏、再比预测」：哈希环完全可能把 4 个
 /// 队列全分给一个实例，另一边在首轮重平衡之前 assignment() 本来就是空 —— 那种初始态
-/// 同样满足「不重不漏」，比出来的其实是「一边还没算」的快照。（Rust 版第一版就在这里翻车。）
+/// 同样满足「不重不漏」，比出来的其实是「一边还没算」的快照。
 bool waitUntilPredictionConverged(const std::string& group, const std::vector<MessageQueue>& mqAll,
                                  const std::vector<DefaultLitePullConsumer*>& cidMembers,
                                  const std::vector<DefaultLitePullConsumer*>& asserted,
@@ -440,7 +438,7 @@ int main(int argc, char** argv) {
     }
 
     // ---------------- S7 可插拔队列分配策略 ----------------
-    std::printf("\nS7 可插拔队列分配策略（对应 Java setAllocateMessageQueueStrategy）\n");
+    std::printf("\nS7 可插拔队列分配策略（对应 setAllocateMessageQueueStrategy）\n");
     {
         std::vector<MessageQueue> allQueues;
         try {
@@ -467,7 +465,7 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             nullRejected =
                 std::string(e.what()).find("allocateMessageQueueStrategy is null") != std::string::npos;
-            check("S7a 策略为 null 时 start() 报 Java 同款文案", nullRejected, e.what());
+            check("S7a 策略为 null 时 start() 报协议同款文案", nullRejected, e.what());
         }
         if (!nullRejected) probe.shutdown();
 
@@ -865,7 +863,7 @@ int main(int argc, char** argv) {
             std::set<MessageQueue> onlyForeign;
             onlyForeign.insert(foreign);
             o.commit(onlyForeign, true);
-            check("S8g 点名提交会把没点名的内存值清掉（Java 的 remove unused mq）",
+            check("S8g 点名提交会把没点名的内存值清掉（remove unused mq）",
                   o.committed(q0) != 300, "committed=" + std::to_string(o.committed(q0)));
             check("S8g 清掉之后回读到的是 broker 上那一格",
                   o.committed(q0) == 60, "committed=" + std::to_string(o.committed(q0)));
@@ -882,7 +880,7 @@ int main(int argc, char** argv) {
             probe.fetchConsumeOffset(q0, brokerSet);
             check("S8g commit(Set) 提交的是已消费游标（60），不是内存里那格 300",
                   brokerSet == 60, "brokerOffset=" + std::to_string(brokerSet));
-            check("S8g persistAll 之后内存表回到已消费游标（Java 的 updateConsumeOffset）",
+            check("S8g persistAll 之后内存表回到已消费游标（updateConsumeOffset）",
                   o.committed(q0) == 60, "committed=" + std::to_string(o.committed(q0)));
 
             o.shutdown();

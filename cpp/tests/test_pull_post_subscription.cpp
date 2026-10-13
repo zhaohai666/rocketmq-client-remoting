@@ -372,7 +372,7 @@ void testPullToSlaveClearsCommitOffsetAndOmitsSubscription() {
     PropertyMap sent = slave.pullExt(0);
     const int64_t sentFlag = MockEndpoint::extInt(sent, "sysFlag");
     expect(!PullSysFlag::hasCommitOffsetFlag(static_cast<int32_t>(sentFlag)),
-           "slave 上一次 COMMIT_OFFSET 都没有意义（Java :219-221）");
+           "slave 上一次 COMMIT_OFFSET 都没有意义");
     expect(PullSysFlag::hasSuspendFlag(static_cast<int32_t>(sentFlag)), "suspend 位保持");
     expect(!slave.pullHasKey(0, "subscription"),
            "SUBSCRIPTION 位关闭时 subscription 键根本不进 extFields");
@@ -453,7 +453,7 @@ void testPullSubscriptionGatingFollowsDefault() {
            "双关");
 
     DefaultMQPushConsumer consumer(kGroup);
-    expect(!consumer.isPostSubscriptionWhenPull(), "Java 5.x 默认 false");
+    expect(!consumer.isPostSubscriptionWhenPull(), "参考实现默认 false");
     consumer.setPostSubscriptionWhenPull(true);
     expect(consumer.isPostSubscriptionWhenPull(), "setter 生效");
 }
@@ -475,7 +475,7 @@ void testPullFromWhichNodeRoundTrip() {
     // 老 broker 不带 suggest：按 master 记账，而不是保留旧值
     pull.updatePullFromWhichNode(mq, PullResult{});
     expectInt(pull.recalculatePullFromWhichNode(mq), MixAll::MASTER_ID,
-              "缺 suggestWhichBrokerId 按 master 记账（Java long 原语口径）");
+              "缺 suggestWhichBrokerId 按 master 记账（协议里它是 long 原语）");
 
     PullResult two;
     two.suggestWhichBrokerId = 2;

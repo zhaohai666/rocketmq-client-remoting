@@ -1,4 +1,4 @@
-// 与 Python verify_fail_fast_live.py 同场景、同断言（三语言对拍共用一套口径）。
+// 发送失败快速判定真机验证（场景与断言见下）。
 //
 // 离线用例（tests/test_fail_fast.cpp）锁的是传输层契约：本机假对端读完就关，断言
 // "毫秒级判死 + 报 RemotingSendRequestException 而不是超时 + 回调只投一次"。但这条路径
@@ -320,7 +320,7 @@ int main(int argc, char** argv) {
             }
             worst = std::max(worst, p.costSeconds);
         }
-        check("L3 报的是 RemotingSendRequestException（Java failFast 的口径）",
+        check("L3 报的是 RemotingSendRequestException（failFast 的口径）",
               sendRequest == kPARKED, "kinds=" + kinds);
         check("L3 一条都没被报成超时（类型错 = 重试决策错）", timeouts == 0,
               "timeout=" + std::to_string(timeouts));

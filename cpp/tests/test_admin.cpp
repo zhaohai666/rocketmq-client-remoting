@@ -395,7 +395,7 @@ void testTopicConfigPropertiesWireSemantics() {
     CHECK(p.count("#comment") == 0, "properties: # 注释被跳过");
     CHECK(p.count("!c2") == 0, "properties: ! 注释被跳过");
 
-    // 空白也是合法分隔符（java.util.Properties.load 语义）
+    // 空白也是合法分隔符（参考实现的 Properties 解析语义）
     PropertyMap p2 = MixAll::string2Properties("a b\nonlykey\nk=v\n");
     CHECK_EQ(p2["a"], std::string("b"), "properties: 空白作分隔符");
     CHECK_EQ(p2["onlykey"], std::string(""), "properties: 只有键");
@@ -477,7 +477,7 @@ void testCreateTopicRequestHeaderSendsTopicFilterType() {
     PropertyMap ext = h.toExtFields();
     CHECK_EQ(ext["topicFilterType"], std::string("SINGLE_TAG"), "createTopic 必须下发 topicFilterType");
     CHECK_EQ(ext["attributes"], std::string(""), "attributes 必须是空串而非 null");
-    CHECK_EQ(ext["force"], std::string("false"), "force 必须是小写 false（Java Boolean.toString）");
+    CHECK_EQ(ext["force"], std::string("false"), "force 必须是小写 false（小写布尔字面量口径）");
     CHECK(ext.count("topic") == 1 && ext.count("perm") == 1, "topic/perm 一并下发");
 
     CreateTopicRequestHeader minimal;
@@ -543,7 +543,7 @@ void testBrokerVipChannel() {
     CHECK(MixAll::brokerVipChannel(true, "127.0.0.1:10911") == "127.0.0.1:10909",
           "10911 ⇒ 10909");
     CHECK(MixAll::brokerVipChannel(true, "127.0.0.1:abc") == "127.0.0.1:abc",
-          "端口不可解析原样返回（Java 抛 NumberFormatException，本端口不崩）");
+          "端口不可解析原样返回（参考实现会抛解析异常，本端口不崩）");
     CHECK(MixAll::brokerVipChannel(true, "127.0.0.1") == "127.0.0.1", "无冒号原样返回");
     CHECK(MixAll::brokerVipChannel(true, "10.0.0.1:8899") == "10.0.0.1:8897", "8899 ⇒ 8897");
 }

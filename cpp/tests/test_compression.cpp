@@ -198,9 +198,9 @@ static void testLz4RoundTrip() {
           "lz4 round-trip via raw type bit 1");
 
     Bytes external = UtilAll::string2Bytes(kLz4ExternalHex);
-    CHECK(external.size() == 58, "external (Java lz4-java) lz4 frame fixture length == 58");
+    CHECK(external.size() == 58, "external (lz4-java produced) lz4 frame fixture length == 58");
     CHECK(CompressorFactory::decompress(external, CompressionType::LZ4) == payload,
-          "decompress external (Java-produced) lz4 frame");
+          "decompress external (reference-produced) lz4 frame");
 }
 
 // ---------------------------------------------------------------- ZSTD
@@ -226,9 +226,9 @@ static void testZstdRoundTrip() {
           "zstd round-trip via raw type bit 2");
 
     Bytes external = UtilAll::string2Bytes(kZstdExternalHex);
-    CHECK(external.size() == 48, "external (Java zstd-jni) zstd frame fixture length == 48");
+    CHECK(external.size() == 48, "external (zstd-jni produced) zstd frame fixture length == 48");
     CHECK(CompressorFactory::decompress(external, CompressionType::ZSTD) == payload,
-          "decompress external (Java-produced) zstd frame with unknown content size");
+          "decompress external (reference-produced) zstd frame with unknown content size");
 
     // 外部真值 2：`zstd -3` CLI 产的**带** content size 的帧（50B），覆盖已知长度分支
     Bytes withSize = UtilAll::string2Bytes(
@@ -319,7 +319,7 @@ static void testEncodeDecodeCompressed() {
         } catch (const std::exception&) {
             threw = true;
         }
-        CHECK(threw, "unsupported compression type -> decompress throws (Java-aligned)");
+        CHECK(threw, "unsupported compression type -> decompress throws (protocol-aligned)");
     }
 }
 

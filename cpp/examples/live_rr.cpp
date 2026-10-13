@@ -1,4 +1,4 @@
-// Request-Reply（5.x）真机验证（与 python/verify_request_reply_live.py 的 S1–S8 同套场景）。
+// Request-Reply（5.x）真机验证（场景 S1–S8 逐条断言）。
 // 用法：rmq_live_rr 127.0.0.1:9876
 //
 // 链路：
@@ -172,8 +172,8 @@ int main(int argc, char* argv[]) {
             detail = "竟然建成功了";
         } catch (const std::exception& e) {
             // createTopic 会把「逐个 broker 都失败」包成 MQClientException（message 里带着
-            // broker 的 CODE/DESC，C++ 异常没有 cause 链可解，与 python 脚本的
-            // broker_error() 解 cause 链等价）：匹配 broker 的 INVALID_PARAMETER(29) 文本。
+            // broker 的 CODE/DESC，C++ 异常没有 cause 链可解）：直接匹配 broker
+            // 的 INVALID_PARAMETER(29) 文本。
             detail = e.what();
             rejected = detail.find("conflict with system topic") != std::string::npos
                        || detail.find("CODE: 29") != std::string::npos;
@@ -363,7 +363,7 @@ int main(int argc, char* argv[]) {
         check("S8 拿本地那份请求消息造应答 → MQClientException 带 10007",
               replyCode == ClientErrorCode::CREATE_REPLY_MESSAGE_EXCEPTION,
               "code=" + std::to_string(replyCode) + " what=" + replyWhat);
-        check("S8 10007 的文案点到缺失的 CLUSTER 属性（Java 原文）",
+        check("S8 10007 的文案点到缺失的 CLUSTER 属性（协议原文）",
               replyWhat.find("property[CLUSTER] is null.") != std::string::npos,
               "what=" + replyWhat);
     } catch (const std::exception& e) {

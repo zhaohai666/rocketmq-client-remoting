@@ -1,7 +1,7 @@
 // Validators / TopicValidator 单测（任务 #32 "Validators fast-fail"）。
 //
 // 锁定三件事：
-//   1. **文案与判定顺序**以 python/client/validators.py 为准（逐字对拍）；
+//   1. **文案与判定顺序**按线上记录逐字钉死；
 //   2. body/大小/INNER_MULTI_DISPATCH 三档带 MESSAGE_ILLEGAL(13)，topic/group 三档
 //      用默认码（Python 的 UNKNOWN=1）；
 //   3. 生产者/消费者 start() 的组名守卫在**建客户端实例之前**跑完——非法/保留组
@@ -86,12 +86,12 @@ bool throwsMessage(const std::function<void()>& fn, const std::string& expectWha
 
 std::string repeatedChar(char ch, size_t n) { return std::string(n, ch); }
 
-// 与 Python 逐字一致的期望文案（改这里 = 改golden，先对齐 validators.py）
+// 与线上基准逐字一致的期望文案（改这里 = 改 golden）
 const char* kIllegalTail = " contains illegal characters, allowing only ^[%|a-zA-Z0-9_-]+$";
 
 // ---------------------------------------------------------------- TopicValidator 字符表
 void testCharTable() {
-    // 空串合法：blankness 由 isBlank 那步单独管（Python 同款口径）
+    // 空串合法：blankness 由 isBlank 那步单独管
     CHECK(!TopicValidator::isTopicOrGroupIllegal(""), "空串不是非法字符");
     CHECK(!TopicValidator::isTopicOrGroupIllegal("%RETRY%group"), "%RETRY%group 合法");
     CHECK(!TopicValidator::isTopicOrGroupIllegal("%DLQ%group"), "%DLQ%group 合法");
@@ -164,7 +164,7 @@ void testCheckTopic() {
 // ---------------------------------------------------------------- checkGroup
 void testCheckGroup() {
     CHECK(throwsMessage([] { Validators::checkGroup(""); }, "the specified group is blank", 1),
-          "空组文案（注意与 topic 的大小写差异，照抄 Python）");
+          "空组文案（注意与 topic 的大小写差异）");
     CHECK(throwsMessage([] { Validators::checkGroup("\t "); }, "the specified group is blank", 1),
           "制表符组也算 blank");
     CHECK(throwsMessage([] { Validators::checkGroup(repeatedChar('g', 121)); },

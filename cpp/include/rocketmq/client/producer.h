@@ -239,7 +239,7 @@ public:
                          int32_t timeoutMillis = -1);
 
     // SendMessageHook（before/after）**照跑**：复用的同步批量内核内部就是 sendWithHooks，
-    // 每轮尝试一个 context，与 Python 的批量分支同一口径。差别只在重试语义——这一条链走的
+    // 每轮尝试一个 context。差别只在重试语义——这一条链走的
     // 是同步内核的 retryTimesWhenSendFailed 循环，不是异步链 onSendException 的换 broker
     // 重试；所以 completeAsync 不再重复跑 after（context 归内核自己收尾）。
     //
@@ -344,7 +344,7 @@ protected:
                                  const std::shared_ptr<ConsumeExecutor>& pool);
     void releaseBackPressure(const std::shared_ptr<AsyncSendState>& state);
     void sendAsyncInner(const std::shared_ptr<AsyncSendState>& state, const MessageQueue* pinned);
-    // 批量分支（Python _send_async_inner 的 isinstance(msg, list) 那一段）：在
+    // 批量分支：在
     // AsyncSenderExecutor 线程里跑同步批量内核，结果挪到回调线程交付。
     void sendBatchAsyncInner(const std::shared_ptr<AsyncSendState>& state,
                              const MessageQueue* pinned);
@@ -412,8 +412,8 @@ protected:
     // SOCKS 代理（start() 时透传给 MQClientInstance -> RemotingClient）
     SocksProxyConfig socksProxy_;
     bool socksProxySet_ = false;
-    // 缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE，与 setEnableTraceContext 的注释和
-    // Python/C# 一致；写死 false 会让这条 env 开关形同虚设。
+    // 缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE，与 setEnableTraceContext 的注释一致；
+    // 写死 false 会让这条 env 开关形同虚设。
     bool enableTraceContext_ = traceContextEnabledFromEnv();
     int32_t sendMsgTimeout_ = 3000;
     int32_t requestTimeoutMillis_ = DEFAULT_REQUEST_TIMEOUT_MILLIS;

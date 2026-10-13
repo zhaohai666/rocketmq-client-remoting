@@ -48,8 +48,8 @@ int64_t nowMs() {
 
 std::string str2bytes(const std::string& s) { return s; }
 
-// 按真实用法先把 topic 建出来，再启动消费者（与 Python verify_redelivery_live.py 的
-// prepare_topic 同义）。真实环境里 topic 由管理员或首次发送预先创建；消费者不做默认
+// 按真实用法先把 topic 建出来，再启动消费者。真实环境里 topic 由管理员或首次发送
+// 预先创建；消费者不做默认
 // topic 兜底，topic 不存在时拿不到路由、不分配队列。这里显式建出来，避免测出
 // "实现没问题但等超时/漏消息"的假失败。
 void prepareTopic(DefaultMQProducer& producer, const std::string& topic, int32_t queues = 4) {

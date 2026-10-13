@@ -1,5 +1,4 @@
 // 与 python/tests/test_local_offsets.py、rust/src/client/consumer.rs（mod tests）、
-// csharp/tests/RocketMQ.Client.Tests/LocalOffsetsTests.cs 的同名测试同题。
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -143,7 +142,7 @@ void testSaveWritesCompatFormatAndRollsBak() {
 }
 
 void testLoadReadsCompatWrittenFile() {
-    std::string dir = tempDir("java");
+    std::string dir = tempDir("legacy");
     std::string path = dir + "/offsets.json";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);

@@ -114,10 +114,10 @@ def test_route():
 
     qd = (cpp_route.get("queueDatas") or [{}])[0]
     for k in ("brokerName", "readQueueNums", "writeQueueNums", "perm", "topicSysFlag"):
-        check("route queue has Java key %s" % k, k in qd, qd)
+        check("route queue has the wire key %s" % k, k in qd, qd)
     bd = (cpp_route.get("brokerDatas") or [{}])[0]
     for k in ("cluster", "brokerName", "brokerAddrs", "zoneName", "enableActingMaster"):
-        check("route broker has Java key %s" % k, k in bd, bd)
+        check("route broker has the wire key %s" % k, k in bd, bd)
 
     sent = {
         "brokerDatas": [
@@ -158,22 +158,22 @@ def test_heartbeat():
     check("hb cpp has producerDataSet", isinstance(cpp_hb.get("producerDataSet"), list), cpp_hb)
     check("hb cpp has consumerDataSet", isinstance(cpp_hb.get("consumerDataSet"), list), cpp_hb)
     check("hb cpp has heartbeatFingerprint", "heartbeatFingerprint" in cpp_hb, cpp_hb)
-    check("hb cpp uses withoutSub (Java fastjson name)", "withoutSub" in cpp_hb, cpp_hb)
+    check("hb cpp uses withoutSub (the wire JSON name)", "withoutSub" in cpp_hb, cpp_hb)
     check("hb cpp no client_id snake_case", "client_id" not in cpp_hb, cpp_hb)
 
     cd = (cpp_hb.get("consumerDataSet") or [{}])[0]
     for k in ("groupName", "consumeType", "messageModel", "consumeFromWhere",
               "subscriptionDataSet", "unitMode"):
-        check("hb consumer has Java key %s" % k, k in cd, cd)
-    check("hb consumer has NO consumeTimestamp (absent in this Java version)",
+        check("hb consumer has the wire key %s" % k, k in cd, cd)
+    check("hb consumer has NO consumeTimestamp (absent in the reference version)",
           "consumeTimestamp" not in cd, cd)
-    check("hb consumer has NO maxReconsumeTimes (absent in this Java version)",
+    check("hb consumer has NO maxReconsumeTimes (absent in the reference version)",
           "maxReconsumeTimes" not in cd, cd)
 
     sd = (cd.get("subscriptionDataSet") or [{}])[0]
     for k in ("classFilterMode", "codeSet", "expressionType", "subString",
               "subVersion", "tagsSet", "topic"):
-        check("hb subscription has Java key %s" % k, k in sd, sd)
+        check("hb subscription has the wire key %s" % k, k in sd, sd)
     check("hb subscription has NO filterClassSource (@JSONField serialize=false)",
           "filterClassSource" not in sd, sd)
     check("hb subscription has NO snake_case (sub_string)",
@@ -230,7 +230,7 @@ def test_heartbeat():
     snake = sorted(k for k in sent_keys if "_" in k)
     check("python SubscriptionData.to_dict() has NO snake_case keys", not snake,
           "snake_case 键 %s 会被 broker(fastjson2) 静默丢弃" % snake)
-    check("python SubscriptionData.to_dict() uses Java keys",
+    check("python SubscriptionData.to_dict() uses the wire keys",
           {"topic", "subString", "tagsSet", "classFilterMode", "expressionType"}
           <= sent_keys, sorted(sent_keys))
 
@@ -247,7 +247,7 @@ def test_heartbeat():
     pcd = (got_py.get("consumerDataSet") or [{}])[0]
     psd = (pcd.get("subscriptionDataSet") or [{}])[0]
     check("hb python-client body: topic survives", psd.get("topic") == "TopicX", psd)
-    check("hb python-client body: Java-named fields ARE visible to C++",
+    check("hb python-client body: wire-named fields ARE visible to C++",
           psd.get("subString") == "TagA" and psd.get("tagsSet") == ["TagA"], psd)
 
 

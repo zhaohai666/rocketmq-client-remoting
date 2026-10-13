@@ -17,11 +17,11 @@ target_link_libraries(rmq_live_redelivery PRIVATE rocketmq::remoting)
 add_executable(rmq_admin_live admin_live.cpp)
 target_link_libraries(rmq_admin_live PRIVATE rocketmq::remoting)
 
-# 批量 admin 方法真机联调（对标 python/verify_admin_batch_live.py；不打进 ctest）
+# 批量 admin 方法真机联调（不打进 ctest）
 add_executable(rmq_admin_batch_live admin_batch_live.cpp)
 target_link_libraries(rmq_admin_batch_live PRIVATE rocketmq::remoting)
 
-# 真实集群自动压缩联调（自产自销 + 与 Java 探针跨客户端互通；不打进 ctest）
+# 真实集群自动压缩联调（自产自销 + 跨客户端互通；不打进 ctest）
 add_executable(rmq_compression_live compression_live.cpp)
 target_link_libraries(rmq_compression_live PRIVATE rocketmq::remoting)
 
@@ -123,7 +123,7 @@ target_link_libraries(rmq_live_flow_control PRIVATE rocketmq::remoting)
 add_executable(rmq_live_producer_unregister live_producer_unregister.cpp)
 target_link_libraries(rmq_live_producer_unregister PRIVATE rocketmq::remoting)
 
-# broker 真死掉时在途请求立刻判死（Java failFast）真机联调：会停一次 broker 再拉起（不打进 ctest）
+# broker 真死掉时在途请求立刻判死（failFast）真机联调：会停一次 broker 再拉起（不打进 ctest）
 add_executable(rmq_live_fail_fast live_fail_fast.cpp)
 target_link_libraries(rmq_live_fail_fast PRIVATE rocketmq::remoting)
 

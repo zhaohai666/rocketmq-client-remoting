@@ -1,4 +1,4 @@
-// CheckForbiddenHook / FilterMessageHook 真机验证（对齐 python/verify_hook_live.py 的 S1–S11）。
+// CheckForbiddenHook / FilterMessageHook 真机验证（场景 S1–S11 逐条断言）。
 // 用法：rmq_live_hook 127.0.0.1:9876
 //
 // 前置：NameServer + Broker 已起（普通配置即可，不需要 traceTopicEnable）。
@@ -18,7 +18,7 @@
 //   S11 POP 路径被摘掉的消息已 ack（观测窗 > invisibleTime，未复活重投）
 //
 // ⚠ 脚本自身的两条纪律（上一轮 trace 联调踩出来的）：
-//   ① topic / 消费组一律带 stamp —— `run_hook_live.sh all` 会让三语言**依次**跑在同一个
+//   ① topic / 消费组一律带 stamp —— 三语言真机工具会**依次**跑在同一个
 //      broker 上，固定名会继承上一轮的提交位点；
 //   ② 断言**按 body 前缀过滤** —— 预热消息、broker consumequeue 异步分发都可能让消费者多收几条。
 #include <algorithm>
@@ -247,7 +247,7 @@ int main(int argc, char* argv[]) {
     {
         SubscriptionData subAll = FilterAPI::buildSubscriptionData("T", "*");
         SubscriptionData subTag = FilterAPI::buildSubscriptionData("T", "TagA||TagB");
-        check("S0 SUB_ALL 的 tagsSet/codeSet 为空、显式 tag 填 codeSet（Java 语义）",
+        check("S0 SUB_ALL 的 tagsSet/codeSet 为空、显式 tag 填 codeSet（协议语义）",
               subAll.tagsSet.empty() && subAll.codeSet.empty() && subTag.tagsSet.size() == 2
                   && subTag.codeSet.count(2598919) == 1 && subTag.codeSet.count(2598920) == 1,
               "sub_all_tags=" + std::to_string(subAll.tagsSet.size()) + " sub_tag_codes="

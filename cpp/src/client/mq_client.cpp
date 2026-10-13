@@ -513,7 +513,7 @@ std::shared_ptr<TopicRouteData> MQClientInstance::getTopicRouteData(const std::s
     try {
         updateTopicRouteInfoFromNameServer(topic);
     } catch (const std::exception&) {
-        // 与 Python 一致：路由刷新失败不抛，交给下面的查表返回空
+        // 路由刷新失败不抛，交给下面的查表返回空
     }
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
     auto it = topicRouteTable_.find(topic);
@@ -612,7 +612,7 @@ std::string MQClientInstance::publishAddrFor(const std::string& brokerName,
 }
 
 std::string MQClientInstance::publishAddrInAdmin(const MessageQueue& mq) {
-    // 与 publishAddrFor 同形（Python `_publish_addr_in_admin` 亦然），单独一层只是
+    // 与 publishAddrFor 同形，单独一层只是
     // 让 offset 查询的调用点读起来是「按 mq 解析」。
     return publishAddrFor(mq.brokerName, mq.topic);
 }

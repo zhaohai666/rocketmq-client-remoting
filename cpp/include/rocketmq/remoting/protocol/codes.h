@@ -1,5 +1,4 @@
-// 本文件由工具脚本依据 ROCKETMQ_JAVA_SRC 指向的 RocketMQ 服务端源码树生成
-// （RequestCode.java / ResponseCode.java / LanguageCode.java）；
+// 本文件由工具脚本依据 ROCKETMQ_SERVER_SRC 指向的 RocketMQ 服务端源码树生成；
 // tests/test_protocol_alignment.cpp 在设置了该环境变量时会做同样的回归守卫。
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_CODES_H
 #define ROCKETMQ_REMOTING_PROTOCOL_CODES_H

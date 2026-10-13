@@ -118,9 +118,9 @@ static bool readFile(const std::string& path, std::string& out) {
 }
 
 static void checkAgainstProtocolSource() {
-    const char* src = std::getenv("ROCKETMQ_JAVA_SRC");
+    const char* src = std::getenv("ROCKETMQ_SERVER_SRC");
     if (src == nullptr || *src == '\0') {
-        std::cout << "[skip] ROCKETMQ_JAVA_SRC not set; Java source regression check skipped\n";
+        std::cout << "[skip] ROCKETMQ_SERVER_SRC not set; server-source regression check skipped\n";
         return;
     }
     std::vector<std::string> candidates = {
@@ -134,7 +134,7 @@ static void checkAgainstProtocolSource() {
         if (readFile(c, text)) { found = true; break; }
     }
     if (!found) {
-        std::cout << "[skip] RequestCode.java not found under ROCKETMQ_JAVA_SRC=" << src << "\n";
+        std::cout << "[skip] RequestCode.java not found under ROCKETMQ_SERVER_SRC=" << src << "\n";
         return;
     }
 
@@ -150,9 +150,9 @@ static void checkAgainstProtocolSource() {
     for (const auto& pr : pairs) {
         long long v = 0;
         if (parseProtocolConst(text, pr.name, v)) {
-            CHECK(v == pr.expect, std::string("java ") + pr.name + " matches codes.h");
+            CHECK(v == pr.expect, std::string("server const ") + pr.name + " matches codes.h");
         } else {
-            std::cout << "[warn] java const " << pr.name << " not found; skipped\n";
+            std::cout << "[warn] server const " << pr.name << " not found; skipped\n";
         }
     }
 }
@@ -160,7 +160,7 @@ static void checkAgainstProtocolSource() {
 // ClientErrorCode.java 单独一趟：上面那个函数在 RequestCode.java 缺失时会提前 return，
 // 不能连带把这张表的回归检查也跳掉。
 static void checkClientErrorCodeAgainstProtocolSource() {
-    const char* src = std::getenv("ROCKETMQ_JAVA_SRC");
+    const char* src = std::getenv("ROCKETMQ_SERVER_SRC");
     if (src == nullptr || *src == '\0') {
         return;
     }
@@ -168,7 +168,7 @@ static void checkClientErrorCodeAgainstProtocolSource() {
     if (!readFile(std::string(src)
                       + "/client/src/main/java/org/apache/rocketmq/client/common/ClientErrorCode.java",
                   text)) {
-        std::cout << "[warn] ClientErrorCode.java not found under ROCKETMQ_JAVA_SRC=" << src
+        std::cout << "[warn] ClientErrorCode.java not found under ROCKETMQ_SERVER_SRC=" << src
                   << "; skipped\n";
         return;
     }
@@ -186,10 +186,10 @@ static void checkClientErrorCodeAgainstProtocolSource() {
     for (const auto& pr : pairs) {
         long long v = 0;
         if (parseProtocolConst(text, pr.name, v)) {
-            CHECK(v == pr.expect, std::string("java ClientErrorCode.") + pr.name
+            CHECK(v == pr.expect, std::string("server const ClientErrorCode.") + pr.name
                                       + " matches exception.h");
         } else {
-            std::cout << "[warn] java const ClientErrorCode." << pr.name << " not found; skipped\n";
+            std::cout << "[warn] server const ClientErrorCode." << pr.name << " not found; skipped\n";
         }
     }
 }

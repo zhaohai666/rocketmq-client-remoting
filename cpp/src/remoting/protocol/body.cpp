@@ -1,4 +1,4 @@
-// 公共 body 实现（对应 Python remoting/protocol/body.py）。
+// 公共 body 实现。
 #include "rocketmq/remoting/protocol/body.h"
 
 #include <algorithm>

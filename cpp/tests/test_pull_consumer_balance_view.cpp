@@ -343,7 +343,7 @@ void testSoleInstanceTakesEveryQueue() {
 
 // ---------------------------------------------------------------- 2. 只拿自己那一份
 
-/// 官方 `PullConsumer.java:62` 的用法之所以成立，全靠「每个实例只拿到自己那一份」。
+/// `PullConsumer` 的示例用法之所以成立，全靠「每个实例只拿到自己那一份」。
 /// 两个真实例互相对拍：各 2 个、不重叠、合起来覆盖 4 个。
 void testTwoInstancesSplitTheQueuesWithoutOverlap() {
     MockEndpoint ep;
@@ -425,7 +425,7 @@ void testRequiresAStartedConsumer() {
     } catch (const MQClientException& e) {
         threw = std::string(e.what()).find("not started") != std::string::npos;
     }
-    expect(threw, "未启动必须抛 MQClientException（Java isRunning()）");
+    expect(threw, "未启动必须抛 MQClientException（isRunning() 守卫）");
 }
 
 // ---------------------------------------------------------------- 6. 命名空间：返回裸 topic
@@ -447,7 +447,7 @@ void testNamespacedInstanceReturnsBareTopics() {
     for (const MessageQueue& mq : view) {
         if (mq.topic != plain) allBare = false;
     }
-    expect(allBare, "返回的队列已剥掉命名空间（Java parseSubscribeMessageQueues）",
+    expect(allBare, "返回的队列已剥掉命名空间（每个实例只拿自己那一份）",
           describe(view));
     c->shutdown();
 }

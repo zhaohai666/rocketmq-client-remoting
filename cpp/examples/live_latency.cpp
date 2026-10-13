@@ -1,5 +1,5 @@
 // 发送延迟故障容错（sendLatencyFaultEnable）真机验证
-// （与 python/verify_latency_live.py 的 S1–S5 同套场景）。
+// （场景 S1–S5 逐条断言）。
 // 用法：rmq_live_latency 127.0.0.1:9876
 //
 // 场景（单 broker broker-a / DefaultCluster）：

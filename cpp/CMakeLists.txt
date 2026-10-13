@@ -86,7 +86,7 @@ set(RMQ_SOURCES
 # 传输层用到 std::thread / std::mutex，需要显式链接线程库（Linux 上尤其必要）
 find_package(Threads REQUIRED)
 
-# 消息体压缩：Java 用 java.util.zip（永远存在），Python 用标准库 zlib。
+# 消息体压缩：对接实现都用标准库 zlib（永远存在）。
 # 这里同样默认要求 zlib（libz 在各平台都自带）。若要构建无 zlib 的精简版，
 # 用 -DRMQ_WITH_ZLIB=OFF；此时**遇到压缩消息会抛异常**而不是静默返回压缩字节，
 # 以免把数据损坏伪装成成功。
@@ -95,9 +95,8 @@ if(RMQ_WITH_ZLIB)
     find_package(ZLIB REQUIRED)
 endif()
 
-# 消息体压缩的另外两个后端：Java 用 lz4-java 的 LZ4Frame*Stream 与 zstd-jni，
-# Python 用 lz4.frame / zstandard，Rust 用 lz4_flex::frame / zstd crate；这里直接链接
-# 系统的 liblz4（LZ4 Frame 互操作格式，见 lz4frame.h）与 libzstd。
+# 消息体压缩的另外两个后端：线上数据的帧格式来自 lz4-java 的 LZ4Frame*Stream 与 zstd-jni；
+# 这里直接链接系统的 liblz4（LZ4 Frame 互操作格式，见 lz4frame.h）与 libzstd。
 # 与 zlib 同一约定：**找不到就只关这一个后端，configure 照样成功**，运行期遇到该算法
 # 的压缩消息一律抛异常，绝不静默把压缩字节当正文交出去（那等于伪装成成功的数据损坏）。
 option(RMQ_WITH_ZSTD "Enable zstd message body (de)compression" ON)
@@ -163,7 +162,7 @@ if(RMQ_WITH_LZ4)
     endif()
 endif()
 
-# 传输层 TLS（对应 Java NettyRemotingClient 的 SslHandler）。找到 OpenSSL 就默认编入
+# 传输层 TLS（连接层 SslHandler 的对位）。找到 OpenSSL 就默认编入
 # （test mode 信任 broker 自签证书，配合 PERMISSIVE broker 即配即通）；找不到时静默降级，
 # setTlsEnable(true) 会在运行时抛出带说明的错误，其余路径零影响。
 option(RMQ_ENABLE_TLS "Enable TLS transport (requires OpenSSL)" ON)

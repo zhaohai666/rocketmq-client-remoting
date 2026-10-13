@@ -1,5 +1,4 @@
-// 与 python/verify_reset_offset_live.py、rust/examples/live_reset_offset.rs、C# 的对应
-// 场景同题、逐条对应。
+// 重置消费位点（220 推送链路）真机联调，场景逐条断言。
 //
 // 220 是 broker 推给**消费端**的重置指令；管理端那笔 INVOKE_BROKER_TO_RESET_OFFSET(222)
 // 的响应只是一张「每个队列重置到哪」的表，真正让消费端改位点的是 broker 随后 oneway 推的
@@ -138,7 +137,7 @@ public:
         std::unique_lock<std::mutex> lk(mtx_);
         // 上限只防死锁：正常路径由测试逐批 release()
         cv_.wait_for(lk, std::chrono::seconds(90), [this] { return released_; });
-        released_ = false;  // 一批一放：与 Python Event.set()+clear() 同构
+        released_ = false;  // 一批一放：放行后复位，等待下一批 release()
         return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
     }
 
@@ -441,7 +440,7 @@ void s1BackwardReset(Fixture& fx, const std::string& topic, const std::string& g
           detail);
 
     std::optional<int64_t> off = localOffset(*c, topic);
-    check("S1-重置后本地表里没有旧位点（Java removeOffset；新位点经撤销尾巴出去）",
+    check("S1-重置后本地表里没有旧位点（removeOffset；新位点经撤销尾巴出去）",
           !off.has_value(),
           "local_offset=" + offText(off) + " epoch=" + std::to_string(c->queueEpoch(key)));
 

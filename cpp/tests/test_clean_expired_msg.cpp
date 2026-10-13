@@ -10,9 +10,8 @@
 // 离线能锁的是「回投失败」这一支：未 start 的消费者 sendMessageBack 必失败（函数按返回值
 // 表态、不抛异常），所以结算断言是"消息留在原地、位点不许动"；「回投成功 → 摘除 →
 // %RETRY% 重投 → reconsumeTimes=1 的第二次投递」只能在真机取证
-//（examples/live_clean_expired_msg.cpp，与 python/verify_clean_expired_msg_live.py 同题）。
+//（examples/live_clean_expired_msg.cpp 是真机那一腿）。
 // 与 python/tests/test_clean_expired_msg.py、rust/src/client/consumer.rs、
-// csharp/tests/RocketMQ.Client.Tests/CleanExpiredMsgTests.cs 的同名测试一一对应。
 #include <cstdio>
 #include <memory>
 #include <stdexcept>

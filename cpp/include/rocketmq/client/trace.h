@@ -93,7 +93,7 @@ enum class TraceMessageType {
     ORDER = 4,
 };
 
-// 本机出口地址（storeHost/clientHost 默认），对齐 Python LOCAL_ADDRESS。
+// 本机出口地址（storeHost/clientHost 默认）。
 std::string localAddressForTrace();
 
 // ---------------------------------------------------------------- TraceBean

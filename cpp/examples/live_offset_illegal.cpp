@@ -1,5 +1,4 @@
-// 与 `python/verify_offset_illegal_live.py`、`rust/examples/live_offset_illegal.rs`、
-// C# 的对应场景同题、逐条对应（S1/S2）。
+// 位点非法（OFFSET_ILLEGAL）自愈分支真机联调（场景 S1/S2 逐条断言）。
 //
 // 这条分支做四件事：位点改用 broker 给的修正值（`setNextOffset`）→ 丢掉这条队列上已取回
 // 未消费的消息（`ProcessQueue.setDropped(true)`）→ 把修正位点**立刻**落盘

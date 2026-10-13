@@ -1,4 +1,4 @@
-// 覆盖（对齐 ConsumeMessagePopOrderlyService.java）：
+// 覆盖 POP 顺序监听的语义：
 //   - submitPopConsumeRequest:161-166 —— 分派进顺序骨架，listener 不被调、不 ack
 //     （pq 的 waitAckCount 不动 = 积压只增不减，交给流控把 pop 循环压停）
 //   - submitConsumeRequest:178-191 —— 去重集按 (pq 引用, mq) 判等：同队列重复提交

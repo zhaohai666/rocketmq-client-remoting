@@ -1,5 +1,4 @@
 // C++ 客户端「定时消息撤回（RECALL_MESSAGE 370）」真机联调
-// （对应 python/verify_recall_live.py、rust/examples/live_producer.rs 的 P9 段）。
 //
 // 为什么必须真机：句柄不是客户端能自己拼出来的。只有 broker 在
 // SendMessageProcessor#attachRecallHandle 里（且仅当消息带 TIMER_* 延迟属性）才会把句柄

@@ -50,7 +50,7 @@ static void testSubscriptionData() {
     CHECK(multi.tagsSet.count("*") == 0, "filter split must not contain '*'");
     CHECK(multi.codeSet.size() == 2 && multi.codeSet.count(2598919) == 1
               && multi.codeSet.count(2598920) == 1,
-          "filter split fills codeSet with java hashCode");
+          "filter split fills codeSet with the protocol hashCode");
 
     bool threw = false;
     try {
@@ -58,7 +58,7 @@ static void testSubscriptionData() {
     } catch (const std::exception& e) {
         threw = std::string(e.what()) == "subString split error";
     }
-    CHECK(threw, "filter '||' -> throws subString split error (java-split drops all trailing empties)");
+    CHECK(threw, "filter '||' -> throws subString split error (the split drops all trailing empties)");
 
     SubscriptionData sd("TopicProbe", "TagA||TagB");
     sd.setTagsSet({"TagA", "TagB"});
@@ -89,7 +89,7 @@ static void testSubscriptionData() {
     a.setSubVersion(1);
     SubscriptionData b("T", "x");
     b.setSubVersion(2);
-    CHECK(a != b, "sub equals includes subVersion (Java semantics)");
+    CHECK(a != b, "sub equals includes subVersion (protocol semantics)");
 
     // compareTo: topic@subString
     SubscriptionData c1("A", "z");
@@ -195,10 +195,10 @@ static void testTopicRouteData() {
               "\"queueDatas\":[{\"brokerName\":\"broker-a\",\"perm\":6,\"readQueueNums\":4,"
               "\"topicSysFlag\":0,\"writeQueueNums\":4}]}",
               fromServerSample),
-          "route decode java-shaped json");
-    CHECK(fromServerSample.getAllMessageQueue("T").size() == 4, "route java-shaped writable queues");
+          "route decode server-shaped json");
+    CHECK(fromServerSample.getAllMessageQueue("T").size() == 4, "route server-shaped writable queues");
     CHECK(fromServerSample.brokerDatas[0].selectBrokerAddr() == "127.0.0.1:10911",
-          "route java-shaped select master");
+          "route server-shaped select master");
 
     TopicRouteData masterless;
     masterless.queueDatas.push_back(
@@ -260,12 +260,12 @@ static void testHeartbeatData() {
     CHECK(contains(cdJson, "\"unitMode\":false"), "consumer json unitMode");
     CHECK(contains(cdJson, "\"subscriptionDataSet\":["), "consumer json subscriptionDataSet");
     CHECK(!contains(cdJson, "consumeTimestamp"),
-          "consumer json must NOT contain consumeTimestamp (absent in this Java version)");
+          "consumer json must NOT contain consumeTimestamp (absent in this protocol version)");
     CHECK(!contains(cdJson, "maxReconsumeTimes"),
-          "consumer json must NOT contain maxReconsumeTimes (absent in this Java version)");
+          "consumer json must NOT contain maxReconsumeTimes (absent in this protocol version)");
 
     // unitMode=true 必须真的上线：broker 只看这一个字段决定 %RETRY%group 建出来
-    // 带不带 UNIT_SUB 位（ClientManageProcessor.java:113-118）。
+    // 带不带 UNIT_SUB 位（broker 侧 ClientManageProcessor 的判定）。
     ConsumerData unitCd = cd;
     unitCd.setUnitMode(true);
     CHECK(contains(unitCd.toJson().dump(), "\"unitMode\":true"),

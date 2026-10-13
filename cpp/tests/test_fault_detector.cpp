@@ -344,8 +344,8 @@ bool pollFor(Cond&& cond, int budgetMillis) {
 
 void testDefaults() {
     LatencyFaultToleranceImpl tol;
-    expectInt(tol.detectTimeout(), 200, "detectTimeout 默认 200（Java ClientConfig）");
-    expectInt(tol.detectInterval(), 2000, "detectInterval 默认 2000（Java ClientConfig）");
+    expectInt(tol.detectTimeout(), 200, "detectTimeout 默认 200");
+    expectInt(tol.detectInterval(), 2000, "detectInterval 默认 2000");
     expect(!tol.isStartDetectorEnable(), "startDetectorEnable 默认 false");
 
     MQFaultStrategy s;
@@ -410,7 +410,7 @@ void testDetectByOneRoundOffline() {
         tol.detectByOneRound();
         expectInt(probes, 1, "到期的故障项被探测一次");
         expectInt(lastTimeout, 200, "探测带上 detectTimeout");
-        expect(tol.isReachable("broker-a"), "探测成功翻回 reachable（Java can be used）");
+        expect(tol.isReachable("broker-a"), "探测成功翻回 reachable");
 
         tol.updateFaultItem("broker-b", 1.0, 0, false);
         tol.setServiceDetector([&probes](const std::string&, int32_t) {

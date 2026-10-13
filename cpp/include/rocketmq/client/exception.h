@@ -21,7 +21,7 @@ struct ClientErrorCode {
 };
 
 struct MQClientException : public std::runtime_error {
-    // 对应 Python MQClientException(message, response_code)；默认 1（UNKNOWN）。
+    // 构造参数 (message, response_code)；默认 1（UNKNOWN）。
     // 管理端靠它把 broker 响应码透传出来——例如 resetOffsetNew 需要区分
     // CONSUMER_NOT_ONLINE 才能退化到 resetOffsetByTimestampOld。
     int32_t responseCode = 1;

@@ -323,7 +323,7 @@ void testPublishLookupTakesOnlyTheMasterWhileTheTolerantLookupFallsBack() {
     auto instance = seeded(namesrv);
 
     expect(instance->findBrokerAddressInPublish(kBroker).empty(),
-           "只剩从节点（brokerId=1）时发布地址查不到：Java map.get(MASTER_ID) == null");
+           "只剩从节点（brokerId=1）时发布地址查不到：按 MASTER_ID 查为空");
     // 负控：同一份路由上，退让口径（心跳/拉取/位点查询用）必须拿得到从节点
     expect(instance->brokerAddrOf(kBroker) == slave.address(),
            "同一份路由上 brokerAddrOf 退到从节点 —— 两条口径不能合成一条");
@@ -345,7 +345,7 @@ void testPublishAddrForRefreshesTheRouteThenRechecks() {
     const size_t before = namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC);
 
     expect(instance->publishAddrFor(kBroker, kTopic) == master.address(),
-           "Java sendKernelImpl:919-924：查不到先按 topic 刷一次路由再查");
+           "参考实现行为：查不到先按 topic 刷一次路由再查");
     expectInt(static_cast<long long>(
                   namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC) - before),
               1, "恰好刷一次");
@@ -407,7 +407,7 @@ void testAdminOffsetQueriesAreMasterOnlyToo() {
     } catch (const MQClientException& e) {
         threw = std::string(e.what()) == "The broker[broker-a] not exist";
     }
-    expect(threw, "只剩从节点时 getMaxOffset 报 not exist（Java MQAdminImpl:195 只打主）");
+    expect(threw, "只剩从节点时 getMaxOffset 报 not exist（参考实现只打主）");
     expectInt(static_cast<long long>(slave.countCode(RequestCode::GET_MAX_OFFSET)), 0,
               "是本端结论：从节点一台都没收到 offset 查询");
 

@@ -157,7 +157,7 @@ private:
         return error_;
     }
 
-    // 未指定结果时的兜底：`SEND_OK` + `123`（与 Python 的 `FakeProducer` 一致）
+    // 未指定结果时的兜底：`SEND_OK` + `123`
     SendResult resolve(const MessageQueue* mq) const {
         std::lock_guard<std::mutex> lk(mutex_);
         if (hasResult_) return result_;
@@ -423,7 +423,7 @@ void testAggregateKeyPartitionsByTopicMqWaitAndTag() {
     const Message msg(TOPIC, std::string(1, 'x'));
     const AggregateKey base = AggregateKey::ofMessage(msg);
     expect(!base.hasTag, "plain message has no tag (null, not empty string)");
-    expect(base.waitStoreMsgOk, "plain message is waitStoreMsgOK (Java isWaitStoreMsgOK default)");
+    expect(base.waitStoreMsgOk, "plain message is waitStoreMsgOK (defaults to true)");
     expect(!base.hasMq, "plain key has no pinned mq");
     expectStr(base.topic, TOPIC, "key topic");
 
@@ -1087,7 +1087,7 @@ void testDetachSenderFailsAsyncBatchWithoutRefund() {
     expectInt(cb->errorCount(), 1, "the callback got the failure");
     const std::vector<std::string> texts = cb->errorTexts();
     expect(texts.size() == 1 && texts[0] == "defaultMQProducer is null, can not send message",
-           "the callback gets the Java message", texts.empty() ? std::string() : texts[0]);
+           "the callback gets the recorded message", texts.empty() ? std::string() : texts[0]);
     expectInt(acc.currentlyHoldSize(), 10, "hold size is NOT refunded (upstream leak, copied)");
     expectInt(static_cast<long long>(sender.calls()), 0, "the detached sender was never called");
 }

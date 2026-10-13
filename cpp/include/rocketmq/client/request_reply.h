@@ -1,4 +1,4 @@
-// 协议回顾（与 python/client/request_reply.py 同形）：
+// 协议回顾：
 //
 //     请求方 (producer.request)                    应答方 (push consumer)
 //     ─────────────────────────                    ──────────────────────

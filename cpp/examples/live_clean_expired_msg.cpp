@@ -1,5 +1,4 @@
-// 与 `python/verify_clean_expired_msg_live.py`、`rust/examples/live_clean_expired_msg.rs`、
-// C# 的对应场景同题、逐条对应（A0–A5）。
+// 过期清扫与重投真机联调（场景 A0–A5 逐条断言）。
 //
 // 离线单测（tests/test_clean_expired_msg.cpp）锁的是**判据**（选条/阈值/上限/摘除闸门）；
 // 这里锁真机上两件离线锁不住的事：
@@ -322,7 +321,7 @@ int main(int argc, char* argv[]) {
         // ---------- A5 位点收尾 ----------
         const bool offsetOk = waitUntil([&] { return fx.committedOffset(group, topic) == 1; },
                                         30000, 1000);
-        check("A5-挂住的 listener 返回后业务队列位点走到 1（Java removeMessage 含已清扫条目）",
+        check("A5-挂住的 listener 返回后业务队列位点走到 1（removeMessage 含已清扫条目）",
               offsetOk, "offset=" + std::to_string(fx.committedOffset(group, topic)));
     } catch (const std::exception& e) {
         check("验证过程抛出异常", false, e.what());

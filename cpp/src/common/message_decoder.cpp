@@ -1,4 +1,4 @@
-// 严格对齐 python/common/message_decoder.py（已对真实 5.5.1 集群验证），
+// 消息编解码实现（已对真实 5.5.1 集群验证），
 // 两条**互不可混用**的路径：
 //   1) 17 段存储格式：encodeMessageExt / decodeMessage / decodeMessages（broker 写入与 pull 返回）；
 //   2) 6 段轻量格式：encodeMessage / encodeMessages / decodeBatchMessage / decodeBatchMessages（批量 body）。

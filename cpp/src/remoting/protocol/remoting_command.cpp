@@ -1,4 +1,4 @@
-// 严格对齐 python/remoting/protocol/remoting_command.py（已对真实 5.5.1 集群验证）：
+// 线格式与编解码（已对真实 5.5.1 集群验证）：
 //   - 线格式：totalLength(4) | headerLength(高 8 位放序列化类型, 4) | header | body
 //   - header(JSON)：RemotingSerializable JSON 编码；解码兼容 5.x 把 language 写成枚举名字符串
 //   - header(ROCKETMQ)：RocketMQSerializable 私有二进制编码
@@ -33,7 +33,7 @@ std::atomic<int32_t>& opaqueCounter() {
 }
 
 // 全局序列化类型配置：环境变量 ROCKETMQ_SERIALIZE_TYPE / rocketmq.serialize.type，
-// 取 "ROCKETMQ" 走二进制，否则 JSON（与 Python _load_serialize_type_config 一致）。
+// 取 "ROCKETMQ" 走二进制，否则 JSON。
 uint8_t loadSerializeTypeConfig() {
     const char* v = std::getenv(SERIALIZE_TYPE_ENV);
     if (v == nullptr) v = std::getenv(SERIALIZE_TYPE_PROPERTY);

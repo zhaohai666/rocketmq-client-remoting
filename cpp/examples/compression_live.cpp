@@ -1,4 +1,4 @@
-// 自动压缩的**真实集群 + 跨客户端**联调工具（对应 python/verify_compression_live.py）。
+// 自动压缩的**真实集群 + 跨客户端**联调工具。
 //
 //
 //
@@ -204,7 +204,7 @@ int main(int argc, char** argv) {
     const Bytes body = str2bytes(payload);
     const uint32_t payloadCrc = crc32(body);
     std::cout << "payload len=" << size << " crc32=" << payloadCrc
-              << "（确定性载荷，Java 探针同算法）" << std::endl;
+              << "（确定性载荷）" << std::endl;
 
     // 1) 发出
     std::string msgId;

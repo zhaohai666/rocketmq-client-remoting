@@ -1,4 +1,4 @@
-// Request-Reply（5.x）客户端侧单测（对齐 python/tests/test_request_reply.py 的覆盖面）。
+// Request-Reply（5.x）客户端侧单测。
 //
 // 覆盖三层：
 // 1. 纯数据/等待槽逻辑（RequestResponseFuture / RequestFutureHolder / createReplyMessage）
@@ -128,7 +128,7 @@ int main() {
                "empty request message -> " + kCreateReply10007 + " too (got "
                    + std::to_string(nullCode) + ")");
         expect(noClusterMsg.find("property[CLUSTER] is null.") != std::string::npos,
-               "10007 points at the missing CLUSTER property (Java wording): " + noClusterMsg);
+               "10007 points at the missing CLUSTER property (reference wording): " + noClusterMsg);
     }
     {
         Message reply = createReplyMessage(requestMsg(), Bytes{'p'});

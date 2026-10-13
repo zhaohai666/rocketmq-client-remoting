@@ -65,7 +65,7 @@ static void testBuildMqClientId() {
 
 static void testChangeInstanceNameToPID() {
     expectEq(changeInstanceNameToPID("inst"), "inst", "显式设置的 instanceName 原样保留");
-    expectEq(changeInstanceNameToPID("ADMIN"), "ADMIN", "admin 的默认名不是 Java 的 DEFAULT");
+    expectEq(changeInstanceNameToPID("ADMIN"), "ADMIN", "admin 的默认名不是默认的 DEFAULT");
     const std::string rewritten = changeInstanceNameToPID(MixAll::DEFAULT_INSTANCE_NAME);
     CHECK(rewritten.rfind(kPidPrefix, 0) == 0, "默认名换成 <pid>#<nanoTime>");
     expectEq(changeInstanceNameToPID(rewritten), rewritten, "改写是幂等的");

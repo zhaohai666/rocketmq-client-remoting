@@ -1,6 +1,5 @@
-// C++ 客户端 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 真机联调
-// （对应 python/verify_sql92_live.py、cpp/tests/test_check_client_config.cpp、
-//   rust/examples/live_sql92.rs、csharp/examples/.../LiveSql92.cs 的 S1–S4：四语言对拍）。
+// C++ 客户端 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 真机联调（场景 S1–S4 逐条断言；
+// 非法配置的拦截另由 cpp/tests/test_check_client_config.cpp 离线锁定）。
 //
 //
 // 用法（先起本地 5.5.1 集群，broker 需 enablePropertyFilter=true）：
@@ -292,7 +291,7 @@ void s1WireEvidence(Env& env, const std::string& topic) {
     } catch (const std::exception& e) {
         check("S1 TAG 消费者启动成功", false, e.what());
     }
-    check("S1 纯 TAG 订阅一笔 46 都不发（Java isTagType 短路）", tagProbe->checkCount() == 0,
+    check("S1 纯 TAG 订阅一笔 46 都不发（isTagType 短路）", tagProbe->checkCount() == 0,
           "codes=" + tagProbe->codesStr());
     t.shutdown();
 }
@@ -435,7 +434,7 @@ int main(int argc, char** argv) {
     prod.setSendMsgTimeout(5000);
     prod.start();
     try {
-        // 队列数 4：与 python/verify_sql92_live.py 的 create_topic("TBW102", topic, 4) 对齐
+        // 队列数 4：建 topic 时显式指定 4 个队列，便于断言队列归属
         prod.createTopic(MixAll::DEFAULT_TOPIC, topic, 4);
         const bool ready = waitFor([&] { return env.routeQueueCount(topic) >= 4; }, 20000);
         check("T0 topic 路由就绪（4 队列）", ready,

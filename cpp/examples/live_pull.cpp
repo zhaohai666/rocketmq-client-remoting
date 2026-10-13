@@ -1,8 +1,6 @@
 // 主动拉取消费者（DefaultMQPullConsumer）真机验证。
 // 用法：rmq_live_pull 127.0.0.1:9876
 //
-// 与 Python verify_pull_live.py 完全同场景（三语言对拍用同一套断言）。
-//
 // 场景（拉模式的核心是「调用方自己拉、自己管位点」，断言都围绕这一点）：
 //   S1 建 topic + fetchSubscribeMessageQueues → 拿到 4 个队列
 //   S1b fetchMessageQueuesInBalance → **没拉取过**的实例靠真实路由 + 38 算出自己那份
@@ -76,7 +74,7 @@ std::vector<std::string> splitAddrs(const std::string& addr) {
 
 std::string bodyOf(const MessageExt& m) { return std::string(m.body.begin(), m.body.end()); }
 
-// 与 Python 的 set(dict) 等价：MessageQueue 需要可比较才能做 map 键（C++ 用 offsetKey）。
+// MessageQueue 需可比较才能做 map 键：用 offsetKey 字符串当键，实现集合式去重。
 std::string qKey(const MessageQueue& q) {
     return q.brokerName + ":" + std::to_string(q.queueId);
 }

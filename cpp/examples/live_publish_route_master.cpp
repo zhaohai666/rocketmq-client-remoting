@@ -1,5 +1,4 @@
-// 与 `python/verify_publish_route_master_live.py`、`rust/examples/live_publish_route_master.rs`、
-// `csharp/examples/RocketMQ.Examples/LivePublishRouteMaster.cs` 同场景、逐条同断言。
+// 主备切换下的发布路由真机联调，场景逐条断言。
 //
 // 前置：namesrv + master + slave 都在跑（按本地集群 runbook）；脚本自己**只停一次 master**
 // （scripts/rmq_test_broker.sh 只认 master 的 java 进程），收尾块保证 master 一定回来。

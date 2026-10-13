@@ -1,4 +1,4 @@
-// C++ 客户端的**真实集群**消息类型联调（对应 python/verify_message_types.py）。
+// C++ 客户端的**真实集群**消息类型联调。
 //
 // 覆盖 7 类消息能力，全部打真实 nameServer + broker：
 //   1. 异步发送（sendAsync + SendCallback）
@@ -9,7 +9,7 @@
 //   6. 带 Key 消息 + 按 Key 服务端查询（QUERY_MESSAGE）
 //   7. 事务消息（两阶段的提交路径；完整链路见 rmq_live_transaction）+ 落库可消费
 //   8. 批量消息（sendBatch → SEND_BATCH_MESSAGE(320)，broker 按 N 条独立消息投递、offset 连续）
-//   附：消费者心跳注册（HEART_BEAT，Python 参考实现缺此能力）
+//   附：消费者心跳注册（HEART_BEAT）
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
 // autoCreateTopicEnable=true。用法：

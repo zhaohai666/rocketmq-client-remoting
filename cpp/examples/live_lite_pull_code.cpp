@@ -1,5 +1,5 @@
 // lite-pull **请求码 / broker 开关**（#107）真机验证。
-// 与 `python/verify_lite_pull_code_live.py`、rust/csharp 的对应场景同题、逐条对应。
+// 场景 S1–S3（S2 含 a–d 四条对照腿），逐条真机断言。
 //
 // 为什么必须真机：`FLAG_LITE_PULL_MESSAGE(0x10)` + `LITE_PULL_MESSAGE(361)` 这条链在离线
 // 假 broker 上永远是绿的 —— 少了位、码还是 11 时，报文依然是一个完全合法的 pull，
@@ -17,7 +17,7 @@
 //      S2d push 消费者照常消费（**对照**：整条消费链路没坏）。
 //   S3 开关还原 true：lite pull 立即恢复。
 //
-// 退出前**无条件**把 `litePullMessageEnable` 改回原值（与 recall_live.cpp 同款）。
+// 退出前**无条件**把 `litePullMessageEnable` 改回原值（与同类真机工具一样）。
 //
 // 用法：./rmq_live_lite_pull_code 127.0.0.1:9876
 #include <chrono>

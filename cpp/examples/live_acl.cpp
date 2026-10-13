@@ -16,10 +16,10 @@
 //   S7 正向：不带凭据走 NameServer 路由查询仍成功（钩子只作用于需要鉴权的目标）
 //
 // 关键事实（不要凭记忆改）：broker 侧所有鉴权失败都抛
-// AbortProcessException(NO_PERMISSION=16)（broker/auth/pipeline/AuthenticationPipeline.java:53）；
+// AbortProcessException(NO_PERMISSION=16)；
 // 失败原因用 ResponseCode 区分不了，只能看 remark：
-//   - 签名不对 → "check signature failed."（DefaultAuthenticationHandler:68）
-//   - 凭据缺失 → "User:null is not found."（DefaultAuthenticationHandler:60）
+//   - 签名不对 → "check signature failed."
+//   - 凭据缺失 → "User:null is not found."
 #include <atomic>
 #include <chrono>
 #include <cstdio>

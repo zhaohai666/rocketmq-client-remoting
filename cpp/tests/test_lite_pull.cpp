@@ -171,7 +171,7 @@ static void testLitePullConsumeTimestamp() {
     }
     CHECK(threw, "非法 consumeTimestamp 时 start() 抛异常");
     CHECK(what.find("consumeTimestamp is invalid") != std::string::npos,
-          "异常文案对齐 Java checkConfig");
+          "异常文案对齐参考实现的 checkConfig");
 
     // 合法值不能被这条守卫误杀（namesrv 不可达是另一回事）
     DefaultLitePullConsumer ok;

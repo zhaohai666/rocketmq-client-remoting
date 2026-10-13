@@ -1,4 +1,4 @@
-// TopicConfig 实现（对应 Python common/topic_config.py）。
+// TopicConfig 实现。
 #include "rocketmq/common/topic_config.h"
 
 #include <string>

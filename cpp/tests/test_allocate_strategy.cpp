@@ -171,7 +171,7 @@ void testAveragelyMatchesKnownSplit() {
     AllocateMessageQueueAveragely s;
     std::vector<size_t> sizes;
     for (const std::string& cid : cidAll) sizes.push_back(s.allocate("G", cid, mqAll, cidAll).size());
-    CHECK(sizes == std::vector<size_t>({3, 3, 2, 2}), "Java 单测 size {3,3,2,2}");
+    CHECK(sizes == std::vector<size_t>({3, 3, 2, 2}), "单测基准 size {3,3,2,2}");
 }
 
 void testCircleMatchesKnownSplit() {
@@ -226,7 +226,7 @@ void testByConfigIgnoresGuards() {
     CHECK(join(allocateIds(s, "anyCID", queuesOf(5), emptyCid)) == "[0,1]", "CONFIG 忽略入参队列");
 }
 
-// 未配置 = 空列表（Python/Rust 口径），且 allocate 返回副本
+// 未配置 = 空列表，且 allocate 返回副本
 void testByConfigDefaultsEmptyAndReturnsCopy() {
     AllocateMessageQueueByConfig s;
     CHECK(s.getMessageQueueList().empty(), "默认未配置 = 空");
@@ -250,7 +250,7 @@ void testStrategyNamesMatchProtocol() {
     for (const auto& s : strategies) names.push_back(s->getName());
     CHECK(names == std::vector<std::string>({"AVG", "AVG_BY_CIRCLE", "CONFIG", "CONSISTENT_HASH",
                                              "MACHINE_ROOM", "MACHINE_ROOM_NEARBY-CONSISTENT_HASH"}),
-          "getName 与 Java 一致");
+          "getName 符合命名约定");
 }
 
 // 全覆盖 + 不重叠：任意 (队列数, 消费者数) 下所有消费者的并集恰为 mqAll
@@ -336,10 +336,10 @@ void testCrossCheckAgainstPythonFormula() {
                 std::string avgExpect = join(pythonAveragely(ids, cidAll, cid));
                 std::string circleExpect = join(pythonCircle(ids, cidAll, cid));
                 CHECK(join(allocateIds(avg, cid, mqAll, cidAll)) == avgExpect,
-                      "AVG 与 Python 算式不一致 " + std::to_string(mqSize) + "x"
+                      "AVG 与算式预期不一致 " + std::to_string(mqSize) + "x"
                           + std::to_string(cidSize) + " cid=" + cid);
                 CHECK(join(allocateIds(circle, cid, mqAll, cidAll)) == circleExpect,
-                      "AVG_BY_CIRCLE 与 Python 算式不一致 " + std::to_string(mqSize) + "x"
+                      "AVG_BY_CIRCLE 与算式预期不一致 " + std::to_string(mqSize) + "x"
                           + std::to_string(cidSize) + " cid=" + cid);
             }
         }
@@ -413,7 +413,7 @@ void testConsistentHashRingTableLayout() {
     runConsistentHashTable(AllocateMessageQueueConsistentHash(), consistentHashDefaultVcCases());
     CHECK_EQ(AllocateMessageQueueConsistentHash(3).getVirtualNodeCnt(), 3, "vc=3 可读回");
     CHECK_EQ(AllocateMessageQueueConsistentHash().getVirtualNodeCnt(), 10,
-             "默认 vc=10（Java 无参构造）");
+             "默认 vc=10（无参构造）");
 }
 
 void testConsistentHashCoversEveryQueueOnce() {
@@ -486,7 +486,7 @@ void testConsistentHashRejectsNegativeVirtualNodeCnt() {
     }
     CHECK(threw, "必须拒绝负数虚拟节点数");
     CHECK(text.find("illegal virtualNodeCnt :-1") != std::string::npos,
-          "文案对齐 Java 构造器：" + text);
+          "文案对齐构造器约定：" + text);
     const AllocateMessageQueueConsistentHash zero(0);
     CHECK(chAllocateIds(zero, "CID-0", queuesOf(4), chCids(2)).empty(), "vc=0 ⇒ 谁都拿不到队列");
 }
@@ -504,9 +504,9 @@ void testConsistentHashUsesInjectedHashFunction() {
     const AllocateMessageQueueConsistentHash strategy(2, injected);
     const std::vector<MessageQueue> mqAll = queuesOf(4);
     const std::vector<std::string> cidAll = chCids(2);
-    CHECK(chAllocateIds(strategy, "CID-0", mqAll, cidAll).empty(), "Java 真值：CID-0 拿不到队列");
+    CHECK(chAllocateIds(strategy, "CID-0", mqAll, cidAll).empty(), "线上真值：CID-0 拿不到队列");
     CHECK(join(chAllocateIds(strategy, "CID-1", mqAll, cidAll)) == "[0,1,2,3]",
-          "Java 真值：环上只剩 CID-1");
+          "线上真值：环上只剩 CID-1");
     CHECK(injected->calls > 0, "自定义哈希没被调用");
 }
 
@@ -555,14 +555,14 @@ void testByMachineRoomSplitsBrokerName() {
     };
     for (const SplitCase& c : cases) {
         CHECK_EQ(javaSplit(c.broker, '@').size(), c.expectedParts,
-                 std::string("javaSplit(\"") + c.broker + "\") 段数与 Java 不一致");
+                 std::string("javaSplit(\"") + c.broker + "\") 段数与预期不一致");
         const std::vector<MessageQueue> mqAll = roomQueuesOf(c.broker, 0, 1);
         const bool got = !allocateIds(strategy, cidAll[0], mqAll, cidAll).empty();
         CHECK_EQ(got, c.allocated, std::string("broker=\"") + c.broker + "\" 参与/剔除判定不一致");
     }
     AllocateMessageQueueByMachineRoom unset;
     CHECK(unset.allocate("G", cidAll[0], roomQueuesOf("room1@b", 0, 1), cidAll).empty(),
-          "未配置白名单 ⇒ 不分（Java 是 NPE）");
+          "未配置白名单 ⇒ 不分（缺配置时上游直接 NPE）");
     strategy.setConsumeridcs({"room2"});
     CHECK_EQ(strategy.getConsumeridcs().count("room2"), static_cast<size_t>(1), "getConsumeridcs 反映新配置");
     CHECK(allocateIds(strategy, cidAll[0], roomQueuesOf("room1@broker-a", 0, 1), cidAll).empty(),
@@ -717,7 +717,7 @@ void testNearbyThrowsWhenRoomIsUnknown() {
     CHECK(threw, "broker 机房为空必须抛");
     CHECK(text.find("Machine room is null for mq MessageQueue [topic=topic, "
                     "brokerName=brokerName, queueId=0]") != std::string::npos,
-          "文案对齐 Java（含 MessageQueue#toString）：" + text);
+          "文案对齐约定（含 MessageQueue#toString）：" + text);
 
     text = catchAllocate(
         AllocateMachineRoomNearby(std::make_shared<AllocateMessageQueueAveragely>(),
@@ -725,7 +725,7 @@ void testNearbyThrowsWhenRoomIsUnknown() {
         mqAll, cidAll, &threw);
     CHECK(threw, "consumer 机房为空必须抛");
     CHECK(text.find("Machine room is null for consumer id CID-0") != std::string::npos,
-          "文案对齐 Java：" + text);
+          "文案对齐约定：" + text);
 
     // 守卫仍然优先：cidAll 为空时先返回空，不碰 resolver
     const AllocateMachineRoomNearby nearby(
@@ -788,7 +788,7 @@ void testConsumersExposeStrategy() {
     // 未配 namesrv / 订阅也会被组名检查先挡住，所以这里直接验证 setter 允许置 null
     // （start() 的守卫见 live 用例 S7a）。
     push.setAllocateMessageQueueStrategy(nullptr);
-    CHECK(push.allocateMessageQueueStrategy() == nullptr, "push setter 接受 null（同 Java）");
+    CHECK(push.allocateMessageQueueStrategy() == nullptr, "push setter 接受 null");
 
     DefaultLitePullConsumer lite("G_test");
     CHECK_EQ(lite.allocateMessageQueueStrategy()->getName(), std::string("AVG"),
@@ -817,7 +817,7 @@ void testConsumersExposeStrategy() {
     }
     CHECK(threw, "lite 策略为 null 时 start() 抛异常");
     CHECK(msg.find("allocateMessageQueueStrategy is null") != std::string::npos,
-          "lite 策略为 null 的文案对齐 Java：" + msg);
+          "lite 策略为 null 的文案对齐约定：" + msg);
 
     DefaultMQPullConsumer pull("G_test");
     CHECK_EQ(pull.allocateMessageQueueStrategy()->getName(), std::string("AVG"),
@@ -826,7 +826,7 @@ void testConsumersExposeStrategy() {
     CHECK_EQ(pull.allocateMessageQueueStrategy()->getName(), std::string("CONFIG"),
              "pull 可替换为 CONFIG");
     pull.setAllocateMessageQueueStrategy(nullptr);
-    CHECK(pull.allocateMessageQueueStrategy() == nullptr, "pull setter 接受 null（同 Java）");
+    CHECK(pull.allocateMessageQueueStrategy() == nullptr, "pull setter 接受 null");
     DefaultMQPullConsumer pullNullStrat("G_test");
     pullNullStrat.setNamesrvAddr("127.0.0.1:1");
     pullNullStrat.setAllocateMessageQueueStrategy(nullptr);
@@ -840,7 +840,7 @@ void testConsumersExposeStrategy() {
     }
     CHECK(pullThrew, "pull 策略为 null 时 start() 抛异常");
     CHECK(pullMsg.find("allocateMessageQueueStrategy is null") != std::string::npos,
-          "pull 策略为 null 的文案对齐 Java：" + pullMsg);
+          "pull 策略为 null 的文案对齐约定：" + pullMsg);
 }
 
 // 三个新策略在 push / lite / pull 消费者上都能换上并读回（暴露面与旧策略一致）

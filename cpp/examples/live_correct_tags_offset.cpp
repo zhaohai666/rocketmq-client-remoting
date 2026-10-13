@@ -1,5 +1,4 @@
-// 与 `python/verify_correct_tags_offset_live.py`、`rust/examples/live_correct_tags_offset.rs`、
-// C# 的对应场景同题、逐条对应（S1–S4）。
+// 修正订阅表达式后位点前移真机联调（场景 S1–S4 逐条断言）。
 //
 // 离线单测（tests/test_correct_tags_offset.cpp）锁的是**判据**；这里锁真机上两件离线锁不住的事：
 //   A. **修正确实走到了 broker**：位点最终由 UPDATE_CONSUMER_OFFSET 落盘，只有真集群能证明
@@ -177,7 +176,7 @@ struct Fixture {
     // 该 topic 在路由上的真实队列列表。
     //
     // 不能用「主 topic 有几个队列」当通用假设：`%RETRY%<group>` 是 broker 建的，
-    // 只有 1 个队列（Python/Rust 参考实现同样按路由查）。照 4 个去查会把"只有 q0 有记录"
+    // 只有 1 个队列。照 4 个去查会把"只有 q0 有记录"
     // 误报成失败。
     std::vector<MessageQueue> queues(const std::string& topicName) {
         TopicRouteData route = admin.examineTopicRoute(topicName);

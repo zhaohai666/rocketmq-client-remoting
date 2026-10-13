@@ -1,6 +1,6 @@
 // 编解码往返单测：JSON / RocketMQ 二进制 / RemotingCommand / 消息格式 / 工具函数。
 //
-// 目标：在不依赖真实集群的前提下，证明 C++ 协议层与 Python 参考实现行为一致（字节级往返正确）。
+// 目标：在不依赖真实集群的前提下，证明本端口协议层字节级往返正确。
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -249,7 +249,7 @@ static void testWaitStoreMsgOkParseBooleanContract() {
 
 static void testUtilAndHash() {
     MessageQueue mq("A", "B", 0);
-    CHECK(mq.hashCode() == 93282, "MessageQueue hashCode java-semantics");
+    CHECK(mq.hashCode() == 93282, "MessageQueue hashCode protocol semantics");
 
     // 十六进制（大写）
     Bytes bs;

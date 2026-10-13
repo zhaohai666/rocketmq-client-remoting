@@ -1,4 +1,4 @@
-// MixAll 的实现（对应 Python common/mix_all.py 中的 properties 与分组判定部分）。
+// MixAll 的实现（properties 与分组判定部分）。
 #include "rocketmq/common/mix_all.h"
 
 #include <string>
@@ -43,7 +43,7 @@ std::string trimBoth(const std::string& s) {
     return s.substr(b, e - b);
 }
 
-// 按 \r\n / \n / \r 切行（等价于 Python str.splitlines 对本场景的行为）
+// 按 \r\n / \n / \r 切行
 std::vector<std::string> splitLines(const std::string& text) {
     std::vector<std::string> lines;
     std::string cur;

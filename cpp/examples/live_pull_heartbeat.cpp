@@ -1,4 +1,4 @@
-// 拉模式消费者心跳真机联调（#98）：对应 python/verify_pull_consumer_heartbeat_live.py 的 A0–A6。
+// 拉模式消费者心跳真机联调（#98）：场景 A0–A6 逐条断言。
 //
 // 为什么必须真机：离线单测能证明「报文形状对」，但证明不了 broker 的 ConsumerManager 真的
 // 把本组登记进 consumerTable（broker 是按台建表的），也证明不了 35 注销之后立刻摘除。
@@ -140,10 +140,10 @@ int main(int argc, char* argv[]) {
         check("A2 主节点 203 查到本组（心跳已注册）", online,
               "connections=" + std::to_string(conn.connectionSet.size()) +
                   (err.empty() ? "" : " err=" + err));
-        check("A2 消费类型是 CONSUME_ACTIVELY（Java DefaultMQPullConsumerImpl:348）",
+        check("A2 消费类型是 CONSUME_ACTIVELY",
               online && conn.consumeType == ConsumeType::CONSUME_ACTIVELY,
               "consumeType=" + conn.consumeType);
-        check("A2 消费位点是 CONSUME_FROM_LAST_OFFSET（:353）",
+        check("A2 消费位点是 CONSUME_FROM_LAST_OFFSET",
               online && conn.consumeFromWhere == ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET,
               "consumeFromWhere=" + conn.consumeFromWhere);
         check("A2 广播/集群口径是 CLUSTERING",

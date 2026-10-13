@@ -383,11 +383,11 @@ void testBadPeriodFallsBackToDefault() {
     MQClientInstance instance("sched_bad_period_instance", {"127.0.0.1:1"}, 3000, 15000, false,
                               std::string(), 0);
     expectInt(instance.pollNameServerIntervalMillis(), 30000,
-              "non-positive poll interval falls back to Java default 30000");
+              "non-positive poll interval falls back to the default 30000");
     MQClientInstance negative("sched_neg_period_instance", {"127.0.0.1:1"}, 3000, 15000, false,
                               std::string(), -1);
     expectInt(negative.pollNameServerIntervalMillis(), 30000,
-              "negative poll interval falls back to Java default 30000");
+              "negative poll interval falls back to the default 30000");
 }
 
 }  // namespace

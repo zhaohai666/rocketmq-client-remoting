@@ -193,7 +193,7 @@ void testUpdateCorePoolSizeGuards() {
 
 void testDefaultMaxIsTwenty() {
     DefaultMQPushConsumer c("GID_ThreadPoolUnit");
-    expectEq(c.getConsumeThreadMax(), 20, "default max is Java 5.x's 20");
+    expectEq(c.getConsumeThreadMax(), 20, "default max is the reference default 20");
     expect(!c.updateCorePoolSize(30), "30 rejected under default max");
     expect(!c.updateCorePoolSize(21), "21 rejected under default max");
     expectEq(c.getCorePoolSize(), 20, "nothing landed");

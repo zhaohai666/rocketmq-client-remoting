@@ -1,5 +1,4 @@
-// C++ 批量 admin 方法的**真实集群**联调（对标 python/verify_admin_batch_live.py，
-// 与 go/examples/live_admin_batch 同口径）。
+// C++ 批量 admin 方法的**真实集群**联调。
 //
 //
 // 本程序自身不启动集群；用 scripts/with_cluster.sh 包一层跑。用法：
@@ -347,7 +346,7 @@ int main(int argc, char** argv) {
     // ---- 10. 静态 topic(513)：端能力差异，SKIP ----
     skip("静态 topic(513)",
          "mapping 构造需完整 TopicQueueMappingDetail 文档（hostedBrokerIds/scope/"
-         "每队列 mappingInfo），Python/Go 参考断言集均未覆盖；header 布线由单测锁定");
+         "每队列 mappingInfo），本工具未做真机覆盖；header 布线由单测锁定");
 
     // ---- 清理 -----------------------------------------------------------
     for (const std::string& t : {topicA, topicB}) {

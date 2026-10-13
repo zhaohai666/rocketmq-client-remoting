@@ -1,9 +1,7 @@
 // Validators / TopicValidator 真机验证（任务 #32）。
 // 用法：rmq_validators_live 127.0.0.1:9876
 //
-// 与 python/verify_validators_live.py、rust/examples/live_validators.rs 同场景对拍：
-// 四语言要拿同一份断言证明「非法名字在本地第一行就被拦掉，合法名字照常在集群收发」。
-// （编号有偏移：Python 那份把寻址故障那一腿编在 S7，本份里是 S8。）
+// 逐条断言证明「非法名字在本地第一行就被拦掉，合法名字照常在集群收发」。
 //
 // 前置：NameServer + Broker 已起（普通配置，不需要 ACL/TLS/trace）。
 //

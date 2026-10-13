@@ -171,7 +171,7 @@ int main() {
         auto tb = TraceDataEncoder::encoderFromContextBean(&ctx);
         expect(tb.has_value(), "pub: encoder returns value");
         if (tb.has_value()) {
-            expectEq(tb->transData, expectedPub(), "pub: matches java vector");
+            expectEq(tb->transData, expectedPub(), "pub: matches the recorded wire vector");
             // trans_key = msgId + 按空格拆开的业务 keys
             expect(tb->transKey.size() == 3 && tb->transKey.count(MSG_ID_1) == 1 &&
                        tb->transKey.count("KeyA") == 1 && tb->transKey.count("KeyB") == 1,
@@ -190,7 +190,7 @@ int main() {
         expect(tb.has_value(), "sub_before: encoder returns value");
         if (tb.has_value()) {
             expectEq(tb->transData, expectedSubBefore(),
-                     "sub_before: matches java vector (2 beans)");
+                     "sub_before: matches the recorded wire vector (2 beans)");
             expectInt(static_cast<long long>(tb->transKey.size()), 5,
                       "sub_before: trans_key merges both beans");
         }
@@ -208,7 +208,7 @@ int main() {
         ctx.traceBeans = {makeBean()};
         auto tb = TraceDataEncoder::encoderFromContextBean(&ctx);
         expect(tb.has_value() && tb->transData == expectedSubAfter(),
-               "sub_after: matches java vector");
+               "sub_after: matches the recorded wire vector");
     }
     {
         TraceContext ctx;
@@ -239,7 +239,7 @@ int main() {
         ctx.traceBeans = {makeBean()};
         auto tb = TraceDataEncoder::encoderFromContextBean(&ctx);
         expect(tb.has_value() && tb->transData == expectedEndTransaction(),
-               "end_tx: matches java vector");
+               "end_tx: matches the recorded wire vector");
     }
     {
         TraceContext ctx;
@@ -250,7 +250,7 @@ int main() {
         ctx.isSuccess = true;
         ctx.traceBeans = {makeBean()};
         auto tb = TraceDataEncoder::encoderFromContextBean(&ctx);
-        expect(tb.has_value() && tb->transData == expectedRecall(), "recall: matches java vector");
+        expect(tb.has_value() && tb->transData == expectedRecall(), "recall: matches the recorded wire vector");
     }
     expect(!TraceDataEncoder::encoderFromContextBean(nullptr).has_value(),
            "encoder(nullptr) -> nullopt");

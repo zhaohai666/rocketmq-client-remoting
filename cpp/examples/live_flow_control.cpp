@@ -1,5 +1,4 @@
-// 与 Python 的 verify_flow_control_live.py、Rust 的 live_flow_control.rs、C# 的
-// LiveFlowControl.cs 一一对应（S0~S5）。
+// 拉取流控阈值真机联调（场景 S0~S5 逐条断言）。
 //
 // 离线单测（tests/test_flow_control.cpp）锁的是**判据本身**；这里锁真机上两件离线
 // 永远锁不住的事：
@@ -11,7 +10,7 @@
 //
 // ⚠ 大消息必须是**不可压缩**的随机字节：生产者对超过压缩阈值的 body 先试压，全同字节
 //   的 payload 会被压到几百字节，broker 落盘的 storeSize 跟着变成几百字节，"size 闸门
-//   永不命中"就成了夹具问题而不是实现问题（Python 侧第一次跑就是这么踩到的）。
+//   永不命中"就成了夹具问题而不是实现问题。
 // ⚠ 每个场景都必须**先建 topic 再启动消费者**：消费者不做默认 topic 兜底，没路由就
 //   不分配队列；S1 还必须建**单队列** topic，否则 8 条 400KB 摊到 4 条队列上每条才
 //   800KB，永远够不到 1MiB 这道队列级闸门。

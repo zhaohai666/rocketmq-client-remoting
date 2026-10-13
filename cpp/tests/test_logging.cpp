@@ -143,7 +143,7 @@ int main() {
         const std::regex re(
             R"(^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} INFO  \[[0-9]+\] \[ConsumeMessageThread_0\] \[test_logging\.cpp:(\d+)\] - )");
         std::smatch m;
-        CHECK(std::regex_search(lines[0], m, re), "line matches Java-like format");
+        CHECK(std::regex_search(lines[0], m, re), "line matches the recorded format");
         if (m.size() > 1) {
             CHECK(std::stoi(m[1].str()) == expectedLine, "file:line captures call site");
         } else {

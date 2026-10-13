@@ -68,7 +68,7 @@ bool parseSingleRecord(const std::vector<std::string>& line, TraceContext& ctx) 
     if (line.empty()) return false;
     const std::string& kind = line[0];
     if (kind == "Pub") {
-        // 最小 12 段（Python 参考实现实际访问到 line[11]）；老版本无 offsetMsgId 时 13 段。
+        // 最小 12 段（解析实际访问到 line[11]）；老版本无 offsetMsgId 时 13 段。
         if (line.size() < 12) return false;
         ctx.traceType = TraceType::PUB;
         ctx.timeStamp = toInt64(safeAt(line, 1), 0);
@@ -112,7 +112,7 @@ bool parseSingleRecord(const std::vector<std::string>& line, TraceContext& ctx) 
         return true;
     }
     if (kind == "SubAfter") {
-        // 最小 6 段（keys 在段 5）；Python 参考实现访问到 line[5]，与之对齐。
+        // 最小 6 段（keys 在段 5，解析实际访问到 line[5]）。
         if (line.size() < 6) return false;
         ctx.traceType = TraceType::SUB_AFTER;
         ctx.requestId = safeAt(line, 1);

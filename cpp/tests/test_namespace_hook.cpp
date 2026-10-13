@@ -739,7 +739,7 @@ void testFacadesPutNamespaceOnTheWire() {
         const int total = mock.countRequests(RequestCode::GET_ROUTEINFO_BY_TOPIC);
         const int marked =
             mock.countRequestsWith(RequestCode::GET_ROUTEINFO_BY_TOPIC, kNsKey, "MQINST-wire");
-        CHECK(total == 0, "admin start itself asks no route (Java DefaultMQAdminExtImpl:161-172)");
+        CHECK(total == 0, "admin start itself asks no route");
         CHECK(marked == total, "admin: nothing unsigned before it talks");
         admin.examineTopicRoute(topic);
         checkAllRequestsMarked(mock, "admin", false);

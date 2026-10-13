@@ -29,8 +29,7 @@ struct TopicValidator {
 
     static constexpr const char* SYSTEM_TOPIC_PREFIX = "rmq_sys_";
 
-    // 字符表判定：**空串返回 false**（空/纯空白由 UtilAll::isBlank 单独管，
-    // 与 Python is_topic_or_group_illegal 的口径一致）。
+    // 字符表判定：**空串返回 false**（空/纯空白由 UtilAll::isBlank 单独管）。
     static bool isTopicOrGroupIllegal(const std::string& name);
 
     // 命中系统 topic 名单或 rmq_sys_ 前缀

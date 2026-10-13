@@ -320,7 +320,7 @@ void a1NonBlockingAndReadBack(Env& env, const std::string& t) {
     check("A1 before 钩子在 AsyncSenderExecutor_N 上跑",
           startsWith(hook->beforeThread(), "AsyncSenderExecutor_"),
           "线程名=" + hook->beforeThread());
-    check("A1 用户回调在 NettyClientPublicExecutor_N 上跑（Java executeInvokeCallback）",
+    check("A1 用户回调在 NettyClientPublicExecutor_N 上跑",
           startsWith(rec->threadAt(0), "NettyClientPublicExecutor_"),
           "线程名=" + rec->threadAt(0));
     check("A1 before/after 各跑一次", hook->before() == 1 && hook->after() == 1,
@@ -465,7 +465,7 @@ void a4ForbiddenHook(Env& env, const std::string& t) {
           waitUntil([&]() { return rejected->done() >= 1; }, 10000)
               && rejected->firstError().find("tag forbidden is not allowed") != std::string::npos,
           rejected->summary());
-    check("A4 钩子拒绝的异常类型是 MQClientException（Java checkForbidden 抛的就是它）",
+    check("A4 钩子拒绝的异常类型是 MQClientException（checkForbidden 抛的就是它）",
           rejected->firstErrorType() == "MQClientException", rejected->summary());
     check("A4 拦截钩子看到的是 ASYNC", forbidden->mode() == CommunicationMode::ASYNC,
           "mode=" + std::string(forbidden->mode() == CommunicationMode::ASYNC      ? "ASYNC"

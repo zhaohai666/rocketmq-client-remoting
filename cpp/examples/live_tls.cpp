@@ -1,4 +1,4 @@
-// TLS + traceparent 真机联调（对应 run_tls_live.sh）。
+// TLS + traceparent 真机联调（配套 scripts/run_cpp_tls_live.sh）。
 //
 // 验证点（单进程闭环）：
 //   0. 传输层：逐轮新建 TLS 连接的首包必须落地；一条 TLS 连接上并发请求必须全部拿到应答
@@ -241,7 +241,7 @@ static int runLive(const std::string& namesrv, const std::string& topic,
 }
 
 int main(int argc, char** argv) {
-    // 三腿（对齐 run_php_live.sh tls / run_node_live.sh tls / run_python_tls_live.sh）：
+    // 三腿：
     //   plain_tls  test-mode，信任自签（历史行为）
     //   ca_verify  严格校验：证书链到 caCert + 主机名/SAN 匹配（serverName 覆盖）
     //   mtls       严格校验 + 客户端证书双向认证

@@ -58,7 +58,7 @@ std::string routedKey(const ConsistentHashRouter& router, const std::string& obj
     return node == nullptr ? std::string("<null>") : node->getKey();
 }
 
-// RFC 1321 附录 A 的官方向量 + 跨块/填充边界的几种长度（参考值与 Rust 同源）
+// RFC 1321 附录 A 的官方向量 + 跨块/填充边界的几种长度
 void testMd5MatchesReferenceVectors() {
     CHECK_EQ(md5Hex(""), std::string("d41d8cd98f00b204e9800998ecf8427e"), "MD5 空串");
     CHECK_EQ(md5Hex("a"), std::string("0cc175b9c0f1b6a831c399e269772661"), "MD5 \"a\"");
@@ -88,7 +88,7 @@ void testMd5HashTakesOnlyFourBytes() {
     Md5Hash hash;
     CHECK_EQ(hash.hash(""), static_cast<int64_t>(0xD41D8CD9), "MD5Hash(\"\")");
     CHECK_EQ(hash.hash("abc"), static_cast<int64_t>(0x90015098), "MD5Hash(\"abc\")");
-    CHECK(hash.hash("abc") >> 32 == 0, "结果必须落在 32 位内（Java 是 long）");
+    CHECK(hash.hash("abc") >> 32 == 0, "结果必须落在 32 位内（参考实现是 long）");
 }
 
 // 同一 key 恒定落点 + 越过环末尾回绕到 firstKey
@@ -121,7 +121,7 @@ void testNegativeVirtualNodeCountIsRejected() {
     } catch (const std::exception&) {
         threwOnEmpty = true;
     }
-    CHECK(!threwOnEmpty, "空节点集不触发检查（Java 同）");
+    CHECK(!threwOnEmpty, "空节点集不触发检查（参考实现同）");
 
     std::string text;
     bool threw = false;
@@ -133,7 +133,7 @@ void testNegativeVirtualNodeCountIsRejected() {
     }
     CHECK(threw, "必须拒绝负数虚拟节点数");
     CHECK(text.find("illegal virtual node counts :-1") != std::string::npos,
-          "文案对齐 Java addNode：" + text);
+          "addNode 的非法入参文案：" + text);
 }
 
 // `i + existingReplicas` 不是冗余：同一物理节点二次 addNode 必须往后编号而不是撞环
@@ -183,7 +183,7 @@ void testRingHashesAreSorted() {
     for (size_t i = 1; i < hashes.size(); ++i) {
         if (hashes[i] < hashes[i - 1]) sorted = false;
     }
-    CHECK(sorted, "环 hash 必须升序（Java TreeMap）");
+    CHECK(sorted, "环 hash 必须升序（参考实现用有序映射）");
 }
 
 }  // namespace

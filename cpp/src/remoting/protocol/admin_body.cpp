@@ -1,4 +1,4 @@
-// 管理端响应体实现（对应 Python remoting/protocol/admin_body.py）。
+// 管理端响应体实现。
 #include "rocketmq/remoting/protocol/admin_body.h"
 
 #include <string>

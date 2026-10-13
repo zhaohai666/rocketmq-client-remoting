@@ -648,7 +648,7 @@ void testValidationFailureGoesToCallback() {
     expectInt(s.successCount, 0, "no onSuccess");
     expect(s.message.find("the message body size over max value, MAX: 1024")
                != std::string::npos,
-           "validation text matches Validators/Java", s.message);
+           "validation text matches the Validators contract", s.message);
     expectInt(broker.sendCount(), 0, "an invalid message never reaches the broker");
     expectInt(hook->beforeCount.load(), 0, "no send hook runs for a message that failed checking");
     p.shutdown();
@@ -726,7 +726,7 @@ void testBrokerErrorCodeDoesNotRetry() {
         if (item != nullptr) {
             expect(!item->isAvailable(), "an async failure isolates the broker");
             expect(item->isReachable(),
-                   "an answered response keeps the broker reachable (Java async passes reachable=true)",
+                   "an answered response keeps the broker reachable (async path passes reachable=true)",
                    "reachable=" + std::to_string(item->isReachable()));
         }
         p.shutdown();
@@ -781,9 +781,9 @@ void testTimeoutSharesOneBudget() {
     auto s = cb->snapshot();
     expectInt(s.exceptionCount, 1, "timeout goes to onException");
     expect(s.message.find("wait response timeout, cost=") != std::string::npos,
-           "Java's timeout wording is preserved", s.message);
+           "the timeout wording is preserved verbatim", s.message);
     expect(s.errorType == "MQClientException",
-           "the transport timeout reaches the callback as Java's wrapper type",
+           "the transport timeout reaches the callback as the client wrapper type",
            "type=" + s.errorType);
     expectInt(silent.sendCount(), 1,
               "the shared remaining budget stops the chain after one timed-out attempt");
@@ -814,7 +814,7 @@ void testConnectFailureRetriesOntoAnotherBroker() {
     auto s = cb->snapshot();
     expectInt(s.exceptionCount, 1, "the failure surfaces through onException");
     expect(s.message.find("connect failed to") != std::string::npos,
-           "Java passes the raw transport error, not a wrapped one", s.message);
+           "the raw transport error reaches the callback, not a wrapped one", s.message);
     // 三次建连失败后链路自然收尾（上面的 connect failed to 已排除 callTimeout 截断）：
     // 在拒绝是毫秒级的机器上 totalMs 是毫秒级，在 ~2s 拒绝的机器上约 9s
     expect(totalMs < 30000, "connect-level failures retry without burning the budget",
@@ -925,7 +925,7 @@ void testQueueFullRejects() {
             accepted.push_back(cb);
         } catch (const MQClientException& e) {
             expect(std::string(e.what()) == "executor rejected",
-                   "a full queue throws Java's rejection message", e.what());
+                   "a full queue throws the expected rejection message", e.what());
             rejected.push_back(cb);
         }
     }
@@ -985,7 +985,7 @@ void testBackPressureDefaultsAndGateOff() {
     expectInt(p.getBackPressureForAsyncSendNum(), 1024, "backPressureForAsyncSendNum default");
     expectInt(p.getBackPressureForAsyncSendSize(), 100LL * 1024 * 1024,
              "backPressureForAsyncSendSize default");
-    expect(!p.isEnableBackpressureForAsyncMode(), "the switch is off by default (as in Java)");
+    expect(!p.isEnableBackpressureForAsyncMode(), "the switch is off by default");
     expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 1024, "num semaphore starts full");
     expectInt(p.getSemaphoreAsyncSendSizeAvailablePermits(), 100LL * 1024 * 1024,
              "size semaphore starts full");
@@ -1041,9 +1041,9 @@ void testNumGateRejectsOnCallerThread() {
     auto s = rejected->snapshot();
     expectInt(s.exceptionCount, 1, "the over-budget send calls back an error");
     expect(s.message == "send message tryAcquire semaphoreAsyncNum timeout",
-           "the num gate text matches Java word for word", s.message);
+           "the num gate text matches word for word", s.message);
     expect(s.errorType == "RemotingTooMuchRequestException",
-           "the gate rejection keeps the Java type (callers branch on it)",
+           "the gate rejection keeps the expected type (callers branch on it)",
            "type=" + s.errorType);
     expect(!startsWith(s.threadName, "AsyncSenderExecutor_")
                && !startsWith(s.threadName, "NettyClientPublicExecutor_"),
@@ -1088,9 +1088,9 @@ void testSizeGateRejectsAndGivesTheNumPermitBack() {
     auto s = second->snapshot();
     expectInt(s.exceptionCount, 1, "the second big send is gated");
     expect(s.message == "send message tryAcquire semaphoreAsyncSize timeout",
-           "the size gate text matches Java word for word", s.message);
+           "the size gate text matches word for word", s.message);
     expect(s.errorType == "RemotingTooMuchRequestException",
-           "the size gate keeps the Java type too", "type=" + s.errorType);
+           "the size gate keeps the expected type too", "type=" + s.errorType);
     expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), kMinAsyncSendNum - 1,
              "the in-flight send still holds exactly one num permit");
     expect(first->waitDone(10000), "the first big send still completes");
@@ -1274,7 +1274,7 @@ void testBatchAsyncOneRequestOneCallback() {
     expect(!attempts.empty() && attempts[0].code == RequestCode::SEND_BATCH_MESSAGE,
            "the batch goes out as SEND_BATCH_MESSAGE",
            attempts.empty() ? "no attempt recorded" : std::to_string(attempts[0].code));
-    // 同步批量内核里就有 sendWithHooks，所以批量异步不绕钩子（与 Python 同一口径）
+    // 同步批量内核里就有 sendWithHooks，所以批量异步不绕钩子
     expectInt(hook->beforeCount.load(), 1, "the batch runs SendMessageHook.before");
     expectInt(hook->afterCount.load(), 1, "and after exactly once — not twice (no async-chain after)");
 
@@ -1287,7 +1287,7 @@ void testBatchAsyncOneRequestOneCallback() {
     expectInt(bad->snapshot().exceptionCount, 1, "the oversized batch is rejected");
     expect(bad->snapshot().message.find("the message body size over max value, MAX: 1024")
                != std::string::npos,
-           "the per-sub-message validation text matches Validators/Java", bad->snapshot().message);
+           "the per-sub-message validation text matches the Validators contract", bad->snapshot().message);
     expectInt(fx.broker.sendCount(), 1, "the rejected batch never reaches the broker");
 
     // 空批：与同步内核同一句文案，且走回调而不是抛给调用方
@@ -1331,7 +1331,7 @@ void testBatchAsyncChargesTheWholeBatchToTheSizeGate() {
     expect(second->snapshot().exceptionCount == 1
                && second->snapshot().message
                       == "send message tryAcquire semaphoreAsyncSize timeout",
-           "the second batch is gated with Java's exact text", second->snapshot().message);
+           "the second batch is gated with the exact text", second->snapshot().message);
     expect(first->waitDone(10000), "the first batch still completes");
     expectInt(fx.broker.sendCount(), 1, "only the first batch reached the broker");
     expect(waitFor([&] { return p.getSemaphoreAsyncSendSizeAvailablePermits() == kMinAsyncSendSize
@@ -1396,7 +1396,7 @@ void testBatchAsyncWritesClientIdsBeforeEncodingTheBody() {
     expect(props != attempts[0].ext.end()
                && props->second.find(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
                       != std::string::npos,
-           "the batch message itself carries a UNIQ_KEY (Java setUniqID(msgBatch))",
+           "the batch message itself carries a UNIQ_KEY (uniq id set on the batch)",
            props == attempts[0].ext.end() ? "no properties on the wire" : props->second);
     p.shutdown();
 }
@@ -1445,7 +1445,7 @@ void testPinnedTopicGuardAsync() {
         expectInt(s.exceptionCount, 1, "the mismatch surfaces through onException");
         expectInt(s.successCount, 0, "no success on the mismatch");
         expect(s.message == "Topic of the message does not match its target message queue",
-               "the async guard keeps Java's (different) wording verbatim", s.message);
+               "the async guard keeps its distinct wording verbatim", s.message);
         expectInt(fx.broker.sendCount(), 0, "nothing reached the broker");
     }
     {

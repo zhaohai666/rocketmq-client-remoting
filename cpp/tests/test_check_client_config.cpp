@@ -359,7 +359,7 @@ void testSql92RequestShape(MockBroker& mock) {
     std::sort(keys.begin(), keys.end());
     const std::vector<std::string> want = {"classFilterMode", "codeSet", "expressionType",
                                            "subString", "subVersion", "tagsSet", "topic"};
-    expect(keys == want, "subscriptionData 只有 Java 的那 7 个键", jsonDump(body).c_str());
+    expect(keys == want, "subscriptionData 只有那 7 个 wire 键", jsonDump(body).c_str());
     expect(sd->find("filterClassSource") == nullptr, "filterClassSource 不参与序列化");
 }
 
@@ -423,7 +423,7 @@ void testTransportErrorWrapped(MockBroker& mock) {
     expect(threw == 1, "连不上 broker 也抛 MQClientException");
     expect(msg.find("SQL92") != std::string::npos, "文案里带上表达式类型", msg);
     expect(msg.find("server has not been upgraded to support") != std::string::npos,
-           "文案与 Java 一致", msg);
+           "文案与参考实现一致", msg);
     expectInt(mock.checkCount(), 0, "传输失败时 broker 没收到 46");
 }
 

@@ -324,12 +324,12 @@ void testStartAnnouncesTheGroupWithTheWireShape() {
 
     ConsumerData cd;
     const bool decoded = broker.consumerData(0, cd);
-    expect(decoded, "心跳 body 能按 Java 字段名解出 ConsumerData");
+    expect(decoded, "心跳 body 能按 wire 字段名解出 ConsumerData");
     if (decoded) {
         expect(cd.groupName == kGroup, "ConsumerData.groupName 是本组", "got=" + cd.groupName);
         // DefaultMQPullConsumerImpl:348
         expect(cd.consumeType == ConsumeType::CONSUME_ACTIVELY,
-               "consumeType=CONSUME_ACTIVELY（Java DefaultMQPullConsumerImpl:348）",
+               "consumeType=CONSUME_ACTIVELY（参考实现同值）",
                "got=" + cd.consumeType);
         // :353
         expect(cd.consumeFromWhere == ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET,
@@ -343,7 +343,7 @@ void testStartAnnouncesTheGroupWithTheWireShape() {
             const SubscriptionData& sub = cd.subscriptionDataSet.front();
             expect(sub.topic == kTopic, "订阅 topic 原样（不加命名空间）", "got=" + sub.topic);
             expect(sub.subString == "*", "subString=SUB_ALL", "got=" + sub.subString);
-            expectInt(sub.subVersion, 0, "subVersion=0（Java setSubVersion(0L)）");
+            expectInt(sub.subVersion, 0, "subVersion=0（缺省即 0）");
         }
     }
 
@@ -478,7 +478,7 @@ void testLitePullHeartbeatIsActivelyTyped() {
     if (decoded) {
         expect(cd.groupName == kGroup, "lite ConsumerData.groupName 是本组", "got=" + cd.groupName);
         expect(cd.consumeType == ConsumeType::CONSUME_ACTIVELY,
-               "lite consumeType=CONSUME_ACTIVELY（Java DefaultLitePullConsumerImpl:1111-1112）",
+               "lite consumeType=CONSUME_ACTIVELY（参考实现同值）",
                "got=" + cd.consumeType);
     }
     consumer.shutdown();

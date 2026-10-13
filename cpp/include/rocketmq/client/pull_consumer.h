@@ -96,7 +96,7 @@ public:
     const std::string& namespaceOf() const { return namespace_; }
     const std::set<std::string>& registerTopics() const { return registerTopics_; }
     bool isStarted() const { return started_; }
-    // 心跳成功轮数（真机验证用；对应 Python DefaultMQPullConsumer.heartbeat_count()）。
+    // 心跳成功轮数（真机验证用）。
     int32_t heartbeatCount() const { return heartbeatCount_.load(); }
 
     // ---------------- 生命周期 ----------------

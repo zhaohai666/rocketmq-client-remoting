@@ -158,9 +158,9 @@ static void testAclSignatureVectors() {
         CHECK(cmd.getExtField("SecurityToken").empty(), "V1 no SecurityToken when token empty");
         CHECK(hex(AclClientRPCHook::buildRequestContent(cmd))
                   == "414b5f544553546c6173743166616c73654d7947726f75704d79546f7069630102030405",
-              "V1 content matches Java combineRequestContent");
+              "V1 content matches the reference content builder");
         CHECK(cmd.getExtField("Signature") == "qQhdzvXfV+g0r8LdwNCt+chJ4XY=",
-              "V1 signature matches Java AclClientRPCHook");
+              "V1 signature matches the reference signer");
     }
 
     // ---- V2：带 SecurityToken（token 参与签名，结果必须与 V1 不同）----
@@ -172,9 +172,9 @@ static void testAclSignatureVectors() {
         CHECK(cmd.getExtField("SecurityToken") == "TOKEN-ABC", "V2 SecurityToken injected");
         CHECK(hex(AclClientRPCHook::buildRequestContent(cmd))
                   == "414b5f54455354544f4b454e2d4142436c6173743166616c73654d7947726f75704d79546f7069630102030405",
-              "V2 content matches Java (token included, sorted after AccessKey)");
+              "V2 content matches the reference (token included, sorted after AccessKey)");
         CHECK(cmd.getExtField("Signature") == "5YIp2FNQL8pxQP3w6YKnSv3kAsw=",
-              "V2 signature matches Java AclClientRPCHook");
+              "V2 signature matches the reference signer");
         CHECK(cmd.getExtField("Signature") != "qQhdzvXfV+g0r8LdwNCt+chJ4XY=",
               "V2 token actually changes the signature");
     }
@@ -185,9 +185,9 @@ static void testAclSignatureVectors() {
         AclClientRPCHook hook(SessionCredentials("AK", "SK"));
         hook.doBeforeRequest("127.0.0.1:9876", cmd);
         CHECK(hex(AclClientRPCHook::buildRequestContent(cmd)) == "414b3132",
-              "V3 content without body matches Java");
+              "V3 content without body matches the reference");
         CHECK(cmd.getExtField("Signature") == "d3vJKL2iRdr4ZykZfY+lxfQlfdc=",
-              "V3 signature matches Java AclClientRPCHook");
+              "V3 signature matches the reference signer");
     }
 
     // ---- 插入顺序无关：等价 extFields 必须得到同一签名 ----

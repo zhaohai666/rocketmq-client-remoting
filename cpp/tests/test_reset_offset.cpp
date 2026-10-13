@@ -12,7 +12,6 @@
 //
 //
 // 与 python/tests/test_reset_offset_handler.py、rust/src/client/consumer.rs 的同名测试、
-// csharp/tests/RocketMQ.Client.Tests/ResetOffsetTests.cs 同题（四端同一判据）。
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

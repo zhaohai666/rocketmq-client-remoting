@@ -1,12 +1,10 @@
 // C++ 客户端 unitName / unitMode / enableStreamRequestType 真机联调
-// （对应 python/verify_unit_config_live.py、rust/examples/live_unit_config.rs 的 U1–U5）。
+// （场景 U1–U5 逐条真机断言）。
 //
 // 为什么必须真机：这三个开关在离线单测里只能证明「字段被填了」，证明不了 broker 认不认。
 // broker 侧可见的证据只有这几处：
-//   * 发送带 unitMode → 自动建出来的 topic 的 topicSysFlag 带 UNIT 位
-//     （AbstractSendMessageProcessor.java:487-497）；
-//   * 心跳带 ConsumerData.unitMode → %RETRY%group 建出来带 UNIT_SUB 位
-//     （ClientManageProcessor.java:113-118）；
+//   * 发送带 unitMode → 自动建出来的 topic 的 topicSysFlag 带 UNIT 位；
+//   * 心跳带 ConsumerData.unitMode → %RETRY%group 建出来带 UNIT_SUB 位；
 //   * clientId 的 @unitName/@STREAM 后缀会出现在 broker 记录的连接信息里
 //     （examineConsumerConnectionInfo）—— 这是唯一能证明「上线的确实是拼好的那个
 //     clientId」的观测点。

@@ -683,7 +683,7 @@ void testNoNameServerAddressQualifies10004(MockEndpoint& mock) {
         expectInt(code, ClientErrorCode::NO_NAME_SERVER_EXCEPTION,
                   "empty name server list -> NO_NAME_SERVER_EXCEPTION(10004)");
         expect(msg == "No name server address, please set it.",
-               "10004 keeps Java's wording", "msg=" + msg);
+               "10004 keeps the reference wording", "msg=" + msg);
     }
     {
         // 地址在、只是这个 topic 拉不到路由 → 10004 那道闸必须闭嘴，原异常照旧抛
@@ -1067,7 +1067,7 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
         } catch (const MQClientException& e) {
             threw = 1;
             expect(std::string(e.what()) == "message's topic not equal mq's topic",
-                   "the sync guard keeps Java's wording verbatim", e.what());
+                   "the sync guard keeps the reference wording verbatim", e.what());
         } catch (const std::exception& e) {
             std::printf("  wrong exception: %s\n", e.what());
         }

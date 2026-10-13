@@ -1077,7 +1077,7 @@ void DefaultMQProducer::sendBatchAsync(const std::vector<Message>& msgs, const M
 
 void DefaultMQProducer::enqueueAsync(const std::shared_ptr<AsyncSendState>& state,
                                      const MessageQueue* pinned, int32_t timeoutMillis) {
-    // 先确认已启动（与 Python 一致：未启动立即抛，而不是在后台线程里静默失败）
+    // 先确认已启动（未启动立即抛，而不是在后台线程里静默失败）
     (void)client();
     std::shared_ptr<ConsumeExecutor> pool;
     {
@@ -1173,7 +1173,7 @@ void DefaultMQProducer::releaseBackPressure(const std::shared_ptr<AsyncSendState
 
 void DefaultMQProducer::sendBatchAsyncInner(const std::shared_ptr<AsyncSendState>& state,
                                             const MessageQueue* pinned) {
-    // Python _send_async_inner 的批量分支：批量在本实现里只有同步内核，所以「异步」= 在
+    // 批量分支：批量在本实现里只有同步内核，所以「异步」= 在
     // AsyncSenderExecutor 线程里同步发一批，结果挪到回调线程交付。对调用方语义没差别。
     // 校验、组批、拼 namespace、选队列、钩子全在内核里，这里不重复做。
     const int32_t timeout = state->timeout;
