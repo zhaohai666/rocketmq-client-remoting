@@ -45,18 +45,20 @@ static int g_fail = 0;
 // 带累计毫秒是为了区分两种红：某段自己就吃掉几十秒（预算被重试放大），
 // 和进了段之后彻底不动（真 parked）。本机永远绿（macOS 关 fd 会唤醒阻塞中的
 // recv），这类信息只能从 CI 拿。
-#define STEP(label)                                                              \
-    do {                                                                         \
-        static const std::chrono::steady_clock::time_point transportT0 =         \
-            std::chrono::steady_clock::now();                                    \
-        const auto transportMs = std::chrono::duration_cast<std::chrono::milliseconds>( \
-            std::chrono::steady_clock::now() - transportT0)                      \
-            .count();                                                            \
-        std::cout << "[transport] " << (label) << " +" << transportMs << "ms"    \
-                  << std::endl;                                                  \
-    } while (false)
+//
+// 起点必须是**共享**的那一个：把 static 直接写在宏里，每个 `}` 块会各自初始化一份，
+// 于是每行都打 +0ms，等于没有时长信息。
+#define STEP(label) std::cout << "[transport] " << (label) << " +" << transportElapsedMs() << "ms" << std::endl
 
 namespace {
+
+// 进程起来至今的毫秒数：所有 STEP 共享这一个起点。
+int64_t transportElapsedMs() {
+    static const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - began)
+        .count();
+}
 
 using netcompat::socket_t;
 using netcompat::socklen_type;
