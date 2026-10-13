@@ -26,6 +26,15 @@ jobs:
         with:
           workspaces: rust
 
+      # 失败清单走 ::error:: 打印：Actions 原始日志只有登录后可见，注解是公开可读的。
       - name: Run offline test suite
         working-directory: rust
-        run: cargo test
+        run: |
+          set +e
+          cargo test 2>&1 | tee /tmp/cargo.log
+          rc=${PIPESTATUS[0]}
+          grep -E '^(test .* FAILED|error(\[E[0-9]+\])?:|failures:$)' /tmp/cargo.log \
+            | head -40 | while IFS= read -r line; do echo "::error::${line}"; done
+          sed -n '/^failures:$/,/^test result/p' /tmp/cargo.log | head -40 \
+            | while IFS= read -r line; do echo "::error::${line}"; done
+          exit $rc

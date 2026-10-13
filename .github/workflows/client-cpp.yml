@@ -25,7 +25,10 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build zlib1g-dev g++
+          # lz4 / zstd / openssl 与本机绿跑时的编译期后端保持一致：CI 少装一个，
+          # 就是换一条运行分支来测。
+          sudo apt-get install -y cmake ninja-build zlib1g-dev g++ \
+            liblz4-dev libzstd-dev libssl-dev
 
       # 放在编译之前：CI 的标准库裁剪了头文件间的传递包含，缺直接包含的文件会
       # 「编到第 N 个目标才报错、一次只暴露一个」。这里静态扫一遍全部一次列出来。
@@ -41,6 +44,16 @@ jobs:
       # client_id / send_retry / producer_async / namespace_hook 存在偶发挂起
       # （与死地址假 NS + 进程退出路径相关，见 2026-10-12 记录），CI 先排除；
       # 修好挂起后移除 -E。
+      # 失败用例名走 ::error:: 打印：Actions 原始日志只有登录后可见，注解是公开可读的。
       - name: Run ctest
         working-directory: cpp/build
-        run: ctest --output-on-failure --timeout 120 -E "^(client_id|send_retry|producer_async|namespace_hook)$"
+        run: |
+          set +e
+          ctest --output-on-failure --timeout 120 -E "^(client_id|send_retry|producer_async|namespace_hook)$" > /tmp/ctest.log 2>&1
+          rc=$?
+          cat /tmp/ctest.log
+          {
+            grep -E '\*\*\*(Failed|Timeout|Not Run|Missing Command)' /tmp/ctest.log
+            sed -n '/The following tests FAILED:/,$p' /tmp/ctest.log
+          } | head -40 | while IFS= read -r line; do echo "::error::${line}"; done
+          exit $rc
