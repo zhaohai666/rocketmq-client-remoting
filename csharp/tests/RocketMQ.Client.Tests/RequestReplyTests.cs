@@ -1,4 +1,4 @@
-// Request-Reply（5.x）客户端侧单测（镜像 python/tests/test_request_reply.py）。
+// Request-Reply（5.x）客户端侧单测（发起端与回推入口的核心断言）。
 //
 // 覆盖三层：
 // 1. 纯数据/等待槽逻辑（RequestResponseFuture / RequestFutureHolder /

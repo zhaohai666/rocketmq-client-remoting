@@ -1,5 +1,4 @@
-// 与 python/tests/test_local_offsets.py、rust/src/client/consumer.rs（mod tests）
-// 的同名测试同题。
+// 本地位点表（OffsetStore）读写的离线单测：黄金向量来自真实 fastjson2 序列化输出。
 using RocketMQ.Client;
 using RocketMQ.Common;
 using Xunit;

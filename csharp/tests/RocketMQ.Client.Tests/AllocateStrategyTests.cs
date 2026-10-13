@@ -1,6 +1,5 @@
-// 与 rust/src/client/allocate_strategy.rs 的 AVERAGELY_CASES / CIRCLE_CASES、
-// cpp/tests/test_allocate_strategy.cpp、python/tests/test_allocate_strategy.py 同一张表，
-// 四语言逐格对拍。
+// 队列分配策略单测：AVERAGELY / CIRCLE 各用一张用例表逐格校验，
+// 另覆盖一致性哈希落点、ByMachineRoom、ByConfig 与参数守卫分支。
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -127,7 +126,7 @@ public class AllocateStrategyTests
         Assert.Equal(new[] { 0, 1 }, Ids(strategy.Allocate("G", "anyCID", QueuesOf(5), empty)));
     }
 
-    /// 未配置 = 空列表（Python/Rust 口径），且 allocate 给的是副本。
+    /// 未配置 = 空列表（缺省就是空），且 allocate 给的是副本。
     [Fact]
     public void ByConfig_defaults_empty_and_returns_copy()
     {
@@ -184,8 +183,8 @@ public class AllocateStrategyTests
         }
     }
 
-    /// 逐值对拍 Python `AllocateMessageQueueAveragely.allocate`（consumer.py:188-214）与
-    /// `AllocateMessageQueueAveragelyByCircle.allocate`（consumer.py:223-236）的算式。
+    /// 差分测试：averagely 与 bycircle 两种策略的算式逐值比对，
+    /// 本地参考实现与策略实现必须逐值一致。
     [Fact]
     public void Matches_python_reference_arithmetic()
     {
@@ -208,7 +207,7 @@ public class AllocateStrategyTests
         }
     }
 
-    // 直译 consumer.py:188-214，不参与实现，只用于差分测试
+    // averagely 策略的参考算式，不参与实现，只用于差分测试
     private static List<int> PythonAveragely(List<int> mqAll, List<string> cidAll, string currentCid)
     {
         if (mqAll.Count == 0) return new List<int>();
@@ -234,7 +233,7 @@ public class AllocateStrategyTests
         return mqAll.GetRange(startIndex, endIndex - startIndex);
     }
 
-    // 直译 consumer.py:223-236
+    // bycircle 策略的参考算式
     private static List<int> PythonCircle(List<int> mqAll, List<string> cidAll, string currentCid)
     {
         var result = new List<int>();

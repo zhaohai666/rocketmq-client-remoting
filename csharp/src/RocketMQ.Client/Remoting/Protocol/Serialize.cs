@@ -5,7 +5,7 @@
 //   code(2) | language(1) | version(2) | opaque(4) | flag(4)
 //   | remark(int + utf8) | extFields(int + [key(short + utf8) value(int + utf8)]...)
 //
-// ⚠ C++/Python 里字符串就是 UTF-8 字节串；C# 的 string 是 UTF-16，所以
+// ⚠ 线格式里的字符串是 UTF-8 字节串；C# 的 string 是 UTF-16，所以
 //   writeStr/readStr 必须**显式 UTF-8 编解码**，且长度字段是 **UTF-8 字节数**（不是字符数）——
 //   含中文的 remark 若用字符数算长度，broker 侧必然解析错位。
 using System.Globalization;

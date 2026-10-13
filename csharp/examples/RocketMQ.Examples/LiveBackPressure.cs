@@ -1,8 +1,8 @@
 // 前置：NameServer + Broker 已起，autoCreateTopicEnable=true。
 //
 //
-// ⚠ 三条脚本纪律（Python 那一轮真机联调踩出来的）：
-//   ① topic 一律带 Stamp —— 三语言**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
+// ⚠ 三条脚本纪律（真机联调踩出来的）：
+//   ① topic 一律带 Stamp —— 多轮**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
 //   ② 「被拒的发送连请求都没发出去」只能看 broker 侧落库条数（各队列 maxOffset-minOffset 之和），
 //      光看客户端回调会被「回调报错但请求照样发出去」的实现蒙过去；
 //   ③ 新建 topic 要等 broker 把 topicConfig 增量注册到 namesrv（秒级到十秒级），所以所有
@@ -57,7 +57,7 @@ public static class LiveBackPressure
 
     private static long NowMs() => (long)UtilAll.MonotonicMillis();
 
-    /// <summary>线程安全的回调记录（对应 Python 验证脚本里的 _Recorder）。</summary>
+    /// <summary>线程安全的回调记录（成功数 / 完成数 / 首条错误）。</summary>
     private sealed class Recorder : ISendCallback
     {
         private readonly object _lk = new();
@@ -152,7 +152,7 @@ public static class LiveBackPressure
         public string Topic(string prefix) => prefix + "_" + Stamp;
     }
 
-    // 钩子必须在 Start() 之前挂上（Python 验证脚本同样如此）
+    // 钩子必须在 Start() 之前挂上：SlowHook 靠拖慢 beforeSend 撑开时间窗
     private static DefaultMQProducer MakeProducer(Env env, string instance, bool enable,
         long num = -1, long size = -1, ISendMessageHook? hook = null)
     {
@@ -312,10 +312,10 @@ public static class LiveBackPressure
             long waited = NowMs() - began;
             Check("B2 闸等到预算耗尽才报错（不是看一眼就拒）", waited >= 130,
                 "调用方等了 " + N(waited) + "ms");
-            Check("B2 超限的两笔回调 TooMuchRequest，文案与 Java 逐字一致",
+            Check("B2 超限的两笔回调 TooMuchRequest，文案与协议约定逐字一致",
                 rejected.AllErrorsContain("send message tryAcquire semaphoreAsyncNum timeout", 2),
                 rejected.Summary());
-            Check("B2 超限回调的异常类型是 RemotingTooMuchRequestException（Java 原类型）",
+            Check("B2 超限回调的异常类型是 RemotingTooMuchRequestException",
                 rejected.AllErrorsAre(typeof(RemotingTooMuchRequestException), 2),
                 rejected.Summary());
 
@@ -403,10 +403,10 @@ public static class LiveBackPressure
             };
             second.Start();
             second.Join(10000);
-            Check("B4 第二笔 600KB 过不了字节闸，文案与 Java 逐字一致",
+            Check("B4 第二笔 600KB 过不了字节闸，文案与协议约定逐字一致",
                 two.AllErrorsContain("send message tryAcquire semaphoreAsyncSize timeout", 1),
                 two.Summary());
-            Check("B4 字节闸拒绝的异常类型是 RemotingTooMuchRequestException（Java BackpressureSendCallBack 原类型）",
+            Check("B4 字节闸拒绝的异常类型是 RemotingTooMuchRequestException",
                 two.AllErrorsAre(typeof(RemotingTooMuchRequestException), 1), two.Summary());
             Check("B4 字节闸没过时条数许可已经归还",
                 WaitUntil(() => NumPermits(p) == FairSemaphore.MinAsyncSendNum, 3000),

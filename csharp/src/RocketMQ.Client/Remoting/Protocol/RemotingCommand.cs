@@ -24,7 +24,7 @@ public sealed class RemotingCommand
 
     public int Code { get; set; }
 
-    /// <summary>C# 客户端用 DOTNET(2)，而不是 C++ 侧的 CPP(1)。</summary>
+    /// <summary>上线的语言标识用 DOTNET(2)，不要和线格式里的 CPP(1) 混淆。</summary>
     public byte Language { get; set; } = LanguageCode.Dotnet;
 
     public int Version { get; set; }
@@ -256,7 +256,7 @@ public sealed class RemotingCommand
         return writer.ToArray();
     }
 
-    /// <summary>解析失败返回 false（err 为失败原因）。对应 C++ 的 tryDecode。</summary>
+    /// <summary>解析失败返回 false（err 为失败原因），不抛异常。</summary>
     public static bool TryDecode(byte[] data, out RemotingCommand outCmd, out string? error)
     {
         outCmd = new RemotingCommand();

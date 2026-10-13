@@ -1,5 +1,5 @@
 // 消费端（DefaultMQPushConsumer 的 309 处理器，Consumer.cs）由 ConsumerStatsTests 一线
-// 已有覆盖；这里锁发起端。与 nodeJs/src/client/admin.ts:1361 同题。
+// 已有覆盖；这里锁发起端（DefaultMQAdminExt.ConsumeMessageDirectly）。
 using System;
 using System.Globalization;
 using RocketMQ.Client;
@@ -155,7 +155,7 @@ public class ConsumeMessageDirectlyTests
 
     // ---------------------------------------------------------------- 失败分支
 
-    /// <summary>309 回 SUCCESS 但 body 为空 ⇒ MQClientException（nodeJs 同口径）。</summary>
+    /// <summary>309 回 SUCCESS 但 body 为空 ⇒ MQClientException（空 body 按失败处理）。</summary>
     [Fact]
     public void EmptyResultBodyThrows()
     {

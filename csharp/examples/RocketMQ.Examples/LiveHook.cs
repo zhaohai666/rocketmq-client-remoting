@@ -6,7 +6,7 @@
 // 场景 S0–S11 与 Check() 一一对应，全部命中才返回 0。
 //
 // ⚠ 两条真机踩出来的硬约定（改脚本时勿回退）：
-//   1. topic / 消费组一律带 Stamp —— `run_hook_live.sh all` 会让三语言**依次**跑在同一个
+//   1. topic / 消费组一律带 Stamp —— 多轮真机联调会**依次**打在同一个
 //      broker 上，固定名会继承上一轮的提交位点；
 //   2. 断言**按 body 前缀过滤** —— 预热消息、以及 broker consumequeue 异步分发都可能让消费者
 //      多收几条，数总数会假红/假绿。
@@ -273,7 +273,7 @@ public static class LiveHook
         {
             SubscriptionData subAll = FilterAPI.BuildSubscriptionData("T", "*");
             SubscriptionData subTag = FilterAPI.BuildSubscriptionData("T", "TagA||TagB");
-            Check("S0 SUB_ALL 的 tagsSet/codeSet 为空、显式 tag 填 codeSet（Java 语义）",
+            Check("S0 SUB_ALL 的 tagsSet/codeSet 为空、显式 tag 填 codeSet（协议语义）",
                 subAll.TagsSet.Count == 0 && subAll.CodeSet.Count == 0
                 && subTag.TagsSet.Count == 2 && subTag.TagsSet.Contains("TagA")
                 && subTag.TagsSet.Contains("TagB")

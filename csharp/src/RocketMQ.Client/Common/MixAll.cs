@@ -287,7 +287,7 @@ public static class MixAll
         return s[b..e];
     }
 
-    /// <summary>按 \r\n / \n / \r 切行（等价于 Python str.splitlines 对本场景的行为）。</summary>
+    /// <summary>按 \r\n / \n / \r 切行。</summary>
     private static List<string> SplitLines(string text)
     {
         var lines = new List<string>();

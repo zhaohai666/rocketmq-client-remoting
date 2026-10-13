@@ -115,7 +115,7 @@ public static class LiveRedelivery
     private static string Key(MessageQueue mq) =>
         mq.Topic + mq.BrokerName + mq.QueueId.ToString(CultureInfo.InvariantCulture);
 
-    /// <summary>按真实用法先把 topic 建出来，再启动消费者（与 Python/C++ 联调同义）。
+    /// <summary>按真实用法先把 topic 建出来，再启动消费者。
     /// 真实环境里 topic 由管理员或首次发送预先创建；消费者不做默认 topic 兜底，
     /// topic 不存在时拿不到路由、不分配队列。</summary>
     private static void PrepareTopic(DefaultMQProducer producer, string topic, int queues = 4)

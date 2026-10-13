@@ -296,7 +296,7 @@ public static class LiveAsyncSend
             Check("A1 before 钩子在 AsyncSenderExecutor_N 上跑",
                 hook.BeforeThread().StartsWith("AsyncSenderExecutor_", StringComparison.Ordinal),
                 "线程名=" + hook.BeforeThread());
-            Check("A1 用户回调在 NettyClientPublicExecutor_N 上跑（Java executeInvokeCallback）",
+            Check("A1 用户回调在 NettyClientPublicExecutor_N 上跑",
                 rec.LastThreadName.StartsWith("NettyClientPublicExecutor_", StringComparison.Ordinal),
                 "线程名=" + rec.LastThreadName);
             Check("A1 before/after 各跑一次", hook.Before() == 1 && hook.After() == 1,
@@ -436,7 +436,7 @@ public static class LiveAsyncSend
             Message bad = Msg(t, "async-a4-rejected");
             bad.Tags = "forbidden";
             p.SendAsync(bad, rejected, 5000);
-            Check("A4 钩子拒绝的异常原样到了回调（类型 + 文案，Java 传的是 Throwable）",
+            Check("A4 钩子拒绝的异常原样到了回调（类型 + 文案原样传递）",
                 rejected.WaitDone(1, 10000)
                 && rejected.FirstError().Contains("tag forbidden is not allowed",
                     StringComparison.Ordinal)

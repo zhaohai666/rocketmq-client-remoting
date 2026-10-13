@@ -3,7 +3,7 @@ using System.Globalization;
 
 namespace RocketMQ.Common;
 
-/// <summary>越界/截断异常：与 C++ 的 std::out_of_range 对应，上层按「解码失败」处理。</summary>
+/// <summary>越界/截断异常：上层统一按「解码失败」处理。</summary>
 public sealed class ByteBufferException : Exception
 {
     public ByteBufferException(string message) : base(message)
@@ -12,7 +12,7 @@ public sealed class ByteBufferException : Exception
 }
 
 /// <summary>
-/// 可增长的二进制写出器（对应 C++ 的 <c>putInt*(Bytes&amp;, v)</c> 系列自由函数）。
+/// 可增长的二进制写出器（PutInt*/Write* 系列 API）。
 /// 全部大端序。
 /// </summary>
 public sealed class ByteWriter

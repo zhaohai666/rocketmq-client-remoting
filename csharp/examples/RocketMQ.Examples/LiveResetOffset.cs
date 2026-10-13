@@ -138,7 +138,7 @@ public static class LiveResetOffset
             }
 
             _release.Wait(TimeSpan.FromSeconds(90));
-            _release.Reset(); // 一批一放：与 Python Event.set()+clear() 同构
+            _release.Reset(); // 一批一放：等本轮放行后立刻复位闸门
             return ConsumeConcurrentlyStatus.ConsumeSuccess;
         }
 
@@ -461,7 +461,7 @@ public static class LiveResetOffset
                     + "s committed=" + N(Probe(admin, group, mq).Committed));
 
                 long? off = c.ConsumeOffsetForTest(key);
-                Check("S1-重置后本地表里没有旧位点（Java removeOffset；新位点经撤销尾巴出去）",
+                Check("S1-重置后本地表里没有旧位点（旧位点被移除；新位点经撤销尾巴出去）",
                     off == null, "local_offset=" + (off.HasValue ? N(off.Value) : "None")
                     + " epoch=" + N(c.QueueEpochForTest(key)));
 

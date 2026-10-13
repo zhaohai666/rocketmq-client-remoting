@@ -1,4 +1,4 @@
-// 路由 / 心跳结构体单测（镜像 C++ test_route_heartbeat.cpp 的核心断言）。
+// 路由 / 心跳结构体单测（结构体字段与编解码的核心断言）。
 //
 // 重点：JSON 字段名与 fastjson2 对齐（键按字母序）、TBW102 回退裁剪、
 // MessageQueue 组装只挑可写队列、ConsumerData 无 4.x 字段。

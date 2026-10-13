@@ -1,5 +1,4 @@
-// 拉模式消费者心跳真机验证（#98）：对应 python/verify_pull_consumer_heartbeat_live.py 的
-// A0–A6 与 cpp/examples/live_pull_heartbeat.cpp（三语言同一套断言）。
+// 拉模式消费者心跳真机验证（#98），覆盖场景段 A0–A6。
 // 用法：rmq pull-heartbeat [namesrv] [masterAddr] [slaveAddr]
 //
 // 为什么必须真机：离线单测只证明「报文形状对」，证明不了 broker 的 ConsumerManager 真的把
@@ -138,7 +137,7 @@ public static class LivePullHeartbeat
             Check("A2 主节点 203 查到本组（心跳已注册）", conn is not null,
                 "connections="
                     + (conn is null ? "-" : conn.ConnectionSet.Count.ToString(CultureInfo.InvariantCulture)));
-            Check("A2 消费类型是 CONSUME_ACTIVELY（Java DefaultMQPullConsumerImpl:348）",
+            Check("A2 消费类型是 CONSUME_ACTIVELY",
                 conn is not null && conn.ConsumeType == ConsumeType.ConsumeActively,
                 "consumeType=" + (conn?.ConsumeType ?? "-"));
             Check("A2 消费位点是 CONSUME_FROM_LAST_OFFSET（:353）",

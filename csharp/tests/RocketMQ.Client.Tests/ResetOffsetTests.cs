@@ -8,8 +8,6 @@
 // 此处断言"新位点确实交给了持久化路径"（RetiredQueuesForTest 里那条记录的
 // ConsumeOffset/HadOffset 就是会走 UpdateConsumerOffset 的材料）。222 的**报文字段**
 // 另由 MockCluster 抓包锁死（isForce 键名，见 Admin.cs）。
-//
-// 与 python/tests/test_reset_offset_handler.py、cpp/tests/test_reset_offset.cpp 的同名用例逐条对拍。
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;

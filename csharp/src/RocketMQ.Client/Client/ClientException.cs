@@ -12,7 +12,7 @@ public static class ClientErrorCode
 }
 
 /// <summary>
-/// 对应 Python MQClientException(message, responseCode)；默认 1（UNKNOWN）。
+/// MQClientException(message, responseCode) 语义；默认 1（UNKNOWN）。
 /// 管理端靠它把 broker 响应码透传出来——例如 resetOffsetNew 需要区分
 /// CONSUMER_NOT_ONLINE 才能退化到 resetOffsetByTimestampOld。
 /// </summary>

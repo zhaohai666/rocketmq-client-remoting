@@ -1,5 +1,3 @@
-// 对端实现：python/tests/test_producer_async.py（38 项）、
-// cpp/tests/test_producer_async.cpp、rust/src/client/producer/send_retry_tests.rs。
 // 这里按 C# 能观察到的证据取样：假集群（MockCluster.cs）能看见**上线的报文**，
 // 日志能看见**重试链**，两者合起来足够钉死「调用方立刻返回 / 回调恰好一次 /
 // 异步不看 retryResponseCodes / 预算共享 / 闸门与队满怎么拒绝」这几条不变式。
@@ -332,7 +330,7 @@ public class ProducerAsyncTests : IDisposable
         (int threadId, string threadName) = cb.LastThread();
         Assert.NotEqual(callerThread, threadId);
         Assert.True(threadName.StartsWith("NettyClientPublicExecutor_", StringComparison.Ordinal),
-            "用户回调不能在发送池或读线程上跑（Java executeInvokeCallback），实际=" + threadName);
+            "用户回调不能在发送池或读线程上跑，实际=" + threadName);
         Assert.Equal(1, cluster.Requests(0));
         producer.Shutdown();
     }
@@ -462,7 +460,7 @@ public class ProducerAsyncTests : IDisposable
         Assert.Single(cb.Errors());
         Assert.Contains("CODE:", cb.Errors()[0]);
         Assert.Equal(1, cluster.Requests(0));
-        Assert.True(cluster.Requests(1) == 0, "异步链不换 broker（Java needRetry=false）");
+        Assert.True(cluster.Requests(1) == 0, "异步链不换 broker（needRetry=false 的语义）");
         FaultItem? item = producer.MqFaultStrategy.LatencyFaultTolerance
             .GetFaultItem(MockCluster.BrokerName(0));
         Assert.NotNull(item);
@@ -632,7 +630,6 @@ public class ProducerAsyncTests : IDisposable
         Assert.Contains("The broker[no-such-broker] not exist", cb.Errors()[0]);
         Assert.Equal(0, cluster.Requests(0));
         // 请求还没建就失败了 ⇒ 没进传输层 ⇒ 不绕道回调池，在准备段那根线程上就地转交
-        //（Python _complete 同一条）
         (int threadId, string threadName) = cb.LastThread();
         Assert.NotEqual(callerThread, threadId);
         Assert.StartsWith("AsyncSenderExecutor_", threadName);
@@ -747,7 +744,7 @@ public class ProducerAsyncTests : IDisposable
         Assert.Contains("sendKernelImpl call timeout", cb.Errors()[0]);
         Assert.True(cluster.Requests(0) == 0, "预算没了就不该建请求");
         Assert.Equal(1, hooks.Before());
-        Assert.True(hooks.After() == 1, "RemotingTooMuchRequest 也跑 after（Java :1088）");
+        Assert.True(hooks.After() == 1, "RemotingTooMuchRequest 也跑 after 钩子");
         Assert.True(hooks.SawException());
         producer.Shutdown();
     }
@@ -829,7 +826,7 @@ public class ProducerAsyncTests : IDisposable
         Assert.True(rejected.WaitDone(1, 5000));
         Assert.Single(rejected.Errors());
         Assert.Contains("send message tryAcquire semaphoreAsyncNum timeout", rejected.Errors()[0]);
-        // 扣不到许可就连池子都没进 ⇒ 回调就地转交（Python _complete）
+        // 扣不到许可就连池子都没进 ⇒ 回调就地转交
         Assert.Equal(callerThread, rejected.LastThread().ThreadId);
         Assert.True(WaitUntil(() => cluster.Requests(0) == 10, 3000),
             "前 10 笔都要上线，被拒的第 11 笔一笔都不许发");
@@ -1067,8 +1064,8 @@ public class ProducerAsyncTests : IDisposable
     }
 
     /// 后半段锁的是「每条子消息都要过 Validators.CheckMessage」：直接把 MessageBatch 丢给
-    /// SendAsync 会漏掉这步，等于批量路径绕过本地校验；而且这类失败必须<b>进回调</b>（Python
-    /// 的批量分支在 runnable 里抛、由外层 catch 接住），不能砸回调用方的栈。
+    /// SendAsync 会漏掉这步，等于批量路径绕过本地校验；而且这类失败必须<b>进回调</b>，
+    /// 不能砸回调用方的栈。
     /// </summary>
     [Fact]
     public void SendBatchAsync_SendsOneRequestPerBatch()
@@ -1213,8 +1210,7 @@ public class ProducerAsyncTests : IDisposable
     }
 
     /// <summary>
-    /// 批量消息过字节闸时按<b>整批</b>扣（Python <c>_back_pressure_msg_len</c> 的 list 分支：
-    /// 逐条累加、空 body 也算 1）。写成「一条」不会让任何一笔发送失败，只会让一批 100 条只占
+    /// 批量消息过字节闸时按<b>整批</b>扣（批量长度逐条累加、空 body 也算 1）。写成「一条」不会让任何一笔发送失败，只会让一批 100 条只占
     /// 1 格容量 —— 字节闸对批量形同虚设，要等长跑把队列打爆才暴露。
     /// </summary>
     [Fact]

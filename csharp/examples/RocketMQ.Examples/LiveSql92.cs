@@ -1,8 +1,5 @@
 // C# 客户端 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 真机联调
-// （对应 python/verify_sql92_live.py、cpp/examples/sql92_live.cpp、
-//   rust/examples/live_sql92.rs、csharp/tests/RocketMQ.Client.Tests/CheckClientConfigTests.cs：
-//   四语言同一套场景）。
-//
+// （场景 S1–S4 逐段验，报文形状的离线断言见 CheckClientConfigTests）。
 //
 // 前置：本地 5.5.1 集群已起，且 broker 配了 enablePropertyFilter=true。
 // 用法：rmq sql92 [namesrv]
@@ -361,7 +358,7 @@ public static class LiveSql92
             Check("S1 TAG 消费者启动成功", false, e.Message);
         }
 
-        Check("S1 纯 TAG 订阅一笔 46 都不发（Java isTagType 短路）", tagProbe.CheckCount() == 0,
+        Check("S1 纯 TAG 订阅一笔 46 都不发（isTagType 短路）", tagProbe.CheckCount() == 0,
             "codes=" + tagProbe.CodesStr());
         tagConsumer.Shutdown();
     }
@@ -521,7 +518,7 @@ public static class LiveSql92
         producer.Start();
         try
         {
-            // 队列数 4：与 python/verify_sql92_live.py 的 create_topic("TBW102", topic, 4) 对齐
+            // 队列数 4：建 topic 时显式指定 4 个队列
             producer.CreateTopic(MixAll.DefaultTopic, topic, 4);
             Check("T0 topic 路由就绪（4 队列）",
                 WaitUntil(() => env.RouteQueueCount(topic) >= 4, 20000),

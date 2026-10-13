@@ -1,5 +1,5 @@
 // 轻量拉取消费者（DefaultLitePullConsumer）+ 220/221/309 body 单测
-// （镜像 C++ test_lite_pull.cpp 的核心部分）。
+// （覆盖拉取主流程与位点表的核心场景）。
 using RocketMQ.Client;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
@@ -96,7 +96,7 @@ public class LitePullTests
         c.Subscribe("MyTopic", "TagC");
     }
 
-    // ---------------------------------------------- 三张位点表（对位 C++ testLitePullOffsetTable）
+    // ---------------------------------------------- 三张位点表（读写、覆盖与守卫）
 
     /// <summary>
     /// #68 的核心：拉取游标 / 已消费游标 / 内存位点表是三样东西，提交只能走第三样，

@@ -1,5 +1,4 @@
-// 与 python/tests/test_client_id.py、cpp/tests/test_client_id.cpp、
-// rust/src/client/{producer,consumer}.rs 的同名测试同题。
+// clientId 生成与复用规则的离线单测。
 using System.Text.RegularExpressions;
 using RocketMQ.Client;
 using RocketMQ.Common;

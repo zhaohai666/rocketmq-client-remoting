@@ -2,7 +2,7 @@
 // 消息发送（SEND_MESSAGE_V2）、拉取（PULL_MESSAGE）、offset 查询/更新、心跳、
 // 按 Key 查询消息、创建 Topic。
 //
-// 与 Python 参考实现（python/client/mq_client.py）逐项对齐。
+// 按协议口径逐项实现。
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -109,7 +109,7 @@ public sealed class TopicPublishInfo
     }
 
     /// <summary>
-    /// 带过滤器的轮询（对应 Python select_one_message_queue(*filters)）：游标照常推进，
+    /// 带过滤器的轮询：游标照常推进，
     /// 一轮内全部不匹配返回 null，由调用方退化选择。filter 与 brokerFilter 都通过才选中。
     /// </summary>
     public MessageQueue? SelectOneMessageQueue(Func<MessageQueue, bool> filter,
@@ -133,7 +133,7 @@ public sealed class TopicPublishInfo
         return null;
     }
 
-    /// <summary>重置轮询游标（对应 Python reset_index，故障规避 resetIndex 用）。</summary>
+    /// <summary>重置轮询游标（故障规避 resetIndex 用）。</summary>
     public void ResetIndex()
     {
         Interlocked.Exchange(ref _index, 0);
@@ -684,7 +684,7 @@ public sealed class MQClientInstance : IDisposable
         }
         catch (Exception)
         {
-            // 与 Python 一致：路由刷新失败不抛，交给下面的查表返回空
+            // 路由刷新失败不抛，交给下面的查表返回空
         }
 
         lock (_routeLock)
@@ -815,7 +815,7 @@ public sealed class MQClientInstance : IDisposable
     /// 形状一致：查发布地址（只认 brokerId=0）→ 查不到按 topic 刷一次路由 → 重查 →
     /// 仍查不到照 <c>sendKernelImpl:1100</c> 抛
     /// <c>MQClientException("The broker[X] not exist")</c>（本端口码为 -1，表示
-    /// 「不是 broker 回的码」，与 Python/C++/Rust 三端同一个口径）。
+    /// 「不是 broker 回的码」）。
     ///
     /// 定点发送不会在 <c>sendDefaultImpl</c> 里取发布信息，这里是它唯一的路由来源；
     /// 主从切换期间这也是「本端立刻报错」与「把请求打到从节点上白挨一轮 SYSTEM_BUSY(2)」的

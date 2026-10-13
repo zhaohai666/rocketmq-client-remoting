@@ -1,6 +1,5 @@
 // 覆盖：分派进顺序骨架（listener 不被调、不 ack）、并发分支回归护栏、去重集按
 // (pq 引用, mq key) 判等、pq 撤销才摘请求、活队列 no-op。
-// 与 cpp tests/test_pop_orderly.cpp、python tests/test_pop_orderly.py 逐条对应。
 using RocketMQ.Client;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;

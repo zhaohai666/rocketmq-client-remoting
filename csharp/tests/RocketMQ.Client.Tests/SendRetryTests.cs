@@ -1,9 +1,6 @@
 // 真集群造不出 SYSTEM_BUSY，也造不出「慢 broker 把总预算吃光」，而这两条恰好是这段
 // 内核的全部难点，所以这里用进程内假集群（MockCluster.cs：1 个 namesrv + N 个 broker，
 // 只说 remoting 协议），把每个 broker 的应答码和应答延迟脚本化。
-//
-// 与 python/tests/test_send_retry.py、cpp/tests/test_send_retry.cpp、
-// rust/src/client/producer/send_retry_tests.rs 同题。
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -176,7 +173,7 @@ public class SendRetryTests
     }
 
     /// <summary>
-    /// client/src/main/java/org/apache/rocketmq/client/common/ClientErrorCode.java 一共七个常量，
+    /// ClientErrorCode 表一共七个常量，
     /// 一个都不能少、一个都不能改值。10001~10005 是发送重试的定性；10006/10007 各有各的抛出点
     /// （request-reply 超时、造应答消息失败），以前表里缺这两个，站点只能拿默认码 1 抛出去。
     /// </summary>

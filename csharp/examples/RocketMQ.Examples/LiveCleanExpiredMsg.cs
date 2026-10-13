@@ -1,5 +1,4 @@
-// 与 python/verify_clean_expired_msg_live.py、cpp/examples/live_clean_expired_msg.cpp、
-// rust/examples/live_clean_expired_msg.rs 的对应场景同题、逐条对应（A0–A5）。
+// 过期消息清理真机验证（场景段 A0–A5）。
 //
 // 离线单测（tests/RocketMQ.Client.Tests/CleanExpiredMsgTests.cs）锁的是**判据**
 //（选条/阈值/上限/摘除闸门/跳过回投）；这里锁真机上两件离线锁不住的事：
@@ -279,7 +278,7 @@ public static class LiveCleanExpiredMsg
 
                 return committed == 1;
             }, 30000, 1000);
-            Check("A5-挂住的 listener 返回后业务队列位点走到 1（Java removeMessage 含已清扫条目）",
+            Check("A5-挂住的 listener 返回后业务队列位点走到 1（removeMessage 含已清扫条目）",
                 offsetOk, "offset=" + N(committed));
         }
         catch (Exception e)

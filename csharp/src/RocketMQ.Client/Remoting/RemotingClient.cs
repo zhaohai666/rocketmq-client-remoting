@@ -1,12 +1,12 @@
 // 提供：连接管理（惰性建连 + 复用 + TCP_NODELAY）、invokeSync / invokeAsync /
 // invokeOneway、opaque 到响应回调的分发、超时控制、连接状态探活。
 //
-// 线程模型（与 Python/C++ 参考实现一致，读线程每连接一个）：
+// 线程模型（读线程每连接一个）：
 //   - 调用线程：encode -> 锁写 -> Socket.Send 全量；随后在 invokeSync 里等事件
 //   - 读线程：阻塞 Receive -> 按 totalLength(4) 分帧 -> decode ->
 //             按 opaque 从响应表取出 future -> 唤醒调用线程 / 触发回调
-//   - C# 的阻塞 Receive 在 socket 被另一线程 Close 时立即抛异常退出，
-//     因此不需要 C++ 那套 select(300ms) 轮询，关连接即可及时回收读线程。
+//   - 阻塞 Receive 在 socket 被另一线程 Close 时立即抛异常退出，
+//     因此不需要 select(300ms) 式轮询，关连接即可及时回收读线程。
 //
 // 线格式：totalLength(4) | headerLength(4) | header | body
 //   totalLength = 4 + headerLength + bodyLength（即首 4 字节之后的所有字节数）
@@ -251,7 +251,7 @@ public sealed class RemotingClient : IDisposable
             var sock = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             try
             {
-                // ConnectAsync + 超时：等价于 C++ 的非阻塞 connect + select
+                // ConnectAsync + 超时：非阻塞建连、限时拿结果
                 using var cts = new CancellationTokenSource(timeoutMillis);
                 Task connectTask = sock.ConnectAsync(ip, port, cts.Token).AsTask();
                 try
@@ -915,7 +915,7 @@ public sealed class RemotingClient : IDisposable
             return;
         }
 
-        // Dispose(waitHandle) 等到正在执行的那一轮结束，等价于 cpp 版 join 清理线程。
+        // Dispose(waitHandle) 等到正在执行的那一轮结束，效果相当于 join 清理线程。
         using var done = new ManualResetEvent(false);
         timer.Dispose(done);
         try

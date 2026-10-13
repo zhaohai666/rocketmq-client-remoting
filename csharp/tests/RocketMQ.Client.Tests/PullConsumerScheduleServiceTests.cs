@@ -310,7 +310,7 @@ public class PullConsumerScheduleServiceTests
         try
         {
             Assert.True(WaitFor(() => { lock (gate) return stamps.Count >= 1; }),
-                "第一轮 delay=0 立即来（Java putTask:77 同款）");
+                "第一轮 delay=0 立即来");
             // 延迟未到期：第二轮不许提前出现（300ms < 600ms，留 300ms 余量仍不该看到）
             Thread.Sleep(delay / 2);
             lock (gate)
@@ -396,7 +396,7 @@ public class PullConsumerScheduleServiceTests
         try
         {
             Assert.True(WaitFor(() => { lock (gate) return stamps.Count >= 2; }, 5000),
-                "回调抛异常不能打穿调度（Java :182-185 catch Throwable 后照样重排）");
+                "回调抛异常不能打穿调度（catch Throwable 后照样重排）");
             long t0; long t1;
             lock (gate)
             {

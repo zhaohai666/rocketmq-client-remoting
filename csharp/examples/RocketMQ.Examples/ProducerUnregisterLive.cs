@@ -1,16 +1,11 @@
 // 生产者退出时的 UNREGISTER_CLIENT(35) 真机验证（C#）。
 // 用法：rmq unreg-live [namesrv]
 //
-// 与 python/verify_producer_unregister_live.py（U1~U6）、
-// cpp/examples/live_producer_unregister.cpp、rust/examples/live_producer.rs 的 P11 同一套场景。
-//
-//
+// 场景段：U1~U6。
 //
 // ⚠ 判据强度：C# 里每个生产者各自持有一份 `MQClientInstance`、各自一条 TCP 连接，退出时
 // 连接也会关掉，broker 的通道扫描同样会把组摘掉 —— 单看 U5 分不出是 35 还是断连的功劳，
-// 所以这里必须由钩子抓帧（U3）直接证明「线上走了这一发」。行为级的判别式证明在
-// `rust/examples/live_producer.rs` 的 P11：Rust 按 clientId 复用实例，两个同 instanceName、
-// 不同组的生产者共用一条连接，先退的那个连接还活着，组能消失只可能是因为 35。
+// 所以这里必须由钩子抓帧（U3）直接证明「线上走了这一发」。
 // 另：「每一发 35 都回 SUCCESS」在本移植**不可观测** —— 传输层有意不调
 // `IRpcHook#DoAfterResponse`（见 Remoting/RemotingClient.cs 的说明），
 // U5 的 broker 侧效果就是它的替代判据。头形状、从节点扇出、单台失败被吞这三条
@@ -284,7 +279,7 @@ public static class ProducerUnregisterLive
             if (!brokers.Contains(f.Addr)) shapeOk = false;
         }
 
-        Check("U3b 35 的头是 clientID + producerGroup，consumerGroup 不上线（Java 传 null）",
+        Check("U3b 35 的头是 clientID + producerGroup，consumerGroup 不上线（该字段传 null）",
             shapeOk, unregs.Count == 0
                 ? "没抓到帧"
                 : ("addr=" + unregs[0].Addr + " ext=" + ExtText(unregs[0].Ext)));

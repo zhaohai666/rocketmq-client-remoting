@@ -1,5 +1,4 @@
-// 严格对齐 cpp/include/rocketmq/common/message_decoder.h 与 message_decoder.cpp
-// （已对真实 5.5.1 集群验证），两条**互不可混用**的路径：
+// 消息编解码（已对真实 5.5.1 集群验证），两条**互不可混用**的路径：
 //   1) 17 段存储格式：EncodeMessageExt / DecodeMessage / DecodeMessages（broker 写入与 pull 返回）；
 //   2) 6 段轻量格式：EncodeMessage / EncodeMessages / DecodeBatchMessage / DecodeBatchMessages（批量 body）。
 //

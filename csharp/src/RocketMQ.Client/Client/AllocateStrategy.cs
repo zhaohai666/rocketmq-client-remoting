@@ -222,7 +222,7 @@ public sealed class AllocateMessageQueueByMachineRoom : IAllocateMessageQueueStr
     {
     }
 
-    /// <summary>对应 Python <c>AllocateMessageQueueByMachineRoom(consumeridcs={...})</c>。</summary>
+    /// <summary>按机房集合（consumeridcs）构造：只在这些机房内分配队列。</summary>
     public AllocateMessageQueueByMachineRoom(IEnumerable<string> consumeridcs)
     {
         _consumeridcs = new HashSet<string>(consumeridcs, StringComparer.Ordinal);

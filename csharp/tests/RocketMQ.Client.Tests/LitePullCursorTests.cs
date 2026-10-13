@@ -9,8 +9,6 @@
 //
 // 判据取自**线上报文**：假 broker 的应答按脚本回，用例从 MockCluster 的取证里查
 // 「下一笔 PULL_MESSAGE 是不是从新位点起的」—— 游标真的上了线，而不只是内存表里改了个数。
-// 与 cpp/tests/test_lite_pull_cursor.cpp、rust/src/client/pull_consumer.rs、
-// python/tests/test_lite_pull_consumer.py 的同名用例同题。
 using System.Linq;
 using System.Text;
 using RocketMQ.Client;

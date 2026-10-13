@@ -79,7 +79,7 @@ public class FlowControlTests
         Assert.Equal(1L, c.FlowControlTriggered);
         c.PullThresholdForQueue = 0;
         Stage(c, mq, NSized(Topic, 100, 1));
-        Assert.True(Hit(c, mq), "PullThresholdForQueue=0 要按 1 条算（Java 的 max(1,n) 守卫）");
+        Assert.True(Hit(c, mq), "PullThresholdForQueue=0 要按 1 条算（max(1,n) 守卫）");
     }
 
     [Fact]
@@ -171,7 +171,7 @@ public class FlowControlTests
     [Fact]
     public void ReasonText_UsesMbUnitWithOneDecimal()
     {
-        // 日志里的数字格式是跨语言对拍的一部分（Python/Rust/C++ 同为 "%.1fMB"）
+        // 日志里的数字格式锁定为 "%.1fMB"，断言按同一形状取数
         var c = new DefaultMQPushConsumer("GID_FlowControlFormatNet");
         var mq = QueueOf(Topic, 0);
         GatesOffExceptCounts(c);

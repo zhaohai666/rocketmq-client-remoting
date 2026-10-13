@@ -1,4 +1,4 @@
-// 管理端 body 单测（镜像 C++ test_admin.cpp 的核心部分）：
+// 管理端 body 单测：
 // fastjson2 非法 JSON 容错（MessageQueue 内联对象键、NaN/Infinity、裸数字键）、
 // properties 文本往返、DTO 默认值、offsetTable 解析。
 using System.Text;

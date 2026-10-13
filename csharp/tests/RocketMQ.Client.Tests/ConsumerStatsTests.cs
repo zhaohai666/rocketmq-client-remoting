@@ -18,7 +18,7 @@ public class ConsumerStatsTests
     {
         StatsItemSet set = pick(m);
         long now = UtilAll.CurrentTimeMillis();
-        // 相隔 1s 的两个采样点（与 Python 测试同款做法，不依赖真实时钟）
+        // 相隔 1s 的两个采样点（不依赖真实时钟，采样时刻直接写进样本）
         set.GetAndCreate(Topic + "@" + Group).AppendSampleForTest(now - 1000, 0, 0);
         set.GetAndCreate(Topic + "@" + Group).AppendSampleForTest(now, v, t);
         return set;

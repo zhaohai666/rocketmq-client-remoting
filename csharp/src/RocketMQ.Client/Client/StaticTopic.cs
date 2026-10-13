@@ -74,7 +74,7 @@ public static class StaticTopic
         {
             foreach (var kv in currIdMap.ObjectItems())
             {
-                // 键是 globalId 的十进制字符串；解析失败的条目跳过（同 Go/Python 口径）。
+                // 键是 globalId 的十进制字符串；解析失败的条目跳过。
                 if (!int.TryParse(kv.Key, NumberStyles.Integer, CultureInfo.InvariantCulture,
                         out int gid) || !kv.Value.IsNumber)
                 {

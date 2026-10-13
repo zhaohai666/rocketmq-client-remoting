@@ -555,7 +555,7 @@ public sealed class TopicRouteData
         + ", brokerDatas=" + BrokerDatas.Count.ToString(CultureInfo.InvariantCulture) + "]";
 }
 
-/// <summary>轻量线程安全随机源（对应 C++ thread_local mt19937_64 的使用场景）。</summary>
+/// <summary>轻量线程安全随机源：每线程独立随机源的使用场景。</summary>
 internal static class ThreadLocalRandom
 {
     private static readonly ThreadLocal<Random> Rng = new(() => new Random(Interlocked.Increment(ref _seed) ^ Environment.TickCount));

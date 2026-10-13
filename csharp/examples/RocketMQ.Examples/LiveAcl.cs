@@ -11,15 +11,15 @@
 //   S4 正向：带凭据的生产者发 3 条 → SendOk（msgId 由 broker 赋值）
 //   S5 正向：带凭据的消费者收满 3 条（心跳 / 长轮询拉取 / 位点提交都带签名）
 //            ⚠ S4/S5 必须**先起消费者再发送**，否则 CONSUME_FROM_LAST_OFFSET 的初始位点
-//              语义 + broker 异步分发会让同一时序在三语言间结果不一致（见 S4/S5 处注释）
+//              语义 + broker 异步分发会让同一时序在不同客户端实现间结果不一致（见 S4/S5 处注释）
 //   S6 反向：不带凭据直连 broker 的裸 RPC → 被拒（NO_PERMISSION=16）
 //   S7 正向：不带凭据走 NameServer 路由查询仍成功（钩子只作用于需要鉴权的目标）
 //
 // 关键事实（不要凭记忆改）：broker 侧所有鉴权失败都抛
-// AbortProcessException(NO_PERMISSION=16)（broker/auth/pipeline/AuthenticationPipeline.java:53）；
+// AbortProcessException(NO_PERMISSION=16)；
 // 失败原因用 ResponseCode 区分不了，只能看 remark：
-//   - 签名不对 → "check signature failed."（DefaultAuthenticationHandler:68）
-//   - 凭据缺失 → "User:null is not found."（DefaultAuthenticationHandler:60）
+//   - 签名不对 → "check signature failed."
+//   - 凭据缺失 → "User:null is not found."
 using System.Text;
 
 using RocketMQ.Client;

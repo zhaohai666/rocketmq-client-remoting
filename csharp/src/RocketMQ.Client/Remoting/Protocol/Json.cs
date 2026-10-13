@@ -8,8 +8,8 @@
 //   - 尾随逗号
 // 另外数字必须区分 int64 与 double：long 型 timestamp 若被写成浮点，broker 侧字段就对不上。
 //
-// 与 python/rocketmq 的 _FastJsonParser、cpp 的 json.cpp 行为逐条对齐：
-//   - Object 保序：set() 覆盖同名键时**保留原位置**（与 Python dict 一致）；
+// 按协议口径逐条实现（服务端 fastjson2 的输出形状决定了下面的行为）：
+//   - Object 保序：set() 覆盖同名键时**保留原位置**（按插入序，覆盖不重排）；
 //   - 字符串按 UTF-8 原样输出（不解码为 \uXXXX），解析时兼容 \uXXXX 与代理对；
 //   - 解析对 fastjson2 的非标准写法宽容。
 using System.Globalization;
@@ -216,7 +216,7 @@ public sealed class JsonValue
                 }
                 else if ((double)_intVal == _num)
                 {
-                    // double 恰好是整数值时按整数输出（与 C++ 行为一致）
+                    // double 恰好是整数值时按整数输出，避免 long 型字段收到浮点形状
                     sb.Append(_intVal.ToString(CultureInfo.InvariantCulture));
                 }
                 else
@@ -285,7 +285,7 @@ public sealed class JsonValue
                     else
                     {
                         // 非 ASCII 直接按 UTF-16 char 输出（C# string 即 UTF-16，
-                        // 写文件/发网络时统一由 UTF-8 编码，与 Python ensure_ascii=False 一致）
+                        // 写文件/发网络时统一由 UTF-8 编码，原文保留、不做 ASCII 转义）
                         sb.Append(c);
                     }
 
@@ -318,7 +318,7 @@ public sealed class JsonValue
 public static class Json
 {
     /// <summary>
-    /// 解析失败返回 false（对应 C++ jsonParse 的 bool 返回 + 可选 err）。
+    /// 解析失败返回 false，错误原因经可选的 out 参数输出。
     /// 对 fastjson2 的非标准写法宽容，见类注释。
     /// </summary>
     public static bool TryParse(string text, out JsonValue value, out string? error)
@@ -641,7 +641,7 @@ public static class Json
         }
 
         /// <summary>
-        /// 宽容读取键名，覆盖 fastjson2 的两种非标准写法（对齐 Python _FastJsonParser._key）：
+        /// 宽容读取键名，覆盖 fastjson2 的两种非标准写法：
         ///   1) 无引号数字键：{"offsetTable":{0:1,1:2}}；
         ///   2) 对象/数组作为 map 键（非法 JSON，管理端必现）：MessageQueue 会被内联。
         /// 内联键保留**原始 JSON 文本**作为键名，调用方再用 ParseMessageQueueKey() 还原。

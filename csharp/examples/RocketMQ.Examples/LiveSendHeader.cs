@@ -1,6 +1,4 @@
-// 发送头三个字段（defaultTopic / defaultTopicQueueNums / brokerName）真机联调
-//（对应 python/verify_send_header_live.py、cpp/examples/live_send_header.cpp、
-//  rust/examples/live_send_header.rs 的 H0–H5）。
+// 发送头三个字段（defaultTopic / defaultTopicQueueNums / brokerName）真机联调（场景段 H0–H5）。
 //
 //
 // 用法：rmq send-header [namesrv]（需本地 5.5.1 集群，autoCreateTopicEnable=true）

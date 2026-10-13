@@ -1,7 +1,5 @@
 // ``FairSemaphore`` 的单测 —— 只测那个公平计数信号量本身。
 //
-//
-// 与 python/tests/test_backpressure.py、cpp/tests/test_backpressure.cpp 同题。
 // 生产者那一侧怎么用它（拿不到就回调、还几次）由真机工具 `dotnet backpressure` 钉
 // （见 csharp/README.md 的联调表）。
 using System;

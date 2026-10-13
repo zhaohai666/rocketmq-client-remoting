@@ -142,8 +142,8 @@ public class AclTests
         // key 长于 64 字节块：必须先 SHA1 压缩成 20 字节再当 key。
         // 注意 key 用 ASCII（80 个 'k'）：HmacSha1Base64 的 key 形参是 string，会按 UTF-8
         // 编码成字节，用 (char)0xaa 这种非 ASCII 字符会编成 2 字节，向量就不成立了。
-        // 期望值由 Python hmac/hashlib（独立实现）算出：
-        //   hmac.new(b'k'*80, b'Test Using Larger Than Block-Size Key - Hash Key First', sha1)
+        // 期望值是记录的黄金向量，可用标准 HMAC-SHA1 独立复算：
+        //   HMAC-SHA1(key=b'k'*80, msg=b'Test Using Larger Than Block-Size Key - Hash Key First')
         Assert.Equal("a08bbef5673f2c2a8bc6faf91fb5fb9b5ef7da35",
             Hex(Convert.FromBase64String(AclClientRPCHook.HmacSha1Base64(
                 new string('k', 80),

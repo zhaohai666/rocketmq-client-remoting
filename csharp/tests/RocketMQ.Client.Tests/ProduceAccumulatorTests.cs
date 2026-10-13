@@ -1,4 +1,4 @@
-// ProduceAccumulator（自动攒批）的离线单测 —— 与 python/tests/test_produce_accumulator.py 同题。
+// ProduceAccumulator（自动攒批）的离线单测。
 using System.Globalization;
 using System.Text;
 using RocketMQ.Client;

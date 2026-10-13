@@ -1,5 +1,4 @@
 // 协议编解码自检：不依赖集群，验证「编码 → 解码」闭环与关键常量。
-// 对应 cpp/examples/selfcheck.cpp（65 行）。
 using System;
 using System.Text;
 using RocketMQ.Client;

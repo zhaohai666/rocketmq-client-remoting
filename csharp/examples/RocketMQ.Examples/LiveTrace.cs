@@ -158,8 +158,8 @@ public static class LiveTrace
     public static int Run(string[] args)
     {
         string namesrv = args.Length > 0 ? args[0] : "127.0.0.1:9876";
-        // topic 与业务消费组都带 Stamp：`run_trace_live.sh all` 会让三语言**依次**跑在同一个 broker 上，
-        // 固定名会让第二个语言继承上一轮的位点与残留消息，使断言结果依赖运行顺序。全新 topic + 全新组
+        // topic 与业务消费组都带 Stamp：多轮真机联调会**依次**打在同一个 broker 上，
+        // 固定名会继承上一轮的位点与残留消息，使断言结果依赖运行顺序。全新 topic + 全新组
         // 才能让每次运行的起点一致（真正的鲁棒性另有保障，见 S6 的 body 过滤）。
         string topic = "TraceTopicLive_" + Stamp;
         string noTraceTopic = "TraceNoTraceTopic_" + Stamp;
@@ -238,7 +238,7 @@ public static class LiveTrace
         // ---------------- S6/S7 消费侧 ----------------
         // ⚠ 只统计**本次发送的**消息：topic 上必然还留着 S1 的预热消息，且消费者的起始位点在
         // "组首次消费"时取的是当时的 maxOffset —— broker 的 consumequeue 是异步分发的，位点可能
-        // 落在预热消息之前，于是预热消息也会被投递过来（实测三语言都踩过）。断言的本意是"本次
+        // 落在预热消息之前，于是预热消息也会被投递过来（真机实测见过）。断言的本意是"本次
         // 业务消息被消费到"，所以按 body 过滤，而不是赌 topic 上只有一条消息。
         static bool IsPrimary(MessageExt m) => BodyText(m).StartsWith("trace-live-", StringComparison.Ordinal);
 
@@ -399,7 +399,7 @@ public static class LiveTrace
                 if (t == MixAll.TraceTopic) segments += CountOf(text, TraceConstants.FieldSplitor);
             }
 
-            Check("S16 轨迹文本记录数（STX 计数）== 解码出的记录数（Java split 语义）",
+            Check("S16 轨迹文本记录数（STX 计数）== 解码出的记录数",
                 segments == records.Count && records.Count > 0,
                 "segments=" + segments.ToString(CultureInfo.InvariantCulture)
                 + " decoded=" + records.Count.ToString(CultureInfo.InvariantCulture));

@@ -1,6 +1,4 @@
-// C# 客户端静态主题（513 createStaticTopic + 端点重写）真机联调
-// （对应 python/verify_static_topic_live.py、rust/examples/live_static_topic.rs、
-//   cpp/examples/live_static_topic.cpp：四语言同一套场景 S1-S5）。
+// C# 客户端静态主题（513 createStaticTopic + 端点重写）真机联调（场景段 S1-S5）。
 //
 // S1 createStaticTopic(513)：单 broker，totalQueues=8，物理 4 队列。
 // S2 路由回读：TopicQueueMappingByBroker 非空。
@@ -92,8 +90,8 @@ public static class LiveStaticTopic
     }
 
     /// <summary>
-    /// 单 broker 的 TopicQueueMappingDetail 文档（513 body，Java
-    /// TopicQueueMappingDetail 的 fastjson2 字段名，与 python 参考版逐字段一致）。
+    /// 单 broker 的 TopicQueueMappingDetail 文档（513 body，broker 侧 TopicQueueMappingDetail
+    /// 的 fastjson2 字段名，与协议定义逐字段一致）。
     /// </summary>
     private static JsonValue MappingDetail(string brokerName)
     {
@@ -269,8 +267,8 @@ public static class LiveStaticTopic
         }, 20000);
         Check("S4 实例把 mock 队列重写到真实 broker", rewriteOk);
 
-        // id TotalQueues-1 在端点表内，值就是 __syslo__none__（Java 语义：返回端点值）；
-        // 透传用例要用表外 id（Go 单测用 99）。
+        // id TotalQueues-1 在端点表内，值就是 __syslo__none__（协议语义：返回端点值）；
+        // 透传用例要用表外 id（这里取 99）。
         string unhostedRewrite = inst.GetBrokerNameFromMessageQueue(
             new MessageQueue(_topic, mockName, TotalQueues - 1));
         Check("S4 无承载 id 返回哨兵值",

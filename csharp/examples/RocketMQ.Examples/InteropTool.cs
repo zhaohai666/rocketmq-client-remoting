@@ -1,5 +1,4 @@
-// 跨语言互操作工具：与 Python 参考客户端交叉验证协议字节。
-// 对应 cpp/examples/interop_tool.cpp（172 行）。
+// 跨语言互操作工具：与 Python 侧进程互换帧字节、逐字节交叉验证。
 //
 // 用法（由 Program 以 "interop <mode> [args...]" 形式调用）：
 //   rmq interop --emit                 打印规范命令的 JSON / ROCKETMQ 两种编码（十六进制）
@@ -19,7 +18,7 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Examples;
 
-/// <summary>跨语言协议字节互操作（与 Python 参考客户端对齐）。</summary>
+/// <summary>跨语言协议字节互操作（与 Python 侧进程互换规范帧字节）。</summary>
 internal static class InteropTool
 {
     // 规范命令（两侧必须一致）：

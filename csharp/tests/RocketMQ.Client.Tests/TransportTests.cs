@@ -1,4 +1,4 @@
-// 传输层单测（镜像 C++ test_transport.cpp 的核心断言）：
+// 传输层单测：
 // 真实本机 TCP —— echo broker 测 invokeSync 往返、粘包/半包重组、
 // 超时抛 RemotingTimeoutException、连接拒绝抛 RemotingConnectException、
 // opaque==0 的首个请求不被改写。

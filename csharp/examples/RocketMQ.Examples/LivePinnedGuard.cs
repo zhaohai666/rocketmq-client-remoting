@@ -251,7 +251,7 @@ public static class LivePinnedGuard
             Console.WriteLine("=== S2 topic 不符：本端亚毫秒拒，broker 上无痕 ===");
             (MQClientException? e, double elapsed) = TimedSend(() =>
                 prod.Send(Keyed(topic, "refused", "pinned-live-refused"), mqOther, 3000));
-            Check("S2a 同步单条拒（Java 原文案）",
+            Check("S2a 同步单条拒，文案与协议约定逐字一致",
                 e is not null && e.Message == SyncWording,
                 Fmt(elapsed) + "ms " + (e is null ? "没有抛异常" : e.Message));
             // 本端拒绝的码是 MQClientException 默认 1（UNKNOWN），不是 broker 回码
@@ -348,7 +348,7 @@ public static class LivePinnedGuard
             bool landed = WaitUntil(() => prod.MaxOffset(mq0) == offAsync + 1, 10000, 100);
             Check("S5a 单向定点没有守卫：报文按 msg 自己的 topic 落进 A",
                 landed, "A maxOffset=" + prod.MaxOffset(mq0).ToString(CultureInfo.InvariantCulture));
-            Check("S5b 目标队列所在的 B 一条都没有（是 Java 的口子，不是漏发）",
+            Check("S5b 目标队列所在的 B 一条都没有（是单向路径固有的口子，不是漏发）",
                 prod.MaxOffset(mqOther) == 0,
                 "B maxOffset=" + prod.MaxOffset(mqOther).ToString(CultureInfo.InvariantCulture));
 

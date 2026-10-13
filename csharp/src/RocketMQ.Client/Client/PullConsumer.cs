@@ -163,7 +163,7 @@ public sealed class DefaultMQPullConsumer
         set => _heartbeatBrokerIntervalMillis = value;
     }
 
-    /// <summary>心跳成功轮数（真机验证用；对应 Python <c>heartbeat_count()</c>）。</summary>
+    /// <summary>心跳成功轮数（真机验证用）。</summary>
     public long HeartbeatCount => Interlocked.Read(ref _heartbeatCount);
 
     // ---------------- ACL 鉴权 ----------------

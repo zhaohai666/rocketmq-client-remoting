@@ -1,5 +1,4 @@
-// 与 Python(tests/test_consumer_check_config.py)、C++(tests/test_consumer_check_config.cpp)、
-// Rust(consumer.rs 的 RANGE_GATES)一一对应：同一张闸门表、同一段检查顺序、同一条文案。
+// 与 src 侧的取值范围检查一一对应：同一张闸门表、同一段检查顺序、同一条文案。
 using RocketMQ.Client;
 using RocketMQ.Common;
 

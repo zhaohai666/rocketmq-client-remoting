@@ -83,7 +83,7 @@ public sealed class AsyncTraceDispatcher
 
     public string NamespaceV2 { get; set; } = string.Empty;
 
-    /// <summary>当前待发送的轨迹条数（对应 Python 的 trace_context_queue.qsize()）。
+    /// <summary>当前待发送的轨迹条数（轨迹队列的积压量）。
     /// 队列满时 Append 会返回 false 并丢弃，这里是唯一的观测点。</summary>
     public int QueueSize => _queue.Count;
 

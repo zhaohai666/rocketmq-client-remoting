@@ -1,7 +1,7 @@
 // 一致性哈希环单测：MD5 摘要 → 前 4 字节大端拼接、含端点的 tailMap、回绕、replica 续编号。
 //
-// 期望值与 rust/src/common/consistent_hash.rs、cpp/tests/test_consistent_hash.cpp 逐值一致
-// （四语言对拍）；策略侧的落点表见 AllocateStrategyTests 的 CONSISTENT_HASH 用例。
+// 期望值是摘要规则下确定的黄金值，逐值写死；策略侧的落点表见 AllocateStrategyTests
+// 的 CONSISTENT_HASH 用例。
 using System;
 using System.Collections.Generic;
 using System.Linq;

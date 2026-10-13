@@ -1,4 +1,4 @@
-// TLS + traceparent 真机联调（对应 cpp live_tls.cpp / run_tls_live.sh）。
+// TLS + traceparent 真机联调。
 //
 // 验证点（单进程闭环）：
 //   0. 传输层：逐轮新建 TLS 连接的首包必须落地；一条 TLS 连接上并发请求必须全部拿到应答
@@ -131,7 +131,7 @@ internal static class LiveTls
         string namesrv = args[0];
         string topic = args[1];
         string group = args[2];
-        // 三腿（对齐 live_tls.php / live_tls.ts）：
+        // 三腿：
         //   plain     tlsEnable=True，信任自签（test-mode）
         //   ca_verify + CaCert —— 严格校验证书链 + 主机名 SAN
         //   mtls      ca_verify + 客户端证书（broker -Dtls.server.authClient=true）

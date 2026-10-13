@@ -3,8 +3,6 @@
 //
 // 为什么必须从 socket 上取证：suspend() 不抛错、不返回任何东西，唯一的可观测事实就是
 // 「PULL_MESSAGE(11) 到底还上不上线」。这里挂起 2.5s 数请求，恢复后再数一次。
-// 与 go/client/consumer_test.go 的 TestConsumerSuspendStopsPullsAndResumeRestartsThem、
-// python/tests/test_consumer_suspend.py 同题。
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -328,7 +326,7 @@ public class SuspendResumeTests
                 "挂起之前拉取循环必须真的在打；已到达的请求码：" + string.Join(",", endpoint.Codes()));
 
             consumer.Suspend();
-            Assert.True(consumer.IsPaused, "isPause() 要如实反映挂起（Java :902）");
+            Assert.True(consumer.IsPaused, "isPause() 要如实反映挂起");
 
             // 挂起前已在途的那一笔先落地，再取基线，否则把合法的一笔算成漏网；
             // 300ms 也给了循环一次「盖章 + 停在挂起闸门」的时间。
@@ -339,7 +337,7 @@ public class SuspendResumeTests
 
             int pausedCount = endpoint.Count(RequestCode.PullMessage);
             Assert.True(pausedCount == baseline,
-                "挂起期间不能有新的 PULL_MESSAGE 上线（Java pullMessage:263-266）："
+                "挂起期间不能有新的 PULL_MESSAGE 上线："
                 + $"基线 {baseline}，挂起 2.5s 后 {pausedCount}");
 
             // 顺序不变量：盖章在挂起判定**之前**，所以暂停的循环仍在按时盖章，
@@ -356,7 +354,7 @@ public class SuspendResumeTests
             Assert.True(WaitFor(() => endpoint.Count(RequestCode.PullMessage) > baseline, TimeSpan.FromSeconds(5)),
                 "Resume() 之后拉取必须恢复");
             Assert.True(queuesBefore.SetEquals(endpoint.PulledQueues()),
-                "挂起/恢复只是暂停发请求，分配集必须原地保留（Java 不动 ProcessQueueTable）");
+                "挂起/恢复只是暂停发请求，分配集必须原地保留");
         }
         finally
         {

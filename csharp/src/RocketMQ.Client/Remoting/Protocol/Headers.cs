@@ -1,4 +1,4 @@
-// 请求/响应自定义头（对应 common/protocol/header/*.java）。
+// 请求/响应自定义头（按协议各请求/响应码的字段定义）。
 using System.Globalization;
 using RocketMQ.Common;
 
@@ -12,7 +12,7 @@ public interface ICommandCustomHeader
     void FromExtFields(PropertyMap ext);
 }
 
-/// <summary>optional &lt;-&gt; 字符串 的编解码助手（对应 C++ 的 putOpt*/getOpt* 自由函数）。</summary>
+/// <summary>optional &lt;-&gt; 字符串 的编解码助手（PutOpt*/GetOpt* 系列）。</summary>
 public static class HeaderCodec
 {
     public static void PutOptStr(PropertyMap outMap, string key, string? v)

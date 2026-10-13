@@ -81,7 +81,7 @@ public sealed class DefaultMQAdminExt
         {
             int semi = addr.IndexOf(';', start);
             string piece = semi < 0 ? addr[start..] : addr[start..semi];
-            // 去首尾空白（C++ 只去 ' ' / '\t'，此处用 Trim 等价且更宽松）
+            // 去首尾空白（Trim 覆盖空格、制表符等各类空白，从严处理）
             piece = piece.Trim();
             if (piece.Length > 0) _nameServerAddrs.Add(piece);
             if (semi < 0) break;
@@ -92,7 +92,7 @@ public sealed class DefaultMQAdminExt
     public void SetNameServerAddresses(IReadOnlyList<string> addrs) =>
         _nameServerAddrs = new List<string>(addrs);
 
-    /// <summary>对应 C++ setInstanceName（运行期改 instanceName 不会重建 client）。</summary>
+    /// <summary>运行期改 instanceName（不会重建 client）。</summary>
     public void SetInstanceName(string name) => _instanceName = name;
 
     /// <summary>instanceName 会被 Start() 就地改写，所以这里读的是启动后的实际值。</summary>
@@ -234,7 +234,7 @@ public sealed class DefaultMQAdminExt
 
     public MQClientInstance GetMQClientInstance() => RequireClient();
 
-    /// <summary>对应 C++ client()（GetMQClientInstance 的别名）。</summary>
+    /// <summary>获取底层客户端实例（GetMQClientInstance 的别名）。</summary>
     public MQClientInstance Client() => GetMQClientInstance();
 
     // ---------------------------------------------------------------- 内部工具
@@ -281,7 +281,7 @@ public sealed class DefaultMQAdminExt
 
     // ---------------------------------------------------------------- Topic 管理
 
-    // 对应 DefaultMQAdminExt.createTopic：key / topicSysFlag 在 C++ 实作中被忽略，
+    // 对应 DefaultMQAdminExt.createTopic：key / topicSysFlag 是忽略形参，
     // 直接走 createTopicInRoute（默认 TopicConfig defaultTopic=TBW102，perm=READ|WRITE）。
     public void CreateTopic(string key, string newTopic, int queueNum = 4, int topicSysFlag = 0)
     {

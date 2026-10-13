@@ -1,7 +1,7 @@
-// Request-Reply（5.x）真机验证（对应 python/verify_request_reply_live.py、cpp/examples/live_rr.cpp）。
+// Request-Reply（5.x）真机验证：发起、broker 回推、等待槽命中全链路。
 // 用法：rmq rr [namesrv]
 //
-// 链路（与 Python 参考客户端同一套场景、同一套断言）：
+// 链路（场景与断言都落在协议字段上）：
 //   请求方 producer.Request(msg, timeout)            应答方 push consumer
 //   ──────────────────────────────                  ─────────────────────
 //   CORRELATION_ID = uuid
@@ -13,7 +13,7 @@
 //        broker 按 REPLY_TO_CLIENT 找到请求方连接推回
 //
 //
-// ⚠ 两个真机必踩点（与 Python 文档一致）：
+// ⚠ 两个真机必踩点：
 //   1) <cluster>_REPLY_TOPIC 是 broker 启动时注册的**系统 topic**，客户端 createTopic 会被
 //      INVALID_PARAMETER(29)「conflict with system topic」拒绝，且 broker 侧不留日志，只能从
 //      客户端异常看出来 —— 所以顺手把"错误传播是准的"也验了。
@@ -535,7 +535,7 @@ public static class LiveRR
                 && c8.ResponseCode == ClientErrorCode.CreateReplyMessageException,
                 "raised=" + (raised8?.GetType().Name ?? "null") + " code="
                 + (raised8 as MQClientException)?.ResponseCode);
-            Check("S8 10007 的文案点到缺失的 CLUSTER 属性（Java 原文）",
+            Check("S8 10007 的文案与协议约定逐字一致，点到缺失的 CLUSTER 属性",
                 raised8?.Message.Contains("property[" + MessageConst.PropertyCluster
                                           + "] is null.") == true,
                 "msg=" + raised8?.Message);

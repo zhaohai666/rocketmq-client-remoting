@@ -1,4 +1,4 @@
-// C# 客户端的**真实集群**消息类型联调（对应 cpp/examples/live_message_types.cpp）。
+// C# 客户端的**真实集群**消息类型联调。
 //
 // 覆盖 8 类消息能力，全部打真实 nameServer + broker：
 //   1. 异步发送（sendAsync + SendCallback）
@@ -24,7 +24,7 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Examples;
 
-/// <summary>真实集群 7 类消息能力联调（与 cpp/examples/live_message_types.cpp 对齐）。</summary>
+/// <summary>真实集群 7 类消息能力联调。</summary>
 internal static class LiveMessageTypes
 {
     private static string _gNamesrv = "127.0.0.1:9876";

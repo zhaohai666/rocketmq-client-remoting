@@ -1,8 +1,7 @@
 // Validators / TopicValidator 真机验证（任务 #32）。
 // 用法：rmq validators-live [namesrv]
 //
-// 与 python/verify_validators_live.py、rust/examples/live_validators.rs、
-// cpp/examples/validators_live.cpp 同场景对拍：四语言用同一套断言证明
+// 本工具用同一套断言证明
 // 「非法名字在本地第一行就被拦掉，合法名字照常在集群收发」。
 //
 // 前置：NameServer + Broker 已起（普通配置，不需要 ACL/TLS/trace）。
@@ -539,7 +538,7 @@ public static class LiveValidators
             Check("S8a 一个地址都没有时报 10004 NO_NAME_SERVER_EXCEPTION（不是 10005）",
                 e is not null && e.ResponseCode == ClientErrorCode.NoNameServerException,
                 "code=" + e?.ResponseCode + " msg=" + e?.Message);
-            Check("S8b 文案是 Java 的「No name server address, please set it.」（指向寻址）",
+            Check("S8b 文案与协议约定逐字一致：「No name server address, please set it.」（指向寻址）",
                 e?.Message == "No name server address, please set it.", "msg=" + e?.Message);
             Check("S8c 失败发生在本地判定，没有把重试预算空转掉（<"
                   + LocalBudgetMs.ToString(CultureInfo.InvariantCulture) + "ms）",

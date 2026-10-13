@@ -1220,7 +1220,7 @@ public sealed class DefaultLitePullConsumer
 
     /// <summary>
     /// 为心跳准备 broker 地址：把本实例关注的 topic（订阅的 + assign 到的）路由拉一遍
-    /// 并登记为在用（对应 Python `_refresh_route_for_heartbeat`）。
+    /// 并登记为在用。
     /// 心跳只发给路由表里已知的 broker，所以这一步必须在首轮心跳之前。
     /// </summary>
     private void RefreshRouteForHeartbeat()

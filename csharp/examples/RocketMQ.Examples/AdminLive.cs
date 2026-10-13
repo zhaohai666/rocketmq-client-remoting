@@ -1,4 +1,4 @@
-// C# 管理客户端（DefaultMQAdminExt）的**真实集群**联调（对应 cpp/examples/admin_live.cpp）。
+// C# 管理客户端（DefaultMQAdminExt）的**真实集群**联调（管理端 RPC 逐项打通）。
 //
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
@@ -14,7 +14,7 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Examples;
 
-/// <summary>真实集群管理端全链路联调（与 cpp/examples/admin_live.cpp 对齐）。</summary>
+/// <summary>真实集群管理端全链路联调。</summary>
 internal static class AdminLive
 {
     private static string _gNamesrv = "127.0.0.1:9876";
@@ -712,7 +712,7 @@ internal static class AdminLive
                     Check("resetOffsetByQueueId(回到 minOffset)",
                         table.Count == 0 || table.Keys.First().QueueId == queueId,
                         "returnedTable=" + table.Count.ToString(CultureInfo.InvariantCulture)
-                        + "（Java 为 void，可为空）");
+                        + "（协议语义为 void，可为空）");
                     bool found = admin.ExamineConsumerOffset(group, mq, out long off);
                     Check("resetOffsetByQueueId 后位点==目标 offset", found && off == minReset,
                         "consumerOffset=" + off.ToString(CultureInfo.InvariantCulture)
@@ -762,7 +762,7 @@ internal static class AdminLive
                         "badTarget=" + badTarget.ToString(CultureInfo.InvariantCulture)
                         + " " + remark.Substring(0, Math.Min(120, remark.Length)));
                     bool found = admin.ExamineConsumerOffset(group, mq, out long off);
-                    Check("越界 reset 停留在第 1 笔写入的非法位点（Java 两笔 RPC 非原子）",
+                    Check("越界 reset 停留在第 1 笔写入的非法位点（两笔 RPC 非原子）",
                         found && off == badTarget,
                         "consumerOffset=" + off.ToString(CultureInfo.InvariantCulture));
                 }

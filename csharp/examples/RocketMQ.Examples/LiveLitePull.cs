@@ -1,8 +1,7 @@
 // 轻量拉取消费者（DefaultLitePullConsumer）真机验证。
 // 用法：rmq lite-pull [namesrv]
 //
-// 与 cpp/examples/live_lite_pull.cpp、python/verify_lite_pull_live.py 完全同场景
-// （三语言对拍用同一套断言）。
+// 场景 S1–S8：rebalance、subscribe/assign、poll、自动与手动提交、seek、位点恢复。
 using System.Globalization;
 using System.Text;
 
@@ -413,7 +412,7 @@ public static class LiveLitePull
         o2.Start();
         long start2 = o2.PullCursorOf(q0);
         // 上界只要求「没吃到另一个实例内存里那格 777」：起点的拉取游标会被后台续拉往前推，
-        // 卡死等于 5 就成了赌时序（Rust L11e 同口径）。
+        // 卡死等于 5 就成了赌时序，所以下界取 5、上界只要求没越过 777。
         Check("S8e 新实例的起点是 broker 上的 5（不是另一个实例内存里的 777）",
             start2 >= 5 && start2 < 777, "pullCursor=" + start2);
         o2.Shutdown();
@@ -452,7 +451,7 @@ public static class LiveLitePull
         // 点名一条 foreign 队列：它没有消费记录（-1 守卫拦下写表），
         // 但 persistAll 扫表时把 q0 那份未落盘的值清了 —— 这才是「提交部分队列」的代价。
         o.Commit(new[] { foreign }, persist: true);
-        Check("S8g 点名提交会把没点名的内存值清掉（Java 的 remove unused mq）",
+        Check("S8g 点名提交会把没点名的内存值清掉（清理未用到的 mq）",
             o.PendingCommitOf(q0) == -1, "pending=" + o.PendingCommitOf(q0));
         Check("S8g 清掉之后回读到的是 broker 上那一格（并回填进表）",
             o.Committed(q0) == 60 && o.PendingCommitOf(q0) == 60,
@@ -466,7 +465,7 @@ public static class LiveLitePull
         long brokerSet = BrokerOffset(probe, q0);
         Check("S8g commit(Set) 提交的是已消费游标（60），不是内存里那格 300", brokerSet == 60,
             "brokerOffset=" + brokerSet);
-        Check("S8g persistAll 之后内存表回到已消费游标（Java 的 updateConsumeOffset）",
+        Check("S8g persistAll 之后内存表回到已消费游标",
             o.PendingCommitOf(q0) == 60, "pending=" + o.PendingCommitOf(q0));
 
         o.Shutdown();
@@ -717,7 +716,7 @@ public static class LiveLitePull
 
         // ---------------- S7 可插拔队列分配策略 ----------------
         Console.WriteLine();
-        Console.WriteLine("S7 可插拔队列分配策略（对应 Java setAllocateMessageQueueStrategy）");
+        Console.WriteLine("S7 可插拔队列分配策略");
         {
             List<MessageQueue> allQueues = c1.FetchMessageQueues(Topic);
             allQueues.Sort();
@@ -733,12 +732,12 @@ public static class LiveLitePull
             try
             {
                 probe.Start();
-                Check("S7a 策略为 null 时 Start() 报 Java 同款文案", false, "没有抛异常");
+                Check("S7a 策略为 null 时 Start() 报协议约定的原文案", false, "没有抛异常");
                 probe.Shutdown();
             }
             catch (MQClientException e)
             {
-                Check("S7a 策略为 null 时 Start() 报 Java 同款文案",
+                Check("S7a 策略为 null 时 Start() 报协议约定的原文案",
                     e.Message.Contains("allocateMessageQueueStrategy is null", StringComparison.Ordinal),
                     e.Message);
             }

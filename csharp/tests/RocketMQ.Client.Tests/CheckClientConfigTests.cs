@@ -1,5 +1,4 @@
-// 与 python/tests/test_check_client_config.py、cpp/tests/test_check_client_config.cpp、
-// rust/src/client/mq_client.rs 的同一组断言对拍。
+// CHECK_CLIENT_CONFIG(46) 的离线报文单测：逐条锁死请求与响应的形状。
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;

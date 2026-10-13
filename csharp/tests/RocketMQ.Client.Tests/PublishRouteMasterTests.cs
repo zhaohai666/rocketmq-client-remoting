@@ -1,4 +1,4 @@
-// 与 python/tests/test_publish_route_master.py 的地址侧同题。
+// 发布地址侧的离线单测：「只认 master」与「退让到从节点」两条口径分别锁死。
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Net;

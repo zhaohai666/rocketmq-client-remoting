@@ -6,8 +6,7 @@
 //   - 回投失败后摘除：消息真丢。
 // 未 Start 的消费者 SendMessageBack 必定抛，所以离线能锁死「判定」与「回投失败原地保留」
 // 两条分支；真机链路（挂起 → 清扫 → %RETRY% 重投到达）见
-// examples/RocketMQ.Examples/LiveCleanExpiredMsg.cs。与 python/tests/test_clean_expired_msg.py、
-// cpp/tests/test_clean_expired_msg.cpp、rust/src/client/consumer.rs 的同名测试一一对应。
+// examples/RocketMQ.Examples/LiveCleanExpiredMsg.cs。
 
 using RocketMQ.Client;
 using RocketMQ.Common;

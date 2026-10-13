@@ -1,4 +1,4 @@
-// 自动压缩的**真实集群 + 跨客户端**联调工具（对应 cpp/examples/compression_live.cpp）。
+// 自动压缩的**真实集群 + 跨客户端**联调工具。
 //
 //
 //
@@ -255,7 +255,7 @@ internal static class CompressionLive
         uint payloadCrc = UtilAll.Crc32(payload);
         Console.WriteLine("payload len=" + size.ToString(CultureInfo.InvariantCulture)
                           + " crc32=" + payloadCrc.ToString(CultureInfo.InvariantCulture)
-                          + "（确定性载荷，Java 探针同算法）");
+                          + "（确定性载荷，互通探针同算法）");
 
         // 1) 发出
         {

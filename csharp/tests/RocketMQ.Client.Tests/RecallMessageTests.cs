@@ -1,8 +1,4 @@
-// 定时消息撤回（RecallMessage 370）的离线对拍。
-//
-//
-// 与 python/tests/test_recall_message.py、cpp/tests/test_recall_message.cpp、
-// rust/src/common/recall_message_handle.rs 的测试同题。
+// 定时消息撤回（RecallMessage 370）的离线单测：编解码、报文键名与本地校验顺序。
 using System.Diagnostics;
 using RocketMQ.Remoting.Protocol;
 using Xunit;

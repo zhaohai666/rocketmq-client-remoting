@@ -331,7 +331,7 @@ public class ClientParityTests
     }
 
     [Theory]
-    [InlineData(false, true, true, "开关默认关（Java 的系统属性默认 false）")]
+    [InlineData(false, true, true, "开关默认关（配置项缺省 false）")]
     [InlineData(true, false, true, "响应为 null")]
     [InlineData(true, true, false, "响应没带 MSG_REGION")]
     public void RecallTraceHook_ThreeGatesAllMustPass(bool enabled, bool hasResponse, bool hasRegion, string why)

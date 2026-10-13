@@ -1,4 +1,4 @@
-// 路由刷新周期 / 位点落盘周期 真机验证（C# 参考 python/verify_interval_live.py 的 I1–I3）。
+// 路由刷新周期 / 位点落盘周期 真机验证（用例编号 I1–I3）。
 //
 //
 //
@@ -66,8 +66,8 @@ public static class LiveScheduledIntervals
     private static string Secs(long fromMs, long toMs) =>
         ((toMs - fromMs) / 1000.0).ToString("F2", CultureInfo.InvariantCulture) + "s";
 
-    /// <summary>broker 上该 group 这条队列的已提交位点（setZeroIfNotFound ⇒ 没提交过回 0，
-    /// 与 Python `_broker_offset` 同口径）。判据是「broker 侧真的收到了位点」。</summary>
+    /// <summary>broker 上该 group 这条队列的已提交位点（setZeroIfNotFound ⇒ 没提交过回 0）。
+    /// 判据是「broker 侧真的收到了位点」。</summary>
     private static long BrokerOffset(DefaultMQAdminExt admin, string group, MessageQueue mq)
     {
         admin.Client().QueryConsumerOffset(group, mq, out long off, 5000, null,
@@ -288,7 +288,7 @@ public static class LiveScheduledIntervals
             long dtSlowFirst = NowMs() - tStart;
             Check("I2 1s 组首次落盘发生在 initialDelay(~10s) 之后", fastFirst,
                 "dt=" + Secs(0, dtFastFirst) + " 周期=" + fastPersistMs.ToString(CultureInfo.InvariantCulture) + "ms");
-            Check("I2 首笔落盘不早于 Java 的 initialDelay 10s",
+            Check("I2 首笔落盘不早于 initialDelay 10s",
                 fastFirst && dtFastFirst / 1000.0 >= persistInitialDelaySec - 0.5,
                 "dt=" + Secs(0, dtFastFirst));
             Check("I2 60s 组同样在 ~10s 完成首笔落盘（周期未到，先走 initialDelay）", slowFirst,
@@ -322,7 +322,7 @@ public static class LiveScheduledIntervals
             slowC.Shutdown();
             consumers.Remove(slowC);
             bool slowSecond = WaitUntil(() => BrokerOffset(admin, gSlow, mq) == 6, 10000, 300);
-            Check("I2 60s 组 Shutdown() 时把 6 落盘（Java persistConsumerOffset 收尾）", slowSecond,
+            Check("I2 60s 组 Shutdown() 时把 6 落盘（persistConsumerOffset 收尾）", slowSecond,
                 "broker=" + BrokerOffset(admin, gSlow, mq).ToString(CultureInfo.InvariantCulture));
         }
         catch (Exception e)

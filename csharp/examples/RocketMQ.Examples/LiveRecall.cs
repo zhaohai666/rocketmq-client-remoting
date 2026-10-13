@@ -5,11 +5,6 @@
 // SendMessageProcessor#attachRecallHandle 里（且仅当消息带 TIMER_* 延迟属性）才会把句柄
 // 挂回 SEND 响应头；撤回是否真的生效也只能靠「到点没投递」来证明。
 // 离线单测（tests/RecallMessageTests.cs）锁的是编解码、报文键名和本地校验顺序，证不了语义。
-//
-//
-//
-// 与 python/verify_recall_live.py、cpp/examples/recall_live.cpp、
-// rust/examples/live_producer.rs 的 P9 段同题。
 using System.Diagnostics;
 using System.Text;
 

@@ -1,4 +1,4 @@
-// 日志模块单测（镜像 C++ test_logging.cpp 的核心断言）：
+// 日志模块单测：
 // 行格式、主线程命名 main、线程名线程本地性、按大小轮转 + maxIndex 上限、级别过滤、关闭文件输出。
 using System.Globalization;
 using System.Text.RegularExpressions;

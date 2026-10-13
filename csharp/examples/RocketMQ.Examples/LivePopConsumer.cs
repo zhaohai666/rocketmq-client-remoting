@@ -2,7 +2,7 @@
 //   POP 弹出 → 投递 listener → 成功则 ack、失败则延长不可见时间 → 不重复投递。
 // 消费循环不查/不提交消费位点，进度完全由 broker 的 checkpoint 跟踪。
 //
-// 场景（与 python/verify_pop_consumer_live.py、cpp/examples/live_pop_consumer.cpp 同套）：
+// 场景：
 //   S1 POP 消费：起消费者 → 发 12 条 → 全部收到、无重复、body 集合一致
 //   S2 ack 生效：收满后再观察一段时间（> invisibleTime）→ 不应被重复投递
 //   S3 RECONSUME_LATER：listener 持续返回 RECONSUME_LATER → 按延迟档位重新投递

@@ -259,7 +259,7 @@ public sealed class RequestFutureHolder
     }
 }
 
-/// <summary>Request-Reply 工具函数（对应 Python request_reply.py 的模块级函数）。</summary>
+/// <summary>Request-Reply 模块级工具函数。</summary>
 public static class RequestReply
 {
     public static string CreateCorrelationId() => Guid.NewGuid().ToString();

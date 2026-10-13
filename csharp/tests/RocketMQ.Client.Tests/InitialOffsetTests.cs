@@ -2,8 +2,8 @@
 // 回拉取应答；「这个 RPC 到底发没发」全部从 socket 上取证。负控腿（LAST_OFFSET 那一支必须
 // 发 GET_MAX_OFFSET）证明这份请求日志不是哑的。
 //
-// 与 rust/src/client/pull_consumer.rs 的 `lite_first_offset_starts_at_zero_without_a_min_offset_rpc`
-// 同题；push 那条腿在这里多补一份（订阅模式走的是 Consumer.cs 的 ResolveInitialOffset）。
+// 锁死这条不变式：lite 首偏移从 0 起且不发 GET_MIN_OFFSET；
+// push 那条腿在这里多补一份（订阅模式走的是 Consumer.cs 的 ResolveInitialOffset）。
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
@@ -365,7 +365,7 @@ public class InitialOffsetTests
     }
 
     /// <summary>
-    /// 推送消费者同题（订阅模式走的是 Consumer.cs 的 ResolveInitialOffset）：新组没有已提交
+    /// 推送消费者同形场景（订阅模式走的是 Consumer.cs 的 ResolveInitialOffset）：新组没有已提交
     /// 位点时，起点 0 直接上线，不发 GET_MIN_OFFSET。
     /// </summary>
     [Fact]

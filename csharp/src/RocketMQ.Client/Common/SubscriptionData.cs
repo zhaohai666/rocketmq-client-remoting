@@ -27,7 +27,7 @@ public sealed class SubscriptionData : IComparable<SubscriptionData>
 
     public SubscriptionData()
     {
-        // 默认取当前毫秒时间戳（C++ 默认构造函数行为一致）
+        // 默认取当前毫秒时间戳
         SubVersion = UtilAll.CurrentTimeMillis();
     }
 

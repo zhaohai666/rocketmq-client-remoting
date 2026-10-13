@@ -1,7 +1,7 @@
-// 真机联调工具集合（对应 cpp/examples 的 5 个可执行文件）。
+// 真机联调工具集合。
 //
 // 用「单可执行文件 + 子命令」而不是 5 个 csproj：构建产物只有一个，
-// 各子命令共享协议层/客户端层代码，调用方式也与 cpp 的工具一一对应。
+// 各子命令共享协议层/客户端层代码。
 using System.Globalization;
 
 namespace RocketMQ.Examples;
@@ -91,10 +91,10 @@ internal static class Program
             usage: rmq <command> [args...]
 
               selfcheck                     协议编解码自检（不依赖集群）
-              interop <mode> [args...]      跨语言互操作（与 Python 参考客户端对齐）
+              interop <mode> [args...]      跨语言互操作（与协议参考实现报文级互通）
               message-types [namesrv]       真实集群 7 类消息能力联调
               admin-live   [namesrv]        真实集群管理端全链路联调
-              admin-batch-live [namesrv]    真实集群批量 admin 联调（对标 python verify_admin_batch_live）
+              admin-batch-live [namesrv]    真实集群批量 admin 联调
               compression-live <mode> ...   压缩跨客户端矩阵
               redelivery    [namesrv]       真实集群消费侧能力联调（回投/位点/顺序/广播/流控）
               acl     [namesrv] [ak] [sk]   真实集群 ACL 鉴权联调（需 broker 开 authenticationEnabled）
@@ -121,7 +121,7 @@ internal static class Program
               sql92      [namesrv]        真实集群 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 联调（需 broker 开 enablePropertyFilter）
               static-topic-live [namesrv] 真实集群静态主题联调（513 createStaticTopic + 端点集推导 + 实例重写 + 收发）
               unreg-live [namesrv]        真实集群退出注销联调（UNREGISTER_CLIENT(35) 抓帧 + 204 前后对照 + 对照组）
-              fail-fast  [namesrv]        broker 真死时在途请求立刻判死（Java failFast）联调（会重启 broker）
+              fail-fast  [namesrv]        broker 真死时在途请求立刻判死（failFast）联调（会重启 broker）
               scheduled-intervals [namesrv] 真实集群周期任务联调（路由刷新周期 1s/30s、位点落盘周期 1s/60s 真机计时）
               subscribe  [namesrv]        真实集群后置订阅联调（start() 之后 subscribe 立即推心跳、新 topic 真被消费）
               pinned-guard [namesrv]      真实集群定点发送 topic 守卫联调（真路由不误拒、拒在本端且 broker 无痕、单向无守卫）

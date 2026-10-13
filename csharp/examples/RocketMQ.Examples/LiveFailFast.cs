@@ -274,7 +274,7 @@ public static class LiveFailFast
             int worstMs = snapshot.Count == 0 ? 0 : snapshot.Max(r => r.ElapsedMs);
             string kinds = string.Join(",", snapshot.Select(r => r.Kind));
             string firstMsg = snapshot.FirstOrDefault(r => r.Kind == "send_request")?.Message ?? string.Empty;
-            Check("L3 报的是 RemotingSendRequestException（Java failFast 的口径）",
+            Check("L3 报的是 RemotingSendRequestException（failFast 的口径）",
                 sendRequest == Parked, "kinds=" + kinds);
             Check("L3 一条都没被报成超时（类型错 = 重试决策错）", timeouts == 0,
                 "timeout=" + timeouts);

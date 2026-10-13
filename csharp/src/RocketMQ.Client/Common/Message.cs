@@ -83,7 +83,7 @@ public class Message
     public byte[] Body
     {
         get => _body;
-        // C++ setBody：设置 body 同时把 hasBody 置 true。
+        // setBody 语义：设置 body 同时把 hasBody 置 true。
         set
         {
             _body = value;

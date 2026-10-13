@@ -1,5 +1,4 @@
-// 与 python/tests/test_pull_expired.py、cpp/tests/test_pull_expired.cpp、
-// rust/src/client/consumer.rs 的同一组断言对拍。真机恢复场景见 examples 的 LiveRedelivery（H 段）。
+// 拉取过期（expired）处理的离线单测。真机恢复场景见 examples 的 LiveRedelivery（H 段）。
 //
 // C# 侧的实现差异（不是漏掉，是刻意为之，详见 Consumer.cs 注释）：没有 per-queue 的
 // classic ProcessQueue 对象，所以"这条循环还是不是这把队列的属主"用登记线程的引用相等来判，
@@ -117,7 +116,7 @@ public class PullExpiredTests
     [Fact]
     public void SweepRetiresStalledQueueAndClearsEveryTrace()
     {
-        // 撤走的收尾（Python _retire_queue_locked）：盖章、线程登记、缓冲、两张位点表全摘掉，
+        // 撤走的收尾：盖章、线程登记、缓冲、两张位点表全摘掉，
         // 而已消费位点必须**带着走**（交给调用方持久化）——重建的新循环要从 broker 的位点续拉，
         // 本地留着旧值会让下一轮把它写回去，位点回退 = 整把队列重投。
         var consumer = NewConsumer();

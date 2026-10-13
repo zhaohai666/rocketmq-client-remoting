@@ -1,9 +1,6 @@
 // 这两个偏差在真机上都只表现为「慢」：没有异常、没有缺字段，只有「新 topic 的路由要等
 // 半分钟才刷新」这种没人会去计时的现象。所以这里用 MockCluster 记录
 // GET_ROUTEINFO_BY_TOPIC 的**到达时刻**（WireRecord.ArrivalMs），把节奏钉死。
-//
-// 与 Python(tests/test_scheduled_intervals.py)、C++(tests/test_scheduled_intervals.cpp)、
-// Rust(mq_client.rs / producer.rs / consumer.rs 内的同题用例) 一一对应。
 using RocketMQ.Client;
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;

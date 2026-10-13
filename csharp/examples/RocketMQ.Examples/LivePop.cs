@@ -1,9 +1,6 @@
 // POP 模式（5.x 轻量消费）真机验证。
 // 用法：rmq pop [namesrv]
 //
-// 与 cpp/examples/live_pop.cpp、python/verify_pop_live.py 完全同场景
-// （三语言对拍用同一套断言）。
-//
 // POP 与 pull 的语义差异是断言的重心：
 //   - **不提交位点**，靠 ack 确认；不 ack 的消息在 invisibleTime 后被复活重投；
 //   - broker 在普通 topic 消息上**不写** POP_CK，客户端必须自己反构 8 段 CK 串。

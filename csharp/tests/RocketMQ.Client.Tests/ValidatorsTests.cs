@@ -2,9 +2,6 @@
 // （Producer.Start / PushConsumer.Start / PullConsumer.Start / LitePullConsumer.Start）
 // 会在任何 I/O 之前拒绝非法组名——测试全程没有可用的 name server，能抛出**组名**
 // 错误而不是「name server address is not set」，本身就证明了顺序正确。
-//
-// 与 python/tests/test_validators.py、cpp/tests/test_validators.cpp、
-// rust/src/client/validators_tests.rs 同题。
 using RocketMQ.Common;
 using RocketMQ.Remoting.Protocol;
 using Xunit;

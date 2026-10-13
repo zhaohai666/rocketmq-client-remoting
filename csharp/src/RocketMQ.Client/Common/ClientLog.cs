@@ -3,15 +3,15 @@
 //
 //
 //
-// C# 移植面的非显然判断（与 C++ 的差异）：
-//   - C++ 用 __FILE__/__LINE__ 宏捕获调用点；C# 用 [CallerFilePath]/[CallerLineNumber]
-//     特性做到等价效果，因此 Debug/Info/Warn/Error 是带可选 caller 参数的公开方法。
-//   - C++ 的 thread_local 显式名缓存在 C# 天然成立：SetThreadName 直接设置
+// 非显然的实现要点：
+//   - 调用点由 [CallerFilePath]/[CallerLineNumber] 特性在调用处展开捕获，
+//     因此 Debug/Info/Warn/Error 是带可选 caller 参数的公开方法。
+//   - 显式线程名缓存天然成立：SetThreadName 直接设置
 //     Thread.CurrentThread.Name（每个托管线程各自持有），同时缓存到 [ThreadStatic] 字段。
-//   - C# BCL 没有可移植的"OS 线程名"读取 API，故 C++ 的 "OS 线程名" 这一档在 C# 中
-//     即等价于托管线程名（已由 SetThreadName 设置）；未命名线程回落 "main" / "tid-xxxx"。
+//   - 没有可移植的"OS 线程名"读取 API，故这一档即
+//     托管线程名（已由 SetThreadName 设置）；未命名线程回落 "main" / "tid-xxxx"。
 //   - 主线程判定：在类型静态初始化时捕获 Environment.CurrentManagedThreadId（那一刻
-//     通常是进程主线程），后续比对即可，对应 C++ 在 main 之前动态初始化阶段捕获主线程 id。
+//     通常是进程主线程），后续比对即可。
 //   - 级别/路径/轮转参数均用 Lazy 在首次使用时求值并缓存，之后不再读环境变量。
 using System.Globalization;
 using System.Runtime.CompilerServices;
@@ -20,7 +20,7 @@ using System.Threading;
 
 namespace RocketMQ.Common;
 
-// 日志级别（数值对齐 C++ 的 enum LogLevel）。
+// 日志级别（数值沿用客户端日志的通用约定）。
 public enum LogLevel
 {
     Debug = 0,
@@ -34,7 +34,7 @@ public enum LogLevel
 public static class ClientLog
 {
     // ---------------------------------------------------------------- 内部状态
-    // 日志文件输出状态（对应 C++ 的 LogFileSink）。
+    // 日志文件输出状态（file sink）。
     private sealed class LogFileState
     {
         public string Path = "";            // 空 = 关闭文件输出
@@ -59,7 +59,7 @@ public static class ClientLog
         new(() => ParseLevel(RawLevelEnv.Value));
 
     // -1 = 尚未解析（首次使用时按环境变量/默认填充）；>=0 表示已确定的级别。
-    // SetLogLevel 通过 Interlocked 覆盖该值，等价于 C++ 的 std::atomic<int>。
+    // SetLogLevel 通过 Interlocked 覆盖该值，保证原子读写。
     private static int _level = -1;
 
     private static int ResolveLevelOnce()
@@ -99,7 +99,7 @@ public static class ClientLog
 
     /// <summary>
     /// 程序内设定轮转阈值（优先于环境变量）。maxSize&lt;=0 关闭按大小轮转；
-    /// maxIndex&lt;=0 不保留备份。对应 C++ 只能通过环境变量在启动前设置。
+    /// maxIndex&lt;=0 不保留备份（环境变量只能在启动前设置，此方法则是运行期覆盖）。
     /// </summary>
     public static void SetLogFileLimits(long maxSize, int maxIndex)
     {
@@ -198,8 +198,8 @@ public static class ClientLog
     }
 
     // ---------------------------------------------------------------- 公开入口
-    // 以下四个方法对应 C++ 的 logger_debug/info/warn/error 宏。[CallerFilePath]/
-    // [CallerLineNumber] 在**调用点**展开，等价于宏捕获的 __FILE__/__LINE__。
+    // 以下四个方法是日志输出的公开入口。[CallerFilePath]/
+    // [CallerLineNumber] 在**调用点**展开，捕获调用方的文件与行号。
     public static void Debug(string msg,
         [CallerFilePath] string file = "", [CallerLineNumber] int line = 0)
         => WriteLine(LogLevel.Debug, msg, file, line);
@@ -333,7 +333,7 @@ public static class ClientLog
     {
         if ((int)level < (int)LogLevel) return;
 
-        DateTime now = DateTime.Now; // 本地时间，对应 C++ 的 localtime_r
+        DateTime now = DateTime.Now; // 本地时间
         string ts = now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
         string ms = now.Millisecond.ToString("D3", CultureInfo.InvariantCulture);
         string levelName = LevelName(level);
@@ -372,7 +372,7 @@ public static class ClientLog
                     }
                     catch (IOException)
                     {
-                        // 轮转失败则降级为直接写新文件，不阻断客户端（对齐 C++ 忽略 error_code）。
+                        // 轮转失败则降级为直接写新文件，不阻断客户端（刻意忽略错误码）。
                     }
                     if (!OpenSinkLocked()) return;
                 }

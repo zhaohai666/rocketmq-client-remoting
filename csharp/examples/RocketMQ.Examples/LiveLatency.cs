@@ -1,6 +1,5 @@
 // 发送延迟故障容错（sendLatencyFaultEnable）真机验证
-// （对应 python/verify_latency_live.py、cpp/examples/live_latency.cpp，同一套 S1–S5；
-//  S6 是发送重试内核的检查，另两种语言由各自的 live 用例锁定）。
+// （S1–S5 验故障容错链，S6 验发送重试内核的定性）。
 // 用法：rmq latency [namesrv]
 using System.Diagnostics;
 using System.Globalization;
@@ -140,7 +139,7 @@ public static class LiveLatency
         Console.WriteLine("S6 发送重试内核（sendDefaultImpl）：配置面 + 没有路由时的定性");
         var p3 = new DefaultMQProducer("PG_LatRetryNet_" + Stamp) { NamesrvAddr = namesrv };
         p3.Start();
-        Check("S6 默认可重试响应码就是 Java 那 8 个",
+        Check("S6 默认可重试响应码就是协议约定的那 8 个",
             p3.IsRetryResponseCode(ResponseCode.SystemError)
             && p3.IsRetryResponseCode(ResponseCode.SystemBusy)
             && p3.IsRetryResponseCode(ResponseCode.ServiceNotAvailable)
@@ -184,9 +183,8 @@ public static class LiveLatency
               "ok=" + capped.ToString(CultureInfo.InvariantCulture) + "/10");
         p3.Shutdown();
 
-        // 路由彻底拉不到：本项目的路由刷新把传输层失败并入「拿不到路由」，所以定性为
+        // 路由彻底拉不到：本端的路由刷新把传输层失败并入「拿不到路由」，所以定性为
         // NOT_FOUND_TOPIC(10005)，而且一次 broker 都没联系、重试次数没被空转掉。
-        // （Python/Rust 那条链把连接失败原样抛出，语义不同，各自的 live 用例分别锁定。）
         string deadAddr = DeadLoopbackAddress();
         var orphan = new DefaultMQProducer("PG_LatOrphanNet_" + Stamp) { NamesrvAddr = deadAddr };
         orphan.Start();

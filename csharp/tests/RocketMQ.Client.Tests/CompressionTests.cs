@@ -1,16 +1,15 @@
 // 消息体压缩单测：ZLIB 回归 + ZSTD + LZ4，重点是**跨实现互通**。
 //
 // 自压自解证明不了任何事（两端会是同一个 bug），所以这里的真值全部是**外部实现产出的字节**：
-//   * `py*`  —— Python 官方 `lz4.frame`（包装上游 C lz4）/ `zlib.compress(data, 5)`
+//   * `py*`  —— 官方 `lz4.frame`（包装上游 C lz4）/ `zlib.compress(data, 5)`
 //   * `rs*`  —— Rust `lz4_flex`（**纯 Rust 实现**，与 liblz4 无关）与 Rust `zstd` crate
 //   * `ZSTD_CLI*` —— `zstd -3` CLI（Yann Collet 参考实现）产出的帧
 //   反向也验：本文件里 `NET_*` 常量是 C# 实际产出的字节（回归护栏），
-//   这些字节另外用 `lz4 -d` / `zstd -d` CLI 与 lz4_flex、python `lz4.frame` 全部解通过
+//   这些字节另外用 `lz4 -d` / `zstd -d` CLI 与 lz4_flex、`lz4.frame` 全部解通过
 //   （含 2.8MB 的多块帧）。原生库/CLI 不在测试机上，所以那一步用脚本离线核对，
 //   本文件负责把「外部字节进得来」和「我们的字节长什么样」钉在单测里。
 //
-// 明文都是**公式生成**的（和 rust `src/common/compression.rs` 的测试同一配方），
-// 所以只需要嵌压缩后的真值，不用嵌明文。
+// 明文都是**公式生成**的，所以只需要嵌压缩后的真值，不用嵌明文。
 using System.Globalization;
 using System.Text;
 using RocketMQ.Common;
@@ -20,7 +19,7 @@ namespace RocketMQ.Client.Tests;
 
 public class CompressionTests
 {
-    /// <summary>与 rust/C++/python 端口真值测试同一段明文（1120 字节）。</summary>
+    /// <summary>互通真值用的公共明文（1120 字节，公式生成）。</summary>
     private static byte[] Payload() =>
         Encoding.ASCII.GetBytes(string.Concat(Enumerable.Repeat("rocketmq-compressed-payload-", 40)));
 
@@ -36,8 +35,8 @@ public class CompressionTests
 
     // ---------------------------------------------------------------- 外部真值（hex）
 
-    // Python `lz4.frame.compress(payload)`：66B。帧头 15 字节、FLG=0x68（**写了 content-size**）、
-    // 块是独立块。等价于 rust 测试里的 LZ4_FRAME_HEX。
+    // `lz4.frame.compress(payload)` 产出：66B。帧头 15 字节、FLG=0x68（**写了 content-size**）、
+    // 块是独立块。
     private const string PY_LZ4_FRAME = @"
         04224d1868406004000000000000482b000000ff0d726f636b65746d712d636f6d707265737365642d7061796c
         6f61642d1c00ffffffff30506c6f61642d00000000";
@@ -46,16 +45,16 @@ public class CompressionTests
         04224d186040822c000000ff0d726f636b65746d712d636f6d707265737365642d7061796c6f61642d1c00ffff
         ffff2f60796c6f61642d00000000";
 
-    // 空输入的 LZ4 帧：python / rust / C# 三边产出**完全相同**的 11 字节。
+    // 空输入的 LZ4 帧：lz4.frame / lz4_flex / 本客户端三方产出**完全相同**的 11 字节。
     private const string LZ4_FRAME_EMPTY = "04224d1860408200000000";
 
-    // C# 实际产出的 1120B 帧（58B）：回归护栏。头部 7 字节与 rust 一致，
-    // 43 字节压缩块与 python 逐字节一致（python 只是多写了 content-size 字段）。
+    // C# 实际产出的 1120B 帧（58B）：回归护栏。头部 7 字节与 `lz4_flex` 产出的真值一致，
+    // 43 字节压缩块与 `lz4.frame` 产出的真值逐字节一致（后者多写了 content-size 字段）。
     private const string NET_LZ4_FRAME = @"
         04224d186040822b000000ff0d726f636b65746d712d636f6d707265737365642d7061796c6f61642d1c00ffff
         ffff30506c6f61642d00000000";
 
-    // Python `lz4.frame.compress`，输入 70500B：370B。FLG=0x48 ⇒ **link 块**（非独立）+
+    // `lz4.frame.compress`，输入 70500B：370B。FLG=0x48 ⇒ **link 块**（非独立）+
     // content-size，BD=0x40 ⇒ 64KB 块 ⇒ 2 个块。解码端必须支持跨块复用压缩窗口。
     private const string PY_LZ4_MULTIBLOCK = @"
         04224d1848406413010000000000573a010000ff20726f636b65746d712d6c7a342d6d756c7469626c6f636b2d73
@@ -68,7 +67,7 @@ public class CompressionTests
         ffffffffb9506d756c74691d0000000feeffffffffffffffffffffffffffffffffffffffff5f506465662d0a0000
         0000";
 
-    // Rust `lz4_flex`，输入 70500B：350B。BD=0x50 ⇒ **256KB 块**（比我们自己发的 64KB 大 4 倍），
+    // `lz4_flex`（纯 Rust 独立实现），输入 70500B：350B。BD=0x50 ⇒ **256KB 块**（比我们自己发的 64KB 大 4 倍），
     // FLG=0x60 ⇒ 独立块、无 content-size。解码端不能假设块大小只有自己写的那种。
     private const string RS_LZ4_MULTIBLOCK = @"
         04224d186050fb4f010000ff20726f636b65746d712d6c7a342d6d756c7469626c6f636b2d736565642d30313233
@@ -89,7 +88,7 @@ public class CompressionTests
         28b52ffd0408250100e0726f636b65746d712d636f6d707265737365642d7061796c6f61642d010004f1ff740278
         aa9792";
 
-    // Rust `zstd::encode_all(data, 3)`：45B，FLG=0x00（单段、无 checksum）。
+    // `zstd::encode_all(data, 3)`：45B，FLG=0x00（单段、无 checksum）。
     private const string RS_ZSTD_FRAME = @"
         28b52ffd0058250100e0726f636b65746d712d636f6d707265737365642d7061796c6f61642d010004f1ff7402";
 
@@ -100,7 +99,7 @@ public class CompressionTests
     private const string NET_ZSTD_FRAME = @"
         28b52ffd606003250100e0726f636b65746d712d636f6d707265737365642d7061796c6f61642d010004f1ff7402";
 
-    // Python `zlib.compress(payload, 5)`：47B。ZLIB 路径的既有真值（改动 LZ4/ZSTD 时不许回退）。
+    // `zlib.compress(payload, 5)`：47B。ZLIB 路径的既有真值（改动 LZ4/ZSTD 时不许回退）。
     private const string ZLIB_L5 = @"
         785e2bca4fce4e2dc92dd44dcecf2d284a2d2e4e4dd12d48acccc94f4cd12d1a951b951b951b95a3400e0058e0b9
         f0";
@@ -135,7 +134,7 @@ public class CompressionTests
     /// 走一遍 LZ4 Frame 的块描述符，返回块数。用来证明大输入**确实**被拆成多块，
     /// 而不是只把断言押在「能解回来」上。
     ///
-    /// 帧头位义（用 python / rust / lz4 CLI 三种产出实测反推，与官方 frame format 一致，
+    /// 帧头位义（用 lz4.frame / lz4_flex / lz4 CLI 三种产出实测反推，与官方 frame format 一致，
     /// 数值按字节位算）：FLG bit7-6 = 版本(必须 01=0x40)、bit5 = 块独立、bit4 = 块校验、
     /// bit3 = 有 8 字节 content-size、bit2 = 有 content checksum；
     /// BD bit7 = 有 4 字节 dictID，bit6-4 = 块大小指数（4=64KB、5=256KB、6=1MB、7=4MB）。
@@ -163,7 +162,7 @@ public class CompressionTests
 
         pos++; // HC
         // BD bit6-4 是块大小的**编号**而不是指数：4=64KB、5=256KB、6=1MB、7=4MB（每 +1 翻 4 倍），
-        // 所以 size = 1 << (2*编号 + 8)。用 python 帧(BD=0x40⇒64KB) 与 rust 帧(BD=0x50⇒256KB)
+        // 所以 size = 1 << (2*编号 + 8)。用 lz4.frame 帧(BD=0x40⇒64KB) 与 lz4_flex 帧(BD=0x50⇒256KB)
         // 两种真实产出各自验算过。
         int blockMax = 1 << ((((bd >> 4) & 0x7) * 2) + 8);
         Assert.InRange(blockMax, 64 * 1024, 4 * 1024 * 1024);
@@ -285,7 +284,7 @@ public class CompressionTests
     [Fact]
     public void Lz4_Decompress_PythonFrame()
     {
-        // 外部实现（python lz4.frame ⇒ 上游 C lz4）产出的帧必须能解，
+        // 外部实现（官方 lz4.frame ⇒ 上游 C lz4）产出的帧必须能解，
         // 它的帧头 15 字节（比我们的多一个 content-size 字段），HC 也不同。
         byte[] external = Unhex(PY_LZ4_FRAME);
         Assert.Equal(66, external.Length);
@@ -307,7 +306,7 @@ public class CompressionTests
     public void Lz4_EmptyInput_ProducesCanonicalEmptyFrame()
     {
         byte[] empty = CompressorFactory.Compress(Array.Empty<byte>(), CompressionType.LZ4);
-        // python / rust / C# 三边对空输入产出**一模一样**的 11 字节帧（头 7 + 结束标记 4）。
+        // lz4.frame / lz4_flex / 本客户端三方对空输入产出**一模一样**的 11 字节帧（头 7 + 结束标记 4）。
         Assert.Equal(Unhex(LZ4_FRAME_EMPTY), empty);
         Assert.Empty(CompressorFactory.Decompress(empty, CompressionType.LZ4));
     }
@@ -315,7 +314,7 @@ public class CompressionTests
     [Fact]
     public void Lz4_Decompress_ExternalMultiBlockLinkedBlocks()
     {
-        // python 默认写 **link 块**（FLG bit5=0）：块之间共享压缩窗口，
+        // lz4.frame 默认写 **link 块**（FLG bit5=0）：块之间共享压缩窗口，
         // 解码端必须自己维护 64KB 窗口，不能每块独立解。
         byte[] external = Unhex(PY_LZ4_MULTIBLOCK);
         byte[] payload = MultiBlockPayload();
@@ -328,7 +327,7 @@ public class CompressionTests
     [Fact]
     public void Lz4_Decompress_ExternalBlockLargerThanOurs()
     {
-        // rust 默认 BD=0x50 ⇒ **256KB 块**，比本端口写出的 64KB 大 4 倍：
+        // lz4_flex 默认 BD=0x50 ⇒ **256KB 块**，比本客户端写出的 64KB 大 4 倍：
         // 解压的 scratch 缓冲不能按「自己的块大小」写死成刚好够用。
         byte[] external = Unhex(RS_LZ4_MULTIBLOCK);
         Assert.Equal(350, external.Length);
@@ -392,7 +391,7 @@ public class CompressionTests
     public void Zstd_EmptyInput_ProducesCanonicalEmptyFrame()
     {
         byte[] empty = CompressorFactory.Compress(Array.Empty<byte>(), CompressionType.ZSTD);
-        Assert.Equal(Unhex(ZSTD_FRAME_EMPTY), empty); // 与 rust zstd::encode_all(b"", 3) 逐字节一致
+        Assert.Equal(Unhex(ZSTD_FRAME_EMPTY), empty); // 与 zstd crate 的 encode_all(b"", 3) 逐字节一致
         Assert.Empty(CompressorFactory.Decompress(empty, CompressionType.ZSTD));
     }
 

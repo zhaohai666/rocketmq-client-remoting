@@ -1,9 +1,6 @@
 // 主动拉取消费者（DefaultMQPullConsumer）真机验证。
 // 用法：rmq pull [namesrv]
 //
-// 与 cpp/examples/live_pull.cpp、python/verify_pull_live.py 完全同场景
-// （三语言对拍用同一套断言）。
-//
 // 场景（拉模式的核心是「调用方自己拉、自己管位点」，断言都围绕这一点）：
 //   S1 建 topic + FetchSubscribeMessageQueues → 拿到 4 个队列
 //   S1b FetchMessageQueuesInBalance → 没拉取过的实例靠真实路由 + 38 算出自己那份

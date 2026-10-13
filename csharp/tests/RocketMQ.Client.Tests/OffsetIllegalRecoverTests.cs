@@ -9,10 +9,6 @@
 // 两个方向在真机短期窗口里都看不出差别（消息照消费、只是一直在弹/一次崩溃才暴露），
 // 所以断言全部放离线；真机另有一条链路证明（examples 的 live-offset-illegal 子命令）。
 //
-//
-// 与 python/tests/test_offset_illegal_recover.py、rust/src/client/consumer.rs、
-// cpp/tests/test_offset_illegal_recover.cpp 的同名用例逐条对拍。
-//
 // C# 侧的实现差异（不是漏掉，是刻意为之，见 Consumer.cs 注释）：没有 per-queue 的 classic
 // ProcessQueue 对象，"这条队列还在不在我名下"用 _pullThreads 引用相等判；网络段（persist 发给
 // broker）离线不可观测，此处断言"纠正值确实交给了持久化路径"（RetiredQueuesForTest 里那条

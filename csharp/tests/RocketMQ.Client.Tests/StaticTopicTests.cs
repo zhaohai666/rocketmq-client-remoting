@@ -1,4 +1,4 @@
-// 静态主题路由测试（对标 Go 端 static_topic_test.go 的五个用例）：
+// 静态主题路由测试（覆盖五类用例）：
 // mock broker 名推导、类型化映射解析缺省值、端点推导（未承载队列哨兵 / scope
 // 不合并 / epoch 围栏）、以及 GetBrokerNameFromMessageQueue 的重写/透传。
 using System.Globalization;

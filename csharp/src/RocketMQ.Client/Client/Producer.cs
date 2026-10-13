@@ -2,7 +2,7 @@
 // 异步发送、单向发送、批量发送、事务消息（两阶段：半消息 + 回查）、
 // 按 Key 查询、offset 查询、建 topic。
 //
-// 与 C++ producer.cpp 逐函数对齐：重试次数、队列选择、压缩判断阈值 4096、
+// 按协议口径逐项实现：重试次数、队列选择、压缩判断阈值 4096、
 // 超时与异常映射都是协议行为，下面的中文注释一并保留。
 using System.Globalization;
 using System.Threading;
@@ -156,7 +156,7 @@ public class DefaultMQProducer
         _enableTraceContext = TraceParentContext.EnabledFromEnv();
     }
 
-    /// <summary>析构：与 C++ ~DefaultMQProducer 一致，释放时兜底 shutdown。</summary>
+    /// <summary>析构：释放时兜底 shutdown。</summary>
     ~DefaultMQProducer()
     {
         try
@@ -313,7 +313,7 @@ public class DefaultMQProducer
     }
 
     /// <summary>
-    /// 对应 Python is_retry_response_code：null（压根没等到响应码）等于不可重试。
+    /// 响应码可重试判定：null（压根没等到响应码）等于不可重试。
     /// </summary>
     public bool IsRetryResponseCode(int? responseCode)
     {
@@ -992,7 +992,7 @@ public class DefaultMQProducer
         }
     }
 
-    /// <summary>返回底层客户端实例（对应 C++ MQClientInstance&amp; client()）。</summary>
+    /// <summary>返回底层客户端实例。</summary>
     public MQClientInstance Client() => GetClient();
 
     private MQClientInstance GetClient()
@@ -1332,7 +1332,7 @@ public class DefaultMQProducer
         return sysFlag;
     }
 
-    // C++ 里 Message 是值类型，send 前会拷一份再压缩；C# 的 Message 是引用类型，
+    // Message 是引用类型，发送语义要求压缩前先拷一份；
     // 这里显式克隆，避免压缩就地改写调用方的原始消息 body。
     private static Message CloneMessage(Message src)
     {
@@ -1568,7 +1568,7 @@ public class DefaultMQProducer
         }
 
         int timesTotal = _retryTimesWhenSendFailed + 1;
-        // 耗时用单调高精度钟（对应 Python time.monotonic / C++ steady_clock / Rust monotonic_millis）：
+        // 耗时用单调高精度钟：
         // 墙钟毫秒粒度会把本地环回的亚毫秒往返量成 0，容错阈值就永远不生效。
         double beginFirst = UtilAll.MonotonicMillis();
         var brokersSent = new List<string>();
@@ -1982,8 +1982,8 @@ public class DefaultMQProducer
         }
         catch (MQClientException e)
         {
-            // Python 这里选不到队列报的是 `Send [0] times, still failed, Topic: …,
-            // BrokersSent: []`；C# 的选队列是抛异常，原始原因拼进同一段文本。
+            // 选不到队列时报 `Send [0] times, still failed, Topic: …,
+            // BrokersSent: []`；这里的选队列是抛异常，原始原因拼进同一段文本。
             throw new MQClientException("Send [0] times, still failed, Topic: " + msg.Topic
                                         + ", BrokersSent: [], last error: " + e.Message);
         }
@@ -2366,7 +2366,7 @@ public class DefaultMQProducer
                     return (new MQClientException("wait response timeout, cost="
                         + cost.ToString(CultureInfo.InvariantCulture), err), true);
                 // 其余 RemotingException 都是「unknown reason」，但 TooMuchRequest 是「自己人太多」，
-                // 换 broker 也没用（Python 同一条判据）。
+                // 换 broker 也没用（属不可重试判据）。
                 case RemotingTooMuchRequestException:
                     return (new MQClientException("unknown reason", err), false);
                 // 连不上（RemotingConnectException）与编解码/命令错也属 RemotingException：
@@ -2513,8 +2513,8 @@ public class DefaultMQProducer
     public void SendBatchAsync(List<Message> msgs, ISendCallback callback, int timeoutMillis = -1,
         MessageQueue? mq = null)
     {
-        // 许可份数在调用方线程上算（Python 也在投队列前算好），公式与 _back_pressure_msg_len
-        // 的 list 分支一致：逐条累加、空 body 也算 1、空列表算 1
+        // 许可份数在调用方线程上算（投队列前算好），批量场景的公式：逐条累加、
+        // 空 body 也算 1、空列表算 1
         long msgLen = 0;
         if (msgs is not null)
         {
@@ -3254,7 +3254,7 @@ public class DefaultMQProducer
         // 对应 createTopic：先本地校验原始 topic 名，再查系统 topic
         Validators.CheckTopic(newTopic);
         Validators.IsSystemTopic(newTopic);
-        // C++ 的 createTopic 忽略 key 形参，统一走默认 topic（MixAll.DefaultTopic）建路由
+        // createTopic 忽略 key 形参，统一走默认 topic（MixAll.DefaultTopic）建路由
         _ = key;
         string realTopic = _namespace.Length == 0
             ? newTopic
@@ -3269,7 +3269,7 @@ public class DefaultMQProducer
 
     public long MinOffset(MessageQueue mq) => GetClient().GetMinOffset(mq);
 
-    // ---------------- 内部工具：分号拆分（对齐 C++ splitSemicolon）----------------
+    // ---------------- 内部工具：分号拆分 ----------------
 
     private static List<string> SplitSemicolon(string addr)
     {

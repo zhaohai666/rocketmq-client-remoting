@@ -23,7 +23,7 @@ public static class UtilAll
     public static long ComputeElapseTimeMillis(long lastTime) => CurrentTimeMillis() - lastTime;
 
     /// <summary>
-    /// 单调高精度时钟起点（对应 Python `time.monotonic()` / C++ `steady_clock::now()`）。
+    /// 单调高精度时钟起点（基于 Stopwatch 的单调时基，不受墙钟回拨影响）。
     ///
     /// 只用于量**耗时**：墙钟（`CurrentTimeMillis`）粒度是毫秒且会被 NTP 往回拨，
     /// 本地环回亚毫秒往返会量成 0，发送延迟故障容错的阈值就永远不会生效。
@@ -40,7 +40,7 @@ public static class UtilAll
             return "-";
         }
 
-        // 先拆出毫秒占位符（对应 C++ 实现里对 "%03d" 的特判）
+        // 先拆出毫秒占位符（模式里的 "%03d" 特判为毫秒）
         string suffix = string.Empty;
         bool hasMillis = false;
         int msPos = pattern.IndexOf("%03d", StringComparison.Ordinal);
@@ -320,7 +320,7 @@ internal static class IpParse
 
     /// <summary>
     /// 严格解析：TryParse 之外还要**回环比对**规范化字符串。
-    /// 否则 "1" 会被 TryParse 接受为 0.0.0.1，而 C++ 的 inet_pton 是拒绝的。
+    /// 否则 "1" 会被 TryParse 接受为 0.0.0.1，严格口径必须拒绝这类缩写形式。
     /// </summary>
     internal static bool TryParseStrict(string text, IpFamily family, out IPAddress? parsed) =>
         TryParseStrict(text, family, out parsed, out _);

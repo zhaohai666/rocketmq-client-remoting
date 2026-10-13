@@ -1,7 +1,7 @@
 <Project>
 
   <!-- csharp/ 下所有工程的共享属性。
-       与 cpp/ 的约定保持一致：目标「零 warning」，所以编译器告警一律当错误。 -->
+       目标「零 warning」，所以编译器告警一律当错误。 -->
   <PropertyGroup>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>

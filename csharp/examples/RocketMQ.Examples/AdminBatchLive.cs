@@ -7,7 +7,7 @@
 //   6. 清理类：306/329 + ByAddr + 死地址报告；316 单请求
 //   7. 消费时间跨度(303)：路由扇出聚合
 //   8. nameserver 配置(318/319) 写读回环（orderMessageEnable，测完还原）
-//   9. 静态 topic(513)：SKIP（参考集未覆盖）
+//   9. 静态 topic(513)：SKIP（本套件断言集未覆盖）
 //
 // 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911)。
 // 用法（由 Program 以 "admin-batch-live [namesrv]" 形式调用）。
@@ -19,7 +19,7 @@ using RocketMQ.Remoting.Protocol;
 
 namespace RocketMQ.Examples;
 
-/// <summary>批量 admin 真实集群联调（与 cpp/examples/admin_batch_live.cpp 对齐）。</summary>
+/// <summary>批量 admin 真实集群联调。</summary>
 internal static class AdminBatchLive
 {
     private static int _gPass;
@@ -415,7 +415,7 @@ internal static class AdminBatchLive
         // ---- 10. 静态 topic(513)：端能力差异，SKIP ----
         Skip("静态 topic(513)",
             "mapping 构造需完整 TopicQueueMappingDetail 文档（hostedBrokerIds/scope/"
-            + "每队列 mappingInfo），Python/Go 参考断言集均未覆盖；header 布线由单测锁定");
+            + "每队列 mappingInfo），本联调套件的断言集未覆盖；header 布线由单测锁定");
 
         // ---- 清理 -----------------------------------------------------------
         foreach (string t in new[] { topicA, topicB })

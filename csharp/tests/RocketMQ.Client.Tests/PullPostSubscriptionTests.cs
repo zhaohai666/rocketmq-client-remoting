@@ -1,7 +1,7 @@
 // P5：postSubscriptionWhenPull + updatePullFromWhichNode（PullAPIWrapper 移植）的离线单测。
 //
 //
-// 与 python/tests/test_pull_post_subscription.py 同题；报文形状（SUBSCRIPTION 位、
+// 报文形状（SUBSCRIPTION 位、
 // `subscription` 键是否上线、打给 master 还是 slave、COMMIT_OFFSET 清位）在这里用
 // 进程内假端点从 socket 上取证，不靠调用方自说自话。
 using System.Buffers.Binary;
@@ -344,7 +344,7 @@ public class PullPostSubscriptionTests
             Assert.False(PullSysFlag.HasCommitOffsetFlag(sentFlag), "slave 上一次 COMMIT_OFFSET 都没有意义");
             Assert.True(PullSysFlag.HasSuspendFlag(sentFlag), "suspend 位保持");
             Assert.False(sent.ContainsKey("subscription"),
-                "SUBSCRIPTION 位关闭时该字段根本不进 extFields（Java 的 null → 丢字段）");
+                "SUBSCRIPTION 位关闭时该字段根本不进 extFields（null → 丢字段）");
             // 应答头 suggestWhichBrokerId 透传给调用方，供回写 pullFromWhichNodeTable
             Assert.Equal(0L, result.SuggestWhichBrokerId);
         }

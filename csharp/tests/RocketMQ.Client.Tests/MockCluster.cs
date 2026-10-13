@@ -4,8 +4,7 @@
 // 的全部难点，所以这里把每个 broker 的应答码、应答延迟与「干脆不回」脚本化。
 //
 // 从 SendRetryTests 抽出来说给两类用例共用：同步重试内核（SendRetryTests）与异步发送
-// 内核（ProducerAsyncTests）。与 python/tests/test_send_retry.py、
-// cpp/tests/test_producer_async.cpp、rust/src/client/producer/send_retry_tests.rs 同题。
+// 内核（ProducerAsyncTests）。
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;

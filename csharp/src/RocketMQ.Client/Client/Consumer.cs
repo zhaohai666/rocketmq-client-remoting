@@ -1746,7 +1746,7 @@ public sealed class DefaultMQPushConsumer
 
     /// <summary>一把被撤队列的收尾材料：队列对象 + 需要持久化的已消费位点（可能压根没有）。</summary>
     private sealed record RetiredQueue(string Key, MessageQueue Mq, long ConsumeOffset, bool HadOffset);
-    /// <summary>撤掉一把队列在本实例里的所有痕迹（Python <c>_retire_queue_locked</c>）：
+    /// <summary>撤掉一把队列在本实例里的所有痕迹：
     /// 线程登记、盖章、缓冲、两张位点表、锁状态、POP 队列一起摘掉，并把要持久化的
     /// 已消费位点交给调用方的 <paramref name="retired"/>。</summary>
     private void RetireQueueLocked(string key, MessageQueue mq, List<RetiredQueue> retired)
@@ -1810,7 +1810,7 @@ public sealed class DefaultMQPushConsumer
 
     // ---------------- 拉取停摆自愈的可观测接缝 ----------------
     //
-    // 与 C++/Python/Rust 三版一致地公开（测试工程没有 InternalsVisibleTo，故用 public，
+    // 作为验证接缝公开（测试工程没有 InternalsVisibleTo，故用 public，
     // 勿用于业务代码）：验证脚本要能把时钟倒拨、触发一次同步，再确认「停摆的队列被撤掉
     // 重建、消息一条不重不丢」。没有接缝就只能 sleep 满 120s 去猜。
 
@@ -2017,7 +2017,7 @@ public sealed class DefaultMQPushConsumer
     /// 读线程阻塞在自己发起的同步调用上必然自死锁，直到 invokeTimeout
     /// （实测 5s 超时、日志出现 "no consumer id list ..., keep current"，
     /// 并连带把其它请求的响应一起卡住）。只置标志、交给 RebalanceThread 去算即可，
-    /// 与 C++ 侧只置 rebalanceNow_ 标志的语义一致。</remarks>
+    /// 不做额外的同步调用。</remarks>
     private void WakeRebalanceLoop()
     {
         _rebalanceNow.Set();
@@ -2381,7 +2381,7 @@ public sealed class DefaultMQPushConsumer
         foreach (RetiredQueue r in revoked)
         {
             // 位点未知就什么都不写：拿默认 0 去 UPDATE_CONSUMER_OFFSET 会把 broker 的位点
-            // 倒拨（Python _on_queues_revoked 同样是"有才写"）。
+            // 倒拨，所以「有才写」。
             if (r.HadOffset)
             {
                 try
