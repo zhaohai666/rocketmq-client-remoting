@@ -13,8 +13,8 @@
 namespace rocketmq {
 namespace static_topic {
 
-// MixAll.METADATA_SCOPE_GLOBAL / LOGICAL_QUEUE_MOCK_BROKER_PREFIX /
-// LOGICAL_QUEUE_MOCK_BROKER_NAME_NOT_EXIST。
+// broker 侧静态主题的保留常量：全局 mapping 作用域、逻辑队列的 mock broker 名前缀、
+// 以及「该逻辑队列在本 broker 上没有真实映射」的哨兵名。
 inline const char* kMetadataScopeGlobal = "__global__";
 inline const char* kLogicalQueueMockBrokerPrefix = "__syslo__";
 inline const char* kLogicalQueueMockNotExist = "__syslo__none__";

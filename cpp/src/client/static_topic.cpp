@@ -30,7 +30,7 @@ bool parseTopicQueueMappingInfo(const JsonValue& raw, TopicQueueMappingInfo& out
     const JsonValue* currIdMap = raw.find("currIdMap");
     if (currIdMap != nullptr && currIdMap->isObject()) {
         for (const auto& kv : currIdMap->objectItems()) {
-            // 键是 globalId 的十进制字符串；解析失败的条目跳过（同 Go/Python 口径）。
+            // 键是 globalId 的十进制字符串；解析失败的条目跳过（宽松解析，不让单条脏数据炸掉整份映射）。
             try {
                 std::size_t consumed = 0;
                 const int gid = std::stoi(kv.first, &consumed);
