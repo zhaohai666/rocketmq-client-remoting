@@ -50,15 +50,15 @@ cd build && ctest --output-on-failure
 ```
 
 This produces the static library `build/librocketmq_remoting.a` (alias `rocketmq::remoting`),
-52 test binaries and 40 tools under `build/examples/`. Measured on this machine:
+56 test binaries and 41 tools under `build/examples/`. Measured on this machine:
 
 ```
-100% tests passed out of 53
-Total Test time (real) =  89.70 sec
+100% tests passed out of 57
+Total Test time (real) =  91.14 sec
 ```
 
-The 53 cases are the 52 test binaries (4055 assertions) plus 1 codec-interop case
-(73 assertions): **4128 assertions in total**.
+The 57 cases are the 56 test binaries (4188 assertions) plus 1 codec-interop case
+(73 assertions): **4261 assertions in total**.
 
 The protocol-layer self-check needs no cluster:
 
@@ -572,8 +572,8 @@ cpp/
 │                               admin / mq_client / allocate_strategy / hook / trace /
 │                               request_reply / backpressure / validators / result / exception
 ├── src/                        Implementations mirroring include/ (common / remoting / client)
-├── tests/                      52 test sources + interop_check.py = 53 ctest cases
-├── examples/                   rmq_selfcheck / rmq_interop + 38 live-cluster tools
+├── tests/                      56 test sources + interop_check.py = 57 ctest cases
+├── examples/                   rmq_selfcheck / rmq_interop + 39 live-cluster tools
 └── tools/                      Windows header preparation and syntax-check scripts
 ```
 

@@ -42,7 +42,7 @@ Node.js(TypeScript) / PHP** 七种语言。每份实现都直连 **NameServer + 
 | 语言 | 目录 | 运行形态 | 压缩 | 单元测试 |
 | --- | --- | --- | --- | --- |
 | Python | [`python/`](python/README.md) | 同步 API（内部线程） | zlib / LZ4 / ZSTD | `pytest -q`：1210 passed + 4 skipped |
-| C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | zlib / LZ4 / ZSTD | `ctest`：53 个用例全绿（4128 项断言） |
+| C++ | [`cpp/`](cpp/README.md) | C++17，手写网络层，无第三方运行时依赖 | zlib / LZ4 / ZSTD | `ctest`：57 个用例全绿（4261 项断言） |
 | C# | [`csharp/`](csharp/README.md) | .NET 10，零 NuGet 依赖 | zlib / LZ4 / ZSTD | `dotnet test`：808 passed |
 | Rust | [`rust/`](rust/README.md) | tokio 异步 API | zlib / LZ4 / ZSTD | `cargo test`：942 passed；`cargo clippy --all-targets` 零 warning |
 | Go | [`go/`](go/README.md) | 同步 API（内部 goroutine），零第三方依赖 | zlib / LZ4 双向；ZSTD 解码全格式、编码为 store-only 合法帧 | `go test ./...`：584 个测试函数（client 313 / common 134 / remoting 137）；`go vet` / `gofmt` 零告警 |

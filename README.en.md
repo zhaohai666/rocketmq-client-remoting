@@ -50,7 +50,7 @@ ports; see the table below and each language README for the details.
 | Language | Directory | Runtime model | Compression | Unit tests |
 | --- | --- | --- | --- | --- |
 | Python | [`python/`](python/README.en.md) | sync API with internal threads | zlib / LZ4 / ZSTD | `pytest -q`: 1210 passed + 4 skipped |
-| C++ | [`cpp/`](cpp/README.en.md) | C++17, hand-written network layer, no third-party runtime deps | zlib / LZ4 / ZSTD | `ctest`: 53 cases green (4128 assertions) |
+| C++ | [`cpp/`](cpp/README.en.md) | C++17, hand-written network layer, no third-party runtime deps | zlib / LZ4 / ZSTD | `ctest`: 57 cases green (4261 assertions) |
 | C# | [`csharp/`](csharp/README.en.md) | .NET 10, zero NuGet dependencies | zlib / LZ4 / ZSTD | `dotnet test`: 808 passed |
 | Rust | [`rust/`](rust/README.en.md) | tokio-based async API | zlib / LZ4 / ZSTD | `cargo test`: 942 passed; `cargo clippy --all-targets` warning-free |
 | Go | [`go/`](go/README.en.md) | sync API with internal goroutines, zero third-party deps | zlib / LZ4 both ways; ZSTD decodes every format, encodes store-only | `go test ./...`: 584 test funcs (client 313 / common 134 / remoting 137); `go vet` / `gofmt` clean |
