@@ -198,10 +198,13 @@ Bytes zstdDecompressBytes(const Bytes& src) {
         }
         // 只有"输出缓冲不够"这一种错误值得扩容重试；其余（坏帧/截断）一律抛错，
         // 且缓冲大小已按帧头声明值给足时也不该再重试——那说明数据本身是坏的。
-        if (sizeKnown || ::ZSTD_getErrorCode(produced) != ZSTD_error_dstSize_tooSmall ||
+        // 注：ZSTD_getErrorCode() / ZSTD_error_dstSize_tooSmall 并非所有 zstd 发行版都
+        // 暴露（CI 用的版本就缺这两个符号），改用稳定可读的错误名字符串来判定——目标
+        // 串是 "Dst buffer is too small"，用 "too small" 子串匹配以兼容措辞微调。
+        const std::string zstd_err = ::ZSTD_getErrorName(produced);
+        if (sizeKnown || std::string(zstd_err).find("too small") == std::string::npos ||
             attempt >= 32) {
-            throw std::runtime_error(std::string("zstd decompress failed: ") +
-                                     ::ZSTD_getErrorName(produced));
+            throw std::runtime_error(std::string("zstd decompress failed: ") + zstd_err);
         }
         capacity *= 2;
     }

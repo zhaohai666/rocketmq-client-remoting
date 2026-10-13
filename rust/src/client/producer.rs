@@ -703,11 +703,17 @@ struct AsyncSenderExecutor {
 /// 投进队列的一个异步发送任务（已经在调用方线程上把消息、预算与起点定好）。
 type AsyncSendJob = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// 池并发额度 = 可用核数（availableProcessors 语义）。取不到时按 1 个额度兜底。
+/// 池并发额度 = max(可用核数, `MIN_ASYNC_SEND_NUM`)。
+///
+/// 取不到核数时按 1 兜底。下限取 `MIN_ASYNC_SEND_NUM` 是因为「在途条数」背压信号量的
+/// 下限就是它(10)：发送器必须至少能并发跑这么多笔，这个背压下限才有意义——否则低核
+/// 机器上信号量永远凑不满（最多只会被占 1~2 份），背压等于失效。多核机器下
+/// `availableProcessors` 语义与原 Java 客户端一致，不受影响。
 fn async_sender_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+        .max(MIN_ASYNC_SEND_NUM as usize)
 }
 
 impl AsyncSenderExecutor {
