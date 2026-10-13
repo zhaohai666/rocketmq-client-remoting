@@ -11,6 +11,20 @@
 //! ```text
 //! cargo run --example live_producer -- 127.0.0.1:9876
 //! ```
+//!
+//! 带两个可选参数就是打到**开了鉴权**（`authenticationEnabled=true`）的集群上：
+//! ```text
+//! cargo run --example live_producer -- 127.0.0.1:9876 <accessKey> <secretKey>
+//! ```
+//! 届时的额外规矩（不带凭据时行为与第一种用法逐字一致）：
+//! - 每个客户端启动前都装上同一份 ACL 签名钩子，broker 才会认它的 RPC；
+//! - 先跑 P0 反证：**不带**凭据的发送必须被拒，且拒的是 broker 码 16
+//!   （`NO_PERMISSION`），不是「随便什么错」——只有真把请求发到了 broker 才谈得上签名；
+//! - 签名钩子是注册在 `MQClientInstance` 的 remoting 通道上的，通道按 clientId 复用，
+//!   所以反证探针用自己独有的 instanceName、并且是本次运行起的**第一个**客户端，
+//!   跑完立刻 shutdown 并等实例从全局表里退掉，再起带凭据的客户端；
+//! - P9 要往 broker 写 `recallMessageEnable`（改 broker 配置）才能跑，
+//!   鉴权跑法不碰它，直接记为跳过。
 
 use std::collections::HashSet;
 use std::env;
@@ -59,6 +73,9 @@ use rocketmq_client_remoting::remoting::protocol::heartbeat::ExpressionType;
 use rocketmq_client_remoting::remoting::protocol::remoting_command::RemotingCommand;
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
 use rocketmq_client_remoting::remoting::protocol::serialize::RemotingSerializable;
+use rocketmq_client_remoting::remoting::rpchook::{
+    AclClientRPCHook, RPCHook, SessionCredentials,
+};
 
 /// 主 topic 的队列数（P2 的定点/选择器断言依赖它）。
 const QUEUE_NUMS: i32 = 4;
@@ -110,6 +127,126 @@ type Live = Result<(), String>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 签名被拒时 broker 回的码：鉴权失败（缺用户名、签名不对、权限不够）全都收敛到这一个。
+const NO_PERMISSION: i32 = 16;
+
+/// ACL 凭据。两个都空 = 关闭鉴权模式，各客户端拿到 `None` 就是不装钩子，
+/// 行为与不带参数时逐字一致。
+#[derive(Clone)]
+struct Creds {
+    access_key: String,
+    secret_key: String,
+}
+
+impl Creds {
+    fn from_args(access_key: Option<&String>, secret_key: Option<&String>) -> Creds {
+        Creds {
+            access_key: access_key.map(|s| s.trim().to_string()).unwrap_or_default(),
+            secret_key: secret_key.map(|s| s.trim().to_string()).unwrap_or_default(),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        !self.access_key.is_empty() && !self.secret_key.is_empty()
+    }
+
+    /// 装了钩子的集群返回钩子；没装凭据的集群返回 `None`，调用方直接透传。
+    fn hook(&self) -> Option<Arc<dyn RPCHook>> {
+        if self.enabled() {
+            Some(acl_hook(&self.access_key, &self.secret_key))
+        } else {
+            None
+        }
+    }
+}
+
+fn acl_hook(access_key: &str, secret_key: &str) -> Arc<dyn RPCHook> {
+    Arc::new(AclClientRPCHook::new(SessionCredentials::new(
+        access_key, secret_key,
+    )))
+}
+
+fn denied(err: &Error) -> bool {
+    err.response_code() == Some(NO_PERMISSION)
+}
+
+fn code_of(err: &Error) -> String {
+    match err.response_code() {
+        Some(code) => format!("code={code}"),
+        None => "code=?".to_string(),
+    }
+}
+
+/// P0 反证：一个**不带任何凭据**的生产者，发送必须被 broker 拒成 16。
+///
+/// 探针要跑成第一个客户端、且用独有的 instanceName —— 签名钩子是挂在按 clientId
+/// 复用的通道上的，先起的客户端把那根通道定调了。用完 shutdown + drop，
+/// 再等实例真的从全局表里消失，才允许带凭据的客户端起跑。
+async fn anon_probe(namesrv: &str, run: &str, ck: &mut Checker) {
+    let group = format!("PID_rust_producer_anon_{run}");
+    let topic = format!("RustLiveProducerAnon_{run}");
+    let anon = match DefaultMQProducer::new(&group) {
+        Ok(p) => p,
+        Err(e) => {
+            ck.abort("P0 构造匿名探针", &e.to_string());
+            return;
+        }
+    };
+    anon.set_namesrv_addr(namesrv);
+    anon.set_instance_name(&format!("{run}-anon"));
+    // start 里就有 RPC（注册到实例、心跳）：被拒同样算 16 断言成立。
+    if let Err(e) = anon.start().await {
+        ck.check(
+            "P0 匿名客户端被 broker 拒绝",
+            denied(&e),
+            &format!("start 阶段 {}", code_of(&e)),
+        );
+        return;
+    }
+    let probe_id = anon.client_id().unwrap_or_default();
+    let mut m = msg(&topic, b"should-not-be-accepted", "", "");
+    match anon.send(&mut m, Some(5000), None).await {
+        Ok(r) => ck.check(
+            "P0 匿名客户端被 broker 拒绝",
+            false,
+            &format!("broker 竟然收了匿名请求：{r:?}（多半是 authenticationEnabled 没开）"),
+        ),
+        Err(e) => {
+            let remark = e.to_string();
+            ck.check(
+                "P0 匿名客户端被 broker 拒绝",
+                denied(&e),
+                &format!("{} remark={remark}", code_of(&e)),
+            );
+            // 「username cannot be null.」这类理由才说明探针真是裸的；
+            // 打印出来好区分「没签」与「签错了」。
+            println!("  [INFO] P0 拒绝理由：{remark}");
+        }
+    }
+    anon.shutdown();
+    drop(anon);
+    let released = {
+        let id = probe_id.clone();
+        tokio::time::timeout(Duration::from_secs(20), async move {
+            loop {
+                if MQClientInstance::find_instance(&id).is_none() {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or(false)
+    };
+    ck.check(
+        "P0 匿名探针的实例已退场（不会把通道留给后面的客户端）",
+        released,
+        &format!("clientId={probe_id} 还在全局表里"),
+    );
+    // 通道拆除与 broker 侧连接关闭之间没有同步点，再给一拍。
+    tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
 /// 轮询异步条件直到成立，超时返回 `false` 让调用方打出现场。
@@ -559,9 +696,16 @@ impl TransactionListener for LiveListener {
 // ---------------------------------------------------------------------- P1
 
 /// 生命周期：未启动即失败、start 生成身份、shutdown 幂等且可重启。
-async fn p1_lifecycle(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) -> Live {
+async fn p1_lifecycle(
+    namesrv: &str,
+    topic: &str,
+    run: &str,
+    creds: &Creds,
+    ck: &mut Checker,
+) -> Live {
     let group = format!("PID_rust_producer_{run}_p1");
-    let p = DefaultMQProducer::new(&group).map_err(|e| format!("build failed: {e}"))?;
+    let p = DefaultMQProducer::with_rpc_hook(&group, creds.hook())
+        .map_err(|e| format!("build failed: {e}"))?;
     p.set_namesrv_addr(namesrv);
 
     let mut probe = msg(topic, b"before-start", "", "");
@@ -1108,9 +1252,16 @@ async fn p3_hooks(
 // ---------------------------------------------------------------------- P4
 
 /// 轨迹接缝：注入 → start 注册钩子并拉起 → 真发送产出 TraceContext。
-async fn p4_trace_seam(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) -> Live {
+async fn p4_trace_seam(
+    namesrv: &str,
+    topic: &str,
+    run: &str,
+    creds: &Creds,
+    ck: &mut Checker,
+) -> Live {
     let group = format!("PID_rust_producer_{run}_p4");
-    let p = DefaultMQProducer::new(&group).map_err(|e| format!("build failed: {e}"))?;
+    let p = DefaultMQProducer::with_rpc_hook(&group, creds.hook())
+        .map_err(|e| format!("build failed: {e}"))?;
     p.set_namesrv_addr(namesrv);
     let dispatcher = FakeDispatcher::new();
     // FakeDispatcher 同时实现 TraceDispatcher + TraceReportSink，靠 producer 模块里的
@@ -1253,6 +1404,7 @@ async fn p6_transactions(
     broker_name: &str,
     broker_addr: &str,
     run: &str,
+    creds: &Creds,
     ck: &mut Checker,
 ) -> Live {
     let end_hook = Arc::new(EndTxnHook::default());
@@ -1364,6 +1516,7 @@ async fn p6_transactions(
     // （本端这个子类唯一多做的事就是这段兜底，这里要把它打实。）
     let txn_group = format!("PID_rust_producer_{run}_p6txn");
     let txn = TransactionMQProducer::new(&txn_group).map_err(|e| format!("txn build failed: {e}"))?;
+    txn.set_rpc_hook(creds.hook());
     txn.set_namesrv_addr(namesrv);
     txn.set_instance_name(&format!("{run}-txn"));
     let preset = LiveListener::new(LocalTransactionState::CommitMessage, LocalTransactionState::Unknow);
@@ -1545,6 +1698,7 @@ async fn p8_send_retry_kernel(
     p: &DefaultMQProducer,
     topic: &str,
     run: &str,
+    creds: &Creds,
     ck: &mut Checker,
 ) -> Live {
     let defaults: Vec<i32> = DEFAULT_RETRY_RESPONSE_CODES.to_vec();
@@ -1589,8 +1743,11 @@ async fn p8_send_retry_kernel(
         .and_then(|l| l.local_addr().ok())
         .map(|a| a.to_string())
         .unwrap_or_else(|| "127.0.0.1:1".to_string());
-    let orphan = DefaultMQProducer::new(&format!("PID_rust_orphan_{run}"))
-        .map_err(|e| format!("orphan producer: {e}"))?;
+    let orphan = DefaultMQProducer::with_rpc_hook(
+        &format!("PID_rust_orphan_{run}"),
+        creds.hook(),
+    )
+    .map_err(|e| format!("orphan producer: {e}"))?;
     orphan.set_namesrv_addr(&dead_addr);
     orphan.set_instance_name(&format!("{run}-orphan"));
     if let Err(e) = orphan.start().await {
@@ -1805,16 +1962,24 @@ async fn producer_clients(admin: &DefaultMQAdminExt, group: &str) -> Vec<String>
 }
 
 /// P11：生产者退出必须逐台 broker 发 `UNREGISTER_CLIENT`(35)。
-async fn p11_producer_unregister(namesrv: &str, topic: &str, run: &str, ck: &mut Checker) -> Live {
+async fn p11_producer_unregister(
+    namesrv: &str,
+    topic: &str,
+    run: &str,
+    creds: &Creds,
+    ck: &mut Checker,
+) -> Live {
     let shared = format!("{run}-unreg");
     let group_a = format!("PID_rust_unreg_a_{run}");
     let group_b = format!("PID_rust_unreg_b_{run}");
 
-    let a = DefaultMQProducer::new(&group_a).map_err(|e| format!("producer a: {e}"))?;
+    let a =
+        DefaultMQProducer::with_rpc_hook(&group_a, creds.hook()).map_err(|e| format!("producer a: {e}"))?;
     a.set_namesrv_addr(namesrv);
     a.set_instance_name(&shared);
     a.start().await.map_err(|e| format!("a start: {e}"))?;
-    let b = DefaultMQProducer::new(&group_b).map_err(|e| format!("producer b: {e}"))?;
+    let b =
+        DefaultMQProducer::with_rpc_hook(&group_b, creds.hook()).map_err(|e| format!("producer b: {e}"))?;
     b.set_namesrv_addr(namesrv);
     b.set_instance_name(&shared);
     b.start().await.map_err(|e| format!("b start: {e}"))?;
@@ -1846,6 +2011,7 @@ async fn p11_producer_unregister(namesrv: &str, topic: &str, run: &str, ck: &mut
 
     let admin = DefaultMQAdminExt::new();
     admin.set_namesrv_addr(namesrv);
+    admin.set_rpc_hook(creds.hook());
     admin
         .start()
         .await
@@ -1931,7 +2097,7 @@ async fn p11_producer_unregister(namesrv: &str, topic: &str, run: &str, ck: &mut
 
 // ------------------------------------------------------------------- main
 
-async fn run(namesrv: &str) -> Checker {
+async fn run(namesrv: &str, creds: Creds) -> Checker {
     let run = stamp();
     let topic = format!("RustLiveProducer_{run}");
     let group = format!("PID_rust_producer_{run}");
@@ -1940,9 +2106,26 @@ async fn run(namesrv: &str) -> Checker {
     println!("   namesrv = {namesrv}");
     println!("   topic   = {topic}");
     println!("   group   = {group}");
+    println!(
+        "   acl     = {}",
+        if creds.enabled() {
+            format!("on (accessKey={})", creds.access_key)
+        } else {
+            "off".to_string()
+        }
+    );
 
     let mut ck = Checker::new();
+
+    // 带凭据时先跑反证：此刻还没有任何带签名的客户端，探针拿到的是自己独立的通道。
+    if creds.enabled() {
+        anon_probe(namesrv, &run, &mut ck).await;
+    }
+
     let probe = RemotingClient::new();
+    if let Some(hook) = creds.hook() {
+        probe.register_rpc_hook(hook);
+    }
     // 先用裸 RPC 建 topic（P1 之前的生产者还没启动），再拿生产者跑各场景
     let created = bootstrap_topic(&probe, namesrv, &topic).await;
     probe.shutdown();
@@ -1951,11 +2134,11 @@ async fn run(namesrv: &str) -> Checker {
         return ck;
     }
 
-    if let Err(e) = p1_lifecycle(namesrv, &topic, &run, &mut ck).await {
+    if let Err(e) = p1_lifecycle(namesrv, &topic, &run, &creds, &mut ck).await {
         ck.abort("P1 lifecycle", &e);
     }
 
-    let p = match DefaultMQProducer::new(&group) {
+    let p = match DefaultMQProducer::with_rpc_hook(&group, creds.hook()) {
         Ok(p) => p,
         Err(e) => {
             ck.abort("P0 producer", &e.to_string());
@@ -1996,7 +2179,7 @@ async fn run(namesrv: &str) -> Checker {
     };
     println!("   broker  = {broker_name} @ {broker_addr}");
 
-    let scenarios: Vec<(&str, Live)> = vec![
+    let mut scenarios: Vec<(&str, Live)> = vec![
         (
             "P2 send paths",
             p2_send_paths(&p, &instance, &topic, &broker_name, &broker_addr, &mut ck).await,
@@ -2005,7 +2188,7 @@ async fn run(namesrv: &str) -> Checker {
             "P3 hooks",
             p3_hooks(&p, &instance, &topic, &broker_name, &broker_addr, &mut ck).await,
         ),
-        ("P4 trace seam", p4_trace_seam(namesrv, &topic, &run, &mut ck).await),
+        ("P4 trace seam", p4_trace_seam(namesrv, &topic, &run, &creds, &mut ck).await),
         (
             "P5 request-reply",
             p5_request_reply(&p, &topic, &broker_name, &mut ck).await,
@@ -2020,6 +2203,7 @@ async fn run(namesrv: &str) -> Checker {
                 &broker_name,
                 &broker_addr,
                 &run,
+                &creds,
                 &mut ck,
             )
             .await,
@@ -2030,17 +2214,24 @@ async fn run(namesrv: &str) -> Checker {
         ),
         (
             "P8 send retry kernel",
-            p8_send_retry_kernel(&p, &topic, &run, &mut ck).await,
-        ),
-        (
-            "P9 recall",
-            p9_recall(&p, &instance, &topic, &broker_name, &broker_addr, &mut ck).await,
+            p8_send_retry_kernel(&p, &topic, &run, &creds, &mut ck).await,
         ),
         (
             "P11 producer unregister",
-            p11_producer_unregister(namesrv, &topic, &run, &mut ck).await,
+            p11_producer_unregister(namesrv, &topic, &run, &creds, &mut ck).await,
         ),
     ];
+
+    // P9 靠往 broker 写 `recallMessageEnable` 才跑得起来（先改再复原）。
+    // 鉴权跑法不动集群配置，整段跳过并在汇总里写明；不带凭据时照旧全跑。
+    if creds.enabled() {
+        println!("  [SKIP] P9 recall：需要先改 broker 的 recallMessageEnable，鉴权跑法不碰集群配置");
+    } else {
+        scenarios.push((
+            "P9 recall",
+            p9_recall(&p, &instance, &topic, &broker_name, &broker_addr, &mut ck).await,
+        ));
+    }
     for (name, outcome) in scenarios {
         if let Err(e) = outcome {
             ck.abort(name, &e);
@@ -2075,7 +2266,7 @@ async fn main() -> ExitCode {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "127.0.0.1:9876".to_string());
-    let mut ck = run(&namesrv).await;
+    let mut ck = run(&namesrv, Creds::from_args(argv.get(2), argv.get(3))).await;
     report(&mut ck);
     if ck.failed.is_empty() {
         ExitCode::SUCCESS

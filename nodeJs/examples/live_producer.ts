@@ -4,19 +4,29 @@
 // check-back.
 //
 //   node --experimental-strip-types examples/live_producer.ts --ns 127.0.0.1:9876
+//   node --experimental-strip-types examples/live_producer.ts --ns 127.0.0.1:9876 \
+//        --ak <accessKey> --sk <secretKey>
+//
+// With --ak/--sk (or env ROCKETMQ_ACL_AK / ROCKETMQ_ACL_SK) every client the
+// example boots signs its broker RPCs with the ACL hook, and the run starts
+// with the paired negative check: an UNSIGNED send must come back with
+// NO_PERMISSION (16). Without the flags nothing about the flow changes.
 //
 // Every check prints PASS/FAIL and the process exits non-zero if any failed.
 // Use a fresh topic per run (the default embeds a timestamp) so leftover state
 // from an earlier run cannot make a check pass.
 //
 // The last line is `SENT=<n>`: how many messages the broker accepted. The
-// read-back check in the other language needs that number, and deriving it
+// paired read-back verification needs that number, and deriving it
 // here means adding a check here can never silently make the read-back
 // expectation wrong.
 import { DefaultMQProducer, TransactionMQProducer, TransactionListener,
   LocalTransactionState, SelectMessageQueueByHash } from '../src/client/producer.ts';
 import { Message, MessageBatch } from '../src/common/message.ts';
 import { SendStatus } from '../src/client/send_result.ts';
+import { AclRPCHook } from '../src/remoting/acl.ts';
+import { ResponseCode } from '../src/remoting/codes.ts';
+import { MQBrokerException } from '../src/client/exception.ts';
 
 const args = process.argv.slice(2);
 function argOf(name: string, def: string): string {
@@ -26,6 +36,10 @@ function argOf(name: string, def: string): string {
 const NS = argOf('--ns', process.env['NAMESRV_ADDR'] || '127.0.0.1:9876');
 const STAMP = argOf('--stamp', String(Math.floor(Date.now() / 1000)));
 const TOPIC = argOf('--topic', `NodeLive_${STAMP}`);
+// Optional ACL credentials; empty = classic unsigned behaviour (unchanged).
+const AK = argOf('--ak', process.env['ROCKETMQ_ACL_AK'] || '');
+const SK = argOf('--sk', process.env['ROCKETMQ_ACL_SK'] || '');
+const WITH_ACL = AK !== '' && SK !== '';
 
 let passCount = 0;
 let failCount = 0;
@@ -59,10 +73,38 @@ class TxListener extends TransactionListener {
 }
 
 async function main(): Promise<void> {
+  // -1. Negative ACL probe (only with credentials): an UNSIGNED send must be
+  // rejected by the broker with NO_PERMISSION (16), otherwise the signed leg
+  // could be a false pass on a cluster that enforces nothing. This port keys
+  // each MQClientInstance by `<ip>@<instanceName>` and the default instance
+  // name is rewritten per client to `<pid>#<nanotime>`, so an unsigned
+  // client's instance cannot shadow a later signed client's hook — but the
+  // probe still runs FIRST and is fully shut down (plus a settle pause) so
+  // the ordering also holds when the caller pins a shared instanceName.
+  if (WITH_ACL) {
+    const probe = new DefaultMQProducer('GID_NodeLive_NoCred');
+    probe.setNamesrvAddr(NS);
+    probe.start();
+    let probeCode = -1;
+    let probeDetail = 'unexpected success without credentials';
+    try {
+      await probe.send(new Message(TOPIC, Buffer.from('nocred'), 'TagNoCred', 'knocred'));
+    } catch (e) {
+      const err = e as MQBrokerException;
+      probeCode = typeof err.responseCode === 'number' ? err.responseCode : -1;
+      probeDetail = `code=${probeCode} remark=${err.message || ''}`;
+    }
+    check('unsigned send rejected with NO_PERMISSION(16)',
+      probeCode === ResponseCode.NO_PERMISSION, probeDetail.slice(0, 160));
+    probe.shutdown();
+    await sleep(1000); // let the probe's MQClientInstance unload before the signed run
+  }
+
   const producer = new DefaultMQProducer('GID_NodeLive_Producer');
   producer.setNamesrvAddr(NS);
+  if (WITH_ACL) producer.rpcHook = new AclRPCHook(AK, SK);
   producer.start();
-  console.log(`producer started ns=${NS} topic=${TOPIC}`);
+  console.log(`producer started ns=${NS} topic=${TOPIC}${WITH_ACL ? ' acl=on' : ''}`);
 
   // 0. pre-create the topic (deterministic queue count; the consumer-side rule
   // "create topic BEFORE starting consumers" applies to the read-back too).
@@ -135,6 +177,7 @@ async function main(): Promise<void> {
   // 6. two-phase transaction: COMMIT on execute.
   const tx = new TransactionMQProducer('GID_NodeLive_Tx', new TxListener());
   tx.setNamesrvAddr(NS);
+  if (WITH_ACL) tx.rpcHook = new AclRPCHook(AK, SK);
   await tx.start();
   try {
     const txMsg = new Message(TOPIC, Buffer.from('tx-commit-0'), 'TagTx', 'ktx');

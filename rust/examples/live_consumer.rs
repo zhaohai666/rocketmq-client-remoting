@@ -42,12 +42,14 @@ use rocketmq_client_remoting::common::message_const::{
 };
 use rocketmq_client_remoting::common::mix_all::MixAll;
 use rocketmq_client_remoting::common::topic_config::{TopicFilterType, DEFAULT_PERM};
+use rocketmq_client_remoting::error::Error;
 use rocketmq_client_remoting::remoting::protocol::admin_body::MessageQueueKey;
 use rocketmq_client_remoting::remoting::protocol::body::ConsumerRunningInfo;
 use rocketmq_client_remoting::remoting::protocol::heartbeat::{
     ConsumeFromWhere, MessageModel, SubscriptionData,
 };
 use rocketmq_client_remoting::remoting::protocol::route::TopicRouteData;
+use rocketmq_client_remoting::remoting::rpchook::{AclClientRPCHook, RPCHook, SessionCredentials};
 
 /// 每个测试 topic 的默认队列数（够 C8 做「4 队列分给 2 实例」）。
 const QUEUE_NUMS: i32 = 4;
@@ -109,6 +111,107 @@ impl Checker {
 /// 锁中毒时照常取内值（listener 里的一次 panic 不该让整轮验证连锁崩）。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ------------------------------------------------------------------ ACL 凭据
+
+/// broker 侧所有鉴权失败都收敛成 NO_PERMISSION(16)。
+const NO_PERMISSION: i32 = 16;
+
+/// 可选的 ACL 凭据：命令行后两个参数都非空才算「带凭据」。
+///
+/// 空的时候 [`Creds::hook`] 恒回 `None`，各客户端拿到 `None` 就是不装钩子 ——
+/// 与普通集群（没开 `authenticationEnabled`）上的行为逐字节一致，harness 照常跑。
+#[derive(Clone)]
+struct Creds {
+    access_key: String,
+    secret_key: String,
+}
+
+impl Creds {
+    fn from_args(access_key: &str, secret_key: &str) -> Creds {
+        Creds {
+            access_key: access_key.trim().to_string(),
+            secret_key: secret_key.trim().to_string(),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        !self.access_key.is_empty() && !self.secret_key.is_empty()
+    }
+
+    /// 装到每个客户端上的签名钩子；不带凭据时是 `None`。
+    fn hook(&self) -> Option<Arc<dyn RPCHook>> {
+        if self.enabled() {
+            Some(Arc::new(AclClientRPCHook::new(SessionCredentials::new(
+                &self.access_key,
+                &self.secret_key,
+            ))))
+        } else {
+            None
+        }
+    }
+}
+
+/// 拒绝类断言：必须是 broker 回的 NO_PERMISSION，而不是连不上 / 超时。
+fn denied(err: &Error) -> bool {
+    err.response_code() == Some(NO_PERMISSION)
+}
+
+fn code_of(err: &Error) -> String {
+    match err.response_code() {
+        Some(code) => format!("code={code}"),
+        None => "code=?".to_string(),
+    }
+}
+
+/// 反向对照：**不带凭据**的消费者起不来或被 broker 拒掉，必须报 16。
+///
+/// 没有这条，「带凭据全绿」在鉴权其实没开起来的集群上，与「签名被 accepted」长得
+/// 一模一样，是一次假通过。它必须抢在本示例任何客户端**之前**跑：这个端口按 clientId
+/// 在进程内共享 [`MQClientInstance`]，钩子注册在实例的 remoting 通道上，探针若与
+/// 后面的签名客户端共用通道，就会被顺手签掉，「被拒」当场消失。
+async fn anon_probe(namesrv: &str, run: &str, ck: &mut Checker) {
+    println!("-- 反向对照：不带凭据的注册/拉取必须被 broker 拒绝（NO_PERMISSION=16）");
+    let group = format!("rust-live-consumer-anon-{run}");
+    let anon = match DefaultMQProducer::with_rpc_hook(&group, None) {
+        Ok(p) => p,
+        Err(e) => {
+            ck.abort("探针构造", &format!("{e}"));
+            return;
+        }
+    };
+    anon.set_namesrv_addr(namesrv);
+    // 独立 instanceName ⇒ 独立 clientId ⇒ 独立通道：钩子拦不到别人身上。
+    anon.set_instance_name(&format!("live-anon-{run}"));
+    if let Err(e) = anon.start().await {
+        ck.check(
+            "探针无凭据 start 被拒",
+            denied(&e),
+            &format!("{} {e}", code_of(&e)),
+        );
+        return;
+    }
+    // 探针发一个只属于本次运行的新 topic：靠 autoCreateTopicEnable 的路由兜底走到 broker，
+    // 在 broker 的鉴权闸上被拦下 —— 这才是「请求原样发出去了」的证据。
+    let probe_topic = format!("RustLiveConsumerAnon{run}");
+    let mut m = Message::new(&probe_topic, Some(b"should-not-be-accepted"));
+    match anon.send(&mut m, Some(5000), None).await {
+        Ok(r) => ck.check(
+            "探针无凭据发送被 broker 拒绝",
+            false,
+            &format!("broker 竟然收了匿名请求：{r:?}（多半是 authenticationEnabled 没开）"),
+        ),
+        Err(e) => ck.check(
+            "探针无凭据发送被 broker 拒绝",
+            denied(&e),
+            &format!("{} {e}", code_of(&e)),
+        ),
+    }
+    anon.shutdown();
+    drop(anon);
+    // 等它的实例彻底释放，再让签名客户端建自己的通道。
+    tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
 /// 轮询到条件成立或超时（真机的一切都是异步到位的，不能 sleep 一个固定值赌）。
@@ -370,6 +473,8 @@ fn is_body(msg: &MessageExt, want: &str) -> bool {
 struct Fixture {
     namesrv: String,
     stamp: String,
+    /// ACL 凭据：非空时本夹具起出来的每个客户端都装签名钩子，空时一个都不装。
+    creds: Creds,
     producer_group: String,
     producer: DefaultMQProducer,
     /// 本例子自建的「运维」实例：建/删 topic、读 broker 位点与存量。
@@ -383,17 +488,24 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(namesrv: &str, stamp: &str) -> Result<Fixture, String> {
+    fn new(namesrv: &str, stamp: &str, creds: Creds) -> Result<Fixture, String> {
         let producer_group = format!("rust-live-consumer-pg-{stamp}");
         let mut producer = DefaultMQProducer::new(&producer_group)
             .map_err(|e| format!("producer build failed: {e}"))?;
         producer.set_namesrv_addr(namesrv);
+        // 钩子在 start() 里注册到实例的 remoting 通道上：本夹具的生产者、admin 实例、
+        // 每个消费者都各走一次，不带凭据时这里是 None（＝不装钩子）。
+        producer.set_rpc_hook(creds.hook());
         let _ = &mut producer;
         let admin_id = format!("rust-live-consumer-admin-{stamp}");
         let admin = MQClientInstance::new(&admin_id, vec![namesrv.to_string()]);
+        if let Some(hook) = creds.hook() {
+            admin.remoting_client().register_rpc_hook(hook);
+        }
         Ok(Fixture {
             namesrv: namesrv.to_string(),
             stamp: stamp.to_string(),
+            creds,
             producer_group,
             producer,
             admin,
@@ -485,7 +597,31 @@ impl Fixture {
     /// 只按组名建消费者（未订阅、未设 listener），C1 的校验分支要用。
     fn plain_consumer(&self, group: &str) -> Result<DefaultMQPushConsumer, String> {
         let cfg = self.base_config(group);
-        DefaultMQPushConsumer::with_config(cfg).map_err(|e| format!("build failed: {e}"))
+        self.push(cfg)
+    }
+
+    /// 建 push 消费者并装上钩子：本示例所有消费者都从这儿出来，
+    /// 免得上鉴权集群时漏掉某一个客户端。
+    fn push(&self, cfg: ConsumerConfig) -> Result<DefaultMQPushConsumer, String> {
+        let consumer =
+            DefaultMQPushConsumer::with_config(cfg).map_err(|e| format!("build failed: {e}"))?;
+        consumer.set_rpc_hook(self.creds.hook());
+        Ok(consumer)
+    }
+
+    /// 建 lite pull 消费者并装上钩子。
+    fn lite(&self, cfg: LitePullConsumerConfig) -> Result<DefaultLitePullConsumer, String> {
+        let consumer = DefaultLitePullConsumer::with_config(cfg)
+            .map_err(|e| format!("build lite pull failed: {e}"))?;
+        consumer.set_rpc_hook(self.creds.hook());
+        Ok(consumer)
+    }
+
+    /// 建独立 admin 并装上钩子（admin 的 RPC 也要签名：307 转发、查位点、建 topic）。
+    fn admin_ext(&self, cfg: AdminConfig) -> DefaultMQAdminExt {
+        let admin = DefaultMQAdminExt::with_config(cfg);
+        admin.set_rpc_hook(self.creds.hook());
+        admin
     }
 
     /// 发到指定 topic（可钉队列）。SendResult 的 status 必须是 SEND_OK。
@@ -667,7 +803,7 @@ async fn c1_lifecycle(ck: &mut Checker, fx: &Fixture) {
             consumer_group: fx.group_name("no-namesrv"),
             ..Default::default()
         };
-        let bare = DefaultMQPushConsumer::with_config(cfg).unwrap();
+        let bare = fx.push(cfg).unwrap();
         let err = bare
             .start()
             .await
@@ -1130,7 +1266,7 @@ fn partial_ack_consumer(
         consume_from_where: ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET.to_string(),
         ..fx.base_config(group)
     };
-    let c = DefaultMQPushConsumer::with_config(cfg).map_err(|e| format!("build failed: {e}"))?;
+    let c = fx.push(cfg)?;
     c.subscribe(topic, "*")
         .map_err(|e| format!("subscribe failed: {e}"))?;
     c.set_message_listener_concurrently(listener);
@@ -1281,7 +1417,7 @@ async fn read_dlq(fx: &Fixture, group: &str, reader_kind: &str, wait_secs: u64) 
         .sum::<i32>()
         .max(1);
     let mqs = fx.queues(&dlq_topic, nums);
-    let lite = DefaultLitePullConsumer::with_config(LitePullConsumerConfig {
+    let lite = fx.lite(LitePullConsumerConfig {
         consumer_group: fx.group_name(reader_kind),
         name_server_addrs: vec![fx.namesrv.clone()],
         instance_name: format!("live-{reader_kind}-{}", fx.stamp),
@@ -1352,7 +1488,7 @@ async fn c4b_dlq_terminal(ck: &mut Checker, fx: &Fixture) {
     let victim = format!("{topic}-000");
     let mut cfg = fx.base_config(&group);
     cfg.max_reconsume_times = MAX_RECONSUME;
-    let c = match DefaultMQPushConsumer::with_config(cfg) {
+    let c = match fx.push(cfg) {
         Ok(v) => v,
         Err(e) => return ck.abort("C4b build consumer", &format!("{e}")),
     };
@@ -1539,7 +1675,7 @@ async fn c5b_pop_pull_stats(ck: &mut Checker, fx: &Fixture) {
     let client_id = c.client_id();
     // 独立的 admin 实例：307 是「admin → broker → 目标客户端」的转发链，
     // 用消费者自己的实例查自己等于跳过整条链路。
-    let admin = DefaultMQAdminExt::with_config(AdminConfig {
+    let admin = fx.admin_ext(AdminConfig {
         instance_name: format!("ADMIN-C5B-{}", fx.stamp),
         name_server_addrs: vec![fx.namesrv.clone()],
         timeout_millis: 10_000,
@@ -1624,7 +1760,7 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
     cfg_a.client_id = Some(client_a.clone());
     cfg_a.message_model = MessageModel::BROADCASTING.to_string();
     fx.register_offset_dir(&client_a);
-    let a = match DefaultMQPushConsumer::with_config(cfg_a.clone()) {
+    let a = match fx.push(cfg_a.clone()) {
         Ok(c) => c,
         Err(e) => return ck.abort("C6 build A", &e.to_string()),
     };
@@ -1662,7 +1798,7 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
     cfg_b.instance_name = client_b.clone();
     cfg_b.client_id = Some(client_b.clone());
     fx.register_offset_dir(&client_b);
-    let b = match DefaultMQPushConsumer::with_config(cfg_b) {
+    let b = match fx.push(cfg_b) {
         Ok(c) => c,
         Err(e) => {
             a.shutdown();
@@ -1733,7 +1869,7 @@ async fn c6_broadcasting_and_local_offsets(ck: &mut Checker, fx: &Fixture) {
                 let mut cfg_r = cfg_a.clone();
                 cfg_r.instance_name = client_a.clone();
                 cfg_r.client_id = Some(client_a.clone());
-                let r = match DefaultMQPushConsumer::with_config(cfg_r) {
+                let r = match fx.push(cfg_r) {
                     Ok(c) => c,
                     Err(e) => return ck.abort("C6 build restart", &e.to_string()),
                 };
@@ -1836,7 +1972,7 @@ async fn c7_orderly_and_lock(ck: &mut Checker, fx: &Fixture) {
     cfg_b.instance_name = client_b.clone();
     cfg_b.client_id = Some(client_b.clone());
     let inbox_b = Arc::new(Inbox::default());
-    let b = match DefaultMQPushConsumer::with_config(cfg_b) {
+    let b = match fx.push(cfg_b) {
         Ok(c) => c,
         Err(e) => return ck.abort("C7 build the takeover consumer", &e.to_string()),
     };
@@ -1891,7 +2027,7 @@ async fn c8_scale_in_and_takeover(ck: &mut Checker, fx: &Fixture) {
     let mut cfg_b = a.config();
     cfg_b.instance_name = format!("live-{group}-b-{}", fx.stamp);
     cfg_b.client_id = Some(cfg_b.instance_name.clone());
-    let b = match DefaultMQPushConsumer::with_config(cfg_b) {
+    let b = match fx.push(cfg_b) {
         Ok(c) => c,
         Err(e) => return ck.abort("C8 build B", &e.to_string()),
     };
@@ -2302,7 +2438,7 @@ async fn c12_orderly_dlq(ck: &mut Checker, fx: &Fixture) {
     cfg.max_reconsume_times = MAX_RECONSUME;
     cfg.consume_message_batch_max_size = 1;
     cfg.suspend_current_queue_time_millis = 500;
-    let c = match DefaultMQPushConsumer::with_config(cfg) {
+    let c = match fx.push(cfg) {
         Ok(v) => v,
         Err(e) => return ck.abort("C12 build consumer", &format!("{e}")),
     };
@@ -2399,7 +2535,7 @@ async fn c12b_orderly_no_cap(ck: &mut Checker, fx: &Fixture) {
     cfg.max_reconsume_times = -1;
     cfg.consume_message_batch_max_size = 1;
     cfg.suspend_current_queue_time_millis = 200;
-    let c = match DefaultMQPushConsumer::with_config(cfg) {
+    let c = match fx.push(cfg) {
         Ok(v) => v,
         Err(e) => return ck.abort("C12b build consumer", &format!("{e}")),
     };
@@ -2625,7 +2761,7 @@ async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
     cfg.consume_message_batch_max_size = 1;
     cfg.max_reconsume_times = -1;
     cfg.suspend_current_queue_time_millis = 900;
-    let c = match DefaultMQPushConsumer::with_config(cfg) {
+    let c = match fx.push(cfg) {
         Ok(v) => v,
         Err(e) => return ck.abort("C12c build consumer", &format!("{e}")),
     };
@@ -2668,7 +2804,7 @@ async fn c12c_orderly_suspend_millis(ck: &mut Checker, fx: &Fixture) {
     cfg_b.consume_message_batch_max_size = 1;
     cfg_b.max_reconsume_times = -1;
     cfg_b.suspend_current_queue_time_millis = 0;
-    let cb = match DefaultMQPushConsumer::with_config(cfg_b) {
+    let cb = match fx.push(cfg_b) {
         Ok(v) => v,
         Err(e) => return ck.abort("C12c build floor consumer", &format!("{e}")),
     };
@@ -2707,7 +2843,7 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     let mut cfg = fx.base_config(&group);
     cfg.consume_message_batch_max_size = 3;
     cfg.suspend_current_queue_time_millis = 200;
-    let c = match DefaultMQPushConsumer::with_config(cfg) {
+    let c = match fx.push(cfg) {
         Ok(v) => v,
         Err(e) => return ck.abort("C13a build consumer", &format!("{e}")),
     };
@@ -2754,7 +2890,7 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     let mut cfg = fx.base_config(&group);
     cfg.consume_message_batch_max_size = 1;
     cfg.suspend_current_queue_time_millis = 200;
-    let c = match DefaultMQPushConsumer::with_config(cfg) {
+    let c = match fx.push(cfg) {
         Ok(v) => v,
         Err(e) => return ck.abort("C13b build consumer", &format!("{e}")),
     };
@@ -2838,7 +2974,7 @@ async fn c13_orderly_explicit_commit_rollback(ck: &mut Checker, fx: &Fixture) {
     let mut cfg = fx.base_config(&group);
     cfg.consume_message_batch_max_size = 1;
     cfg.suspend_current_queue_time_millis = 200;
-    let c = match DefaultMQPushConsumer::with_config(cfg) {
+    let c = match fx.push(cfg) {
         Ok(v) => v,
         Err(e) => return ck.abort("C13c build consumer", &format!("{e}")),
     };
@@ -2921,29 +3057,40 @@ async fn c10_cleanup(ck: &mut Checker, fx: &mut Fixture) {
 
 // ------------------------------------------------------------------ driver
 
-async fn run(namesrv: &str) -> Checker {
+async fn run(namesrv: &str, creds: Creds) -> Checker {
     let stamp_s = stamp();
     println!("== rust live_consumer ==");
     println!("   namesrv   = {namesrv}");
     println!("   stamp     = {stamp_s}");
+    println!(
+        "   acl       = {}",
+        if creds.enabled() {
+            format!("ak={}", creds.access_key)
+        } else {
+            "未带凭据（普通集群口径，不装钩子）".to_string()
+        }
+    );
 
-    let mut fx = match Fixture::new(namesrv, &stamp_s) {
+    let mut ck = Checker::new();
+    // 反向对照必须抢在任何客户端之前：见 [`anon_probe`] 的说明。
+    if creds.enabled() {
+        anon_probe(namesrv, &stamp_s, &mut ck).await;
+    }
+
+    let mut fx = match Fixture::new(namesrv, &stamp_s, creds) {
         Ok(f) => f,
         Err(e) => {
-            let mut ck = Checker::new();
             ck.abort("C0 fixture build", &e);
             return ck;
         }
     };
     if let Err(e) = fx.start().await {
-        let mut ck = Checker::new();
         ck.abort("C0 fixture start", &e);
         return ck;
     }
     println!("   broker    = {} @ {}", fx.broker_name, fx.broker_addr);
     println!("   producer  = {}", fx.producer_group);
 
-    let mut ck = Checker::new();
     c1_lifecycle(&mut ck, &fx).await;
     c2_pull_consume_and_offset_persist(&mut ck, &fx).await;
     c3_tag_filter(&mut ck, &fx).await;
@@ -2978,13 +3125,18 @@ fn report(ck: &mut Checker) {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let argv: Vec<String> = env::args().collect();
+    let argv: Vec<String> = env::args().skip(1).collect();
     let namesrv = argv
-        .get(1)
+        .first()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "127.0.0.1:9876".to_string());
-    let mut ck = run(&namesrv).await;
+    // 后两个参数可选：`[access_key] [secret_key]`，都非空才装 ACL 签名钩子。
+    let creds = Creds::from_args(
+        argv.get(1).map(|s| s.as_str()).unwrap_or_default(),
+        argv.get(2).map(|s| s.as_str()).unwrap_or_default(),
+    );
+    let mut ck = run(&namesrv, creds).await;
     report(&mut ck);
     if ck.failed.is_empty() {
         ExitCode::SUCCESS

@@ -92,7 +92,8 @@ internal static class Program
 
               selfcheck                     协议编解码自检（不依赖集群）
               interop <mode> [args...]      跨语言互操作（与协议参考实现报文级互通）
-              message-types [namesrv]       真实集群 7 类消息能力联调
+              message-types [namesrv] [ak] [sk]
+                                            真实集群 11 类消息能力联调（传 ak/sk 则全员挂 ACL 凭据，并先跑无凭据反向断言）
               admin-live   [namesrv]        真实集群管理端全链路联调
               admin-batch-live [namesrv]    真实集群批量 admin 联调
               compression-live <mode> ...   压缩跨客户端矩阵

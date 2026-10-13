@@ -4,8 +4,14 @@
 // no duplicate). Uses a fresh topic + group per run.
 //
 //   node --experimental-strip-types examples/live_consumer.ts --ns 127.0.0.1:9876
+//   node --experimental-strip-types examples/live_consumer.ts --ns 127.0.0.1:9876 \
+//        --ak <accessKey> --sk <secretKey>
 //
-// Cross-port rules honoured here:
+// With --ak/--sk (or env ROCKETMQ_ACL_AK / ROCKETMQ_ACL_SK) both clients are
+// given the ACL signing hook so the smoke also runs against a broker with
+// `authenticationEnabled=true`; without the flags behaviour is unchanged.
+//
+// Cluster rules honoured here:
 //   - "consume" tests MUST start the consumer BEFORE sending
 //     (CONSUME_FROM_LAST_OFFSET with no committed offset initialises the
 //     cursor to the then-current maxOffset),
@@ -16,6 +22,7 @@ import { DefaultMQProducer } from '../src/client/producer.ts';
 import { DefaultMQPushConsumer } from '../src/client/consumer.ts';
 import { Message, MessageQueue } from '../src/common/message.ts';
 import { ConsumeConcurrentlyStatus } from '../src/client/consumer_result.ts';
+import { AclRPCHook } from '../src/remoting/acl.ts';
 
 const args = process.argv.slice(2);
 function argOf(name: string, def: string): string {
@@ -27,6 +34,10 @@ const STAMP = argOf('--stamp', String(Math.floor(Date.now() / 1000)));
 const TOPIC = argOf('--topic', `NodeLive_${STAMP}`);
 const GROUP = argOf('--group', `GID_NodeLive_Consume_${STAMP}`);
 const TOTAL = parseInt(argOf('--total', '20'), 10);
+// Optional ACL credentials; empty = classic unsigned behaviour (unchanged).
+const AK = argOf('--ak', process.env['ROCKETMQ_ACL_AK'] || '');
+const SK = argOf('--sk', process.env['ROCKETMQ_ACL_SK'] || '');
+const WITH_ACL = AK !== '' && SK !== '';
 
 let passCount = 0;
 let failCount = 0;
@@ -39,6 +50,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function main(): Promise<void> {
   const producer = new DefaultMQProducer('GID_NodeLive_Producer');
   producer.setNamesrvAddr(NS);
+  if (WITH_ACL) producer.rpcHook = new AclRPCHook(AK, SK);
   producer.start();
   await producer.createTopic(TOPIC, producer.createTopicKey, 4);
   await sleep(3000);
@@ -48,6 +60,7 @@ async function main(): Promise<void> {
   const queueSet = new Set<string>();
   const consumer = new DefaultMQPushConsumer(GROUP);
   consumer.setNamesrvAddr(NS);
+  if (WITH_ACL) consumer.rpcHook = new AclRPCHook(AK, SK);
   consumer.subscribe(TOPIC, '*');
   consumer.setConsumeThreadNums(4);
   consumer.registerMessageListenerConcurrently((msgs) => {

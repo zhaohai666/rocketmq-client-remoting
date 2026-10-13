@@ -5,6 +5,11 @@
 //
 //	go run ./examples/live_producer -ns 127.0.0.1:9876
 //
+// Against an ACL-enabled cluster pass the credentials too; without them every
+// broker RPC is rejected with NO_PERMISSION(16):
+//
+//	go run ./examples/live_producer -ns 127.0.0.1:9876 -ak <ak> -sk <sk>
+//
 // Every check prints PASS/FAIL and the process exits non-zero if any failed.
 // Use a fresh topic per run (the default embeds a timestamp) so leftover state
 // from an earlier run cannot make a check pass.
@@ -25,6 +30,7 @@ import (
 
 	"github.com/zhaohai666/rocketmq-client-remoting/go/client"
 	"github.com/zhaohai666/rocketmq-client-remoting/go/common"
+	"github.com/zhaohai666/rocketmq-client-remoting/go/remoting"
 )
 
 var (
@@ -83,6 +89,8 @@ func main() {
 	group := flag.String("group", "", "producer group (default: GID_GoLive_<unix>)")
 	checkBackBudget := flag.Duration("check-back-budget", 90*time.Second,
 		"how long to wait for the broker's transaction check-back")
+	accessKey := flag.String("ak", "", "ACL accessKey (needs -sk; required on an ACL-enabled cluster)")
+	secretKey := flag.String("sk", "", "ACL secretKey (needs -ak)")
 	flag.Parse()
 
 	stamp := time.Now().Unix()
@@ -107,6 +115,17 @@ func main() {
 	}
 	p.SetNameServerAddresses([]string{*nsAddr})
 	p.SetSendMsgTimeout(5000)
+	// With both credentials given, sign every request with the ACL hook; an
+	// ACL-enabled cluster answers uncredentialed broker RPCs with
+	// NO_PERMISSION(16). Without the flags the behaviour is unchanged (no hook).
+	if *accessKey != "" && *secretKey != "" {
+		hook, err := remoting.NewAclClientRPCHook(remoting.NewSessionCredentials(*accessKey, *secretKey))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "acl hook: %v\n", err)
+			os.Exit(1)
+		}
+		p.SetRpcHook(hook)
+	}
 	if err := p.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "producer start: %v\n", err)
 		os.Exit(1)

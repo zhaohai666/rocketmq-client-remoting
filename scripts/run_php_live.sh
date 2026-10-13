@@ -49,7 +49,8 @@ case "$WHICH" in
   pop)           EXAMPLE="examples/live_pop.php"            ;;
   tls)           EXAMPLE="examples/live_tls.php"            ;;
   request_reply) EXAMPLE="examples/live_request_reply.php"  ;;
-  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc)" >&2; exit 2 ;;
+  static_topic)  EXAMPLE="examples/live_static_topic.php"   ;;
+  *) echo "unknown example: $WHICH (redelivery|admin|compression|pop|tls|request_reply|pull|lite_qc|static_topic)" >&2; exit 2 ;;
 esac
 
 port_open() {

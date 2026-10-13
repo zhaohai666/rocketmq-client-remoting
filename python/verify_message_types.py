@@ -13,10 +13,19 @@
   6. 用户属性（user property）生产/消费透传
   7. 事务消息（send_message_in_transaction，两阶段：半消息 → 本地事务 → END_TRANSACTION；
      本文件只做提交路径的冒烟，回查/回滚的完整链路见 verify_transaction_live.py）
+  8. 单向发送（send_oneway，无应答）+ 批量发送（send(list) → SEND_BATCH_MESSAGE），
+     两者都靠回读条数兜底
+  9. 定时消息（TIMER_DELIVER_MS，到点才投递）
 
 本脚本自身不启动集群；调用方需先启动 nameServer(9876)+broker(10911) 且
 autoCreateTopicEnable=true。运行：在 venv 中 `python verify_message_types.py`
 为避免 store 累积假象，所有 topic/group 均带时间戳且使用全新 store。
+
+集群开了 ACL（broker authenticationEnabled=true）时把凭据带上：
+`python verify_message_types.py 127.0.0.1:9876 <accessKey> <secretKey>`。
+此时每一类消息的发送/消费都必须靠签名通过鉴权，脚本额外加一条反向断言：
+同一 topic 上不带凭据的发送必须被 broker 拒成 NO_PERMISSION(16)。
+没有这条反向断言，「带凭据全绿」在鉴权没真开起来的集群上是假绿。
 """
 import os
 import sys
@@ -32,8 +41,38 @@ from client.consumer import (DefaultMQPushConsumer, MessageListenerConcurrently,
 from client.consumer_result import (ConsumeConcurrentlyStatus, ConsumeOrderlyStatus)
 from common.message import Message, MessageExt, MessageQueue
 from remoting.protocol.heartbeat import ConsumeFromWhere
+from remoting.rpchook import AclClientRPCHook, SessionCredentials
 
-NAMESRV = "127.0.0.1:9876"
+NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
+AK = sys.argv[2] if len(sys.argv) > 2 else ""
+SK = sys.argv[3] if len(sys.argv) > 3 else ""
+# broker 侧所有鉴权失败都收敛成 NO_PERMISSION(16)
+NO_PERMISSION = 16
+
+
+def _hook():
+    """带凭据时返回 ACL 签名钩子，不带时返回 None（等价于跑在无鉴权集群上）。"""
+    if AK and SK:
+        return AclClientRPCHook(SessionCredentials(AK, SK))
+    return None
+
+
+def _rejected(exc: BaseException) -> bool:
+    """沿 cause 链判断是否被 broker 以 NO_PERMISSION 拒绝。
+
+    MQBrokerException 直接把码放在 response_code 上，MQClientException 也可能
+    包一层（admin 路径），所以要顺着链找，不能只看最外层。
+    """
+    seen = set()
+    cur = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if getattr(cur, "response_code", None) == NO_PERMISSION:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 STAMP = int(time.time())
 PREFIX = "MT_%d" % STAMP
 
@@ -91,7 +130,8 @@ def run_consumer(topic, sub_expr, duration, orderly=False, group_suffix="c",
                         received.append(m)
                 return ConsumeConcurrentlyStatus.CONSUME_SUCCESS
 
-    cons = DefaultMQPushConsumer(consumer_group="%s_%s" % (PREFIX, group_suffix))
+    cons = DefaultMQPushConsumer(consumer_group="%s_%s" % (PREFIX, group_suffix),
+                                 rpc_hook=_hook())
     cons.set_namesrv_addr(NAMESRV)
     cons.set_consume_from_where(ConsumeFromWhere.CONSUME_FROM_FIRST_OFFSET)
     cons.subscribe(topic, sub_expr)
@@ -111,8 +151,38 @@ def run_consumer(topic, sub_expr, duration, orderly=False, group_suffix="c",
     return received
 
 
+def _anon_probe() -> None:
+    """反向对照：不带凭据发送必须被拒成 NO_PERMISSION(16)。
+
+    缺了这条，「带凭据全绿」无法区分「签名被接受」和「集群根本没开鉴权」。
+    必须在建主生产者**之前**跑：同进程内 client_id 相同会共享 MQClientInstance，
+    而 ACL 钩子只在实例首次创建时注册，后起的实例才会带上自己的钩子。
+    """
+    anon = DefaultMQProducer(producer_group="%s_anon" % PREFIX)
+    anon.set_namesrv_addr(NAMESRV)
+    anon.set_send_msg_timeout(5000)
+    denied = False
+    detail = ""
+    try:
+        anon.start()
+        try:
+            anon.send(Message("%s_Anon" % PREFIX, b"should-not-send"))
+            detail = "unexpectedly succeeded"
+        except Exception as e:  # noqa: BLE001
+            denied = _rejected(e)
+            detail = "%r" % (e,)
+    except Exception as e:  # noqa: BLE001
+        detail = "start failed: %r" % (e,)
+    finally:
+        anon.shutdown()
+    check("无凭据发送被拒(NO_PERMISSION=16)", denied, detail)
+
+
 def main():
-    prod = DefaultMQProducer(producer_group="%s_producer" % PREFIX)
+    if AK and SK:
+        _anon_probe()
+        time.sleep(1)
+    prod = DefaultMQProducer(producer_group="%s_producer" % PREFIX, rpc_hook=_hook())
     prod.set_namesrv_addr(NAMESRV)
     prod.set_send_msg_timeout(5000)
     prod.start()
@@ -306,6 +376,35 @@ def main():
     check("事务消息落库可被消费", any(m.body == b"tx-commit" for m in recv_tx),
           "received=%d" % len(recv_tx))
 
+    # ---------- 8. 单向 + 批量：没有逐条应答的两种入口，靠回读条数兜底 ----------
+    topic_ent = "%s_Entries" % PREFIX
+    prod.send(Message(topic_ent, b"ent-sync"))
+    prod.send_oneway(Message(topic_ent, b"ent-oneway"))
+    ent_expect = [b"ent-sync", b"ent-oneway"] + [b"ent-batch-%d" % i for i in range(3)]
+    brs = prod.send([Message(topic_ent, b) for b in ent_expect[2:]])
+    check("批量发送 send(list) SEND_OK", brs.send_status.name == "SEND_OK",
+          "status=%s" % brs.send_status.name)
+    recv_ent = run_consumer(topic_ent, "*", 18, group_suffix="ent", expect=len(ent_expect))
+    got_ent = sorted(m.body for m in recv_ent)
+    check("单向+批量消息全部落到 broker 并可消费",
+          got_ent == sorted(ent_expect),
+          "received=%d/%d bodies=%s" % (len(recv_ent), len(ent_expect), got_ent))
+
+    # ---------- 9. 定时消息（TIMER_DELIVER_MS：到点才投递）----------
+    topic_timer = "%s_Timer" % PREFIX
+    deliver_at = int(time.time() * 1000) + 5000
+    tm = Message(topic_timer, b"timer-5s")
+    tm.set_user_property("TIMER_DELIVER_MS", str(deliver_at))
+    prod.send(tm)
+    recv_timer = run_consumer(topic_timer, "*", 20, group_suffix="timer", expect=1)
+    hit_timer = [m for m in recv_timer if m.body == b"timer-5s"]
+    check("定时消息最终投递", bool(hit_timer), "received=%d" % len(recv_timer))
+    if hit_timer:
+        tdrift = hit_timer[0].store_timestamp - hit_timer[0].born_timestamp
+        check("定时生效(store_ts-born_ts>=4000ms)", tdrift >= 4000, "drift=%dms" % tdrift)
+    else:
+        check("定时生效(store_ts-born_ts>=4000ms)", False, "无定时消息可校验")
+
     prod.shutdown()
 
     # ---------- 汇总 ----------
@@ -317,7 +416,8 @@ def main():
     if failed:
         print("结果: %d 项失败" % len(failed))
         return 1
-    print("结果: 全部通过（7 类消息类型均对真实集群验证通过）")
+    print("结果: 全部通过（9 类消息类型均对真实集群验证通过%s）"
+          % ("，且带 ACL 签名" if AK and SK else ""))
     return 0
 
 
