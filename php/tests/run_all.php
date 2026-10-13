@@ -25,6 +25,7 @@ $suites = [
     'Client 实例' => __DIR__ . '/RunClientInstance.php',
     'Client 故障探活' => __DIR__ . '/RunClientFaultDetector.php',
     'Client 消费者' => __DIR__ . '/RunClientConsumer.php',
+    'Client 生产者' => __DIR__ . '/RunClientProducer.php',
     'Client 队列变更监听' => __DIR__ . '/RunClientLiteTopicChange.php',
     'Client 静态主题路由' => __DIR__ . '/RunClientStaticTopic.php',
 ];

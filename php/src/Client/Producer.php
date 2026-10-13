@@ -1688,6 +1688,11 @@ class DefaultMQProducer
             if ($response !== null) {
                 return $response;
             }
+            if (!$future->sendRequestOk || $future->cause !== null) {
+                // 发送已判失败（Java 里 onException 会 countDown latch 立刻唤醒等待方），
+                // 这里等价地立刻跳出，否则明明发送失败还要傻等满 timeout。
+                break;
+            }
             $now = $this->wallMillis();
             if ($now >= $deadline) {
                 break;
@@ -2075,6 +2080,10 @@ class DefaultMQProducer
         } catch (\Throwable $e) {
             $cost = (int) ($this->monoMillis() - $began);
             $this->updateFaultItem($mq, $began, true, false);
+            // 同步抛出（如连接被拒）也要过分类：Java netty 的 connect 失败走 operationFail
+            // else 分支包成 MQClientException('unknown reason') 再进重试链；PHP 阻塞式 connect
+            // 在这里同步抛，不分类的话最终回调拿到的是裸 RemotingConnectException。
+            [$wrapped, $needRetry] = self::classifyAsyncFailure($e, $cost);
             $this->onSendException(
                 $client,
                 $brokerName,
@@ -2086,8 +2095,8 @@ class DefaultMQProducer
                 $publish,
                 $context,
                 $times,
-                $e,
-                true
+                $wrapped,
+                $needRetry
             );
         }
     }
@@ -2367,16 +2376,20 @@ class DefaultMQProducer
 
     public function sendDirect(Message $msg, ?MessageQueue $mq, SendCallback|InternalSendCallback|null $sendCallback): ?SendResult
     {
+        // 显式传 sendMsgTimeout：send()/sendAsync() 只在 timeout===null 且 autoBatch 开启时
+        // 才分流进 sendByAccumulator —— 这里若不传，非攒批消息（延时/带组属性）会
+        // sendDirect → send() → sendByAccumulator → sendDirect 无限递归直到 OOM。
+        // Java 无此问题是因为 facade.sendDirect 调的是 impl.send（不做 autoBatch 判断）。
         if ($sendCallback === null) {
             if ($mq === null) {
-                return $this->send($msg);
+                return $this->send($msg, $this->sendMsgTimeout);
             }
-            return $this->send($msg, null, $mq);
+            return $this->send($msg, $this->sendMsgTimeout, $mq);
         }
         if ($mq === null) {
-            $this->sendAsync($msg, $sendCallback);
+            $this->sendAsync($msg, $sendCallback, $this->sendMsgTimeout);
         } else {
-            $this->sendAsync($msg, $sendCallback, null, $mq);
+            $this->sendAsync($msg, $sendCallback, $this->sendMsgTimeout, $mq);
         }
         return null;
     }

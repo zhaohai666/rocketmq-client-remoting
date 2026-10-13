@@ -147,6 +147,11 @@ function producerBrokerSendResponse(RemotingCommand $cmd, string $selfAddr): arr
 {
     $ext = $cmd->extFields;
     $topic = (string) ($ext['b'] ?? $ext['topic'] ?? '');
+    // 命名空间生产者（PHPNS）线上 topic 是 "PHPNS%FailTopic" 形态；脚本分支按裸名匹配，
+    // 这里剥掉第一段前缀再比较（日志记录的是原始 ext，断言不受影响）。
+    if (str_contains($topic, '%')) {
+        $topic = substr($topic, strpos($topic, '%') + 1);
+    }
     $oneway = $cmd->isOnewayRPC();
 
     if ($topic === 'FailTopic') {
@@ -219,7 +224,11 @@ function producerBrokerHandleFrame($conn, RemotingCommand $cmd, string $logFile,
         switch ($cmd->code) {
             case RequestCode::GET_ROUTEINFO_BY_TOPIC: {
                 $topic = (string) ($cmd->extFields['topic'] ?? '');
-                if ($topic === 'NoRouteTopic') {
+                // NoRouteTopic 与 TBW102（兜底默认 topic）都回 NOT_FOUND：
+                // 客户端按 Java 语义在直查失败后还会拿 TBW102 路由兜底
+                // （tryToFindTopicPublishInfo 的 isDefault 分支），mock 若对 TBW102
+                // 也回路由，NoRouteTopic 的 10005 就永远走不到。
+                if ($topic === 'NoRouteTopic' || $topic === MixAll::DEFAULT_TOPIC) {
                     $resp = RemotingCommand::createResponseCommand(ResponseCode::TOPIC_NOT_EXIST, 'no route');
                 } elseif ($topic === 'GhostTopic') {
                     // 一台永远连不上的 broker（连接拒绝）
@@ -1155,12 +1164,21 @@ final class RunClientProducer
         $this->checkSame(5000, $decoded[count($decoded) - 2] ?? -1, '第二次发送解一层=5000');
         $this->checkSame(5000, $decoded[count($decoded) - 1] ?? -1, '第三次发送解一层=5000');
 
-        // 4) 定点发送走钩子（命名空间下定点守卫用拼过的名字比较）
+        // 4) 定点发送走钩子。定点守卫语义七端一致（python producer.py:939 / go producer.go:981）：
+        //    消息 topic 与 mq.topic **各自拼命名空间后**比较（withNamespace 幂等）——
+        //    裸名 mq 拼上 PHPNS 后与消息的 PHPNS%SyncTopic 相等 → 不抛、正常发出。
         $pinnedMq = new MessageQueue('SyncTopic', 'broker-a', 0);
+        try {
+            $r = $p->send(new Message('SyncTopic', 'x'), 3000, $pinnedMq);
+            $this->check($r->sendStatus === SendStatus::SEND_OK, '定点守卫双方拼命名空间后比较：裸名 mq 命中，SEND_OK');
+        } catch (\Throwable $e) {
+            $this->check(false, '定点守卫双方拼命名空间后比较：不应抛（' . get_class($e) . ': ' . $e->getMessage() . '）');
+        }
+        // mq 与消息 topic 真不一致时仍守卫拦截（异步文案同理见异步段）
         $this->checkThrows(
-            fn() => $p->send(new Message('SyncTopic', 'x'), 3000, $pinnedMq),
+            fn() => $p->send(new Message('SyncTopic', 'x'), 3000, new MessageQueue('OtherTopic', 'broker-a', 0)),
             MQClientException::class,
-            '定点守卫比较的是各自拼过命名空间后的名字（SyncTopic vs PHPNS%SyncTopic）'
+            '定点守卫：mq 与消息 topic 不一致抛同步文案'
         );
 
         $p->shutdown();
@@ -1248,13 +1266,13 @@ final class RunClientProducer
         $p->sendOneway($msg);
         $this->check(true, 'sendOneway 不抛');
         $this->checkSame('OnewayTopic', $msg->getTopic(), 'oneway 消息 topic 还原');
-        $this->checkSame(1, $broker->logCount(RequestCode::SEND_MESSAGE_V2, 'OnewayTopic'), 'broker 收到 oneway 发送');
+        $this->checkSame(1, $this->waitLogCount($broker, RequestCode::SEND_MESSAGE_V2, 1, 'OnewayTopic'), 'broker 收到 oneway 发送');
         $onewayEntries = array_values(array_filter($broker->logEntries(), static fn ($e) =>
             ($e['code'] ?? 0) === RequestCode::SEND_MESSAGE_V2 && ($e['ext']['b'] ?? '') === 'OnewayTopic'));
         $this->checkSame(true, (bool) ($onewayEntries[0]['oneway'] ?? false), 'oneway 标记置位');
         // 定点 oneway
         $p->sendOneway(new Message('OnewayTopic', 'p2'), new MessageQueue('OnewayTopic', 'broker-a', 1));
-        $this->checkSame(2, $broker->logCount(RequestCode::SEND_MESSAGE_V2, 'OnewayTopic'), '定点 oneway 到达');
+        $this->checkSame(2, $this->waitLogCount($broker, RequestCode::SEND_MESSAGE_V2, 2, 'OnewayTopic'), '定点 oneway 到达');
         $p->shutdown();
         MQClientInstance::removeInstance('oneway-inst-1-cid');
         $this->check(true, 'oneway 套件 shutdown 完成');
@@ -1306,10 +1324,25 @@ final class RunClientProducer
         $this->checkSame(1, $slotF->calls, '异步失败: 回调恰一次');
         $this->check($slotF->error instanceof MQBrokerException, '异步失败: broker 码原样 MQBrokerException');
 
-        // 连接失败：换 opaque 重试 retryTimesWhenSendAsyncFailed=2 → 共 3 次内核尝试
+        // 连接失败：MQClientAPIImpl 层重试 retryTimesWhenSendAsyncFailed=2 次（1+2=3 内核尝试），
+        // 最终包装 MQClientException('unknown reason')（Java MQClientAPIImpl#operationFail else 分支）、
+        // cause 保留 RemotingConnectException。禁止钩子在**重试层之上**（Java sendKernelImpl），
+        // 只执行 1 次——不能用抛异常的钩子数内核尝试次数。
         $pGhost = $this->makeProducer($broker, 'GID-ghost', 'GhostTopic', 'ghost-inst-1');
-        $forbidden = new ThrowingForbiddenHook(); // 每次 sendKernelAsync 都跑 → 计内核尝试数
-        $pGhost->registerCheckForbiddenHook($forbidden);
+        $counting = new class() implements CheckForbiddenHook {
+            public int $calls = 0;
+
+            public function hookName(): string
+            {
+                return 'CountingForbiddenHook';
+            }
+
+            public function checkForbidden(CheckForbiddenContext $context): void
+            {
+                $this->calls++;
+            }
+        };
+        $pGhost->registerCheckForbiddenHook($counting);
         $pGhost->start();
         $slotG = new CallbackSlot();
         $pGhost->sendAsync(new Message('GhostTopic', 'x'), $slotG);
@@ -1317,12 +1350,28 @@ final class RunClientProducer
         $this->check($slotG->error instanceof MQClientException, '连接失败: 包装为 MQClientException');
         $this->checkSame('unknown reason', $slotG->error->getMessage() ?? '', '连接失败: unknown reason 文案');
         $this->check($slotG->error->getPrevious() instanceof RemotingConnectException, '连接失败: cause 保留');
-        $this->checkSame(3, $forbidden->calls, '连接失败: 内核尝试 1+2 次（forbidden 钩子计数）');
+        $this->checkSame(1, $counting->calls, '禁止钩子在重试层之上，执行 1 次（Java parity）');
+
+        // 抛异常的钩子：首轮即抛 → runnable catch 原样回调（Java async 语义），不重试、不包装
+        $pThrowG = $this->makeProducer($broker, 'GID-ghost2', 'GhostTopic', 'ghost2-inst-1');
+        $throwingG = new ThrowingForbiddenHook();
+        $pThrowG->registerCheckForbiddenHook($throwingG);
+        $pThrowG->start();
+        $slotT = new CallbackSlot();
+        $pThrowG->sendAsync(new Message('GhostTopic', 'x'), $slotT);
+        $this->checkSame(1, $slotT->calls, '抛钩子: 回调恰一次');
+        $this->checkSame('forbidden by test hook', $slotT->error->getMessage() ?? '', '抛钩子: 首轮异常原样回调');
+        $this->checkSame(1, $throwingG->calls, '抛钩子: 执行 1 次后不再重试');
+        $pThrowG->shutdown();
+        MQClientInstance::removeInstance('ghost2-inst-1-cid');
 
         // 背压：信号量掏空 → tryAcquire 失败 → RemotingTooMuchRequestException 文案
         $pBp = $this->makeProducer($broker, 'GID-bp', 'AsyncOkTopic', 'bp-inst-1');
         $pBp->setEnableBackpressureForAsyncMode(true);
         $pBp->setBackPressureForAsyncSendNum(10);
+        // 字节闸显式设 1MB：默认 100MB 的"归还"断言在数值上区分不出少还一个 body，
+        // 1MB 才能精确验证回调后归还到位。
+        $pBp->setBackPressureForAsyncSendSize(1024 * 1024);
         $pBp->start();
         $semNum = $this->privateOf($pBp, 'semaphoreAsyncSendNum');
         $semNum->tryAcquire(10, 0);
@@ -1411,7 +1460,8 @@ final class RunClientProducer
         $r3 = $p->sendBySelector(new Message('SelTopic', 'r'), $byRoom, 'broker', 3000);
         $this->checkSame(SendStatus::SEND_OK, $r3->sendStatus, 'ByMachineRoom 发送 OK（broker- 前缀命中）');
 
-        // 拦截钩子抛异常：不吞、沿重试链向上（最终 Send [N] times）
+        // 拦截钩子抛异常：Java sendSelectImpl（DefaultMQProducerImpl#1329）**没有重试循环**——
+        // 选一次队列、发一次，钩子异常原样向上抛（不包 Send[N] times、responseCode 保持钩子原样）
         $throwing = new ThrowingForbiddenHook();
         $p2 = $this->makeProducer($broker, 'GID-sel2', 'SelTopic', 'sel2-inst-1');
         $p2->registerCheckForbiddenHook($throwing);
@@ -1420,10 +1470,10 @@ final class RunClientProducer
             $p2->sendBySelector(new Message('SelTopic', 'x'), $byHash, 'a', 3000);
             $this->check(false, '拦截钩子异常应传播');
         } catch (MQClientException $e) {
-            $this->check(str_contains($e->getMessage(), 'forbidden by test hook'), '拦截异常出现在最终信息里');
-            $this->checkSame(10003, $e->responseCode, '客户端自身故障定性 10003');
+            $this->check(str_contains($e->getMessage(), 'forbidden by test hook'), '拦截异常原样抛出');
+            $this->checkSame(null, $e->responseCode, '钩子异常不包装（responseCode 保持钩子原样）');
         }
-        $this->checkSame(3, $throwing->calls, '拦截钩子每轮重试都执行（3 次）');
+        $this->checkSame(1, $throwing->calls, 'selector 路径无重试循环，钩子只执行 1 次');
 
         $p2->shutdown();
         MQClientInstance::removeInstance('sel2-inst-1-cid');
@@ -1484,6 +1534,8 @@ final class RunClientProducer
         $this->checkSame('TransTopic', $msg->getTopic(), '事务: 调用方 topic 还原');
         $this->checkSame('trans-body', $msg->getBody(), '事务: 调用方 body 还原（executeLocalTransaction 看到原文）');
         // END_TRANSACTION(37) oneway 到达 broker：commitOrRollback=8, fromTransactionCheck=false
+        // （oneway 写完即返回，mock 子进程异步记日志 → 先轮询等帧落地）
+        $this->waitLogCount($broker, RequestCode::END_TRANSACTION, 1);
         $endEntries = array_values(array_filter($broker->logEntries(), static fn ($e) => ($e['code'] ?? 0) === RequestCode::END_TRANSACTION));
         $this->check(count($endEntries) >= 1, 'broker 收到 END_TRANSACTION');
         $first = $endEntries[0] ?? [];
@@ -1499,12 +1551,14 @@ final class RunClientProducer
         // ROLLBACK
         $listener2 = new ScriptedTransactionListener(LocalTransactionState::ROLLBACK_MESSAGE);
         $p->sendMessageInTransaction(new Message('TransTopic', 'r'), $listener2);
+        $this->waitLogCount($broker, RequestCode::END_TRANSACTION, 2);
         $endEntries = array_values(array_filter($broker->logEntries(), static fn ($e) => ($e['code'] ?? 0) === RequestCode::END_TRANSACTION));
         $this->checkSame('12', (string) ($endEntries[1]['ext']['commitOrRollback'] ?? ''), 'ROLLBACK → commitOrRollback=12');
 
         // UNKNOW
         $listener3 = new ScriptedTransactionListener(LocalTransactionState::UNKNOW);
         $p->sendMessageInTransaction(new Message('TransTopic', 'u'), $listener3);
+        $this->waitLogCount($broker, RequestCode::END_TRANSACTION, 3);
         $endEntries = array_values(array_filter($broker->logEntries(), static fn ($e) => ($e['code'] ?? 0) === RequestCode::END_TRANSACTION));
         $this->checkSame('0', (string) ($endEntries[2]['ext']['commitOrRollback'] ?? ''), 'UNKNOW → commitOrRollback=0');
 
@@ -1522,6 +1576,7 @@ final class RunClientProducer
         };
         $txBoom = $p->sendMessageInTransaction(new Message('TransTopic', 'e'), $boomListener);
         $this->checkSame(LocalTransactionState::UNKNOW, $txBoom->getLocalTransactionState(), '本地事务异常 → UNKNOW');
+        $this->waitLogCount($broker, RequestCode::END_TRANSACTION, 4);
         $endEntries = array_values(array_filter($broker->logEntries(), static fn ($e) => ($e['code'] ?? 0) === RequestCode::END_TRANSACTION));
         $this->check(count($endEntries) >= 4, 'END_TRANSACTION 请求共 4 条');
 
@@ -1688,7 +1743,7 @@ final class RunClientProducer
         $this->checkSame('broker-a', $queues[0]->brokerName, '队列 brokerName');
 
         $this->checkThrows(fn() => $p->viewMessage('T', 'id'), MQClientException::class, 'viewMessage 不支持');
-        $this->checkThrows(fn() => $p->createTopic('k', 'SCHEDULE_TOPIC_XXX'), MQClientException::class, 'createTopic 拒绝系统 topic');
+        $this->checkThrows(fn() => $p->createTopic('k', 'SCHEDULE_TOPIC_XXXX'), MQClientException::class, 'createTopic 拒绝系统 topic');
 
         $p->shutdown();
         MQClientInstance::removeInstance('admin-inst-1-cid');
@@ -1720,9 +1775,11 @@ final class RunClientProducer
         $r2 = $p->send($delayed);
         $this->checkSame(SendStatus::SEND_OK, $r2->sendStatus, '延时消息退回直发 OK');
 
-        // 异步走累加器：回调被驱动
+        // 异步走累加器：PHP 单线程适配，无后台线程，显式 flushAll 泵出
+        // （驱动方式与 RunClientAccumulator 的 async 段一致）
         $slot = new CallbackSlot();
         $p->sendAsync(new Message('AccTopic', 'async-acc'), $slot);
+        $p->produceAccumulator->flushAll();
         $this->checkSame(1, $slot->calls, '攒批异步回调恰一次');
         $this->check($slot->result !== null, '攒批异步成功');
 
@@ -1738,7 +1795,9 @@ final class RunClientProducer
         $p = $this->makeProducer($broker, 'GID-trace', 'TraceTopic', 'trace-inst-1');
         $p->setEnableTrace(true);
         $p->start();
-        $this->check($p->traceDispatcher instanceof AsyncTraceDispatcher, 'enableTrace → AsyncTraceDispatcher 建立');
+        // 注意用 FQCN：本文件在全局命名空间且未 import AsyncTraceDispatcher，
+        // 裸类名 instanceof 未定义类会**静默返回 false**（不报错）。
+        $this->check($p->traceDispatcher instanceof \RocketMQ\Client\AsyncTraceDispatcher, 'enableTrace → AsyncTraceDispatcher 建立');
         $this->checkSame(1, count(array_filter($p->sendMessageHookList, static fn ($h) => $h instanceof \RocketMQ\Client\SendMessageTraceHook)), '注册 SendMessageTraceHook');
         $this->checkSame(1, count(array_filter($p->endTransactionHookList, static fn ($h) => $h instanceof \RocketMQ\Client\EndTransactionTraceHook)), '注册 EndTransactionTraceHook');
         $this->check($p->traceDispatcher->traceProducer !== null, '内部轨迹生产者建立');
@@ -1764,6 +1823,22 @@ final class RunClientProducer
         $r = new \ReflectionProperty(get_class($obj), $name);
         $r->setAccessible(true);
         return $r->getValue($obj);
+    }
+
+    /**
+     * 轮询等 mock broker 的日志条数到目标值（oneway / END_TRANSACTION 是 fire-and-forget，
+     * 客户端写完就返回，mock 子进程异步记日志——断言前必须轮询，否则纯竞态假失败）。
+     * 返回到达时的实际条数（供 checkSame 断言）。
+     */
+    private function waitLogCount(ProducerFakeBroker $broker, int $code, int $want, ?string $topic = null, int $timeoutMs = 3000): int
+    {
+        $deadline = microtime(true) + $timeoutMs / 1000.0;
+        $n = $broker->logCount($code, $topic);
+        while ($n < $want && microtime(true) < $deadline) {
+            usleep(20000);
+            $n = $broker->logCount($code, $topic);
+        }
+        return $n;
     }
 
     // ================================================================ run
