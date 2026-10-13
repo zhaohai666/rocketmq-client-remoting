@@ -129,7 +129,7 @@ def drain_for(consumer: DefaultLitePullConsumer, seconds: float) -> list:
 
 
 def queue_keys(queues: list) -> set:
-    """队列列表 → key 集合（"brokerName#queueId"），用于跨语言比分配结果。"""
+    """队列列表 → key 集合（"brokerName#queueId"），用于比对分配结果。"""
     return {"%s#%d" % (mq.broker_name, mq.queue_id) for mq in queues}
 
 
@@ -348,7 +348,7 @@ def s8_three_offset_tables(foreign_pool: list) -> None:
         o2.start()
         start2 = o2.pull_cursor_of(q0)
         # 上界只要求「没吃到另一个实例内存里那格 777」：起点的拉取游标会被后台续拉往前推，
-        # 卡死等于 5 就成了赌时序（Rust L11e 同口径）。
+        # 卡死等于 5 就成了赌时序。
         check("S8e 新实例的起点是 broker 上的 5（不是另一个实例内存里的 777）",
               5 <= start2 < 777, "pullCursor=%d" % start2)
         o2.shutdown()

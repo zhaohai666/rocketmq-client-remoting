@@ -893,8 +893,8 @@ class DefaultMQProducer:
         hb = HeartbeatData(self.client_id or "")
         pd = ProducerData(self.producer_group)
         # ⚠ Python 的 HeartbeatData 没有 heartbeatFingerprint / withoutSub 字段
-        # （已知缺陷，见项目记忆）。缺失时 broker 反序列化为 0，等价于走 V1 注册路径，
-        # 与 C++ 侧显式置 0 的效果一致，这里保持现状不引入新差异。
+        # （已知缺陷，见项目记忆）。缺失时 broker 反序列化为 0，等价于走 V1 注册路径；
+        # 显式置 0 与不置的效果相同，保持现状。
         hb.producer_data_set.add(pd)
         ok_count = 0
         for addr in addrs:

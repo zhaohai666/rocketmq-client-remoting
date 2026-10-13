@@ -24,7 +24,7 @@ git clone <本仓库> && cd rocketmq-client-remoting/nodeJs
 node --experimental-strip-types selfcheck.ts
 ```
 
-`selfcheck.ts` 加载 `src/` 全部 **60** 个模块并依次跑 **12** 套离线冒烟，2026-10-11 实测 **ALL GREEN**。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
+`selfcheck.ts` 加载 `src/` 全部 **63** 个模块并依次跑 **14** 套离线冒烟，2026-10-13 实测 **ALL GREEN**，共 **301** 项检查。单套运行：`node --experimental-strip-types test/<套件>.ts`，实测结果：
 
 | 套件 | 实测 |
 | --- | --- |
@@ -35,11 +35,13 @@ node --experimental-strip-types selfcheck.ts
 | `test/compat_contract_smoke.ts`（线上格式/行为钉死面） | 10 组检查通过 |
 | `test/pop_smoke.ts` | 11 组检查通过 |
 | `test/fixes2_smoke.ts` | 38 项检查通过 |
-| `test/namespace_rpc_smoke.ts` | 7 组检查通过 |
+| `test/namespace_rpc_smoke.ts` | 5 组检查通过 |
 | `test/ns_failover_smoke.ts` | 12 项检查通过 |
 | `test/lite_topic_queue_change_smoke.ts` | 25 通过 / 0 失败 |
 | `test/pull_balance_view_smoke.ts` | 14 通过 / 0 失败 |
 | `test/socks_smoke.ts`（SOCKS 代理握手 + 经代理建连） | 51 通过 / 0 失败 |
+| `test/mq_client_manager_smoke.ts` | 52 通过 / 0 失败 |
+| `test/static_topic_smoke.ts` | 29 通过 / 0 失败 |
 
 真机示例直接对集群运行：
 
@@ -348,7 +350,7 @@ nodeJs/
 │                        # 队列分配/位点存储/消费统计/轨迹/背压/traceparent
 ├── examples/            # 真机 live 工具（见「真实集群联调」）
 ├── test/                # 离线冒烟（协议往返、分配、位点、轨迹、统计、命名空间、POP）
-├── selfcheck.ts         # 一键离线自检（模块加载 + 12 套冒烟）
+├── selfcheck.ts         # 一键离线自检（模块加载 + 14 套冒烟）
 └── package.json         # engines: node >= 22
 ```
 

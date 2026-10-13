@@ -5,9 +5,8 @@
 #   - topic 级闸门失效 ⇒ 同 topic 多队列各自为政，单队列都"没超"但实例总量爆掉。
 # 单位也只有一个坑：size 阈值是 **MiB** 不是字节；跨度是**严格大于**而条数/字节是 **>=**。
 #
-# 本文件锁的是**参考实现**本身（Python 是四语言的对齐基准），C++/Rust/C# 的
-# test_flow_control 与这里逐条同构。真机侧"闸门命中之后消息一条都不丢"见
-# ../verify_flow_control_live.py。
+# 本文件锁的是流控判定的离线语义：五条闸门的命中方向与单位逐条钉死。
+# 真机侧"闸门命中之后消息一条都不丢"见 ../verify_flow_control_live.py。
 from client.consumer import DefaultMQPushConsumer
 from common.message import MessageExt, MessageQueue
 

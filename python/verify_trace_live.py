@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""消息轨迹真机验证（Python 参考实现）。
+"""消息轨迹真机验证。
 
 前置：NameServer + Broker 已起，且 broker 配置里 **traceTopicEnable=true**
 （否则 RMQ_SYS_TRACE_TOPIC 不会被预建，也没法用 admin 建 —— 它是系统 topic，
@@ -27,9 +27,10 @@ from remoting.protocol.heartbeat import ConsumeFromWhere
 
 NAMESRV = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:9876"
 STAMP = int(time.time() * 1000)
-# topic 与业务消费组都带 STAMP：`run_trace_live.sh all` 会让三语言**依次**跑在同一个 broker 上，
-# 固定名会让第二个语言继承上一轮的位点与残留消息，使断言结果依赖运行顺序。全新 topic + 全新组
-# 才能让每次运行的起点一致（真正的鲁棒性另有保障，见 S6 的 body 过滤）。
+# topic 与业务消费组都带 STAMP：`run_trace_live.sh all` 会让多轮验证**依次**跑在
+# 同一个 broker 上，固定名会让后一轮继承前一轮的位点与残留消息，使断言结果依赖
+# 运行顺序。全新 topic + 全新组才能让每次运行的起点一致（真正的鲁棒性另有保障，
+# 见 S6 的 body 过滤）。
 TOPIC = "TraceTopicLive_%d" % STAMP
 NOTRACE_TOPIC = "TraceNoTraceTopic_%d" % STAMP
 PRODUCER_GROUP = "GID_trace_producer_live"
@@ -162,7 +163,7 @@ def main() -> int:
     # ---------- S6/S7 消费到消息 ----------
     # ⚠ 只统计**本次发送的**消息：topic 上必然还留着 S1 的预热消息，且"组首次消费"的起始位点
     #   取的是当时的 maxOffset —— broker 的 consumequeue 是**异步分发**的，位点可能落在预热消息
-    #   之前，于是预热消息也会被投递过来（实测 C++/C# 都在这里翻车）。断言的本意是"本次业务
+    #   之前，于是预热消息也会被投递过来（真机实测踩过）。断言的本意是"本次业务
     #   消息被消费到"，所以按 body 过滤，而不是赌 topic 上只有一条消息。
     def _is_primary(m) -> bool:
         return bytes(m.body).startswith(b"trace-live-")

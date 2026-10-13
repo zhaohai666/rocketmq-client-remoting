@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""invoke_async 的真实 socket 用例（镜像 C++ test_transport.cpp 的第 3 / 3b 段）。
+"""invoke_async 的真实 socket 用例（loopback 上的真连接，非 mock）。
 
 覆盖的是同一条链路：异步请求登记进在途表之后，必须**恰好一次**地拿到结果——
 正常响应带 response，收不到响应带 error，且条目要从表里摘掉。

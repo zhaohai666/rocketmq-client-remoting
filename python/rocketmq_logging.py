@@ -8,7 +8,7 @@ from logging.handlers import TimedRotatingFileHandler
 
 LOGGER_NAME = "rocketmq.client"
 
-# 环境变量配置（级别/文件名/备份数与其余端口同名）
+# 环境变量配置：ROCKETMQ_CLIENT_LOG_* 分别控制目录/文件名/级别/备份数/是否打 stdout
 _DEFAULT_LOG_DIR = os.path.join(os.getcwd(), "logs", "rocketmqlogs")
 _LOG_DIR = os.environ.get("ROCKETMQ_CLIENT_LOG_DIR") or _DEFAULT_LOG_DIR
 _LOG_FILE = os.environ.get("ROCKETMQ_CLIENT_LOG_FILE") or "rocketmq_py_client.log"

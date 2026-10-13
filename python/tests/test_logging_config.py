@@ -48,7 +48,7 @@ def test_default_dir_follows_cwd_not_home(monkeypatch, tmp_path):
     """默认目录是 <cwd>/logs/rocketmqlogs，**刻意不写用户 HOME**。
 
     Python 客户端常被当脚本嵌进别人的进程里跑，在 $HOME 下悄悄建目录写文件是越界
-    副作用（与 php/src/Client/Logger.php 同一取舍）；这里用 chdir 把两者分开验证。
+    副作用；这里用 chdir 把两者分开验证。
     """
     home = tmp_path / "fakehome"
     home.mkdir()
@@ -64,7 +64,7 @@ def test_default_dir_follows_cwd_not_home(monkeypatch, tmp_path):
 
 
 def test_level_aliases(monkeypatch):
-    """go/nodeJs/php 口径的 WARN/TRACE 也必须认（Python 原生级别名是 WARNING）。"""
+    """WARN/TRACE 这类缩写级别也要认（logging 原生级别名是 WARNING）。"""
     rl = _reload(monkeypatch)
     assert rl._level_from_name("WARN") == rl._logging.WARNING
     assert rl._level_from_name("WARNING") == rl._logging.WARNING

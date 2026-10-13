@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""CheckForbiddenHook / FilterMessageHook 真机验证（Python 参考实现）。
+"""CheckForbiddenHook / FilterMessageHook 真机验证。
 
 前置：NameServer + Broker 已起（普通配置即可，不需要 traceTopicEnable）。
 
@@ -8,9 +8,10 @@
 场景 S1–S12 见 main()，全部命中才返回 0。
 
 ⚠ 脚本自身的两条纪律（上一轮 trace 联调踩出来的）：
-  ① topic / 消费组一律带 STAMP —— `run_hook_live.sh all` 会让三语言**依次**跑在同一个 broker 上，
-     固定名会继承上一轮的提交位点；② 断言**按 body 前缀过滤**，因为预热消息、以及
-     broker consumequeue 异步分发都可能让消费者多收几条，数总数会假红/假绿。
+  ① topic / 消费组一律带 STAMP —— `run_hook_live.sh all` 会让多轮验证**依次**跑在
+     同一个 broker 上，固定名会继承上一轮的提交位点；② 断言**按 body 前缀过滤**，
+     因为预热消息、以及 broker consumequeue 异步分发都可能让消费者多收几条，数总数会
+     假红/假绿。
 """
 from __future__ import annotations
 

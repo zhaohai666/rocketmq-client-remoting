@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""unitName / unitMode / enableStreamRequestType 真机验证（Python 参考实现）。
+"""unitName / unitMode / enableStreamRequestType 真机验证。
 
 对应用户要求"基于真实集群测试是否正常"：这三项里 unitName 与 unitMode 都不是
 只在客户端自 high 的字段，broker 侧有可观测后果，所以全部用真机断言：

@@ -51,7 +51,7 @@ echo "======================================================================" . 
 echo "PullConsumer live (PHP): ns=$ns topic=$topic group=$group" . PHP_EOL;
 echo "======================================================================" . PHP_EOL;
 
-/** 队列的稳定标识：brokerName:queueId（与其余端口的 qKey 同口径）。 */
+/** 队列的稳定标识：brokerName:queueId，观测结果的比对都以此为键。 */
 $qKey = static fn (MessageQueue $q): string => $q->brokerName . ':' . $q->queueId;
 
 /** 轮询到条件成立；返回是否成立（顺带把最后一次的观测值带回来）。 */

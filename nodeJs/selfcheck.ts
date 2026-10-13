@@ -11,12 +11,14 @@ const node = process.execPath;
 
 // Every module in src/ must import cleanly (no console output expected).
 const modules = [
+  'src/logging.ts',
   'src/remoting/remotingCommand.ts', 'src/remoting/serialize.ts', 'src/remoting/codes.ts',
   'src/remoting/headers.ts', 'src/remoting/bodies.ts', 'src/remoting/heartbeat.ts',
   'src/remoting/route.ts', 'src/remoting/namespace.ts', 'src/remoting/subscription.ts',
   'src/remoting/admin_body.ts', 'src/remoting/extra_info.ts', 'src/remoting/acl.ts',
   'src/remoting/rpc_hooks.ts',
   'src/remoting/client.ts', 'src/remoting/exception.ts', 'src/remoting/socks_proxy.ts',
+  'src/remoting/static_topic.ts',
   'src/common/message.ts', 'src/common/messageConst.ts', 'src/common/messageDecoder.ts',
   'src/common/messageClientIdSetter.ts', 'src/common/message_accessor.ts', 'src/common/messageType.ts',
   'src/common/mixAll.ts', 'src/common/sysflag.ts', 'src/common/utilAll.ts',

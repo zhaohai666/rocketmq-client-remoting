@@ -70,7 +70,7 @@ class FileSink {
     }
   }
 
-  // rollLocked — csharp ClientLog.RollLocked: delete .N, shift .N-1..1 up,
+  // rollLocked — size-based rotation: delete .N, shift .N-1..1 up,
   // move base to .1, then reopen a fresh file.
   roll(): void {
     if (this.fd != null) { try { fs.closeSync(this.fd); } catch (e) { /* best effort */ } this.fd = null; }

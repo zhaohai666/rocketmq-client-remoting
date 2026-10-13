@@ -32,7 +32,7 @@ final class StaticTopic
 
     /**
      * PHP 数组键只能用标量：逻辑队列一律以 "topic@brokerName@queueId" 字符串键
-     * 进端点表（JS 端同款教训：引用身份的键查不到等值条目）。
+     * 进端点表（引用身份的键查不到等值条目）。
      */
     public static function queueKey(MessageQueue $mq): string
     {

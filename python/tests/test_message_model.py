@@ -198,7 +198,7 @@ class TestMessageBatch:
     def test_batch_defaults_wait_store_msg_ok_to_true(self):
         pass
         messages = [Message(topic="T", body=b"a"), Message(topic="T", body=b"b")]
-        # 前提：Message.__init__（同 Rust 的 Message::new）不预写 WAIT
+        # 前提：Message.__init__ 不预写 WAIT 属性
         assert messages[0].get_wait_store_msg_ok() is None
         batch = MessageBatch.generate_from_list(messages)
         assert batch.get_wait_store_msg_ok() == "true"

@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """静态主题路由测试：类型化映射解析、topicRouteData2EndpointsForStaticTopic
-纯函数移植、以及实例的 getBrokerNameFromMessageQueue 重写（对标 Go 端
-static_topic_test.go 的五个用例）。"""
+纯函数移植、以及实例的 getBrokerNameFromMessageQueue 重写，共五个用例。"""
 from __future__ import annotations
 
 from client import static_topic

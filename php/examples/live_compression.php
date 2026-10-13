@@ -36,7 +36,7 @@ function build_payload(int $size): string
     return substr($out, 0, $size);
 }
 
-/** 标准 CRC-32（无符号十进制字符串），与其他四端口同一口径。 */
+/** 标准 CRC-32（无符号十进制字符串），发送腿与接收腿用它对账正文。 */
 function crc_u32(string $data): string
 {
     return sprintf('%u', crc32($data));

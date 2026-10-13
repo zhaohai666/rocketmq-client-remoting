@@ -1,7 +1,5 @@
-# 与其它语言同构：go/client/consumer_test.go 的
-# TestConsumerSuspendStopsPullsAndResumeRestartsThem、
-# csharp/tests/RocketMQ.Client.Tests/SuspendResumeTests.cs、
-# nodeJs/test/java_gap_fill_smoke.ts 的挂起块。
+# 离线锁死挂起/恢复的闸门：suspend 后停止拉取与 POP，resume 后恢复，
+# 且挂起期间仍要打时间戳（否则会被停摆清扫误伤）。
 import threading
 import time
 

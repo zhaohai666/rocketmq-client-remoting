@@ -197,8 +197,8 @@ def main():
             check("消费时间跨度(303) 路由扇出聚合", False, repr(e))
 
         # ---- 9. nameserver 配置(318/319) ----------------------------------
-        # namesrv 的 Configuration.update 只认真实字段：未知键被**静默丢弃**
-        # （nodeJs 侧 live_admin_ns 已确认），所以必须用 orderMessageEnable
+        # namesrv 的 Configuration.update 只认真实字段：未知键被**静默丢弃**（真机
+        # 实测确认），所以必须用 orderMessageEnable
         # 这个真实字段做写读回环，测完还原为默认值 false。
         try:
             before = admin.get_name_server_config()

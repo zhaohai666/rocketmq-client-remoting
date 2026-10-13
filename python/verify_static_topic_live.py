@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""真机静态主题腿（七端口径的 python 参考版）。
+"""真机静态主题腿。
 
 S1 createStaticTopic(513)：单 broker，totalQueues=8，物理 4 队列
    （currIdMap 0-3 → 物理 0-3，4-7 无承载者）。

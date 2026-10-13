@@ -854,7 +854,7 @@ export class DefaultMQPushConsumer {
   // Order matters: retire -> settle -> add. Reversed, the new loop would start
   // from a stale offset and write the smaller value back.
   syncPullLoops(): void {
-    // POP mode branches here too (Go does the same): the POP twin retires and
+    // POP mode branches here too: the POP twin retires and
     // adds pop loops instead of pull loops — no offset to settle, only the
     // dropped marker so in-flight batches abort instead of ACKing.
     if (this.popMode) {

@@ -1,4 +1,4 @@
-# 与 C++/Rust/C# 的 test_pull_expired 一一对应；真机恢复场景见 ../verify_pull_expired_live.py
+# 离线锁死停摆队列的摘除与重建；真机恢复场景见 ../verify_pull_expired_live.py
 #（注入停摆 → 走生产 rebalance 路径重建 → 同一队列继续消费、位点不回退）。
 import threading
 import time
