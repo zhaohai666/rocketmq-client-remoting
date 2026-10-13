@@ -874,7 +874,12 @@ final class RunClientConsumer
         $this->checkSame(1, $c->assignedQueueCount(), '顺序消费 start 完成 rebalance');
 
         // 第一轮 tick：LOCK_BATCH_MQ → 拉取 → listener 挂起 → 批次塞回队首。
-        $c->tick();
+        // 一趟 tick 能不能落地取决于假 broker 子进程何时被调度，机器忙时会整轮空转
+        // （锁没发、批没拉，后面一串断言全塌）。所以这里是闸门：在首次投递之前反复
+        // tick，一收到就停——不多跑一轮，"只跑一次"的断言因此仍然成立。
+        for ($i = 0; $i < 8 && ($GLOBALS['RECV']['STopic'] ?? []) === []; $i++) {
+            $c->tick();
+        }
         $this->checkSame(['order-0', 'order-1', 'order-2'], $GLOBALS['RECV']['STopic'] ?? [], '顺序首轮收到 3 条');
         $this->checkSame(1, $listener->calls, '挂起路径 listener 只跑一次');
         $sStatus = $c->getConsumerStatus('STopic');
@@ -893,9 +898,12 @@ final class RunClientConsumer
         $this->checkSame([], $this->logWhere(RequestCode::CONSUMER_SEND_MSG_BACK, null, 'GID-S-CONS'),
             '顺序挂起不回投');
 
-        // 挂起到点：重排批次 → SUCCESS → 位点推进到 3。
-        usleep(60000);
-        $c->tick();
+        // 挂起到点：重排批次 → SUCCESS → 位点推进到 3。判据是"listener 跑到第二次"，
+        // 所以按闸门推进，不押一个固定时长窗口（下限 10ms 的挂起周期只是最早可能重排的时刻）。
+        for ($i = 0; $i < 20 && $listener->calls < 2; $i++) {
+            usleep(20_000);
+            $c->tick();
+        }
         $this->checkSame(2, $listener->calls, '重排后 listener 第二次执行');
         $this->checkSame(array_merge(['order-0', 'order-1', 'order-2'], ['order-0', 'order-1', 'order-2']),
             $GLOBALS['RECV']['STopic'] ?? [], '同一批消息被原地重排重放');
