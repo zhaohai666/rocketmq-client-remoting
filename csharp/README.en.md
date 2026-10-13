@@ -589,7 +589,7 @@ Subcommands:
 | --- | --- |
 | `selfcheck` | Local protocol codec self-check, no cluster needed |
 | `interop --emit` / `interop --decode <hex>` | Print / re-decode canonical frame hex (JSON and RocketMQ binary serialization) for byte-level comparison |
-| `message-types` | 8 message capabilities: async / orderly / tag / user properties / delayed / key / transaction / batch (320 lands as N independent messages) |
+| `message-types [namesrv] [ak] [sk]` | 11 message capabilities: sync / async / oneway / orderly / tag / user properties / delayed / timed / key / transaction (three states) / batch (320 lands as N independent messages); with `ak`/`sk` every type is sent and received against a broker with `authenticationEnabled=true`, preceded by a reverse assertion that an unsigned send is rejected |
 | `admin-live` | Full admin path |
 | `admin-batch-live` | Batch-style admin requests: batch create topics(18) / groups(225), read-permission ban(353), half-message resume(323), ordered topic config, cleanup calls(306/329/316), consume time span(303), nameserver config(318/319) |
 | `compression-live selftest\|send\|recv <namesrv> <topic> <group> <size> [codec]` | Compression honesty: real send → consume → decompress → CRC; `send` / `recv` act as one end of `../scripts/compression_matrix.sh` |

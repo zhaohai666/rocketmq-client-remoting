@@ -383,8 +383,8 @@ LitePull / Admin）同款 API。须在 `start()` 前设置（建 `MQClientInstan
 - ✅ 压缩：ZLIB（`gzcompress`）、纯 PHP LZ4 Frame、ZSTD（CLI 优先，纯 PHP 兜底）
 - ✅ TLS：CA 校验 / mTLS / SNI
 - ✅ 离线自测：13 套件 2,117 项断言 + 重复类名静态守卫（实测全绿）
-- ✅ 真机联调：`examples/live_*.php` 8 条用例覆盖管理端 / 重投死信 / 拉模式 / 队列变更监听 /
-  POP / TLS / Request-Reply / 压缩冒烟
+- ✅ 真机联调：`examples/live_*.php` 10 条用例覆盖管理端 / 重投死信 / 拉模式 / 队列变更监听 /
+  POP / TLS / Request-Reply / 压缩冒烟 / 静态 topic / 鉴权集群上的全部消息类型收发
 
 ## 客户端日志
 
@@ -430,6 +430,13 @@ bash scripts/run_php_live.sh <case> 127.0.0.1:9876 [legs]
 | `pop` | `examples/live_pop.php` | POP 消费 S1–S2：ACK 生效计时观察 + 失败退避（changeInvisibleTime→RETRY→重试标记）（可选 `legs=all\|s1,s2`） |
 | `tls` | `examples/live_tls.php` | TLS 三腿 `plain_tls` / `ca_verify` / `mtls`，脚本现造 CA/server(SAN:127.0.0.1)/client 证书 |
 | `compression` | `examples/live_compression.php` | 本端压缩冒烟：zlib / lz4 / zstd 自压自解一条腿；退出码 0 ok / 1 普通失败 / 2 坏 codec / 3 recv 超时 |
+| `static_topic` | `examples/live_static_topic.php` | 静态主题 S1–S5：513 建 8 队列映射 4 物理队列、路由回读、端点表、mock 队列名解析回真实 broker、端到端收发 |
+
+`examples/live_acl_message_types.php` 不走这个编排脚本：它要的是**开了鉴权**的 broker，而
+`run_php_live.sh` 起的是普通集群。跑法是 `ROCKETMQ_CLIENT_LOG_DIR=/tmp/... php
+examples/live_acl_message_types.php <namesrv> <accessKey> <secretKey> [legs]`，根目录一条命令：
+`bash scripts/run_acl_message_types_live.sh php`。反向断言两条——无凭据与错 secretKey 都必须被拒成
+`NO_PERMISSION(16)`，缺凭据参数直接用法错误退出，不会静默跳过。
 
 跑真机用例的三条硬规则：
 

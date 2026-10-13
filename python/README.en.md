@@ -440,7 +440,7 @@ named `_live`. One line each on what they prove:
 
 | Script | What it proves |
 | --- | --- |
-| `verify_message_types.py` | End-to-end over the 7 message capabilities: sync / async / oneway / batch / transactional / pinned / request-reply (hits the cluster) |
+| `verify_message_types.py [namesrv] [ak] [sk]` | End-to-end over 9 message capabilities: the real async chain (caller never blocks / executor-thread accounting / 20 concurrent sends / pinned queue / validation failures only via callback) / delay level / orderly (selector keeps one key on one queue + ordered consumption) / server-side tag filtering / key + server-side key query / user properties / transaction commit / oneway + batch / timed `TIMER_DELIVER_MS`. With `ak`/`sk` every type passes authentication by signature, preceded by one reverse assertion: an unsigned send on the same topic must come back `NO_PERMISSION(16)` |
 | `verify_live_clean.py` | Send-and-receive reconciliation on a brand-new topic, group and store directory, including batch counts |
 | `verify_acl_signature_vectors.py` | Fixed-vector comparison of the ACL signed content and signature (offline, no cluster) |
 | `verify_ack_index_live.py` | Partial ack via `ackIndex` and whole-batch failure redelivery in concurrent consumption |

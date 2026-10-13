@@ -321,8 +321,8 @@ The examples:
 
 | File | One-liner |
 | --- | --- |
-| `examples/live_producer.ts` | full send chain: sync/batch/oneway/async/selector/transaction COMMIT + broker check-back |
-| `examples/live_consumer.ts` | push consume read-back: start the consumer first, then send; every message exactly-once |
+| `examples/live_producer.ts` | full send chain: sync/batch/oneway/async/selector/transaction COMMIT + broker check-back; signs every request when given `--ak/--sk` |
+| `examples/live_consumer.ts` | push consume read-back: start the consumer first, then send; every message exactly-once; `--ak/--sk` installs the signing hook on the consumer side too |
 | `examples/live_pull.ts` | PullConsumer short polling + manual offset bookkeeping + sendMessageBack + persistence |
 | `examples/live_lite_pull.ts` | LitePull subscribe+poll, seek backwards, commitSync |
 | `examples/live_lite_queue_change.ts` | queue-change listener: scale-out 2→4 / scale-in 4→2 / unknown topic errors / polling floor |
@@ -331,6 +331,7 @@ The examples:
 | `examples/live_admin.ts` | admin: topic CRUD/cluster/runtime/subscription groups/connections/offsets/Properties config |
 | `examples/live_admin_ns.ts` | admin-only wire round-trips: 318/319 NameServer config, 309 consumeMessageDirectly, etc. |
 | `examples/live_acl.ts` | ACL: passes on a broker with authentication enabled using the right AK/SK; a wrong SK is rejected |
+| `examples/live_acl_message_types.ts` | every message type against an authenticating cluster: unsigned send rejected with broker code 16 first, then sync / async / oneway / batch / delay-level / timer / transaction / orderly / tag filter / user property / server-side key query, each read back; `--ak/--sk` required |
 | `examples/live_tls.ts` | three TLS legs: plain_tls / ca_verify / mtls (needs a TLS-dedicated cluster) |
 | `examples/live_tls_negative.ts` | negative probe: strict-CA client against the wrong CA — the route error must surface, not be swallowed |
 | `examples/live_slave_only.ts` | with only the slave broker alive, a push consumer still consumes |

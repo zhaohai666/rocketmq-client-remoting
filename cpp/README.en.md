@@ -498,7 +498,8 @@ consumer before sending messages: most scenarios rely on the consumer registerin
 broker's subscription table, offsets and trace records land on the intended group.
 
 ```bash
-./build/examples/rmq_live_message_types 127.0.0.1:9876   # the default namesrv address may be omitted
+./build/examples/rmq_live_message_types 127.0.0.1:9876
+./build/examples/rmq_live_message_types 127.0.0.1:9876 <accessKey> <secretKey>   # authenticated cluster
 ```
 
 Any failure exits non-zero. Output prints `[PASS]` / `[FAIL]` per check and a final
@@ -520,7 +521,7 @@ arguments:
 | --- | --- | --- |
 | `rmq_selfcheck` | Protocol-layer round-trip self-check, no cluster needed | — |
 | `rmq_interop` | Codec interop tool, driven by `tests/interop_check.py` | — |
-| `rmq_live_message_types` | Eight message capabilities: async / FIFO / tag / property / delayed / key query / transactional / batch | — |
+| `rmq_live_message_types` | Sync / oneway / async / async-to-queue / FIFO / tag / property / delayed / timed / key query / transaction (three states) / batch; with `[ak] [sk]` every type is sent and received on an authenticating cluster, plus the reverse assertion that unsigned sends are rejected | `authenticationEnabled=true` (ACL legs) |
 | `rmq_live_redelivery` | Thirteen legs: redelivery, offset persistence, ordered locks, broadcasting, flow control, multi-instance rebalance, explicit ack | — |
 | `rmq_live_pop` | POP polling / ack / invisible-time extension / redelivery after no ack | — |
 | `rmq_live_pop_consumer` | POP consume loop plus pullRT / pullTPS in the 307 status table | — |

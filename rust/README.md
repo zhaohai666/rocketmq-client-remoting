@@ -25,7 +25,7 @@ NameServer + Broker，无 proxy、无本地扩展依赖、无代码生成步骤�
 
 ```bash
 cd rust
-cargo build --all-targets                       # lib + 36 个 examples
+cargo build --all-targets                       # lib + 39 个 examples
 cargo test --quiet                              # 982 passed; 0 failed; 0 ignored（~10s）
 cargo clippy --all-targets -- -D warnings       # 零 warning 是硬门槛
 ```
@@ -308,6 +308,9 @@ broker 后再发消息"**（否则首批消息会因 broker 尚不认识本组�
 | `live_unit_config` | unitName / unitMode / stream：broker 侧可见的 clientId 后缀与 UNIT / UNIT_SUB 位 |
 | `live_sql92` | SQL92 过滤 + CHECK_CLIENT_CONFIG(46)；⚠ 需 broker `enablePropertyFilter=true` |
 | `live_acl` | ACL 签名鉴权全链路；⚠ 需 `authenticationEnabled=true`，实参 `<AK> <SK>` |
+| `live_acl_message_types` | 鉴权集群上的全部消息类型收发：先断言无凭据发送被拒(16)，再带签名把同步 / 异步 / 单向 / 批量 / 延迟 / 定时 / 事务（含 transactionId）/ 顺序 / Tag / Key / 用户属性逐条发出并从 broker 读回，位点提交也走签名 RPC；⚠ 需 `authenticationEnabled=true`，实参 `<AK> <SK>`（实测 `PASS=33 FAIL=0`） |
+| `live_latency` | 发送延迟故障容错 S1–S5：默认关闭不记表、健康 broker 不触发隔离、成功发送后可容错、手工注入隔离走 available→reachable→普通轮询退化链、到期恢复 |
+| `live_static_topic` | 静态主题 S1–S5：513 建 8 队列映射 4 物理队列、路由回读 `TopicQueueMappingByBroker`、端点表 0-3 真 broker / 4-7 `__syslo__none__`、实例把 mock 队列名重写到真实 broker（表外 id 透传）、端到端发 4 收 4 |
 | `live_backpressure` | 两个公平闸 + 有界发送队列的真机闭环（含运行时扩容放行） |
 | `live_async_send` | 异步内核：offsetMsgId 读回原文、并发不串台、批量异步、shutdown 不等在途 |
 | `live_fail_fast` | broker 真死时在途请求毫秒级终态；⚠ 会停一次 broker 再拉起（不删 store） |
@@ -356,7 +359,7 @@ rust/
 │       ├── hook.rs / latency.rs / consumer_stats.rs / metrics.rs / shutdown.rs
 │       ├── request_reply.rs / top_addressing.rs / validators.rs / result.rs
 │       └── trace.rs / trace_context.rs / trace_hook.rs / trace_dispatcher.rs
-└── examples/                   36 个真机联调工具（见上表）
+└── examples/                   39 个真机联调工具（见上表）
 ```
 
 单元测试内联在 `src/**/mod tests`（需要访问 `pub(crate)` 与假时钟）；只有真机才能证明的性质

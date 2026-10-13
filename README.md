@@ -374,6 +374,30 @@ CI，日志落在 `$HOME` 下既难清理也容易污染；随项目走更容易
 全部工具自带断言、失败以非 0 退出码收口；各端逐项清单与覆盖缺口写在对应 README 的
 「真实集群联调」一节。`scripts/with_cluster.sh` 会先检查 NameServer / Broker 是否就绪再执行命令。
 
+### 开启 ACL 鉴权的集群：全部消息类型逐端收发
+
+集群打开 `authenticationEnabled=true` 后，每一端都要求**成对断言**：先无凭据发一次，必须拿到
+`NO_PERMISSION(16)`；再带签名把全部消息类型发出去并从 broker 读回。只有前一半才能证明集群真在
+鉴权——没开鉴权时后一半照样全绿。
+
+```bash
+RMQ_ACL_AK=<accessKey> RMQ_ACL_SK=<secretKey> bash scripts/run_acl_message_types_live.sh       # 七端
+RMQ_ACL_AK=<accessKey> RMQ_ACL_SK=<secretKey> bash scripts/run_acl_message_types_live.sh go php # 只跑某几端
+```
+
+| 语言 | 入口 | 覆盖的消息类型 |
+| --- | --- | --- |
+| Python | `python/verify_message_types.py <namesrv> <ak> <sk>` | 异步 / 单向 / 批量 / 延迟等级 / 定时 / 事务 / 顺序 / Tag / Key 查询 / 用户属性 |
+| C++ | `cpp/build/examples/rmq_live_message_types <namesrv> <ak> <sk>` | 同步 / 异步 / 单向 / 定点异步 / 顺序 / Tag / 属性 / 延迟 / 定时 / Key 查询 / 事务三态 / 批量 |
+| C# | `... -- message-types <namesrv> <ak> <sk>` | 同步 / 异步 / 单向 / 顺序 / Tag / 属性 / 延迟 / 定时 / Key / 事务三态 / 批量 |
+| Rust | `cargo run --example live_acl_message_types -- <namesrv> <ak> <sk>` | 同步 / 异步 / 单向 / 批量 / 延迟 / 定时 / 事务（含 transactionId）/ 顺序 / Tag / Key / 属性 + 签名位点提交 |
+| Go | `go run ./examples/live_acl_message_types -ak .. -sk ..` | 同步 / 异步 / 单向 / 批量 / 延迟 / 定时 / 事务 / 顺序 / Tag / 属性 / Key 查询 |
+| Node.js | `nodeJs/examples/live_acl_message_types.ts --ak .. --sk ..` | 同步 / 异步 / 单向 / 批量 / 延迟 / 定时 / 事务 / 顺序 / Tag / 属性 / Key 查询 |
+| PHP | `php examples/live_acl_message_types.php <namesrv> <ak> <sk>` | 同步 / 异步 / 单向 / 批量 / 延迟 / 定时 / 事务 / 顺序 / Tag / Key；反向断言两条（无凭据、错 secretKey 都必须拒成 16） |
+
+`scripts/run_acl_live.sh` 是另一条更窄的腿：只验签名本身（正确凭据通过、错 secretKey 与缺凭据
+都被拒），不铺消息类型。
+
 另有一个**不依赖集群**的协议层离线自检，Python / C++ / C# / Go / Node.js / PHP 六端各有一份
 （`python -m selfcheck`、`cpp` 的 `rmq_selfcheck`、`csharp` 的 `selfcheck` 子命令、
 `go run ./examples/selfcheck`、`node --experimental-strip-types selfcheck.ts`、

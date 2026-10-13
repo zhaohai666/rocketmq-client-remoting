@@ -421,7 +421,7 @@ TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址
 
 | 脚本 | 证明 |
 | --- | --- |
-| `verify_message_types.py` | 7 类消息能力端到端：同步 / 异步 / 单向 / 批量 / 事务 / 定点 / request-reply（打集群，非 `_live` 命名） |
+| `verify_message_types.py [namesrv] [ak] [sk]` | 9 类消息能力端到端：异步真链路（不阻塞调用方 / 执行器线程口径 / 并发 20 条 / 定点 / 校验失败只走回调）/ 延迟等级 / 顺序（选择器同 key 同队列 + 顺序消费保序）/ Tag 服务端过滤 / Key + 按 Key 服务端查询 / 用户属性 / 事务提交 / 单向 + 批量 / 定时 `TIMER_DELIVER_MS`。传 `ak`/`sk` 时每一类都靠签名过鉴权，并先跑一条反向断言：同 topic 无凭据发送必须被 broker 拒成 `NO_PERMISSION(16)` |
 | `verify_live_clean.py` | 全新 topic + 全新 group + 全新 store 的干净收发对账，含批量发送计数 |
 | `verify_acl_signature_vectors.py` | ACL 签名内容与签名值的固定向量比对（离线，无需集群） |
 | `verify_ack_index_live.py` | 并发消费的 `ackIndex` 部分 ack 与整批失败重投 |

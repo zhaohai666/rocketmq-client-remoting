@@ -417,9 +417,10 @@ Assigning the public `$client->socksProxy` property works too; all five client f
 - ✅ TLS: CA verification / mTLS / SNI
 - ✅ Offline self-test: 13 suites with 2,117 assertions + the duplicate-class-name static
   guard (measured all green)
-- ✅ Live-cluster verification: the 8 `examples/live_*.php` cases cover the admin surface,
-  redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply and
-  the compression smoke
+- ✅ Live-cluster verification: the 10 `examples/live_*.php` cases cover the admin surface,
+  redelivery / dead-letter, pull mode, queue-change listening, POP, TLS, Request-Reply,
+  the compression smoke, static topics, and every message type sent and received on an
+  ACL-enforcing cluster
 
 ## Client Logging
 
@@ -471,6 +472,14 @@ bash scripts/run_php_live.sh <case> 127.0.0.1:9876 [legs]
 | `pop` | `examples/live_pop.php` | POP consumption S1–S2: timed-window observation that ACKs really take effect + failure backoff (change-invisible-time → RETRY → retry marker) (optional `legs=all\|s1,s2`) |
 | `tls` | `examples/live_tls.php` | the three TLS legs `plain_tls` / `ca_verify` / `mtls`; the script mints CA/server(SAN:127.0.0.1)/client certificates on the spot |
 | `compression` | `examples/live_compression.php` | this-end compression smoke: one php→php leg compressing and decompressing over zlib / lz4 / zstd; exit codes 0 ok / 1 ordinary failure / 2 bad codec or usage / 3 recv timeout |
+| `static_topic` | `examples/live_static_topic.php` | static topic S1–S5: 513 mapping 8 queues over 4 physical ones, route read-back, the endpoints table, mock queue names resolving back to the real broker, end-to-end send and receive |
+
+`examples/live_acl_message_types.php` does not go through this orchestration script: it needs a
+broker with authentication enabled, while `run_php_live.sh` starts a plain cluster. Run it as
+`ROCKETMQ_CLIENT_LOG_DIR=/tmp/... php examples/live_acl_message_types.php <namesrv> <accessKey>
+<secretKey> [legs]`, or from the repository root with `bash scripts/run_acl_message_types_live.sh
+php`. It carries two reverse legs — an unsigned send and a wrong secretKey must both come back
+`NO_PERMISSION(16)` — and missing credentials are a usage error, never a silent skip.
 
 Three hard rules for running the live cases:
 

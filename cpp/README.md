@@ -479,13 +479,14 @@ producer.setTlsOptions(opts);
 broker 侧的订阅表、位点与轨迹才落在预期的组上。
 
 ```bash
-./build/examples/rmq_live_message_types 127.0.0.1:9876   # 默认 namesrv 地址可省
+./build/examples/rmq_live_message_types 127.0.0.1:9876
+./build/examples/rmq_live_message_types 127.0.0.1:9876 <accessKey> <secretKey>   # 集群开了认证
 ```
 
 失败以非 0 退出码结束，输出里逐条打 `[PASS]` / `[FAIL]` 与末行 `PASS=<n> FAIL=<m>`；
 需要额外 broker 配置的分支会打 SKIP 并写明原因。
 
-大多数工具只接一个可选的 namesrv 参数（默认 `127.0.0.1:9876`）。参数更多的几只：
+绝大多数工具只接一个可选的 namesrv 参数（默认 `127.0.0.1:9876`）。参数更多的几只：
 
 ```bash
 ./build/examples/rmq_live_tls 127.0.0.1:9876 <topic> <group> [leg] [caCert] [serverName] [clientCert] [clientKey]
@@ -500,7 +501,7 @@ broker 侧的订阅表、位点与轨迹才落在预期的组上。
 | --- | --- | --- |
 | `rmq_selfcheck` | 协议层往返自检，不需要集群 | — |
 | `rmq_interop` | 编解码互操作工具，由 `tests/interop_check.py` 驱动 | — |
-| `rmq_live_message_types` | 异步 / 顺序 / Tag / 属性 / 延迟 / Key 查询 / 事务 / 批量八类消息能力 | — |
+| `rmq_live_message_types` | 同步 / 单向 / 异步 / 定点异步 / 顺序 / Tag / 属性 / 延迟 / 定时 / Key 查询 / 事务三态 / 批量等消息能力；带 `[ak] [sk]` 时每类都在鉴权集群上收发，并含无凭据被拒的反向断言 | `authenticationEnabled=true`（跑鉴权腿时） |
 | `rmq_live_redelivery` | 回投、位点持久化、顺序锁、广播、流控、多实例 rebalance、显式 ack 等十三段 | — |
 | `rmq_live_pop` | POP 拉取 / ack / 延长不可见时间 / 不 ack 复活重投 | — |
 | `rmq_live_pop_consumer` | POP 消费循环 + 307 状态表里的 pullRT / pullTPS | — |

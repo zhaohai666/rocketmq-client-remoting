@@ -17,6 +17,7 @@
 | SOCKS5/4 代理 | `NettyRemotingClient` Socks5ProxyHandler | 各端 socks 单测（真机无代理则单测为准） |
 | fail-fast（断连立刻判死在途请求） | `NettyRemotingClient#requestFail` | `live_fail_fast`（py/cpp/cs/rust） |
 | ACL 签名（SHA1+HMAC-SHA1 RPC 钩子） | `AclClientRPCHook` | `scripts/run_acl_live.sh`、`live_acl`（py/cpp/cs/rust/go/node）、`verify_acl_live.py` |
+| ACL 集群上的全部消息类型收发（七端） | `AclClientRPCHook` + `Message` 各族 | `scripts/run_acl_message_types_live.sh`：py `verify_message_types.py`、cpp `rmq_live_message_types`、cs `message-types`、rust / go / php `live_acl_message_types`、node `live_acl_message_types.ts`。每一端成对断言：无凭据必须先被拒(16)，再带签名把同步 / 异步 / 单向 / 批量 / 延迟等级 / 定时 / 事务 / 顺序 / Tag / 用户属性 / Key 逐条发出并从 broker 读回 |
 
 ## 2. 名字服务 / 路由 / 客户端实例
 
@@ -34,7 +35,7 @@
 | 能力 | 参考实现出处 | live 入口 |
 |---|---|---|
 | 同步 / 异步 / 单向发送（含重试 2+1） | `DefaultMQProducerImpl#send*` | `live_producer` / `live_async_send`（py/cpp/cs/rust/node） |
-| 消息类型（正常 / 延迟等级 / 顺序） | `MessageSysFlag` / `setDelayTimeSec` | `live_message_types`（py 用 `integration_live_test.py`） |
+| 消息类型（正常 / 延迟等级 / 顺序） | `MessageSysFlag` / `setDelayTimeSec` | `live_message_types`（py 用 `verify_message_types.py`）；鉴权集群上的同一套见上一行 |
 | 压缩（>4K，ZLIB/LZ4/ZSTD） | `CompressionCodec` | `live_compression` / `scripts/compression_matrix.sh` |
 | 批量发送（显式 batch，msgId=join UNIQ_KEY） | `DefaultMQProducerImpl#send(messages)` | `run_go_autobatch_live.sh`、`live_producer` |
 | 自动攒批 ProduceAccumulator（默认 OFF） | `ProduceAccumulator` | `run_go_autobatch_live.sh`（Go 10/10 + Py 对拍） |

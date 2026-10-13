@@ -460,7 +460,7 @@ Other switches: `ROCKETMQ_SERIALIZE_TYPE` (wire serialization, default `JSON`),
 
 ## Live Cluster Verification
 
-`examples/` holds 13 executables. They are **not part of `go test`**, every one is
+`examples/` holds 16 executables. They are **not part of `go test`**, every one is
 self-asserting, and all except `selfcheck` need a live cluster. The uniform way to run them:
 
 ```sh
@@ -476,7 +476,7 @@ Each check prints `PASS` / `FAIL` and the last line is the tally (`PASS=<n> FAIL
 | --- | --- |
 | `selfcheck` | Protocol self-test with no cluster: dual frame round-trips, header key spellings, the V2 short-key set, the 17-segment and 6-segment message formats, msgId reverse parsing, Crc32 vectors, ACL signature injection (measured `PASS=10 FAIL=0`) |
 | `wait_cluster` | Blocks until the NameServer reports a master broker. The broker's "boot success" only means its local store opened — registration is a separate thread and lags several seconds, so gate on this first |
-| `live_producer` | The six send paths, every `SendResult` field, the async kernel (callback exactly once / explicit queue / selector / batch / backpressure permit return), the two-phase transaction plus broker check-back; closing line carries `SENT=<n>` |
+| `live_producer` | The six send paths, every `SendResult` field, the async kernel (callback exactly once / explicit queue / selector / batch / backpressure permit return), the two-phase transaction plus broker check-back; closing line carries `SENT=<n>`. With `-ak/-sk` every request is signed (needs `authenticationEnabled=true`) |
 | `live_consumer` | Push consumption: `CONSUME_FROM_FIRST_OFFSET` receives everything with no duplication and no loss, a second instance of the same group gets nothing, client-side secondary Tag filtering, ordered consumption, two-instance split, graceful unregister |
 | `live_pull` | Pull: min / max / offset-by-timestamp, empty queue head short polling does not suspend, empty queue tail `NO_NEW_MSG` does not suspend, long polling waking early and expiring, caller-owned cursor, `sendMessageBack` into `%RETRY%`; closing line carries `COMMITTED=<offset>` |
 | `live_lite_pull` | LitePull: `Assign` dual-cursor advance, `Commit` and restart continuity without replay, `Seek` replay, `Subscribe` rebalance + auto-commit read back from the broker, shutdown persistence |
@@ -487,8 +487,11 @@ Each check prints `PASS` / `FAIL` and the last line is the tally (`PASS=<n> FAIL
 | `live_admin` | 29 admin checks: cluster liveness and master election, topic CRUD, broker config and runtime KV, subscription group CRUD, eight messages to verify topic stats, the four offset queries, KEYS lookup + `viewMessage`, and confirmation that the topic is gone after deletion |
 | `live_admin_batch` | The batch and housekeeping RPCs: batch topic / subscription group configuration, static topics, read-forbidden, half-message resume, order-topic config, expiry cleanup |
 | `live_compression_matrix` | One leg of the compression matrix, using positional arguments instead of flags: `send` publishes a payload rebuilt locally from a fixed recipe, `recv` reads it back and compares the CRC of the decompressed body |
+| `live_autobatch` | ProduceAccumulator: same-key batches flushed by the byte threshold and by the guard timer each land as ONE broker batch, the comma-separated batch reply splits back into per-message `SendResult`, and the async accumulation chain is covered too; closing line carries `SENT=<n>` |
+| `live_static_topic` | Static topic (513 + endpoint rewrite): 8 mapped queues over 4 physical ones, route read-back of `TopicQueueMappingByBroker`, the endpoints table resolving mock queue names back to the real broker, ids outside the table and non-static topics passing through untouched, end-to-end send and consume |
+| `live_acl_message_types` | Every message type on an authenticating cluster: the unsigned send must first be rejected with code 16, then sync / async / oneway / batch / delay-level / timer / transaction / orderly / tag / user property / server-side key query are each sent signed and read back (measured `PASS=27 FAIL=0`) |
 
-The two that need extra arguments:
+The three that need extra arguments:
 
 ```sh
 go run ./examples/live_consumer -ns 127.0.0.1:9876 \
@@ -496,6 +499,8 @@ go run ./examples/live_consumer -ns 127.0.0.1:9876 \
 
 go run ./examples/live_compression_matrix send <topic> <group> <size> 127.0.0.1:9876 zlib
 go run ./examples/live_compression_matrix recv <topic> <group> <size> 127.0.0.1:9876
+
+go run ./examples/live_acl_message_types -ns 127.0.0.1:9876 -ak <accessKey> -sk <secretKey>
 ```
 
 `live_pop` and `live_redelivery` accept `-legs s1,s2` to run only some scenarios. The
@@ -568,7 +573,7 @@ go/
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
 │   └── *_test.go                   56 test files, 626 test functions
-└── examples/                   13 executables (see "Live Cluster Verification")
+└── examples/                   16 executables (see "Live Cluster Verification")
 ```
 
 ## License

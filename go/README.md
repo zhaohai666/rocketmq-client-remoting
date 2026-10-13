@@ -440,7 +440,7 @@ go run ./examples/live_producer -ns 127.0.0.1:9876
 
 ## 真实集群联调
 
-`examples/` 下 13 个可执行工具，**不进 `go test`**，全部自断言；除 `selfcheck` 外都要
+`examples/` 下 16 个可执行工具，**不进 `go test`**，全部自断言；除 `selfcheck` 外都要
 一个活着的集群。统一跑法：
 
 ```sh
@@ -456,7 +456,7 @@ go run ./examples/<名字> -ns 127.0.0.1:9876
 | --- | --- |
 | `selfcheck` | 不连集群的协议自检：双帧回环、header 键拼写、V2 短键集、17 段与 6 段消息格式、msgId 反解、Crc32 向量、ACL 签名注入（实测 `PASS=10 FAIL=0`） |
 | `wait_cluster` | 阻塞到 NameServer 报出 master broker 才退出。Broker 的「boot success」只代表本地 store 打开，注册是另一条线程、晚几秒，跑批前先过这道门 |
-| `live_producer` | 六条发送路径、`SendResult` 各字段形状、异步内核（回调恰好一次 / 定点 / 选择器 / 批量 / 背压许可归还）、事务两阶段与 broker 回查；收口行带 `SENT=<n>` |
+| `live_producer` | 六条发送路径、`SendResult` 各字段形状、异步内核（回调恰好一次 / 定点 / 选择器 / 批量 / 背压许可归还）、事务两阶段与 broker 回查；收口行带 `SENT=<n>`；`-ak/-sk` 时全程签名（需 broker 开 `authenticationEnabled=true`） |
 | `live_consumer` | Push 消费：`CONSUME_FROM_FIRST_OFFSET` 收全且不重不漏、同组第二实例收不到、客户端二次 tag 过滤、顺序消费、双实例切分、优雅注销 |
 | `live_pull` | Pull：min / max / 按时间搜位点、空队头短轮询不挂起、空队尾 `NO_NEW_MSG` 不挂起、长轮询提前唤醒与超时、调用方游标、`sendMessageBack` 进 `%RETRY%`；收口行带 `COMMITTED=<offset>` |
 | `live_lite_pull` | LitePull：`Assign` 双游标推进、`Commit` 与重启续读不重放、`Seek` 重放、`Subscribe` 重平衡 + 自动提交在 broker 读回、关停持久化 |
@@ -467,8 +467,11 @@ go run ./examples/<名字> -ns 127.0.0.1:9876
 | `live_admin` | 管理端 29 项：集群探活与 master 选主、topic CRUD、broker 配置与运行时 KV、订阅组 CRUD、发 8 条验 topic 统计、四路位点查询、KEYS 检索 + `viewMessage`、删 topic 后确认消失 |
 | `live_admin_batch` | 批量与运维类 RPC：批量 topic / 订阅组配置、静态 topic、禁写、半消息恢复、顺序 topic 配置、清理类调用 |
 | `live_compression_matrix` | 压缩矩阵的一腿，用位置参数而不是 flag：`send` 灌一个由固定配方本地重建的载荷，`recv` 读回并比对解压正文的 CRC |
+| `live_autobatch` | ProduceAccumulator 自动攒批：同 key 攒够字节阈值 / 到守护定时器各落成**一个** broker 批量，批量应答的逗号 msgId 拆回每条 `SendResult`，异步攒批链路同样验；收口行带 `SENT=<n>` |
+| `live_static_topic` | 静态 topic（513 + endpoint 改写）：建 8 队列映射 4 物理队列、路由回读 `TopicQueueMappingByBroker`、endpoints 表里 mock 队列名解析回真 broker、表外队列与非静态 topic 原样透传、收发端到端 |
+| `live_acl_message_types` | 鉴权集群上的全消息类型收发：先跑无凭据发送必须被拒(16) 的反向断言，再带签名跑同步 / 异步 / 单向 / 批量 / 延迟等级 / 定时 / 事务 / 顺序 / Tag / 用户属性 / KEYS 服务端查询，并逐条从 broker 读回（实测 `PASS=27 FAIL=0`） |
 
-需要额外参数的两条：
+需要额外参数的三条：
 
 ```sh
 go run ./examples/live_consumer -ns 127.0.0.1:9876 \
@@ -476,6 +479,8 @@ go run ./examples/live_consumer -ns 127.0.0.1:9876 \
 
 go run ./examples/live_compression_matrix send <topic> <group> <size> 127.0.0.1:9876 zlib
 go run ./examples/live_compression_matrix recv <topic> <group> <size> 127.0.0.1:9876
+
+go run ./examples/live_acl_message_types -ns 127.0.0.1:9876 -ak <accessKey> -sk <secretKey>
 ```
 
 `live_pop` 与 `live_redelivery` 支持 `-legs s1,s2` 只跑其中几个场景。仓库根目录 `scripts/`
@@ -544,7 +549,7 @@ go/
 │   ├── consumer_stats.go · stats_item.go · consumer_running_info.go · fault_strategy.go
 │   ├── consume_directly.go · jsonutil.go
 │   └── *_test.go                   56 个测试文件，626 个测试函数
-└── examples/                   13 个可执行工具（见「真实集群联调」）
+└── examples/                   16 个可执行工具（见「真实集群联调」）
 ```
 
 ## License

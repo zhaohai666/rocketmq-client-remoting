@@ -30,7 +30,7 @@ code-generation step.
 
 ```bash
 cd rust
-cargo build --all-targets                       # lib + 36 examples
+cargo build --all-targets                       # lib + 39 examples
 cargo test --quiet                              # 982 passed; 0 failed; 0 ignored (~10s)
 cargo clippy --all-targets -- -D warnings       # zero warnings is a hard gate
 ```
@@ -339,6 +339,9 @@ list extra preconditions.
 | `live_unit_config` | unitName / unitMode / stream: the clientId suffix visible broker-side and the UNIT / UNIT_SUB flags |
 | `live_sql92` | SQL92 filtering + CHECK_CLIENT_CONFIG(46); ⚠ requires broker `enablePropertyFilter=true` |
 | `live_acl` | the ACL signing/authentication chain end to end; ⚠ requires `authenticationEnabled=true`, real args `<AK> <SK>` |
+| `live_acl_message_types` | every message type on an authenticating cluster: asserts first that an unsigned send is rejected with code 16, then sends and reads back sync / async / oneway / batch / delayed / timed / transaction (incl. transactionId) / orderly / tag / key / user property from the broker, with offset commit also going through signed RPC; ⚠ requires `authenticationEnabled=true`, real args `<AK> <SK>` (measured `PASS=33 FAIL=0`) |
+| `live_latency` | send-latency fault tolerance S1–S5: off by default so nothing is recorded, a healthy broker triggers no isolation, successful sends populate the table, an injected outage degrades available→reachable→plain round-robin, and the entry recovers on expiry |
+| `live_static_topic` | static topic S1–S5: 513 mapping 8 queues over 4 physical ones, route read-back of `TopicQueueMappingByBroker`, the endpoints table (0-3 → real broker, 4-7 → `__syslo__none__`), the instance rewriting mock queue names back to the real broker (ids outside the table pass through), end-to-end send 4 / consume 4 |
 | `live_backpressure` | the real-machine closed loop of the two fair gates + the bounded send queue (incl. admission after a runtime resize) |
 | `live_async_send` | async kernel: offsetMsgId read back verbatim, concurrency without cross-talk, batch async, shutdown does not wait for in-flight sends |
 | `live_fail_fast` | in-flight requests reach a terminal state in milliseconds when the broker truly dies; ⚠ stops the broker once then brings it back (store not deleted) |
@@ -389,7 +392,7 @@ rust/
 │       ├── hook.rs / latency.rs / consumer_stats.rs / metrics.rs / shutdown.rs
 │       ├── request_reply.rs / top_addressing.rs / validators.rs / result.rs
 │       └── trace.rs / trace_context.rs / trace_hook.rs / trace_dispatcher.rs
-└── examples/                   36 live-cluster tools (table above)
+└── examples/                   39 live-cluster tools (table above)
 ```
 
 Unit tests are inlined in `src/**/mod tests` (they need access to `pub(crate)` internals

@@ -563,7 +563,7 @@ dotnet run --no-build --project examples/RocketMQ.Examples -- lite-queue-change 
 | --- | --- |
 | `selfcheck` | 本地协议编解码自检，不依赖集群 |
 | `interop --emit` / `interop --decode <hex>` | 打印 / 反向解出规范帧 hex（JSON 与 RocketMQ 二进制双序列化），供字节级互通核对 |
-| `message-types` | 8 类消息能力：异步 / 顺序 / Tag / 用户属性 / 延迟 / Key / 事务 / 批量（320 落成 N 条独立消息） |
+| `message-types [namesrv] [ak] [sk]` | 11 类消息能力：同步 / 异步 / 单向 / 顺序 / Tag / 用户属性 / 延迟 / 定时 / Key / 事务三态 / 批量（320 落成 N 条独立消息）；传 `ak`/`sk` 时每一类都在开了 `authenticationEnabled=true` 的 broker 上收发，并先跑一次无凭据发送的反向断言 |
 | `admin-live` | 管理端全链路 |
 | `admin-batch-live` | 批量类管理请求：批量建 topic(18) / 订阅组(225)、读禁配(353)、恢复半消息(323)、顺序 topic 配置、清理类(306/329/316)、消费时间跨度(303)、nameserver 配置(318/319) |
 | `compression-live selftest\|send\|recv <namesrv> <topic> <group> <size> [codec]` | 压缩真实性：真机发送 → 消费 → 解压 → CRC；`send` / `recv` 作为 `../scripts/compression_matrix.sh` 的一端 |

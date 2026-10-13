@@ -320,8 +320,8 @@ bash scripts/run_node_live.sh <目标> [namesrv]
 
 | 文件 | 一句话 |
 | --- | --- |
-| `examples/live_producer.ts` | 发送全链路：sync/batch/oneway/async/selector/事务 COMMIT + broker 回查 |
-| `examples/live_consumer.ts` | push 消费回读：先起消费者再发消息，逐条 exactly-once 校验 |
+| `examples/live_producer.ts` | 发送全链路：sync/batch/oneway/async/selector/事务 COMMIT + broker 回查；`--ak/--sk` 时全程签名发送 |
+| `examples/live_consumer.ts` | push 消费回读：先起消费者再发消息，逐条 exactly-once 校验；`--ak/--sk` 时消费侧同样挂签名钩子 |
 | `examples/live_pull.ts` | PullConsumer 短轮询 + 位点簿记 + sendMessageBack + 持久化 |
 | `examples/live_lite_pull.ts` | LitePull subscribe+poll、seek 回退、commitSync |
 | `examples/live_lite_queue_change.ts` | 队列变更监听：扩容 2→4 / 缩容 4→2 / 未知 topic 报错 / 轮询间隔下限 |
@@ -330,6 +330,7 @@ bash scripts/run_node_live.sh <目标> [namesrv]
 | `examples/live_admin.ts` | 管理端：topic CRUD/集群/运行时/订阅组/连接/位点/Properties 配置 |
 | `examples/live_admin_ns.ts` | 管理端专属回环：318/319 NameServer 配置、309 consumeMessageDirectly 等 |
 | `examples/live_acl.ts` | ACL：开启鉴权的 broker 上，正确 AK/SK 通过、错 SK 被拒 |
+| `examples/live_acl_message_types.ts` | 鉴权集群上的全消息类型收发：无凭据被拒(16) 反向断言 + 同步/异步/单向/批量/延迟等级/定时/事务/顺序/Tag 过滤/用户属性/KEYS 服务端查询逐条读回；`--ak/--sk` 必填 |
 | `examples/live_tls.ts` | TLS 三腿：plain_tls / ca_verify / mtls（需 TLS 专用集群） |
 | `examples/live_tls_negative.ts` | 负向探针：严格 CA 连错 CA，路由错误必须透传而非吞掉 |
 | `examples/live_slave_only.ts` | 只剩 slave broker 时 push 消费者仍能消费 |

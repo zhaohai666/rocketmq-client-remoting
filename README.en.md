@@ -392,6 +392,31 @@ Every tool asserts its own expectations and exits non-zero on failure; the per-p
 coverage gaps are listed in the "Live Cluster Verification" section of each language README.
 `scripts/with_cluster.sh` checks that NameServer / Broker are ready before running a command.
 
+### Every message type on an ACL-enforcing cluster
+
+Once the broker sets `authenticationEnabled=true`, each port must assert **both halves**: an
+unsigned send first, which has to come back `NO_PERMISSION(16)`, and then every message type sent
+signed and read back from the broker. Only the first half proves enforcement — without it the
+second half is green on a cluster that never turned ACL on.
+
+```bash
+RMQ_ACL_AK=<accessKey> RMQ_ACL_SK=<secretKey> bash scripts/run_acl_message_types_live.sh         # all 7
+RMQ_ACL_AK=<accessKey> RMQ_ACL_SK=<secretKey> bash scripts/run_acl_message_types_live.sh go php # a few
+```
+
+| Language | Entry point | Message types covered |
+| --- | --- | --- |
+| Python | `python/verify_message_types.py <namesrv> <ak> <sk>` | async / oneway / batch / delay-level / timer / transaction / orderly / tag / key query / user property |
+| C++ | `cpp/build/examples/rmq_live_message_types <namesrv> <ak> <sk>` | sync / async / oneway / async-to-queue / FIFO / tag / property / delayed / timed / key query / transaction (three states) / batch |
+| C# | `... -- message-types <namesrv> <ak> <sk>` | sync / async / oneway / FIFO / tag / property / delayed / timed / key / transaction (three states) / batch |
+| Rust | `cargo run --example live_acl_message_types -- <namesrv> <ak> <sk>` | sync / async / oneway / batch / delayed / timed / transaction (incl. transactionId) / FIFO / tag / key / property + signed offset commit |
+| Go | `go run ./examples/live_acl_message_types -ak .. -sk ..` | sync / async / oneway / batch / delayed / timed / transaction / FIFO / tag / property / key query |
+| Node.js | `nodeJs/examples/live_acl_message_types.ts --ak .. --sk ..` | sync / async / oneway / batch / delayed / timed / transaction / FIFO / tag / property / key query |
+| PHP | `php examples/live_acl_message_types.php <namesrv> <ak> <sk>` | sync / async / oneway / batch / delayed / timed / transaction / FIFO / tag / key; two reverse legs (unsigned and wrong secretKey both rejected with 16) |
+
+`scripts/run_acl_live.sh` is the narrower sibling: it verifies the signature alone (correct
+credentials pass, wrong or missing credentials are rejected) and does not spread message types.
+
 There is also a cluster-free protocol-layer self-check available on six ports (`python -m
 selfcheck`, `cpp`'s `rmq_selfcheck`, `csharp`'s `selfcheck` subcommand, `go run
 ./examples/selfcheck`, `node --experimental-strip-types selfcheck.ts`, `php tests/run_all.php`):
