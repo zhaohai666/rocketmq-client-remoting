@@ -36,7 +36,10 @@ jobs:
         run: python3 scripts/check_cpp_portable_includes.py cpp
 
       - name: Configure
-        run: cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        # -g 只为运行时的可读栈：CI 是唯一能看见这类挂起的地方（本机是 macOS，
+        # POSIX 差异类挂起不复现），Optimized 行号能把停在哪个函数哪个字节说清楚。
+        # 优化级别仍由 CMAKE_BUILD_TYPE=Release 决定，这里只是追加调试信息。
+        run: cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=-g
 
       - name: Build
         run: cmake --build cpp/build -j
@@ -49,11 +52,57 @@ jobs:
         working-directory: cpp/build
         run: |
           set +e
+          # ctest 只会把卡住的用例在 120s 后杀掉，公开日志里剩一句 `***Timeout`，
+          # 既不知道停在哪个栈上，也不知道跑到第几段。这里配一个看门狗：活过 60s
+          # 的测试进程抓一份全线程栈，105s 再抓第二份（两份同帧=真 parked，不同帧=在磨）。
+          (
+            dumped60=""
+            dumped105=""
+            while :; do
+              for pid in $(pgrep -f 'rmq_test_' 2>/dev/null); do
+                case "$(cat /proc/${pid}/comm 2>/dev/null)" in
+                  rmq_test_*) ;;
+                  *) continue ;;
+                esac
+                age=$(ps -o etimes= -p "${pid}" 2>/dev/null | tr -d ' ')
+                [ -n "${age}" ] || continue
+                name=$(tr '\0' ' ' < /proc/${pid}/cmdline | cut -c1-100)
+                case " ${dumped60} " in *" ${pid} "*) ;; *)
+                  if [ "${age}" -ge 60 ]; then
+                    dumped60="${dumped60} ${pid}"
+                    echo "=== ${pid} @${age}s (1) ${name}"
+                    sudo gdb -p "${pid}" -batch -ex 'thread apply all bt' 2>/dev/null
+                  fi ;;
+                esac
+                case " ${dumped105} " in *" ${pid} "*) ;; *)
+                  if [ "${age}" -ge 105 ]; then
+                    dumped105="${dumped105} ${pid}"
+                    echo "=== ${pid} @${age}s (2) ${name}"
+                    sudo gdb -p "${pid}" -batch -ex 'thread apply all bt' 2>/dev/null
+                  fi ;;
+                esac
+              done
+              sleep 5
+            done
+          ) > /tmp/bt.log 2>&1 &
+          watcher=$!
           ctest --output-on-failure --timeout 120 -E "^(client_id|send_retry|producer_async|namespace_hook)$" > /tmp/ctest.log 2>&1
           rc=$?
+          kill "${watcher}" 2>/dev/null
           cat /tmp/ctest.log
           {
             grep -E '\*\*\*(Failed|Timeout|Not Run|Missing Command)' /tmp/ctest.log
             sed -n '/The following tests FAILED:/,$p' /tmp/ctest.log
           } | head -40 | while IFS= read -r line; do echo "::error::${line}"; done
+          if grep -q '\*\*\*Timeout' /tmp/ctest.log; then
+            # 用例自己打的段进度（行首 `[`）指明停在第几段，栈指明哪一帧；两段都只在真
+            # 出现 Timeout 时才公开，绿跑不留噪声。
+            grep -E '^\[' /tmp/ctest.log | tail -20 \
+              | while IFS= read -r line; do echo "::error::[段进度] ${line}"; done
+            if [ -s /tmp/bt.log ]; then
+              head -120 /tmp/bt.log | while IFS= read -r line; do echo "::error::${line}"; done
+            else
+              echo "::error::看门狗没抓到栈：gdb 不可用或没有活过 60s 的测试进程"
+            fi
+          fi
           exit $rc

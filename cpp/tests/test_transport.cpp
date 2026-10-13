@@ -40,6 +40,22 @@ static int g_fail = 0;
         }                                                                      \
     } while (0)
 
+// 每进一段打一行进度标记（行首 `[`）。CI 上整条用例被 ctest 在 120s 掐掉时，
+// --output-on-failure 捕获的部分输出能指明停在第几段，配合栈看门狗定位到帧。
+// 带累计毫秒是为了区分两种红：某段自己就吃掉几十秒（预算被重试放大），
+// 和进了段之后彻底不动（真 parked）。本机永远绿（macOS 关 fd 会唤醒阻塞中的
+// recv），这类信息只能从 CI 拿。
+#define STEP(label)                                                              \
+    do {                                                                         \
+        static const std::chrono::steady_clock::time_point transportT0 =         \
+            std::chrono::steady_clock::now();                                    \
+        const auto transportMs = std::chrono::duration_cast<std::chrono::milliseconds>( \
+            std::chrono::steady_clock::now() - transportT0)                      \
+            .count();                                                            \
+        std::cout << "[transport] " << (label) << " +" << transportMs << "ms"    \
+                  << std::endl;                                                  \
+    } while (false)
+
 namespace {
 
 using netcompat::socket_t;
@@ -290,6 +306,7 @@ bool throwsTimeoutException(const std::string& addr) {
 
 int main() {
     // ---------------------------------------------------------- 1. 正常同步调用 + 连接复用
+    STEP("1 sync + reuse");
     {
         TestServer server(ServerMode::Normal, 4);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
@@ -319,6 +336,7 @@ int main() {
     }
 
     // ---------------------------------------------------------- 2. 半包重组
+    STEP("2 half-split");
     {
         TestServer server(ServerMode::HalfSplit, 2);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
@@ -331,6 +349,7 @@ int main() {
     }
 
     // ---------------------------------------------------------- 3. 异步回调
+    STEP("3 async callback");
     {
         TestServer server(ServerMode::Normal, 2);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
@@ -365,6 +384,7 @@ int main() {
     // ------------------------------------------------------ 3b. 异步超时回调
     // 对端收下请求但永不回复：timeoutMillis 必须生效，回调仍要触发**一次**（带 error）。
     // 修复前该参数被直接丢弃，在途表项和回调都会永久悬挂。
+    STEP("3b async timeout");
     {
         TestServer server(ServerMode::Silent, 1);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
@@ -392,6 +412,7 @@ int main() {
     }
 
     // ---------------------------------------------------------- 4. 单向调用
+    STEP("4 oneway");
     {
         TestServer server(ServerMode::Normal, 2);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
@@ -413,12 +434,14 @@ int main() {
     }
 
     // ---------------------------------------------------------- 5. 建连失败
+    STEP("5 connect failure");
     {
         // 127.0.0.1:1 基本不可能有服务
         CHECK(throwsConnectException("127.0.0.1:1"), "connect failure -> RemotingConnectException");
     }
 
     // ---------------------------------------------------------- 6. 超时
+    STEP("6 no response");
     {
         TestServer server(ServerMode::Silent, 2);
         CHECK(throwsTimeoutException(server.address()),
@@ -426,6 +449,7 @@ int main() {
     }
 
     // ---------------------------------------------------------- 7. closeChannel / shutdown
+    STEP("7 closeChannel + shutdown");
     {
         TestServer server(ServerMode::Normal, 4);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
@@ -446,6 +470,7 @@ int main() {
         CHECK(!client.isChannelWritable(addr), "not writable after shutdown");
     }
 
+    STEP("8.1 goaway retry");
     {
         // 8.1 第一条连接回 GO_AWAY，第二条正常 -> 调用方只看到成功
         TestServer server(ServerMode::GoAway, 4, 1);
@@ -462,6 +487,7 @@ int main() {
               "GO_AWAY: the retry carries a fresh opaque, else responses mis-pair");
         client.shutdown();
     }
+    STEP("8.2 goaway twice");
     {
         // 8.2 两次都 GO_AWAY -> 抛错而不是无限重连
         TestServer server(ServerMode::GoAway, 4, 1000);
@@ -483,6 +509,7 @@ int main() {
         CHECK(server.connections() == 2, "GO_AWAY twice: retries exactly once");
         client.shutdown();
     }
+    STEP("8.3 goaway flag off");
     {
         // 8.3 开关关掉：直接失败，一条连接都不重连
         TestServer server(ServerMode::GoAway, 4, 1000);
@@ -504,6 +531,7 @@ int main() {
         CHECK(server.connections() == 1, "GO_AWAY flag off: no reconnect at all");
         client.shutdown();
     }
+    STEP("8.4 async goaway retry");
     {
         TestServer server(ServerMode::GoAway, 4, 1);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
@@ -530,6 +558,7 @@ int main() {
         CHECK(server.connections() == 2, "async GO_AWAY: retried on a new connection");
         client.shutdown();
     }
+    STEP("8.5 async goaway twice");
     {
         // 8.5 异步两次 GO_AWAY -> 折成回调错误，不能悄悄吞掉
         TestServer server(ServerMode::GoAway, 4, 1000);
@@ -557,6 +586,7 @@ int main() {
     }
 
     // ---------------------------------------------------------- 9. 地址解析
+    STEP("9 parse address");
     {
         std::string h;
         std::string p;
@@ -568,6 +598,7 @@ int main() {
         CHECK(h == "broker.example.com" && p == "10911", "parseAddress hostname");
     }
 
+    STEP("all sections done");
     std::cout << "transport checks: " << g_pass << " passed, " << g_fail << " failed\n";
     return g_fail == 0 ? 0 : 1;
 }
