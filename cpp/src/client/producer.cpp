@@ -275,15 +275,15 @@ void DefaultMQProducer::start() {
     RequestFutureHolder::getInstance().startScheduledTask();
 
     // 心跳线程：周期性向 broker 注册 ProducerData。没有它 broker 无法主动回查事务。
-    heartbeatRunning_.store(true);
+    heartbeatStop_.store(false);
     heartbeatThread_ = std::thread([this]() {
         setThreadName("ProducerHeartbeatThread");
         // 启动后立刻发一次：让 broker 尽快登记 channel，避免首条事务消息错过回查窗口。
         // 之后固定速率：每跳锚定在 heartbeatIntervalMillis_（见 schedule_util.h）——
         // "干完再按 100ms 切片睡满 30s"每轮会多出十几毫秒，心跳周期被越拖越长。
         auto next = std::chrono::steady_clock::now();
-        while (heartbeatRunning_.load()) {
-            sleepUntilDeadline(heartbeatRunning_, next);
+        while (!heartbeatStop_.load()) {
+            sleepUntilDeadline(heartbeatStop_, next);
             next += std::chrono::milliseconds(heartbeatIntervalMillis_);
             try {
                 sendHeartbeatToAllBroker();
@@ -301,7 +301,7 @@ void DefaultMQProducer::start() {
         [this](const std::string& addr, int32_t timeoutMillis) {
             return detectBrokerByMaxOffset(addr, timeoutMillis);
         });
-    detectorRunning_.store(true);
+    detectorStop_.store(false);
     detectorThread_ = std::thread([this]() { detectorLoop(); });
 }
 
@@ -344,11 +344,11 @@ void DefaultMQProducer::shutdown() {
         traceDispatcher_.reset();
     }
     // 先停心跳线程（它内部持有 mqClient_ 引用），再回收其它线程
-    heartbeatRunning_.store(false);
+    heartbeatStop_.store(true);
     if (heartbeatThread_.joinable()) {
         heartbeatThread_.join();
     }
-    detectorRunning_.store(false);
+    detectorStop_.store(true);
     if (detectorThread_.joinable()) {
         detectorThread_.join();
     }
@@ -1608,8 +1608,13 @@ int32_t DefaultMQProducer::sendHeartbeatToAllBroker() {
 void DefaultMQProducer::detectorLoop() {
     setThreadName("FaultDetectorThread");
     auto next = std::chrono::steady_clock::now();
-    while (detectorRunning_.load()) {
-        sleepUntilDeadline(detectorRunning_, next);
+    // 注意：sleepUntilDeadline 的第一参是"停止标志"（false=继续睡，true=立刻返回），
+    // 与 consumer 的 stop_、mq_client 的 routeRefreshStop_ 同一约定。此前把运行中标志
+    // detectorRunning_ 直接传进来，极性反了：运行期 sleepUntilDeadline 立即返回，
+    // 循环变成零节流热轮询，next 每轮无条件 +3s 被推到实际时刻几十小时之外；
+    // shutdown 置停后线程反而进入"睡到 next"分支，join 被拖住数小时（ctest 挂死根因）。
+    while (!detectorStop_.load()) {
+        sleepUntilDeadline(detectorStop_, next);
         next += std::chrono::milliseconds(3000);
         if (!mqFaultStrategy_.isStartDetectorEnable()) {
             continue;

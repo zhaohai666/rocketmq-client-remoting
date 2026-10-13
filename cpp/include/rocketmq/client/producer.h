@@ -384,13 +384,16 @@ protected:
     std::mutex txThreadsMutex_;
 
     std::thread heartbeatThread_;
-    std::atomic<bool> heartbeatRunning_{false};
+    // 停止标志（false=运行中，true=已停），与 sleepUntilDeadline(stop, ...) 的契约一致：
+    // 传"运行中"语义的标志会把极性搞反——运行期零节流热循环、且 next 每轮 +interval
+    // 无限超前；stop 后线程反而要睡到一个被推到几十小时外的 deadline，join 永久挂死。
+    std::atomic<bool> heartbeatStop_{true};
     std::atomic<int64_t> lastHeartbeatMs_{0};
     int32_t heartbeatIntervalMillis_ = 30000;
     std::atomic<int32_t> heartbeatCount_{0};
 
     std::thread detectorThread_;
-    std::atomic<bool> detectorRunning_{false};
+    std::atomic<bool> detectorStop_{true};
     std::mutex detectTopicsMutex_;
     std::set<std::string> detectTopics_;
 
