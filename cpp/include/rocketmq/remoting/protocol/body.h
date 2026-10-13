@@ -164,8 +164,10 @@ struct ConsumeStatsList {
     JsonValue statsList;  // 透传
     std::string brokerAddr;
     bool hasBrokerAddr = false;
-    long long totalDiff = 0;
-    long long totalInflightDiff = 0;
+    // int64_t（不是 long long）：在 LP64 上 int64_t==long 与 long long 是不同类型，
+    // `tryGetInt(key, int64_t&)` 无法绑定 long long& 左值（CI 的 gcc 直接报错）。
+    int64_t totalDiff = 0;
+    int64_t totalInflightDiff = 0;
 
     JsonValue toJson() const;
     static ConsumeStatsList fromJson(const JsonValue& v);
