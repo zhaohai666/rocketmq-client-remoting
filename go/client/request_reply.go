@@ -185,8 +185,8 @@ func (h *RequestFutureHolder) RemoveRequest(correlationID string) *RequestRespon
 	return nil
 }
 
-// PutResponse removes the future FIRST (the Rust contract: whoever removes
-// owns it), then wakes it and fires its callback. A nil return means no one is
+// PutResponse removes the future FIRST (whoever removes owns it), then wakes
+// it and fires its callback. A nil return means no one is
 // waiting — a normal race when a request timed out or a duplicate push
 // arrived.
 func (h *RequestFutureHolder) PutResponse(correlationID string, response *common.MessageExt) *RequestResponseFuture {

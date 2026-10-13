@@ -56,7 +56,7 @@ func TestStatsSnapshotWithOnlyOneEntryIsNaN(t *testing.T) {
 		t.Errorf("snapshot = %+v, want all zeros", snap)
 	}
 	if !math.IsNaN(snap.Tps) {
-		t.Errorf("Tps = %v, want NaN (0 * 1000.0 / 0, unguarded as in Java)", snap.Tps)
+		t.Errorf("Tps = %v, want NaN (0 * 1000.0 / 0, left unguarded)", snap.Tps)
 	}
 }
 
@@ -186,7 +186,7 @@ func TestStatsItemSetKeepsTheFirstItemsKind(t *testing.T) {
 		t.Fatal("item was not created")
 	}
 	if !it.rtItem {
-		t.Error("the RT item was replaced by a plain one; Java keeps the first")
+		t.Error("the RT item was replaced by a plain one; the first item must be kept")
 	}
 	if !containsSubstring(it.statPrintDetail(it.statsDataInMinute()), "AVGRT") {
 		t.Errorf("print detail = %q, want the RT variant", it.statPrintDetail(it.statsDataInMinute()))
@@ -408,7 +408,7 @@ func TestRecordConsumeSuccessTPSReproducesNegativeOkWithoutClamping(t *testing.T
 
 	m.samplingInSeconds()
 	if got := m.topicAndGroupConsumeOKTPS.statsDataInMinute(key).Sum; got != -4 {
-		t.Errorf("OK sum = %d, want -4 (ackIndex+1 = -4, unclamped as in Java)", got)
+		t.Errorf("OK sum = %d, want -4 (ackIndex+1 = -4, left unclamped)", got)
 	}
 	if got := m.consumeStatus(group, topic).ConsumeFailedTPS; got != 0.8 {
 		t.Errorf("ConsumeFailedTPS = %v, want 0.8 (4 - (-4) = 8 over 10s)", got)

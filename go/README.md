@@ -496,8 +496,8 @@ go run ./examples/live_compression_matrix recv <topic> <group> <size> 127.0.0.1:
 - ZLIB 与 LZ4 编码是真压缩：同一份 9600 字节载荷，ZLIB 压到 80 字节、LZ4 压到 103 字节，
   三个 codec 回环都一致。
 - POP 的队列集合默认由本地重平衡算出（每队列一个 POP 循环 + ack）；`SetClientRebalance(false)`
-  改为向 broker 发 `QUERY_ASSIGNMENT(400)` 由服务端分配（对齐 Java `clientRebalance=false`
-  语义：broker 出错/应答缺失集合时保留当前分配，显式空集合清空，重试节奏跟随 20s 重平衡循环）。
+  改为向 broker 发 `QUERY_ASSIGNMENT(400)` 由服务端分配（语义：broker 出错/应答缺失集合时保留
+  当前分配，显式空集合清空，重试节奏跟随 20s 重平衡循环）。
 - `OFFSET_ILLEGAL` 冻结重建、拉取流控五档、心跳全景、六个分配策略目前只有单测与进程内假集群
   覆盖，`examples/` 里还没有对应的真机工具。
 

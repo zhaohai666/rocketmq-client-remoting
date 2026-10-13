@@ -27,7 +27,7 @@
 // defer, nothing. Without that, a leaked send-back goroutine would finish on
 // its own and the test would pass even against the broken build.
 //
-// THE TRAP THIS AVOIDS (same one the Rust live_shutdown_race documents): a
+// THE TRAP THIS AVOIDS: a
 // single-process version that pads a sleep(2s) after shutdown() is testing the
 // sleep, not the contract — the goroutines it forgot to join simply finish
 // during the padding.
@@ -426,7 +426,7 @@ func newPush(ns string, cfg consCfg, topics ...string) (*client.DefaultMQPushCon
 	return c, nil
 }
 
-// killNow is the Go analogue of Rust's drop(runtime): os.Exit tears the process
+// killNow is the hard exit: os.Exit tears the process
 // down without waiting for a single goroutine. Whatever the client still had in
 // flight at this instant is gone — that is the contract under test.
 func killNow() { os.Exit(0) }

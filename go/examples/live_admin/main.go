@@ -6,9 +6,8 @@
 //
 //	go run ./examples/live_admin -ns 127.0.0.1:9876
 //
-// 对标 python/verify_admin_live.py 与 rust/examples/live_admin.rs；Go 侧管理端
-// 库（client/admin*.go）此前只有 35 条单测，没有真机工具 —— 报文编码错了照样能过
-// mock broker，所以这一层必须落到真集群。
+// 本程序覆盖 Go 侧管理端库（client/admin*.go）：此前只有 35 条单测，没有真机
+// 工具 —— 报文编码错了照样能过 mock broker，所以这一层必须落到真集群。
 //
 // 每项打印 PASS/FAIL，任一项失败进程以非 0 退出码结束，收口行
 // `PASS=<n> FAIL=<n> TOPIC=<topic>`。

@@ -11,9 +11,9 @@
 //  2. the hooks skip any message whose topic starts with the trace topic name.
 //
 // Shutdown flushes and WAITS for the last batches: a short-lived client that
-// stops one tick after its last consume must still get that record out (the
-// Rust port hit exactly this — the final batch was still queued when the
-// internal producer was torn down).
+// stops one tick after its last consume must still get that record out
+// (otherwise the final batch is still queued when the internal producer is
+// torn down).
 package client
 
 import (

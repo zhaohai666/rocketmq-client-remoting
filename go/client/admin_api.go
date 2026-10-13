@@ -212,7 +212,7 @@ func (i *Instance) DeleteTopicInNameSrv(topic string, timeoutMillis int64) error
 	return common.ClientError(fmt.Sprintf("Failed to delete topic %s in name server", topic))
 }
 
-// ---------------- java.util.Properties codec ----------------
+// ---------------- properties-text codec ----------------
 
 // This matters because GET_BROKER_CONFIG(26) returns properties TEXT, not
 // JSON — a client that parses it as a KVTable fails on every real broker.

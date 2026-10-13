@@ -979,8 +979,8 @@ func (c *DefaultLitePullConsumer) Commit() error {
 	c.mu.Lock()
 	for mq := range c.assigned {
 		// A queue Poll never delivered from has NO cursor yet — the map's zero
-		// value 0 must not sneak in as a "committed at 0" (Rust's
-		// unwrap_or(-1) guards the same hole against the -1 check below).
+		// value 0 must not sneak in as a "committed at 0"; the -1 check below
+		// relies on absent cursors staying out of targets.
 		if off, ok := c.consumeOffset[mq]; ok {
 			targets[mq] = off
 		}
@@ -1345,7 +1345,7 @@ func (c *DefaultLitePullConsumer) heartbeatLoop(stop chan struct{}) {
 
 // sendHeartbeatToAllBrokers builds and fans the heartbeat out; the return
 // value counts the brokers that accepted it (0 when not started — the loop
-// keeps ticking like the Rust/Python ports instead of exiting).
+// keeps ticking instead of exiting).
 func (c *DefaultLitePullConsumer) sendHeartbeatToAllBrokers() int {
 	c.mu.Lock()
 	if c.instance == nil {

@@ -4,14 +4,14 @@
 //	go run ./examples/live_consumer -ns 127.0.0.1:9876 \
 //	    -topic T -group G -expect 12 -orderly-topic T_ord -orderly-expect 6
 //
-// The messages are produced by the PYTHON client (go_consumer_feed_check.py),
-// so the check is genuinely cross-language: Go's own producer already proves
-// the wire format by being read back by Python, and this direction proves the
+// The messages are produced by an external reference-client feeder script, so
+// the check is genuinely cross-implementation: Go's own producer already proves
+// the wire format by being read back externally, and this direction proves the
 // Go consumer can decode and ack what another implementation wrote.
 //
 // Scenarios:
 //
-//	S1  CONSUME_FROM_FIRST_OFFSET drains everything the Python client produced;
+//	S1  CONSUME_FROM_FIRST_OFFSET drains everything the external feeder produced;
 //	    every body arrives exactly once and in per-queue offset order.
 //	S2  the committed offset is on the broker: a SECOND consumer in the same
 //	    group receives nothing (the group already consumed it).
@@ -256,7 +256,7 @@ func allTopics(c *client.DefaultMQPushConsumer) string {
 
 // ---------------------------------------------------------------- scenarios
 
-// S1: CONSUME_FROM_FIRST_OFFSET drains everything the Python client produced;
+// S1: CONSUME_FROM_FIRST_OFFSET drains everything the external feeder produced;
 // every body arrives exactly once and in per-queue offset order.
 func runS1(ns, topic, group string, expect int) {
 	coll := newCollector()
@@ -530,7 +530,7 @@ func runS5(ns, topic, group string) {
 // The Go side can only prove the group WAS registered (a non-empty assignment
 // means the broker answered GET_CONSUMER_LIST_BY_GROUP for this clientId) and
 // that the consumer then reports itself stopped. The third leg — that the
-// broker-side connection really disappeared — is read back by the Python
+// broker-side connection really disappeared — is read back by the external
 // verifier, which is why this scenario's group is passed to it.
 func runS6(ns, topic, group string) {
 	coll := newCollector()

@@ -7,11 +7,10 @@ import (
 	"testing"
 )
 
-// The vectors below are the same fixtures asserted by
-// python/verify_acl_signature_vectors.py, captured from a probe that printed
-// content_hex and the signature for fixed inputs. A green run here means the
-// Go signer is byte-identical to the recorded vectors, not merely
-// self-consistent — and the broker's ACL validator recomputes exactly this
+// The vectors below are recorded reference fixtures, captured from a probe
+// that printed content_hex and the signature for fixed inputs. A green run
+// here means the Go signer is byte-identical to the recorded vectors, not
+// merely self-consistent — and the broker's ACL validator recomputes exactly this
 // content and signature.
 const (
 	v1ContentHex = "414b5f544553546c6173743166616c73654d7947726f75704d79546f7069630102030405"

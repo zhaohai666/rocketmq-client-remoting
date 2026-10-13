@@ -1035,9 +1035,8 @@ func (i *Instance) GetBrokerNameFromMessageQueue(mq common.MessageQueue) string 
 
 // EndPointsOf returns a copy of the static-topic endpoints entry for the
 // topic (nil when the topic has no mapping, i.e. it is not a static topic).
-// Diagnostics/live-tool parity with the other ends: python exposes the client
-// instance, C# exposes Client(), rust exposes mq_client(); this is the Go
-// read-only accessor over topicEndPointsTable.
+// Diagnostics/live-tool support: this is the read-only accessor over
+// topicEndPointsTable.
 func (i *Instance) EndPointsOf(topic string) map[common.MessageQueue]string {
 	i.mu.Lock()
 	defer i.mu.Unlock()

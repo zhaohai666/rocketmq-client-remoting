@@ -160,10 +160,10 @@ func (a *DefaultMQAdminExt) CreateStaticTopic(brokerAddr, defaultTopic string,
 	if mapping == nil {
 		return common.ClientError("createStaticTopic: nil TopicQueueMappingDetail")
 	}
-	// Java's TopicConfig defaults perm to PERM_READ|PERM_WRITE; Go's struct
-	// has no zero-value default, and a perm=0 topic is created unwritable AND
+	// The protocol default for perm is PERM_READ|PERM_WRITE; Go's struct has
+	// no zero-value default, and a perm=0 topic is created unwritable AND
 	// unreadable (producers then see zero publish queues). Treat 0 as "unset"
-	// and apply the Java default.
+	// and apply that default.
 	if config.Perm == 0 {
 		config.Perm = common.PermRead | common.PermWrite
 	}

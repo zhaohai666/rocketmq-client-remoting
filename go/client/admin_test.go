@@ -233,7 +233,7 @@ func (c *adminCluster) onBroker(s *mockServer, req *remoting.RemotingCommand) *r
 	case remoting.ReqGetAllSubscriptionGroupConfig:
 		return c.subscriptionGroupPage(req)
 	case remoting.ReqGetBrokerConfig:
-		// java.util.Properties TEXT, not JSON.
+		// Properties TEXT, not JSON.
 		return respOK([]byte("brokerName=b1\nbrokerId=0\n# comment\nmaxMessageSize: 4194304\n"))
 	case remoting.ReqGetBrokerRuntimeInfo:
 		kv := remoting.NewKVTable()
@@ -380,7 +380,7 @@ func encodeStored(t *testing.T, msg *common.MessageExt) []byte {
 	return raw
 }
 
-// ---------------- pure function: java.util.Properties ----------------
+// ---------------- pure function: properties-text parsing ----------------
 
 func TestString2PropertiesMatchesServerPropertyParsing(t *testing.T) {
 	text := strings.Join([]string{
@@ -452,7 +452,7 @@ func TestAdminStartRequiresNameserver(t *testing.T) {
 	admin.SetInstanceName(uniqueSuffix(t))
 	err := admin.Start()
 	if err == nil || !strings.Contains(err.Error(), "name server address is not set") {
-		t.Fatalf("Start without a nameserver must fail with the Java message, got %v", err)
+		t.Fatalf("Start without a nameserver must fail with the not-set message, got %v", err)
 	}
 }
 
@@ -550,7 +550,7 @@ func TestAdminExamineTopicRouteMissing(t *testing.T) {
 	c := newAdminCluster(t)
 	_, err := c.admin.ExamineTopicRoute("NoSuchTopic")
 	if err == nil || !strings.Contains(err.Error(), "topic NoSuchTopic not exist") {
-		t.Fatalf("want the Java wording, got %v", err)
+		t.Fatalf("want the topic-not-exist wording, got %v", err)
 	}
 }
 
@@ -610,14 +610,14 @@ func TestAdminExamineTopicStatsMergesAndRejectsEmpty(t *testing.T) {
 	}
 	if _, err := empty.admin.ExamineTopicStats("MyTopic"); err == nil ||
 		!strings.Contains(err.Error(), "Not found the topic stats info") {
-		t.Fatalf("empty stats must raise the Java message, got %v", err)
+		t.Fatalf("empty stats must raise the not-found message, got %v", err)
 	}
 }
 
 // ---------------- broker config ----------------
 
-// GET_BROKER_CONFIG(26) returns java.util.Properties TEXT. Parsing it as a
-// KVTable JSON — which an earlier port did — fails on every real broker.
+// GET_BROKER_CONFIG(26) returns properties TEXT. Parsing it as a KVTable
+// JSON fails on every real broker.
 func TestAdminGetBrokerConfigParsesPropertiesText(t *testing.T) {
 	c := newAdminCluster(t)
 	props, err := c.admin.GetBrokerConfig(c.brokerSrv.addr, 0)
@@ -992,7 +992,7 @@ func TestAdminResetOffsetByTimestampSendsIsForce(t *testing.T) {
 		t.Error("must NOT send `force` — the broker reads `isForce`")
 	}
 	if got := ext(t, req, "offset"); got != "-1" {
-		t.Errorf("offset = %q, want -1 (Java's null-offset sentinel)", got)
+		t.Errorf("offset = %q, want -1 (the null-offset sentinel)", got)
 	}
 	if got := ext(t, req, "timestamp"); got != "-1" {
 		t.Errorf("timestamp = %q", got)

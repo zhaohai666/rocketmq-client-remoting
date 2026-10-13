@@ -626,8 +626,8 @@ func (c *DefaultMQPushConsumer) finishOrderlyHook(hooks []ConsumeMessageHook, ct
 	executeConsumeHookAfter(hooks, ctx)
 }
 
-// consumeReturnType is Python _consume_return_type (Rust consume_return_type) —
-// the value lands in the trace's SubAfter contextCode.
+// consumeReturnType maps the consume outcome to the value that lands in the
+// trace's SubAfter contextCode.
 func (c *DefaultMQPushConsumer) consumeReturnType(unknown, panicked, failed bool, rtMs int64) ConsumeReturnType {
 	if unknown {
 		if panicked {

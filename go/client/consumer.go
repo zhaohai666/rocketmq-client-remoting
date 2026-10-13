@@ -937,7 +937,7 @@ func (c *DefaultMQPushConsumer) RebalanceImmediately() {
 func (c *DefaultMQPushConsumer) AdjustThreadPool() {
 	total := c.computeAccumulationTotal()
 	if total > c.adjustThreadPoolNumsThreshold {
-		common.LogWarnf("the consumer [%s] accumulation is %d, exceeds the threshold %d (auto adjust is a no-op in Java 5.x)",
+		common.LogWarnf("the consumer [%s] accumulation is %d, exceeds the threshold %d (auto adjust is a no-op here)",
 			c.consumerGroup, total, c.adjustThreadPoolNumsThreshold)
 	}
 }

@@ -142,8 +142,8 @@ func InitLogging() {
 	})
 }
 
-// rotateLocked rolls the current file into the fixed backup window
-// (csharp ClientLog.RollLocked / nodeJs roll): delete <file>.N, shift .N-1→.N …
+// rotateLocked rolls the current file into the fixed backup window:
+// delete <file>.N, shift .N-1→.N …
 // .1→.2, then base→.1 and reopen. Callers hold logMu.
 func rotateLocked() {
 	f, ok := logWriter.(*os.File)

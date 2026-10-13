@@ -679,7 +679,7 @@ func TestPopDelayLevelTable(t *testing.T) {
 		t.Fatalf("10s -> %d, want 1", got)
 	}
 	if got := popDelayLevelForElapsed(5_000); got != -1 {
-		t.Fatalf("5s -> %d, want -1 (Java's loop then AIOOBEs)", got)
+		t.Fatalf("5s -> %d, want -1 (below the first delay level)", got)
 	}
 	if got := popDelayLevelSeconds(popDelayLevelForElapsed(5_000)); got != 10 {
 		t.Fatalf("5s clamps to %d, want 10", got)

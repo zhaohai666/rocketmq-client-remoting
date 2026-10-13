@@ -105,7 +105,7 @@ func TestTraceEncodePubMatchesWireFormat(t *testing.T) {
 	}
 	tb := EncodeTraceContext(ctx)
 	if tb.TransData != expectedPub {
-		t.Errorf("encoded Pub differs from the Java vector:\n got %q\nwant %q", tb.TransData, expectedPub)
+		t.Errorf("encoded Pub differs from the expected vector:\n got %q\nwant %q", tb.TransData, expectedPub)
 	}
 	if got := keysOf(tb.TransKey); !equalStringSet(got, []string{referenceMsgID1, "KeyA", "KeyB"}) {
 		t.Errorf("trans keys = %v", got)

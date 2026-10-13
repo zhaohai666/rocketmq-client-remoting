@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// python3 -c 'import zlib; print(zlib.compress(b"rocketmq-compressed-payload-"*40, 5).hex())'
+// Reference fixture: zlib.compress(b"rocketmq-compressed-payload-"*40, level 5), hex-encoded.
 const zlibFixture47 = "785e2bca4fce4e2dc92dd44dcecf2d284a2d2e4e4dd12d48acccc94f4cd12d1a951b951b951b95a3400e0058e0b9f0"
 
 var zlibPayload = bytes.Repeat([]byte("rocketmq-compressed-payload-"), 40)
@@ -138,7 +138,7 @@ func TestZlibOutputIsRFC1950(t *testing.T) {
 	if compressed[0] != 0x78 {
 		t.Fatalf("missing zlib header byte, got 0x%X", compressed[0])
 	}
-	// 与 Python zlib 输出可互相解开（deflate 实现字节不必一致，流必须一致）
+	// 与标准 zlib 输出可互相解开（deflate 实现字节不必一致，流必须一致）
 	other, err := ZlibDecompress(mustZlibFixture(t))
 	if err != nil || !strings.HasPrefix(string(other), "rocketmq-compressed-") {
 		t.Fatal("fixture payload mismatch")

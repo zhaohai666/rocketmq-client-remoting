@@ -9,7 +9,7 @@
 //   - the consumer EXTRACTS it so business code can parent its own span.
 //
 // Opt-in via SetEnableTraceContext or the ROCKETMQ_TRACE_CONTEXT_ENABLE env
-// var (same switch names as the other ports).
+// var.
 package client
 
 import (
@@ -114,8 +114,7 @@ func ExtractTraceparent(msg *common.MessageExt) (string, bool) {
 	return v, true
 }
 
-// TraceContextEnabledFromEnv reads ROCKETMQ_TRACE_CONTEXT_ENABLE (the env
-// convention shared by the other ports).
+// TraceContextEnabledFromEnv reads ROCKETMQ_TRACE_CONTEXT_ENABLE.
 func TraceContextEnabledFromEnv() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(traceContextEnableEnv))) {
 	case "1", "true", "yes":

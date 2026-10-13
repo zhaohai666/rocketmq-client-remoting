@@ -169,7 +169,7 @@ func TestTransactionProducerRequiresListener(t *testing.T) {
 		t.Fatal("a transaction send without a listener must fail")
 	}
 	if !strings.Contains(err.Error(), "TransactionListener is null") {
-		t.Errorf("error = %v, want Java's wrapper wording", err)
+		t.Errorf("error = %v, want the wrapper wording", err)
 	}
 	if got := len(broker.requests(remoting.ReqSendMessageV2)); got != 0 {
 		t.Errorf("nothing may be sent, but the broker saw %d requests", got)

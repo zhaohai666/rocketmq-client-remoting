@@ -667,9 +667,8 @@ func (a *DefaultMQAdminExt) GetBrokerRuntimeInfo(brokerAddr string, timeoutMilli
 	return a.FetchBrokerRuntimeStats(brokerAddr, timeoutMillis)
 }
 
-// GetBrokerConfig sends GET_BROKER_CONFIG(26). The body is java.util.Properties
-// TEXT, not JSON — an earlier port parsed it as a KVTable and therefore failed
-// on every real broker.
+// GetBrokerConfig sends GET_BROKER_CONFIG(26). The body is properties TEXT,
+// not JSON — parsing it as a KVTable fails on every real broker.
 func (a *DefaultMQAdminExt) GetBrokerConfig(brokerAddr string, timeoutMillis int64) (map[string]string, error) {
 	response, err := a.invokeBroker(brokerAddr, remoting.ReqGetBrokerConfig, nil, nil, timeoutMillis)
 	if err != nil {

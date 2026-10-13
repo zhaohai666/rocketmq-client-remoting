@@ -512,7 +512,7 @@ func TestRouteFetchTopicNotExistIsQuietlyFalse(t *testing.T) {
 	}
 	_, err = inst.GetTopicPublishInfo("Tt", false)
 	if err == nil || !strings.Contains(err.Error(), "Can not find Message Queue for topic: Tt") {
-		t.Errorf("publish info must fail with the Java wording, got %v", err)
+		t.Errorf("publish info must fail with the no-queue wording, got %v", err)
 	}
 }
 
@@ -845,7 +845,7 @@ func TestCheckSubscriptionsInBroker(t *testing.T) {
 	}
 	err = inst4.CheckSubscriptionsInBroker("CG", []*remoting.SubscriptionData{sqlSub})
 	if err == nil || !strings.Contains(err.Error(), "Check client in broker error, maybe because you use SQL92") {
-		t.Fatalf("transport failure must get the fixed Java wording, got %v", err)
+		t.Fatalf("transport failure must get the fixed wording, got %v", err)
 	}
 }
 

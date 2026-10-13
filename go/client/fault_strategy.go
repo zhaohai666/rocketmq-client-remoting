@@ -193,8 +193,8 @@ func (l *latencyFaultToleranceImpl) faultItem(name string) *faultItem {
 // With sendLatencyFaultEnable off (the default) selection degrades to: try the
 // round-robin ring while skipping lastBrokerName, and if a full round is
 // filtered out, fall back to unconditional round-robin. Note there is
-// deliberately no resetIndex here — Python's latency.py does the same, and the
-// index reset is only needed by the enabled path to escape a poisoned cursor.
+// deliberately no resetIndex here — the index reset is only needed by the
+// enabled path to escape a poisoned cursor.
 type mqFaultStrategy struct {
 	mu                     sync.Mutex
 	sendLatencyFaultEnable bool

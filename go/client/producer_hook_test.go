@@ -342,7 +342,7 @@ func TestCheckForbiddenHookContextFields(t *testing.T) {
 		t.Errorf("mq topic = %q, want the namespaced topic", ctx.MQ.Topic)
 	}
 	if ctx.Arg != nil {
-		t.Errorf("arg = %v, want nil (Java sends none)", ctx.Arg)
+		t.Errorf("arg = %v, want nil (no arg is sent)", ctx.Arg)
 	}
 }
 

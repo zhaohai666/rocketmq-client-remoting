@@ -16,7 +16,7 @@ import (
 // 要写满 64MB 才看得见 —— 只能离线用小上限造出来。
 //
 // 三条判据：
-//  1. 默认文件名是本端专属的 rocketmq_go_client.log，**不用**跨语言共享的
+//  1. 默认文件名是本端专属的 rocketmq_go_client.log，**不用**通用的
 //     rocketmq_client.log（同机两个客户端进程共用一个文件时会互相插行、并把
 //     对方的文件轮走，之后各自写进已 unlink 的 inode）；
 //  2. OFF / NONE / 空串关掉文件落盘（只剩 stderr），USE_STDOUT 优先；
@@ -75,7 +75,7 @@ func TestLogDefaultsToPortSpecificFileName(t *testing.T) {
 	if !strings.Contains(string(data), "hello default") {
 		t.Fatalf("log line missing from %q: %q", got, data)
 	}
-	// 行格式：时间戳 + 级别 + 消息（与其余端口同一口径）
+	// 行格式：时间戳 + 级别 + 消息
 	if !strings.Contains(string(data), " INFO ") {
 		t.Fatalf("level token missing: %q", data)
 	}
@@ -113,7 +113,7 @@ func TestLogUseStdoutWinsOverFile(t *testing.T) {
 
 func TestLogFilePathWithSeparatorIsFullPath(t *testing.T) {
 	dir := t.TempDir()
-	// 带路径分隔符的 ROCKETMQ_CLIENT_LOG_FILE 当整路径处理（同 php/csharp 口径），
+	// 带路径分隔符的 ROCKETMQ_CLIENT_LOG_FILE 当整路径处理，
 	// 否则用户没法把日志放到 LOG_DIR 之外。
 	full := filepath.Join(dir, "nested", "deep", "rmq.log")
 	resetSink(t, dir, full, 0, 0)

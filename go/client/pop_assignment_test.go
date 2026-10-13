@@ -135,7 +135,7 @@ func TestQueryAssignmentRequestBodyFields(t *testing.T) {
 		t.Fatalf("clientId = %q, want %q", got.ClientID, f.clientID)
 	}
 	if got.StrategyName != "AVG" {
-		t.Fatalf("strategyName = %q (Java sends the client strategy's name)", got.StrategyName)
+		t.Fatalf("strategyName = %q, want the client strategy's name", got.StrategyName)
 	}
 	if got.MessageModel != MessageModelClustering {
 		t.Fatalf("messageModel = %q", got.MessageModel)
@@ -278,7 +278,7 @@ func TestClientRebalanceDefaultKeepsLocalPath(t *testing.T) {
 	// The setter flips the path for later rounds only; the local strategy is
 	// what built this assignment.
 	if !c.IsClientRebalance() {
-		t.Fatal("default clientRebalance must be true (Java DefaultMQPushConsumer)")
+		t.Fatal("default clientRebalance must be true")
 	}
 }
 

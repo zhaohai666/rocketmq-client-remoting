@@ -326,15 +326,15 @@ func TestConsumerRunningInfoClassicConsumerFillsOnlyMqTable(t *testing.T) {
 		}
 	}
 	if _, ok := pqi["cachedMsgSizeInMiB"]; !ok {
-		t.Error("cachedMsgSizeInMiB is unconditional in Java")
+		t.Error("cachedMsgSizeInMiB must always be present")
 	}
 	if _, ok := pqi["droped"]; !ok {
-		t.Errorf("the field is spelled `droped` (one p), Java's typo: %v", pqi)
+		t.Errorf("the field is spelled `droped` (one p) on the wire: %v", pqi)
 	}
 	// A long field rendering matters: 14 keys means the int-typed
 	// cachedMsgSizeInMiB must not have smuggled a JSONDouble in.
 	if _, ok := pqi["cachedMsgSizeInMiB"].(int32); !ok {
-		t.Errorf("cachedMsgSizeInMiB = %#v, want a plain int32 (Java `int`)", pqi["cachedMsgSizeInMiB"])
+		t.Errorf("cachedMsgSizeInMiB = %#v, want a plain int32", pqi["cachedMsgSizeInMiB"])
 	}
 }
 
@@ -385,7 +385,7 @@ func TestConsumerRunningInfoPullConsumerHasNoTables(t *testing.T) {
 		t.Errorf("a pull consumer must have no mqTable/mqPopTable: %v %v", info.MQTable, info.MQPopTable)
 	}
 	if len(info.StatusTable) != 0 {
-		t.Errorf("a pull consumer has no statusTable in Java: %v", info.StatusTable)
+		t.Errorf("a pull consumer must have no statusTable: %v", info.StatusTable)
 	}
 	if len(info.SubscriptionSet) != 1 {
 		t.Errorf("subscriptionSet = %v, want the one subscription", info.SubscriptionSet)
@@ -592,7 +592,7 @@ func TestConsumeMessageDirectlyConcurrentVerdicts(t *testing.T) {
 				t.Error("order = true, want false on the concurrent path")
 			}
 			if !got.AutoCommit {
-				t.Error("autoCommit = false, want true (Java never changes it here)")
+				t.Error("autoCommit = false, want true")
 			}
 			if got.ConsumeResult == nil || *got.ConsumeResult != tc.want {
 				t.Errorf("consumeResult = %v, want %v", got.ConsumeResult, tc.want)
@@ -618,7 +618,7 @@ func TestConsumeMessageDirectlyResultNullVerdictShape(t *testing.T) {
 	got := remoting.NewConsumeMessageDirectlyResult()
 	body := got.Encode()
 	if string(body) != `{"autoCommit":true,"order":false,"spentTimeMills":0}` {
-		t.Errorf("empty result body = %s, want the 3-key Java default", body)
+		t.Errorf("empty result body = %s, want the 3-key default", body)
 	}
 	requireKeys(t, body, "autoCommit", "order", "spentTimeMills")
 }
@@ -899,6 +899,6 @@ func TestNotifyUnsubscribeLiteIsSwallowedWithoutAReply(t *testing.T) {
 	sync := remoting.CreateRequestCommand(remoting.ReqNotifyUnsubscribeLite,
 		&remoting.NotifyUnsubscribeLiteRequestHeader{ConsumerGroup: remoting.StrPtr(group)})
 	if got, err := f.brokerSrv.pushSync(sync, 500*time.Millisecond); err == nil {
-		t.Fatalf("a sync 200073 was answered with code=%d; Java answers nothing", got.Code)
+		t.Fatalf("a sync 200073 was answered with code=%d; it must go unanswered", got.Code)
 	}
 }

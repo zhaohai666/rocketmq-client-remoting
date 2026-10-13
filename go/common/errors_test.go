@@ -31,7 +31,7 @@ func TestErrorTextsMatchTheOtherPorts(t *testing.T) {
 }
 
 func TestRequestTimeoutTextMatchesPython(t *testing.T) {
-	// python/client/producer.py::_wait_request_response 的字面量
+	// 超时错误文案的固定字面量
 	e := RequestTimeoutError("TopicTest", 3000)
 	want := "send request message to <TopicTest> OK, but wait reply message timeout, 3000 ms."
 	if e.Error() != want {

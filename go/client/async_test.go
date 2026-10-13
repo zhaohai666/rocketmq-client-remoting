@@ -152,9 +152,9 @@ func TestFairSemaphoreGrantsOnlyTheHead(t *testing.T) {
 	}
 }
 
-// TestFairSemaphoreHeadGivingUpWakesTheNext is the case the Python port's
-// docstring calls out: the head asks for more than can ever fit, times out, and
-// its REMOVAL is what makes the request behind it admissible. Without the wake-up
+// TestFairSemaphoreHeadGivingUpWakesTheNext is the case that matters: the head
+// asks for more than can ever fit, times out, and its REMOVAL is what makes
+// the request behind it admissible. Without the wake-up
 // on that exit the second request would sleep out its whole timeout even though a
 // permit was free the entire time.
 func TestFairSemaphoreHeadGivingUpWakesTheNext(t *testing.T) {
@@ -260,7 +260,7 @@ func TestAsyncConfigDefaultsAndFloors(t *testing.T) {
 	p := MustNewDefaultMQProducer("GID_async_config")
 
 	if p.IsEnableBackpressureForAsyncMode() {
-		t.Error("Java's enableBackpressureForAsyncMode default is false")
+		t.Error("enableBackpressureForAsyncMode default is false")
 	}
 	if got := p.BackPressureForAsyncSendNum(); got != 1024 {
 		t.Errorf("backPressureForAsyncSendNum = %d, want 1024", got)
@@ -272,7 +272,7 @@ func TestAsyncConfigDefaultsAndFloors(t *testing.T) {
 		t.Errorf("retryTimesWhenSendAsyncFailed = %d, want 2", got)
 	}
 	if got := p.AsyncSenderQueueCapacity(); got != 50000 {
-		t.Errorf("asyncSenderQueueCapacity = %d, want Java's 50000", got)
+		t.Errorf("asyncSenderQueueCapacity = %d, want 50000", got)
 	}
 	if got := p.SemaphoreAsyncSendNumAvailablePermits(); got != 1024 {
 		t.Errorf("num semaphore permits = %d, want 1024", got)
@@ -503,7 +503,7 @@ func TestAsyncSendReportsSendRequestFailed(t *testing.T) {
 		t.Fatal("expected a failure")
 	}
 	if !strings.Contains(err.Error(), "send request failed") {
-		t.Errorf("error = %q, want Java's %q wording", err.Error(), "send request failed")
+		t.Errorf("error = %q, want the %q wording", err.Error(), "send request failed")
 	}
 	if !common.IsKind(errors.Unwrap(err), common.KindSendRequest) {
 		t.Errorf("the transport error must stay reachable through Unwrap: %v", errors.Unwrap(err))
@@ -575,7 +575,7 @@ func TestAsyncSendBackPressureNumGateRejectsAndSendsNothing(t *testing.T) {
 		t.Fatalf("error kind = %v, want RemotingTooMuchRequestException: %v", err, err)
 	}
 	if !strings.Contains(err.Error(), "send message tryAcquire semaphoreAsyncNum timeout") {
-		t.Errorf("error = %q, want Java's semaphoreAsyncNum wording", err.Error())
+		t.Errorf("error = %q, want the semaphoreAsyncNum wording", err.Error())
 	}
 	if got := len(broker.requests(remoting.ReqSendMessageV2)); got != 0 {
 		t.Errorf("a gated send reached the broker %d times, want 0", got)
@@ -611,7 +611,7 @@ func TestAsyncSendBackPressureSizeGateReturnsTheCountPermit(t *testing.T) {
 		t.Fatal("the byte gate must fail the send")
 	}
 	if !strings.Contains(err.Error(), "send message tryAcquire semaphoreAsyncSize timeout") {
-		t.Errorf("error = %q, want Java's semaphoreAsyncSize wording", err.Error())
+		t.Errorf("error = %q, want the semaphoreAsyncSize wording", err.Error())
 	}
 	if got := p.SemaphoreAsyncSendNumAvailablePermits(); got != numBefore {
 		t.Errorf("count permits = %d, want %d — the byte-gate failure leaked a permit",

@@ -1345,7 +1345,7 @@ func TestConsumerRetryTopicTimestampUsesMaxOffset(t *testing.T) {
 		t.Errorf("retry topic queueOffset = %d, want maxOffset 9", got)
 	}
 	if got := f.broker.searchTimestamps(); len(got) != 0 {
-		t.Errorf("SEARCH_OFFSET_BY_TIMESTAMP was called %d times for a retry topic; Java answers maxOffset", len(got))
+		t.Errorf("SEARCH_OFFSET_BY_TIMESTAMP was called %d times for a retry topic; it must be answered with maxOffset", len(got))
 	}
 }
 
@@ -1575,8 +1575,7 @@ func TestConsumerOrderlyLocksThenUnlocks(t *testing.T) {
 // Shutdown must WAIT for an in-flight batch: the listener call and the
 // send-back it produces have to land before the client instance goes away.
 // Without the drain an immediate process exit cuts the send-back short and the
-// message never reaches %RETRY%/%DLQ% (the same failure Python joins and Rust
-// finalizes to prevent).
+// message never reaches %RETRY%/%DLQ%.
 func TestShutdownWaitsForInFlightSendBack(t *testing.T) {
 	topic := uniqueTopic("GoConsumerDrain", t)
 	const group = "GID_go_drain"

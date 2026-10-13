@@ -82,7 +82,7 @@ func refresh(t *testing.T, c *DefaultLitePullConsumer, topic string) {
 func TestLiteQueueChangeListenerGuards(t *testing.T) {
 	c := MustNewDefaultLitePullConsumer("GID_tqc_guard")
 	if err := c.RegisterTopicMessageQueueChangeListener("", &queueChangeRecorder{}); err == nil {
-		t.Fatal("blank topic must be rejected (Java throws MQClientException)")
+		t.Fatal("blank topic must be rejected")
 	}
 	if err := c.RegisterTopicMessageQueueChangeListener("T", nil); err == nil {
 		t.Fatal("nil listener must be rejected")
@@ -173,7 +173,7 @@ func TestLiteQueueChangeListenerBeforeStartHasNoSnapshot(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	if _, ok := c.messageQueuesForTopic["T"]; ok {
-		t.Fatal("a pre-start registration must not snapshot (Java gates on RUNNING)")
+		t.Fatal("a pre-start registration must not snapshot (the snapshot gate is RUNNING)")
 	}
 	if err := c.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -214,7 +214,7 @@ func TestLiteQueueChangeSetEquality(t *testing.T) {
 		return out
 	}
 	if isQueueSetEqual(nil, false, mq()) {
-		t.Fatal("no snapshot is Java's oldSet == null: never equal")
+		t.Fatal("no snapshot means a nil oldSet: never equal")
 	}
 	if isQueueSetEqual(mq(0, 1), true, mq(0)) {
 		t.Fatal("different size must count as changed")

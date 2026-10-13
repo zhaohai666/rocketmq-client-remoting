@@ -1,13 +1,11 @@
-// selfcheck is the offline protocol self-test for the Go port — the counterpart
-// of python/selfcheck.py (7 checks), cpp/examples/selfcheck.cpp (3) and
-// csharp/examples/RocketMQ.Examples/SelfCheck.cs (3).
+// selfcheck is the offline protocol self-test for the Go port.
 //
 //	go run ./examples/selfcheck
 //
 // It needs NO cluster: every check is encode -> bytes -> decode (or a byte-level
 // fixture), plus the constants and ext-field spellings that break interop
-// silently when they drift. That is the whole point of the tool existing in
-// every port — it is the cheap gate you run before touching a live cluster, and
+// silently when they drift. That is the whole point of the tool — it is the
+// cheap gate you run before touching a live cluster, and
 // it is deliberately NOT part of `go test` so a failing build is obvious.
 //
 // Where a round-trip alone could cancel out a symmetric bug, the check is

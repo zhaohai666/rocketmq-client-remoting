@@ -6,7 +6,7 @@ import (
 )
 
 func TestMessageQueueHashCodeVectors(t *testing.T) {
-	// java.lang.String#hashCode + MessageQueue#hashCode，32 位回绕
+	// MessageQueue 哈希：字符串哈希逐段组合 topic/broker 再并入 queueId，32 位回绕
 	cases := []struct {
 		topic  string
 		broker string
@@ -118,7 +118,7 @@ func TestMessageBodyNilVsZeroLength(t *testing.T) {
 	if len(zero.GetBody()) != 0 {
 		t.Fatal("GetBody never returns nil to callers")
 	}
-	// NewMessage 把 nil 归一成空（Python 同语义）
+	// NewMessage 把 nil 归一成空
 	if m := NewMessage("T", nil); m.Body == nil {
 		t.Fatal("NewMessage normalizes nil body")
 	}

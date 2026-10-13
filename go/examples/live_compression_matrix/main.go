@@ -19,13 +19,13 @@
 // module takes no third-party dependencies, so LZ4 and ZSTD are hand-rolled
 // (common/lz4.go, common/zstd.go). The ZSTD decoder reads what the real
 // encoders write — Huffman-coded literals and FSE-coded sequences — which is
-// what makes the cpp/rust/csharp -> Go legs of this matrix meaningful; the
+// what makes the other-implementation -> Go legs of this matrix meaningful; the
 // ZSTD encoder emits legal store-only frames, so Go's own sends show a
-// storeSize near the payload size while still being readable by every port.
+// storeSize near the payload size while still being readable by every client.
 //
-// Exit codes follow the Python leg so the script can tell them apart:
-// 0 ok / 1 generic failure (a failed send included — that is what Python's
-// uncaught MQClientException exits with) / 2 bad codec or bad usage / 3 recv
+// Exit codes follow the matrix convention so the script can tell them apart:
+// 0 ok / 1 generic failure (a failed send included — that is what an
+// uncaught client exception exits with) / 2 bad codec or bad usage / 3 recv
 // timeout. Keeping 2 strictly for "bad codec / bad usage" is the point: a plain
 // send failure must NOT report 2 or it becomes indistinguishable from an
 // unsupported codec.

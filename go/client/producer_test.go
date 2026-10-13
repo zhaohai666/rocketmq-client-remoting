@@ -872,7 +872,7 @@ func TestSendStatusStringAndMapping(t *testing.T) {
 		t.Error("SYSTEM_ERROR must not map to a send status")
 	}
 	if SendOK.String() != "SEND_OK" || SlaveNotAvailable.String() != "SLAVE_NOT_AVAILABLE" {
-		t.Error("SendStatus strings drifted from Java's enum names")
+		t.Error("SendStatus strings drifted from the protocol enum names")
 	}
 }
 

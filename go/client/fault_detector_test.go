@@ -221,7 +221,7 @@ func TestDetectorConfigDefaultsMatchJavaClientConfig(t *testing.T) {
 		t.Error("startDetectorEnable must default to false")
 	}
 	if got := tol.tickMillis.Load(); got != 3000 {
-		t.Errorf("detector tick = %dms, want Java's 3000ms", got)
+		t.Errorf("detector tick = %dms, want 3000ms", got)
 	}
 
 	p := MustNewDefaultMQProducer("GID_detector_defaults")

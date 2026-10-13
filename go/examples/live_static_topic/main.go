@@ -1,8 +1,6 @@
 // live_static_topic verifies the static-topic (513 + endpoint rewrite) path
 // end-to-end against a real RocketMQ 5.x cluster — the seven-end canonical
-// scenario, Go version (python/verify_static_topic_live.py,
-// rust/examples/live_static_topic.rs, cpp/examples/live_static_topic.cpp,
-// csharp/examples/LiveStaticTopic.cs, php/examples/live_static_topic.php).
+// scenario, in this client's version.
 //
 //	go run ./examples/live_static_topic -ns 127.0.0.1:9876
 //
@@ -65,8 +63,9 @@ func fatal(format string, args ...any) {
 }
 
 // mappingDetail builds the single-broker TopicQueueMappingDetail (the 513
-// body, Java TopicQueueMappingDetail fastjson2 field names — same field set
-// as the python reference version). Scope must be "__global__" explicitly:
+// body uses the broker-side fastjson2 field names for
+// TopicQueueMappingDetail — the exact field set the broker round-trips).
+// Scope must be "__global__" explicitly:
 // the zero-value fallback in TopicQueueMappingDetail.toJSONValue writes the
 // legacy "GLOBAL", which is NOT what the broker round-trips.
 func mappingDetail(topic, bname string) *client.TopicQueueMappingDetail {
@@ -149,10 +148,9 @@ func main() {
 			TopicName:      *topic,
 			ReadQueueNums:  physicalQueues,
 			WriteQueueNums: physicalQueues,
-			// Go's TopicConfig has no zero-value defaults (unlike the Java/
-			// python/C#/php TopicConfig whose perm defaults to 6): perm=0
-			// would create an unwritable+unreadable topic and the producer
-			// would see zero publish queues.
+			// Go's TopicConfig has no zero-value defaults, so perm must be
+			// set explicitly: perm=0 would create an unwritable+unreadable
+			// topic and the producer would see zero publish queues.
 			Perm: common.PermRead | common.PermWrite,
 		}, mappingDetail(*topic, brokerName), true)
 	check("S1 CreateStaticTopic(513) 被接受", err == nil,
@@ -245,9 +243,9 @@ func main() {
 	}
 	check("S4 实例把 mock 队列重写到真实 broker", rewriteOk, "")
 
-	// id totalQueues-1 IS in the table, and the Java semantics return the
-	// endpoint value, i.e. the sentinel itself; the passthrough case must
-	// use an out-of-table id (the Go unit test uses 99).
+	// id totalQueues-1 IS in the table, and the expected rewrite semantics
+	// return the endpoint value, i.e. the sentinel itself; the passthrough
+	// case must use an out-of-table id (the Go unit test uses 99).
 	unhostedRewrite := inst.GetBrokerNameFromMessageQueue(
 		common.NewMessageQueue(*topic, mockName, totalQueues-1))
 	check("S4 无承载 id 返回哨兵值", unhostedRewrite == mockAbsent, unhostedRewrite)

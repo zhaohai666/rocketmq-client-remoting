@@ -3,9 +3,7 @@ package common
 import "testing"
 
 // The vectors below are recorded reference fixtures, captured from a measured
-// run of the namespace utility
-// (python/rocketmq/remoting/protocol/namespace_util.py, NamespaceUtil); they
-// pin this port's answers directly.
+// run of the namespace utility; they pin this port's answers directly.
 
 func TestWrapNamespaceVectorsMatchPython(t *testing.T) {
 	cases := []struct {

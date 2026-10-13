@@ -12,8 +12,8 @@
 //
 // The last line is `PASS=<n> FAIL=<n> COMMITTED=<offset> TOTAL=<n>`:
 // COMMITTED is the deliberately PARTIAL offset this consumer left in the broker
-// and TOTAL is how many messages the topic holds. The Python read-back
-// (scripts/run_go_pull_live.sh → python/go_pull_consume_check.py) consumes both,
+// and TOTAL is how many messages the topic holds. The external read-back
+// checker (driven by scripts/run_go_pull_live.sh) consumes both,
 // so adding a check here can never silently make the read-back expectation
 // wrong.
 package main
@@ -78,7 +78,7 @@ func main() {
 	topic := flag.String("topic", "", "topic name (default: GoPullLive_<unix>)")
 	group := flag.String("group", "", "pull consumer group (default: GID_GoPullLive_<unix>)")
 	suspend := flag.Duration("suspend", 3*time.Second,
-		"broker suspend budget for the long poll; Java's default is 20s, lowered here so the idle-tail check stays quick")
+		"broker suspend budget for the long poll; normally 20s, lowered here so the idle-tail check stays quick")
 	flag.Parse()
 
 	stamp := time.Now().Unix()
@@ -203,8 +203,8 @@ func main() {
 	// ---- 3. min / max offset ------------------------------------------------------
 	// MaxOffset is the ConsumeQueue's dispatch progress, and the broker dispatches
 	// the commitlog asynchronously — right after a burst of sends it can still be
-	// one behind. Poll instead of reading once: the same reason python's
-	// verify_pull_live.py has wait_offsets() and this script did not.
+	// one behind. Poll instead of reading once: a one-shot read is flaky for
+	// exactly that reason.
 	maxOffset := int64(-1)
 	seedDeadline := time.Now().Add(15 * time.Second)
 	for {
@@ -366,8 +366,8 @@ func main() {
 		check("PersistConsumerOffset", true, "")
 	}
 	// READ_FROM_STORE forces a broker round trip: this asserts the offset really
-	// left the process (the Python side then confirms the same value from its own
-	// connection).
+	// left the process (the external read-back then confirms the same value
+	// from its own connection).
 	if got, err := c.FetchConsumeOffset(q0, true); err != nil || got != committedOffset {
 		check("从 broker 读回位点", false, fmt.Sprintf("got=%d err=%v", got, err))
 	} else {
@@ -381,8 +381,9 @@ func main() {
 
 	// ---- 9. sendMessageBack: the message must land in %RETRY%group ----------------
 	// maxReconsumeTimes is 16 for a pull consumer (not the push consumer's -1), so
-	// the broker re-queues instead of DLQ-ing on the first bounce. Python reads
-	// %RETRY%<group> and asserts the body is there — and that %DLQ%<group> is not.
+	// the broker re-queues instead of DLQ-ing on the first bounce. The external
+	// read-back checks %RETRY%<group> and asserts the body is there — and that
+	// %DLQ%<group> is not.
 	if bounced, err := c.Pull(q0, "*", 0, 1); err != nil {
 		check("取一条消息用于回投", false, err.Error())
 	} else if len(bounced.MsgFoundList) == 0 {

@@ -624,7 +624,7 @@ func TestPullConsumerCreateTopic(t *testing.T) {
 	for key, value := range want {
 		got, ok := ext.Get(key)
 		if !ok {
-			t.Errorf("extFields is missing %q (Java writes every one of them)", key)
+			t.Errorf("extFields is missing %q (every one of them must be written)", key)
 			continue
 		}
 		if got != value {
