@@ -13,8 +13,7 @@
 //  instance-scheduled tasks
 //    -> heartbeat (30s, MQClient), offset persist (5s), clean-expire, lock
 //
-// Ordering rules that are load-bearing (see Go consumer.go for the full
-// rationale — they are identical here):
+// Ordering rules that are load-bearing (the same rationale applies throughout):
 //  - The instance's heartbeat puts this group into the broker's
 //    ConsumerManager; without it GET_CONSUMER_LIST_BY_GROUP answers empty and
 //    rebalance KEEPS the previous assignment (never "I own every queue").
@@ -1080,8 +1079,8 @@ export class DefaultMQPushConsumer {
       // — not "keep the previous value".
       let brokerId = this.pullFromWhichNode.get(key);
       if (brokerId === undefined) brokerId = MixAll.MASTER_ID;
-      // 静态主题：地址解析必须走端点重写（Java PullAPIWrapper.pullKernelImpl:
-      // findBrokerAddressInSubscribe(getBrokerNameFromMessageQueue(mq), ...)），
+      // 静态主题：地址解析必须走端点重写（先按 MessageQueue 解析出真实
+      // brokerName 再查订阅地址），
       // wire header 里的 brokerName 仍保留逻辑（mock）名，由 broker 侧
       // TopicQueueMappingDetail 做逻辑→物理翻译。测试工程的 duck-typed mock
       // client 可能没有这个方法——非静态主题的重写结果就是原 broker 名，回退安全。

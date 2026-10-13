@@ -1687,7 +1687,7 @@ final class RunClientAdmin
         $this->checkSame(1, count($admin20->requests), '309 uniqKey 硬解失败 → 不发 VIEW_MESSAGE_BY_ID');
         $this->checkSame(RequestCode::CONSUME_MESSAGE_DIRECTLY, $admin20->requests[0]['cmd']->code, '309 uniqKey 兜底直达');
         $this->checkSame('10.0.0.9:10911', $admin20->requests[0]['addr'], '309 uniqKey 兜底仍发 storeHost');
-        $this->checkSame('7f00000100002a9f0000000000000065', $admin20->requests[0]['cmd']->extFields['msgId'] ?? null, '309 带 UNIQ_KEY → 下发 offsetMsgId（Java 两路径）');
+        $this->checkSame('7f00000100002a9f0000000000000065', $admin20->requests[0]['cmd']->extFields['msgId'] ?? null, '309 带 UNIQ_KEY → 下发 offsetMsgId（两路径一致）');
 
         // consumeMessageDirectly：显式 brokerAddr 跳过 viewMessage 直发
         $admin21 = $this->newAdmin();

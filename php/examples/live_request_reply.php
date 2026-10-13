@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-// PHP 端真机 Request-Reply 往返：对标 nodeJs producer request()/reply 通路。
+// 真机 Request-Reply 往返：producer request()/reply 通路。
 //
 //   php examples/live_request_reply.php responder <namesrv> <topic> <expect>
 //   php examples/live_request_reply.php requester <namesrv> <topic> <expect>

@@ -1,9 +1,6 @@
 // live_static_topic verifies the static-topic (513 + endpoint rewrite) path
-// end-to-end against a real RocketMQ 5.x cluster — the seven-end canonical
-// scenario, Node version (python/verify_static_topic_live.py,
-// rust/examples/live_static_topic.rs, cpp/examples/live_static_topic.cpp,
-// csharp/examples/LiveStaticTopic.cs, php/examples/live_static_topic.php,
-// go/examples/live_static_topic).
+// end-to-end against a real RocketMQ 5.x cluster — the canonical static-topic
+// scenario (S1-S5).
 //
 //   node --experimental-strip-types examples/live_static_topic.ts --ns 127.0.0.1:9876
 //
@@ -55,8 +52,7 @@ function check(name: string, ok: boolean, detail = ''): void {
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Single-broker TopicQueueMappingDetail (the 513 body, Java fastjson2
- * field names — same field set as the python reference version). */
+/** Single-broker TopicQueueMappingDetail (the 513 body, fastjson2 field names). */
 function mappingDetail(bname: string): TopicQueueMappingDetail {
   const currIdMap: Record<string, number> = {};
   const hostedQueues: Record<string, LogicQueueMappingItem[]> = {};
@@ -110,7 +106,7 @@ async function main(): Promise<void> {
   let lastDetail = 'no poll ran';
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
-    // Fresh admin RPC per poll (same shape as the other ends). Do NOT poll
+    // Fresh admin RPC per poll. Do NOT poll
     // the client's cached route: a route fetched before the mapping
     // propagated would never refresh.
     const probe = new DefaultMQAdminExt();
@@ -191,7 +187,7 @@ async function main(): Promise<void> {
   }
   check('S4 实例把 mock 队列重写到真实 broker', rewriteOk);
 
-  // id TOTAL_QUEUES-1 IS in the table, and the Java semantics return the
+  // id TOTAL_QUEUES-1 IS in the table, and the protocol semantics return the
   // endpoint value, i.e. the sentinel itself; the passthrough case must use
   // an out-of-table id (the unit test uses 99).
   const unhostedRewrite = inst != null

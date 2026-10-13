@@ -2,10 +2,7 @@
 
 declare(strict_types=1);
 
-// PHP 端静态主题（513 createStaticTopic + 端点重写）真机联调：
-// 七端口径的 php 版，对应 python/verify_static_topic_live.py、
-// rust/examples/live_static_topic.rs、cpp/examples/live_static_topic.cpp、
-// csharp/examples/LiveStaticTopic.cs（同一套场景 S1-S5）。
+// 静态主题（513 createStaticTopic + 端点重写）真机联调，覆盖 S1-S5 全套场景：
 //
 //   php examples/live_static_topic.php [namesrv]
 //
@@ -54,8 +51,8 @@ $brokerName = '';
 
 echo "=== PHP static topic live: ns=$ns topic=$topic ===" . PHP_EOL;
 
-/** 单 broker 的 TopicQueueMappingDetail 文档（513 body，Java
- * TopicQueueMappingDetail 的 fastjson2 字段名，与 python 参考版逐字段一致）。
+/** 单 broker 的 TopicQueueMappingDetail 文档（513 body，字段名按服务端
+ * fastjson2 的序列化约定，逐字段固定）。
  * 注意 currIdMap/hostedQueues 的键是 gid 字符串——PHP 连续整数键数组会被
  * json_encode 编成 JSON 数组，broker 的 fastjson2 会拒收，必须用 stdClass。 */
 $mappingDetail = static function (string $bname) use ($topic, $physicalQueues, $totalQueues): array {
@@ -215,8 +212,8 @@ if ($inst !== null) {
 }
 $check($rewriteOk, 'S4 实例把 mock 队列重写到真实 broker');
 
-// id totalQueues-1 在端点表内，值就是 __syslo__none__（Java 语义：返回端点值）；
-// 透传用例要用表外 id（Go 单测用 99）。
+// id totalQueues-1 在端点表内，值就是 __syslo__none__（协议语义：返回端点值）；
+// 透传用例要用表外 id（本端单测用 99）。
 $unhostedRewrite = $inst?->getBrokerNameFromMessageQueue(
     new MessageQueue($topic, $mockName, $totalQueues - 1));
 $check($unhostedRewrite === StaticTopic::LOGICAL_QUEUE_MOCK_NOT_EXIST,

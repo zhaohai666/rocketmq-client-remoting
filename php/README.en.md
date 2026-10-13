@@ -370,7 +370,7 @@ validation are strict by default.
 
 ### SOCKS Proxy
 
-Mirrors the Java `ClientConfig` `socksProxyConfig` (`SocksProxyConfig`: addr / username /
+SOCKS proxy via `SocksProxyConfig` (addr / username /
 password; SOCKS5 by default, SOCKS4 also supported): once configured, every remoting
 connection (NameServer + Broker) goes `TCP to proxy → SOCKS CONNECT handshake → TLS
 upgrade → RocketMQ frames` (HTTP name-server addressing does not go through the proxy).

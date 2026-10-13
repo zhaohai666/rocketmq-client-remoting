@@ -114,7 +114,7 @@ class FileSink {
   }
 }
 
-// Resolve the sink once at module load, exactly like the Go port's sync.Once.
+// Resolve the sink once at module load.
 function buildSink(): FileSink | null {
   if (process.env.ROCKETMQ_CLIENT_LOG_USE_STDOUT) return null;
   let file = process.env.ROCKETMQ_CLIENT_LOG_FILE;
@@ -122,7 +122,7 @@ function buildSink(): FileSink | null {
   if (file === '' || file.toUpperCase() === 'OFF' || file.toUpperCase() === 'NONE') return null;
   const dir = process.env.ROCKETMQ_CLIENT_LOG_DIR || DEFAULT_LOG_DIR;
   // A file value containing a separator is treated as a full path, else it is
-  // joined under the log dir (go's behaviour).
+  // joined under the log dir.
   const p = path.isAbsolute(file) || file.includes('/') || file.includes('\\')
     ? file : path.join(dir, file);
   return new FileSink(p);

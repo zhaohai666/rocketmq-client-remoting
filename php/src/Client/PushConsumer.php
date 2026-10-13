@@ -465,7 +465,7 @@ final class DefaultMQPushConsumer
         }
     }
 
-    /** 解析 consumeTimestamp（解析不了必须硬失败，见 Python _consume_timestamp_millis）。 */
+    /** 解析 consumeTimestamp（解析不了必须硬失败）。 */
     public function consumeTimestampMillis(): int
     {
         $ts = $this->consumeTimestamp;
@@ -733,7 +733,7 @@ final class DefaultMQPushConsumer
      * 消费者**必须**注册到 broker：broker 的 ConsumerManager 只有收到心跳才知道
      * 消费组里有哪些 clientId，rebalance 的 GET_CONSUMER_LIST_BY_GROUP 才有返回。
      * 从节点漏发不是"少一发冗余"：从节点收不到心跳时，它会给指向自己的拉取回
-     * SUBSCRIPTION_NOT_EXIST（详见 Python 蓝本 _send_heartbeat_to_all_broker 注释）。
+     * SUBSCRIPTION_NOT_EXIST（详见向全部 broker 发心跳处的注释）。
      */
     public function sendHeartbeatToAllBroker(): int
     {
@@ -847,7 +847,7 @@ final class DefaultMQPushConsumer
             }
         }
 
-        // ③ 重平衡（启动阶段且无分配时快速重试，对齐 Python _rebalance_loop）。
+        // ③ 重平衡（启动阶段且无分配时快速重试）。
         // POP broker 侧分配路径不在这里跑：本地策略一格都不该执行，节奏由实例 tick 的
         // 阶段⑦（QUERY_ASSIGNMENT 轮）决定，见 usesBrokerPopAssignment()。
         if (!$this->usesBrokerPopAssignment()
@@ -863,7 +863,7 @@ final class DefaultMQPushConsumer
             }
         }
 
-        // ④ 顺序锁（每 20s；对齐 Python _lock_loop）。
+        // ④ 顺序锁（每 20s）。
         if ($this->isOrderly() && !$this->popMode
             && $this->messageModel !== MessageModel::BROADCASTING
             && $now >= $this->nextLockAt) {
@@ -876,7 +876,7 @@ final class DefaultMQPushConsumer
             $this->popRound($now);
         } else {
             $this->pullRound($now);
-            // ⑥ 分发消费（每轮拉取后紧接分发；对齐 Python 分发线程）。
+            // ⑥ 分发消费（每轮拉取后紧接分发）。
             $this->dispatchRound();
             if (!$this->isOrderly() && $now >= $this->nextCleanAt) {
                 $this->nextCleanAt = $now + max(1, $this->consumeTimeout) * 60.0;
@@ -1276,7 +1276,7 @@ final class DefaultMQPushConsumer
     }
 
     /**
-     * 单队列一次拉取（对齐 Python _queue_pull_loop 的单轮）。
+     * 单队列一次拉取（单轮）。
      * 返回 true = 拉到了消息，可以立刻再来一轮；false = 本 tick 该队列到此为止。
      */
     private function pullOnce(MessageQueue $mq, string $key, bool $orderly, float $now): bool
@@ -1379,7 +1379,7 @@ final class DefaultMQPushConsumer
             );
         }
 
-        // 单线程模型下撤队列不可能发生在同步拉取期间；位点推进照 Python 口径在
+        // 单线程模型下撤队列不可能发生在同步拉取期间；位点推进放在
         // "仍持有队列"守卫之后执行。
         $illegal = false;
         if ($found && $result->msgFoundList !== []) {
@@ -1570,7 +1570,7 @@ final class DefaultMQPushConsumer
 
     /**
      * 一轮分发：把各队列 pending 里排好的批次交给 listener（同步执行）。
-     * 对齐 Python _dispatch_loop 的循环体；批次数有界，保证 tick 可控。
+     * 循环体批次数有界，保证 tick 可控。
      */
     private function dispatchRound(): void
     {
@@ -1666,7 +1666,7 @@ final class DefaultMQPushConsumer
         if ($retired === []) {
             return;
         }
-        usleep(200000); // 0.2s（有意偏差，见 Python 注释：代号已让在途 ack 全部失效）
+        usleep(200000); // 0.2s（有意偏差：代号已让在途 ack 全部失效）
         $this->onQueuesRevoked($retired);
         try {
             $this->doRebalance();
@@ -2593,7 +2593,7 @@ final class DefaultMQPushConsumer
     }
 
     /**
-     * 单队列一次 POP（对齐 Python _queue_pop_loop 的单轮）。
+     * 单队列一次 POP（单轮）。
      *
      * 与 pull 的关键差别：**不查、不提交消费位点**（进度由 broker 侧 checkpoint 跟踪，
      * 确认只靠 ack）；弹出即投递消费（内联执行）；``POLLING_NOT_FOUND`` 是正常态。

@@ -361,15 +361,15 @@ producer = DefaultMQProducer("PID_DEMO",
 # producer.set_socks_proxy_config(SocksProxyConfig(...))
 ```
 
-`SocksProxyConfig` mirrors the Java `SocksProxyConfig` fields, plus proxy type, port and an
-enable switch: proxy type `SOCKS5` (default) / `SOCKS4` (domain targets use the 4a extension),
-proxy address (a Java-style `"host:port"` string also works), port, optional username/password
+`SocksProxyConfig` carries the proxy type, address, port, optional credentials and an enable
+switch: proxy type `SOCKS5` (default) / `SOCKS4` (domain targets use the 4a extension),
+proxy address (a `"host:port"` compound string also works), port, optional username/password
 (SOCKS5 uses the RFC 1929 username-password sub-negotiation), and `enable`
 (`None` by default = enabled whenever addr is set; explicit `False` = keep the config but bypass
-the proxy). Once configured, **all remoting connections** (NameServer + Broker, equivalent to Java
-CIDR `0.0.0.0/0`) run the SOCKS CONNECT handshake after the TCP connect and before the TLS
+the proxy). Once configured, **all remoting connections** (NameServer + Broker, i.e. a full
+`0.0.0.0/0` scope) run the SOCKS CONNECT handshake after the TCP connect and before the TLS
 handshake; the plain HTTP requests of dynamic NameServer addressing do not go through the proxy
-(same semantics as Java). Target hostnames are not resolved locally and are handed to the proxy
+(bypassed by design). Target hostnames are not resolved locally and are handed to the proxy
 (SOCKS5 atyp=3 / SOCKS4a). The handshake is hand-written on the standard-library `socket`, no
 third-party dependencies.
 

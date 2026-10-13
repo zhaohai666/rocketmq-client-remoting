@@ -83,7 +83,7 @@ def test_count_gate_fires_at_threshold_and_treats_zero_as_one():
     assert c._flow_control_triggered == 1
     c.pull_threshold_for_queue = 0
     _stage(c, mq, _n_sized(TOPIC, 100, 1))
-    assert _hit(c, mq), "pull_threshold_for_queue=0 要按 1 条算（Java 的 max(1,n) 守卫）"
+    assert _hit(c, mq), "pull_threshold_for_queue=0 要按 1 条算（max(1,n) 守卫）"
 
 
 def test_size_gate_is_in_mib_and_disabled_by_zero():

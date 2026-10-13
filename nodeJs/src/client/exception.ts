@@ -1,6 +1,6 @@
 // NOTE: the foundation remoting/exception.ts is the single source of truth for the exception
-// classes; this module only adds the client-specific error codes (mirroring python/
-// client/exception.py) and a thin RequestTimeoutException used by the request-reply path.
+// classes; this module only adds the client-specific error codes
+// and a thin RequestTimeoutException used by the request-reply path.
 import {
   MQClientException,
   MQBrokerException,
@@ -24,7 +24,7 @@ export const ClientErrorCode = {
   SEND_REQUEST_WITH_FUTURE_EXCEPTION: 10008,
 };
 
-// Convenience subclass used by the request-reply future path (mirrors python).
+// Convenience subclass used by the request-reply future path.
 export class RequestTimeoutException extends RemotingTimeoutException {
   constructor(addr: string, timeoutMillis: number) {
     super(addr, timeoutMillis);

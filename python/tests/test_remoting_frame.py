@@ -44,7 +44,7 @@ class TestFrameLayout:
         assert header["remark"] == "hi"
         assert header["extFields"] == {"topic": "T"}
         assert header["language"] == LanguageCode.PYTHON
-        assert "body" not in header, "Java side body 用 @JSONField(serialize=false) 排除"
+        assert "body" not in header, "协议头声明 body 不参与序列化，帧里不该出现"
 
     def test_null_remark_is_omitted(self):
         cmd = make_request()

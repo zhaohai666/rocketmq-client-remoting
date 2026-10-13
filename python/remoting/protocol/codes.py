@@ -128,7 +128,7 @@ class RequestCode:
     UPDATE_AND_GET_GROUP_FORBIDDEN = 353
     GET_BROKER_MEMBER_GROUP = 901
     BROKER_HEARTBEAT = 904
-    # ---- 以下由 rocketmq/remoting RequestCode.java 全量补齐（含 controller / acl / 冷数据 / 静态 topic）----
+    # ---- 以下按服务端 remoting 协议全量补齐（含 controller / acl / 冷数据 / 静态 topic）----
     CHECK_ROCKSDB_CQ_WRITE_PROGRESS = 354
     EXPORT_ROCKSDB_CONFIG_TO_JSON = 355
     LITE_PULL_MESSAGE = 361

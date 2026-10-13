@@ -232,7 +232,7 @@ def main() -> int:
         check("S5 抛的是 RequestTimeoutException（不是静默返回/别的异常）",
               isinstance(raised, RequestTimeoutException),
               "raised=%s: %s" % (type(raised).__name__, raised))
-        check("S5 异常带上 Java 的 10006 REQUEST_TIMEOUT_EXCEPTION",
+        check("S5 异常带上 10006 REQUEST_TIMEOUT_EXCEPTION",
               getattr(raised, "response_code", None) == ClientErrorCode.REQUEST_TIMEOUT_EXCEPTION,
               "code=%s" % getattr(raised, "response_code", None))
         check("S5 超时时长接近设定值（2s ~ 12s，说明真的等了而不是立即失败）",
@@ -298,7 +298,7 @@ def main() -> int:
               and raised8.response_code == ClientErrorCode.CREATE_REPLY_MESSAGE_EXCEPTION,
               "raised=%s code=%s" % (type(raised8).__name__ if raised8 else None,
                                      getattr(raised8, "response_code", None)))
-        check("S8 10007 的文案点到缺失的 CLUSTER 属性（Java 原文）",
+        check("S8 10007 的文案点到缺失的 CLUSTER 属性（协议原文）",
               raised8 is not None
               and "property[%s] is null." % MessageConst.PROPERTY_CLUSTER in str(raised8),
               "msg=%s" % raised8)

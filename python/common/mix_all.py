@@ -246,7 +246,7 @@ class MixAll:
         if text is None:
             return {}
         result = {}
-        # 先把续行合并成逻辑行（java.util.Properties 语义）
+        # 先把续行合并成逻辑行（.properties 的续行格式）
         logical_lines = []
         pending = None
         for raw in text.splitlines():
@@ -287,7 +287,7 @@ class MixAll:
         return result
 
 
-# java.util.Properties.load 认的空白字符（string2_properties 的分隔判断用）。
+# .properties 格式认的空白字符（string2_properties 的分隔判断用）。
 # 必须是模块级常量：staticmethod 里裸名查找走的是模块全局，不是类作用域。
 _PROP_WS = " \t\f"
 

@@ -254,7 +254,7 @@ def s1_backward_reset(setup: MQClientInstance, admin: DefaultMQAdminExt,
           % (elapsed, BACK_TARGET), ok, fmt_rows(committed(setup, GROUP1, TOPIC1) or []))
 
     off = local_offset(c, TOPIC1)
-    check("S1-重置后本地表里没有旧位点（Java removeOffset；新位点经撤销尾巴出去）",
+    check("S1-重置后本地表里没有旧位点（removeOffset；新位点经撤销尾巴出去）",
           off is None, "local_offset=%s epoch=%d" % (off, c._queue_epoch.get(key, 0)))
 
     # 放行旧批次：它的 ack 属于已被撤销的 ProcessQueue，必须作废

@@ -74,7 +74,7 @@ final class FairSemaphore
     }
 }
 
-/** 一个还在排队的许可申请（对应 Python 内部类 ``_Pending``）。 */
+/** 一个还在排队的许可申请。 */
 final class Pending
 {
     public function __construct(public int $permits)

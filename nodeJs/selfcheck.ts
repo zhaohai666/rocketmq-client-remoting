@@ -45,8 +45,7 @@ for (const mod of modules) {
   else { failures++; console.log(`  FAIL ${mod}\n       ${(r.stderr || '').trim().split('\n')[0]}`); }
 }
 
-// The offline smoke suites. (test/java_gap_fill_smoke.ts was removed from the
-// repo in 59cac5f — the reference here went stale and failed the baseline.)
+// The offline smoke suites.
 const smokes = ['test/smoke.ts', 'test/producer_smoke.ts', 'test/consumer_smoke.ts', 'test/stats_smoke.ts',
   'test/compat_contract_smoke.ts', 'test/pop_smoke.ts', 'test/fixes2_smoke.ts', 'test/namespace_rpc_smoke.ts',
   'test/ns_failover_smoke.ts', 'test/lite_topic_queue_change_smoke.ts', 'test/pull_balance_view_smoke.ts',

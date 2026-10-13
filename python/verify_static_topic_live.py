@@ -66,7 +66,7 @@ class Recorder(MessageListenerConcurrently):
 
 
 def mapping_detail(broker_name: str) -> dict:
-    """单 broker 的 TopicQueueMappingDetail 文档（513 body，Java
+    """单 broker 的 TopicQueueMappingDetail 文档（513 body，服务端
     TopicQueueMappingDetail 的 fastjson2 字段名）。"""
     hosted = {}
     for gid in range(PHYSICAL_QUEUES):
@@ -165,7 +165,7 @@ def main() -> int:
             MessageQueue(TOPIC, mock_name, gid)) == broker_name
         for gid in range(PHYSICAL_QUEUES))
     check("S4 实例把 mock 队列重写到真实 broker", rewrite_ok)
-    # id TOTAL-1 在端点表内，值就是 __syslo__none__（Java 语义：返回端点值）；
+    # id TOTAL-1 在端点表内，值就是 __syslo__none__（哨兵值：返回端点值本身）；
     # 透传用例要用表外 id（Go 单测用 99）。
     unhosted_rewrite = inst.get_broker_name_from_message_queue(
         MessageQueue(TOPIC, mock_name, TOTAL_QUEUES - 1)) \

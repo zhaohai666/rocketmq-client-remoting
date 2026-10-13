@@ -256,15 +256,15 @@ Supported by Producer / PushConsumer / LitePullConsumer; `tlsEnable` is process-
 ### SOCKS proxy
 
 ```ts
-// Mirrors Java ClientConfig#socksProxyConfig (SocksProxyConfig: addr/username/password)
+// SOCKS proxy config (SocksProxyConfig: addr/username/password)
 producer.setSocksProxyConfig({ addr: '127.0.0.1:1080' });                               // SOCKS5, no auth
 producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', username: 'u', password: 'p' }); // SOCKS5 RFC 1929 subnegotiation
 producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });                   // SOCKS4/4a
 ```
 
-- The SOCKS CONNECT handshake runs after the TCP connect and BEFORE the TLS handshake (Java's Socks5ProxyHandler sits before the SSL handler in the pipeline); `version` defaults to 5, or 4 / `'SOCKS4'` (domain targets fall back to the SOCKS4a 0.0.0.1 sentinel).
-- Applies to all remoting connections (NameServer + Broker, Java's `0.0.0.0/0` behaviour); **TopAddressing's HTTP route fetch does NOT go through the proxy**.
-- Supported by Producer / PushConsumer; the environment variable `ROCKETMQ_SOCKS_PROXY_CONFIG` accepts the same JSON (Java's `{"0.0.0.0/0": {...}}` shape or a bare object).
+- The SOCKS CONNECT handshake runs after the TCP connect and BEFORE the TLS handshake (the SOCKS handler sits before the SSL handler in the pipeline); `version` defaults to 5, or 4 / `'SOCKS4'` (domain targets fall back to the SOCKS4a 0.0.0.1 sentinel).
+- Applies to all remoting connections (NameServer + Broker, i.e. the `0.0.0.0/0` catch-all); **TopAddressing's HTTP route fetch does NOT go through the proxy**.
+- Supported by Producer / PushConsumer; the environment variable `ROCKETMQ_SOCKS_PROXY_CONFIG` accepts the same JSON (the `{"0.0.0.0/0": {...}}` route-map shape or a bare object).
 
 ## Features and Status
 
@@ -279,7 +279,7 @@ producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });           
 - ✅ Two namespace mechanisms: `namespace` prefix + `namespaceV2` wire stamping; clientId `<ip>@<instanceName>[@<unitName>][@STREAM]`
 - ✅ Six queue allocation strategies: AVG / AVG_BY_CIRCLE / CONFIG / MACHINE_ROOM / MACHINE_ROOM_NEARBY / CONSISTENT_HASH
 - ✅ Message tracing (encode/decode + async dispatcher + send/receive hooks), consume statistics (differential window + 307 statusTable), W3C traceparent
-- ✅ Three compression types: zlib / LZ4 (Frame) / ZSTD; TLS opt-in; SOCKS4/5 proxy (mirrors ClientConfig#socksProxyConfig)
+- ✅ Three compression types: zlib / LZ4 (Frame) / ZSTD; TLS opt-in; SOCKS4/5 proxy (via SocksProxyConfig)
 - ✅ NameServer failover (client-side address switching and route re-fetch)
 
 ## Client Logging

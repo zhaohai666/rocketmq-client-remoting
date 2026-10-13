@@ -101,7 +101,7 @@ export const MessageAccessor = {
     MessageAccessor.putProperty(msg, PROPERTY_TIMER_DELIVER_MS, String(ms));
   },
 
-  // --- helpers mirrored from the Python port ---
+  // --- helper accessors ---
   setKeys(msg: any, keys: string): void {
     msg.putProperty(MessageConst.PROPERTY_KEYS, keys);
   },

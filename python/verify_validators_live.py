@@ -109,7 +109,7 @@ def main() -> int:
         prod.set_max_message_size(1024 * 1024 * 4)
         m_boundary = Message(TOPIC, b"1" * 8)
         validators.check_message(m_boundary, 8)
-        check("S1g 恰好等于 maxMessageSize 放行（Java 的 > 判定）", True)
+        check("S1g 恰好等于 maxMessageSize 放行（> 判定）", True)
 
         # ---------------- S2 批量反腿 ----------------
         print("=== S2 批量发送不绕过本地校验 ===")
@@ -267,7 +267,7 @@ def main() -> int:
                   e is not None
                   and e.response_code == ClientErrorCode.NO_NAME_SERVER_EXCEPTION,
                   "code=%s msg=%s" % (getattr(e, "response_code", None), e))
-            check("S7b 文案是 Java 的「No name server address, please set it.」（指向寻址）",
+            check("S7b 文案是「No name server address, please set it.」（指向寻址）",
                   str(e) == "No name server address, please set it.", "msg=%s" % e)
             check("S7c 失败发生在本地判定，没有把重试预算空转掉（<%gms）" % LOCAL_BUDGET_MS,
                   elapsed_ms < LOCAL_BUDGET_MS, "elapsed=%.2fms" % elapsed_ms)

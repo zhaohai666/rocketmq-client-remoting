@@ -235,7 +235,7 @@ final class MessageUtil
     }
 }
 
-/** Request-Reply 的若干便利函数（对应 Python 模块级 helper）。 */
+/** Request-Reply 的若干便利函数（模块级 helper）。 */
 final class RequestReply
 {
     /**

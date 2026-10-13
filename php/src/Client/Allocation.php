@@ -465,7 +465,7 @@ final class ConsistentHashRouter
     }
 
     /**
-     * Python bisect_left：返回 keys 中第一个 >= target 的下标（升序数组，二分）。
+     * 二分查找：返回 keys 中第一个 >= target 的下标（升序数组）。
      *
      * @param list<int> $keys
      */
@@ -537,7 +537,7 @@ final class AllocateMessageQueueConsistentHash implements AllocateMessageQueueSt
 
 final class AllocateMessageQueueByMachineRoom implements AllocateMessageQueueStrategy
 {
-    /** set 语义（对应 Python set）：key = 机房名，value 同名占位。 @var array<string, string> */
+    /** set 语义：key = 机房名，value 同名占位。 @var array<string, string> */
     private array $consumeridcs = [];
 
     /** @param list<string>|null $consumeridcs */

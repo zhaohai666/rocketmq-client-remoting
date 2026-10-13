@@ -147,7 +147,7 @@ def main() -> int:
         print("=== S2 topic 不符：本端亚毫秒拒，broker 上无痕 ===")
         e, elapsed = timed_send(prod, Message(TOPIC, b"refused", keys="pinned-live-refused"),
                                 mq_other)
-        check("S2a 同步单条拒（Java 原文案）",
+        check("S2a 同步单条拒（协议原文案）",
               e is not None and str(e) == SYNC_WORDING,
               "%.2fms %s" % (elapsed, str(e) if e else "没有抛异常"))
         check("S2b 拒在本端：亚毫秒且无 broker 码（不是超时/不是 broker remark）",
@@ -240,7 +240,7 @@ def main() -> int:
         landed = wait_until(lambda: prod.max_offset(mq0) == off_after_async + 1, 10)
         check("S5a 单向定点没有守卫：报文按 msg 自己的 topic 落进 A",
               landed, "A maxOffset=%d" % prod.max_offset(mq0))
-        check("S5b 目标队列所在的 B 一条都没有（是 Java 的口子，不是漏发）",
+        check("S5b 目标队列所在的 B 一条都没有（是设计上的口子，不是漏发）",
               prod.max_offset(mq_other) == 0, "B maxOffset=%d" % prod.max_offset(mq_other))
 
         # ---------------- S6 正腿收尾：消息一条不少 ----------------

@@ -111,7 +111,7 @@ function testPure(): void {
   check('SOCKS4 CD=91 throws', threw.includes('rejected or failed'), threw);
 
   const cfg = parseSocksProxyConfig('{"0.0.0.0/0": {"addr": "1.2.3.4:1080", "username": "u"}}');
-  check('parseSocksProxyConfig Java map shape', cfg != null && cfg.addr === '1.2.3.4:1080' && cfg.username === 'u');
+  check('parseSocksProxyConfig route-map shape', cfg != null && cfg.addr === '1.2.3.4:1080' && cfg.username === 'u');
   const bare = parseSocksProxyConfig('{"addr": "5.6.7.8:1080"}');
   check('parseSocksProxyConfig bare object shape', bare != null && bare.addr === '5.6.7.8:1080');
   check('parseSocksProxyConfig empty/{} -> null', parseSocksProxyConfig('{}') === null && parseSocksProxyConfig('') === null && parseSocksProxyConfig(null) === null);

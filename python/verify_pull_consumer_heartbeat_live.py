@@ -76,7 +76,7 @@ def main() -> int:
         conn = group_is_online(admin, GROUP, MASTER)
         check("A2 主节点 203 查到本组（心跳已注册）", conn is not None,
               "connections=%d" % (len(conn.connection_set) if conn else 0))
-        check("A2 消费类型是 CONSUME_ACTIVELY（Java DefaultMQPullConsumerImpl:348）",
+        check("A2 消费类型是 CONSUME_ACTIVELY",
               conn is not None and conn.consume_type == "CONSUME_ACTIVELY",
               "consumeType=%s" % (conn.consume_type if conn else None))
         check("A2 消费位点是 CONSUME_FROM_LAST_OFFSET（:353）",

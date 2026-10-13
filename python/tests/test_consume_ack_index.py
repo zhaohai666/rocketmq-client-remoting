@@ -192,7 +192,7 @@ class TestReconsumeLater:
         assert h.consume([msg(0), msg(1)], FixedListener(None)) is True
         assert h.backed_offsets == [0, 1], "整批回投"
         assert hook.after == [("RECONSUME_LATER", False, "RETURNNULL")], (
-            "status 的形态按 Java 的 Enum.toString()（裸成员名），不是 str(枚举) 那种带类名的")
+            "status 的形态是裸成员名，不是带类名的枚举字符串")
 
     def test_hook_status_is_the_uppercase_enum_name_on_the_success_path_too(self):
         pass

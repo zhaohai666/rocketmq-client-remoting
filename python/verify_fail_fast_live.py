@@ -181,7 +181,7 @@ def main() -> int:
         types = sorted({p[1] for p in parked})
         send_fail = [p for p in parked if p[1] == "RemotingSendRequestException"]
         timeout_like = [p for p in parked if "Timeout" in p[1]]
-        check("L3 报的是 RemotingSendRequestException（Java failFast 的口径）",
+        check("L3 报的是 RemotingSendRequestException（failFast 的口径）",
               len(send_fail) == 3, "types=%s" % types)
         check("L3 一条都没被报成超时（类型错 = 重试决策错）", not timeout_like,
               "timeout=%d" % len(timeout_like))

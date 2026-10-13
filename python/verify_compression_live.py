@@ -113,7 +113,7 @@ def selftest():
     size = 8192  # 远超 compressMsgBodyOverHowmuch(4096)
     payload = build_payload(size)
     payload_crc = crc32(payload)
-    print("payload len=%d crc32=%d（确定性载荷，与 Java 探针同算法）" % (size, payload_crc))
+    print("payload len=%d crc32=%d（确定性载荷，crc32 与探针同算法）" % (size, payload_crc))
 
     # 1) 发出
     prod = DefaultMQProducer("CompressLivePyProducer_%d" % stamp)

@@ -135,7 +135,7 @@ def main() -> int:
         tag_probe = CheckConfigProbe()
         c2, _ = new_consumer(GROUP + "_TAG", probe=tag_probe, expression="tagA || tagB")
         c2.start()
-        check("纯 TAG 订阅一笔 46 都不发（Java isTagType 短路）",
+        check("纯 TAG 订阅一笔 46 都不发（isTagType 短路）",
               tag_probe.check_count == 0, str(tag_probe.codes))
         c2.shutdown()
 

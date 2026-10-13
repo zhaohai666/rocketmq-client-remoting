@@ -97,7 +97,7 @@ final class TraceContextPropagator
         return in_array(strtolower(trim((string) $raw)), ['1', 'true', 'yes'], true);
     }
 
-    /** 对应 Python ``secrets.token_hex(n // 2)``：n 位十六进制。 */
+    /** 生成 n 位十六进制随机串。 */
     private static function hex(int $n): string
     {
         return bin2hex(random_bytes(intdiv($n, 2)));

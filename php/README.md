@@ -346,7 +346,7 @@ $producer->tlsOptions = [
 
 ### SOCKS 代理
 
-对齐 Java `ClientConfig` 的 `socksProxyConfig`（`SocksProxyConfig`：addr / username / password，
+SOCKS 代理配置 `SocksProxyConfig`（addr / username / password，
 缺省 SOCKS5，另支持 SOCKS4）：配置后 NameServer + Broker 的全部 remoting 连接改为
 `TCP 连代理 → SOCKS CONNECT 握手 → TLS 升级 → RocketMQ 帧`（动态取址的 HTTP 请求不走代理）。
 

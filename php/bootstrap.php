@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 // 自动加载（不依赖 composer：任何入口 include 本文件即可用全部类）。
 //
-// 目录布局与 Python 端 1:1 对应：Common/*、Client/*、Remoting/Protocol/*。
+// 目录布局：Common/*、Client/*、Remoting/Protocol/*。
 // 注意：Remoting/Protocol 下的 Header/Body 类按「域」聚合在少数文件里（Headers.php、
 // Bodies.php 等），一个文件包含多个类，PSR-4 推导不出 → 命中失败后回退到全量 classmap
 // （首次 miss 时用 token_get_all 扫描 src/ 一次并缓存于进程内）。

@@ -54,7 +54,7 @@ final class Logger
 
     /**
      * 生效级别：ROCKETMQ_CLIENT_LOG_LEVEL 优先，取不到或名字不认识回 INFO。
-     * TRACE 与 Go/nodeJs 同归到最详细档（本端口最细档是 DEBUG）。
+     * TRACE 归到最详细档（本端口最细档是 DEBUG）。
      * setLevel() 显式调用过则以调用方为准。
      */
     private static function resolvedLevel(): int
@@ -116,7 +116,7 @@ final class Logger
         fwrite(STDERR, $line);
     }
 
-    /** 解析一次落盘目标（同 Go 的 sync.Once / nodeJs 的模块级 sink）。 */
+    /** 解析一次落盘目标（模块级 sink，进程内只解析一次）。 */
     private static function sink(): ?FileSink
     {
         if (self::$sinkResolved) {
@@ -135,7 +135,7 @@ final class Logger
         if ($upper === 'OFF' || $upper === 'NONE') {
             return self::$sink = null;
         }
-        // 含路径分隔符的取值按完整路径处理，否则拼到日志目录下（与 Go/nodeJs 同）
+        // 含路径分隔符的取值按完整路径处理，否则拼到日志目录下
         if (!str_starts_with($file, '/') && !str_contains($file, DIRECTORY_SEPARATOR)) {
             $dir = getenv('ROCKETMQ_CLIENT_LOG_DIR');
             if ($dir === false || $dir === '') {
@@ -148,7 +148,7 @@ final class Logger
 
     /**
      * 默认日志目录 = <当前工作目录>/logs/rocketmqlogs，刻意避开用户 HOME
-     * （见类注释与 python/rocketmq_logging.py 的同名取舍）。
+     * （见类注释中同名取舍的说明）。
      * cwd 取不到（已删除的目录）时退回系统临时目录，而不是 HOME。
      */
     public static function defaultLogDir(): string
@@ -162,8 +162,7 @@ final class Logger
 }
 
 /**
- * 按大小轮转的文件落盘点。写失败只降级（一次），绝不影响客户端主流程 ——
- * 与 nodeJs FileSink / csharp ClientLog 同一取舍。
+ * 按大小轮转的文件落盘点。写失败只降级（一次），绝不影响客户端主流程。
  */
 final class FileSink
 {

@@ -54,9 +54,9 @@ final class BrokerSetSelector
  */
 final class AsyncTraceDispatcher
 {
-    /** 内部生产者组名的全局自增序号（Python itertools.count(1)）。 */
+    /** 内部生产者组名的全局自增序号（从 1 起）。 */
     private static int $counter = 1;
-    /** traceInstanceId 的全局自增序号（Python itertools.count(0)）。 */
+    /** traceInstanceId 的全局自增序号（从 0 起）。 */
     private static int $instanceNum = 0;
 
     public const WAIT_FOR_SHUTDOWN = 5000;
@@ -73,7 +73,7 @@ final class AsyncTraceDispatcher
     public int $discardCount = 0;
     public bool $stopped = false;
     public bool $isStarted = false;
-    /** PHP 无线程：恒为 null（保留字段只为逐字对照 Python）。 */
+    /** PHP 无线程：恒为 null（保留字段以兼容线上结构）。 */
     public mixed $worker = null;
     public AccessChannel $accessChannel = AccessChannel::LOCAL;
     public string $namespaceV2 = '';
@@ -265,7 +265,7 @@ final class AsyncTraceDispatcher
     }
 
     /**
-     * 显式跑一轮后台循环（替代 Python 的 _async_run 线程体）。
+     * 显式跑一轮后台循环（线程体的等价物）。
      *
      * @param bool $forceFlush true 时无条件刷写（等价 flush 的一步）
      */

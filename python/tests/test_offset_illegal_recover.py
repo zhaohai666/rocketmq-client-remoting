@@ -132,7 +132,7 @@ class TestFreeze:
     def test_frozen_offset_ignores_ack(self):
         h = Harness()
         h.freeze(0)
-        # 旧批次（offset 2 已消费）迟到的 ack：把位点推回 3 就是 java 的弹跳现场
+        # 旧批次（offset 2 已消费）迟到的 ack：把位点推回 3 就是弹跳现场
         h.ack([0, 1, 2], epoch=0)
         assert h.offset == 0
 

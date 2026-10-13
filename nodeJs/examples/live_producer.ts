@@ -106,7 +106,7 @@ async function main(): Promise<void> {
   try {
     await producer.sendOneway(new Message(TOPIC, Buffer.from('oneway-0'), 'TagOneway', 'ko'));
     check('oneway send', true);
-    sent++; // oneway cannot be confirmed; count optimistically like the Go port
+    sent++; // oneway cannot be confirmed; count optimistically
   } catch (e) {
     check('oneway send', false, String((e as Error).message));
   }

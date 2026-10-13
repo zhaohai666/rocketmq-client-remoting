@@ -177,7 +177,7 @@ def main() -> int:
               "gap=%.1fs" % ((times[1][1] - first_at) if len(times) >= 2 else -1))
 
         # ---------- A5 位点收尾 ----------
-        check("A5-挂住的 listener 返回后业务队列位点走到 1（Java removeMessage 含已清扫条目）",
+        check("A5-挂住的 listener 返回后业务队列位点走到 1（removeMessage 含已清扫条目）",
               wait_until(lambda: committed_offset(group, topic) == 1, 30),
               "offset=%d" % committed_offset(group, topic))
     finally:

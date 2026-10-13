@@ -94,7 +94,7 @@ class TestRocketMQSerializable:
         assert got["version"] == 7
         assert got["opaque"] == 12345
         assert got["flag"] == 0
-        assert got["remark"] is None, "Java readStr 长度 0 返回 null"
+        assert got["remark"] is None, "长度为 0 的字符串字段解出 None"
         assert got["extFields"] == {"topic": "TopicTest", "中文键": "中文值"}
 
     def test_write_str_short_and_int_length(self):

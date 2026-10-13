@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-// PHP 端 DefaultMQAdminExt 真机冒烟：对标 go/examples/live_admin 的场景面（精简版）。
+// DefaultMQAdminExt 真机冒烟（精简版场景面）。
 //
 //   php examples/live_admin.php [namesrv]
 //

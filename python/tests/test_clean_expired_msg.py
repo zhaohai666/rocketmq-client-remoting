@@ -185,8 +185,8 @@ def test_expired_first_entry_is_sent_back_at_delay_3_then_removed(monkeypatch):
 
     h.sweep()
 
-    assert h.backed == [(m, 3)], "必须用固定 delayLevel 3 回投（Java:103）"
-    assert h.record_offsets == [], "回投成功且仍是队首 → 摘除（Java:106-115）"
+    assert h.backed == [(m, 3)], "必须用固定 delayLevel 3 回投"
+    assert h.record_offsets == [], "回投成功且仍是队首 → 摘除"
 
     h.sweep()
     assert len(h.backed) == 1, "已摘除的不会在下一轮再被看见"

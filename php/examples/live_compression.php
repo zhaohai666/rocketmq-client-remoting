@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-// PHP 端压缩矩阵腿：对标 go/examples/live_compression_matrix（参数与退出码一致）。
+// 压缩矩阵腿：参数与退出码固定。
 //
 //   php examples/live_compression.php send <topic> <group> <size> <namesrv> [codec]
 //   php examples/live_compression.php recv <topic> <group> <size> <namesrv>
@@ -13,7 +13,7 @@ declare(strict_types=1);
 // Raw/RLE 帧）——见 2026-10-08。接收端按 sysFlag 类型位
 // 自动解压，所以「B 能解 A 压的」正是矩阵要证明的部分。
 //
-// 退出码（对齐 Python/Go 腿，脚本据此区分）：0 ok / 1 普通失败（含发送失败，
+// 退出码（矩阵脚本据此区分）：0 ok / 1 普通失败（含发送失败，
 // 不能占用 2）/ 2 坏 codec 或坏用法 / 3 recv 超时。
 require __DIR__ . '/../bootstrap.php';
 

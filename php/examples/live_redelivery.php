@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-// PHP 端真机重投/死信矩阵：对标 go/examples/live_redelivery（S1-S4 全部口径）。
+// 真机重投/死信矩阵（S1-S4 全部口径）。
 //
 //   php examples/live_redelivery.php [namesrv] [legs]
 //   legs = all | s1,s2,s3,s4
@@ -300,7 +300,7 @@ function rd_send(DefaultMQProducer $p, string $topic, string $body): void
 
 /**
  * 起一个 push 消费者并等分配到位（FIRST_OFFSET：新组从队首读，S4 的
- * 消息发在启动之前也必须可见——Go 参考实现同款注释）。
+ * 消息发在启动之前也必须可见）。
  */
 function rd_start_consumer(string $ns, string $group, object $listener, string ...$topics): DefaultMQPushConsumer
 {

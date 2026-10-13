@@ -208,7 +208,7 @@ final class TraceDataEncoder
             $bean->storeHost = self::at($line, 8);
             $bean->bodyLength = (int) self::at($line, 9);
             $ctx->costTime = (int) self::at($line, 10);
-            // MessageType::from 对越界值抛 ValueError（与 Python MessageType(int) 一致），
+            // MessageType::from 对越界值抛 ValueError，
             // 由 decoderFromTraceDataString 捕获后跳过该条记录。
             $bean->msgType = MessageType::from((int) self::at($line, 11));
             $n = count($line);

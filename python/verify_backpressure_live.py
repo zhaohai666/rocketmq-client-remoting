@@ -208,7 +208,7 @@ def main():
         check("B2 闸等到预算耗尽才报错（不是看一眼就拒）",
               int((time.monotonic() - began) * 1000) >= 130,
               "调用方等了 %dms" % int((time.monotonic() - began) * 1000))
-        check("B2 超限的两笔回调 TooMuchRequest，文案与 Java 逐字一致",
+        check("B2 超限的两笔回调 TooMuchRequest，文案与协议约定逐字一致",
               len(rejected.errors) == 2
               and all(isinstance(e, RemotingTooMuchRequestException) for e in rejected.errors)
               and all("send message tryAcquire semaphoreAsyncNum timeout" in str(e)
@@ -279,7 +279,7 @@ def main():
         th_two = threading.Thread(target=lambda: p3.send_async(Message(t3, big), two, 150))
         th_two.start()
         th_two.join(10.0)
-        check("B4 第二笔 600KB 过不了字节闸，文案与 Java 逐字一致",
+        check("B4 第二笔 600KB 过不了字节闸，文案与协议约定逐字一致",
               len(two.errors) == 1
               and "send message tryAcquire semaphoreAsyncSize timeout" in str(two.errors[0]),
               two.summary())

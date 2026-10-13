@@ -97,7 +97,7 @@ class TestUtilAll:
 
     def test_string_2_bytes_roundtrip(self):
         assert UtilAll.string_2_bytes("0AFF") == b"\x0a\xff"
-        assert UtilAll.string_2_bytes("0aff") == b"\x0a\xff", "Java 内部先 toUpperCase"
+        assert UtilAll.string_2_bytes("0aff") == b"\x0a\xff", "解析时先统一转大写"
         assert UtilAll.string_2_bytes("") is None
         assert UtilAll.string_2_bytes(None) is None
 

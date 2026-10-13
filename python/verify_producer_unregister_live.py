@@ -162,7 +162,7 @@ def main():
                 shape_ok = False
             if addr not in all_addrs:
                 shape_ok = False
-        check("U3b 35 的头是 clientID + producerGroup，consumerGroup 不上线（Java 传 null）",
+        check("U3b 35 的头是 clientID + producerGroup，consumerGroup 不上线（留空）",
               shape_ok, "ext=%s" % (requests[0][1] if requests else None))
         all_ok = bool(responses) and all(addr in all_addrs for addr, _ in requests) \
             and all(rc == RemotingSysResponseCode.SUCCESS for _, rc in responses)

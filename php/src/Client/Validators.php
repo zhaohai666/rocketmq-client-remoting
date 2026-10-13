@@ -14,7 +14,7 @@ final class Validators
 {
     public const CHARACTER_MAX_LENGTH = 255;
 
-    /** 对应 Python ``os.sep``：多队列分发（LMQ）路径里不允许出现文件系统分隔符。 */
+    /** 文件系统分隔符：多队列分发（LMQ）路径里不允许出现。 */
     public const FILE_SEPARATOR = DIRECTORY_SEPARATOR;
 
     /** 对应 ``Validators.checkGroup``。 */

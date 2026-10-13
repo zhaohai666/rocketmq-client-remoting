@@ -288,7 +288,7 @@ final class DefaultMQPullConsumer
         return $this->heartbeatCount;
     }
 
-    /** 心跳到点驱动（对齐 Python 后台心跳循环的循环体；无订阅时可跳过）。 */
+    /** 心跳到点驱动（后台心跳循环的循环体；无订阅时可跳过）。 */
     public function tick(?int $nowMillis = null): void
     {
         if (!$this->started) {
@@ -1027,7 +1027,7 @@ final class DefaultLitePullConsumer
     }
 
     /**
-     * 单队列一次拉取（对齐 Python _pull_one）：短轮询；FOUND/NO_NEW_MSG/NO_MATCHED_MSG/
+     * 单队列一次拉取：短轮询；FOUND/NO_NEW_MSG/NO_MATCHED_MSG/
      * OFFSET_ILLEGAL 都推进拉取游标到 nextBeginOffset；刹车：**在途结果不许盖掉刚 seek /
      * 刚被撤走的位点**（游标还是不是我发请求时的那个值）。
      */
@@ -1636,7 +1636,7 @@ final class DefaultLitePullConsumer
     }
 }
 
-/** 便捷监听器包装：把消费逻辑转成纯函数（对应 Python SimpleMessageListener）。 */
+/** 便捷监听器包装：把消费逻辑转成纯函数。 */
 final class SimpleMessageListener implements MessageListenerConcurrently
 {
     /** @var callable(list<MessageExt>): ConsumeConcurrentlyStatus */

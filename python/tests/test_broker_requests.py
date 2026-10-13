@@ -376,10 +376,10 @@ class TestMqClientDispatch:
 
         cmd = fake_cmd(NOTIFY_CONSUMER_IDS_CHANGED, {"consumerGroup": GROUP})
         resp = mqc._process_notify_consumer_ids_changed(cmd, "127.0.0.1:10911")
-        assert resp is None, "40 是 broker 的 oneway 通知，Java 返回 null ⇒ 不回包"
+        assert resp is None, "40 是 broker 的 oneway 通知，不该回包"
         assert mqc.consumer_ids_changed_count == 1
         assert c1._rebalance_now.is_set() and c2._rebalance_now.is_set(), \
-            "整组一起唤醒（Java rebalanceImmediately 不读 consumerGroup）"
+            "整组一起唤醒（rebalanceImmediately 不读 consumerGroup）"
 
     def test_40_with_no_group_or_consumer_is_silent(self):
         mqc = MQClientInstance("client@40-empty", ["127.0.0.1:9876"])

@@ -1485,7 +1485,7 @@ class QueryDataVersionResponseHeader(CommandCustomHeader):
 #
 # ext key 必须逐字等于协议字段名：broker 用 fastjson 按协议属性名反序列化，
 # 错一个字母就**静默丢字段**（不报错、行为静默退化），所以下面每个 key 都对着
-# 协议 `remoting/.../protocol/header/Pop*Header.java` 的字段声明逐字核对。
+# 协议里 Pop*Header 系列的字段声明逐字核对。
 #
 # 另外注意 `order` / `suspend` 这两个字段协议里是**非空** Boolean/boolean
 # （`order = Boolean.FALSE`、`suspend = false`），

@@ -51,8 +51,8 @@ def creds(sk: str = SK) -> AclClientRPCHook:
 def response_code_of(exc: BaseException) -> Optional[int]:
     """沿 cause 链找 broker 响应码。
 
-    broker 侧**所有**鉴权失败都抛 AbortProcessException(NO_PERMISSION=16)
-    （broker/auth/pipeline/AuthenticationPipeline.java:53），所以 16 就是「被拒绝」。
+    broker 侧**所有**鉴权失败都收敛成 AbortProcessException(NO_PERMISSION=16)，
+    所以 16 就是「被拒绝」。
     不能只看最外层：admin 的 create_topic_in_route 会把底层 MQBrokerException
     包进 MQClientException(cause=...)，最外层根本没有 response_code。
     """

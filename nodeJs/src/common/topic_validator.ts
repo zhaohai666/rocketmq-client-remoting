@@ -10,7 +10,7 @@ export const RETRY_OR_DLQ_TOPIC_MAX_LENGTH = 255;
 
 export const VALID_CHAR_PATTERN = '^[%|a-zA-Z0-9_-]+$';
 export const CHARSET_ILLEGAL = '{}\n';
-// Allowed character set (code points 0-127 only); mirrors Python _ALLOWED_CHARS.
+// Allowed character set (code points 0-127 only).
 export const VALID_CHARS = new Set(
   '%-_|0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'.split(''),
 );
@@ -60,7 +60,7 @@ export const NOT_ALLOWED_SEND_TOPIC_SET = new Set<string>([
   RMQ_SYS_ROCKSDB_TRANS_OP_HALF_TOPIC,
 ]);
 
-// Mirrors Python is_topic_or_group_illegal: empty string is NOT illegal (blank-ness is
+// Empty string is NOT illegal (blank-ness is
 // handled separately); returns true when any char has code point >= 128 or is not allowed.
 export function isTopicOrGroupIllegal(name: string | null): boolean {
   if (name == null) return true;

@@ -416,7 +416,7 @@ def main():
     rqi = safe("resetOffsetByQueueId(回到 minOffset)",
                lambda: admin.reset_offset_by_queue_id(
                    broker_addr, GROUP, TOPIC, mq.queue_id, min_reset),
-               lambda d: "returnedTable=%d（Java 为 void，可为空）" % len(d))
+               lambda d: "returnedTable=%d（该 RPC 无返回体，可为空）" % len(d))
     if rqi is not None:
         off_rqi = admin.examine_consumer_offset(GROUP, mq)
         check("resetOffsetByQueueId 后位点==目标 offset", off_rqi == min_reset,
@@ -451,7 +451,7 @@ def main():
         check("resetOffsetByQueueId 越界目标被 broker 拒绝", True,
               "%s: %s" % (type(e).__name__, str(e)[:160]))
     off_after_bad = admin.examine_consumer_offset(GROUP, mq)
-    check("越界 reset 停留在第 1 笔写入的非法位点（Java 两笔 RPC 非原子）",
+    check("越界 reset 停留在第 1 笔写入的非法位点（两笔 RPC 非原子）",
           off_after_bad == bad_target,
           "consumerOffset=%s badTarget=%s" % (off_after_bad, bad_target))
 

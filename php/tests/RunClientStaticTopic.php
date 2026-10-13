@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 /**
- * 静态主题路由离线单测（对标 Go 端 static_topic_test.go 的五个用例）—— 不需要集群。
+ * 静态主题路由离线单测（五个用例）—— 不需要集群。
  *
  * 覆盖：mock broker 名推导、类型化映射解析缺省值、端点推导（未承载队列 ->
  * "__syslo__none__" 哨兵、scope 不合并、epoch 围栏）、getBrokerNameFromMessageQueue

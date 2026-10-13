@@ -123,8 +123,8 @@ export class TopicRouteData {
     }
     return mqs;
   }
-  // Assemble all readable MessageQueues (subscribe side). Mirrors
-  // MQClientInstance.topicRouteData2TopicSubscribeInfo (read perm; no master required).
+  // Assemble all readable MessageQueues (subscribe side): read perm, no master
+  // required.
   // Static-topic branch: with a mapping present the subscribe set is the
   // logical endpoints key set, regardless of queueDatas.
   getAllSubscribeMessageQueue(topic = ''): MessageQueue[] {

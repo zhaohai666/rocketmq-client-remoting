@@ -268,7 +268,7 @@ def main() -> int:
 
     all_segments = sum(text.count(TraceConstants.FIELD_SPLITOR)
                        for _k, t, text in raw if t == MixAll.TRACE_TOPIC)
-    check("S16 轨迹文本记录数（STX 计数）== 解码出的记录数（Java split 语义）",
+    check("S16 轨迹文本记录数（STX 计数）== 解码出的记录数（split 语义）",
           all_segments == len(records) and len(records) > 0,
           "segments=%d decoded=%d" % (all_segments, len(records)))
 

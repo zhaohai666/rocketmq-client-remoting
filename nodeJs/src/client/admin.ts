@@ -1353,9 +1353,9 @@ export class DefaultMQAdminExt {
     return merged;
   }
 
-  // viewMessage mirrors Java DefaultMQAdminExtImpl#viewMessage: try the
-  // offset-msgId decode first; a client UNIQ_KEY is NOT an offset id and the
-  // decode throws (or yields a bogus port) — Java catches that and falls back
+  // viewMessage: try the offset-msgId decode first; a client UNIQ_KEY is NOT
+  // an offset id and the decode throws (or yields a bogus port) — the caller
+  // catches that and falls back
   // to the U-index query across the route's brokers. Keep the same contract:
   // never let a uniq key die inside decodeMessageId.
   async viewMessage(topic: string, msgId: string): Promise<MessageExt> {
@@ -1393,7 +1393,7 @@ export class DefaultMQAdminExt {
     return msg;
   }
 
-  // The uniq-key leg of Java's viewMessage fallback:
+  // The uniq-key leg of the viewMessage fallback:
   // MQAdminImpl#queryMessageByUniqKey — U-index query across every broker in
   // the route, first hit wins, verified against the UNIQ_KEY property so a
   // stray key collision can't satisfy the lookup.

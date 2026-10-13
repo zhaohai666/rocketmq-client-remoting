@@ -52,7 +52,7 @@ final class RecallMessageHandle
             throw new MQClientException(self::INVALID_HANDLE);
         }
         if (!preg_match('//u', $raw)) {
-            // Python UnicodeDecodeError -> 同样给固定文案
+            // 非法 UTF-8 序列同样给固定文案
             throw new MQClientException(self::INVALID_HANDLE);
         }
         $items = explode(self::SEPARATOR, $raw);

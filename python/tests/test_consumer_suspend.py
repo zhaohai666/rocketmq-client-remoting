@@ -100,7 +100,7 @@ def test_suspend_backoff_matches_the_default_interval():
 
 def test_suspend_flag_is_off_by_default():
     c, mq, key, fake = _consumer()
-    assert c.is_paused() is False, "默认不挂起（Java private volatile boolean pause = false）"
+    assert c.is_paused() is False, "默认不挂起：pause 初始为 false"
 
 
 # ---------------- 核心：挂起停拉取，恢复接着拉 ----------------
@@ -119,13 +119,13 @@ def test_suspend_stops_pulls_and_resume_restarts_them():
         stamp_before = c._last_pull_table[key]
         time.sleep(2.5)
 
-        assert fake.count() == baseline, "挂起期间不能有新的 PULL_MESSAGE 上线（Java pullMessage:263-266）"
+        assert fake.count() == baseline, "挂起期间不能有新的 PULL_MESSAGE 上线"
         assert c._last_pull_table[key] > stamp_before, \
-            "挂起期间 lastPullTimestamp 必须继续推进：闸门在盖章之后（Java :253 → :263），" \
+            "挂起期间 lastPullTimestamp 必须继续推进：闸门在盖章之后，" \
             "否则一次超过 120s 的挂起会被停摆判据当成死循环，rebalance 把分配整个摘走"
         with c._lock:
             assert c._pull_stalled_locked(key) is False, "挂起不等于停摆"
-        assert c._queue_threads[key] is th, "挂起不换线程、不撤队列（Java 只翻一个布尔）"
+        assert c._queue_threads[key] is th, "挂起不换线程、不撤队列：只翻一个布尔"
         assert c._mq_map.get(key) == mq, "分配关系保持原样"
 
         c.resume()
@@ -161,7 +161,7 @@ def test_resume_triggers_rebalance():
         c.suspend()
         c._rebalance_now.clear()
         c.resume()
-        assert c._rebalance_now.is_set() is True, "resume 必须叫醒重平衡循环（Java rebalanceImmediately）"
+        assert c._rebalance_now.is_set() is True, "resume 必须叫醒重平衡循环"
     finally:
         c._paused = False
 
@@ -185,7 +185,7 @@ def test_pop_mode_suspend_stops_pops_and_keeps_stamping():
         table_before = c._last_pull_table[key]
         time.sleep(2.5)
 
-        assert fake.count() == baseline, "挂起期间不能有新的 POP_MESSAGE 上线（Java popMessage:518-521）"
+        assert fake.count() == baseline, "挂起期间不能有新的 POP_MESSAGE 上线"
         assert pq.last_pop_timestamp > stamp_before, "lastPopTimestamp 必须继续推进"
         assert c._last_pull_table[key] > table_before
         with c._lock:

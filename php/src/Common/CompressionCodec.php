@@ -11,7 +11,7 @@ declare(strict_types=1);
 // 能解标准 Compressed 块，与 broker 侧的真 zstd 互通）；CLI 不可用时退回纯实现——
 // 压缩 = 只用 RAW 块（长串跑 RLE）拼出的合法 zstd 帧（无压缩率但 wire 兼容），
 // 解压只认 Raw/RLE 块，遇到 Compressed 块显式报错而不是把压缩字节当正文交回
-// —— 跨端规则「unsupported = throw, never passthrough」。
+// —— wire 兼容规则「unsupported = throw, never passthrough」。
 namespace RocketMQ\Common;
 
 final class CompressionCodec

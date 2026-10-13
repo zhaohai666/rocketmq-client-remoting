@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-// PHP 端真机 POP 消费验证：对标 go/examples/live_pop（S1/S2 全口径）。
+// 真机 POP 消费验证（S1/S2 全口径）。
 //
 //   php examples/live_pop.php [namesrv] [legs]     # legs = all | s1,s2
 //

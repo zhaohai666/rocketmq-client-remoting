@@ -203,7 +203,7 @@ class TestMessageId:
     def test_create_and_decode_roundtrip_v4(self):
         msg_id = create_message_id(ip_and_port_to_bytes("10.0.0.1", 10911), 2048)
         assert len(msg_id) == 32
-        assert msg_id == msg_id.upper(), "Java UtilAll.bytes2string 产出大写十六进制"
+        assert msg_id == msg_id.upper(), "bytes2string 产出大写十六进制"
         assert decode_message_id(msg_id) == ("10.0.0.1", 10911, 2048)
 
     def test_create_and_decode_roundtrip_v6(self):

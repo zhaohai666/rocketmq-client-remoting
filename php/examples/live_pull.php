@@ -2,8 +2,7 @@
 
 declare(strict_types=1);
 
-// PHP 端真机拉模式消费者验证：对标 cpp/examples/live_pull.cpp 与 rust/examples/live_pull_consumer.rs
-// 的同场景（S1 队列、S1b 平衡视图、S2 发送+逐队列拉全、S3 位点提交回读）。
+// 真机拉模式消费者验证，覆盖同场景（S1 队列、S1b 平衡视图、S2 发送+逐队列拉全、S3 位点提交回读）。
 //
 //   php examples/live_pull.php [namesrv] [legs]     # legs = all | s1,s2,s3
 //

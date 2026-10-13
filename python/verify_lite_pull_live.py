@@ -383,7 +383,7 @@ def s8_three_offset_tables(foreign_pool: list) -> None:
         # 点名一条 foreign 队列：它没有消费记录（-1 守卫拦下写表），
         # 但 persistAll 扫表时把 q0 那份未落盘的值清了 —— 这才是「提交部分队列」的代价。
         o.commit([foreign], persist=True)
-        check("S8g 点名提交会把没点名的内存值清掉（Java 的 remove unused mq）",
+        check("S8g 点名提交会把没点名的内存值清掉（remove unused mq）",
               o.pending_commit_of(q0) == -1, "pending=%d" % o.pending_commit_of(q0))
         check("S8g 清掉之后回读到的是 broker 上那一格（并回填进表）",
               o.committed(q0) == 60 and o.pending_commit_of(q0) == 60,
@@ -397,7 +397,7 @@ def s8_three_offset_tables(foreign_pool: list) -> None:
         set_committed = broker_offset(probe, q0)
         check("S8g commit(Set) 提交的是已消费游标（60），不是内存里那格 300",
               set_committed == 60, "brokerOffset=%d" % set_committed)
-        check("S8g persistAll 之后内存表回到已消费游标（Java 的 updateConsumeOffset）",
+        check("S8g persistAll 之后内存表回到已消费游标（updateConsumeOffset）",
               o.pending_commit_of(q0) == 60, "pending=%d" % o.pending_commit_of(q0))
     finally:
         o.shutdown()
@@ -522,7 +522,7 @@ def main() -> int:
     c5.shutdown()
 
     # ===== S7 可插拔队列分配策略 =====
-    print("\nS7 可插拔队列分配策略（对应 Java setAllocateMessageQueueStrategy）")
+    print("\nS7 可插拔队列分配策略（setAllocateMessageQueueStrategy）")
     all_queues = sorted(c1.fetch_message_queues(TOPIC),
                         key=lambda mq: (mq.topic, mq.broker_name, mq.queue_id))
     total_queues = len(all_queues)
@@ -536,10 +536,10 @@ def main() -> int:
     probe.subscribe(TOPIC, "*")
     try:
         probe.start()
-        check("S7a 策略为 None 时 start() 报 Java 同款文案", False, "没有抛异常")
+        check("S7a 策略为 None 时 start() 报同款文案", False, "没有抛异常")
         probe.shutdown()
     except MQClientException as e:
-        check("S7a 策略为 None 时 start() 报 Java 同款文案",
+        check("S7a 策略为 None 时 start() 报同款文案",
               "allocateMessageQueueStrategy is null" in str(e), str(e))
 
     # S7b AVG_BY_CIRCLE：同组两实例交叉切分，不重不漏

@@ -43,7 +43,7 @@ class DefaultTopAddressing
 
     /**
      * 对应 ``DefaultTopAddressing.clearNewLine``：trim 后截断到第一个 \r 或 \n。
-     * （Python 侧是模块级函数 ``clear_new_line``，这里落成静态方法以便 autoload。）
+     * （落成静态方法以便 autoload。）
      */
     public static function clearNewLine(string $content): string
     {

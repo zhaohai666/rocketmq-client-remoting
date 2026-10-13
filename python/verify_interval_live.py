@@ -196,7 +196,7 @@ def main():
         dt_slow_first = time.time() - t_start
         check("I2 1s 组首次落盘发生在 initialDelay(~10s) 之后", fast_first,
               "dt=%.2fs 周期=%dms" % (dt_fast_first, FAST_PERSIST_MS))
-        check("I2 首笔落盘不早于 Java 的 initialDelay 10s",
+        check("I2 首笔落盘不早于 initialDelay 10s",
               fast_first and dt_fast_first >= PERSIST_INITIAL_DELAY - 0.5,
               "dt=%.2fs" % dt_fast_first)
         check("I2 60s 组同样在 ~10s 完成首笔落盘（周期未到，先走 initialDelay）", slow_first,
@@ -225,7 +225,7 @@ def main():
         slow_c.shutdown()
         consumers.remove(slow_c)
         slow_final = _wait_until(lambda: _broker_offset(admin, g_slow, mq) == 6, 10.0, 0.3)
-        check("I2 60s 组 shutdown() 时把 6 落盘（Java persistConsumerOffset 收尾）",
+        check("I2 60s 组 shutdown() 时把 6 落盘（persistConsumerOffset 收尾）",
               slow_final, "broker=%d" % _broker_offset(admin, g_slow, mq))
     except Exception as exc:  # noqa: BLE001
         import traceback

@@ -400,9 +400,9 @@ $T->checkThrows(
     'LZ4 零偏移抛异常'
 );
 
-// ZSTD Raw/RLE 帧：node 产出的完整小帧（magic/帧头/RAW 块跨端锚点）+ 往返 + RLE
+// ZSTD Raw/RLE 帧：一个完整的标准小帧（magic/帧头/RAW 块）+ 往返 + RLE
 $zstdNode = hex2bin('28b52ffde01600000000000000b100007a7374642d7261772d6672616d652d7061796c6f6164');
-$T->checkSame('zstd-raw-frame-payload', CompressionCodec::zstdDecompressFrame($zstdNode), 'ZSTD node 帧解压');
+$T->checkSame('zstd-raw-frame-payload', CompressionCodec::zstdDecompressFrame($zstdNode), 'ZSTD 标准帧解压');
 $T->checkSame($zstdNode, CompressionCodec::zstdCompressRaw('zstd-raw-frame-payload'), 'ZSTD 与 node 压缩逐字节一致');
 $zstdRle = CompressionCodec::zstdCompressRaw(str_repeat('Z', 500000)); // 500KB 全 Z → RLE 块
 $T->check(strlen($zstdRle) < 5000, 'ZSTD RLE 大跑长压缩有效');

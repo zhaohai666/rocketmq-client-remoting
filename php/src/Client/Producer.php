@@ -1253,7 +1253,7 @@ class DefaultMQProducer
         }
         // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
         // 按 message_ext 的 PGROUP 属性匹配本生产者，不匹配则丢弃。
-        // PHP 单线程：回查处理内联执行（Python 起线程），见 _handleCheckTransactionState。
+        // PHP 单线程：回查处理内联执行。
         $this->mqClient->remotingClient->registerProcessor(
             RequestCode::CHECK_TRANSACTION_STATE,
             $this->handleCheckTransactionState(...)
@@ -1366,9 +1366,9 @@ class DefaultMQProducer
         }
         $hb = new HeartbeatData($this->clientId ?? '');
         $pd = new ProducerData($this->producerGroup);
-        // ⚠ Python 的 HeartbeatData 没有 heartbeatFingerprint / withoutSub 字段
+        // ⚠ HeartbeatData 没有 heartbeatFingerprint / withoutSub 字段
         // （已知缺陷，见项目记忆）。缺失时 broker 反序列化为 0，等价于走 V1 注册路径，
-        // 与 C++ 侧显式置 0 的效果一致，这里保持现状不引入新差异。
+        // 与显式置 0 的效果一致，这里保持现状不引入新差异。
         $hb->producerDataSet[] = $pd;
         $okCount = 0;
         foreach ($addrs as $addr) {
@@ -1416,7 +1416,7 @@ class DefaultMQProducer
     }
 
     /**
-     * 对应 Python message_decoder._compress：ZLIB 走 gzcompress，LZ4（Frame）/ZSTD
+     * 消息压缩：ZLIB 走 gzcompress，LZ4（Frame）/ZSTD
      * （CLI 优先、Raw/RLE 兜底）由 CompressionCodec 承担，与 MessageDecoder 的
      * 口径一致；未知类型抛出 → tryToCompressMessage 降级不压缩。
      */
@@ -1497,12 +1497,11 @@ class DefaultMQProducer
 
     /**
      * 同步发送：msg 或 array；指定 mq 走定点发送，否则轮询选择。
-     * （对应 Python 装饰器 ``@_restores_caller_message`` 包裹的 ``send``：还原语义
-     * 见 ``restoreCallerMessage``，批量路径不还原。）
+     * （还原语义见 ``restoreCallerMessage``，批量路径不还原。）
      */
     public function send(Message|array $msg, ?int $timeoutMillis = null, ?MessageQueue $mq = null): SendResult
     {
-        // 批量直入 _sendBatch（Python：isinstance(list, tuple) 分支，不还原）
+        // 批量直入 _sendBatch（批量分支不还原）
         if (is_array($msg)) {
             return $this->sendBatch($msg, $mq, $timeoutMillis ?? $this->sendMsgTimeout);
         }
@@ -1519,7 +1518,7 @@ class DefaultMQProducer
         }
     }
 
-    /** ``send()`` 的单条主体（对应 Python send 装饰器内的函数体）。 */
+    /** ``send()`` 的单条主体。 */
     private function sendSingle(Message $msg, ?int $timeoutMillis, ?MessageQueue $mq): SendResult
     {
         $client = $this->requireClient();
@@ -1689,7 +1688,7 @@ class DefaultMQProducer
                 return $response;
             }
             if (!$future->sendRequestOk || $future->cause !== null) {
-                // 发送已判失败（Java 里 onException 会 countDown latch 立刻唤醒等待方），
+                // 发送已判失败（onException 会 countDown latch 立刻唤醒等待方），
                 // 这里等价地立刻跳出，否则明明发送失败还要傻等满 timeout。
                 break;
             }
@@ -1823,7 +1822,7 @@ class DefaultMQProducer
         };
 
         $this->executeAsyncMessageSend($run, $gated, $timeout, $begin, $executor);
-        // PHP 单线程适配（PORTING.md）：Python 注册回调后由后台线程收响应；
+        // PHP 单线程适配（PORTING.md）：注册回调后由后台线程收响应是常规部署形态；
         // 这里在内部泵到回调链走完（对调用方呈现相同的回调时序）。
         $this->pumpAsyncSend($gated, $timeout);
     }
@@ -1869,7 +1868,7 @@ class DefaultMQProducer
     }
 
     /**
-     * 泵异步发送链到回调走完（PHP 单线程替代 Python 的后台线程收响应）：
+     * 泵异步发送链到回调走完（PHP 单线程下主动收响应）：
      * 每轮依次执行 AsyncSenderExecutor 的排队任务、remoting 层 waitResponses、
      * 回调执行器的排队任务，直到 ``gated`` 标记完成或超出兜底期限
      * （timeout + 10s；正常情况下底层超时早就把回调打完）。
@@ -2080,8 +2079,8 @@ class DefaultMQProducer
         } catch (\Throwable $e) {
             $cost = (int) ($this->monoMillis() - $began);
             $this->updateFaultItem($mq, $began, true, false);
-            // 同步抛出（如连接被拒）也要过分类：Java netty 的 connect 失败走 operationFail
-            // else 分支包成 MQClientException('unknown reason') 再进重试链；PHP 阻塞式 connect
+            // 同步抛出（如连接被拒）也要过分类：connect 失败会被包成
+            // MQClientException('unknown reason') 再进重试链；PHP 阻塞式 connect
             // 在这里同步抛，不分类的话最终回调拿到的是裸 RemotingConnectException。
             [$wrapped, $needRetry] = self::classifyAsyncFailure($e, $cost);
             $this->onSendException(
@@ -2379,7 +2378,6 @@ class DefaultMQProducer
         // 显式传 sendMsgTimeout：send()/sendAsync() 只在 timeout===null 且 autoBatch 开启时
         // 才分流进 sendByAccumulator —— 这里若不传，非攒批消息（延时/带组属性）会
         // sendDirect → send() → sendByAccumulator → sendDirect 无限递归直到 OOM。
-        // Java 无此问题是因为 facade.sendDirect 调的是 impl.send（不做 autoBatch 判断）。
         if ($sendCallback === null) {
             if ($mq === null) {
                 return $this->send($msg, $this->sendMsgTimeout);
@@ -2758,7 +2756,7 @@ class DefaultMQProducer
 
     public function viewMessage(string $topic, string $msgId): never
     {
-        throw new MQClientException('viewMessage by msgId is not supported in Python edition');
+        throw new MQClientException('viewMessage by msgId is not supported in this edition');
     }
 
     // ================================================================ 辅助
@@ -2802,7 +2800,7 @@ final class TransactionMQProducer extends DefaultMQProducer
 }
 
 /**
- * 便捷回调包装：把 onSuccess / onException 转成普通函数（对应 Python SendCallbackImpl）。
+ * 便捷回调包装：把 onSuccess / onException 转成普通函数。
  */
 final class SendCallbackImpl implements SendCallback
 {

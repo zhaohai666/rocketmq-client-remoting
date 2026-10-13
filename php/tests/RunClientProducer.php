@@ -225,7 +225,7 @@ function producerBrokerHandleFrame($conn, RemotingCommand $cmd, string $logFile,
             case RequestCode::GET_ROUTEINFO_BY_TOPIC: {
                 $topic = (string) ($cmd->extFields['topic'] ?? '');
                 // NoRouteTopic 与 TBW102（兜底默认 topic）都回 NOT_FOUND：
-                // 客户端按 Java 语义在直查失败后还会拿 TBW102 路由兜底
+                // 客户端按协议语义在直查失败后还会拿 TBW102 路由兜底
                 // （tryToFindTopicPublishInfo 的 isDefault 分支），mock 若对 TBW102
                 // 也回路由，NoRouteTopic 的 10005 就永远走不到。
                 if ($topic === 'NoRouteTopic' || $topic === MixAll::DEFAULT_TOPIC) {
@@ -1164,7 +1164,7 @@ final class RunClientProducer
         $this->checkSame(5000, $decoded[count($decoded) - 2] ?? -1, '第二次发送解一层=5000');
         $this->checkSame(5000, $decoded[count($decoded) - 1] ?? -1, '第三次发送解一层=5000');
 
-        // 4) 定点发送走钩子。定点守卫语义七端一致（python producer.py:939 / go producer.go:981）：
+        // 4) 定点发送走钩子。定点守卫语义：
         //    消息 topic 与 mq.topic **各自拼命名空间后**比较（withNamespace 幂等）——
         //    裸名 mq 拼上 PHPNS 后与消息的 PHPNS%SyncTopic 相等 → 不抛、正常发出。
         $pinnedMq = new MessageQueue('SyncTopic', 'broker-a', 0);
@@ -1325,8 +1325,8 @@ final class RunClientProducer
         $this->check($slotF->error instanceof MQBrokerException, '异步失败: broker 码原样 MQBrokerException');
 
         // 连接失败：MQClientAPIImpl 层重试 retryTimesWhenSendAsyncFailed=2 次（1+2=3 内核尝试），
-        // 最终包装 MQClientException('unknown reason')（Java MQClientAPIImpl#operationFail else 分支）、
-        // cause 保留 RemotingConnectException。禁止钩子在**重试层之上**（Java sendKernelImpl），
+        // 最终包装 MQClientException('unknown reason')（走 operationFail 的 else 分支）、
+        // cause 保留 RemotingConnectException。禁止钩子在**重试层之上**（sendKernelImpl），
         // 只执行 1 次——不能用抛异常的钩子数内核尝试次数。
         $pGhost = $this->makeProducer($broker, 'GID-ghost', 'GhostTopic', 'ghost-inst-1');
         $counting = new class() implements CheckForbiddenHook {
@@ -1350,9 +1350,9 @@ final class RunClientProducer
         $this->check($slotG->error instanceof MQClientException, '连接失败: 包装为 MQClientException');
         $this->checkSame('unknown reason', $slotG->error->getMessage() ?? '', '连接失败: unknown reason 文案');
         $this->check($slotG->error->getPrevious() instanceof RemotingConnectException, '连接失败: cause 保留');
-        $this->checkSame(1, $counting->calls, '禁止钩子在重试层之上，执行 1 次（Java parity）');
+        $this->checkSame(1, $counting->calls, '禁止钩子在重试层之上，执行 1 次（协议约定）');
 
-        // 抛异常的钩子：首轮即抛 → runnable catch 原样回调（Java async 语义），不重试、不包装
+        // 抛异常的钩子：首轮即抛 → runnable catch 原样回调（异步语义），不重试、不包装
         $pThrowG = $this->makeProducer($broker, 'GID-ghost2', 'GhostTopic', 'ghost2-inst-1');
         $throwingG = new ThrowingForbiddenHook();
         $pThrowG->registerCheckForbiddenHook($throwingG);
@@ -1460,7 +1460,7 @@ final class RunClientProducer
         $r3 = $p->sendBySelector(new Message('SelTopic', 'r'), $byRoom, 'broker', 3000);
         $this->checkSame(SendStatus::SEND_OK, $r3->sendStatus, 'ByMachineRoom 发送 OK（broker- 前缀命中）');
 
-        // 拦截钩子抛异常：Java sendSelectImpl（DefaultMQProducerImpl#1329）**没有重试循环**——
+        // 拦截钩子抛异常：定点发送 sendSelectImpl **没有重试循环**——
         // 选一次队列、发一次，钩子异常原样向上抛（不包 Send[N] times、responseCode 保持钩子原样）
         $throwing = new ThrowingForbiddenHook();
         $p2 = $this->makeProducer($broker, 'GID-sel2', 'SelTopic', 'sel2-inst-1');

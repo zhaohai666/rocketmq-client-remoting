@@ -201,7 +201,7 @@ def test_orderly_cap_does_not_reuse_the_concurrent_16_default():
     m.commit_log_offset = 1234
     c.send_message_back(m, 3)
     header: ConsumerSendMsgBackRequestHeader = captured["header"]
-    assert header.max_reconsume_times == 16, "并发回投仍按 Java 的 -1 → 16"
+    assert header.max_reconsume_times == 16, "并发回投仍按 -1 → 16"
     assert c._orderly_max_reconsume_times() == _INT32_MAX, "顺序侧必须是" \
         " Integer.MAX_VALUE，两者不能共用一个解析结果"
 
@@ -232,7 +232,7 @@ def test_at_cap_sends_back_and_lets_the_queue_move_on():
     poison.put_property(MessageConst.PROPERTY_TRANSACTION_PREPARED, "true")
     poison.put_property(MessageConst.PROPERTY_KEYS, "k7")
     assert h.c._check_orderly_reconsume_times([poison]) is False, \
-        "回投成功 = 这条已经交给 broker，Java 这时 commit 位点而不是继续原地重试"
+        "回投成功 = 这条已经交给 broker，这时 commit 位点而不是继续原地重试"
     assert len(h.sent) == 1
     sent = h.sent[0]["msg"]
     assert sent.topic == RETRY_TOPIC, "顺序回投走%RETRY%<group>，不是 CONSUMER_SEND_MSG_BACK"
@@ -255,7 +255,7 @@ def test_send_back_failure_keeps_the_queue_suspended():
     poison = msg(7, 2)
     assert h.c._check_orderly_reconsume_times([poison]) is True, \
         "回投失败时不能前进位点：这条消息哪儿也没去，只能继续挂着"
-    assert poison.get_reconsume_times() == 3, "Java :330 失败也 +1，下次再来"
+    assert poison.get_reconsume_times() == 3, "失败也 +1，下次再来"
     # ⚠ 只回投了一次：把失败判据写反（return True 而不计数）会变成无限重复投同一条
     assert len(h.sent) == 1
 
@@ -331,7 +331,7 @@ def test_retry_topic_properties_are_lifted_into_the_send_header():
     assert request.custom_header.reconsume_times == 4
     assert request.custom_header.max_reconsume_times == 6
     assert m.properties.get(MessageConst.PROPERTY_RECONSUME_TIME) is None, \
-        "抬完要清掉本地属性（Java 在 clearProperty 之后才复用这条 msg）"
+        "抬完要清掉本地属性（clearProperty 之后才复用这条 msg）"
     assert "RECONSUME_TIME" in ext["i"], "V2 的 properties 键是 i"
 
 
@@ -352,7 +352,7 @@ def test_ordinary_topic_send_is_not_lifted():
 def test_orderly_context_defaults_are_the_protocol_defaults():
     h = Harness()
     ctx = ConsumeOrderlyContext(h.mq)
-    assert ctx.suspend_current_queue_time_millis == -1, "Java 默认 -1 = 未指定"
+    assert ctx.suspend_current_queue_time_millis == -1, "默认 -1 = 未指定"
     assert ctx.auto_commit is True
 
 
@@ -436,7 +436,7 @@ def test_manual_commit_advances_without_tps():
     stats = RecordingStats()
     h = Harness(stats=stats)
     assert _consume(h, [msg(7, 0)], _manual(ConsumeOrderlyStatus.COMMIT)) is True
-    assert h.c._consume_offsets[KEY] == 8, "Java:275-277 commit()"
+    assert h.c._consume_offsets[KEY] == 8, "commit() 之后本地位点前移"
     assert list(h.c._pending[KEY]) == []
     assert stats.ok == [] and stats.failed == [], "提交分支一个 TPS 都不记"
     assert len(stats.rt) == 1, "RT 在 processConsumeResult 之外，照记"
@@ -464,7 +464,7 @@ def test_manual_success_holds_the_batch_without_committing(monkeypatch):
     assert h.c._consume_offsets[KEY] == 0
     assert [m.queue_offset for m in h.c._pending[KEY]] == [3]
     assert slept == [1.0], "不 sleep 的话下一轮立刻又拿到同一批：100% CPU 空转"
-    assert stats.ok == [1], "Java:272-274 只记 OK TPS"
+    assert stats.ok == [1], "只记 OK TPS"
     assert stats.failed == []
 
 
@@ -524,9 +524,9 @@ def _hooked(h, listener):
 def test_orderly_hook_marks_commit_as_success():
     h = Harness()
     status, success, ctx_type = _hooked(h, _manual(ConsumeOrderlyStatus.COMMIT))
-    assert status == "COMMIT", "钩子拿的是原始 status，形态按 Java Enum.toString()"
+    assert status == "COMMIT", "钩子拿的是原始 status，形态是裸成员名"
     assert status != str(ConsumeOrderlyStatus.COMMIT), "不能带上 Python 的类名前缀"
-    assert success is True, "Java:509 —— success 判据是 SUCCESS || COMMIT"
+    assert success is True, "success 判据是 SUCCESS || COMMIT"
     assert ctx_type == "SUCCESS"
 
 

@@ -46,7 +46,7 @@ final class FaultItem
         );
     }
 
-    /** 当前毫秒时间戳（对应 Python ``time.time() * 1000.0``）。 */
+    /** 当前毫秒时间戳（浮点，微秒精度）。 */
     public static function nowMillis(): float
     {
         return microtime(true) * 1000.0;

@@ -349,13 +349,13 @@ producer = DefaultMQProducer("PID_DEMO",
 # producer.set_socks_proxy_config(SocksProxyConfig(...))
 ```
 
-`SocksProxyConfig` 字段对齐 Java `SocksProxyConfig` 并补齐类型/端口/enable：
-代理类型 `SOCKS5`（默认）/ `SOCKS4`（域名目标走 4a 扩展）、代理地址（也接受 Java 风格的
+`SocksProxyConfig` 带代理类型、地址、端口、可选用户名密码与 enable：
+代理类型 `SOCKS5`（默认）/ `SOCKS4`（域名目标走 4a 扩展）、代理地址（也接受
 `"host:port"` 合写）、端口、可选用户名密码（SOCKS5 走 RFC 1929 用户名密码子协商）、
 `enable`（缺省 `None` = addr 非空即启用；显式 `False` = 留着配置但不走代理）。
-配置后**全部 remoting 连接**（NameServer + Broker，等价 Java CIDR `0.0.0.0/0`）在
+配置后**全部 remoting 连接**（NameServer + Broker，即全量 `0.0.0.0/0` 范围）在
 TCP 建连后、TLS 握手前完成 SOCKS CONNECT；NameServer HTTP 动态取址的普通 HTTP
-请求不经代理（与 Java 口径一致）。目标域名不在本地解析、原样交给代理
+请求不经代理（设计上绕过）。目标域名不在本地解析、原样交给代理
 （SOCKS5 atyp=3 / SOCKS4a）。纯标准库 `socket` 手写握手，无第三方依赖。
 
 ## 特性与进度

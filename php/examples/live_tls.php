@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-// PHP 端真机 TLS/mTLS 验证：对标 nodeJs/examples/live_tls.ts 并补齐 CA 校验与 mTLS 两腿。
+// 真机 TLS/mTLS 验证：三腿覆盖 plain_tls / ca_verify / mtls。
 //
 //   php examples/live_tls.php <ns> <leg> <caCert> <serverName> [clientCert] [clientKey]
 //

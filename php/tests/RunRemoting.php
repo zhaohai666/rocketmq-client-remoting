@@ -1034,11 +1034,11 @@ final class RunRemoting
         $this->checkSame('127.0.0.1:1080', $cfg->getAddr(), 'getAddr');
         $this->checkSame('u', $cfg->getUsername(), 'getUsername');
         $this->checkSame('p', $cfg->getPassword(), 'getPassword');
-        $this->checkSame('socks5', $cfg->getVersion(), '缺省版本 socks5（对齐 Java Socks5ProxyHandler）');
+        $this->checkSame('socks5', $cfg->getVersion(), '缺省版本 socks5（协议默认 SOCKS5）');
         $this->checkSame(
             'SocksProxy address: 127.0.0.1:1080, username: u, password: p',
             (string)$cfg,
-            'toString 对齐 Java SocksProxyConfig#toString'
+            'toString 输出 SocksProxyConfig 约定格式'
         );
         $cfg->setAddr('10.0.0.1:1180');
         $cfg->setUsername(null);

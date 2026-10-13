@@ -149,8 +149,7 @@ def test_name_server_configured_keeps_the_10005_no_route_code():
 
 # ---------------------------------------------------------------- 错误码表
 def test_client_error_code_table_matches_the_wire_codes():
-    """``client/src/main/java/org/apache/rocketmq/client/common/ClientErrorCode.java``
-    一共七个常量，一个都不能少、一个都不能改值。
+    """客户端错误码表一共七个常量，一个都不能少、一个都不能改值。
 
     10001~10005 是发送重试的定性；10006/10007 各有各的抛出点（request-reply 超时、
     造应答消息失败），以前表里缺这两个，站点只能拿默认码 1/None 抛出去。

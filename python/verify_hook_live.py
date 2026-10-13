@@ -176,7 +176,7 @@ def main() -> int:
     # ---------- S0 订阅语义自检（本地纯逻辑，防回归）----------
     sub_all = FilterAPI.build_subscription_data("T", "*")
     sub_tag = FilterAPI.build_subscription_data("T", "TagA||TagB")
-    check("S0 SUB_ALL 的 tagsSet/codeSet 为空、显式 tag 填 codeSet（Java 语义）",
+    check("S0 SUB_ALL 的 tagsSet/codeSet 为空、显式 tag 填 codeSet",
           sub_all.tags_set == set() and sub_all.code_set == set()
           and sub_tag.tags_set == {"TagA", "TagB"}
           and sub_tag.code_set == {2598919, 2598920},

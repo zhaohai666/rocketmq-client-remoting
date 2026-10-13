@@ -199,7 +199,7 @@ class MQClientInstance
 
     public const POP_ASSIGNMENT_INTERVAL_MILLIS = 20_000;
 
-    /** 对应 Python 的 INSTANCE_MAP（clientId → 实例）。 */
+    /** 进程级实例表：clientId → 实例。 */
     public static array $instanceMap = [];
 
     public string $clientId;

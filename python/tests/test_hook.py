@@ -69,7 +69,7 @@ def test_split_error_raises_on_an_empty_tag_list():
 
 
 def test_tag_hash_vectors():
-    # 向量由探针 /tmp/subprobe/HashProbe.java + SubProbe.java 打印
+    # 向量由本地探针程序打印
     assert utf16_int32_hash("TagA") == 2598919
     assert utf16_int32_hash("TagB") == 2598920
     assert utf16_int32_hash("P") == 80

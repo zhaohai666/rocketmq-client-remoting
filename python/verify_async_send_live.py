@@ -219,7 +219,7 @@ def a1_non_blocking_and_read_back(admin, topic):
         check("A1 before 钩子在 AsyncSenderExecutor_N 上跑",
               hook.before_thread.startswith("AsyncSenderExecutor_"),
               "线程名=%s" % hook.before_thread)
-        check("A1 用户回调在 NettyClientPublicExecutor_N 上跑（Java executeInvokeCallback）",
+        check("A1 用户回调在 NettyClientPublicExecutor_N 上跑（executeInvokeCallback）",
               rec.threads[0].startswith("NettyClientPublicExecutor_"),
               "线程名=%s" % rec.threads[0])
         check("A1 before/after 各跑一次", hook.before == 1 and hook.after == 1,

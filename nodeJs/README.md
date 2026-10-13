@@ -255,15 +255,15 @@ Producer / PushConsumer / LitePullConsumer 均支持；`tlsEnable` 是进程级�
 ### SOCKS 代理
 
 ```ts
-// 对齐 Java ClientConfig#socksProxyConfig（SocksProxyConfig: addr/username/password）
+// SOCKS 代理配置：SocksProxyConfig（addr/username/password）
 producer.setSocksProxyConfig({ addr: '127.0.0.1:1080' });                          // SOCKS5 无认证
 producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', username: 'u', password: 'p' }); // SOCKS5 RFC 1929 子协商
 producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });              // SOCKS4/4a
 ```
 
-- TCP 建连后、TLS 握手前完成 CONNECT（Java 的 Socks5ProxyHandler 在 SSL handler 之前的管线序）；`version` 缺省 5，可 4 / `'SOCKS4'`（域名目标自动走 4a 的 0.0.0.1 哨兵）。
-- 作用于全部 remoting 连接（NameServer + Broker，Java `0.0.0.0/0` 口径）；**TopAddressing 的 HTTP 寻址不走代理**。
-- Producer / PushConsumer 均支持；也可用环境变量 `ROCKETMQ_SOCKS_PROXY_CONFIG` 传 JSON（Java 的 `{"0.0.0.0/0": {...}}` 形状或裸对象）。
+- TCP 建连后、TLS 握手前完成 CONNECT（SOCKS handler 在 SSL handler 之前的管线序）；`version` 缺省 5，可 4 / `'SOCKS4'`（域名目标自动走 4a 的 0.0.0.1 哨兵）。
+- 作用于全部 remoting 连接（NameServer + Broker，即 `0.0.0.0/0` 全量口径）；**TopAddressing 的 HTTP 寻址不走代理**。
+- Producer / PushConsumer 均支持；也可用环境变量 `ROCKETMQ_SOCKS_PROXY_CONFIG` 传 JSON（`{"0.0.0.0/0": {...}}` 路由表形状或裸对象）。
 
 ## 特性与进度
 
@@ -294,7 +294,7 @@ producer.setSocksProxyConfig({ addr: '127.0.0.1:1080', version: 4 });           
 | `ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE` | 64MB | 滚动阈值 |
 | `ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX` | 10 | 备份个数，`.1`..`.10` 依次顶替 |
 
-本端口径：每行日志始终打 stdout/stderr；默认**同时**落文件，`ROCKETMQ_CLIENT_LOG_USE_STDOUT` 或 `ROCKETMQ_CLIENT_LOG_FILE=OFF` 关闭文件落盘。滚动按大小触发，文件名 `rocketmq_node_client.log` 带端口标识，多端并跑互不串写。
+本端口径：每行日志始终打 stdout/stderr；默认**同时**落文件，`ROCKETMQ_CLIENT_LOG_USE_STDOUT` 或 `ROCKETMQ_CLIENT_LOG_FILE=OFF` 关闭文件落盘。滚动按大小触发，文件名 `rocketmq_node_client.log` 带端口标识，避免并发运行时串写。
 
 ## 真实集群联调
 

@@ -224,7 +224,7 @@ final class ConsumerStatsManager
 
     /**
      * 采样线程一轮：分钟级采样全部 StatsItemSet；每 60 轮（60 × 10s = 10 分钟）
-     * 追加一次小时级采样。对应 Python ``_sample_loop`` 的循环体。
+     * 追加一次小时级采样（对应采样循环体的循环体）。
      */
     public function sampleOnce(): void
     {
