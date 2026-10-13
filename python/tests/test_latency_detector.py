@@ -393,7 +393,7 @@ class TestServiceDetectorOverSocket:
 
 
 class TestProducerDetectorConfig:
-    def test_defaults_align_java_client_config(self):
+    def test_defaults_align_classic_client_config(self):
         producer = DefaultMQProducer("GID_DetectorDefaults")
         assert producer.start_detector_enable is False
         assert producer.detect_timeout_millis == 200

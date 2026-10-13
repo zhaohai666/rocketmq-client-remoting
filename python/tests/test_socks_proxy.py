@@ -31,7 +31,7 @@ from remoting.protocol import headers as headers_mod
 from remoting.protocol.codes import RequestCode, ResponseCode
 from remoting.socks_proxy import (SOCKS4, SOCKS5, SocksProxyConfig, SocksProxyError)
 
-# 建连预算：失败类断言也不许因为本机 loopback 的瞬时怪癖而假失败（任务口径 ≥30s）
+# 建连预算：失败类断言也不许因为本机 loopback 的瞬时怪癖而假失败（预算 ≥30s）
 _CONNECT_TIMEOUT_MILLIS = 35000
 
 

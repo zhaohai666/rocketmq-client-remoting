@@ -83,7 +83,7 @@ def test_concurrent_get_or_create_creates_exactly_one():
 # ---------------------------------------------------------------- 引用计数生命周期
 
 def test_refcount_two_facades_share_then_survive_then_close():
-    """任务口径 1-3：同 clientId 两门面共享（计数 2）→ 先关一个仍存活 → 全关才关闭。"""
+    """同 clientId 两门面共享（计数 2）→ 先关一个仍存活 → 全关才关闭。"""
     mgr = _fresh_manager()
     inst, _ = mgr.get_or_create_mq_client_instance("life@id", lambda: _make_instance("life@id"))
     mgr.register_client("life@id", inst)
