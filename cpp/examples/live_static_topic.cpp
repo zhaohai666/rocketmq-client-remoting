@@ -9,6 +9,7 @@
 // 用法：rmq_live_static_topic <namesrv>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <mutex>

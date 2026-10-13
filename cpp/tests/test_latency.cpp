@@ -5,6 +5,8 @@
 // 4. 容错表无记录 isAvailable/isReachable=true；隔离后 false、到期恢复；
 // 5. 策略关闭时不记录任何故障项；
 // 6. 策略开启：健康 broker 正常选出；单 broker 注入隔离后退化为普通轮询仍能选出队列。
+#include <chrono>
+#include <cstdio>
 #include <thread>
 
 #include "rocketmq/client/latency.h"

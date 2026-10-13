@@ -2,6 +2,7 @@
 #include "rocketmq/client/static_topic.h"
 
 #include <algorithm>
+#include <exception>
 
 namespace rocketmq {
 namespace static_topic {

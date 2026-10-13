@@ -1,6 +1,7 @@
 #ifndef ROCKETMQ_COMMON_MESSAGE_CONST_H
 #define ROCKETMQ_COMMON_MESSAGE_CONST_H
 
+#include <cstdint>
 #include <string>
 
 namespace rocketmq {

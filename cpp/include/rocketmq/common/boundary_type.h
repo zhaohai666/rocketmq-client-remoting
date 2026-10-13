@@ -1,6 +1,7 @@
 #ifndef ROCKETMQ_COMMON_BOUNDARY_TYPE_H
 #define ROCKETMQ_COMMON_BOUNDARY_TYPE_H
 
+#include <cstddef>
 #include <string>
 
 namespace rocketmq {

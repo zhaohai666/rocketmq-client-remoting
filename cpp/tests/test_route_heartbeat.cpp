@@ -1,5 +1,6 @@
 // 路由 / 心跳 / 订阅数据的编解码往返单测。
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <vector>

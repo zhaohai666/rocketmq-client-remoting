@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <map>
+#include <utility>
 
 #include "rocketmq/client/exception.h"
 #include "rocketmq/common/logging.h"

@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <chrono>
 #include <thread>
+#include <utility>
 
 #include "rocketmq/common/logging.h"
 

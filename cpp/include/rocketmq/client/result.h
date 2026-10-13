@@ -9,6 +9,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "rocketmq/common/byte_buffer.h"

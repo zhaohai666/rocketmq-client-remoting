@@ -1,8 +1,10 @@
 #include "rocketmq/client/trace.h"
 
 #include <cstdlib>
+#include <exception>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 #include "rocketmq/common/logging.h"
 #include "rocketmq/common/message_const.h"

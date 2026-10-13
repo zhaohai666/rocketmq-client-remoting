@@ -9,6 +9,7 @@
 //    （broker 侧是 invokeSync，不回响应它那边会超时）。
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <set>
 #include <string>
 #include <thread>

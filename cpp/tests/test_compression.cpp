@@ -1,6 +1,7 @@
 // 压缩/解压单测：压缩类型解析、zlib/lz4/zstd 与外部实现的互通、17 段报文里
 // "解压后清 COMPRESSED_FLAG" 的语义、以及老版本 **类型位为 0** 的兼容路径。
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <string>

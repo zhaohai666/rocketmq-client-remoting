@@ -1,5 +1,6 @@
 #include "rocketmq/remoting/protocol/extra_info.h"
 
+#include <cstddef>
 #include <stdexcept>
 
 #include "rocketmq/common/mix_all.h"
