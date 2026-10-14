@@ -1,25 +1,25 @@
-// 前置：broker 开了 `authenticationEnabled=true`，并用 `initAuthenticationUser`
-//       建了 accessKey/secretKey 对应的 SUPER 用户（见 /tmp/run_acl_live.sh 的
-//       broker_acl.conf）。此时**所有** broker RPC 都要求合法签名：
+// Prerequisite: the broker has `authenticationEnabled=true` and, via `initAuthenticationUser`,
+//       a SUPER user matching the accessKey/secretKey (see broker_acl.conf of /tmp/run_acl_live.sh).
+//       Then **every** broker RPC requires a valid signature:
 //       AuthConfig.isAuthenticationRequired() = authenticationEnabled && !whitelist.contains(rpc),
-//       而白名单默认为空。
+//       and the whitelist is empty by default.
 //
-// 场景：
-//   S1 正向：带凭据的 admin 建 topic → 成功（管理路径签名被接受）
-//   S2 反向：不带凭据的 admin 建 topic → 被拒（broker NO_PERMISSION=16）
-//   S3 反向：secretKey 错误的生产者发送 → 被拒（NO_PERMISSION=16）
-//   S4 正向：带凭据的生产者发 3 条 → SEND_OK（msgId 由 broker 赋值）
-//   S5 正向：带凭据的消费者收满 3 条（心跳 / 长轮询拉取 / 位点提交都带签名）
-//            ⚠ S4/S5 必须**先起消费者再发送**，否则 CONSUME_FROM_LAST_OFFSET 的初始位点
-//              语义 + broker 异步分发会让同一时序在三语言间结果不一致（见 S4/S5 处注释）
-//   S6 反向：不带凭据直连 broker 的裸 RPC → 被拒（NO_PERMISSION=16）
-//   S7 正向：不带凭据走 NameServer 路由查询仍成功（钩子只作用于需要鉴权的目标）
+// Scenarios:
+//   S1 positive: admin with credentials creates the topic -> succeeds (admin-path signature accepted)
+//   S2 negative: admin without credentials creates a topic -> rejected (broker NO_PERMISSION=16)
+//   S3 negative: producer with a wrong secretKey sends -> rejected (NO_PERMISSION=16)
+//   S4 positive: producer with credentials sends 3 messages -> SEND_OK (msgId assigned by the broker)
+//   S5 positive: consumer with credentials receives all 3 (heartbeat / long-poll pull / offset commit all signed)
+//            ⚠ S4/S5 must **start the consumer before sending**, otherwise the CONSUME_FROM_LAST_OFFSET initial-offset
+//              semantics + async broker delivery make this same timing sequence yield inconsistent results (see the comments at S4/S5)
+//   S6 negative: bare RPC straight to the broker without credentials -> rejected (NO_PERMISSION=16)
+//   S7 positive: credential-less NameServer route query still succeeds (the hook only acts on auth-required targets)
 //
-// 关键事实（不要凭记忆改）：broker 侧所有鉴权失败都抛
-// AbortProcessException(NO_PERMISSION=16)；
-// 失败原因用 ResponseCode 区分不了，只能看 remark：
-//   - 签名不对 → "check signature failed."
-//   - 凭据缺失 → "User:null is not found."
+// Key fact (do not change this from memory): every broker-side auth failure throws
+// AbortProcessException(NO_PERMISSION=16);
+// the failure reason cannot be told apart by ResponseCode, only by the remark:
+//   - wrong signature → "check signature failed."
+//   - missing credentials → "User:null is not found."
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -62,11 +62,11 @@ bool contains(const std::string& s, const std::string& sub) {
     return s.find(sub) != std::string::npos;
 }
 
-// broker 侧鉴权失败的统一响应码。
+// The unified response code for broker-side auth failures.
 constexpr int32_t NO_PERMISSION = 16;
 
-// createTopicInRoute 会把底层 MQBrokerException 的 what() 拼进消息，形如
-// "create new topic failed: CODE: 16 DESC: ..."，故用这个标记识别 NO_PERMISSION。
+// createTopicInRoute appends the underlying MQBrokerException's what() into the message, shaped like
+// "create new topic failed: CODE: 16 DESC: ...", so this marker identifies NO_PERMISSION.
 std::string noPermissionMarker() { return "CODE: " + std::to_string(NO_PERMISSION); }
 
 std::vector<std::string> splitAddrs(const std::string& addr) {
@@ -120,8 +120,8 @@ int main(int argc, char** argv) {
                 topic.c_str(), group.c_str(), ak.c_str());
     std::printf("======================================================================\n");
 
-    // ---------------- S1 正向：带凭据 admin 建 topic ----------------
-    std::printf("\nS1 带凭据 admin 建 topic\n");
+    // ---------------- S1 positive: admin with credentials creates the topic ----------------
+    std::printf("\nS1 admin with credentials creates the topic\n");
     {
         DefaultMQAdminExt admin("ACL_ADMIN_OK");
         admin.setNamesrvAddr(namesrv);
@@ -129,15 +129,15 @@ int main(int argc, char** argv) {
         admin.start();
         try {
             admin.createTopic("TBW102", topic, 4);
-            check("S1 带凭据 admin 建 topic 成功", true);
+            check("S1 credentialed admin creates the topic successfully", true);
         } catch (const std::exception& e) {
-            check("S1 带凭据 admin 建 topic 成功", false, e.what());
+            check("S1 credentialed admin creates the topic successfully", false, e.what());
         }
         admin.shutdown();
     }
 
-    // ---------------- S2 反向：无凭据 admin 必须被拒 ----------------
-    std::printf("\nS2 不带凭据的 admin 建 topic 必须被拒\n");
+    // ---------------- S2 negative: credential-less admin must be rejected ----------------
+    std::printf("\nS2 credential-less admin creating a topic must be rejected\n");
     {
         DefaultMQAdminExt admin("ACL_ADMIN_NO");
         admin.setNamesrvAddr(namesrv);
@@ -151,12 +151,12 @@ int main(int argc, char** argv) {
             detail = e.what();
             rejected = contains(detail, noPermissionMarker());
         }
-        check("S2 无凭据 admin 被 broker 拒绝(NO_PERMISSION=16)", rejected, detail);
+        check("S2 credential-less admin rejected by the broker (NO_PERMISSION=16)", rejected, detail);
         admin.shutdown();
     }
 
-    // ---------------- S3 反向：错误 secretKey 必须被拒 ----------------
-    std::printf("\nS3 错误 secretKey 的生产者必须被拒\n");
+    // ---------------- S3 negative: a wrong secretKey must be rejected ----------------
+    std::printf("\nS3 producer with a wrong secretKey must be rejected\n");
     {
         DefaultMQProducer bad("PG_AclCppBad_" + stamp);
         bad.setNamesrvAddr(namesrv);
@@ -176,12 +176,12 @@ int main(int argc, char** argv) {
             detail = e.what();
             rejected = contains(detail, noPermissionMarker());
         }
-        check("S3 错误 secretKey 被 broker 拒绝(NO_PERMISSION=16)", rejected, detail);
+        check("S3 wrong secretKey rejected by the broker (NO_PERMISSION=16)", rejected, detail);
         bad.shutdown();
     }
 
     int32_t sent = 0;
-    std::printf("\nS4/S5 带正确凭据的生产者/消费者（先起消费者再发送）\n");
+    std::printf("\nS4/S5 producer/consumer with correct credentials (consumer starts before sending)\n");
     {
         auto listener = std::make_shared<CountingListener>();
         DefaultMQPushConsumer consumer(group);
@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
         consumer.setMessageListener(listener);
         consumer.start();
         try {
-            // 等 rebalance 把队列分下来：初始位点必须在 topic 还空着的时候解析
+            // Wait for rebalance to assign queues: the initial offset must resolve while the topic is still empty
             std::this_thread::sleep_for(std::chrono::seconds(5));
 
             std::string evidence;
@@ -214,11 +214,11 @@ int main(int argc, char** argv) {
                 }
             }
             prod.shutdown();
-            // msgId 由 broker 生成：非空即证明 broker 真的接受了这条签名请求
-            check("S4 带凭据生产者发送 3 条(SEND_OK)", sent == 3,
+            // msgId is generated by the broker: non-empty proves the broker really accepted this signed request
+            check("S4 credentialed producer sends 3 (SEND_OK)", sent == 3,
                   "sent=" + std::to_string(sent) + " " + evidence);
 
-            // S5：心跳 / 长轮询拉取 / 位点提交全程带签名，收满才算消费链路鉴权通过
+            // S5: heartbeat / long-poll pull / offset commit signed throughout; only a full receive proves the consume path passes auth
             const int64_t deadline = nowMs() + 30000;
             while (nowMs() < deadline && listener->count.load() < sent) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -231,16 +231,16 @@ int main(int argc, char** argv) {
                     bodies += b + " ";
                 }
             }
-            check("S5 带凭据消费者收满 " + std::to_string(sent) + " 条", got == sent,
+            check("S5 credentialed consumer receives all " + std::to_string(sent) + " messages", got == sent,
                   "got=" + std::to_string(got) + " bodies=" + bodies);
         } catch (const std::exception& e) {
-            check("S4/S5 场景执行", false, e.what());
+            check("S4/S5 scenario execution", false, e.what());
         }
         consumer.shutdown();
     }
 
-    // ---------------- S6 反向：无凭据裸 broker RPC 必须被拒 ----------------
-    std::printf("\nS6 不带凭据的直接 broker RPC 必须被拒\n");
+    // ---------------- S6 negative: bare broker RPC without credentials must be rejected ----------------
+    std::printf("\nS6 credential-less direct broker RPC must be rejected\n");
     {
         MQClientInstance client("ACL_PROBE_" + stamp, nsAddrs);
         client.start();
@@ -255,9 +255,9 @@ int main(int argc, char** argv) {
             detail = "no broker addr in route for topic " + topic;
         } else {
             try {
-                // getConsumerListByGroup 是**裸** RPC：非 SUCCESS 直接抛 MQBrokerException。
-                // 不能用 getConsumerIdListByGroup —— 它内部吞掉异常返回空 vector，
-                // 「被拒绝」与「查不到」在调用方看来一模一样（曾因此把 FAIL 看成 PASS）。
+                // getConsumerListByGroup is a **bare** RPC: anything but SUCCESS throws MQBrokerException.
+                // Do not use getConsumerIdListByGroup -- it swallows the exception and returns an empty vector,
+                // so "rejected" and "nothing found" look identical to the caller (this once read a FAIL as a PASS).
                 client.getConsumerListByGroup(group, addr, 5000);
                 detail = "unexpectedly succeeded, addr=" + addr;
             } catch (const MQBrokerException& e) {
@@ -268,12 +268,12 @@ int main(int argc, char** argv) {
                 detail = "addr=" + addr + " " + e.what();
             }
         }
-        check("S6 无凭据 broker RPC 被拒绝(NO_PERMISSION=16)", rejected, detail);
+        check("S6 credential-less broker RPC rejected (NO_PERMISSION=16)", rejected, detail);
         client.shutdown();
     }
 
-    // ---------------- S7 正向：无凭据走 namesrv 仍应成功 ----------------
-    std::printf("\nS7 不带凭据走 NameServer 路由查询仍应成功\n");
+    // ---------------- S7 positive: credential-less namesrv access should still succeed ----------------
+    std::printf("\nS7 credential-less NameServer route query should still succeed\n");
     {
         MQClientInstance client("ACL_NS_" + stamp, nsAddrs);
         client.start();
@@ -285,16 +285,16 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             detail = e.what();
         }
-        check("S7 无凭据 namesrv 路由查询成功", ok, detail);
+        check("S7 credential-less namesrv route query succeeds", ok, detail);
         client.shutdown();
     }
 
     std::printf("\n===== ACL live (C++) summary =====\n");
     std::printf("  PASS=%d FAIL=%d\n", gPass, gFail);
     if (gFail == 0) {
-        std::printf("  result: ACL 鉴权（签名 / 拒绝 / namesrv 兼容）真机通过\n");
+        std::printf("  result: ACL auth (signature / rejection / namesrv compatibility) passed on the real cluster\n");
         return 0;
     }
-    std::printf("  result: %d 项失败\n", gFail);
+    std::printf("  result: %d checks failed\n", gFail);
     return 1;
 }

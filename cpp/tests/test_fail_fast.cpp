@@ -1,4 +1,4 @@
-// 全部用真 socket 对端（读完请求就关连接），不用 mock：只有真 EOF 才走读线程退出那条路。
+// All cases use real socket peers (read the request, then close the connection), no mocks: only a real EOF takes the read-thread-exit path.
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -49,7 +49,7 @@ bool readN(socket_t s, char* buf, size_t n) {
     return true;
 }
 
-// 读一个完整帧，只为了知道"请求到了"；不解析内容
+// Read one complete frame just to know "the request arrived"; the content is not parsed
 bool readFrame(socket_t s) {
     char lenBuf[4];
     if (!readN(s, lenBuf, 4)) {
@@ -75,10 +75,10 @@ bool waitUntil(const std::function<bool()>& pred, int timeoutMs = 8000) {
     return pred();
 }
 
-// 本机回环服务端：每条连接读完一个请求后按 mode 处置。
-//   Drop —— 读完立刻关连接且**一个字节都不回**（模拟对端掉线/重启）
-//   Hold —— 读完挂住不关也不回（用来证明"别人家的请求不该被牵连"）
-//   Reply —— 读完回 SUCCESS（正向对照：换连接之后还能正常工作）
+// Loopback server on this host: each connection, after reading one request, is handled per mode.
+//   Drop -- close the connection right after reading and **reply not a single byte** (simulates a peer going down / restarting)
+//   Hold -- hang after reading without closing or replying (proves "other requests must not be dragged in")
+//   Reply -- reply SUCCESS after reading (positive control: a new connection still works normally)
 enum class Mode { Drop, Hold, Reply };
 
 class PeerServer {
@@ -135,14 +135,14 @@ private:
                 break;
             }
             handleConn(conn);
-            netcompat::closeSocket(conn);  // Drop 模式在这里真的关连接，客户端读到 EOF
+            netcompat::closeSocket(conn);  // Drop mode really closes the connection here, so the client reads EOF
         }
     }
 
     void handleConn(socket_t conn) {
         served_.fetch_add(1);
         if (mode_ == Mode::Hold) {
-            // 挂着不回也不关：这条请求应当一直在途
+            // Hang without replying or closing: this request should stay in flight the whole time
             Bytes dummy;
             readFrame(conn);
             while (!stop_.load()) {
@@ -186,7 +186,7 @@ private:
             }
             return;
         }
-        // Drop：读完这一帧就返回 -> 析构里关掉连接
+        // Drop: return right after reading this frame -> the connection is closed on scope exit
         readFrame(conn);
     }
 
@@ -200,7 +200,7 @@ private:
     std::thread thread_;
 };
 
-// 远超断连传播所需的时间；loopback 上 EOF 毫秒级就到，用它当"没修好"的判据
+// Far longer than disconnect propagation needs; on loopback EOF arrives within milliseconds, so this is the "not fixed" discriminator
 constexpr int32_t kLongTimeout = 30000;
 
 struct AsyncResult {
@@ -213,7 +213,7 @@ struct AsyncResult {
 }  // namespace
 
 int main() {
-    // ------------------------------------------- 1. 同步调用：断连立刻抛发送失败，不等超时
+    // ------------------------------------------- 1. Sync call: a dead connection throws send-failure immediately, no waiting for the timeout
     {
         PeerServer server(Mode::Drop, 1);
         RemotingClient client(2000, kLongTimeout);
@@ -245,7 +245,7 @@ int main() {
         client.shutdown();
     }
 
-    // --------------------------------------------- 2. 异步回调：立刻拿到 SEND_REQUEST
+    // --------------------------------------------- 2. Async callback: SEND_REQUEST arrives immediately
     {
         PeerServer server(Mode::Drop, 1);
         RemotingClient client(2000, kLongTimeout);
@@ -273,10 +273,10 @@ int main() {
         client.shutdown();
     }
 
-    // ------------------------------ 3. 断连与超时清理线程抢同一条请求：回调只能有一次
+    // ------------------------------ 3. Disconnect vs timeout-cleanup thread racing on one request: the callback may fire only once
     {
         PeerServer server(Mode::Drop, 1);
-        RemotingClient client(2000, 200);  // 短超时：两条路径都会想去抢这个条目
+        RemotingClient client(2000, 200);  // short timeout: both paths will try to claim this entry
         RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
         AsyncResult r;
         client.invokeAsync(
@@ -287,12 +287,12 @@ int main() {
             },
             200);
         CHECK(waitUntil([&r] { return r.fired.load() >= 1; }), "once: callback fired");
-        std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // 跨过 timeout + 1s 宽限
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // sleep past timeout + 1s grace
         CHECK(r.fired.load() == 1, "once: callback fired " + std::to_string(r.fired.load()) + " times");
         client.shutdown();
     }
 
-    // ------------------ 4. 只失败断开那条连接自己的请求；另一条地址上的请求不受牵连
+    // ------------------ 4. Only the request on the dying connection fails; a request on another address is not dragged in
     {
         PeerServer dying(Mode::Drop, 1);
         PeerServer quiet(Mode::Hold, 1);
@@ -326,17 +326,17 @@ int main() {
         CHECK(dyingResult.kind.load() == static_cast<int32_t>(InvokeError::Kind::SEND_REQUEST),
               "collateral: dying request reports SEND_REQUEST");
 
-        // shutdown 收掉仍在途的那条：回调必须落地，不能悄悄消失
+        // shutdown reaps the still in-flight one: the callback must land and may not silently vanish
         client.shutdown();
         CHECK(quietResult.fired.load() == 1, "shutdown: in-flight callback still delivered");
         CHECK(quietResult.kind.load() == static_cast<int32_t>(InvokeError::Kind::SEND_REQUEST),
               "shutdown: reported as a send failure");
     }
 
-    // ------------------- 5. 断连判死之后，同一个地址还能照常建新连接、跑完新请求
-    // failFast 只该收拾"已经不会有人响应"的那些请求：地址本身是干净的，下一次调用
-    // 必须能重新建连并拿到真应答。（按 Connection 对象身份认领就是在守这个窗口：
-    // 旧读线程收尾时，同地址的新连接可能已经有请求在途。）
+    // ------------------- 5. After a disconnect declares death, the same address can still build a new connection and complete a new request
+    // failFast should only settle requests that "will never be answered": the address itself stays clean and the next call
+    // must rebuild the connection and get a real reply. (Claiming by Connection object identity guards exactly this window:
+    // while the old read thread is winding down, the new connection at the same address may already have requests in flight.)
     {
         PeerServer drop(Mode::Drop, 1);
         RemotingClient client(2000, kLongTimeout);
@@ -355,7 +355,7 @@ int main() {
         CHECK(firstResult.kind.load() == static_cast<int32_t>(InvokeError::Kind::SEND_REQUEST),
               "reuse: failed request reports SEND_REQUEST");
 
-        // 同地址再来一次同步调用：服务端这条新连接正常应答
+        // Same address, one more sync call: the server's new connection answers normally
         PeerServer live(Mode::Reply, 1);
         RemotingClient client2(2000, kLongTimeout);
         RemotingCommand second = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);

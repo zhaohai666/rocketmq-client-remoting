@@ -1,21 +1,21 @@
-// 主动拉取消费者（DefaultMQPullConsumer）真机验证。
-// 用法：rmq_live_pull 127.0.0.1:9876
+// Active-pull consumer (DefaultMQPullConsumer) live-cluster verification.
+// Usage: rmq_live_pull 127.0.0.1:9876
 //
-// 场景（拉模式的核心是「调用方自己拉、自己管位点」，断言都围绕这一点）：
-//   S1 建 topic + fetchSubscribeMessageQueues → 拿到 4 个队列
-//   S1b fetchMessageQueuesInBalance → **没拉取过**的实例靠真实路由 + 38 算出自己那份
-//   S2 生产 12 条 → 每队列 min/max offset 差值 = 3（消息均匀落到 4 队列）
-//   S3 手动拉取：逐队列从 min offset 拉到 max offset → 收全 12 条且 body 与发送集合一致
-//   S4 手动提交位点：updateConsumeOffset → fetchConsumeOffset 回读一致（broker 往返）
-//   S5 位点由调用方掌控：从已提交位点再拉 → NO_NEW_MSG；把位点退回 min 再拉 → FOUND
-//      （push 模式做不到这一点，这正是 pull 模式的存在意义）
-//   S6 searchOffset(now) / earliestMsgStoreTime → 均 > 0
-//   S7 sendMessageBack → 消息落到 %RETRY%group，可被拉取到（回投链路真实可用）
+// Scenarios (the core of pull mode is "the caller pulls itself and manages offsets itself"; every assertion revolves around that):
+//   S1 create topic + fetchSubscribeMessageQueues → get 4 queues
+//   S1b fetchMessageQueuesInBalance → an instance that **never pulled** derives its own share from the real route + 38
+//   S2 produce 12 messages → per-queue min/max offset difference = 3 (messages land evenly on the 4 queues)
+//   S3 manual pull: per queue from min offset to max offset → all 12 received and bodies match the sent set
+//   S4 manual offset commit: updateConsumeOffset → fetchConsumeOffset reads back the same value (broker round trip)
+//   S5 the caller owns the offset: pull again from the committed offset → NO_NEW_MSG; rewind the offset to min and pull → FOUND
+//      (push mode cannot do this — precisely why pull mode exists)
+//   S6 searchOffset(now) / earliestMsgStoreTime → both > 0
+//   S7 sendMessageBack → the message lands in %RETRY%group and can be pulled (the redelivery path really works)
 //
-// ⚠ 两个踩过的坑（不要"顺手优化"掉）：
-//   1. 必须**先建 topic 再取队列**：消费者不做默认 topic 兜底，topic 不存在就拿不到路由；
-//   2. 生产完**不能立刻查 maxOffset**：broker 的 consumequeue 是异步分发的，会读到 0
-//      （探针实测），必须轮询到各队列 max-min 之和到位。
+// ⚠ Two traps already stepped in (do not "optimize them away"):
+//   1. **create the topic before fetching queues**: the consumer does no default-topic fallback, so a nonexistent topic yields no route;
+//   2. **do not query maxOffset right after producing**: the broker's consumequeue dispatches asynchronously and
+//      would read 0 (measured with a probe); poll until the sum of per-queue max-min reaches the target.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -74,7 +74,7 @@ std::vector<std::string> splitAddrs(const std::string& addr) {
 
 std::string bodyOf(const MessageExt& m) { return std::string(m.body.begin(), m.body.end()); }
 
-// MessageQueue 需可比较才能做 map 键：用 offsetKey 字符串当键，实现集合式去重。
+// MessageQueue must be comparable to serve as a map key: use the offsetKey string as key, for set-style deduplication.
 std::string qKey(const MessageQueue& q) {
     return q.brokerName + ":" + std::to_string(q.queueId);
 }
@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
                 topic.c_str(), group.c_str());
     std::printf("======================================================================\n");
 
-    // ---------------- 建 topic ----------------
+    // ---------------- create the topic ----------------
     {
         DefaultMQProducer prep("PG_PrepareCpp_" + stamp);
         prep.setNamesrvAddr(namesrv);
@@ -122,8 +122,8 @@ int main(int argc, char** argv) {
     DefaultMQPullConsumer consumer(group);
     consumer.setNamesrvAddr(namesrv);
 
-    // ---------------- S1 队列 ----------------
-    std::printf("\nS1 建 topic + fetchSubscribeMessageQueues\n");
+    // ---------------- S1 queues ----------------
+    std::printf("\nS1 create topic + fetchSubscribeMessageQueues\n");
     std::vector<MessageQueue> routes;
     {
         consumer.start();
@@ -140,20 +140,20 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
         if (static_cast<int32_t>(routes.size()) != queueNum) {
-            check("S1 拿到 " + std::to_string(queueNum) + " 个队列", false,
+            check("S1 got " + std::to_string(queueNum) + " queues", false,
                   "got=" + std::to_string(routes.size()) + " last=" + last);
             std::printf("\nPullConsumer: PASS=%d FAIL=%d\n", gPass, gFail);
             return 1;
         }
     }
-    check("S1 拿到 " + std::to_string(queueNum) + " 个队列", true,
+    check("S1 got " + std::to_string(queueNum) + " queues", true,
           "got=" + std::to_string(routes.size()));
     {
         bool namesOk = true;
         for (const MessageQueue& q : routes) {
             if (q.topic != topic || q.brokerName.empty()) namesOk = false;
         }
-        check("S1 队列 topic 与 broker 名非空", namesOk,
+        check("S1 queue topics and broker names are non-empty", namesOk,
               "sample=" + routes[0].brokerName + ":" + std::to_string(routes[0].queueId));
     }
 
@@ -161,7 +161,7 @@ int main(int argc, char** argv) {
     {
         consumer.registerMessageQueueListener(topic, nullptr);
         const int32_t hbOk = consumer.sendHeartbeatToAllBroker();
-        check("S1b 登记 topic 后心跳发出去了（38 可见的前提）", hbOk > 0,
+        check("S1b heartbeat went out after registering the topic (prerequisite for 38 to be visible)", hbOk > 0,
               "heartbeat_ok=" + std::to_string(hbOk));
         std::vector<MessageQueue> mine;
         const int64_t balanceDeadline = nowMs() + 20000;
@@ -175,8 +175,8 @@ int main(int argc, char** argv) {
             consumer.sendHeartbeatToAllBroker();
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
-        check("S1b 平衡视图：独占分组拿到全部 " + std::to_string(queueNum) + " 个队列"
-              "（未拉取过⇒只可能是路由+38 算出来的）",
+        check("S1b balance view: the exclusive group got all " + std::to_string(queueNum) + " queues"
+              " (never pulled ⇒ can only have been computed from route + 38)",
               static_cast<int32_t>(mine.size()) == queueNum,
               "got=" + std::to_string(mine.size()) + " of " + std::to_string(queueNum));
         std::set<std::string> mineKeys, wholeKeys;
@@ -186,10 +186,10 @@ int main(int argc, char** argv) {
         for (const std::string& k : mineKeys) {
             if (wholeKeys.find(k) == wholeKeys.end()) subset = false;
         }
-        check("S1b 平衡视图是订阅视图的子集", subset, "mine=" + join(mineKeys));
+        check("S1b balance view is a subset of the subscribe view", subset, "mine=" + join(mineKeys));
     }
-    // ---------------- S2 生产 ----------------
-    std::printf("\nS2 生产 %d 条\n", nMsg);
+    // ---------------- S2 produce ----------------
+    std::printf("\nS2 produce %d messages\n", nMsg);
     std::set<std::string> sent;
     {
         DefaultMQProducer prod("PG_PullLiveCpp_" + stamp);
@@ -212,12 +212,12 @@ int main(int argc, char** argv) {
                 std::printf("   send %d failed: %s\n", i, e.what());
             }
         }
-        check("S2 生产 " + std::to_string(nMsg) + " 条成功", sentOk == nMsg,
+        check("S2 produced " + std::to_string(nMsg) + " messages successfully", sentOk == nMsg,
               "sentOk=" + std::to_string(sentOk));
         prod.shutdown();
     }
 
-    // 轮询等 consumequeue 分发落地（不能刚发完就查 maxOffset）
+    // Poll until the consumequeue dispatch lands (maxOffset must not be queried right after sending)
     std::map<std::string, int64_t> lo;
     std::map<std::string, int64_t> hi;
     {
@@ -237,12 +237,12 @@ int main(int argc, char** argv) {
     }
     for (const MessageQueue& q : routes) {
         const int64_t diff = hi[qKey(q)] - lo[qKey(q)];
-        check("S2 队列 " + qKey(q) + " 有 " + std::to_string(perQueue) + " 条", diff == perQueue,
+        check("S2 queue " + qKey(q) + " holds " + std::to_string(perQueue) + " messages", diff == perQueue,
               "min=" + std::to_string(lo[qKey(q)]) + " max=" + std::to_string(hi[qKey(q)]));
     }
 
-    // ---------------- S3 手动拉取 ----------------
-    std::printf("\nS3 手动拉取（逐队列 min -> max）\n");
+    // ---------------- S3 manual pull ----------------
+    std::printf("\nS3 manual pull (per queue min -> max)\n");
     std::set<std::string> got;
     {
         for (const MessageQueue& q : routes) {
@@ -255,7 +255,7 @@ int main(int argc, char** argv) {
                 try {
                     r = consumer.pull(q, "*", offset, 32, 5000);
                 } catch (const std::exception& e) {
-                    check("S3 拉取 " + qKey(q) + " 异常", false, e.what());
+                    check("S3 pull " + qKey(q) + " threw an exception", false, e.what());
                     break;
                 }
                 if (r.status == PullStatus::FOUND) {
@@ -269,7 +269,7 @@ int main(int argc, char** argv) {
                 } else if (r.status == PullStatus::OFFSET_ILLEGAL) {
                     break;
                 } else {
-                    check("S3 拉取 " + qKey(q) + " 状态异常", false,
+                    check("S3 pull " + qKey(q) + " returned an unexpected status", false,
                           std::string("status=") + pullStatusName(r.status));
                     break;
                 }
@@ -281,49 +281,49 @@ int main(int argc, char** argv) {
                             std::inserter(missing, missing.begin()));
         std::set_difference(got.begin(), got.end(), sent.begin(), sent.end(),
                             std::inserter(extra, extra.begin()));
-        check("S3 手动拉取收全 " + std::to_string(nMsg) + " 条且内容一致", got == sent,
+        check("S3 manual pull collected all " + std::to_string(nMsg) + " messages with matching content", got == sent,
               "got=" + std::to_string(got.size()) + " missing=[" + join(missing) + "] extra=[" +
                   join(extra) + "]");
     }
 
     if (got.empty()) {
-        std::printf("\n!! 一条都没拉到，后续场景跳过\n");
+        std::printf("\n!! nothing was pulled, skipping the remaining scenarios\n");
         std::printf("\nPullConsumer: PASS=%d FAIL=%d\n", gPass, gFail);
         consumer.shutdown();
         return 1;
     }
 
-    // ---------------- S4 手动提交位点 ----------------
-    std::printf("\nS4 手动提交位点并回读\n");
+    // ---------------- S4 manual offset commit ----------------
+    std::printf("\nS4 commit the offset manually and read it back\n");
     {
         const MessageQueue& q0 = routes[0];
         const int64_t target = hi[qKey(q0)];
         consumer.updateConsumeOffset(q0, target);
         int64_t back = -1;
         const bool haveOffset = consumer.fetchConsumeOffset(q0, back);
-        check("S4 位点提交后回读一致", haveOffset && back == target,
+        check("S4 offset reads back the same after commit", haveOffset && back == target,
               "committed=" + std::to_string(back) + " target=" + std::to_string(target));
     }
 
-    // ---------------- S5 位点由调用方掌控 ----------------
-    std::printf("\nS5 位点由调用方掌控\n");
+    // ---------------- S5 the caller owns the offset ----------------
+    std::printf("\nS5 the caller owns the offset\n");
     {
         const MessageQueue& q0 = routes[0];
         const int64_t committed = hi[qKey(q0)];
         PullResult r1 = consumer.pull(q0, "*", committed, 32, 5000);
-        check("S5 从已提交位点再拉 = NO_NEW_MSG",
+        check("S5 pulling again from the committed offset = NO_NEW_MSG",
               r1.status == PullStatus::NO_NEW_MSG && r1.msgFoundList.empty(),
               std::string("status=") + pullStatusName(r1.status) +
                   " n=" + std::to_string(r1.msgFoundList.size()));
 
         PullResult r2 = consumer.pull(q0, "*", lo[qKey(q0)], 32, 5000);
-        check("S5 位点退回 min 后可重拉（pull 模式的核心能力）",
+        check("S5 after rewinding the offset to min the messages can be re-pulled (the core capability of pull mode)",
               r2.status == PullStatus::FOUND && !r2.msgFoundList.empty(),
               std::string("status=") + pullStatusName(r2.status) +
                   " n=" + std::to_string(r2.msgFoundList.size()));
     }
 
-    // ---------------- S6 位点查询 ----------------
+    // ---------------- S6 offset queries ----------------
     std::printf("\nS6 searchOffset / earliestMsgStoreTime / min/max\n");
     {
         const MessageQueue& q0 = routes[0];
@@ -335,8 +335,8 @@ int main(int argc, char** argv) {
               "min=" + std::to_string(lo[qKey(q0)]) + " max=" + std::to_string(hi[qKey(q0)]));
     }
 
-    // ---------------- S7 回投 ----------------
-    std::printf("\nS7 sendMessageBack -> %%RETRY%%group 可拉取\n");
+    // ---------------- S7 redelivery ----------------
+    std::printf("\nS7 sendMessageBack -> %%RETRY%%group is pullable\n");
     {
         MessageExt sample;
         bool haveSample = false;
@@ -349,15 +349,15 @@ int main(int argc, char** argv) {
             }
         }
         if (!haveSample) {
-            check("S7 取样本消息", false, "no message available");
+            check("S7 take a sample message", false, "no message available");
         } else {
             const std::string want = bodyOf(sample);
             try {
                 consumer.sendMessageBack(sample, 0);
-                check("S7 回投请求被 broker 接受", true,
+                check("S7 redelivery request accepted by the broker", true,
                       "offset=" + std::to_string(sample.commitLogOffset) + " body=" + want);
             } catch (const std::exception& e) {
-                check("S7 回投请求被 broker 接受", false, e.what());
+                check("S7 redelivery request accepted by the broker", false, e.what());
                 std::printf("\nPullConsumer: PASS=%d FAIL=%d\n", gPass, gFail);
                 consumer.shutdown();
                 return gFail == 0 ? 0 : 1;
@@ -400,7 +400,7 @@ int main(int argc, char** argv) {
                 }
                 if (!found) std::this_thread::sleep_for(std::chrono::seconds(1));
             }
-            check("S7 %RETRY% 拉到了被回投的消息", found, detail);
+            check("S7 the %RETRY% topic served the redelivered message", found, detail);
         }
     }
 

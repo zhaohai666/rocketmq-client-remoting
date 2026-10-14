@@ -1,8 +1,8 @@
-// C++ 客户端 SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 真机联调（场景 S1–S4 逐条断言；
-// 非法配置的拦截另由 cpp/tests/test_check_client_config.cpp 离线锁定）。
+// C++ client SQL92 filtering + CHECK_CLIENT_CONFIG(46) live-cluster verification (assert scenarios S1-S4 one by one;
+// intercepting illegal configuration is locked offline by cpp/tests/test_check_client_config.cpp).
 //
 //
-// 用法（先起本地 5.5.1 集群，broker 需 enablePropertyFilter=true）：
+// Usage (start a local 5.5.1 cluster first; the broker needs enablePropertyFilter=true):
 //   ./rmq_sql92_live [namesrv]
 #include <algorithm>
 #include <chrono>
@@ -63,10 +63,10 @@ bool waitFor(F&& pred, int timeoutMs, int stepMs = 300) {
     }
 }
 
-// ---------------------------------------------------------------- 取证钩子
+// ---------------------------------------------------------------- forensic hook
 
-// 钩在 transport 上，抓启动期真正发出去的 46 号请求（含 body）。
-// doBeforeRequest 跑在发送线程上、且一个钩子对象可能被多线程共用，必须自带锁。
+// Hooked on the transport, capturing the request 46 really sent during startup (body included).
+// doBeforeRequest runs on the sending thread and one hook object may be shared by several threads, so it must carry its own lock.
 class CheckConfigProbe : public RPCHook {
 public:
     void doBeforeRequest(const std::string& /*remoteAddr*/, RemotingCommand& request) override {
@@ -110,9 +110,9 @@ private:
     std::vector<CheckClientRequestBody> bodies;
 };
 
-// ---------------------------------------------------------------- 收集监听器
+// ---------------------------------------------------------------- collecting listener
 
-// 攒下消费到的消息（监听器跑在消费线程上，sink 跨线程共享）。
+// Accumulates the consumed messages (the listener runs on consumer threads and the sink is shared across threads).
 struct Sink {
     std::mutex mtx;
     std::vector<std::string> bodies;
@@ -153,12 +153,12 @@ private:
     Sink& sink_;
 };
 
-// ---------------------------------------------------------------- 环境
+// ---------------------------------------------------------------- environment
 
 std::string gStamp;
 std::string gNsAddr;
 
-// 一套按 stamp 隔离的 topic/group，跑完自己扫干净。
+// A set of stamp-isolated topics/groups, cleaned up completely after the run.
 struct Env {
     DefaultMQAdminExt admin{"SQL92CPPADMIN"};
     std::vector<std::string> topics;
@@ -193,8 +193,8 @@ struct Env {
         admin.start();
     }
 
-    // 消费者通用装配：地址 + 起点 + 订阅（selector 为空时用 TAG 表达式）+ 可选取证钩子。
-    // 组名在构造 DefaultMQPushConsumer 时给（本端口没有 setConsumerGroup）。
+    // Common consumer assembly: address + start point + subscription (TAG expression when selector is null) + optional forensic hook.
+    // The group name is given when constructing DefaultMQPushConsumer (this port has no setConsumerGroup).
     void configure(DefaultMQPushConsumer& c, const std::string& topic,
                    const MessageSelector* selector, const std::string& expression,
                    const std::shared_ptr<RPCHook>& probe) {
@@ -231,7 +231,7 @@ struct Env {
             }
         }
         for (const std::string& g : groupList) {
-            // %RETRY%/%DLQ% 随订阅组一起删（只有走删组接口 broker 才会真删 retry topic）
+            // %RETRY%/%DLQ% go with the subscription group (only the delete-group API makes the broker really delete the retry topic)
             try {
                 admin.deleteSubscriptionGroup(addr, g, true);
             } catch (const std::exception& e) {
@@ -247,9 +247,9 @@ struct Env {
     }
 };
 
-// ---------------------------------------------------------------- S1 线上取证
+// ---------------------------------------------------------------- S1 wire evidence
 void s1WireEvidence(Env& env, const std::string& topic) {
-    std::printf("\n---------- S1 启动期的 46 号请求 ----------\n");
+    std::printf("\n---------- S1 request 46 during startup ----------\n");
     const std::string sqlGroup = env.group("SQL");
     auto probe = std::make_shared<CheckConfigProbe>();
     Sink sqlSink;
@@ -262,9 +262,9 @@ void s1WireEvidence(Env& env, const std::string& topic) {
         c.start();
         c.shutdown();
     } catch (const std::exception& e) {
-        check("S1 SQL92 消费者启动成功", false, e.what());
+        check("S1 SQL92 consumer starts successfully", false, e.what());
     }
-    check("S1 SQL92 订阅触发恰好一笔 CHECK_CLIENT_CONFIG(46)", probe->checkCount() == 1,
+    check("S1 a SQL92 subscription triggers exactly one CHECK_CLIENT_CONFIG(46)", probe->checkCount() == 1,
           "codes=" + probe->codesStr());
     CheckClientRequestBody body;
     const bool hasBody = probe->firstBody(body);
@@ -272,7 +272,7 @@ void s1WireEvidence(Env& env, const std::string& topic) {
         && body.subscriptionData.expressionType == std::string(ExpressionType::SQL92)
         && body.subscriptionData.subString == "color = 'red'"
         && body.subscriptionData.topic == topic;
-    check("S1 body 是 CheckClientRequestBody（clientId / group / subscriptionData）", shapeOk,
+    check("S1 body is a CheckClientRequestBody (clientId / group / subscriptionData)", shapeOk,
           "hasBody=" + std::to_string(hasBody) + " group=" + body.group
               + " clientId=" + body.clientId + " want=" + c.clientId()
               + " type=" + body.subscriptionData.expressionType
@@ -289,16 +289,16 @@ void s1WireEvidence(Env& env, const std::string& topic) {
     try {
         t.start();
     } catch (const std::exception& e) {
-        check("S1 TAG 消费者启动成功", false, e.what());
+        check("S1 TAG consumer starts successfully", false, e.what());
     }
-    check("S1 纯 TAG 订阅一笔 46 都不发（isTagType 短路）", tagProbe->checkCount() == 0,
+    check("S1 a pure TAG subscription sends not a single request 46 (isTagType short-circuits)", tagProbe->checkCount() == 0,
           "codes=" + tagProbe->codesStr());
     t.shutdown();
 }
 
 // ---------------------------------------------------------------- S2 / S3
 void s2S3RealFiltering(Env& env, const std::string& topic, DefaultMQProducer& prod) {
-    std::printf("\n---------- S2 broker 按属性过滤 / S3 永不匹配的表达式 ----------\n");
+    std::printf("\n---------- S2 broker filters by property / S3 an expression that never matches ----------\n");
     MessageSelector redSel = MessageSelector::bySql("color = 'red'");
     MessageSelector greenSel = MessageSelector::bySql("color = 'green'");
 
@@ -315,7 +315,7 @@ void s2S3RealFiltering(Env& env, const std::string& topic, DefaultMQProducer& pr
     redC.setMessageListener(redL);
     greenC.setMessageListener(greenL);
     allC.setMessageListener(allL);
-    // 必须先起来再发：新消费组的 CONSUME_FROM_LAST_OFFSET 会跳过启动前的消息。
+    // They must start before sending: CONSUME_FROM_LAST_OFFSET of a new consumer group skips messages published before startup.
     redC.start();
     greenC.start();
     allC.start();
@@ -328,7 +328,7 @@ void s2S3RealFiltering(Env& env, const std::string& topic, DefaultMQProducer& pr
             m.setKeys(gStamp + "-" + color + "-" + std::to_string(i));
             m.putProperty("color", color);
             const SendResult r = prod.send(m, 5000);
-            check("S2 发送 " + text + " 成功", r.sendStatus == SendStatus::SEND_OK, r.msgId);
+            check("S2 send " + text + " succeeded", r.sendStatus == SendStatus::SEND_OK, r.msgId);
             if (std::string(color) == "red") {
                 redBodiesSent.push_back(text);
             } else {
@@ -340,34 +340,34 @@ void s2S3RealFiltering(Env& env, const std::string& topic, DefaultMQProducer& pr
     std::sort(blueBodiesSent.begin(), blueBodiesSent.end());
 
     waitFor([&] { return all.count() >= 6; }, 25000);
-    std::this_thread::sleep_for(std::chrono::seconds(4));  // 再等一会，确认 green 不是"来得晚"
+    std::this_thread::sleep_for(std::chrono::seconds(4));  // wait a bit more to confirm green is not merely "late"
     const std::vector<std::string> gotRed = red.sorted();
     const std::vector<std::string> gotAll = all.sorted();
-    check("S2 SQL92(color=red) 收到 3 条，且正好是发出去的那 3 条", gotRed == redBodiesSent,
+    check("S2 SQL92(color=red) received 3 messages, exactly the 3 that were sent", gotRed == redBodiesSent,
           join(gotRed));
     std::vector<std::string> everything = redBodiesSent;
     everything.insert(everything.end(), blueBodiesSent.begin(), blueBodiesSent.end());
     std::sort(everything.begin(), everything.end());
-    check("S2 TAG '*' 对照组收到 6 条（红+蓝全在）", gotAll == everything, join(gotAll));
+    check("S2 the TAG '*' control group received 6 messages (red and blue all present)", gotAll == everything, join(gotAll));
     bool leaked = false;
     for (const std::string& b : blueBodiesSent) {
         if (std::find(gotRed.begin(), gotRed.end(), b) != gotRed.end()) leaked = true;
     }
-    check("S2 blue 的 3 条没漏进 SQL92 消费者（证明 broker 真在过滤）", !leaked, join(gotRed));
+    check("S2 the 3 blue messages did not leak into the SQL92 consumer (proof the broker really filters)", !leaked, join(gotRed));
     const std::set<std::string> colors = red.colorSet();
-    check("S2 收到的消息属性 color 可读且都是 red",
+    check("S2 the received messages' property color is readable and always red",
         colors == std::set<std::string>{"red"},
         join(std::vector<std::string>(colors.begin(), colors.end())));
-    check("S3 订阅永不匹配的 color='green' ⇒ 一条都没收到", green.count() == 0,
+    check("S3 subscribing the never-matching color='green' => not one message received", green.count() == 0,
           join(green.sorted()));
     redC.shutdown();
     greenC.shutdown();
     allC.shutdown();
 }
 
-// ---------------------------------------------------------------- S4 反证
+// ---------------------------------------------------------------- S4 counter-evidence
 void s4BadExpressionFails(Env& env, const std::string& topic) {
-    std::printf("\n---------- S4 非法表达式在启动期失败 ----------\n");
+    std::printf("\n---------- S4 an illegal expression fails at startup ----------\n");
     const std::string badGroup = env.group("BAD");
     MessageSelector bad = MessageSelector::bySql("color ==");
     Sink sink;
@@ -393,15 +393,15 @@ void s4BadExpressionFails(Env& env, const std::string& topic) {
     const long long costMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                  std::chrono::steady_clock::now() - began)
                                  .count();
-    check("S4 start() 抛出 MQClientException", threw == 1, msg);
-    check("S4 错误码是 broker 的 SUBSCRIPTION_PARSE_FAILED(23)",
+    check("S4 start() throws MQClientException", threw == 1, msg);
+    check("S4 the error code is the broker's SUBSCRIPTION_PARSE_FAILED(23)",
         code == ResponseCode::SUBSCRIPTION_PARSE_FAILED,
         "code=" + std::to_string(code) + " remark=" + msg);
-    check("S4 失败后消费者没留在已启动状态", !c.isStarted());
-    check("S4 非法表达式立刻失败（<5s，不是等超时兜底）", costMs < 5000,
+    check("S4 after the failure the consumer is not left in a started state", !c.isStarted());
+    check("S4 the illegal expression fails immediately (<5 s, not waiting out a timeout fallback)", costMs < 5000,
           std::to_string(costMs) + "ms");
 
-    // 回滚干净了？同一个对象换个合法表达式应当能重新 start
+    // Rolled back cleanly? The same object with a legal expression should be able to start again
     std::string retryMsg;
     try {
         MessageSelector ok = MessageSelector::bySql("color = 'blue'");
@@ -410,7 +410,7 @@ void s4BadExpressionFails(Env& env, const std::string& topic) {
     } catch (const std::exception& e) {
         retryMsg = e.what();
     }
-    check("S4 失败后修正表达式可重新 start（启动已就地回滚）", retryMsg.empty(), retryMsg);
+    check("S4 after the failure a fixed expression can start again (startup rolled back in place)", retryMsg.empty(), retryMsg);
     if (retryMsg.empty()) c.shutdown();
 }
 
@@ -434,10 +434,10 @@ int main(int argc, char** argv) {
     prod.setSendMsgTimeout(5000);
     prod.start();
     try {
-        // 队列数 4：建 topic 时显式指定 4 个队列，便于断言队列归属
+        // Queue count 4: create the topic with exactly 4 queues so queue attribution can be asserted
         prod.createTopic(MixAll::DEFAULT_TOPIC, topic, 4);
         const bool ready = waitFor([&] { return env.routeQueueCount(topic) >= 4; }, 20000);
-        check("T0 topic 路由就绪（4 队列）", ready,
+        check("T0 topic route ready (4 queues)", ready,
               "queues=" + std::to_string(env.routeQueueCount(topic)));
 
         s1WireEvidence(env, topic);

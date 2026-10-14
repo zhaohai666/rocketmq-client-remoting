@@ -1,4 +1,4 @@
-// 动态 name server（DefaultTopAddressing）单测 —— 本地 mock HTTP server，不依赖外网。
+// DefaultTopAddressing (dynamic name server) unit tests -- local mock HTTP server, no external network.
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -52,8 +52,8 @@ void expectEq(const std::string& actual, const std::string& expected, const std:
     }
 }
 
-// 临时改环境变量、析构时还原（值设成空串即等价于"未设置"：实现按 env[0]=='\0' 判断）。
-// ::setenv 是 POSIX 专有，MSVC 只有 _putenv_s。
+// Temporarily set an environment variable and restore it on destruction (an empty value equals "unset": the implementation checks env[0]=='\0').
+// ::setenv is POSIX-only; MSVC only has _putenv_s.
 class ScopedEnv {
  public:
     ScopedEnv(const char* name, const char* value) : name_(name) {
@@ -94,7 +94,7 @@ class MockAddrServer {
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;    // 系统分配
+        addr.sin_port = 0;    // assigned by the OS
         ::bind(listen_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
         netcompat::socklen_type len = sizeof(addr);
         ::getsockname(listen_, reinterpret_cast<sockaddr*>(&addr), &len);
@@ -163,13 +163,13 @@ std::string topAddrDomain(const MockAddrServer& s) {
     return "127.0.0.1:" + std::to_string(s.port());
 }
 
-// 构造函数第一个参数是 **wsAddr**（不是 domain 关键字），
-// 这里统一用 getWsAddr 生成完整 URL。
+// The first constructor parameter is **wsAddr** (not the domain keyword);
+// the full URL is always produced via getWsAddr here.
 std::string topAddrWs(const MockAddrServer& s) {
     return DefaultTopAddressing::getWsAddr(topAddrDomain(s));
 }
 
-// ------------------------------------------------------------------ 用例
+// ------------------------------------------------------------------ test cases
 
 void testGetWsAddr() {
     expectEq(DefaultTopAddressing::getWsAddr("jmenv.tbsite.net"),
@@ -227,7 +227,7 @@ void testFetchAndApply(MockAddrServer& s) {
 }
 
 void testMqClientIntegration(MockAddrServer& s) {
-    // 配了静态地址 → 不该问地址服务器（hits 用差值比较，前面用例已经打过它）
+    // static addrs configured => must not ask the address server (hits compared by delta; earlier cases already hit it)
     const int baseline = s.hitCount();
     {
         MQClientInstance mqc("c@cppdyn", {"127.0.0.1:9876"});
@@ -236,7 +236,7 @@ void testMqClientIntegration(MockAddrServer& s) {
         mqc.shutdown();
         expectEq(s.hitCount() == baseline ? "0" : "n", "0", "static addrs never fetch");
     }
-    // 空地址 → start 时 fetch 一次并应用
+    // empty addrs => fetch once and apply at start
     s.setResponse(200, "127.0.0.1:9876");
     {
         MQClientInstance mqc("c@cppdyn2", {});
@@ -248,7 +248,7 @@ void testMqClientIntegration(MockAddrServer& s) {
         expectEq(s.hitCount() > 0 ? "y" : "n", "y", "address server hit");
         mqc.shutdown();
     }
-    // 地址服务器取不到 → start 报错
+    // address server unreachable => start throws
     s.setResponse(500, "");
     {
         MQClientInstance mqc("c@cppdyn3", {});
@@ -271,50 +271,50 @@ void testDefaultConstructedIsDisabled() {
 
 void testConfigureFromEnv(MockAddrServer& s) {
     const std::string key = "ROCKETMQ_NAMESRV_DOMAIN";
-    // 1) 未配置 = 完全 no-op（不能让没设 env 的用户白等 3s 域名解析）
+    // 1) unconfigured = complete no-op (users without the env var must not burn 3s on DNS resolution)
     {
         ScopedEnv off(key.c_str(), "");
-        expect(!DefaultTopAddressing::isConfigured(), "env 未设置时 isConfigured=false");
+        expect(!DefaultTopAddressing::isConfigured(), "isConfigured=false when env unset");
         DefaultTopAddressing ta;
         ta.configureFromEnv("unitA");
-        expect(ta.wsAddr().empty(), "env 未设置 → 不改 wsAddr");
-        expect(ta.unitName().empty(), "env 未设置 → 不记 unitName");
-        expectEq(ta.fetchNsAddr(false), "", "env 未设置时 fetch 仍是 no-op");
+        expect(ta.wsAddr().empty(), "env unset => wsAddr unchanged");
+        expect(ta.unitName().empty(), "env unset => unitName not recorded");
+        expectEq(ta.fetchNsAddr(false), "", "fetch stays a no-op when env unset");
     }
-    // 2) 配置了 domain：wsAddr 按 MixAll.getWSAddr 拼，unitName 进 URL
+    // 2) domain configured: wsAddr is built like MixAll.getWSAddr, unitName goes into the URL
     s.setResponse(200, "127.0.0.1:9876");
     {
         ScopedEnv on(key.c_str(), topAddrDomain(s).c_str());
-        expect(DefaultTopAddressing::isConfigured(), "env 设置后 isConfigured=true");
+        expect(DefaultTopAddressing::isConfigured(), "isConfigured=true after env set");
         DefaultTopAddressing ta;
         ta.configureFromEnv("unitA");
-        expectEq(ta.wsAddr(), topAddrWs(s), "configureFromEnv 拼出 wsAddr");
-        expectEq(ta.unitName(), "unitA", "unitName 落到地址服务器配置");
-        // domain 自带端口 ⇒ 不追加 :8080；unitName 段是 "-<unit>?nofix=1"
-        expectEq(ta.buildUrl(), topAddrWs(s) + "-unitA?nofix=1", "env + unitName 的 URL");
-        expectEq(ta.fetchNsAddr(false), "127.0.0.1:9876", "env 驱动的 fetch 取到地址");
+        expectEq(ta.wsAddr(), topAddrWs(s), "configureFromEnv builds wsAddr");
+        expectEq(ta.unitName(), "unitA", "unitName lands in the addressing config");
+        // domain carries its own port => :8080 is not appended; the unitName segment is "-<unit>?nofix=1"
+        expectEq(ta.buildUrl(), topAddrWs(s) + "-unitA?nofix=1", "URL built from env + unitName");
+        expectEq(ta.fetchNsAddr(false), "127.0.0.1:9876", "env-driven fetch returns the address");
     }
-    // 3) MQClientInstance 构造时自己装配：facade 不用手工 setWsAddr
+    // 3) MQClientInstance assembles it during construction: the facade does not call setWsAddr manually
     {
         ScopedEnv on(key.c_str(), topAddrDomain(s).c_str());
         MQClientInstance mqc("c@cppenv", {}, 3000, 15000, false, "unitZ");
-        expectEq(mqc.topAddressing().wsAddr(), topAddrWs(s), "实例从 env 装好 wsAddr");
-        expectEq(mqc.topAddressing().unitName(), "unitZ", "实例把 unitName 传给取址配置");
+        expectEq(mqc.topAddressing().wsAddr(), topAddrWs(s), "instance loads wsAddr from env");
+        expectEq(mqc.topAddressing().unitName(), "unitZ", "instance passes unitName to the addressing config");
         mqc.start();
         const std::vector<std::string> addrs = mqc.nameServerAddrs();
         expect(addrs.size() == 1 && addrs[0] == "127.0.0.1:9876",
-               "env 驱动的实例 start 时取到地址", "addrs=" + std::to_string(addrs.size()));
+               "env-driven instance fetches addrs at start", "addrs=" + std::to_string(addrs.size()));
         mqc.shutdown();
     }
-    // 4) 没有 env 时实例保持关闭动态取址，也不碰地址服务器
+    // 4) without the env var the instance keeps dynamic addressing disabled and never touches the address server
     {
         ScopedEnv off(key.c_str(), "");
         MQClientInstance mqc("c@cppenv2", {"127.0.0.1:9876"});
-        expect(mqc.topAddressing().wsAddr().empty(), "无 env 时实例 wsAddr 为空");
+        expect(mqc.topAddressing().wsAddr().empty(), "instance wsAddr empty without env");
         const int before = s.hitCount();
         mqc.start();
         mqc.shutdown();
-        expectEq(std::to_string(s.hitCount() - before), "0", "无 env 时不请求地址服务器");
+        expectEq(std::to_string(s.hitCount() - before), "0", "address server not queried without env");
     }
 }
 

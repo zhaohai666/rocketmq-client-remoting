@@ -1,11 +1,11 @@
-// 真机静态主题腿，五个场景逐条断言：
-//   S1 createStaticTopic(513)：单 broker，totalQueues=8，物理 4 队列；
-//   S2 路由回读 TopicQueueMappingByBroker；
-//   S3 topicRouteData2EndpointsForStaticTopic：8 条端点（0-3 → broker，
-//      4-7 → __syslo__none__）；
-//   S4 消费者实例把 mock 队列名重写到真实 broker（表外 id 透传）；
-//   S5 端到端：生产者发 4 条、PUSH 消费者收齐 4 条。
-// 用法：rmq_live_static_topic <namesrv>
+// Live static-topic leg, one assertion per scenario:
+//   S1 createStaticTopic(513): single broker, totalQueues=8, 4 physical queues;
+//   S2 route read-back carries TopicQueueMappingByBroker;
+//   S3 topicRouteData2EndpointsForStaticTopic: 8 endpoints (0-3 -> broker,
+//      4-7 -> __syslo__none__);
+//   S4 the consumer instance rewrites mock queue names onto the real broker (ids outside the table pass through);
+//   S5 end to end: producer sends 4 messages, the PUSH consumer receives all 4.
+// Usage: rmq_live_static_topic <namesrv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -51,7 +51,7 @@ int64_t nowMs() {
         .count();
 }
 
-// Message body 构造是 std::string（按字节透传）。
+// The message body is a std::string (passed through byte for byte).
 std::string str2bytes(const std::string& s) { return s; }
 
 JsonValue mappingDetail(const std::string& topic, const std::string& brokerName) {
@@ -122,7 +122,7 @@ int main(int argc, char** argv) {
     const int32_t physicalQueues = 4;
     const int32_t totalQueues = 8;
 
-    std::cout << "\nS1 起管理端，createStaticTopic(513)" << std::endl;
+    std::cout << "\nS1 bring up the admin client, createStaticTopic(513)" << std::endl;
     DefaultMQAdminExt admin;
     admin.setNamesrvAddr(nsAddr);
     admin.setTimeoutMillis(10000);
@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    check("S1 broker 地址解析", !brokerAddr.empty(),
+    check("S1 broker address resolved", !brokerAddr.empty(),
           brokerName + "(" + brokerAddr + ")");
     if (brokerAddr.empty()) return 1;
 
@@ -154,14 +154,14 @@ int main(int argc, char** argv) {
         config.writeQueueNums = physicalQueues;
         admin.createStaticTopic(brokerAddr, "TBW102", config,
                                 mappingDetail(topic, brokerName), true);
-        check("S1 createStaticTopic(513) 被接受", true,
+        check("S1 createStaticTopic(513) accepted", true,
               "totalQueues=" + std::to_string(totalQueues));
     } catch (const std::exception& e) {
-        check("S1 createStaticTopic(513) 被接受", false, e.what());
+        check("S1 createStaticTopic(513) accepted", false, e.what());
         return 1;
     }
 
-    std::cout << "\nS2/S3 路由回读 + 端点集推导" << std::endl;
+    std::cout << "\nS2/S3 route read-back + endpoint set derivation" << std::endl;
     TopicRouteData route;
     bool routeOk = false;
     for (int i = 0; i < 30; ++i) {
@@ -181,16 +181,16 @@ int main(int argc, char** argv) {
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    check("S2 路由携带 TopicQueueMappingByBroker", routeOk);
+    check("S2 route carries TopicQueueMappingByBroker", routeOk);
     if (!routeOk) return 1;
 
     std::map<MessageQueue, std::string> endpoints;
     bool epOk = static_topic::topicRouteData2EndpointsForStaticTopic(topic, route, endpoints);
-    check("S3 端点集非空", epOk);
+    check("S3 endpoint set is not empty", epOk);
     if (!epOk) return 1;
 
     const std::string mockName = static_topic::getMockBrokerName("__global__");
-    check("S3 端点总数 = totalQueues",
+    check("S3 endpoint count = totalQueues",
           static_cast<int32_t>(endpoints.size()) == totalQueues,
           "got " + std::to_string(endpoints.size()));
     bool hostedOk = true;
@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
         auto it = endpoints.find(MessageQueue(topic, mockName, gid));
         if (it == endpoints.end() || it->second != brokerName) hostedOk = false;
     }
-    check("S3 承载 id 0-3 → broker", hostedOk);
+    check("S3 hosted ids 0-3 -> broker", hostedOk);
     bool unhostedOk = true;
     for (int32_t gid = physicalQueues; gid < totalQueues; ++gid) {
         auto it = endpoints.find(MessageQueue(topic, mockName, gid));
@@ -206,9 +206,9 @@ int main(int argc, char** argv) {
             unhostedOk = false;
         }
     }
-    check("S3 无承载 id 4-7 → __syslo__none__", unhostedOk);
+    check("S3 unhosted ids 4-7 -> __syslo__none__", unhostedOk);
 
-    std::cout << "\nS4/S5 实例重写 + 端到端收发" << std::endl;
+    std::cout << "\nS4/S5 instance rewrite + end-to-end send and receive" << std::endl;
     auto inbox = std::make_shared<Inbox>();
     auto consumer = std::make_shared<DefaultMQPushConsumer>(group);
     consumer->setNamesrvAddr(nsAddr);
@@ -224,17 +224,17 @@ int main(int argc, char** argv) {
             rewriteOk = false;
         }
     }
-    check("S4 实例把 mock 队列重写到真实 broker", rewriteOk);
+    check("S4 the instance rewrites mock queues onto the real broker", rewriteOk);
     const std::string sentinel = consumer->client().getBrokerNameFromMessageQueue(
         MessageQueue(topic, mockName, totalQueues - 1));
-    check("S4 无承载 id 返回哨兵值",
+    check("S4 unhosted id returns the sentinel value",
           sentinel == static_topic::kLogicalQueueMockNotExist, sentinel);
     const std::string outside = consumer->client().getBrokerNameFromMessageQueue(
         MessageQueue(topic, mockName, 99));
-    check("S4 表外 id 透传 mock 名", outside == mockName, outside);
+    check("S4 id outside the table passes the mock name through", outside == mockName, outside);
     const std::string plain = consumer->client().getBrokerNameFromMessageQueue(
         MessageQueue("Plain" + stamp, brokerName, 0));
-    check("S4 非静态主题原样透传", plain == brokerName, plain);
+    check("S4 non-static topic passes through unchanged", plain == brokerName, plain);
 
     DefaultMQProducer producer("cpp_static_prod_" + stamp);
     producer.setNamesrvAddr(nsAddr);
@@ -249,7 +249,7 @@ int main(int argc, char** argv) {
         }
     }
     producer.shutdown();
-    check("S5 发送 4 条", sent == physicalQueues, "sent=" + std::to_string(sent));
+    check("S5 sent 4 messages", sent == physicalQueues, "sent=" + std::to_string(sent));
 
     bool got = false;
     for (int i = 0; i < 40; ++i) {
@@ -259,7 +259,7 @@ int main(int argc, char** argv) {
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    check("S5 消费收齐 4 条", got, "got=" + std::to_string(inbox->count()));
+    check("S5 consumer received all 4", got, "got=" + std::to_string(inbox->count()));
     consumer->shutdown();
     admin.shutdown();
 

@@ -1,9 +1,9 @@
-// 第六到第八组是**订阅口径**的另一半（#104）：`findBrokerAddressInSubscribe(brokerName,
-// MASTER_ID, true)` 的三处调用面 —— 顺序消费的锁（RebalanceImpl#lock:153/lockAll:195，
-// 只认主、**不刷路由**、拿不到整台跳过）、POP 拉取（PullAPIWrapper#popAsync:369-373，
-// 刷一次路由后仍只认主）、消费位点读取（RemoteBrokerOffsetStore#fetchConsumeOffsetFromBroker:237-241，
-// 刷一次路由后**放宽**到从节点）。三条口径在同一份「只剩从节点」的路由上的表现各不相同，
-// 这正是它们必须分开测的原因。
+// Groups six to eight are the other half of the **subscribe-side lookup** contract (#104): the three call
+// sites of `findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)` -- orderly-consumption locking
+// (master only, **never refreshes the route**, and a broker whose master is missing is skipped whole),
+// POP pulling (refreshes the route once and still takes only the master) and consume-offset reading
+// (refreshes the route once, then **relaxes** to the slave). The three contracts behave differently on the
+// same "only a slave left" route, which is exactly why they must be tested separately.
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -56,7 +56,7 @@ void expectInt(long long actual, long long expected, const std::string& name) {
     }
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -107,16 +107,16 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// ---------------------------------------------------------------- 假端点（name server / broker 一个壳）
+// ---------------------------------------------------------------- fake endpoint (one shell for name server / broker)
 
 struct ReqRecord {
     int32_t code = 0;
     PropertyMap ext;
 };
 
-// 同一套 socket 骨架（与 test_pull_post_subscription.cpp 的 MockEndpoint 同源）：
-// 回路由给 name server，回 GET_MAX_OFFSET 的 scripted offset 给 broker，
-// 并把每条到达的请求按 code 记账 —— 「刷没刷路由」这类断言只能从线上报文取。
+// The same socket skeleton as MockEndpoint in test_pull_post_subscription.cpp: it answers routes as the
+// name server, answers GET_MAX_OFFSET with the scripted offset as the broker, and books every arriving
+// request by code -- assertions like "was the route refreshed" can only come from the wire.
 class MockEndpoint {
 public:
     MockEndpoint() {
@@ -258,8 +258,8 @@ private:
                 }
                 resp.code = ResponseCode::SUCCESS;
             } else if (req.code == RequestCode::POP_MESSAGE) {
-                // 假 broker 对 POP 一律回 POLLING_TIMEOUT(210)：既能证明请求打在主地址上，
-                // 又顺带证明客户端把 210 翻成 PollingNotFound。
+                // the fake broker always answers POP with POLLING_TIMEOUT(210): that proves the request went
+                // to the master address and, in passing, that the client translates 210 into PollingNotFound.
                 resp.code = ResponseCode::POLLING_TIMEOUT;
             } else {
                 resp.code = ResponseCode::SUCCESS;
@@ -284,7 +284,7 @@ private:
     std::thread acceptor_;
 };
 
-// ---------------------------------------------------------------- 脚手架
+// ---------------------------------------------------------------- scaffolding
 
 const char* kTopic = "PublishRouteTopic";
 const char* kBroker = "broker-a";
@@ -306,8 +306,8 @@ std::map<int64_t, std::string> masterAndSlave(const std::string& master,
     return {{MixAll::MASTER_ID, master}, {MixAll::MASTER_ID + 1, slave}};
 }
 
-// 起实例，并用**真 RPC**（GET_ROUTEINFO_BY_TOPIC 打假 name server）把 kTopic 的路由
-// 刷进缓存 —— 平表的写入点就在 updateTopicRouteInfoFromNameServer 里面。
+// Start an instance and push kTopic's route into the cache with a **real RPC** (GET_ROUTEINFO_BY_TOPIC to
+// the fake name server) -- the flat table is written inside updateTopicRouteInfoFromNameServer itself.
 std::unique_ptr<MQClientInstance> seeded(MockEndpoint& namesrv) {
     auto instance = std::make_unique<MQClientInstance>(
         kClientId, std::vector<std::string>{namesrv.address()});
@@ -315,7 +315,7 @@ std::unique_ptr<MQClientInstance> seeded(MockEndpoint& namesrv) {
     return instance;
 }
 
-// ---------------------------------------------------------------- 1. 查表口径
+// ---------------------------------------------------------------- 1. Lookup contracts
 
 void testPublishLookupTakesOnlyTheMasterWhileTheTolerantLookupFallsBack() {
     MockEndpoint namesrv, master, slave;
@@ -323,35 +323,35 @@ void testPublishLookupTakesOnlyTheMasterWhileTheTolerantLookupFallsBack() {
     auto instance = seeded(namesrv);
 
     expect(instance->findBrokerAddressInPublish(kBroker).empty(),
-           "只剩从节点（brokerId=1）时发布地址查不到：按 MASTER_ID 查为空");
-    // 负控：同一份路由上，退让口径（心跳/拉取/位点查询用）必须拿得到从节点
+           "publish lookup finds nothing when only a slave (brokerId=1) remains: querying by MASTER_ID is empty");
+    // Negative control: on the same route the tolerant lookup (heartbeat/pull/offset query) must still reach the slave
     expect(instance->brokerAddrOf(kBroker) == slave.address(),
-           "同一份路由上 brokerAddrOf 退到从节点 —— 两条口径不能合成一条");
+           "on the same route brokerAddrOf falls back to the slave -- the two contracts must not be merged");
 
     namesrv.addRoute(kTopic, routeOf(kBroker, masterAndSlave(master.address(), slave.address())));
-    expect(instance->updateTopicRouteInfoFromNameServer(kTopic), "master 重新注册后刷路由成功");
+    expect(instance->updateTopicRouteInfoFromNameServer(kTopic), "refreshing the route after the master re-registers succeeds");
     expect(instance->findBrokerAddressInPublish(kBroker) == master.address(),
-           "跳的是「没有 master」而不是名字：master 一注册立刻解析得出");
+           "what is skipped is 'no master', not the name: as soon as the master registers it resolves");
 }
 
-// ---------------------------------------------------------------- 2. 刷路由再查
+// ---------------------------------------------------------------- 2. Refresh the route then recheck
 
 void testPublishAddrForRefreshesTheRouteThenRechecks() {
     MockEndpoint namesrv, master;
     namesrv.addRoute(kTopic, routeOf(kBroker, {{MixAll::MASTER_ID, master.address()}}));
-    // 缓存为空：本端还没见过这个 topic（定点发送不会先去取发布信息，这是唯一的路由来源）
+    // The cache is empty: this client has never seen the topic (targeted sending does not fetch publish info first, so this is the only route source)
     auto instance = std::make_unique<MQClientInstance>(
         kClientId, std::vector<std::string>{namesrv.address()});
     const size_t before = namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC);
 
     expect(instance->publishAddrFor(kBroker, kTopic) == master.address(),
-           "参考实现行为：查不到先按 topic 刷一次路由再查");
+           "publishAddrFor contract: when nothing is found, refresh the route by topic once and recheck");
     expectInt(static_cast<long long>(
                   namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC) - before),
-              1, "恰好刷一次");
+              1, "refreshed exactly once");
 }
 
-// ---------------------------------------------------------------- 3. 主掉线 → not exist
+// ---------------------------------------------------------------- 3. Master gone → not exist
 
 void testPublishAddrForReportsNotExistWhenTheMasterIsGone() {
     MockEndpoint namesrv, master, slave;
@@ -364,19 +364,19 @@ void testPublishAddrForReportsNotExistWhenTheMasterIsGone() {
         instance->publishAddrFor(kBroker, kTopic);
     } catch (const MQClientException& e) {
         threw = std::string(e.what()) == "The broker[broker-a] not exist";
-        expectInt(e.getResponseCode(), -1, "not exist 的 responseCode == -1");
+        expectInt(e.getResponseCode(), -1, "the responseCode of not exist == -1");
     }
-    expect(threw, "只剩从节点时 publishAddrFor 报 not exist");
+    expect(threw, "publishAddrFor reports not exist when only a slave remains");
     expectInt(static_cast<long long>(
                   namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC) - before),
-              1, "报 not exist 之前刷过一次路由");
+              1, "the route was refreshed once before reporting not exist");
 
     namesrv.addRoute(kTopic, routeOf(kBroker, masterAndSlave(master.address(), slave.address())));
     expect(instance->publishAddrFor(kBroker, kTopic) == master.address(),
-           "负控：master 一注册立刻解析得出");
+           "negative control: the master resolves as soon as it registers");
 }
 
-// ---------------------------------------------------------------- 4. 不认识的 brokerName
+// ---------------------------------------------------------------- 4. An unknown brokerName
 
 void testPublishAddrForReportsNotExistForAnUnknownBroker() {
     MockEndpoint namesrv, other;
@@ -389,10 +389,10 @@ void testPublishAddrForReportsNotExistForAnUnknownBroker() {
     } catch (const MQClientException& e) {
         threw = std::string(e.what()) == "The broker[broker-a] not exist";
     }
-    expect(threw, "路由里压根没有这个 brokerName：同样报 not exist，不退到别的 broker");
+    expect(threw, "no such brokerName in the route: likewise not exist, without falling back to another broker");
 }
 
-// ---------------------------------------------------------------- 5. 管理 offset 查询
+// ---------------------------------------------------------------- 5. Admin offset queries
 
 void testAdminOffsetQueriesAreMasterOnlyToo() {
     MockEndpoint namesrv, master, slave;
@@ -407,18 +407,18 @@ void testAdminOffsetQueriesAreMasterOnlyToo() {
     } catch (const MQClientException& e) {
         threw = std::string(e.what()) == "The broker[broker-a] not exist";
     }
-    expect(threw, "只剩从节点时 getMaxOffset 报 not exist（参考实现只打主）");
+    expect(threw, "getMaxOffset reports not exist when only a slave remains (this lookup only targets the master)");
     expectInt(static_cast<long long>(slave.countCode(RequestCode::GET_MAX_OFFSET)), 0,
-              "是本端结论：从节点一台都没收到 offset 查询");
+              "this is a local verdict: the slave received no offset query at all");
 
-    // 负控：主回来之后查得到，且请求落在**主**地址上（不是路由里那台从节点）
+    // Negative control: once the master is back the query succeeds and lands on the **master** address (not on the slave in the route)
     namesrv.addRoute(kTopic, routeOf(kBroker, masterAndSlave(master.address(), slave.address())));
-    expectInt(instance->getMaxOffset(mq), 7, "主回来之后查得到");
+    expectInt(instance->getMaxOffset(mq), 7, "the query succeeds once the master is back");
     expectInt(static_cast<long long>(master.countCode(RequestCode::GET_MAX_OFFSET)), 1,
-              "请求落在主地址上");
+              "the request landed on the master address");
     expectInt(static_cast<long long>(slave.countCode(RequestCode::GET_MAX_OFFSET)), 0,
-              "从节点始终没被打过");
-    expect(master.lastExt().at("topic") == kTopic, "offset 查询带 topic");
+              "the slave was never hit");
+    expect(master.lastExt().at("topic") == kTopic, "the offset query carries topic");
 }
 
 
@@ -431,33 +431,33 @@ void testOrderlyLocksSkipTheBrokerWhenTheMasterIsGone() {
                                   MessageQueue(kTopic, kBroker, 1)};
 
     expect(instance->lockBatchMq("G", kClientId, mqs).empty(),
-           "只剩从节点时一台队列都锁不上");
+           "not a single queue can be locked when only a slave remains");
     expectInt(static_cast<long long>(
                   namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC) - before),
-              0, "锁/解锁不刷路由（与 publishAddrFor 的分界）");
+              0, "lock/unlock never refresh the route (the dividing line from publishAddrFor)");
     instance->unlockBatchMq("G", kClientId, mqs);
     expectInt(static_cast<long long>(master.countCode(RequestCode::LOCK_BATCH_MQ)), 0,
-              "LOCK_BATCH_MQ 一台没发");
+              "no LOCK_BATCH_MQ was sent at all");
     expectInt(static_cast<long long>(slave.countCode(RequestCode::LOCK_BATCH_MQ)), 0,
-              "从节点也不该被锁");
+              "the slave must not be locked either");
     expectInt(static_cast<long long>(slave.countCode(RequestCode::UNLOCK_BATCH_MQ)), 0,
-              "UNLOCK 同样一台没发");
+              "UNLOCK likewise sent to none");
 
-    // 负控：master 一注册立刻锁上，请求落在**主**地址、返回集来自响应的 lockOKMQSet
+    // Negative control: as soon as the master registers, the locks succeed on the **master** address and the returned set comes from the response's lockOKMQSet
     namesrv.addRoute(kTopic, routeOf(kBroker, masterAndSlave(master.address(), slave.address())));
     instance->updateTopicRouteInfoFromNameServer(kTopic);
     std::vector<MessageQueue> locked = instance->lockBatchMq("G", kClientId, mqs);
-    expectInt(static_cast<long long>(locked.size()), 2, "两台队列都锁上了");
+    expectInt(static_cast<long long>(locked.size()), 2, "both queues got locked");
     expect(locked.size() == 2 && locked[0].brokerName == kBroker && locked[0].queueId == 0 &&
                locked[1].queueId == 1,
-           "返回集是响应里的 lockOKMQSet 原样");
+           "the returned set is exactly the lockOKMQSet from the response");
     expectInt(static_cast<long long>(master.countCode(RequestCode::LOCK_BATCH_MQ)), 1,
-              "LOCK_BATCH_MQ 落在主地址上");
+              "LOCK_BATCH_MQ landed on the master address");
     instance->unlockBatchMq("G", kClientId, mqs);
     expectInt(static_cast<long long>(master.countCode(RequestCode::UNLOCK_BATCH_MQ)), 1,
-              "UNLOCK_BATCH_MQ 也落在主地址上");
+              "UNLOCK_BATCH_MQ also landed on the master address");
     expectInt(static_cast<long long>(slave.countCode(RequestCode::LOCK_BATCH_MQ)), 0,
-              "从节点始终没被打过");
+              "the slave was never hit");
 }
 
 void testPopMessageIsMasterOnlyAndReportsNotExist() {
@@ -471,24 +471,24 @@ void testPopMessageIsMasterOnlyAndReportsNotExist() {
         instance->popMessage("G", kTopic, 0, 32, 30000, 0, 0);
     } catch (const MQClientException& e) {
         threw = std::string(e.what()) == "The broker[broker-a] not exist";
-        expectInt(e.getResponseCode(), -1, "not exist 的 responseCode == -1");
+        expectInt(e.getResponseCode(), -1, "the responseCode of not exist == -1");
     }
-    expect(threw, "只剩从节点时 POP 报 not exist");
+    expect(threw, "POP reports not exist when only a slave remains");
     expectInt(static_cast<long long>(
                   namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC) - before),
-              1, "报错前恰好刷一次路由");
+              1, "the route was refreshed exactly once before the error");
     expectInt(static_cast<long long>(slave.countCode(RequestCode::POP_MESSAGE)), 0,
-              "从节点一台都没收到 POP —— 写请求打到从节点只会换一个 SYSTEM_BUSY(2)");
+              "the slave received no POP at all -- a write to a slave would only trade for SYSTEM_BUSY(2)");
 
-    // 负控：master 回来之后 POP 打得出去，210 翻成 PollingNotFound
+    // Negative control: once the master returns, POP goes out and 210 becomes PollingNotFound
     namesrv.addRoute(kTopic, routeOf(kBroker, masterAndSlave(master.address(), slave.address())));
     PopResult result = instance->popMessage("G", kTopic, 0, 32, 30000, 0, 0);
     expect(result.status == PopStatus::POLLING_NOT_FOUND,
-           "假 broker 回 210 翻成 PollingNotFound");
+           "the fake broker's 210 becomes PollingNotFound");
     expectInt(static_cast<long long>(master.countCode(RequestCode::POP_MESSAGE)), 1,
-              "POP 落在主地址上");
+              "POP landed on the master address");
     expectInt(static_cast<long long>(slave.countCode(RequestCode::POP_MESSAGE)), 0,
-              "从节点始终没被打过");
+              "the slave was never hit");
 }
 
 void testConsumerOffsetFallsBackToTheSlaveAfterARefresh() {
@@ -501,24 +501,24 @@ void testConsumerOffsetFallsBackToTheSlaveAfterARefresh() {
     const size_t before = namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC);
 
     int64_t offset = 0;
-    expect(instance->queryConsumerOffset("G", mq, offset), "只剩从节点时位点查得到");
-    expectInt(offset, 424242, "刷一次路由后放宽到从节点");
+    expect(instance->queryConsumerOffset("G", mq, offset), "the offset is still readable when only a slave remains");
+    expectInt(offset, 424242, "after one route refresh it relaxes to the slave");
     expectInt(static_cast<long long>(
                   namesrv.countCode(RequestCode::GET_ROUTEINFO_BY_TOPIC) - before),
-              1, "放宽前恰好刷一次路由");
+              1, "the route was refreshed exactly once before relaxing");
     expectInt(static_cast<long long>(slave.countCode(RequestCode::QUERY_CONSUMER_OFFSET)), 1,
-              "QUERY_CONSUMER_OFFSET 落在从节点上");
+              "QUERY_CONSUMER_OFFSET landed on the slave");
 
-    // 负控：master 在时先打主（主分支不进刷新逻辑，从节点计数冻住）
+    // Negative control: with the master present the query goes to it (the master branch never enters the refresh logic, so the slave's counter stays frozen)
     namesrv.addRoute(kTopic, routeOf(kBroker, masterAndSlave(master.address(), slave.address())));
     instance->updateTopicRouteInfoFromNameServer(kTopic);
     int64_t masterOffset = 0;
-    expect(instance->queryConsumerOffset("G", mq, masterOffset), "master 在时查得到");
-    expectInt(masterOffset, 111, "位点读主的");
+    expect(instance->queryConsumerOffset("G", mq, masterOffset), "the query succeeds while the master is present");
+    expectInt(masterOffset, 111, "the offset is read from the master");
     expectInt(static_cast<long long>(slave.countCode(RequestCode::QUERY_CONSUMER_OFFSET)), 1,
-              "从节点的计数冻住");
+              "the slave's counter stayed frozen");
 
-    // 路由里压根没有这个 brokerName：报 not exist，不退到别的 broker 上，也不静默返回 0
+    // The route has no such brokerName at all: report not exist, do not fall back to another broker, and do not silently return 0
     MockEndpoint ns2;
     ns2.addRoute(kTopic, routeOf("broker-b", {{MixAll::MASTER_ID, other.address()}}));
     auto instance2 = seeded(ns2);
@@ -528,11 +528,11 @@ void testConsumerOffsetFallsBackToTheSlaveAfterARefresh() {
         instance2->queryConsumerOffset("G", MessageQueue(kTopic, kBroker, 0), unused);
     } catch (const MQClientException& e) {
         threw = std::string(e.what()) == "The broker[broker-a] not exist";
-        expectInt(e.getResponseCode(), -1, "not exist 的 responseCode == -1");
+        expectInt(e.getResponseCode(), -1, "the responseCode of not exist == -1");
     }
-    expect(threw, "未知 brokerName 同样报 not exist");
+    expect(threw, "an unknown brokerName likewise reports not exist");
     expectInt(static_cast<long long>(other.countCode(RequestCode::QUERY_CONSUMER_OFFSET)), 0,
-              "别的 broker 一次没被打");
+              "the other broker was never hit");
 }
 
 }  // namespace

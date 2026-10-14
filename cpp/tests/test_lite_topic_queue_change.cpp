@@ -1,19 +1,19 @@
-// LitePull 消费者的「topic 队列集合变更」监听（registerTopicMessageQueueChangeListener）
-// 离线单测 —— 不需要集群。
+// Offline unit tests for the LitePull consumer's topic queue-set change listener
+// (registerTopicMessageQueueChangeListener) -- no cluster needed.
 //
-// 这里锁的是本端自己的契约，判据全部取自线上报文：
-//   * 回调只在**队列集合**相对上一次快照真的变化时发一次；数量没变、内容换了也算变化。
-//   * 启动前注册 = 没有快照，后台第一趟必然回调一次（把当前集合交给调用方）；
-//     运行中注册 = 立刻记一版快照，当前状态不会被当成「变化」重复上报。
-//   * 每趟比对都**现问 name server**（不吃路由缓存），否则扩容最快要等一次周期轮询才看得见。
-//   * 查不到队列时**抛**而不是回空表 —— "查不到" ≠ "这个 topic 缩到 0 队列"，
-//     后者会让监听器收到一次假缩容回调、并把快照刷成空集。
-//   * 一个 topic 取路由失败只跳过它自己，本轮其余 topic 照常比对。
-//   * 重复注册同一 topic 覆盖旧监听器。
-//   * 比对每趟都真的重查 nameserver（GET_ROUTEINFO_BY_TOPIC 计数递增）。
-//
-// 后台线程首查延迟 10s，单测不等它：比对那一趟由测试直接驱动
-//（fetchTopicMessageQueuesAndCompare 公开就是为这个）。
+// What is pinned here is this client's own contract; every judgement is taken from the wire:
+//   * the callback fires once only when the **queue set** really changed against the previous snapshot
+//     (an unchanged count with different content still counts); registering before start = no snapshot, so
+//     the first background round must call back once with the current set, while a mid-run registration
+//     records a snapshot at once so the current state is never reported again as a "change".
+//   * every comparison round **re-queries the name server** instead of eating the route cache, else a
+//     scale-up would take one full polling cycle to become visible.
+//   * when no queues are found it **throws** rather than returning an empty list -- "not found" != "this
+//     topic shrank to 0 queues"; the latter would hand the listener a fake scale-down callback and flush
+//     the snapshot to the empty set.
+//   * a route failure for one topic only skips it (the round keeps comparing the others), re-registering
+//     the same topic overwrites the old listener, and each round really re-queries GET_ROUTEINFO_BY_TOPIC.
+// The background thread delays its first check by 10s and the tests do not wait: they drive fetchTopicMessageQueuesAndCompare directly (public exactly for this).
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -91,7 +91,7 @@ std::string joinTopics(const std::vector<std::string>& topics) {
     return s;
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -142,10 +142,10 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// ---------------------------------------------------------------- 假 name server
+// ---------------------------------------------------------------- fake name server
 //
-// 路由**按请求现造**：测试中途 setQueueNums() 之后，下一笔路由请求就是新的队列数，
-// 这样「集合变化 → 回调」是被真的观察到，不是靠测试自己塞进去的假数据。
+// The route is **built per request**: after the test calls setQueueNums() mid-run, the next route
+// request already reports the new queue count, so "set changed -> callback" is really observed.
 class MockNameServer {
 public:
     MockNameServer() {
@@ -194,8 +194,8 @@ public:
         queueNums_[topic] = n;
     }
 
-    /// topic 在表里但队列为 0：路由能查到、订阅信息为空，正是「缩到 0 队列」。
-    /// 不在表里则是「没有这个 topic 的路由」。
+    /// topic present in the map with 0 queues: the route is found but the queue data is empty, i.e.
+    /// "shrunk to 0 queues". Absent from the map means "no route for this topic at all".
     void dropRoute(const std::string& topic) {
         std::lock_guard<std::mutex> lk(state_);
         queueNums_.erase(topic);
@@ -206,7 +206,7 @@ public:
         return routeReqs_;
     }
 
-    /// 收到过的路由查询 topic（按到达顺序，含重复）。
+    /// The route-query topics seen so far (in arrival order, duplicates included).
     std::vector<std::string> requestedTopics() {
         std::lock_guard<std::mutex> lk(state_);
         return requested_;
@@ -293,7 +293,7 @@ private:
     std::thread acceptor_;
 };
 
-// ---------------------------------------------------------------- 记录用监听器
+// ---------------------------------------------------------------- recording listener
 
 class Recorder : public TopicMessageQueueChangeListener {
 public:
@@ -317,16 +317,16 @@ private:
     std::vector<std::pair<std::string, std::string>> events_;
 };
 
-// ---------------------------------------------------------------- 脚手架
+// ---------------------------------------------------------------- scaffolding
 
 const char* kGroup = "PG_LiteMqUnit";
 const char* kTopic = "LiteMqChangeTopic";
-// 排在 kTopic 之前的名字（比对按 topic 名有序遍历），这样「坏 topic 会不会打断本轮」
-// 才有判据：坏的那个先被处理，如果异常逃出了循环体，后面正常的就收不到回调。
+// A name sorting before kTopic (the comparison iterates topics in name order) is what gives "does a bad
+// topic break the round" its evidence: the bad one is handled first, so an exception escaping the loop body would leave the later healthy topic without a callback.
 const char* kGhost = "ALiteMqGhost";
 
-/// 起一个指向假 name server 的 lite 消费者：subscribe 是启动前置条件，
-/// 顺带把 topic 登记进实例的在用路由表。
+/// Start a lite consumer pointed at the fake name server: subscribe is a precondition for start and
+/// doubles as registering the topic in the instance's route-in-use table.
 std::unique_ptr<DefaultLitePullConsumer> started(const std::string& instance,
                                                  const MockNameServer& ns,
                                                  const std::string& topic,
@@ -340,7 +340,7 @@ std::unique_ptr<DefaultLitePullConsumer> started(const std::string& instance,
     return c;
 }
 
-// ---------------------------------------------------------------- 1. 入参守卫与周期
+// ---------------------------------------------------------------- 1. Input guards and interval
 
 void testGuardsAndInterval() {
     DefaultLitePullConsumer c(kGroup);
@@ -356,16 +356,16 @@ void testGuardsAndInterval() {
     } catch (const MQClientException& e) {
         listenerGuard = std::string(e.what()).find("Topic or listener is null") != std::string::npos;
     }
-    expect(topicGuard, "空 topic 被拒");
-    expect(listenerGuard, "空监听器被拒");
-    expectInt(c.topicMetadataCheckIntervalMillis(), 30000, "默认比对周期 30s");
+    expect(topicGuard, "empty topic is rejected");
+    expect(listenerGuard, "an empty listener is rejected");
+    expectInt(c.topicMetadataCheckIntervalMillis(), 30000, "the default comparison interval is 30s");
     c.setTopicMetadataCheckIntervalMillis(0);
-    expectInt(c.topicMetadataCheckIntervalMillis(), 1000, "周期下限收到 1s（0 会让后台永不推进）");
+    expectInt(c.topicMetadataCheckIntervalMillis(), 1000, "the interval floor is clamped to 1s (0 would make the background round never advance)");
     c.setTopicMetadataCheckIntervalMillis(5000);
-    expectInt(c.topicMetadataCheckIntervalMillis(), 5000, "周期可放大");
+    expectInt(c.topicMetadataCheckIntervalMillis(), 5000, "the interval can be enlarged");
 }
 
-// ---------------------------------------------------------------- 2. 启动前注册
+// ---------------------------------------------------------------- 2. Registration before start
 
 void testRegistrationBeforeStartFiresOnceThenQuiets() {
     MockNameServer ns;
@@ -374,50 +374,50 @@ void testRegistrationBeforeStartFiresOnceThenQuiets() {
     DefaultLitePullConsumer c(kGroup);
     c.setInstanceName("lite_mq_pre");
     c.setNamesrvAddr(ns.address());
-    // 注册在 start() 之前：这时记不了快照（还没法查队列），所以首趟必然回调一次。
+    // Registration happens before start(): no snapshot can be taken yet (queues are not queryable), so the first round must call back once.
     c.subscribe(kTopic, "*");
     c.registerTopicMessageQueueChangeListener(kTopic, rec);
     c.start();
-    // 没快照，所以第一趟把「当前集合」当成变化交出来 —— 调用方由此拿到初始状态，
-    // 之后才只需要收增量。
+    // With no snapshot the first round hands out the "current set" as a change -- the caller thereby
+    // gets the initial state and only increments from then on.
     c.fetchTopicMessageQueuesAndCompare();
-    expect(rec->count() == 1, "启动后第一趟回调一次", std::to_string(rec->count()));
+    expect(rec->count() == 1, "the first round after start calls back once", std::to_string(rec->count()));
     const auto ev = rec->events();
-    if (!ev.empty()) expect(ev[0].second == "0,1", "首回调带当前队列集合", ev[0].second);
+    if (!ev.empty()) expect(ev[0].second == "0,1", "the first callback carries the current queue set", ev[0].second);
     c.fetchTopicMessageQueuesAndCompare();
-    expect(rec->count() == 1, "集合没变就不再回调");
+    expect(rec->count() == 1, "no further callback when the set did not change");
     c.shutdown();
 }
 
-// ---------------------------------------------------------------- 3. 运行中注册 + 扩缩容
+// ---------------------------------------------------------------- 3. Mid-run registration + scale up/down
 
 void testRunningRegistrationSnapshotsAndTracksScale() {
     MockNameServer ns;
     ns.setQueueNums(kTopic, 1);
     auto c = started("lite_mq_running", ns, kTopic);
     auto rec = std::make_shared<Recorder>();
-    // 运行中注册：立刻记一版快照，「此刻存在的东西」不能被当成变化上报。
+    // Mid-run registration: a snapshot is recorded at once, so "what already exists now" must not be reported as a change.
     c->registerTopicMessageQueueChangeListener(kTopic, rec);
     c->fetchTopicMessageQueuesAndCompare();
-    expect(rec->count() == 0, "运行中注册后第一趟不误报", std::to_string(rec->count()));
+    expect(rec->count() == 0, "the first round after a mid-run registration does not misfire", std::to_string(rec->count()));
 
     ns.setQueueNums(kTopic, 3);
     c->fetchTopicMessageQueuesAndCompare();
     auto ev = rec->events();
-    expectInt(static_cast<long long>(ev.size()), 1, "扩容被观察到");
-    if (ev.size() == 1) expect(ev[0].second == "0,1,2", "回调带扩容后的集合", ev[0].second);
+    expectInt(static_cast<long long>(ev.size()), 1, "the scale-up was observed");
+    if (ev.size() == 1) expect(ev[0].second == "0,1,2", "the callback carries the scaled-up set", ev[0].second);
     c->fetchTopicMessageQueuesAndCompare();
-    expect(rec->count() == 1, "同一集合不重复回调");
+    expect(rec->count() == 1, "the same set is not reported twice");
 
     ns.setQueueNums(kTopic, 2);
     c->fetchTopicMessageQueuesAndCompare();
     ev = rec->events();
-    expectInt(static_cast<long long>(ev.size()), 2, "缩容也被观察到");
-    if (ev.size() == 2) expect(ev[1].second == "0,1", "回调带缩容后的集合", ev[1].second);
+    expectInt(static_cast<long long>(ev.size()), 2, "the scale-down was observed too");
+    if (ev.size() == 2) expect(ev[1].second == "0,1", "the callback carries the scaled-down set", ev[1].second);
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 4. 每趟现问 name server
+// ---------------------------------------------------------------- 4. Every round re-queries the name server
 
 void testEachRoundRequeriesTheNameserver() {
     MockNameServer ns;
@@ -428,13 +428,13 @@ void testEachRoundRequeriesTheNameserver() {
     c->fetchTopicMessageQueuesAndCompare();
     const int afterFirst = ns.routeRequests();
     c->fetchTopicMessageQueuesAndCompare();
-    expect(afterFirst >= 1, "比对这一趟会问路由", std::to_string(afterFirst));
-    expect(ns.routeRequests() > afterFirst, "下一趟再问一次（不吃缓存，否则扩容慢一个周期）",
+    expect(afterFirst >= 1, "the comparison round queries the route", std::to_string(afterFirst));
+    expect(ns.routeRequests() > afterFirst, "the next round asks again (no route cache, otherwise a scale-up would lag one cycle)",
            std::to_string(afterFirst) + "->" + std::to_string(ns.routeRequests()));
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 5. 一个 topic 失败不饿死别人
+// ---------------------------------------------------------------- 5. One failing topic must not starve others
 
 void testFailingTopicDoesNotBlockOthers() {
     MockNameServer ns;
@@ -445,17 +445,17 @@ void testFailingTopicDoesNotBlockOthers() {
     c->registerTopicMessageQueueChangeListener(kTopic, good);
     c->registerTopicMessageQueueChangeListener(kGhost, bad);
     ns.setQueueNums(kTopic, 3);
-    // Ghost 没有路由：取队列那步抛异常，本趟跳过它自己，排在它后面的照常比对。
+    // Ghost has no route: fetching its queues throws, this round skips only it, and later topics still compare.
     c->fetchTopicMessageQueuesAndCompare();
-    expect(bad->count() == 0, "查不到路由的 topic 不发回调（也绝不回空表假装缩容）");
-    expectInt(static_cast<long long>(good->count()), 1, "同轮其余 topic 照常",
+    expect(bad->count() == 0, "a topic whose route cannot be found gets no callback (and never an empty list faking a scale-down)");
+    expectInt(static_cast<long long>(good->count()), 1, "the other topics of the same round proceed normally",
               std::to_string(good->count()));
     const auto ev = good->events();
-    if (!ev.empty()) expect(ev[0].second == "0,1,2", "正常 topic 收到的是新集合", ev[0].second);
+    if (!ev.empty()) expect(ev[0].second == "0,1,2", "the healthy topic receives the new set", ev[0].second);
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 6. 重复注册覆盖旧的
+// ---------------------------------------------------------------- 6. Re-registration overwrites the old one
 
 void testReRegisterOverwritesOldListener() {
     MockNameServer ns;
@@ -467,15 +467,15 @@ void testReRegisterOverwritesOldListener() {
     c->registerTopicMessageQueueChangeListener(kTopic, second);
     ns.setQueueNums(kTopic, 2);
     c->fetchTopicMessageQueuesAndCompare();
-    expect(first->count() == 0, "旧监听器不再收到回调", std::to_string(first->count()));
-    expect(second->count() == 1, "只有新监听器收到", std::to_string(second->count()));
+    expect(first->count() == 0, "the old listener receives no more callbacks", std::to_string(first->count()));
+    expect(second->count() == 1, "only the new listener is called back", std::to_string(second->count()));
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 7. 带命名空间
+// ---------------------------------------------------------------- 7. With a namespace
 
-// 本端内部一律以「已套命名空间」的 topic 为键：注册用裸名，回调里收到的是套好的键，
-// 而每趟比对都拿它去问路由（假端点按 ns%topic 命中才回路由）。
+// Internally this client keys everything on the namespace-wrapped topic: registration uses the bare
+// name, the callback receives the wrapped key, and every round asks the route with it (the fake endpoint answers the route only for ns%topic).
 void testNamespacedKeyIsUsedThroughout() {
     const std::string nameSpace = "MQ_INST_lite";
     const std::string plain = "LiteMqNsTopic";
@@ -490,34 +490,34 @@ void testNamespacedKeyIsUsedThroughout() {
     ns.setQueueNums(wrapped, 2);
     c->fetchTopicMessageQueuesAndCompare();
     const auto ev = rec->events();
-    expectInt(static_cast<long long>(ev.size()), 1, "带命名空间也能比对出变化",
+    expectInt(static_cast<long long>(ev.size()), 1, "a change is still detected with a namespace",
               std::to_string(ev.size()));
     if (!ev.empty()) {
-        expect(ev[0].first == wrapped, "回调的 topic 是套好命名空间的那一个", ev[0].first);
-        expect(ev[0].second == "0,1", "回调带扩容后的集合", ev[0].second);
+        expect(ev[0].first == wrapped, "the callback topic key is the namespace-wrapped one", ev[0].first);
+        expect(ev[0].second == "0,1", "the callback carries the scaled-up set", ev[0].second);
     }
     std::vector<std::string> asked = ns.requestedTopics();
     expect(std::find(asked.begin(), asked.end(), wrapped) != asked.end(),
-          "比对每趟拿套好命名空间的键去问路由", joinTopics(asked));
+          "each comparison round asks the route with the namespace-wrapped key", joinTopics(asked));
 
-    // 套壳必须幂等：拿已经套好的键再注册一次，只会覆盖同一个条目，
-    // 不会冒出 ns%ns%topic 的第二个监听器（那样的监听器永远查不到路由）。
+    // Wrapping must be idempotent: registering the already-wrapped key overwrites the same entry and
+    // must not create a second ns%ns%topic listener (such a listener could never resolve a route).
     c->registerTopicMessageQueueChangeListener(wrapped, rec);
     ns.clearRequests();
     ns.setQueueNums(wrapped, 3);
     c->fetchTopicMessageQueuesAndCompare();
-    expectInt(static_cast<long long>(rec->count()), 2, "重复注册同一个（已套壳）键不会多出一份监听器",
+    expectInt(static_cast<long long>(rec->count()), 2, "re-registering the same (already wrapped) key does not add a second listener",
               std::to_string(rec->count()));
     asked = ns.requestedTopics();
     bool doubleWrapped = false;
     for (const std::string& t : asked) {
         if (t == nameSpace + "%" + wrapped) doubleWrapped = true;
     }
-    expect(!doubleWrapped, "绝不出现二次套壳的查询", joinTopics(asked));
+    expect(!doubleWrapped, "never a double-wrapped query", joinTopics(asked));
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 8. 未启动就查队列
+// ---------------------------------------------------------------- 8. Fetching queues without start
 
 void testFetchQueuesRequiresStartedConsumer() {
     DefaultLitePullConsumer c("PG_LiteMqNotStarted");
@@ -527,7 +527,7 @@ void testFetchQueuesRequiresStartedConsumer() {
     } catch (const MQClientException& e) {
         threw = std::string(e.what()).find("not started") != std::string::npos;
     }
-    expect(threw, "未启动查队列直接报错（返回空表会被读成「没有队列」）");
+    expect(threw, "fetching queues before start throws (an empty list would read as 'no queues')");
 }
 
 }  // namespace

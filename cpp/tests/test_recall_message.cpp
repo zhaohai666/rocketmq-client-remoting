@@ -1,7 +1,7 @@
-// 定时消息撤回（RECALL_MESSAGE 370）离线单测 —— 不需要集群。
+// Offline unit test for scheduled-message recall (RECALL_MESSAGE 370) -- no cluster required.
 //
 //
-// 语义（撤回后消息到底还不投递）只有真机能证，见 examples/recall_live.cpp。
+// Only a live cluster can prove the semantics (whether the message is really not delivered after a recall); see examples/recall_live.cpp.
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -44,43 +44,43 @@ std::string catchMessage(const std::function<void()>& fn) {
     return "<no exception>";
 }
 
-// ---------------------------------------------------------------- 句柄编解码
+// ---------------------------------------------------------------- handle codec
 void testCodec() {
     const std::string handle = buildRecallHandle(kTopic, kBroker, "1700000000000", kUniqKey);
     expect(handle == "djEgVG9waWNSZWNhbGxVbml0IGJyb2tlci1hIDE3MDAwMDAwMDAwMDAg"
                      "MDEyMzQ1Njc4OUFCQ0RFRjAxMjM0NTY3ODlhYmNkZWY=",
-           "buildHandle 与已知向量一致", handle);
-    expect(handle.size() % 4 == 0, "buildHandle 保留 '=' 填充");
+           "buildHandle matches the known vector", handle);
+    expect(handle.size() % 4 == 0, "buildHandle keeps the '=' padding");
 
     const HandleV1 parsed = decodeRecallHandle(handle);
     expect(parsed.topic == kTopic && parsed.brokerName == kBroker &&
                parsed.timestampStr == "1700000000000" && parsed.messageId == kUniqKey,
-           "句柄往返一致", parsed.topic + "/" + parsed.brokerName);
+           "the handle round trip is consistent", parsed.topic + "/" + parsed.brokerName);
     std::string unpadded = handle;
     while (!unpadded.empty() && unpadded.back() == '=') unpadded.pop_back();
-    expect(decodeRecallHandle(unpadded) == parsed, "无填充句柄同样能解");
+    expect(decodeRecallHandle(unpadded) == parsed, "an unpadded handle decodes just as well");
 
     const HandleV1 truncated =
         decodeRecallHandle("djEgVG9waWNBIGJyb2tlci1hIDE3MDAwMDAwMDAwMDAgYWJjIGp1bms=");
     expect(truncated.topic == "TopicA" && truncated.messageId == "abc",
-           "多余分段被忽略", truncated.messageId);
+           "extra segments are ignored", truncated.messageId);
 
-    expect(catchMessage([] { decodeRecallHandle(""); }) == kInvalid, "空句柄被拒");
+    expect(catchMessage([] { decodeRecallHandle(""); }) == kInvalid, "an empty handle is rejected");
     expect(catchMessage([] { decodeRecallHandle("not-a-handle"); }) == kInvalid,
-           "非 v1 五段的句柄被拒");
+           "a handle that is not five v1 segments is rejected");
     expect(catchMessage([] { decodeRecallHandle("!!!!"); }) == kInvalid,
-           "非法 base64 字符被拒");
+           "illegal base64 characters are rejected");
     // base64url("v2 TopicA b 1 id") / ("v1 TopicA b 1")
     expect(catchMessage([] { decodeRecallHandle("djIgVG9waWNBIGIgMSBpZA=="); }) == kInvalid,
-           "版本号不对被拒");
+           "a wrong version number is rejected");
     expect(catchMessage([] { decodeRecallHandle("djEgVG9waWNBIGIgMQ=="); }) == kInvalid,
-           "段数不足被拒");
-    // utf-8 编码的 0xFF 0xFE 开头 —— 解出来根本不是文本
+           "too few segments are rejected");
+    // Starting with the utf-8 encoding of 0xFF 0xFE -- the decoded result is not text at all
     expect(catchMessage([] { decodeRecallHandle("__4gYmFkIHV0Zjg="); }) == kInvalid,
-           "解出来不是合法 utf-8 时拒绝");
+           "rejected when the decoded bytes are not valid utf-8");
 }
 
-// ---------------------------------------------------------------- 报文头
+// ---------------------------------------------------------------- message header
 void testHeaders() {
     RecallMessageRequestHeader header;
     header.producerGroup = std::string("PG");
@@ -90,72 +90,72 @@ void testHeaders() {
     const PropertyMap ext = header.toExtFields();
     expect(ext.size() == 4 && ext.count("producerGroup") == 1 && ext.count("topic") == 1 &&
                ext.count("recallHandle") == 1 && ext.count("bname") == 1,
-           "撤回请求头用协议键名（brokerName 反射名是 bname）");
-    expect(ext.at("bname") == kBroker, "bname 落盘", ext.count("bname") ? ext.at("bname") : "");
+           "the recall request header uses protocol key names (the reflected name of brokerName is bname)");
+    expect(ext.at("bname") == kBroker, "bname is written out", ext.count("bname") ? ext.at("bname") : "");
 
     RecallMessageRequestHeader decoded;
     decoded.fromExtFields(ext);
     expect(decoded.bname == kBroker && decoded.recallHandle == "djEg" && decoded.topic == kTopic &&
                decoded.producerGroup == "PG",
-           "撤回请求头往返一致");
+           "the recall request header round-trips consistently");
 
     RecallMessageResponseHeader resp;
     PropertyMap respExt;
     respExt["msgId"] = std::string(kUniqKey);
     resp.fromExtFields(respExt);
-    expect(resp.msgId == kUniqKey, "撤回响应头读 msgId");
-    expect(resp.toExtFields().at("msgId") == kUniqKey, "撤回响应头写 msgId");
+    expect(resp.msgId == kUniqKey, "the recall response header reads msgId");
+    expect(resp.toExtFields().at("msgId") == kUniqKey, "the recall response header writes msgId");
 
     SendMessageResponseHeader send;
     PropertyMap sendExt;
     sendExt["msgId"] = std::string("0000000000000000");
     sendExt["recallHandle"] = std::string("djEg");
     send.fromExtFields(sendExt);
-    expect(send.recallHandle == "djEg", "SEND 响应头解析 recallHandle");
-    expect(send.toExtFields().at("recallHandle") == "djEg", "recallHandle 能编回线上格式");
+    expect(send.recallHandle == "djEg", "the SEND response header parses recallHandle");
+    expect(send.toExtFields().at("recallHandle") == "djEg", "recallHandle encodes back into the wire format");
     SendMessageResponseHeader plain;
     plain.fromExtFields(PropertyMap{{"msgId", std::string("x")}});
-    expect(!plain.recallHandle.has_value(), "普通消息没有 recallHandle");
-    expect(plain.toExtFields().count("recallHandle") == 0, "缺失时不会被编进报文");
+    expect(!plain.recallHandle.has_value(), "an ordinary message has no recallHandle");
+    expect(plain.toExtFields().count("recallHandle") == 0, "a missing value is not encoded into the payload");
 
-    expect(RequestCode::RECALL_MESSAGE == 370, "请求码 370");
+    expect(RequestCode::RECALL_MESSAGE == 370, "request code 370");
 }
 
-// ---------------------------------------------------------------- 生产者本地校验
+// ---------------------------------------------------------------- producer-side local validation
 void testProducerValidation() {
     DefaultMQProducer notStarted("PG_not_started");
     expect(catchMessage([&] { (void)notStarted.recallMessage(kTopic, "djEg"); }) ==
                "producer not started, call start() first",
-           "未 start 就撤回会被拒");
+           "recalling without start is rejected");
 
-    // 起了实例但地址服务器不可达：本地校验必须在打网络之前跑完。
+    // The instance is started but the address server is unreachable: local validation must finish before any network call.
     DefaultMQProducer p("PG_recall_unit");
     p.setNamesrvAddr("127.0.0.1:1");
     p.start();
 
     expect(catchMessage([&] { (void)p.recallMessage("%RETRY%PG_recall_unit", "djEg"); }) ==
                "topic is not supported",
-           "%RETRY% topic 在本地就被拒（文案逐字校验）");
+           "%RETRY% topic is rejected locally (message checked verbatim)");
     expect(catchMessage([&] { (void)p.recallMessage("%DLQ%PG_recall_unit", "djEg"); }) ==
                "topic is not supported",
-           "%DLQ% topic 在本地就被拒（文案逐字校验）");
+           "%DLQ% topic is rejected locally (message checked verbatim)");
     expect(catchMessage([&] { (void)p.recallMessage("bad topic!", "djEg"); }) !=
                "<no exception>",
-           "非法 topic 名被拒");
+           "an illegal topic name is rejected");
 
     const auto began = std::chrono::steady_clock::now();
     const std::string corrupt = catchMessage([&] { (void)p.recallMessage(kTopic, "not-a-handle"); });
     const auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - began)
                           .count();
-    expect(corrupt == kInvalid, "非法句柄本地即拒", corrupt);
-    expect(cost < 200, "非法句柄是秒回的（没打网络）", std::to_string(cost) + "ms");
+    expect(corrupt == kInvalid, "an illegal handle is rejected locally", corrupt);
+    expect(cost < 200, "an illegal handle returns immediately (no network was touched)", std::to_string(cost) + "ms");
 
     const std::string handle = buildRecallHandle(kTopic, kBroker, "1700000000000", kUniqKey);
     const std::string noRoute = catchMessage([&] { (void)p.recallMessage(kTopic, handle); });
-    // 只断言前缀：路由拉取真的失败时，后面还会带上 "(route fetch failed: ...)" 明细。
+    // Only the prefix is asserted: when the route fetch really fails, a "(route fetch failed: ...)" detail follows.
     expect(noRoute.rfind("Can not find Message Queue for topic: " + std::string(kTopic), 0) == 0,
-           "路由缺失时预热带异常照抛", noRoute);
+           "with no route the prefixed exception is still thrown", noRoute);
 
     p.shutdown();
 }

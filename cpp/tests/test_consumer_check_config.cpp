@@ -35,12 +35,12 @@ struct Gate {
     bool hasMinusOneSentinel = false;
 };
 
-// 每个消费者都从"只差数值"的合法配置起步，逐条只改一个字段。
+// Every consumer starts from a legal config differing only in numbers; each case changes one field.
 DefaultMQPushConsumer fresh() {
     return DefaultMQPushConsumer("GID_CheckConfigCppUnit");
 }
 
-// 抓 checkConfigRanges() 的文案；没抛返回空串。
+// Capture the message from checkConfigRanges(); returns an empty string when nothing is thrown.
 std::string gateMessage(DefaultMQPushConsumer& c) {
     try {
         c.checkConfigRanges();
@@ -56,13 +56,13 @@ std::vector<Gate> gates() {
     std::vector<Gate> v;
     v.push_back({"consumeThreadMin", 1, 1000, "consumeThreadMin Out of range [1, 1000]",
                  [](DefaultMQPushConsumer& c, int64_t n) {
-                     c.setConsumeThreadMax(1000);   // 否则先撞上 "min is larger than max"
+                     c.setConsumeThreadMax(1000);   // otherwise "min is larger than max" fires first
                      c.setConsumeThreadMin(static_cast<int32_t>(n));
                  },
                  true, false});
     v.push_back({"consumeThreadMax", 1, 1000, "consumeThreadMax Out of range [1, 1000]",
                  [](DefaultMQPushConsumer& c, int64_t n) {
-                     c.setConsumeThreadMin(1);      // 默认 min=20，压 max 到 1 会先撞那道门
+                     c.setConsumeThreadMin(1);      // default min=20, pushing max to 1 hits that gate first
                      c.setConsumeThreadMax(static_cast<int32_t>(n));
                  },
                  true, false});
@@ -122,7 +122,7 @@ std::vector<Gate> gates() {
     return v;
 }
 
-// ---------------- 默认值 ----------------
+// ---------------- Default values ----------------
 
 void testDefaultsClearEveryGate() {
     DefaultMQPushConsumer c = fresh();
@@ -141,24 +141,24 @@ void testDefaultsClearEveryGate() {
            num(c.popInvisibleTime()) + "/" + num(c.popBatchNums()));
 }
 
-// ---------------- 区间：边界合法、越界被拒 ----------------
+// ---------------- Ranges: bounds legal, out-of-range rejected ----------------
 
 void testBoundsAndRejection() {
     for (const Gate& g : gates()) {
-        // 上下界**本身**必须放行：把 < lo 写成 <= lo 只有这一格能抓到
+        // The bounds **themselves** must pass: only this cell catches writing < lo as <= lo
         for (int64_t bound : {g.lo, g.hi}) {
             DefaultMQPushConsumer c = fresh();
             g.set(c, bound);
             expect(gateMessage(c).empty(), g.field + ".bound" + num(bound), gateMessage(c));
         }
-        // 上界 +1 一律被拒，且文案一字不差
+        // Upper bound + 1 is always rejected, and the message must match character for character
         {
             DefaultMQPushConsumer c = fresh();
             g.set(c, g.hi + 1);
             expect(gateMessage(c) == g.msg, g.field + ".aboveHi",
                    "want=[" + g.msg + "] got=[" + gateMessage(c) + "]");
         }
-        // 下界 -1：够得着就被拒；setter 先夹到 1 的字段锁"夹到 1"这个行为
+        // Lower bound - 1: rejected when reachable; fields whose setter clamps to 1 lock that in
         {
             DefaultMQPushConsumer c = fresh();
             g.set(c, g.lo - 1);
@@ -182,7 +182,7 @@ void testBoundsAndRejection() {
             expect(gateMessage(c) == g.msg, g.field + ".zeroRejected",
                    "want=[" + g.msg + "] got=[" + gateMessage(c) + "]");
         }
-        // 哨兵：只有 -1 放行，-2 落进区间判断
+        // Sentinel: only -1 passes, -2 falls into the range comparison
         if (g.hasMinusOneSentinel) {
             DefaultMQPushConsumer c = fresh();
             g.set(c, -1);
@@ -195,7 +195,7 @@ void testBoundsAndRejection() {
     }
 }
 
-// ---------------- min / max 的相对关系 ----------------
+// ---------------- Relative relationship between min and max ----------------
 
 void testThreadMinNotLargerThanMax() {
     DefaultMQPushConsumer c = fresh();
@@ -205,7 +205,7 @@ void testThreadMinNotLargerThanMax() {
     expect(gateMessage(c) == want, "minLargerThanMax",
            "want=[" + want + "] got=[" + gateMessage(c) + "]");
 
-    // 严格 > ：min == max 是合法的单线程池配置
+    // Strict > : min == max is a legal single-thread pool configuration
     DefaultMQPushConsumer e = fresh();
     e.setConsumeThreadMin(1);
     e.setConsumeThreadMax(1);
@@ -215,8 +215,8 @@ void testThreadMinNotLargerThanMax() {
     f.setConsumeThreadMax(32);
     expect(gateMessage(f).empty(), "minEqualsMax32", gateMessage(f));
 
-    // 两道区间排在相对关系之前：min 自身越界时报的是 min 的区间，不是把两个数字塞进
-    // "is larger than" 文案
+    // The two range checks run before the relative check: an out-of-range min reports min's own
+    // range message instead of stuffing both numbers into the "is larger than" text
     DefaultMQPushConsumer g = fresh();
     g.setConsumeThreadMax(1);
     g.setConsumeThreadMin(2000);
@@ -224,22 +224,22 @@ void testThreadMinNotLargerThanMax() {
            gateMessage(g));
 }
 
-// ---------------- 闸门顺序 ----------------
+// ---------------- Gate order ----------------
 
 void testGateCheckOrder() {
-    // 同时写坏两道时报靠前的那道：一次只吐一个错才修得动。
+    // With two gates broken at once the earlier one reports: one error at a time is actionable.
     DefaultMQPushConsumer c = fresh();
     c.setConsumeThreadMax(1001);
     c.setPullBatchSize(0);
     expect(gateMessage(c) == "consumeThreadMax Out of range [1, 1000]", "firstGateWins",
            gateMessage(c));
-    // 修掉前者后，后者才露出来（顺序反了的话这条会红）
+    // Only after the first one is fixed does the second surface (this goes red if the order flips)
     c.setConsumeThreadMax(64);
     expect(gateMessage(c) == "pullBatchSize Out of range [1, 1024]", "secondGateAfterFix",
            gateMessage(c));
 }
 
-// ---------------- 闸门是本地行为，排在网络之前 ----------------
+// ---------------- Gates are local behaviour, ahead of any network access ----------------
 
 class NullListener : public MessageListenerConcurrently {
 public:
@@ -249,8 +249,8 @@ public:
     }
 };
 
-// 地址指向一个**没人监听**的端口：闸门若真的在建实例之前，start() 报的一定是配置文案，
-// 而不是连接失败。这条锁的是"起了后台线程再抛错"泄漏线程的那类错法。
+// The address points at a port **nobody listens on**: if the gate runs before construction, start()
+// must report the config text, not a connection failure; this locks out leaking a started thread.
 void testStartRejectsBeforeTouchingNetwork() {
     const std::string dead = "127.0.0.1:1";
     struct Case {

@@ -34,7 +34,7 @@ def warn(msg):
 
 
 def _json_default(o):
-    """Python 侧 to_dict() 会把 tagsSet/codeSet 留成 set —— 顺带说明该路径确实未经测试。"""
+    """The Python to_dict() leaves tagsSet/codeSet as a set -- which also shows that path is untested."""
     if isinstance(o, (set, frozenset)):
         return sorted(o)
     raise TypeError("not JSON serializable: %r" % (type(o).__name__,))
@@ -45,7 +45,7 @@ def run_tool(*args):
 
 
 def canon(o):
-    """规范化：字典按键排序、列表按内容排序，消除集合顺序差异。"""
+    """Normalize: sort dicts by key and lists by content so set ordering cannot differ."""
     if isinstance(o, dict):
         return {k: canon(v) for k, v in sorted(o.items())}
     if isinstance(o, list):
@@ -101,7 +101,7 @@ def verify_cpp_decoded(tag, line):
     check("%s ext" % tag, exts.get("topic") == "T_TEST" and exts.get("queueId") == "2", line)
 
 
-# ---------------------------------------------------------------- 路由结构体
+# ---------------------------------------------------------------- route structures
 def test_route():
     cpp_route = json.loads(run_tool("--emit-route"))
     check("route cpp has brokerDatas", isinstance(cpp_route.get("brokerDatas"), list), cpp_route)
@@ -151,7 +151,7 @@ def test_route():
           got_bare["brokerDatas"][0]["brokerAddrs"].get("0") == "127.0.0.1:10911", got_bare)
 
 
-# ---------------------------------------------------------------- 心跳结构体
+# ---------------------------------------------------------------- heartbeat structures
 def test_heartbeat():
     cpp_hb = json.loads(run_tool("--emit-heartbeat"))
     check("hb cpp has clientID", cpp_hb.get("clientID") == "10.0.0.1@12345", cpp_hb)
@@ -212,16 +212,16 @@ def test_heartbeat():
     from common.subscription_data import FilterAPI as PyFilterAPI
     from remoting.protocol.heartbeat import ConsumerData as PyConsumerData
 
-    # 守卫 1：SubscriptionData 必须可哈希
-    # （它定义了 __eq__；若不同时定义 __hash__ 就不可哈希，
-    #   ConsumerData.subscription_data_set.add(...) 会直接抛 TypeError）
+    # Guard 1: SubscriptionData must be hashable
+    # (it defines __eq__; without a matching __hash__ it is unhashable and
+    #   ConsumerData.subscription_data_set.add(...) raises TypeError outright)
     try:
         set().add(PySub("T", "*"))
         check("python SubscriptionData is hashable", True)
     except TypeError as exc:
         check("python SubscriptionData is hashable", False,
-              "SubscriptionData 定义了 __eq__ 却没配 __hash__，"
-              "subscription_data_set.add(...) 会抛 TypeError(%s)" % exc)
+              "SubscriptionData defines __eq__ but no matching __hash__, so "
+              "subscription_data_set.add(...) raised TypeError(%s)" % exc)
 
     py_cd = PyConsumerData("cg_x")
     py_cd.subscription_data_set = {PyFilterAPI.build_subscription_data("TopicX", "TagA")}
@@ -229,7 +229,7 @@ def test_heartbeat():
     sent_keys = set((py_dict.get("subscriptionDataSet") or [{}])[0].keys())
     snake = sorted(k for k in sent_keys if "_" in k)
     check("python SubscriptionData.to_dict() has NO snake_case keys", not snake,
-          "snake_case 键 %s 会被 broker(fastjson2) 静默丢弃" % snake)
+          "snake_case key %s would be silently dropped by the broker (fastjson2)" % snake)
     check("python SubscriptionData.to_dict() uses the wire keys",
           {"topic", "subString", "tagsSet", "classFilterMode", "expressionType"}
           <= sent_keys, sorted(sent_keys))
@@ -276,16 +276,16 @@ def main():
         line = run_tool("--decode", hexstr)
         verify_cpp_decoded("cpp<-py %s" % label, line)
 
-    # ---------- 3) 结构体 ----------
+    # ---------- 3) structures ----------
     test_route()
     test_heartbeat()
 
     print("\n===== interop summary =====")
     print("  PASS=%d FAIL=%d WARN=%d" % (_pass, _fail, _warn))
     if _fail == 0:
-        print("  result: C++ <-> Python 双向编解码一致")
+        print("  result: C++ <-> Python codec agrees in both directions")
         return 0
-    print("  result: %d 项失败" % _fail)
+    print("  result: %d checks failed" % _fail)
     return 1
 
 

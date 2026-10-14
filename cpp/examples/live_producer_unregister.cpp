@@ -1,20 +1,20 @@
-// 生产者退出时的 UNREGISTER_CLIENT(35) 真机验证。
-// 用法：rmq_live_producer_unregister 127.0.0.1:9876
+// Live-cluster verification of UNREGISTER_CLIENT(35) when a producer exits.
+// Usage: rmq_live_producer_unregister 127.0.0.1:9876
 //
-// 场景 U1~U6 逐条真机断言。
+// Assert scenarios U1~U6 one by one on a real cluster.
 //
 //
 //
-// ⚠ 判据强度：本移植里每个生产者各自持有一份 `MQClientInstance`、各自一条
-// TCP 连接，退出时连接也会关掉，broker 的通道扫描同样会把组摘掉 —— 单看 U5 分不出是 35
-// 还是断连的功劳，所以这里必须由钩子抓帧（U3）直接证明「线上走了这一发」。行为级的判别式
-// 只在按 clientId 复用实例的形态下成立：两个同
-// instanceName、不同组的生产者共用一条连接，先退的那个连接还活着，组能消失只可能是因为 35。
-// 另：U4（每一发 35 都回 SUCCESS）在本移植**不可观测** —— 传输层有意不调
-// `RPCHook#doAfterResponse`（见 remoting/remoting_client.h 的说明），U5 的 broker 侧效果
-// 就是它的替代判据。
+// ⚠ Decision strength: in this port each producer holds its own `MQClientInstance` and its own
+// TCP connection, which also closes at exit, so the broker's channel scan would drop the group as well -- U5 alone cannot tell
+// whether the credit goes to 35 or to the disconnect, so the frame capture by the hook (U3) must directly prove "this one shot really went on the wire".
+// A behaviour-level discriminator only holds in the shape where instances are reused per clientId: two producers with the same
+// instanceName but different groups share one connection; when the first one exits its connection is still alive, so the group can only have vanished because of 35.
+// Also: U4 (every 35 answers SUCCESS) is **unobservable** in this port -- the transport deliberately does not call
+// `RPCHook#doAfterResponse` (see the note in remoting/remoting_client.h), and U5's broker-side effect
+// is its substitute decision.
 //
-// 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
+// Prerequisites: NameServer + Broker already running, with ``autoCreateTopicEnable=true``.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -125,7 +125,7 @@ public:
         return out;
     }
 
-    // 最后一条业务发送 / 第一条 35 的序号，用来判「注销排在发送之后」。
+    // Sequence numbers of the last business send / the first 35, used to judge "the unregister is ordered after the sends".
     int32_t lastOf(const std::vector<int32_t>& codes) const {
         int32_t seq = -1;
         for (const Frame& f : frames()) {
@@ -154,7 +154,7 @@ std::vector<std::string> connectionClientIds(DefaultMQAdminExt& admin, const std
             msg.find("not online") != std::string::npos) {
             return {};
         }
-        std::printf("  [diag] examineProducerConnectionInfo(%s) 异常: %s\n", group.c_str(),
+        std::printf("  [diag] examineProducerConnectionInfo(%s) threw: %s\n", group.c_str(),
                     msg.c_str());
         return {};
     }
@@ -169,7 +169,7 @@ std::string extField(const UnregisterProbe::Frame& f, const std::string& key) {
     return it == f.ext.end() ? std::string() : it->second;
 }
 
-// 按场景配好并启动一个生产者；退出作用域时 shutdown。
+// Configure and start one producer per scenario; shutdown when leaving the scope.
 class ScopedProducer {
 public:
     ScopedProducer(const std::string& group, const std::string& nsAddr, const std::string& kind,
@@ -211,7 +211,7 @@ void runChecks(const std::string& nsAddr, const std::vector<std::string>& broker
     ScopedProducer peer(peerGroup, nsAddr, "unreg-peer", stamp);
 
     const SendResult r = (*p).send(Message(topic, bytesOf("unreg-probe")), 5000);
-    check("U1 生产者发送成功", r.sendStatus == SendStatus::SEND_OK, "msgId=" + r.msgId);
+    check("U1 producer send succeeded", r.sendStatus == SendStatus::SEND_OK, "msgId=" + r.msgId);
     (*peer).send(Message(topic, bytesOf("peer")), 5000);
 
     const std::string clientId = (*p).clientId();
@@ -222,23 +222,23 @@ void runChecks(const std::string& nsAddr, const std::vector<std::string>& broker
             return contains(seen, clientId);
         },
         70000);
-    check("U2 心跳后 204 能看到本 clientId", registered,
-          "clientId=" + clientId + " 当前=" + join(seen));
+    check("U2 after the heartbeat 204 can see this clientId", registered,
+          "clientId=" + clientId + " now=" + join(seen));
     const std::vector<std::string> peerSeen =
         connectionClientIds(admin, brokerAddr, peerGroup);
-    check("U2b 对照组注册可见（204 这条判据本身有效）",
-          contains(peerSeen, (*peer).clientId()), "当前=" + join(peerSeen));
+    check("U2b control-group registration visible (the 204 decision itself is valid)",
+          contains(peerSeen, (*peer).clientId()), "now=" + join(peerSeen));
 
-    check("U3 前置：还没退出时不应有 35", probe->of(RequestCode::UNREGISTER_CLIENT).empty(),
+    check("U3 precondition: no 35 while nothing has exited yet", probe->of(RequestCode::UNREGISTER_CLIENT).empty(),
           "count=" + num(static_cast<int32_t>(probe->of(RequestCode::UNREGISTER_CLIENT).size())));
 
-    // 注销走的是**还开着**的那条长连接：C++ 的 shutdown 顺序是先 35 再关客户端，
-    // 这条顺序只有 broker 侧能验证（U5）。
+    // The unregister rides the long connection that is **still open**: this port's shutdown order is 35 first, then close the client,
+    // and only the broker side can verify that order (U5).
     (*p).shutdown();
 
     const std::vector<UnregisterProbe::Frame> unregs =
         probe->of(RequestCode::UNREGISTER_CLIENT);
-    check("U3 shutdown 给每台已知 broker 各发了一发 35",
+    check("U3 shutdown sent one 35 to each known broker",
           unregs.size() == brokers.size(),
           "count=" + num(static_cast<int32_t>(unregs.size())) +
               " brokers=" + num(static_cast<int32_t>(brokers.size())));
@@ -249,23 +249,23 @@ void runChecks(const std::string& nsAddr, const std::vector<std::string>& broker
         if (f.ext.count("consumerGroup") != 0) shapeOk = false;
         if (!contains(brokers, f.addr)) shapeOk = false;
     }
-    check("U3b 35 的头是 clientID + producerGroup，consumerGroup 不上线（传 null 不序列化）",
-          shapeOk, unregs.empty() ? "没抓到帧" : ("addr=" + unregs.front().addr +
+    check("U3b the 35 header is clientID + producerGroup, consumerGroup never goes on the wire (a null is not serialized)",
+          shapeOk, unregs.empty() ? "no frame captured" : ("addr=" + unregs.front().addr +
                                                  " ext=" + extText(unregs.front().ext)));
     const int32_t lastSend = probe->lastOf({RequestCode::SEND_MESSAGE, RequestCode::SEND_MESSAGE_V2});
     const int32_t firstUnreg = unregs.empty() ? -1 : unregs.front().seq;
-    check("U3c 35 排在业务发送之后", lastSend >= 0 && firstUnreg > lastSend,
+    check("U3c the 35 is ordered after the business sends", lastSend >= 0 && firstUnreg > lastSend,
           "last_send=" + num(lastSend) + " first_unreg=" + num(firstUnreg));
 
     const bool gone = waitUntil(
         [&] { return connectionClientIds(admin, brokerAddr, group).empty(); }, 10000);
-    check("U5 退出后 204 查不到这个组（broker 回 not exist）", gone,
-          "当前=" + join(connectionClientIds(admin, brokerAddr, group)));
+    check("U5 after the exit 204 no longer finds this group (the broker answers not exist)", gone,
+          "now=" + join(connectionClientIds(admin, brokerAddr, group)));
 
     const std::vector<std::string> peerAfter =
         connectionClientIds(admin, brokerAddr, peerGroup);
-    check("U6 对照组仍在（排掉「broker 全清」这种假阳性）",
-          contains(peerAfter, (*peer).clientId()), "当前=" + join(peerAfter));
+    check("U6 the control group is still there (rules out the false positive of 'the broker cleared everything')",
+          contains(peerAfter, (*peer).clientId()), "now=" + join(peerAfter));
 }
 
 }  // namespace
@@ -294,7 +294,7 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     if (cluster.brokerAddrTable.empty()) {
-        check("集群探活", false, "nameServer 无 broker 注册");
+        check("cluster reachability probe", false, "no broker registered on the name server");
         admin.shutdown();
         return 1;
     }
@@ -304,12 +304,12 @@ int main(int argc, char** argv) {
             brokers.push_back(addr.second);
         }
     }
-    check("集群探活", true, "brokers=" + join(brokers));
+    check("cluster reachability probe", true, "brokers=" + join(brokers));
 
     try {
         runChecks(nsAddr, brokers, admin);
     } catch (const std::exception& e) {
-        std::printf("  [FAIL] 用例抛出未捕获异常: %s\n", e.what());
+        std::printf("  [FAIL] the case threw an uncaught exception: %s\n", e.what());
         ++gFail;
     }
 
@@ -318,6 +318,6 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::printf("  [diag] admin shutdown failed: %s\n", e.what());
     }
-    std::printf("\n== 结果: %d/%d 通过 ==\n", gPass, gPass + gFail);
+    std::printf("\n== result: %d/%d passed ==\n", gPass, gPass + gFail);
     return gFail == 0 ? 0 : 1;
 }

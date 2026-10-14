@@ -1,10 +1,10 @@
-// #25 负探针（生产者-only，不走消费者）：严格 CA 校验下信任【错误 CA】，
-// producer 路由层不得吞掉 TLS 握手异常。
-//   修复前：send 只报 "Can not find Message Queue for topic: X"（黑盒，
-//           用户往"建 topic"方向查，真正坏的是证书/CA）。
-//   修复后：报错必须带 "(route fetch failed: <证书/CA 错误文本>)"。
-// 用法: rmq_live_tls_negative <namesrv> <topic> <wrongCaCert> [serverName]
-// 退出码：0 = 报错含 CA 标记（符合预期）；1 = 未按预期报错；2 = 用法错误。
+// #25 negative probe (producer only, no consumer): trusting the [wrong CA] under strict CA verification,
+// the producer's route layer must not swallow the TLS handshake exception.
+//   Before the fix: send only reports "Can not find Message Queue for topic: X" (a black box;
+//           the user looks for "create the topic" while the certificate/CA is what is broken).
+//   After the fix: the error must carry "(route fetch failed: <cert/CA error text>)".
+// Usage: rmq_live_tls_negative <namesrv> <topic> <wrongCaCert> [serverName]
+// Exit codes: 0 = the error carries a CA marker (as expected); 1 = it did not fail as expected; 2 = bad usage.
 #include <iostream>
 #include <string>
 
@@ -41,16 +41,16 @@ int main(int argc, char** argv) {
     try {
         prod.start();
     } catch (const std::exception& e) {
-        // start 就抛也行——只要根因可见就算数
+        // Throwing already at start is fine too -- what counts is that the root cause stays visible
         errText = e.what();
         std::cout << "captured (start): " << errText << "\n";
     }
     if (errText.empty()) {
         try {
             const SendResult r = prod.send(Message(topic, "neg-probe"));
-            std::cout << "FAIL  send 竟然成功 status="
+            std::cout << "FAIL  send unexpectedly succeeded status="
                       << (r.getSendStatus() == SendStatus::SEND_OK ? "SEND_OK" : "other")
-                      << "（严格校验没生效？）\n";
+                      << "(strict verification did not take effect?)\n";
             prod.shutdown();
             return 1;
         } catch (const std::exception& e) {

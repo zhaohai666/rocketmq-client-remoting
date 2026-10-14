@@ -1,26 +1,26 @@
-// CheckForbiddenHook / FilterMessageHook 真机验证（场景 S1–S11 逐条断言）。
-// 用法：rmq_live_hook 127.0.0.1:9876
+// Live verification of CheckForbiddenHook / FilterMessageHook (asserting scenarios S1–S11 one by one).
+// Usage: rmq_live_hook 127.0.0.1:9876
 //
-// 前置：NameServer + Broker 已起（普通配置即可，不需要 traceTopicEnable）。
+// Prerequisite: NameServer + Broker up (plain configuration suffices; traceTopicEnable is not needed).
 //
-// 场景：
-//   S0  订阅语义自检（本地纯逻辑）：SUB_ALL 两集合为空、显式 tag 填 codeSet
-//   S1  预热建 topic + 消费者已分配队列
-//   S2  放行钩子：发送成功、钩子被调用 1 次、上下文带 group/mq/unitMode=false/sendResult=null
-//   S3  拦截钩子：send 抛 MQClientException，且按 retryTimes+1 次调用
-//   S4  被拦截的消息没有落到 broker（只有放行的那 1 条）
-//   S5  单向发送同样被拦截，且上下文 mode=ONEWAY
-//   S6  过滤钩子在**拉取路径**生效：3 收 2 丢
-//   S7  被摘掉的消息不会重投（位点已推进）
-//   S8  客户端二次 tag 过滤：订阅 TagA 只收 TagA
-//   S9  钩子抛异常被吞掉、后续钩子照常生效
-//   S10 POP 路径过滤钩子生效（摘掉即 ack）
-//   S11 POP 路径被摘掉的消息已 ack（观测窗 > invisibleTime，未复活重投）
+// Scenarios:
+//   S0  subscription-semantics self-check (pure local logic): SUB_ALL has empty sets, explicit tags fill codeSet
+//   S1  warm-up creates the topic + consumer has assigned queues
+//   S2  allow hook: send succeeds, hook called once, context carries group/mq/unitMode=false/sendResult=null
+//   S3  forbid hook: send throws MQClientException, called retryTimes+1 times
+//   S4  the blocked message never lands on the broker (only the 1 allowed message)
+//   S5  oneway send is blocked too, with context mode=ONEWAY
+//   S6  the filter hook takes effect on the **pull path**: 3 received, 2 dropped
+//   S7  dropped messages are not redelivered (the offset has advanced)
+//   S8  client-side secondary tag filtering: subscribing TagA only receives TagA
+//   S9  a hook throwing is swallowed and later hooks still take effect
+//   S10 POP-path filter hook takes effect (a drop is an ack)
+//   S11 a POP-path dropped message is acked (observation window > invisibleTime, no revival redelivery)
 //
-// ⚠ 脚本自身的两条纪律（上一轮 trace 联调踩出来的）：
-//   ① topic / 消费组一律带 stamp —— 三语言真机工具会**依次**跑在同一个
-//      broker 上，固定名会继承上一轮的提交位点；
-//   ② 断言**按 body 前缀过滤** —— 预热消息、broker consumequeue 异步分发都可能让消费者多收几条。
+// ⚠ Two disciplines of the script itself (found during the last trace runbook):
+//   ① topic / consumer group names always carry the stamp — the three-language live tools run **sequentially** against the
+//      same broker, and fixed names would inherit the previous round's committed offsets;
+//   ② assertions **filter by body prefix** — warm-up messages and asynchronous broker consumequeue dispatch can make a consumer receive extra messages.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -77,7 +77,7 @@ bool waitUntil(const std::function<bool()>& pred, int32_t timeoutMs) {
     return pred();
 }
 
-// 收集消费到的消息（并发安全），并按 body 前缀筛
+// Collects the consumed messages (concurrency safe) and filters them by body prefix
 class Collector : public MessageListenerConcurrently {
 public:
     ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
@@ -92,7 +92,7 @@ public:
         return msgs_;
     }
 
-    // 按 body 前缀筛（预热消息 / 上一轮的残留都靠它排除）
+    // Filter by body prefix (this is how warm-up messages and leftovers from a previous round are excluded)
     std::vector<MessageExt> byPrefix(const std::vector<std::string>& prefixes) {
         std::lock_guard<std::mutex> lk(m_);
         std::vector<MessageExt> out;
@@ -181,7 +181,7 @@ public:
     int32_t calls = 0;
 };
 
-// 预热：触发 broker 自动建 topic（必须先建 topic 再起消费者，否则拿不到路由）
+// Warm-up: triggers the broker's automatic topic creation (the topic must be created before the consumer starts, otherwise no route can be obtained)
 bool warm(const std::string& nsAddr, const std::string& topic, const std::string& groupSuffix) {
     DefaultMQProducer p("GID_hook_live_warm_" + groupSuffix);
     p.setNamesrvAddr(nsAddr);
@@ -243,34 +243,34 @@ int main(int argc, char* argv[]) {
     std::printf("=== RocketMQ hook live verify (cpp) ===\n");
     std::printf("namesrv=%s stamp=%lld\n", nsAddr.c_str(), static_cast<long long>(st));
 
-    // ---------- S0 订阅语义自检 ----------
+    // ---------- S0 Subscription-semantics self-check ----------
     {
         SubscriptionData subAll = FilterAPI::buildSubscriptionData("T", "*");
         SubscriptionData subTag = FilterAPI::buildSubscriptionData("T", "TagA||TagB");
-        check("S0 SUB_ALL 的 tagsSet/codeSet 为空、显式 tag 填 codeSet（协议语义）",
+        check("S0 SUB_ALL has empty tagsSet/codeSet and an explicit tag fills codeSet (protocol semantics)",
               subAll.tagsSet.empty() && subAll.codeSet.empty() && subTag.tagsSet.size() == 2
                   && subTag.codeSet.count(2598919) == 1 && subTag.codeSet.count(2598920) == 1,
               "sub_all_tags=" + std::to_string(subAll.tagsSet.size()) + " sub_tag_codes="
                   + std::to_string(subTag.codeSet.size()));
     }
 
-    // =============== 第一部分：CheckForbiddenHook ===============
+    // =============== Part 1: CheckForbiddenHook ===============
     if (!warm(nsAddr, topicCk, "ck")) {
-        check("S1 预热建 topic（CheckForbidden 用）", false);
+        check("S1 warm-up creates the topic (for CheckForbidden)", false);
         return 1;
     }
     auto ckCollector = std::make_shared<Collector>();
     ConsumerOpts ckOpts;
     auto ckConsumer = startConsumer(nsAddr, topicCk, group + "_ck", ckCollector, ckOpts);
     bool assigned = waitUntil([&]() { return !ckConsumer->assignedQueueKeys().empty(); }, 30000);
-    check("S1 预热建 topic + 消费者已分配队列", assigned,
+    check("S1 warm-up creates the topic + the consumer has assigned queues", assigned,
           "assigned=" + std::to_string(ckConsumer->assignedQueueKeys().size()));
     if (!assigned) {
         ckConsumer->shutdown();
         return 1;
     }
 
-    // S2 放行
+    // S2 Allowing
     {
         auto allow = std::make_shared<ForbidHook>(/*forbid=*/false, "");
         DefaultMQProducer p(pg + "_allow");
@@ -285,20 +285,20 @@ int main(int argc, char* argv[]) {
         } catch (const std::exception& e) {
             std::printf("  [warn] allowed send failed: %s\n", e.what());
         }
-        check("S2 放行钩子：发送成功且钩子被调用 1 次", ok && allow->calls == 1,
+        check("S2 allow hook: the send succeeds and the hook is called once", ok && allow->calls == 1,
               "ok=" + std::string(ok ? "true" : "false") + " calls="
                   + std::to_string(allow->calls) + " mode="
                   + std::to_string(static_cast<int>(allow->modes.empty()
                                                         ? CommunicationMode::SYNC
                                                         : allow->modes[0])));
-        check("S2b 拦截上下文带上 group / mq / unitMode=false / sendResult=null",
+        check("S2b the checking context carries group / mq / unitMode=false / sendResult=null",
               allow->calls == 1 && allow->lastGroup == pg + "_allow" && allow->lastTopic == topicCk
                   && allow->lastUnitMode == false && allow->lastSendResultNull,
               "group=" + allow->lastGroup + " topic=" + allow->lastTopic);
         p.shutdown();
     }
 
-    // S3 拦截（每次尝试都跑钩子）
+    // S3 Blocking (the hook runs on every attempt)
     {
         auto forbid = std::make_shared<ForbidHook>(/*forbid=*/true, topicCk);
         DefaultMQProducer p(pg + "_forbid");
@@ -314,14 +314,14 @@ int main(int argc, char* argv[]) {
         } catch (const std::exception&) {
             threw = true;
         }
-        check("S3 拦截钩子：send 抛 MQClientException，且钩子按 retryTimes+1=3 次调用",
+        check("S3 forbid hook: send throws MQClientException and the hook is called retryTimes+1=3 times",
               threw && forbid->calls == 3,
               "threw=" + std::string(threw ? "true" : "false") + " calls="
                   + std::to_string(forbid->calls));
         p.shutdown();
     }
 
-    // S5 单向发送同样被拦截
+    // S5 A oneway send is blocked as well
     {
         auto forbidOw = std::make_shared<ForbidHook>(/*forbid=*/true, topicCk);
         DefaultMQProducer p(pg + "_oneway");
@@ -334,7 +334,7 @@ int main(int argc, char* argv[]) {
         } catch (const std::exception&) {
             threw = true;
         }
-        check("S5 单向发送也被拦截，且上下文 mode=ONEWAY",
+        check("S5 the oneway send is blocked too and the context carries mode=ONEWAY",
               threw && forbidOw->modes.size() == 1
                   && forbidOw->modes[0] == CommunicationMode::ONEWAY,
               "threw=" + std::string(threw ? "true" : "false") + " modes="
@@ -342,21 +342,21 @@ int main(int argc, char* argv[]) {
         p.shutdown();
     }
 
-    // S4 被拦截的消息没有落到 broker：只有 allowed-1 这一条
+    // S4 The blocked message never lands on the broker: only the allowed-1 one
     {
         bool got = waitUntil(
             [&]() { return !ckCollector->byPrefix({"allowed-"}).empty(); }, 20000);
-        std::this_thread::sleep_for(std::chrono::milliseconds(2000));  // 留出"万一真发出去了"的到达窗口
+        std::this_thread::sleep_for(std::chrono::milliseconds(2000));  // leave an arrival window for the case where it really did get sent
         std::vector<MessageExt> landed = ckCollector->byPrefix({"allowed-", "blocked-"});
-        check("S4 被拦截的消息没有落到 broker（只有放行的那 1 条）",
+        check("S4 the blocked message never landed on the broker (only the 1 allowed message)",
               got && landed.size() == 1 && bodyOf(landed[0]) == "allowed-1",
               "count=" + std::to_string(landed.size()));
     }
     ckConsumer->shutdown();
 
-    // =============== 第二部分：FilterMessageHook（拉取路径）===============
+    // =============== Part 2: FilterMessageHook (the pull path) ===============
     if (!warm(nsAddr, topicFilter, "flt")) {
-        check("S6 预热建 topic（过滤钩子用）", false);
+        check("S6 warm-up creates the topic (for the filter hook)", false);
         return 1;
     }
     {
@@ -366,7 +366,7 @@ int main(int argc, char* argv[]) {
         opts.hooks.push_back(drop);
         auto fltConsumer = startConsumer(nsAddr, topicFilter, group + "_filter", fltCollector, opts);
         if (!waitUntil([&]() { return !fltConsumer->assignedQueueKeys().empty(); }, 30000)) {
-            check("S6 消费者已分配到队列", false);
+            check("S6 the consumer has been assigned queues", false);
             fltConsumer->shutdown();
             return 1;
         }
@@ -382,14 +382,14 @@ int main(int argc, char* argv[]) {
         bool got = waitUntil([&]() { return fltCollector->byPrefix({"keep-"}).size() >= 3; }, 25000);
         size_t kept = fltCollector->byPrefix({"keep-"}).size();
         size_t dropped = fltCollector->byPrefix({"drop-"}).size();
-        check("S6 过滤钩子在拉取路径生效：3 收 2 丢",
+        check("S6 the filter hook takes effect on the pull path: 3 received, 2 dropped",
               got && kept == 3 && dropped == 0,
               "keep=" + std::to_string(kept) + " drop=" + std::to_string(dropped)
                   + " hook_calls=" + std::to_string(drop->calls));
 
-        // S7 被摘掉的消息不重投（拉取路径静默跳过、位点照常推进）
+        // S7 Dropped messages are not redelivered (the pull path skips them silently and the offset keeps advancing)
         std::this_thread::sleep_for(std::chrono::milliseconds(8000));
-        check("S7 被摘掉的消息不会重投（位点已推进，等 8s 计数不变）",
+        check("S7 the dropped messages are not redelivered (the offset has advanced; the counts stay the same over 8s)",
               fltCollector->byPrefix({"drop-"}).empty() && fltCollector->byPrefix({"keep-"}).size() == 3,
               "keep=" + std::to_string(fltCollector->byPrefix({"keep-"}).size()) + " drop="
                   + std::to_string(fltCollector->byPrefix({"drop-"}).size()));
@@ -397,18 +397,18 @@ int main(int argc, char* argv[]) {
         fltConsumer->shutdown();
     }
 
-    // =============== 第三部分：客户端二次 tag 过滤 ===============
+    // =============== Part 3: client-side secondary tag filtering ===============
     if (!warm(nsAddr, topicTag, "tag")) {
-        check("S8 预热建 topic（tag 过滤用）", false);
+        check("S8 warm-up creates the topic (for tag filtering)", false);
         return 1;
     }
     {
         auto tagCollector = std::make_shared<Collector>();
         ConsumerOpts opts;
-        opts.tagExpression = "TagA";  // tagsSet={TagA} → 客户端会二次过滤
+        opts.tagExpression = "TagA";  // tagsSet={TagA}, so the client filters a second time
         auto tagConsumer = startConsumer(nsAddr, topicTag, group + "_tag", tagCollector, opts);
         if (!waitUntil([&]() { return !tagConsumer->assignedQueueKeys().empty(); }, 30000)) {
-            check("S8 消费者已分配到队列（tag）", false);
+            check("S8 the consumer has been assigned queues (tag)", false);
             tagConsumer->shutdown();
             return 1;
         }
@@ -429,7 +429,7 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
         size_t ta = tagCollector->byPrefix({"tagA-"}).size();
         size_t tb = tagCollector->byPrefix({"tagB-"}).size();
-        check("S8 订阅 TagA：只收到 TagA 的 2 条（broker 哈希过滤 + 客户端二次过滤）",
+        check("S8 subscribing TagA only receives the 2 TagA messages (broker hash filtering + client-side secondary filtering)",
               got && ta == 2 && tb == 0,
               "tagA=" + std::to_string(ta) + " tagB=" + std::to_string(tb));
 
@@ -437,9 +437,9 @@ int main(int argc, char* argv[]) {
         tagConsumer->shutdown();
     }
 
-    // =============== 第四部分：钩子异常不影响消费 ===============
+    // =============== Part 4: a hook exception does not affect consumption ===============
     if (!warm(nsAddr, topicBoom, "boom")) {
-        check("S9 预热建 topic（异常钩子用）", false);
+        check("S9 warm-up creates the topic (for the throwing hook)", false);
         return 1;
     }
     {
@@ -451,7 +451,7 @@ int main(int argc, char* argv[]) {
         opts.hooks.push_back(drop2);
         auto boomConsumer = startConsumer(nsAddr, topicBoom, group + "_boom", boomCollector, opts);
         if (!waitUntil([&]() { return !boomConsumer->assignedQueueKeys().empty(); }, 30000)) {
-            check("S9 消费者已分配到队列（boom）", false);
+            check("S9 the consumer has been assigned queues (boom)", false);
             boomConsumer->shutdown();
             return 1;
         }
@@ -464,7 +464,7 @@ int main(int argc, char* argv[]) {
 
         bool got = waitUntil([&]() { return !boomCollector->byPrefix({"keep-"}).empty(); }, 25000);
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-        check("S9 前一个钩子抛异常被吞掉、后续钩子照常生效（异常不影响消费）",
+        check("S9 the exception thrown by the earlier hook is swallowed and the later hooks still take effect (an exception does not disturb consumption)",
               got && boom->calls >= 1 && drop2->calls >= 1
                   && boomCollector->byPrefix({"keep-"}).size() == 1
                   && boomCollector->byPrefix({"drop-"}).empty(),
@@ -476,9 +476,9 @@ int main(int argc, char* argv[]) {
         boomConsumer->shutdown();
     }
 
-    // =============== 第五部分：FilterMessageHook（POP 路径，摘掉即 ack）===============
+    // =============== Part 5: FilterMessageHook (the POP path, a drop is an ack) ===============
     if (!warm(nsAddr, topicPop, "pop")) {
-        check("S10 预热建 topic（POP 用）", false);
+        check("S10 warm-up creates the topic (for POP)", false);
         return 1;
     }
     {
@@ -491,7 +491,7 @@ int main(int argc, char* argv[]) {
         opts.hooks.push_back(popDrop);
         auto popConsumer = startConsumer(nsAddr, topicPop, group + "_pop", popCollector, opts);
         if (!waitUntil([&]() { return !popConsumer->assignedQueueKeys().empty(); }, 30000)) {
-            check("S10 POP 消费者已分配到队列", false);
+            check("S10 the POP consumer has been assigned queues", false);
             popConsumer->shutdown();
             return 1;
         }
@@ -505,19 +505,19 @@ int main(int argc, char* argv[]) {
         p.send(Message(topicPop, std::string("drop-pop-0")), 5000);
 
         bool got = waitUntil([&]() { return popCollector->byPrefix({"keep-"}).size() >= 2; }, 30000);
-        check("S10 POP 路径过滤钩子生效：2 收 1 丢",
+        check("S10 the POP-path filter hook takes effect: 2 received, 1 dropped",
               got && popCollector->byPrefix({"keep-"}).size() == 2
                   && popCollector->byPrefix({"drop-"}).empty(),
               "keep=" + std::to_string(popCollector->byPrefix({"keep-"}).size()) + " drop="
                   + std::to_string(popCollector->byPrefix({"drop-"}).size()) + " hook_calls="
                   + std::to_string(popDrop->calls));
 
-        // S11 观测窗口必须 > invisibleTime，否则"ack 没发出去"会伪装成通过
-        std::printf("  ... 等待 %llds（> invisibleTime=%llds）确认被摘掉的消息不复活\n",
+        // S11 The observation window must be longer than invisibleTime, otherwise "the ack was never sent" would look like a pass
+        std::printf("  ... waiting %llds (> invisibleTime=%llds) to confirm the dropped message does not come back\n",
                     static_cast<long long>(invisibleMs / 1000 + 6),
                     static_cast<long long>(invisibleMs / 1000));
         std::this_thread::sleep_for(std::chrono::milliseconds(invisibleMs + 6000));
-        check("S11 POP 路径被摘掉的消息已 ack（观测窗 > invisibleTime，未复活重投）",
+        check("S11 the POP-path dropped message is acked (observation window > invisibleTime, no revival redelivery)",
               popCollector->byPrefix({"keep-"}).size() == 2
                   && popCollector->byPrefix({"drop-"}).empty(),
               "keep=" + std::to_string(popCollector->byPrefix({"keep-"}).size()) + " drop="

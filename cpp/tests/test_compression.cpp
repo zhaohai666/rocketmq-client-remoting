@@ -1,5 +1,5 @@
-// 压缩/解压单测：压缩类型解析、zlib/lz4/zstd 与外部实现的互通、17 段报文里
-// "解压后清 COMPRESSED_FLAG" 的语义、以及老版本 **类型位为 0** 的兼容路径。
+// Compression/decompression unit tests: compression type resolution, interop with external implementations for zlib/lz4/zstd,
+// the "clear COMPRESSED_FLAG after decompression" semantics in the 17-section frame, and the legacy path where **the type bits are 0**.
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -29,7 +29,7 @@ static int g_fail = 0;
 
 namespace {
 
-// zlib 真值与下面用例共用的明文
+// The zlib reference and the plaintext shared by the cases below
 std::string repeatedPayload() {
     std::string s;
     for (int i = 0; i < 40; ++i) {
@@ -38,7 +38,7 @@ std::string repeatedPayload() {
     return s;
 }
 
-// zlib level 5 压 "rocketmq-compressed-payload-"*40（1120B）得到 47B 的真值
+// zlib level 5 compressing "rocketmq-compressed-payload-"*40 (1120B) yields this 47B reference
 const char* kZlibHex =
     "785e2bca4fce4e2dc92dd44dcecf2d284a2d2e4e4dd12d48acccc94f4cd12d1a951b951b951b95a3400e"
     "0058e0b9f0";
@@ -51,8 +51,8 @@ const char* kZstdExternalHex =
     "28b52ffd0058240100e0726f636b65746d712d636f6d707265737365642d7061796c6f61642d010004f1"
     "ff7402010000";
 
-// 确定性可压缩载荷：重复一行固定文本到 size 字节
-// （与 examples/compression_live.cpp 同配方）
+// Deterministic compressible payload: one fixed line of text repeated until it reaches size bytes
+// (same recipe as examples/compression_live.cpp)
 std::string bigPayload(size_t size) {
     const std::string line = "rocketmq-compress-interop-payload-line-0123456789\n";
     std::string s;
@@ -73,8 +73,8 @@ std::string incompressiblePayload(size_t size) {
     return s;
 }
 
-// 后端可用性由编译期决定（CMake 找不到库就会关掉对应宏），所以每个用例都要能
-// 走"没编入 -> 必须抛错"这条分支——**不能**假装通过。
+// Backend availability is decided at compile time (CMake switches the matching macro off when the library is missing), so every
+// case must be able to take the "not compiled in -> must throw" branch -- it must **not** pretend to pass.
 bool codecAvailable(int32_t type) {
     switch (type) {
         case CompressionType::ZLIB:
@@ -88,7 +88,7 @@ bool codecAvailable(int32_t type) {
     }
 }
 
-// 捕获式断言：返回抛出的原因（未抛则返回空串）
+// Catching assertion: returns the reason thrown (an empty string when nothing was thrown)
 std::string throwsWhat(const std::function<void()>& fn) {
     try {
         fn();
@@ -120,7 +120,7 @@ MessageExt makeMessageExt(const std::string& body, int32_t sysFlag) {
 
 }  // namespace
 
-// ---------------------------------------------------------------- 类型解析
+// ---------------------------------------------------------------- type resolution
 static void testTypeResolution() {
     CHECK(hasZlibSupport(), "zlib support compiled in");
 
@@ -146,23 +146,23 @@ static void testTypeResolution() {
           "zstd compression flag == 0x200");
 }
 
-// ---------------------------------------------------------------- zlib 往返 + 外部互通
+// ---------------------------------------------------------------- zlib round trip + external interop
 static void testZlibRoundTrip() {
     const std::string payload = repeatedPayload();
 
     Bytes compressed = CompressorFactory::compress(payload, CompressionType::ZLIB, 5);
     CHECK(!compressed.empty() && compressed.size() < payload.size(),
           "zlib compress shrinks a repetitive payload");
-    // zlib 流格式头：0x78（CMF，deflate + 32K window）
+    // zlib stream format header: 0x78 (CMF, deflate + 32K window)
     CHECK(static_cast<unsigned char>(compressed[0]) == 0x78, "zlib stream has 0x78 CMF byte");
     CHECK(CompressorFactory::decompress(compressed, CompressionType::ZLIB) == payload,
           "zlib round-trip");
 
-    // 类型位 0 也必须按 ZLIB 解（这是老版本客户端产的压缩消息）
+    // Type bits 0 must also decompress as ZLIB (these are compressed messages produced by legacy clients)
     CHECK(CompressorFactory::decompress(compressed, 0) == payload,
           "decompress with type 0 falls back to ZLIB");
 
-    // 外部真值：另一路 zlib 实现产出的字节必须能被解开
+    // External reference: bytes produced by another zlib implementation must decompress
     Bytes external = UtilAll::string2Bytes(kZlibHex);
     CHECK(!external.empty(), "external zlib fixture decoded from hex");
     CHECK(external.size() == 47, "external zlib fixture length == 47");
@@ -174,7 +174,7 @@ static void testZlibRoundTrip() {
 static void testLz4RoundTrip() {
     const std::string payload = repeatedPayload();
     if (!hasLz4Support()) {
-        // 后端被编掉：必须抛错，绝不返回压缩字节（同 zlib 的约定）
+        // Backend compiled out: must throw and never return compressed bytes (same contract as zlib)
         CHECK(!throwsWhat([&] { CompressorFactory::compress(payload, CompressionType::LZ4); }).empty(),
               "lz4 backend compiled out -> compress throws (no silent passthrough)");
         return;
@@ -182,14 +182,14 @@ static void testLz4RoundTrip() {
     Bytes compressed = CompressorFactory::compress(payload, CompressionType::LZ4);
     CHECK(!compressed.empty() && compressed.size() < payload.size(),
           "lz4 compress shrinks a repetitive payload");
-    // LZ4 Frame magic 0x184D2204，小端落盘 = 04 22 4d 18
+    // LZ4 Frame magic 0x184D2204, written little-endian as 04 22 4d 18
     CHECK(static_cast<unsigned char>(compressed[0]) == 0x04 &&
               static_cast<unsigned char>(compressed[1]) == 0x22 &&
               static_cast<unsigned char>(compressed[2]) == 0x4d &&
               static_cast<unsigned char>(compressed[3]) == 0x18,
           "lz4 output carries LZ4 Frame magic (not a raw block)");
-    // FLG 的 bit5 = Block Independence：lz4-java 的 LZ4FrameInputStream **拒绝**
-    // 依赖块，多块载荷（>64KB）时这一位没置就直接解不开。
+    // FLG bit5 = Block Independence: the LZ4FrameInputStream of lz4-java **rejects** dependent blocks,
+    // so with a multi-block payload (>64KB) this bit unset makes the frame undecodable.
     CHECK((static_cast<unsigned char>(compressed[4]) & 0x20) != 0,
           "lz4 frame sets Block-Independence flag (lz4-java requires it)");
     CHECK(CompressorFactory::decompress(compressed, CompressionType::LZ4) == payload,
@@ -214,7 +214,7 @@ static void testZstdRoundTrip() {
     Bytes compressed = CompressorFactory::compress(payload, CompressionType::ZSTD, 5);
     CHECK(!compressed.empty() && compressed.size() < payload.size(),
           "zstd compress shrinks a repetitive payload");
-    // zstd magic 0xFD2FB528，小端落盘 = 28 b5 2f fd
+    // zstd magic 0xFD2FB528, written little-endian as 28 b5 2f fd
     CHECK(static_cast<unsigned char>(compressed[0]) == 0x28 &&
               static_cast<unsigned char>(compressed[1]) == 0xb5 &&
               static_cast<unsigned char>(compressed[2]) == 0x2f &&
@@ -230,7 +230,7 @@ static void testZstdRoundTrip() {
     CHECK(CompressorFactory::decompress(external, CompressionType::ZSTD) == payload,
           "decompress external (reference-produced) zstd frame with unknown content size");
 
-    // 外部真值 2：`zstd -3` CLI 产的**带** content size 的帧（50B），覆盖已知长度分支
+    // External reference 2: a frame **with** content size produced by the `zstd -3` CLI (50B), covering the known-length branch
     Bytes withSize = UtilAll::string2Bytes(
         "28b52ffd646003250100e0726f636b65746d712d636f6d707265737365642d7061796c6f61642d010004f1"
         "ff740278aa9792");
@@ -239,10 +239,10 @@ static void testZstdRoundTrip() {
           "decompress zstd frame that declares its content size");
 }
 
-// ---------------------------------------------------------------- 尺寸矩阵
+// ---------------------------------------------------------------- size matrix
 //
-// 覆盖：空 / 1B / 阈值上下（4095/4096/4097，producer 的自动压缩阈值）/
-// 跨多个 lz4 block（>64KB）/ **不可压缩**载荷（压不动也必须原样往返）。
+// Coverage: empty / 1B / around the threshold (4095/4096/4097, the producer auto-compression threshold) /
+// spanning several lz4 blocks (>64KB) / an **incompressible** payload (even when nothing shrinks it must round-trip verbatim).
 static void testSizeMatrix() {
     const size_t sizes[] = {0, 1, 100, 4095, 4096, 4097, 8192, 1120, 65536, 65537, 200000};
     const int32_t codecs[] = {CompressionType::ZLIB, CompressionType::LZ4, CompressionType::ZSTD};
@@ -253,11 +253,11 @@ static void testSizeMatrix() {
             const Bytes c = CompressorFactory::compress(plain, codec, 5);
             CHECK(CompressorFactory::decompress(c, codec) == plain,
                   "round-trip codec=" + std::to_string(codec) + " size=" + std::to_string(n));
-            // 非空输入压完还得带帧头（说明走的是真编码器，不是透传）
+            // A non-empty input must still carry a frame header afterwards (proof a real encoder ran, not a passthrough)
             CHECK(n == 0 ? true : c.size() >= 4,
                   "compressed output is a real frame, size=" + std::to_string(n));
         }
-        // 不可压缩载荷：必然膨胀，但**必须**逐字节还原（膨胀 != 透传）
+        // Incompressible payload: it necessarily inflates, yet must restore byte-for-byte (inflation != passthrough)
         const std::string noisy = incompressiblePayload(20000);
         const Bytes cn = CompressorFactory::compress(noisy, codec, 5);
         CHECK(cn != noisy, "incompressible payload is not passed through unchanged");
@@ -266,7 +266,7 @@ static void testSizeMatrix() {
     }
 }
 
-// ---------------------------------------------------------------- 17 段报文往返
+// ---------------------------------------------------------------- 17-section frame round trip
 static void testEncodeDecodeCompressed() {
     const std::string payload = repeatedPayload();
     const int32_t compressedFlag = MessageSysFlag::COMPRESSED_FLAG | (0x3 << 8);
@@ -274,10 +274,10 @@ static void testEncodeDecodeCompressed() {
     MessageExt src = makeMessageExt(payload, compressedFlag);
     Bytes raw = encodeMessageExt(src, /*needCompress=*/true);
 
-    // 报文里存的应是压缩后的 body：总长明显小于原始 body 长度
+    // The body stored in the frame should be the compressed one: the total length is clearly below the raw body length
     CHECK(raw.size() < payload.size(), "encoded frame smaller than raw payload");
 
-    // 解压路径：body 还原 + 清 COMPRESSED_FLAG（保留类型位）
+    // Decompress path: body restored + COMPRESSED_FLAG cleared (type bits preserved)
     MessageExt out;
     CHECK(decodeMessage(raw, out, true, true), "decode compressed message");
     CHECK(out.body == payload, "compressed body restored");
@@ -286,7 +286,7 @@ static void testEncodeDecodeCompressed() {
     CHECK(MessageSysFlag::getCompressionType(out.sysFlag) == 3,
           "compression type bits preserved after clear");
 
-    // 不解压路径：body 仍是压缩字节，标志位保留
+    // Non-decompress path: the body stays compressed bytes and the flag bits are kept
     MessageExt kept;
     CHECK(decodeMessage(raw, kept, true, false), "decode without decompress");
     CHECK(kept.body != payload, "body stays compressed when decompressBody=false");
@@ -295,9 +295,9 @@ static void testEncodeDecodeCompressed() {
     CHECK(CompressorFactory::decompress(kept.body, 3) == payload,
           "manually decompressing the kept body works");
 
-    // 类型位为 0（老版本）也要能解：先伪造一个类型位为 0 的 sysFlag 再编码
+    // Type bits 0 (legacy) must also decode: first fake a sysFlag whose type bits are 0, then encode
     MessageExt legacy = makeMessageExt(payload, MessageSysFlag::COMPRESSED_FLAG);
-    // 直接给出压缩后的 body（不经 maybeCompress，模拟"就是老客户端产的"）
+    // Feed the compressed body directly (bypassing maybeCompress, simulating "exactly what a legacy client produced")
     legacy.body = CompressorFactory::compress(payload, CompressionType::ZLIB, 5);
     Bytes legacyRaw = encodeMessageExt(legacy, /*needCompress=*/false);
     MessageExt legacyOut;
@@ -323,9 +323,9 @@ static void testEncodeDecodeCompressed() {
     }
 }
 
-// ---------------------------------------------------------------- 17 段报文 x LZ4/ZSTD
+// ---------------------------------------------------------------- 17-section frame x LZ4/ZSTD
 static void testEncodeDecodeCompressedLz4Zstd() {
-    const std::string payload = bigPayload(8192);  // 远超 4096 阈值，形状同线上大消息
+    const std::string payload = bigPayload(8192);  // far above the 4096 threshold, same shape as a large live message
     const int32_t codecs[] = {CompressionType::LZ4, CompressionType::ZSTD};
     for (int32_t codec : codecs) {
         if (!codecAvailable(codec)) continue;
@@ -345,7 +345,7 @@ static void testEncodeDecodeCompressedLz4Zstd() {
         CHECK(MessageSysFlag::getCompressionType(out.sysFlag) == codec,
               tag + ": compression type bits preserved after clear");
 
-        // 不解压路径：body 保持压缩字节，标志位保留，手工解压仍正确
+        // Non-decompress path: the body keeps the compressed bytes, flag bits kept, manual decompression still correct
         MessageExt kept;
         CHECK(decodeMessage(raw, kept, true, false), tag + ": decode without decompress");
         CHECK(kept.body != payload, tag + ": body stays compressed");
@@ -356,9 +356,9 @@ static void testEncodeDecodeCompressedLz4Zstd() {
     }
 }
 
-// ---------------------------------------------------------------- 失败必须响亮
+// ---------------------------------------------------------------- failures must be loud
 static void testFailuresAreLoud() {
-    // 截断的 zlib 流必须抛异常，而不是静默返回半截数据
+    // A truncated zlib stream must throw instead of silently returning half the data
     const std::string payload = repeatedPayload();
     Bytes compressed = CompressorFactory::compress(payload, CompressionType::ZLIB, 5);
     Bytes truncated = compressed.substr(0, compressed.size() / 2);
@@ -378,13 +378,13 @@ static void testFailuresAreLoud() {
               "unknown compression type " + std::to_string(bogus) + " -> decompress throws");
     }
 
-    // 非压缩的垃圾数据同样抛错
+    // Non-compressed garbage throws as well
     CHECK(!throwsWhat([&] {
               CompressorFactory::decompress(std::string("not-a-zlib-stream"), CompressionType::ZLIB);
           }).empty(),
           "garbage input throws (zlib)");
 
-    // 编入的后端：截帧 / 错喂别的codec / 垃圾输入都必须抛（每一端都不许"尽力而为"）
+    // For a compiled-in backend: a truncated frame / bytes of another codec / garbage input must all throw (no backend may best-effort)
     if (hasLz4Support()) {
         const Bytes lz = CompressorFactory::compress(payload, CompressionType::LZ4);
         CHECK(!throwsWhat([&] {
@@ -396,7 +396,7 @@ static void testFailuresAreLoud() {
                                                CompressionType::LZ4);
               }).empty(),
               "garbage input throws (lz4)");
-        // 把 zlib 流喂给 lz4 解码器：帧头 magic 不符必须报错，而不是"试试看"
+        // Feeding a zlib stream to the lz4 decoder: a frame magic mismatch must error instead of "give it a try"
         CHECK(!throwsWhat([&] { CompressorFactory::decompress(compressed, CompressionType::LZ4); }).empty(),
               "zlib bytes fed to the lz4 decoder throws");
     }
@@ -413,7 +413,7 @@ static void testFailuresAreLoud() {
               "garbage input throws (zstd)");
         CHECK(!throwsWhat([&] { CompressorFactory::decompress(compressed, CompressionType::ZSTD); }).empty(),
               "zlib bytes fed to the zstd decoder throws");
-        // 帧头声明一个荒谬的 content size：必须被上限拦住并抛错，而不是照着开内存
+        // A frame header declaring an absurd content size: it must be capped and throw instead of allocating to match
         Bytes hostile = UtilAll::string2Bytes("28b52ffd");
         hostile += std::string(8, '\xff');  // content size = 0xFFFFFFFFFFFFFFFF
         CHECK(!throwsWhat([&] { CompressorFactory::decompress(hostile, CompressionType::ZSTD); }).empty(),

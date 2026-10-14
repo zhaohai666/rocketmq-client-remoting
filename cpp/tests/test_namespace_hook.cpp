@@ -1,15 +1,15 @@
-// NamespaceRpcHook（5.x 新命名空间 / Aliyun 实例 ID 形态）单测。
+// Unit tests for NamespaceRpcHook (the 5.x new-namespace / Aliyun instance-ID form).
 //
 //
-// 覆盖四件事：
-//   (a) 钩子加 nsd=true / ns=<值>；
-//   (b) 空命名空间时 extFields 原样不动（不物化任何键）；
-//   (c) 组合链序 Namespace → Stream → ACL（含只有一个/零个钩子时的形态）；
-//   (d) 设了 namespaceV2 之后 ACL 签名跟着变（broker 侧算法重放能验通）。
+// Covers four things:
+//   (a) the hook adds nsd=true / ns=<value>;
+//   (b) with an empty namespace extFields stays untouched (no key is materialized);
+//   (c) composition order Namespace → Stream → ACL (including the shape with one / zero hooks);
+//   (d) once namespaceV2 is set the ACL signature changes accordingly (a broker-side algorithm replay verifies it).
 //
-// 后半部分再从 socket 这头取证：五个门面（生产者 / 推送 / 拉取 / 轻量拉取 / 管理端）
-// 都真的把 nsd/ns 装上了链 —— composeRequestHooks 自身的单测锁不住「门面有没有用它」，
-// 曾经就漏过 lite 消费者那一处（见 test_send_retry.cpp 用例 9 的同款回归）。
+// The second half takes evidence from the socket side: all five facades (producer / push / pull / lite-pull / admin)
+// really put nsd/ns on the chain — unit tests of composeRequestHooks alone cannot lock down whether a facade uses it,
+// and the lite-consumer site was once exactly such a regression (see the same-shaped case 9 in test_send_retry.cpp).
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -86,7 +86,7 @@ std::function<std::string()> getterOf(std::string value) {
     return [value] { return value; };
 }
 
-// 记录「自己被调用时看到了什么」的探针钩子，用来证明链序（探针跑在前面时看不到后面的字段）。
+// A probe hook recording what it saw when invoked, used to prove chain order (a probe running first cannot see later fields).
 class ProbeHook : public RPCHook {
 public:
     explicit ProbeHook(std::string name) : name_(std::move(name)) {}
@@ -108,7 +108,7 @@ public:
     size_t extSizeWhenRun = 0;
 };
 
-// ---------------------------------------------------------------- (a) 配了 namespaceV2
+// ---------------------------------------------------------------- (a) namespaceV2 configured
 void testHookAddsNamespaceFields() {
     RemotingCommand cmd = pullRequest();
     NamespaceRpcHook hook(getterOf("MQINST-abc"));
@@ -120,13 +120,13 @@ void testHookAddsNamespaceFields() {
     CHECK(kNsdKey == "nsd", "MixAll nsd key spelling");
     CHECK(kNsKey == "ns", "MixAll ns key spelling");
 
-    // 已有字段原样保留（钩子只做加法，不改写别人的键）
+    // pre-existing fields are preserved as-is (the hook only adds, it never rewrites others' keys)
     RemotingCommand withExt = makeRequest({{"topic", "MyTopic"}});
     hook.doBeforeRequest("127.0.0.1:9876", withExt);
     CHECK(withExt.getExtField("topic") == "MyTopic", "pre-existing extFields survive");
     CHECK(withExt.extFields.size() == 3, "old + nsd + ns");
 
-    // 重复调用幂等（每笔请求都会过钩子，同一请求被跑两次也不能长出第三个键）
+    // repeated calls are idempotent (every request passes the hooks; running the same request twice must not grow a third key)
     hook.doBeforeRequest("127.0.0.1:9876", withExt);
     CHECK(withExt.extFields.size() == 3, "addExtField overwrite, not append");
 
@@ -156,13 +156,13 @@ void testEmptyNamespaceLeavesExtFieldsUntouched() {
     CHECK(cmd.extFields.count(kNsdKey) == 0, "empty namespace => no nsd key");
     CHECK(cmd.extFields.count(kNsKey) == 0, "empty namespace => no ns key");
 
-    // 已有 extFields 也不能被动过
+    // existing extFields must not be touched either
     RemotingCommand withExt = makeRequest({{"topic", "MyTopic"}, {"producerGroup", "G"}});
     hook.doBeforeRequest("127.0.0.1:9876", withExt);
     CHECK(withExt.extFields.size() == 2, "empty namespace => existing keys untouched");
     CHECK(withExt.getExtField("topic") == "MyTopic", "empty namespace => topic still MyTopic");
 
-    // 取值函数为空 / 未传（facade 没配 namespaceV2 时的形状）同样什么都不做
+    // an empty / absent getter (the shape when the facade did not configure namespaceV2) likewise does nothing
     RemotingCommand noGetter = pullRequest();
     const std::function<std::string()> noNamespaceWired;
     NamespaceRpcHook emptyHook(noNamespaceWired);
@@ -170,7 +170,7 @@ void testEmptyNamespaceLeavesExtFieldsUntouched() {
     CHECK(noGetter.extFields.empty(), "null getter behaves like an empty namespace");
 }
 
-// ---------------------------------------------------------------- (c) 链序
+// ---------------------------------------------------------------- (c) chain order
 void testCompositionOrderNamespaceThenStreamThenAcl() {
     auto acl = std::make_shared<AclClientRPCHook>(SessionCredentials("AK", "SK"));
     const std::function<std::string()> nsGetter = getterOf("MQINST-order");
@@ -187,7 +187,7 @@ void testCompositionOrderNamespaceThenStreamThenAcl() {
                             && hooks[2].get() == acl.get();
         CHECK(typesInOrder, "chain order is Namespace -> Stream -> user(ACL)");
 
-        // 行为证据：ACL 跑到时 nsd/ns/ReqT 都已就位（Namespace 又在 Stream 之前）。
+        // behavioral evidence: when ACL runs, nsd/ns/ReqT are all in place (Namespace is again before Stream).
         auto probe = std::make_shared<ProbeHook>("user");
         std::vector<std::shared_ptr<RPCHook>> probed{
             std::make_shared<NamespaceRpcHook>(nsGetter),
@@ -204,7 +204,7 @@ void testCompositionOrderNamespaceThenStreamThenAcl() {
               "nsd/ns survive to the wire");
         CHECK(cmd.getExtField(kNsKey) == "MQINST-order", "ns value reaches the wire");
 
-        // 反序（先签名后打标）就是 bug：签的内容里没有 nsd/ns。
+        // the reverse order (sign first, tag later) is the bug: the signed content contains no nsd/ns.
         auto signer = std::make_shared<ProbeHook>("acl");
         ChainedRPCHook reversed{std::vector<std::shared_ptr<RPCHook>>{
             signer, std::make_shared<NamespaceRpcHook>(nsGetter)}};
@@ -214,16 +214,16 @@ void testCompositionOrderNamespaceThenStreamThenAcl() {
         CHECK(wrong.extFields.count(kNsdKey) == 1, "reversed order still puts nsd on the wire");
     }
 
-    // 只配了 namespaceV2（没开 stream、没 ACL）：单钩子，不套链壳
+    // only namespaceV2 configured (no stream, no ACL): a single hook, not wrapped in a chain
     const std::shared_ptr<RPCHook> onlyNs = composeRequestHooks(false, nullptr, nsGetter);
     CHECK(std::dynamic_pointer_cast<NamespaceRpcHook>(onlyNs) != nullptr,
           "namespace only => the NamespaceRpcHook itself");
     CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(onlyNs) == nullptr,
           "namespace only => not wrapped in a chain");
-    // namespaceV2 **没接线**（两参调用点）+ 没开 stream：形态与历史完全一致
+    // namespaceV2 **not wired** (two-arg call site) + no stream: the shape is exactly as before
     CHECK(composeRequestHooks(false, acl).get() == acl.get(),
           "no namespace arg + no stream => the very same user hook");
-    // ⚠ 判据是「有没有接线」而不是「当前值空不空」：见下一段的现读语义。
+    // ⚠ the criterion is whether it is wired, not whether the current value is empty: see the live re-read semantics below.
     const std::function<std::string()> notWiredAtAll;
     CHECK(composeRequestHooks(false, nullptr, notWiredAtAll) == nullptr,
           "nothing wired => no hook at all (zero overhead)");
@@ -231,7 +231,7 @@ void testCompositionOrderNamespaceThenStreamThenAcl() {
           "two-arg overload still returns the user hook untouched");
 
     {
-        std::string live;  // 此刻还没配 namespaceV2
+        std::string live;  // namespaceV2 not configured yet at this point
         const std::shared_ptr<RPCHook> wrapped =
             composeRequestHooks(false, acl, [&live] { return live; });
         auto chain = std::dynamic_pointer_cast<ChainedRPCHook>(wrapped);
@@ -247,7 +247,7 @@ void testCompositionOrderNamespaceThenStreamThenAcl() {
               "namespaceV2 set after start() still takes effect");
     }
 
-    // 两参重载（未接线 namespace 的老调用点）形态不变
+    // the two-arg overload (old call sites without a wired namespace) keeps its shape
     {
         const std::shared_ptr<RPCHook> noNsArg = composeRequestHooks(true, acl);
         const auto chained = std::dynamic_pointer_cast<ChainedRPCHook>(noNsArg);
@@ -256,12 +256,12 @@ void testCompositionOrderNamespaceThenStreamThenAcl() {
     }
 }
 
-// ---------------------------------------------------------------- (d) 签名覆盖 nsd/ns
+// ---------------------------------------------------------------- (d) the signature covers nsd/ns
 void testAclSignatureCoversNamespace() {
     const SessionCredentials credentials("AK_TEST", "SK_TEST_SECRET_12345678");
     const Bytes body("hello", 5);
 
-    // 1) 链式：Namespace → ACL（namespaceV2 已配）
+    // 1) chained: Namespace → ACL (namespaceV2 configured)
     RemotingCommand chained = makeRequest({{"topic", "MyTopic"}});
     chained.body = body;
     chained.hasBody = true;
@@ -269,7 +269,7 @@ void testAclSignatureCoversNamespace() {
                         getterOf("MQINST-sign"))
         ->doBeforeRequest("127.0.0.1:9876", chained);
 
-    // 2) 参照：手工把 nsd/ns 摆进 extFields 再单独跑 ACL —— 与 broker 侧重组出来的一致
+    // 2) reference: manually place nsd/ns into extFields then run ACL alone — matches what the broker reassembles
     RemotingCommand reference =
         makeRequest({{"topic", "MyTopic"}, {kNsKey, "MQINST-sign"}, {kNsdKey, "true"}});
     reference.body = body;
@@ -280,7 +280,7 @@ void testAclSignatureCoversNamespace() {
               == reference.getExtField(SessionCredentials::SIGNATURE),
           "nsd/ns sit inside the signed content (chain == manual order)");
 
-    // 3) 不设 namespaceV2 的同一笔请求：签名必须不同（否则「命名空间」这层等于没签进去）
+    // 3) the same request without namespaceV2: the signature must differ (otherwise the namespace layer is effectively unsigned)
     RemotingCommand plain = makeRequest({{"topic", "MyTopic"}});
     plain.body = body;
     plain.hasBody = true;
@@ -290,8 +290,8 @@ void testAclSignatureCoversNamespace() {
     CHECK(plainSig != chained.getExtField(SessionCredentials::SIGNATURE),
           "setting namespaceV2 changes the ACL signature");
 
-    // 4) 先签名后补 nsd/ns（错误顺序）产出的签名与链式不同 —— broker 会验签失败。
-    //    这一条就是 MQClientAPIImpl:329 把 Namespace 装在 ACL 之前的全部理由。
+    // 4) signing first and adding nsd/ns afterwards (wrong order) yields a signature different from the chain — the broker's verification fails.
+    //    That is the whole reason the signing chain installs Namespace before ACL.
     RemotingCommand late = makeRequest({{"topic", "MyTopic"}});
     late.body = body;
     late.hasBody = true;
@@ -306,7 +306,7 @@ void testAclSignatureCoversNamespace() {
     CHECK(AclClientRPCHook::buildRequestContent(chained)
               == Bytes("AK_TESTMQINST-signtrueMyTopic") + body,
           "signed content is AccessKey + ns + nsd + topic + body");
-    // broker 侧算法重放：拿上线的 extFields + body 再算一遍，等式成立才说明顺序对
+    // broker-side algorithm replay: recompute from the on-the-wire extFields + body; the equality only holds when the order is right
     {
         RemotingCommand replay;
         replay.extFields = chained.extFields;
@@ -317,7 +317,7 @@ void testAclSignatureCoversNamespace() {
               "broker-side replay verifies the namespaced signature");
     }
 
-    // 6) Namespace + Stream + ACL 三环：ReqT 也在签名之内（链序不能只对齐前两环）
+    // 6) the three-ring Namespace + Stream + ACL chain: ReqT is inside the signature too (order must align all three, not just the first two)
     {
         RemotingCommand three = makeRequest({{"topic", "MyTopic"}});
         three.body = body;
@@ -359,7 +359,7 @@ void testFacadeConfigSurface() {
     admin.setNamespaceV2("inst-ad");
     CHECK(admin.namespaceV2() == "inst-ad", "admin exposes namespaceV2");
 
-    // 默认空串（未配置 = 钩子不加字段），且与老 namespace 互不干扰
+    // defaults to an empty string (unconfigured = the hook adds nothing), and it is independent from the legacy namespace
     DefaultMQProducer fresh("PG_nsface_fresh");
     CHECK(fresh.namespaceV2().empty(), "namespaceV2 defaults to empty");
     fresh.setNamespace("legacy");
@@ -372,7 +372,7 @@ void testFacadeConfigSurface() {
     CHECK(dispatcher.namespaceV2() == "inst-trace", "dispatcher carries the host namespaceV2");
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
     while (got < n) {
@@ -428,9 +428,9 @@ struct Conn {
     std::mutex writeM;
 };
 
-// 同时扮演 name server 与 broker：路由按登记的 topic 回，其余一律回 SUCCESS
-// （SEND 补 msgId/queueId/queueOffset，消费者侧的拉取/位点回 NO_MESSAGE 形状即可，
-//  本文件只取「报文里有没有 nsd/ns」这一件事）。
+// Plays both the name server and the broker: routes answer for registered topics, everything else answers SUCCESS
+// (SEND carries msgId/queueId/queueOffset; consumer-side pull/offset replies in the NO_MESSAGE shape are fine;
+//  this file only evidences whether the wire request carries nsd/ns.
 class MockEndpoint {
 public:
     struct WireRecord {
@@ -484,7 +484,7 @@ public:
         routes_[topic] = route.encode();
     }
 
-    // 请求码为 `code`、且带 key==value 扩展字段的报文条数
+    // number of wire requests with request code `code` and ext field key==value
     int countRequestsWith(int32_t code, const std::string& key, const std::string& value) {
         std::lock_guard<std::mutex> lk(state_);
         int n = 0;
@@ -624,14 +624,14 @@ public:
     }
 };
 
-// 每个门面用**独立 mock + 独立 instanceName**：
-//   * 独立 mock —— 上一个门面的后台路由刷新线程可能在 shutdown() 之后仍打到同一个端点，
-//     共用一个 mock 会把「别人的报文」算进这一家的账（真机不存在这问题，同进程多门面
-//     才会）；端点随作用域销毁，报文账本就只属于这一家。
-//   * 独立 instanceName —— 同进程 clientId 相同会复用同一个 MQClientInstance，而钩子槽是
-//     first-wins，复用会把后面门面的钩子静默吞掉。
-// 判据是「GET_ROUTEINFO 的总条数 == 带 ns=<值> 的条数 == 带 nsd=true 的条数」：
-// 钩子装在实例上，本门面的**每一笔**报文（start 期间的路由/心跳/注销）都必须打标。
+// Every facade uses **its own mock + its own instanceName**:
+//   * its own mock — the previous facade's background route-refresh thread may still hit the same endpoint
+//     after shutdown(); sharing one mock would charge other facades' traffic to this one (this problem does not
+//     exist against a real cluster, only with multiple facades in one process); the endpoint dies with its scope.
+//   * its own instanceName — the same clientId in one process reuses the same MQClientInstance, and the
+//     hook slot is first-wins, so reuse would silently swallow the later facade's hook.
+// the criterion is: total GET_ROUTEINFO count == count carrying ns=<value> == count carrying nsd=true:
+// the hook sits on the instance, so every request of this facade (route/heartbeat/unregister during start()) must be marked.
 void checkAllRequestsMarked(MockEndpoint& mock, const std::string& tag, bool expectReqT) {
     const int total = mock.countRequests(RequestCode::GET_ROUTEINFO_BY_TOPIC);
     const int marked =
@@ -643,14 +643,14 @@ void checkAllRequestsMarked(MockEndpoint& mock, const std::string& tag, bool exp
     CHECK(total > 0, tag + ": facade talked to the namesrv");
     CHECK(marked == total, tag + ": every request carries ns=<namespaceV2>");
     CHECK(markedNsd == total, tag + ": every request carries nsd=true");
-    // 开着 stream 的门面：Namespace 之后还有 Stream（链序 Namespace → Stream → 用户）
+    // facades with stream on: Stream still follows Namespace (chain order Namespace → Stream → user)
     CHECK(!expectReqT || markedReqT == total, tag + ": ReqT follows the namespace hook");
 }
 
 void testFacadesPutNamespaceOnTheWire() {
     const std::string topic = "NsV2WireTopic";
 
-    // 1. 生产者：发送报文 + broker 侧算法重放验签（nsd/ns 必须在签名之内）
+    // 1. producer: the send request + a broker-side algorithm replay verifies the signature (nsd/ns must be inside it)
     {
         MockEndpoint mock;
         mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
@@ -681,7 +681,7 @@ void testFacadesPutNamespaceOnTheWire() {
               "producer: stream off => no ReqT (namespace hook installed independently)");
     }
 
-    // 2. 推送消费者（默认关 stream）
+    // 2. push consumer (stream off by default)
     {
         MockEndpoint mock;
         mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
@@ -696,10 +696,10 @@ void testFacadesPutNamespaceOnTheWire() {
         checkAllRequestsMarked(mock, "push consumer", false);
     }
 
-    // 3. 拉模式消费者（默认开 stream：链序必须是 Namespace → Stream）
-    //    registerTopics 是**只读**访问器，登记入口是 registerMessageQueueListener（需非空
-    //    监听器）；本用例不关心订阅，直接调 fetchSubscribeMessageQueues —— 它必然发一笔
-    //    GET_ROUTEINFO_BY_TOPIC，报文账本可判定。
+    // 3. pull consumer (stream on by default: the chain order must be Namespace → Stream)
+    //    registerTopics is a **read-only** accessor; the registration entry is registerMessageQueueListener (needs a non-null
+    //    listener); this case does not care about subscription and calls fetchSubscribeMessageQueues directly — it necessarily
+    //    sends one GET_ROUTEINFO_BY_TOPIC, which the wire ledger can decide.
     {
         MockEndpoint mock;
         mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
@@ -713,7 +713,7 @@ void testFacadesPutNamespaceOnTheWire() {
         checkAllRequestsMarked(mock, "pull consumer", true);
     }
 
-    // 4. 轻量拉取消费者（曾经绕过 composeRequestHooks 的那一处回归）
+    // 4. lite pull consumer (the site that once bypassed composeRequestHooks)
     {
         MockEndpoint mock;
         mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
@@ -727,7 +727,7 @@ void testFacadesPutNamespaceOnTheWire() {
         checkAllRequestsMarked(mock, "lite pull consumer", true);
     }
 
-    // 5. 管理端
+    // 5. admin
     {
         MockEndpoint mock;
         mock.addRoute(topic, makeRoute(mock.address(), 1, 1));

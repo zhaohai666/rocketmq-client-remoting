@@ -1,17 +1,17 @@
-// 为什么必须离线锁死：这条路径错了是**静默**的 —— 220 是 broker 单向推送
-// （Broker2Client.resetOffset 用 oneway 发给消费端，发起方 admin 拿到的是另一笔
-// INVOKE_BROKER_TO_RESET_OFFSET 的响应），管理端看到的响应完好无损，而消费端如果
-// 只是把新位点写进内存表：
-//   1. 重置前取回、重置后才返回的批次一 ack 又把位点推回原处（broker 上刚写下的新
-//      位点被盖掉，消费从重置前的位置继续）；
-//   2. 本端口重建走 offsetTable_ 表失 + 新位点落盘 —— 新位点没经 onQueuesRevoked
-//      的尾巴持久化，进程一重启这次重置等于没做。
-// 两种错在真机短期窗口里都表现为"重置了但没完全重置"，所以断言放离线；真机另有一条
-// 链路（examples/live_reset_offset.cpp 的 S1/S2：「撤下在途批次 + broker 上的位点
-// 0.0-0.5s 内跳到重置值」与「前跳位点不越界 + 恢复消费」）。
+// Why it must be locked down offline: getting this path wrong is **silent** -- 220 is a one-way push from the broker
+// (Broker2Client.resetOffset sends oneway to the consumer, while the initiating admin receives the response of a different
+// INVOKE_BROKER_TO_RESET_OFFSET), so the response the admin side sees is perfectly fine, and if the consumer merely
+// writes the new offset into the in-memory table:
+//   1. a batch fetched before the reset and acked after it pushes the offset right back (the new offset just written
+//      on the broker is overwritten and consumption continues from the pre-reset position);
+//   2. rebuilding in this port goes through offsetTable_ loss + the new offset persisted -- a new offset that never
+//      went through the onQueuesRevoked tail means a process restart undoes the reset.
+// Both mistakes look like "reset but not fully reset" inside a short live window, hence the assertions live offline; the
+// live side has its own path (S1/S2 of examples/live_reset_offset.cpp: "in-flight batches withdrawn + the offset on the broker
+// jumps to the reset value within 0.0-0.5s" and "the forward-jumped offset stays in range + consumption resumes").
 //
 //
-// 与 python/tests/test_reset_offset_handler.py、rust/src/client/consumer.rs 的同名测试、
+// The same assertions are covered by the sibling offline reset-offset tests in this repository.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -44,7 +44,7 @@ const char* kGroup = "GID_ResetOffsetCppUnit";
 const char* kTopic = "ResetOffsetCppUnitTopic";
 const char* kBroker = "broker-a";
 
-// ::setenv / ::unsetenv 是 POSIX 专有，MSVC 下不存在（只有 _putenv_s，置空串即删除）
+// ::setenv / ::unsetenv are POSIX-only and do not exist under MSVC (only _putenv_s, where an empty string deletes)
 void setEnvVar(const char* name, const char* value) {
 #if defined(_WIN32)
     _putenv_s(name, value);
@@ -95,8 +95,8 @@ public:
     size_t lastSize = 0;
 };
 
-// 未 start 的消费者即可：resetOffset 的本地状态改动全在锁下完成，onQueuesRevoked 在
-// mqClient_ 为空时不做网络（只剩广播模式的本地落盘），doRebalance 直接返回。
+// A consumer that never started is enough: every local state change of resetOffset happens under the locks, onQueuesRevoked
+// with a null mqClient_ performs no network work (only the local persist of broadcasting mode) and doRebalance returns directly.
 class Harness {
 public:
     explicit Harness(const std::string& group = kGroup)
@@ -106,7 +106,7 @@ public:
         consumer_.setAssignedQueue(key_, queue0());
     }
 
-    // 用真实消费路径产生一个已知的已消费位点（位点表没有直接写入面）
+    // Produce a known consumed offset through the real consumption path (the offset table has no direct write surface)
     void seedConsumed(int64_t uptoOffsetExclusive) {
         std::vector<MessageExt> batch;
         for (int64_t i = 0; i < uptoOffsetExclusive; i++) {
@@ -134,12 +134,12 @@ void expectOffset(Harness& h, std::optional<int64_t> want, const std::string& na
     expect(got == want, name, "want=" + offText(want) + " got=" + offText(got));
 }
 
-// ------------------------------------------------- 220 请求体的两种形状
+// ------------------------------------------------- the two shapes of a 220 request body
 
 void testParseMapForm() {
     ResetOffsetBody body;
     body.offsetTable[queue0()] = 100;
-    body.offsetTable[MessageQueue(kTopic, kBroker, 1)] = -1;  // timestamp=-1 ⇒ broker 算出的 maxOffset
+    body.offsetTable[MessageQueue(kTopic, kBroker, 1)] = -1;  // timestamp=-1 means the maxOffset computed by the broker
     const auto parsed = DefaultMQPushConsumer::parseResetOffsetBody(body.encode());
     expect(parsed.size() == 2, "mapForm.entries", std::to_string(parsed.size()));
     expect(parsed.count(queue0()) == 1 && parsed.at(queue0()) == 100, "mapForm.offset0");
@@ -161,8 +161,8 @@ void testParseForCArrayForm() {
     expect(parsed.count(MessageQueue(kTopic, kBroker, 1)) == 1
                && parsed.at(MessageQueue(kTopic, kBroker, 1)) == 0,
            "forCForm.offset1");
-    // 反向控制：map 形状的解析器对数组只会得到**空表** —— 这正是"没有数组那一支就静默
-    // 丢弃"的机关，固定下来防止哪天顺手把 fallback 删了。
+    // Reverse control: the map-shape parser can only ever get an **empty table** from an array -- that is exactly the
+    // mechanism behind "silently dropped when the array branch is missing", pinned here so the fallback is not deleted on a whim.
     ResetOffsetBody mapOnly;
     expect(ResetOffsetBody::decode(json, mapOnly) && mapOnly.offsetTable.empty(),
            "forCForm.mapParserYieldsEmpty");
@@ -174,14 +174,14 @@ void testParseGarbageIsEmpty() {
            "garbage.notJson");
     expect(DefaultMQPushConsumer::parseResetOffsetBody("{\"offsetTable\":{\"x\":1}}").empty(),
            "garbage.wrongShape");
-    // 空数组 / 空 map 都是合法形状，只是没有条目
+    // An empty array / empty map are both legal shapes, simply with no entries
     expect(DefaultMQPushConsumer::parseResetOffsetBody("{\"offsetTable\":[]}").empty(),
            "garbage.emptyArray");
     expect(DefaultMQPushConsumer::parseResetOffsetBody("{\"offsetTable\":{}}").empty(),
            "garbage.emptyMap");
 }
 
-// ------------------------------------------------- 重置 = 丢队列 + 代号 +1 + 位点经撤销尾巴落盘
+// ------------------------------------------------- reset = drop the queue + epoch +1 + offset persisted through the revoke tail
 
 void testResetRetiresQueueAndDropsPreResetBatch() {
     Harness h;
@@ -200,12 +200,12 @@ void testResetRetiresQueueAndDropsPreResetBatch() {
            std::to_string(h.consumer().queueEpoch(h.key())));
     expect(h.consumer().getConsumerStatus(kTopic).empty(), "reset.mqMapCleared");
 
-    // 重置前取回、重置后才 ack 的旧批次（代号 0）：整批作废，位点不许复活
+    // A batch fetched before the reset and acked only after it (epoch 0): the whole batch is void, the offset must not come back
     const bool staleDone = h.consumer().consumeBatch(h.key(), queue0(), offsetBatch(0, 2), 0);
     expect(!staleDone, "reset.staleAckRefused");
     expectOffset(h, std::nullopt, "reset.staleAckDropped");
 
-    // 反向控制：重建后（代号 1）的新批次照常推进 —— 闸门不能把正常路径也挡掉
+    // Reverse control: after the rebuild (epoch 1) a fresh batch still advances -- the gate must not block the normal path too
     const bool freshDone = h.consumer().consumeBatch(h.key(), queue0(), offsetBatch(4, 6), 1);
     expect(freshDone, "reset.freshAckAccepted");
     expectOffset(h, 6, "reset.freshAckAdvanced");
@@ -226,18 +226,18 @@ void testResetOnlyTouchesMatchingTopicAndTableEntries() {
     h.consumer().consumeBatch(siblingKey, sibling, siblingBatch, h.consumer().queueEpoch(siblingKey));
     h.consumer().setLastPullAt(siblingKey, 42);
 
-    // 表里只给了 queue0 ⇒ queue1 的一切原样（一条"clear 全表"的实现会让同实例其它队列全重投）
+    // The table only gives queue0, so everything of queue1 stays as it was (a "clear the whole table" implementation would redeliver every other queue of the same instance)
     h.consumer().resetOffset(kTopic, {{queue0(), 100}});
 
     expect(h.consumer().queueEpoch(siblingKey) == 0, "scope.siblingEpoch");
     expect(h.consumer().consumeOffset(siblingKey) == std::optional<int64_t>(5),
            "scope.siblingOffset");
     expect(h.consumer().lastPullAt(siblingKey) == 42, "scope.siblingStillAssigned");
-    // 未分配的队列给了条目也是 no-op：没有 mqMap_ 条目就没有可落盘的对象，不能凭空造位点
+    // An entry for an unassigned queue is also a no-op: without an mqMap_ entry there is nothing to persist, no offset may be invented
     const uint64_t epochBefore = h.consumer().queueEpoch(h.key());
     h.consumer().resetOffset(kTopic, {{MessageQueue(kTopic, kBroker, 9), 7}});
     expect(h.consumer().queueEpoch(h.key()) == epochBefore, "scope.unassignedNoop");
-    // 空 topic / 空表直接返回
+    // An empty topic / empty table returns immediately
     h.consumer().resetOffset("", {{queue0(), 1}});
     h.consumer().resetOffset(kTopic, {});
     expect(h.consumer().queueEpoch(h.key()) == epochBefore, "scope.emptyInputNoop");
@@ -247,7 +247,7 @@ void testSecondResetKeepsEpochMonotonic() {
     Harness h;
     h.consumer().resetOffset(kTopic, {{queue0(), 10}});
     expect(h.consumer().queueEpoch(h.key()) == 1, "twice.firstResetEpoch");
-    h.consumer().setAssignedQueue(h.key(), queue0());  // rebalance 重建
+    h.consumer().setAssignedQueue(h.key(), queue0());  // rebuilt by rebalance
     h.consumer().resetOffset(kTopic, {{queue0(), 20}});
     expect(h.consumer().queueEpoch(h.key()) == 2, "twice.epochMonotonic",
            std::to_string(h.consumer().queueEpoch(h.key())));
@@ -256,8 +256,8 @@ void testSecondResetKeepsEpochMonotonic() {
 
 
 void testResetPersistsNewOffsetInBroadcast() {
-    // 广播模式位点只存本地：撤销尾巴就是这份文件的唯一写入口。先 persist 后 removeOffset
-    // 的顺序错了（或干脆不 persist），同名队列下次分回来按 consumeFromWhere 从头重扫。
+    // In broadcasting mode offsets live only locally: the revoke tail is the single write entry of that file. Getting the
+    // persist-then-removeOffset order wrong (or not persisting at all) makes the same queue rescan from the start per consumeFromWhere once it is assigned again.
     const std::string home =
         (std::filesystem::temp_directory_path() / "rmq_cpp_reset_offset_home").string();
     std::filesystem::remove_all(home);
@@ -289,11 +289,11 @@ void testResetPersistsNewOffsetInBroadcast() {
                                  + "GID_ResetOffsetCppUnitBroadcast/offsets.json";
         const std::map<std::string, int64_t> loaded =
             DefaultMQPushConsumer::loadLocalOffsetsAt(path);
-        // 新位点（100）而不是重置前的 3，且带着队列信息（只有位点没队列会被 build 跳过）
+        // The new offset (100) and not the pre-reset 3, and carrying queue info (an offset without a queue is skipped by build)
         expect(loaded.count(h.key()) == 1 && loaded.at(h.key()) == 100,
                "broadcast.newOffsetPersisted",
                std::to_string(loaded.count(h.key()) ? loaded.at(h.key()) : -999));
-        // 同一次落盘是 merge 不是 replace：兄弟队列的旧位点还在
+        // The same persist merges instead of replacing: the sibling queue keeps its old offset
         expect(loaded.count(siblingKey) == 1 && loaded.at(siblingKey) == 7,
                "broadcast.siblingMerged");
         expectOffset(h, std::nullopt, "broadcast.tableCleared");
@@ -308,8 +308,8 @@ void testResetPersistsNewOffsetInBroadcast() {
 }
 
 void testSaveLocalOffsetsSkipsQueuesWithoutOffset() {
-    // 撤销表里位点是 null（本端口用 -1 表达）时不凭空造条目：下次分回来读到的应该还是
-    // "没有记录"，而不是一个假的 -1（把 -1 当合法位点提交上去等于让 broker 从头开始）。
+    // A null offset in the revoke table (expressed as -1 in this port) must not invent an entry: on the next assignment the read
+    // should still be "no record", not a fake -1 (committing -1 as a legal offset is the same as telling the broker to start over).
     const std::string home =
         (std::filesystem::temp_directory_path() / "rmq_cpp_reset_offset_extra_home").string();
     std::filesystem::remove_all(home);
@@ -340,16 +340,16 @@ void testSaveLocalOffsetsSkipsQueuesWithoutOffset() {
 }
 
 void testResetOffsetExtFieldsNames() {
-    // 222 报文键名：`isForce` 少一个字母或写成 `force` 都是**静默**的 —— broker 侧
-    // isForce 恒为 false，`Broker2Client.resetOffset:152-158` 的分支退化成「取时间戳位点」，
-    // 前重（timestamp=-1）把 consumerOffset 原样回显而不是跳到 maxOffset。
-    // 5.5.1 真机探针：{"force":"true", timestamp:-1} → 目标 3（=consumerOffset），
-    //               {"isForce":"true", timestamp:-1} → 目标 10（=maxOffset）。
+    // Key names of the 222 payload: one letter missing in `isForce` or spelling it `force` is **silent** -- on the broker side
+    // isForce stays false, the branch in `Broker2Client.resetOffset:152-158` degrades into "take the timestamp offset",
+    // and a rewind (timestamp=-1) echoes consumerOffset instead of jumping to maxOffset.
+    // Live 5.5.1 probe: {"force":"true", timestamp:-1} -> target 3 (=consumerOffset),
+    //                   {"isForce":"true", timestamp:-1} -> target 10 (=maxOffset).
     const PropertyMap forw =
         DefaultMQAdminExt::buildResetOffsetExtFields(kTopic, kGroup, -1, /*isForce=*/true, -1, -1);
     expect(forw.count("isForce") == 1 && forw.at("isForce") == "true", "ext.isForceTrue",
            forw.count("isForce") ? forw.at("isForce") : "(missing)");
-    // 负向对照：错误拼写不得同时存在（有 force 就说明键名写错了）
+    // Negative control: the wrong spelling must not coexist (a `force` key means the key name was written wrong)
     expect(forw.count("force") == 0, "ext.noBareForce");
     expect(forw.at("topic") == kTopic && forw.at("group") == kGroup, "ext.topicGroup");
     expect(forw.at("timestamp") == "-1" && forw.at("offset") == "-1", "ext.timestampOffset");

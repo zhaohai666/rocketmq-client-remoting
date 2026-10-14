@@ -1,6 +1,6 @@
-// 定点（指定队列）发送守卫真机联调（场景 S1..S6 逐条断言）。
+// Live-cluster verification of the pinned (specified-queue) send guard (assert every scenario S1..S6 one by one).
 //
-// 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
+// Prerequisites: NameServer + Broker already running, with ``autoCreateTopicEnable=true``.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -52,7 +52,7 @@ bool waitUntil(const std::function<bool()>& fn, int timeoutMillis) {
     return fn();
 }
 
-/// 一次异步发送的终态。
+/// Terminal state of one async send.
 class SendLatch : public SendCallback {
 public:
     void onSuccess(const SendResult& result) override {
@@ -86,7 +86,7 @@ private:
     volatile bool done = false;
 };
 
-/// 消费到的 keys 收集器。
+/// Collector of the keys that were consumed.
 struct KeySink {
     std::mutex mtx;
     std::vector<std::string> keys;
@@ -133,7 +133,7 @@ std::string join(const std::vector<std::string>& v) {
     return s + "]";
 }
 
-/// 6*2=一个号段，stamp 用毫秒尾部，够本次跑完不重名。
+/// 6*2 = one id range; the stamp uses the low digits of epoch millis, unique enough that this run has no collisions.
 std::string stamp() { return std::to_string(nowMs() % 1000000000); }
 
 }  // namespace
@@ -161,17 +161,17 @@ int main(int argc, char* argv[]) {
         const ClusterInfo cluster = admin.fetchBrokerClusterInfo();
         const std::vector<std::string> addrs = cluster.getBrokerAddrs();
         if (addrs.empty()) {
-            check("集群探活", false, "nameServer 无 broker 注册");
+            check("cluster reachability probe", false, "no broker registered on the name server");
             admin.shutdown();
             return 1;
         }
         brokerAddr = addrs[0];
     } catch (const std::exception& e) {
-        check("集群探活", false, std::string("fetchBrokerClusterInfo: ") + e.what());
+        check("cluster reachability probe", false, std::string("fetchBrokerClusterInfo: ") + e.what());
         admin.shutdown();
         return 1;
     }
-    check("集群探活", true, "broker=" + brokerAddr);
+    check("cluster reachability probe", true, "broker=" + brokerAddr);
 
     std::shared_ptr<DefaultMQProducer> producer;
     std::shared_ptr<DefaultMQProducer> nsProducer;
@@ -188,7 +188,7 @@ int main(int argc, char* argv[]) {
         producer->setInstanceName("pin-guard-" + tag);
         producer->start();
 
-        // ---------------- S0 路由 + 消费者就位 ----------------
+        // ---------------- S0 routes + consumer in place ----------------
         MessageQueue mqA;
         MessageQueue mqB;
         bool routed = waitUntil(
@@ -204,19 +204,19 @@ int main(int argc, char* argv[]) {
                 return !mqA.brokerName.empty() && !mqB.brokerName.empty();
             },
             20000);
-        check("S0 两条 topic 的路由都可用（反腿用真队列，拒的才一定是 topic 而不是地址）",
+        check("S0 routes of both topics available (the negative legs use real queues, so a rejection must be about the topic, not the address)",
               routed && mqA.brokerName == mqB.brokerName,
               "A=" + mqA.brokerName + "/" + std::to_string(mqA.queueId) + " B=" + mqB.brokerName +
                   "/" + std::to_string(mqB.queueId));
         if (!routed) {
-            check("S0 前置失败，后续场景无法继续", false);
+            check("S0 prerequisite failed, later scenarios cannot continue", false);
             producer->shutdown();
             admin.shutdown();
             std::printf("############ PASS=%d FAIL=%d ############\n", gPass, gFail);
             return 1;
         }
 
-        // 消费者先起（CONSUME_FROM_FIRST_OFFSET），不和发送抢 rebalance 的时间点
+        // Start the consumer first (CONSUME_FROM_FIRST_OFFSET); do not race the rebalance moment with the sends
         consumer = std::make_shared<DefaultMQPushConsumer>(group);
         consumer->setNamesrvAddr(nsAddr);
         consumer->setInstanceName("pin-guard-live-" + tag);
@@ -225,13 +225,13 @@ int main(int argc, char* argv[]) {
         consumer->subscribe(topicA, "*");
         consumer->start();
 
-        // ---------------- S1 正腿：真路由队列上的定点发送 ----------------
+        // ---------------- S1 positive legs: pinned sends onto real routed queues ----------------
         const std::string kSingle = "pinned-single-" + tag;
         const std::string kB1 = "pinned-b1-" + tag;
         const std::string kB2 = "pinned-b2-" + tag;
         {
             const SendResult r = producer->send(keyed(topicA, Bytes{'s', '1'}, kSingle), mqA, 5000);
-            check("S1a 同步单条定点 SEND_OK 且落在 queue 0",
+            check("S1a sync single pinned send SEND_OK and lands on queue 0",
                   r.sendStatus == SendStatus::SEND_OK && r.messageQueue.queueId == mqA.queueId &&
                       r.messageQueue.topic == topicA,
                   "status=" + std::to_string(static_cast<int>(r.sendStatus)) +
@@ -241,11 +241,11 @@ int main(int argc, char* argv[]) {
             const SendResult r = producer->sendBatch(
                 {keyed(topicA, Bytes{'b', '1'}, kB1), keyed(topicA, Bytes{'b', '2'}, kB2)},
                 mqA, 5000);
-            check("S1b 同步批量定点 SEND_OK 且同一队列",
+            check("S1b sync batch pinned send SEND_OK and the same queue",
                   r.sendStatus == SendStatus::SEND_OK && r.messageQueue.queueId == mqA.queueId,
                   "status=" + std::to_string(static_cast<int>(r.sendStatus)));
         }
-        // 批量在消费队列上按**子消息**逐条落位（broker 收到 inner-batch 后拆开写）⇒ 2 条子消息涨 2
+        // A batch lands on the consume queue **sub-message by sub-message** (the broker splits the inner-batch when writing) => 2 sub-messages advance the offset by 2
         int64_t offAfterS1 = -1;
         waitUntil(
             [&] {
@@ -254,10 +254,10 @@ int main(int argc, char* argv[]) {
             },
             10000);
         offAfterS1 = producer->maxOffset(mqA);
-        check("S1c 三笔子消息都真落库（maxOffset = 单条 1 + 批量子消息 2）", offAfterS1 == 3,
+        check("S1c all three sub-messages really persisted (maxOffset = 1 single + 2 batch sub-messages)", offAfterS1 == 3,
               "maxOffset=" + std::to_string(offAfterS1));
 
-        // ---------------- S2 反腿：同步拒绝，本端、无痕 ----------------
+        // ---------------- S2 negative legs: sync rejection, local-side, no trace ----------------
         {
             const int64_t began = nowMs();
             std::string msg;
@@ -269,9 +269,9 @@ int main(int argc, char* argv[]) {
                 msg = e.what();
             }
             const double ms = static_cast<double>(nowMs() - began);
-            check("S2a 同步单条拒（协议原文案）", threw && msg == syncWording,
-                  std::to_string(ms) + "ms " + (threw ? msg : "没有抛异常"));
-            check("S2b 拒在本端：亚毫秒（不是超时、不是 broker remark）",
+            check("S2a sync single send rejected (exact protocol wording)", threw && msg == syncWording,
+                  std::to_string(ms) + "ms " + (threw ? msg : "no exception thrown"));
+            check("S2b rejection is local-side: sub-millisecond (not a timeout, not a broker remark)",
                   threw && ms < localBudgetMs, std::to_string(ms) + "ms");
         }
         {
@@ -286,19 +286,19 @@ int main(int argc, char* argv[]) {
                 msg = e.what();
             }
             const double ms = static_cast<double>(nowMs() - began);
-            check("S2c 同步批量共用同一处守卫与同一句文案",
+            check("S2c sync batch shares the same guard site and the same wording",
                   threw && msg == syncWording && ms < localBudgetMs,
-                  std::to_string(ms) + "ms " + (threw ? msg : "没有抛异常"));
+                  std::to_string(ms) + "ms " + (threw ? msg : "no exception thrown"));
         }
         {
             const int64_t aNow = producer->maxOffset(mqA);
             const int64_t bNow = producer->maxOffset(mqB);
-            check("S2d wire 反证：A 的 maxOffset 一动没动，B 上一条都没有",
+            check("S2d wire-level counter-evidence: A's maxOffset did not move and B received nothing",
                   aNow == offAfterS1 && bNow == 0,
                   "A=" + std::to_string(aNow) + " B=" + std::to_string(bNow));
         }
 
-        // ---------------- S3 命名空间：wrap 幂等，只拒真的不同名 ----------------
+        // ---------------- S3 namespace: wrap is idempotent, only genuinely different names are rejected ----------------
         nsProducer = std::make_shared<DefaultMQProducer>("PG_pin_guard_ns_" + tag);
         nsProducer->setNamesrvAddr(nsAddr);
         nsProducer->setInstanceName("pin-guard-ns-" + tag);
@@ -313,18 +313,18 @@ int main(int argc, char* argv[]) {
                 return !mqw.brokerName.empty();
             },
             20000);
-        check("S3a 带前缀 topic 的路由可用", nsRouted, "topic=" + wTopic);
+        check("S3a route of the prefixed topic available", nsRouted, "topic=" + wTopic);
         {
             const SendResult r =
                 nsProducer->send(keyed(topicA, Bytes{'n', '1'}, "pinned-ns-q-" + tag), mqw, 5000);
-            check("S3b 队列 topic 已带 ns 前缀：wrap 幂等，不误拒",
+            check("S3b queue topic already carries the ns prefix: wrap is idempotent, no false rejection",
                   r.sendStatus == SendStatus::SEND_OK,
                   "status=" + std::to_string(static_cast<int>(r.sendStatus)));
         }
         {
             const SendResult r =
                 nsProducer->send(keyed(wTopic, Bytes{'n', '2'}, "pinned-ns-m-" + tag), mqw, 5000);
-            check("S3c 消息 topic 自己已带前缀同样放行",
+            check("S3c a message topic carrying the prefix itself also passes",
                   r.sendStatus == SendStatus::SEND_OK,
                   "status=" + std::to_string(static_cast<int>(r.sendStatus)));
         }
@@ -340,9 +340,9 @@ int main(int argc, char* argv[]) {
                 msg = e.what();
             }
             const double ms = static_cast<double>(nowMs() - began);
-            check("S3d 换成 ns2% 前缀才拒（对照腿：拒的是名字，不是「有前缀」）",
+            check("S3d rejected only after switching to the ns2% prefix (control leg: what is rejected is the name, not 'having a prefix')",
                   threw && msg == syncWording && ms < localBudgetMs,
-                  std::to_string(ms) + "ms " + (threw ? msg : "没有抛异常"));
+                  std::to_string(ms) + "ms " + (threw ? msg : "no exception thrown"));
         }
         {
             int64_t nsOff = -1;
@@ -353,22 +353,22 @@ int main(int argc, char* argv[]) {
                 },
                 10000);
             nsOff = nsProducer->maxOffset(mqw);
-            check("S3e 两条放行腿真落进 ns1%topic（maxOffset=2）", nsOff == 2,
+            check("S3e both passing legs really land in ns1%topic (maxOffset=2)", nsOff == 2,
                   "maxOffset=" + std::to_string(nsOff));
         }
 
-        // ---------------- S4 异步：回调里是异步那处文案 ----------------
+        // ---------------- S4 async: the callback carries the async-site wording ----------------
         {
             auto refused = std::make_shared<SendLatch>();
             producer->sendAsync(keyed(topicA, Bytes{'a', 'r'}, "pinned-async-refused-" + tag), mqB,
                                 refused, 5000);
             const bool done = refused->waitDone(10000);
-            check("S4a 单条异步拒绝走回调、文案是异步那处",
+            check("S4a single async rejection goes through the callback with the async-site wording",
                   done && refused->exceptionCount == 1 && refused->successCount == 0 &&
                       refused->message == asyncWording,
                   "msg=" + refused->message);
             const int64_t aNow = producer->maxOffset(mqA);
-            check("S4b 拒后 maxOffset 仍不动（异步也没偷发）", aNow == offAfterS1,
+            check("S4b maxOffset still unchanged after the rejection (async did not sneak a send)", aNow == offAfterS1,
                   "maxOffset=" + std::to_string(aNow));
         }
         {
@@ -377,7 +377,7 @@ int main(int argc, char* argv[]) {
                                       Message(topicA, Bytes{'a', 'r', '2'})},
                                      mqB, refused, 5000);
             const bool done = refused->waitDone(10000);
-            check("S4c 批量异步共用同一处文案与同一条拒绝路径",
+            check("S4c batch async shares the same wording and the same rejection path",
                   done && refused->exceptionCount == 1 && refused->message == asyncWording,
                   "msg=" + refused->message);
         }
@@ -391,7 +391,7 @@ int main(int argc, char* argv[]) {
                                       mqA, batchOk, 5000);
             const bool okSingle = singleOk->waitDone(10000);
             const bool okBatch = batchOk->waitDone(10000);
-            check("S4d 两条放行腿都 SEND_OK",
+            check("S4d both passing legs return SEND_OK",
                   okSingle && singleOk->successCount == 1 && okBatch &&
                       batchOk->successCount == 1,
                   "single_err=" + singleOk->message + " batch_err=" + batchOk->message);
@@ -403,7 +403,7 @@ int main(int argc, char* argv[]) {
                 },
                 10000);
             offAfterAsync = producer->maxOffset(mqA);
-            check("S4e 异步放行腿同样真落库（单条 1 + 批量子消息 2，maxOffset 再涨 3）",
+            check("S4e async passing legs also really persist (1 single + 2 batch sub-messages, maxOffset advances by 3 again)",
                   offAfterAsync == offAfterS1 + 3, "maxOffset=" + std::to_string(offAfterAsync));
 
             const std::string kOw = "pinned-oneway-" + tag;
@@ -416,14 +416,14 @@ int main(int argc, char* argv[]) {
                 },
                 10000);
             offAfterOw = producer->maxOffset(mqA);
-            check("S5a 单向定点没有守卫：报文按 msg 自己的 topic 落进 A",
+            check("S5a oneway pinned has no guard: the message lands in A under the msg's own topic",
                   offAfterOw == offAfterAsync + 1,
                   "A maxOffset=" + std::to_string(offAfterOw));
             const int64_t bNow = producer->maxOffset(mqB);
-            check("S5b 目标队列所在的 B 一条都没有（是设计上的口子，不是漏发）", bNow == 0,
+            check("S5b queue B, the pinned target, received nothing (a deliberate design gap, not a lost send)", bNow == 0,
                   "B maxOffset=" + std::to_string(bNow));
 
-            // ---------------- S6 正腿收尾：消息一条不少 ----------------
+            // ---------------- S6 positive-leg wrap-up: not one message missing ----------------
             const std::set<std::string> expected = {
                 kSingle, kB1, kB2, "pinned-async-single-" + tag, "pinned-async-b1-" + tag,
                 "pinned-async-b2-" + tag, kOw};
@@ -437,10 +437,10 @@ int main(int argc, char* argv[]) {
                 },
                 40000);
             const std::vector<std::string> got = sink.snapshot();
-            check("S6 正腿消息一条不少地被消费到", all, "received=" + join(got));
+            check("S6 every positive-leg message was consumed", all, "received=" + join(got));
         }
     } catch (const std::exception& e) {
-        check("用例执行中未预期异常", false, e.what());
+        check("unexpected exception while running the case", false, e.what());
     }
 
     if (consumer) consumer->shutdown();
@@ -451,7 +451,7 @@ int main(int argc, char* argv[]) {
         admin.deleteTopic(topicB, topicB);
         admin.deleteTopic(wTopic, wTopic);
     } catch (const std::exception& e) {
-        std::printf("  [WARN] 清理 topic 失败: %s\n", e.what());
+        std::printf("  [WARN] topic cleanup failed: %s\n", e.what());
     }
     admin.shutdown();
 

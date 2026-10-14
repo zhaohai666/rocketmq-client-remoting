@@ -1,18 +1,18 @@
-// 过期清扫与重投真机联调（场景 A0–A5 逐条断言）。
+// Live-cluster verification of clean-expired-msg and redelivery (assert every scenario A0-A5 one by one).
 //
-// 离线单测（tests/test_clean_expired_msg.cpp）锁的是**判据**（选条/阈值/上限/摘除闸门）；
-// 这里锁真机上两件离线锁不住的事：
-//   A. **清扫真的会开火**：需要一个 listener 挂着不返回超过 consumeTimeout 分钟，清扫线程
-//      把这条消息 sendMessageBack（delayLevel 3）——整条链路上客户端不能丢它、也不能投两次。
-//   B. **重投真的回到 broker**：%RETRY%<group> 的拉取循环独立于挂住的消费线程，消息必须
-//      重新出现在本地缓冲、被第二次投递且 reconsumeTimes=1（broker 侧计数）。
+// The offline unit test (tests/test_clean_expired_msg.cpp) locks down the **decision rules** (selection/threshold/cap/removal gate);
+// what this locks down are two things offline cannot prove, which need a real cluster:
+//   A. **the sweep really fires**: with a listener blocked and not returning beyond consumeTimeout minutes, the sweep
+//      thread must sendMessageBack this message (delayLevel 3) -- along the whole chain the client must neither lose it nor deliver it twice.
+//   B. **redelivery really returns to the broker**: the pull loop of %RETRY%<group> is independent of the blocked consumer thread, and the message must
+//      reappear in the local buffer and be delivered a second time with reconsumeTimes=1 (the broker-side counter).
 //
-// 这条路径坏掉的样子是**静默**的：卡住的消息把该队列位点与分发循环一起钉死，没有任何异常
-// 或超时可见，只能从"消息发了却永远不来第二次"反推。所以必须真机跑出「挂起 → 清扫 →
-// 重投到达」的完整证据链，光靠"客户端不报错"什么都证明不了。
+// This path fails **silently** when broken: the stuck message pins the queue offset and the dispatch loop together, with no visible
+// exception or timeout; the only way to infer it is "the message was sent but a second delivery never arrives". So this must run on a real cluster and produce the
+// full evidence chain of "hang -> sweep -> redelivery arrives"; "the client raised no error" proves nothing by itself.
 //
 //
-// 用法：./rmq_live_clean_expired_msg 127.0.0.1:9876   （约 4 分钟，等两个清扫周期）
+// Usage: ./rmq_live_clean_expired_msg 127.0.0.1:9876   (about 4 minutes, waits for two sweep cycles)
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -66,7 +66,7 @@ bool waitUntil(const std::function<bool()>& pred, int64_t timeoutMs, int64_t int
     return pred();
 }
 
-// 第一次投递就挂住不返回；放行后恢复正常返回 CONSUME_SUCCESS。
+// Hangs without returning on the first delivery; after release, returns CONSUME_SUCCESS normally.
 class HungListener : public MessageListenerConcurrently {
 public:
     ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
@@ -86,7 +86,7 @@ public:
             std::unique_lock<std::mutex> lk(mtx_);
             firstSeen_ = true;
             cv_.notify_all();
-            // 挂起窗口：等清扫动手 + 验证脚本放行（300s 上限兜底，防止脚本崩了卡死线程）
+            // Hang window: wait for the sweep to act plus release by the verifying script (300 s cap as fallback so a crashed script cannot wedge the thread)
             releaseCv_.wait_for(lk, std::chrono::seconds(300), [this] { return release_; });
         }
         return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
@@ -108,7 +108,7 @@ public:
         return calls_;
     }
 
-    // 某 body 的到达记录 [(reconsumeTimes, 时刻)]
+    // Arrival records of a body as [(reconsumeTimes, timestamp)]
     std::vector<std::pair<int32_t, int64_t>> times(const std::string& body) {
         std::lock_guard<std::mutex> lk(mtx_);
         std::vector<std::pair<int32_t, int64_t>> out;
@@ -150,7 +150,7 @@ struct Fixture {
         ClusterInfo cluster = admin.fetchBrokerClusterInfo();
         const std::vector<std::string> addrs = cluster.getBrokerAddrs();
         if (addrs.empty()) {
-            throw std::runtime_error("nameServer 无 broker 注册");
+            throw std::runtime_error("no broker registered on the name server");
         }
         brokerAddr = addrs[0];
         producer = std::make_shared<DefaultMQProducer>("GID_cpp_live_ce_pg_" + stamp);
@@ -161,8 +161,8 @@ struct Fixture {
 
     std::string topic() const { return "CppLiveCe" + stamp; }
 
-    // 已提交位点之和（业务 topic 只有 1 个队列；路由上查全，别拿"主 topic 有 4 个队列"
-    // 的假设硬套）。broker 查无记录 → 返回 -1。
+    // Sum of committed offsets (the business topic has only 1 queue; query every queue from the route and
+    // do not force the assumption that 'the main topic has 4 queues'). No record on the broker -> return -1.
     int64_t committedOffset(const std::string& group, const std::string& topicName) {
         TopicRouteData route = admin.examineTopicRoute(topicName);
         const std::vector<MessageQueue> mqs = route.getAllMessageQueue(topicName);
@@ -207,10 +207,10 @@ int main(int argc, char* argv[]) {
     try {
         fx.start(nsAddr);
     } catch (const std::exception& e) {
-        check("集群探活", false, e.what());
+        check("cluster reachability probe", false, e.what());
         return 1;
     }
-    check("集群探活", true, "broker=" + fx.brokerAddr);
+    check("cluster reachability probe", true, "broker=" + fx.brokerAddr);
 
     const std::string topic = fx.topic();
     const std::string group = "GID_cpp_live_ce_" + fx.stamp;
@@ -233,7 +233,7 @@ int main(int argc, char* argv[]) {
         consumer->subscribe(topic, "*");
         consumer->start();
 
-        // ---------- A0 业务队列（排除 %RETRY%） ----------
+        // ---------- A0 business queue (exclude %RETRY%) ----------
         std::string bizKey;
         const bool assigned = waitUntil(
             [&] {
@@ -246,18 +246,18 @@ int main(int argc, char* argv[]) {
                 return false;
             },
             30000);
-        check("A0-业务队列已分配（%RETRY% 队列不算）", assigned, "key=" + bizKey);
+        check("A0-business queue assigned (%RETRY% queues do not count)", assigned, "key=" + bizKey);
         if (!assigned) {
-            throw std::runtime_error("业务队列未分配");
+            throw std::runtime_error("business queue not assigned");
         }
 
-        // ---------- A1 基线：第一投挂住 ----------
+        // ---------- A1 baseline: the first delivery hangs ----------
         Message msg(topic, body);
         fx.producer->send(msg);
         const bool firstOk = listener->waitFirst(30000);
-        check("A1-首投在 30s 内到达并挂住", firstOk, "calls=" + std::to_string(listener->calls()));
+        check("A1-first delivery arrived within 30 s and hung", firstOk, "calls=" + std::to_string(listener->calls()));
         const auto first = listener->times(body);
-        check("A1-首投 reconsumeTimes=0", !first.empty() && first[0].first == 0,
+        check("A1-first delivery has reconsumeTimes=0", !first.empty() && first[0].first == 0,
               "times=" + std::to_string(first.empty() ? -1 : first[0].first));
         bool registered = false;
         std::string stampSeen;
@@ -267,24 +267,24 @@ int main(int argc, char* argv[]) {
                 stampSeen = m.getProperty(MessageConst::PROPERTY_CONSUME_START_TIMESTAMP);
             }
         }
-        check("A1-挂住期间消息登记在册（在 listener 手里）", registered);
-        check("A1-在册副本带本轮 CONSUME_START_TIME（清扫靠它判过期）", !stampSeen.empty(),
+        check("A1-message registered while the listener hangs (still in its hands)", registered);
+        check("A1-registered copy carries CONSUME_START_TIME of this round (the sweep uses it to detect expiry)", !stampSeen.empty(),
               "stamp=" + stampSeen);
 
-        // ---------- A2 清扫命中：listener 还挂着，登记里已经没了 ----------
+        // ---------- A2 sweep hits: the listener still hangs, but the registry no longer holds the message ----------
         const int64_t t0 = nowMs();
         const bool swept = waitUntil(
             [&] { return !containsBody(consumer->processQueueEntries(bizKey), body); },
             210000, 1000);
         const double elapsed = static_cast<double>(nowMs() - t0) / 1000.0;
-        check("A2-清扫在 listener 仍挂起时收走了这条消息（约 start+120s）", swept,
+        check("A2-sweep took the message away while the listener was still hung (about start+120 s)", swept,
               "elapsed=" + std::to_string(elapsed) + "s calls=" +
                   std::to_string(listener->calls()));
-        check("A2-收走时间晚于一个清扫阈值（>60s，排除别的路径动手）", elapsed > 60.0,
+        check("A2-removal happened later than one sweep threshold (>60 s, rules out other paths acting)", elapsed > 60.0,
               "elapsed=" + std::to_string(elapsed) + "s");
 
-        // ---------- A3 回投真的到了 broker：%RETRY% 缓冲里出现 ----------
-        // 挂起的 listener 把分发线程占住，重投消息只能停在 %RETRY% 队列的本地缓冲里。
+        // ---------- A3 the back-send really reached the broker: it shows up in the %RETRY% buffer ----------
+        // The hung listener occupies the dispatch thread, so the redelivered message can only sit in the local buffer of the %RETRY% queue.
         std::string retryKeyFound;
         const bool back = waitUntil(
             [&] {
@@ -296,56 +296,56 @@ int main(int argc, char* argv[]) {
                 return false;
             },
             40000, 1000);
-        check("A3-回投消息出现在 " + retryTopic +
-                  " 的本地缓冲（broker 真收到了 sendMessageBack）",
+        check("A3-redelivered message appears in the local buffer of " + retryTopic +
+                  " (the broker really received sendMessageBack)",
               back, "retryKey=" + retryKeyFound);
 
-        // ---------- A4 放行：重投被重新消费 ----------
+        // ---------- A4 release: the redelivery is consumed again ----------
         listener->release();
         const bool second = waitUntil([&] { return listener->times(body).size() >= 2; }, 60000, 1000);
         auto times = listener->times(body);
-        check("A4-放行后重新消费到（reconsumeTimes=1）", second,
+        check("A4-reconsumed after release (reconsumeTimes=1)", second,
               "times=" + std::to_string(times.size()));
-        check("A4-第二次投递 reconsumeTimes=1（broker 侧重投计数）",
+        check("A4-second delivery has reconsumeTimes=1 (broker-side redelivery counter)",
               times.size() >= 2 && times[1].first == 1,
               "times=" + std::to_string(times.size() >= 2 ? times[1].first : -1));
-        check("A4-同一条 body 全程只到两次（清算一次回投，无重复投递）", times.size() == 2,
+        check("A4-the same body arrives exactly twice overall (one clean redelivery, no duplicate delivery)", times.size() == 2,
               "times=" + std::to_string(times.size()));
-        check("A4-第二次投递与首投相隔 >60s（不是 listener 自己造成的重投）",
+        check("A4-second delivery is more than 60 s after the first (not a redelivery caused by the listener itself)",
               times.size() >= 2 && (times[1].second - times[0].second) > 60000,
               "gap=" + std::to_string(times.size() >= 2
                                           ? (times[1].second - times[0].second) / 1000
                                           : -1) +
                   "s");
 
-        // ---------- A5 位点收尾 ----------
+        // ---------- A5 offset wrap-up ----------
         const bool offsetOk = waitUntil([&] { return fx.committedOffset(group, topic) == 1; },
                                         30000, 1000);
-        check("A5-挂住的 listener 返回后业务队列位点走到 1（removeMessage 含已清扫条目）",
+        check("A5-business queue offset advances to 1 after the hung listener returns (removeMessage includes swept entries)",
               offsetOk, "offset=" + std::to_string(fx.committedOffset(group, topic)));
     } catch (const std::exception& e) {
-        check("验证过程抛出异常", false, e.what());
+        check("the verification threw an exception", false, e.what());
     }
 
-    // ---------------- 清理 ----------------
+    // ---------------- cleanup ----------------
     listener->release();
     if (consumer) {
         try {
             consumer->shutdown();
         } catch (const std::exception& e) {
-            std::printf("    (consumer shutdown 失败: %s)\n", e.what());
+            std::printf("    (consumer shutdown failed: %s)\n", e.what());
         }
     }
     try {
         fx.admin.deleteTopic(topic);
         std::printf("    (deleteTopic(%s) OK)\n", topic.c_str());
     } catch (const std::exception& e) {
-        std::printf("    (deleteTopic(%s) 失败: %s)\n", topic.c_str(), e.what());
+        std::printf("    (deleteTopic(%s) failed: %s)\n", topic.c_str(), e.what());
     }
     try {
         fx.admin.deleteSubscriptionGroup(fx.brokerAddr, group, true);
     } catch (const std::exception& e) {
-        std::printf("    (deleteSubscriptionGroup(%s) 失败: %s)\n", group.c_str(), e.what());
+        std::printf("    (deleteSubscriptionGroup(%s) failed: %s)\n", group.c_str(), e.what());
     }
     fx.shutdown();
 

@@ -1,17 +1,17 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// 仅供 win_syntax_check.sh 使用（通过 -include 强制先包含）。
+// Used only by win_syntax_check.sh (force-included via -include).
 //
-// 背景：本机 Apple libc++ 的 win32 locale 支持
-// （__support/win32/locale_win32.h）假定 CRT 会像 MSVC 那样提供带下划线前缀的
-// `_islower_l` / `_isupper_l` / `_isdigit_l` / `_isxdigit_l`。mingw-w64 的头文件
-// **没有**这些声明，于是 libc++ 的 <locale> 无法编译。
+// Background: the host Apple libc++ win32 locale support
+// (__support/win32/locale_win32.h) assumes the CRT provides underscore-prefixed
+// `_islower_l` / `_isupper_l` / `_isdigit_l` / `_isxdigit_l` the way MSVC does. mingw-w64 headers
+// **do not** carry these declarations, so libc++'s <locale> fails to compile.
 //
-// 这是"mingw 头 + 面向 MSVC 的 libc++"这一组合的产物，**与被检查的代码无关**：
-// 真正的 mingw 工具链用 mingw 自己的 libstdc++，不存在此问题。
-// 补上声明只是为了让自有代码能通过完整体检。
+// This is an artifact of the "mingw headers + MSVC-targeted libc++" combination and is
+// **unrelated to the code under check**: a real mingw toolchain uses mingw's own libstdc++,
+// so the problem does not arise there. Adding the declarations only lets our code pass the full check.
 //
-// 先包含 <locale.h> 以获得 mingw 的 `_locale_t` 定义。
+// Include <locale.h> first to get mingw's `_locale_t` definition.
 // ---------------------------------------------------------------------------
 #include <locale.h>
 

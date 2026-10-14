@@ -1,4 +1,4 @@
-# 构建产物
+# Build outputs
 build/
 build-*/
 out/
@@ -19,7 +19,7 @@ x64/
 Debug/
 Release/
 
-# 编译中间产物 / 库
+# Compile intermediates / libraries
 *.o
 *.obj
 *.pdb
@@ -32,7 +32,7 @@ Release/
 *.exe
 *.dll
 
-# 编辑器
+# Editors
 .idea/
 .vscode/
 *.swp

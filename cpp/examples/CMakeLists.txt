@@ -1,165 +1,165 @@
-# 自检二进制：协议层往返自检（不依赖真实集群）
+# Self-check binary: protocol-layer round-trip self-check (does not depend on a real cluster)
 add_executable(rmq_selfcheck selfcheck.cpp)
 target_link_libraries(rmq_selfcheck PRIVATE rocketmq::remoting)
 
-# 互操作工具：与 Python 参考客户端做跨语言编解码交叉验证
+# Interop tool: cross-language encode/decode cross-validation against the Python reference client
 add_executable(rmq_interop interop_tool.cpp)
 target_link_libraries(rmq_interop PRIVATE rocketmq::remoting)
 
-# 真实集群消息类型联调（需先起 nameServer+broker；不打进 ctest）
+# Real-cluster message-type integration (requires nameServer+broker up first; not packed into ctest)
 add_executable(rmq_live_message_types live_message_types.cpp)
 target_link_libraries(rmq_live_message_types PRIVATE rocketmq::remoting)
 
 add_executable(rmq_live_redelivery live_redelivery.cpp)
 target_link_libraries(rmq_live_redelivery PRIVATE rocketmq::remoting)
 
-# 真实集群管理端联调（需先起 nameServer+broker；不打进 ctest）
+# Real-cluster admin-side integration (requires nameServer+broker up first; not packed into ctest)
 add_executable(rmq_admin_live admin_live.cpp)
 target_link_libraries(rmq_admin_live PRIVATE rocketmq::remoting)
 
-# 批量 admin 方法真机联调（不打进 ctest）
+# Batch admin-method real-machine integration (not packed into ctest)
 add_executable(rmq_admin_batch_live admin_batch_live.cpp)
 target_link_libraries(rmq_admin_batch_live PRIVATE rocketmq::remoting)
 
-# 真实集群自动压缩联调（自产自销 + 跨客户端互通；不打进 ctest）
+# Real-cluster auto-compression integration (self-produce/self-consume + cross-client interop; not packed into ctest)
 add_executable(rmq_compression_live compression_live.cpp)
 target_link_libraries(rmq_compression_live PRIVATE rocketmq::remoting)
 
-# ACL 鉴权真机联调（需 broker 开 authenticationEnabled；不打进 ctest）
+# ACL authentication real-machine integration (requires the broker to enable authenticationEnabled; not packed into ctest)
 add_executable(rmq_live_acl live_acl.cpp)
 target_link_libraries(rmq_live_acl PRIVATE rocketmq::remoting)
 
-# TLS + traceparent 真机联调（需 broker 开 tls.test.mode.enable；不打进 ctest）
+# TLS + traceparent real-machine integration (requires the broker to enable tls.test.mode.enable; not packed into ctest)
 add_executable(rmq_live_tls live_tls.cpp)
 target_link_libraries(rmq_live_tls PRIVATE rocketmq::remoting)
 
-# #25 负探针：严格 CA 校验下信任错误 CA，producer 报错必须带 CA/证书标记
-# （route fetch failed 穿线；不打进 ctest）
+# #25 negative probe: under strict CA validation, trusting a wrong CA must make the producer error carry a CA/certificate marker
+# (route fetch failed threaded through; not packed into ctest)
 add_executable(rmq_live_tls_negative live_tls_negative.cpp)
 target_link_libraries(rmq_live_tls_negative PRIVATE rocketmq::remoting)
 
-# 主动拉取消费者（DefaultMQPullConsumer）真机联调
+# Active-pull consumer (DefaultMQPullConsumer) real-machine integration
 add_executable(rmq_live_pull live_pull.cpp)
 target_link_libraries(rmq_live_pull PRIVATE rocketmq::remoting)
 
-# 静态主题真机腿（七端口径：513 建topic + 端点推导 + 实例重写 + 端到端收发）
+# Static-topic real-machine leg (seven conventions: 513 topic creation + endpoint derivation + instance rewrite + end-to-end send/recv)
 add_executable(rmq_live_static_topic live_static_topic.cpp)
 target_link_libraries(rmq_live_static_topic PRIVATE rocketmq::remoting)
 
-# 轻量拉取消费者（DefaultLitePullConsumer）真机联调：subscribe/assign 双模式 + poll
+# Lite-pull consumer (DefaultLitePullConsumer) real-machine integration: subscribe/assign dual mode + poll
 add_executable(rmq_live_lite_pull live_lite_pull.cpp)
 target_link_libraries(rmq_live_lite_pull PRIVATE rocketmq::remoting)
 
-# lite-pull 拉取游标真机验证（#105：NO_MATCHED_MSG 跟过整段 + OFFSET_ILLEGAL 越界自愈）
+# lite-pull cursor real-machine verification (#105: NO_MATCHED_MSG following past a whole span + OFFSET_ILLEGAL out-of-range self-healing)
 add_executable(rmq_live_lite_pull_cursor live_lite_pull_cursor.cpp)
 target_link_libraries(rmq_live_lite_pull_cursor PRIVATE rocketmq::remoting)
 
-# lite-pull 请求码/broker 开关真机验证（#107：361 + LITE_PULL_MESSAGE 位 + litePullMessageEnable）
+# lite-pull request codes/broker switch real-machine verification (#107: 361 + the LITE_PULL_MESSAGE bit + litePullMessageEnable)
 add_executable(rmq_live_lite_pull_code live_lite_pull_code.cpp)
 target_link_libraries(rmq_live_lite_pull_code PRIVATE rocketmq::remoting)
 
-# lite-pull topic 队列集合变更监听真机验证（检查周期 1s + 真实扩缩容 ⇒ 证明比对趟次现查路由）
+# lite-pull topic queue-set change listener real-machine verification (1s check period + real scale up/down => proves each comparison pass re-queries the route)
 add_executable(rmq_live_lite_topic_queue_change live_lite_topic_queue_change.cpp)
 target_link_libraries(rmq_live_lite_topic_queue_change PRIVATE rocketmq::remoting)
 
-# Request-Reply（5.x）真机联调（请求 → 应答 → 326 推回；不打进 ctest）
+# Request-Reply (5.x) real-machine integration (request -> reply -> 326 push-back; not packed into ctest)
 add_executable(rmq_live_request_reply live_rr.cpp)
 target_link_libraries(rmq_live_request_reply PRIVATE rocketmq::remoting)
 
-# 发送延迟故障容错真机联调（默认关/开、隔离退化链、到期恢复；不打进 ctest）
+# Send-latency fault tolerance real-machine integration (default off/on, isolation degradation chain, recover on expiry; not packed into ctest)
 add_executable(rmq_live_latency live_latency.cpp)
 target_link_libraries(rmq_live_latency PRIVATE rocketmq::remoting)
 
-# POP 模式（5.x 轻量消费）真机联调：POP/ACK/延长不可见时间/复活重投（不打进 ctest）
+# POP mode (5.x lightweight consumption) real-machine integration: POP/ACK/extend invisible time/revive redelivery (not packed into ctest)
 add_executable(rmq_live_pop live_pop.cpp)
 target_link_libraries(rmq_live_pop PRIVATE rocketmq::remoting)
 
-# POP **消费侧**真机联调（消费循环 + ack + 延长不可见时间；不打进 ctest）
+# POP **consumer side** real-machine integration (consume loop + ack + extend invisible time; not packed into ctest)
 add_executable(rmq_live_pop_consumer live_pop_consumer.cpp)
 target_link_libraries(rmq_live_pop_consumer PRIVATE rocketmq::remoting)
 
-# 消息轨迹真机联调（需 broker traceTopicEnable=true；不打进 ctest）
+# Message trace real-machine integration (requires broker traceTopicEnable=true; not packed into ctest)
 add_executable(rmq_live_trace live_trace.cpp)
 target_link_libraries(rmq_live_trace PRIVATE rocketmq::remoting)
 
-# 钩子真机联调：CheckForbiddenHook 拦截 + FilterMessageHook 拉取/POP 两条路径（不打进 ctest）
+# Hook real-machine integration: CheckForbiddenHook interception + FilterMessageHook pull/POP two paths (not packed into ctest)
 add_executable(rmq_live_hook live_hook.cpp)
 target_link_libraries(rmq_live_hook PRIVATE rocketmq::remoting)
 
 
-# 名字校验（Validators/TopicValidator）真机联调：本地快拒 + 合法名字照常收发 + 往返对照（不打进 ctest）
+# Name validation (Validators/TopicValidator) real-machine integration: local fast-reject + legal names send/recv as usual + round-trip comparison (not packed into ctest)
 add_executable(rmq_validators_live validators_live.cpp)
 target_link_libraries(rmq_validators_live PRIVATE rocketmq::remoting)
 
-# 定时消息撤回（370）真机联调：句柄往返 + 撤回后到点不投递 + broker 开关还原（不打进 ctest）
+# Scheduled-message recall (370) real-machine integration: handle round-trip + after recall it is not delivered at the due time + broker switch restored (not packed into ctest)
 add_executable(rmq_recall_live recall_live.cpp)
 target_link_libraries(rmq_recall_live PRIVATE rocketmq::remoting)
 
-# unitName / unitMode / enableStreamRequestType 真机联调：clientId 后缀 + broker 侧单元位（不打进 ctest）
+# unitName / unitMode / enableStreamRequestType real-machine integration: clientId suffix + the broker-side unit bit (not packed into ctest)
 add_executable(rmq_live_unit_config live_unit_config.cpp)
 target_link_libraries(rmq_live_unit_config PRIVATE rocketmq::remoting)
 
-# SQL92 过滤 + CHECK_CLIENT_CONFIG(46) 真机联调（需 broker enablePropertyFilter=true；不打进 ctest）
+# SQL92 filtering + CHECK_CLIENT_CONFIG(46) real-machine integration (requires broker enablePropertyFilter=true; not packed into ctest)
 add_executable(rmq_sql92_live sql92_live.cpp)
 target_link_libraries(rmq_sql92_live PRIVATE rocketmq::remoting)
 
-# 异步发送背压（两个公平信号量）真机联调：限流文案 + broker 侧对账 + 运行时扩容（不打进 ctest）
+# Async-send backpressure (two fair semaphores) real-machine integration: throttle wording + broker-side reconciliation + runtime scale-up (not packed into ctest)
 add_executable(rmq_live_backpressure live_backpressure.cpp)
 target_link_libraries(rmq_live_backpressure PRIVATE rocketmq::remoting)
 
-# 异步发送内核（准备段/回调线程口径、并发不串台、定点/拦截/批量/关池排空）真机联调（不打进 ctest）
+# Async-send kernel (the prepare-section/callback-thread conventions, concurrency without cross-talk, pinned/intercepted/batched/closed-pool drain) real-machine integration (not packed into ctest)
 add_executable(rmq_live_async_send live_async_send.cpp)
 target_link_libraries(rmq_live_async_send PRIVATE rocketmq::remoting)
 
-# 发送头 c/d/n 三个字段真机联调（模板 topic 决定自动建出来的队列数；不打进 ctest）
+# Send-header c/d/n three fields real-machine integration (the template topic decides the auto-created queue count; not packed into ctest)
 add_executable(rmq_live_send_header live_send_header.cpp)
 target_link_libraries(rmq_live_send_header PRIVATE rocketmq::remoting)
 
-# 拉取前流控五个阈值真机联调：闸门真会命中 + 命中之后一条不丢（不打进 ctest）
+# The five pre-pull flow-control thresholds real-machine integration: the gate really gets hit + after a hit not one message is lost (not packed into ctest)
 add_executable(rmq_live_flow_control live_flow_control.cpp)
 target_link_libraries(rmq_live_flow_control PRIVATE rocketmq::remoting)
 
-# 生产者退出注销 UNREGISTER_CLIENT(35) 真机联调：抓帧证明线上走了这一发 + 204 前后对比（不打进 ctest）
+# Producer shutdown unregister UNREGISTER_CLIENT(35) real-machine integration: frame capture proves this one went online + 204 before/after comparison (not packed into ctest)
 add_executable(rmq_live_producer_unregister live_producer_unregister.cpp)
 target_link_libraries(rmq_live_producer_unregister PRIVATE rocketmq::remoting)
 
-# broker 真死掉时在途请求立刻判死（failFast）真机联调：会停一次 broker 再拉起（不打进 ctest）
+# When a broker really dies, in-flight requests are judged dead immediately (failFast) real-machine integration: stops the broker once then brings it back up (not packed into ctest)
 add_executable(rmq_live_fail_fast live_fail_fast.cpp)
 target_link_libraries(rmq_live_fail_fast PRIVATE rocketmq::remoting)
 
-# 路由刷新周期 / 位点落盘周期真机联调：两个实例不同周期，缓存/位点何时动（不打进 ctest）
+# Route-refresh period / offset-persist period real-machine integration: two instances with different periods, when do the cache/offset move (not packed into ctest)
 add_executable(rmq_live_scheduled_intervals live_scheduled_intervals.cpp)
 target_link_libraries(rmq_live_scheduled_intervals PRIVATE rocketmq::remoting)
 
-# 后置订阅立即生效真机联调：subscribe 之后 broker 的 topic→group 表立刻登记本组（不打进 ctest）
+# Post-hoc subscribe takes effect immediately real-machine integration: after subscribe the broker's topic->group table registers this group at once (not packed into ctest)
 add_executable(rmq_live_subscribe live_subscribe.cpp)
 target_link_libraries(rmq_live_subscribe PRIVATE rocketmq::remoting)
 
-# 定点发送 topic 一致性守卫真机联调：拒在本端（broker 上 maxOffset 不动），放行腿照常收齐（不打进 ctest）
+# Pinned-send topic consistency guard real-machine integration: rejected on this end (broker maxOffset does not move), the allowed leg receives all as usual (not packed into ctest)
 add_executable(rmq_live_pinned_guard live_pinned_guard.cpp)
 target_link_libraries(rmq_live_pinned_guard PRIVATE rocketmq::remoting)
 
-# 空应答（NO_NEW_MSG/NO_MATCHED_MSG）位点修正真机联调：零投递但 broker 侧位点前移（不打进 ctest）
+# Empty-reply (NO_NEW_MSG/NO_MATCHED_MSG) offset correction real-machine integration: zero delivery but the broker-side offset advances (not packed into ctest)
 add_executable(rmq_live_correct_tags_offset live_correct_tags_offset.cpp)
 target_link_libraries(rmq_live_correct_tags_offset PRIVATE rocketmq::remoting)
 
-# OFFSET_ILLEGAL 纠错真机联调：整批作废在途/缓冲消息 + 按修正位点重建 + 立即落盘（不打进 ctest）
+# OFFSET_ILLEGAL recovery real-machine integration: discard the whole batch's in-flight/buffered messages + rebuild by the corrected offset + persist immediately (not packed into ctest)
 add_executable(rmq_live_offset_illegal live_offset_illegal.cpp)
 target_link_libraries(rmq_live_offset_illegal PRIVATE rocketmq::remoting)
 
-# 220 重置消费位点真机联调：broker 推 220 后立刻落盘 + 在途批次作废 + 队列按新位点重建（不打进 ctest）
+# 220 reset-consumer-offset real-machine integration: after the broker pushes 220 it persists at once + in-flight batches discarded + queue rebuilt at the new offset (not packed into ctest)
 add_executable(rmq_live_reset_offset live_reset_offset.cpp)
 target_link_libraries(rmq_live_reset_offset PRIVATE rocketmq::remoting)
 
-# 拉模式消费者心跳真机联调：203/38 可见性 + consumeType/consumeFromWhere/订阅表 + 35 立刻注销（不打进 ctest）
+# Pull-mode consumer heartbeat real-machine integration: 203/38 visibility + consumeType/consumeFromWhere/subscription table + 35 unregister immediately (not packed into ctest)
 add_executable(rmq_live_pull_heartbeat live_pull_heartbeat.cpp)
 target_link_libraries(rmq_live_pull_heartbeat PRIVATE rocketmq::remoting)
 
-# 发布路由跳过没有 master 的 broker 真机联调：停一次 master，发布队列归零/订阅不变/从节点收消息（不打进 ctest）
+# Publish route skipping a broker with no master real-machine integration: stop a master once, publish queues go to zero/subscription unchanged/slave receives messages (not packed into ctest)
 add_executable(rmq_live_publish_route_master live_publish_route_master.cpp)
 target_link_libraries(rmq_live_publish_route_master PRIVATE rocketmq::remoting)
 
-# cleanExpiredMsg 挂起逃生口真机联调：listener 挂住 2 分钟 → 清扫回投 → %RETRY% 重投到达
-# （约 4 分钟，等两个清扫周期；不打进 ctest）
+# cleanExpiredMsg suspension escape hatch real-machine integration: the listener hangs for 2 minutes -> sweep redelivers -> the %RETRY% redelivery arrives
+# (about 4 minutes, waiting for two sweep periods; not packed into ctest)
 add_executable(rmq_live_clean_expired_msg live_clean_expired_msg.cpp)
 target_link_libraries(rmq_live_clean_expired_msg PRIVATE rocketmq::remoting)

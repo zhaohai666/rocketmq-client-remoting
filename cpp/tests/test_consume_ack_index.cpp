@@ -1,4 +1,4 @@
-// classic 并发消费路径的 ackIndex 语义单测 —— 不需要集群。
+// Unit tests for ackIndex semantics on the classic concurrent-consumption path - no cluster needed.
 #include <cstdio>
 #include <limits>
 #include <string>
@@ -75,19 +75,19 @@ private:
     bool thrown_;
 };
 
-// 一把「未 start」的消费者：sendMessageBack 必定失败（client() 抛 → 内部吞掉 → 返回
-// false），正是「回投失败不能推进位点」这条分支的夹具。
+// A consumer that was never started: sendMessageBack is guaranteed to fail (client() throws -> swallowed internally -> returns
+// false), exactly the fixture for the "failed redelivery must not advance the offset" branch.
 class Harness {
 public:
     explicit Harness(const std::string& model = MessageModel::CLUSTERING)
         : consumer_(kGroup), key_(DefaultMQPushConsumer::offsetKey(queue0())) {
         consumer_.setMessageModel(model);
-        // 真机里 dispatchLoop 是「先从缓冲取走本批、再消费」，所以 key 一定还在表里
-        //（可能还有余量）。回投失败要塞回的正是这张表；不预置就等于队列已被撤走。
+        // In a real run dispatchLoop first takes the batch out of the buffer, then consumes it, so the key is definitely still in the map
+        //(possibly with extra left). Failed redelivery must be pushed back into exactly this map; not pre-setting it means the queue was already removed.
         consumer_.setPendingMessages(key_, {});
     }
 
-    // 返回 consumeBatch 的结果（true = 位点前进了）
+    // Returns the consumeBatch result (true = the offset advanced)
     bool run(const std::vector<MessageExt>& batch, ConsumeConcurrentlyStatus status,
              int32_t ackIndex, bool thrown = false) {
         consumer_.setMessageListener(
@@ -99,7 +99,7 @@ public:
     std::optional<int64_t> offset() const { return consumer_.consumeOffset(key_); }
     int64_t consumedCount() const { return consumer_.consumedCount(); }
 
-    // 队首缓冲的 (queueOffset, reconsumeTimes) 列表，便于一次性比对
+    // (queueOffset, reconsumeTimes) list of the front buffer, for one-shot comparison
     std::vector<std::pair<int64_t, int32_t>> pendingShape() const {
         std::vector<std::pair<int64_t, int32_t>> out;
         for (const MessageExt& m : pending()) {
@@ -143,7 +143,7 @@ void testContextDefault() {
 
 void testConsumeSuccess() {
     {
-        // 默认（不碰 ackIndex）：一条都不回投，位点整批前进
+        // Default (ackIndex untouched): no redelivery at all, offset advances by the whole batch
         Harness h;
         const bool advanced = h.run(offsetBatch(3), ConsumeConcurrentlyStatus::CONSUME_SUCCESS,
                                     AckListener::kNoAckIndex);
@@ -171,7 +171,7 @@ void testConsumeSuccess() {
                std::to_string(h.consumedCount()));
     }
     {
-        // ackIndex=-1（listener 显式不认可任何一条）：整批回投，位点原地不动
+        // ackIndex=-1 (listener explicitly acknowledges none): whole batch redelivered, offset frozen in place
         Harness h;
         h.run(offsetBatch(3), ConsumeConcurrentlyStatus::CONSUME_SUCCESS, -1);
         expectShape(h, {{0, 1}, {1, 1}, {2, 1}}, "success.none.requeued");
@@ -180,7 +180,7 @@ void testConsumeSuccess() {
         expect(h.consumedCount() == 0, "success.none.count", std::to_string(h.consumedCount()));
     }
     {
-        // 尾巴里的中间那条回投失败也要钳住（这里离线全失败，检查顺序与条数）
+        // A failed redelivery of a middle item inside the tail must still clamp (offline all deliveries fail here; check order and count)
         Harness h;
         h.run(offsetBatch(2), ConsumeConcurrentlyStatus::CONSUME_SUCCESS, 0);
         expectShape(h, {{1, 1}}, "success.tail1.requeued");
@@ -216,7 +216,7 @@ void testBroadcasting() {
         expect(h.consumedCount() == 3, "broadcast.count", std::to_string(h.consumedCount()));
     }
     {
-        // 广播 + RECONSUME_LATER：同样前进（不回投是本地的既定语义）
+        // BROADCASTING + RECONSUME_LATER: still advances (not redelivering is the established local semantics)
         Harness h(MessageModel::BROADCASTING);
         expect(h.run(offsetBatch(2), ConsumeConcurrentlyStatus::RECONSUME_LATER,
                      AckListener::kNoAckIndex),

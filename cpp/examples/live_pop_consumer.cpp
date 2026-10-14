@@ -1,16 +1,16 @@
-// 与 rmq_live_pop（协议管道）的区别：这里验证**消费循环** ——
-//   POP 弹出 → 投递 listener → 成功则 ack、失败则延长不可见时间 → 不重复投递。
-// 消费循环不查/不提交消费位点，进度完全由 broker 的 checkpoint 跟踪。
+// Difference from rmq_live_pop (protocol plumbing): this verifies the **consume loop** --
+//   POP pops -> deliver to the listener -> ack on success, extend the invisible time on failure -> no duplicate delivery.
+// The consume loop neither queries nor commits consumer offsets; progress is tracked entirely by the broker's checkpoint.
 //
-// 场景：
-//   S1 POP 消费：起消费者 → 发 12 条 → 全部收到、无重复、body 集合一致
-//   S2 ack 生效：收满后再观察一段时间（> invisibleTime）→ 不应被重复投递
-//   S3 RECONSUME_LATER：listener 持续返回 RECONSUME_LATER → 按延迟档位重新投递
-//   S4 多队列：消息确实落到了多个队列且都被消费（POP 是逐队列弹的）
-//   S5 拉取统计：POP 路径也要把 pullRT/pullTPS 记进状态表（307 statusTable 非 0）
+// Scenarios:
+//   S1 POP consuming: start the consumer -> send 12 messages -> all received, no duplicates, body sets match
+//   S2 ack really works: after receiving them all keep observing for a while (> invisibleTime) -> no redelivery expected
+//   S3 RECONSUME_LATER: the listener keeps returning RECONSUME_LATER -> redelivery per delay level
+//   S4 multi-queue: messages really land on several queues and all are consumed (POP pops queue by queue)
+//   S5 pull statistics: the POP path must also record pullRT/pullTPS into the status table (307 statusTable non-zero)
 //
-// ⚠ S2 的观测窗口必须 > popInvisibleTime，否则"ack 完全没发出去"也看不出重复投递
-//   （消息还没到复活时间）——这是最容易伪装成通过的假绿。
+// ⚠ S2's observation window must be > popInvisibleTime, otherwise even "the ack never went out" would show no duplicate delivery
+//   (the message has not reached its revival time yet) -- this is the false green most easily disguised as a pass.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -98,9 +98,9 @@ int main(int argc, char* argv[]) {
     prepareTopic(prep, topicStats, 4);
     prep.shutdown();
 
-    // ---------------- S1 / S2 / S4：正常消费 + ack ----------------
+    // ---------------- S1 / S2 / S4: normal consuming + ack ----------------
     {
-        std::printf("=== S1 POP 消费（全收 + 无重复）===\n");
+        std::printf("=== S1 POP consuming (all received + no duplicates) ===\n");
         std::mutex mtx;
         std::vector<std::string> got;
         std::set<int32_t> queues;
@@ -130,11 +130,11 @@ int main(int argc, char* argv[]) {
         consumer->setPopMode(true);
         consumer->setConsumeThreadNums(4);
         consumer->setConsumeMessageBatchMaxSize(4);
-        // ⚠ 故意压到 10s：让"没 ack → invisibleTime 到期复活重投"在观测窗口内来得及暴露
+        // ⚠ deliberately squeezed to 10 s: so that "no ack -> revival redelivery when invisibleTime expires" has time to surface inside the observation window
         consumer->setPopInvisibleTime(10000);
         consumer->setMessageListener(std::make_shared<L>(mtx, got, queues));
         consumer->subscribe(topic);
-        // 先起消费者再发消息（见项目约定）
+        // Start the consumer before sending the messages (see the project convention)
         consumer->start();
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
@@ -157,32 +157,32 @@ int main(int argc, char* argv[]) {
                 return static_cast<int32_t>(got.size()) >= nMsg;
             },
             30000);
-        // 必须 > popInvisibleTime(10s)，否则 ack 没发也看不出重复投递
+        // Must be > popInvisibleTime (10 s), otherwise a missing ack would show no duplicate delivery
         std::this_thread::sleep_for(std::chrono::seconds(16));
 
         std::set<std::string> gotSet;
         {
             std::lock_guard<std::mutex> lk(mtx);
             gotSet.insert(got.begin(), got.end());
-            check("S1a 全部消息被消费", all && static_cast<int32_t>(got.size()) >= nMsg,
+            check("S1a all messages were consumed", all && static_cast<int32_t>(got.size()) >= nMsg,
                   "received=" + std::to_string(got.size()) + "/" + std::to_string(nMsg));
-            check("S1b body 集合与发送一致", gotSet == sent,
+            check("S1b the body set matches what was sent", gotSet == sent,
                   "got=" + std::to_string(gotSet.size()) + " sent=" + std::to_string(sent.size()));
-            check("S2a 无重复投递", gotSet.size() == got.size(),
+            check("S2a no duplicate delivery", gotSet.size() == got.size(),
                   "received=" + std::to_string(got.size())
                       + " unique=" + std::to_string(gotSet.size()));
-            check("S2b 观察期内没有新增投递", static_cast<int32_t>(got.size()) == nMsg,
+            check("S2b no new deliveries during the observation window", static_cast<int32_t>(got.size()) == nMsg,
                   "received=" + std::to_string(got.size()));
-            check("S4 消息分布在多个队列且都被消费", queues.size() > 1,
+            check("S4 messages spread over multiple queues and all were consumed", queues.size() > 1,
                   "queues=" + std::to_string(queues.size()));
         }
         consumer->shutdown();
         producer.shutdown();
     }
 
-    // ---------------- S3：RECONSUME_LATER → 延迟后重投 ----------------
+    // ---------------- S3: RECONSUME_LATER -> redelivery after a delay ----------------
     {
-        std::printf("=== S3 RECONSUME_LATER → 延迟后重投 ===\n");
+        std::printf("=== S3 RECONSUME_LATER -> redelivery after a delay ===\n");
         std::mutex mtx;
         std::vector<std::string> keys;
 
@@ -235,10 +235,10 @@ int main(int argc, char* argv[]) {
             std::lock_guard<std::mutex> lk(mtx);
             firstRound = keys.size();
         }
-        check("S3a 首轮投递 3 条", first && firstRound >= 3, "count=" + std::to_string(firstRound));
+        check("S3a the first round delivered 3 messages", first && firstRound >= 3, "count=" + std::to_string(firstRound));
 
-        // ⚠ 断言的是"每条都重投过"，不是"又多收了 3 次投递"：按条数算时，
-        // 某一条被重投 3 次而另一条从没回来也会通过。
+        // ⚠ the assertion is "every message was redelivered", not "3 more deliveries overall": judged by raw count,
+        // one message redelivered 3 times while another never came back would still pass.
         auto redeliveredKinds = [&]() {
             std::map<std::string, int32_t> seen;
             for (const std::string& k : keys) ++seen[k];
@@ -264,7 +264,7 @@ int main(int argc, char* argv[]) {
                 joined += (joined.empty() ? "" : ",") + k;
             }
         }
-        check("S3b 每条消费失败的消息都被重新投递（延长不可见时间生效）", again,
+        check("S3b every failed message was redelivered (extending the invisible time works)", again,
               "first=" + std::to_string(firstRound) + " redelivered=" + std::to_string(kinds)
                   + " deliveries=" + joined);
         c2->shutdown();
@@ -272,7 +272,7 @@ int main(int argc, char* argv[]) {
     }
 
     {
-        std::printf("=== S5 POP 循环把 pullRT/pullTPS 写进 307 状态表 ===\n");
+        std::printf("=== S5 the POP loop writes pullRT/pullTPS into the 307 status table ===\n");
         std::mutex mtx5;
         int32_t delivered5 = 0;
 
@@ -306,7 +306,7 @@ int main(int argc, char* argv[]) {
         p5.start();
         const int64_t began5 = stamp();
         int32_t rounds = 0;
-        while (stamp() - began5 < 26000) {  // 约 3 个采样周期
+        while (stamp() - began5 < 26000) {  // about 3 sampling periods
             for (int32_t i = 0; i < 4; i++) {
                 char buf[32];
                 std::snprintf(buf, sizeof(buf), "s5-%d-%d", rounds, i);
@@ -321,7 +321,7 @@ int main(int argc, char* argv[]) {
         DefaultMQAdminExt admin(pfx + "_admin5");
         admin.setNamesrvAddr(nsAddr);
         admin.start();
-        // 走 broker 转发到消费者本体的 307；失败当空表（下面的断言会把它显性化）
+        // 307 routed through the broker to the consumer itself; a failure is treated as an empty table (the assertions below make it visible)
         JsonValue status = JsonValue::makeObject();
         try {
             ConsumerRunningInfo ri = admin.examineConsumerRunningInfo(groupStats, c5->clientId());
@@ -335,16 +335,16 @@ int main(int argc, char* argv[]) {
         const double consumeOKTPS = cs.get("consumeOKTPS").doubleValue();
         std::printf("  sent=%d pullRT=%.2f pullTPS=%.4f consumeOKTPS=%.4f\n", sent5, pullRT,
                     pullTPS, consumeOKTPS);
-        check("S5a pullRT 非 0（POP 每次 FOUND 记一次拉取耗时）", pullRT > 0.0,
+        check("S5a pullRT is non-zero (every POP FOUND records one pull duration)", pullRT > 0.0,
               "pullRT=" + std::to_string(pullRT));
-        check("S5b pullTPS 非 0（按弹到的条数计）", pullTPS > 0.0,
+        check("S5b pullTPS is non-zero (counted by the number of popped messages)", pullTPS > 0.0,
               "pullTPS=" + std::to_string(pullTPS));
-        // 拉取侧与消费侧两格各自独立：只有 consumeOKTPS 有值而 pull* 全 0，正是
-        // POP 循环漏记拉取统计的特征形状。
-        check("S5c consumeOKTPS 同时非 0（两格各自独立上报）", consumeOKTPS > 0.0,
+        // The pull cell and the consume cell report independently: only consumeOKTPS having a value while pull* are all 0 is exactly
+        // the signature of a POP loop that forgets the pull statistics.
+        check("S5c consumeOKTPS is non-zero at the same time (both cells reported independently)", consumeOKTPS > 0.0,
               "consumeOKTPS=" + std::to_string(consumeOKTPS));
-        // 状态表非 0 只说明"计数被调用过"，还得确认这些统计对应的流量真被消费掉：
-        // 否则 pullTPS 可以靠一直接触到从未 ack 的消息刷高，看板上好看、实际在打转。
+        // A non-zero status table only proves "the counters were called"; we must also confirm the traffic behind these statistics really got
+        // consumed: otherwise pullTPS could be inflated by repeatedly popping messages that are never acked -- the dashboard looks good while it spins.
         bool consumed = waitUntil(
             [&]() {
                 std::lock_guard<std::mutex> lk(mtx5);
@@ -353,7 +353,7 @@ int main(int argc, char* argv[]) {
             20000);
         {
             std::lock_guard<std::mutex> lk(mtx5);
-            check("S5d 状态表背后的流量确实被消费了", consumed,
+            check("S5d the traffic behind the status table was really consumed", consumed,
                   "delivered=" + std::to_string(delivered5) + " sent=" + std::to_string(sent5));
         }
         c5->shutdown();

@@ -1,17 +1,17 @@
-// 拉模式消费者心跳真机联调（#98）：场景 A0–A6 逐条断言。
+// Pull-mode consumer heartbeat live-cluster verification (#98): assert scenarios A0-A6 one by one.
 //
-// 为什么必须真机：离线单测能证明「报文形状对」，但证明不了 broker 的 ConsumerManager 真的
-// 把本组登记进 consumerTable（broker 是按台建表的），也证明不了 35 注销之后立刻摘除。
-// 这三个观测点只有真 broker 有：
-//   * 203 examineConsumerConnectionInfo：组在不在、consumeType / consumeFromWhere /
-//     messageModel / subscriptionTable 是什么（AdminBrokerProcessor:1971 读的就是这些）；
-//   * 38 GET_CONSUMER_LIST_BY_GROUP：consumerTable 里的 clientId 列表（**裸 RPC**，
-//     组不在时 broker 直接回 "no consumer for this group"，不是空列表）；
-//   * shutdown → 35 之后 203 是否立刻查不到（不必等 ~120s 通道扫描）。
-// 反面对照：从未心跳过的幽灵组必须查不到 —— 否则说明判据本身是空转的。
+// Why a real cluster is required: offline unit tests can prove "the wire shape is right", but cannot prove the broker's ConsumerManager really
+// registers this group into consumerTable (the table is built per broker), nor that removal happens right after the 35 unregister.
+// Only a real broker offers these three observation points:
+//   * 203 examineConsumerConnectionInfo: whether the group is present and what consumeType / consumeFromWhere /
+//     messageModel / subscriptionTable are (these are exactly what AdminBrokerProcessor:1971 reads);
+//   * 38 GET_CONSUMER_LIST_BY_GROUP: the clientId list inside consumerTable (**bare RPC**,
+//     when the group is absent the broker answers "no consumer for this group" directly, not an empty list);
+//   * after shutdown -> 35, whether 203 stops finding the group immediately (without waiting out the ~120 s channel scan).
+// Negative control: a ghost group that never heartbeated must not be found -- otherwise the decision itself is spinning idle.
 //
-// 用法：./rmq_live_pull_heartbeat [namesrv] [masterAddr] [slaveAddr]
-//   默认 127.0.0.1:9876 / 127.0.0.1:10911 /（无从节点）
+// Usage: ./rmq_live_pull_heartbeat [namesrv] [masterAddr] [slaveAddr]
+//   defaults 127.0.0.1:9876 / 127.0.0.1:10911 / (no slave)
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -55,7 +55,7 @@ public:
                              const std::vector<MessageQueue>&) override {}
 };
 
-// 203 的原始答案：在线返回 true；组不在时 broker 抛 MQBrokerException → 当不在线。
+// The raw answer of 203: true when online; when the group is absent the broker throws MQBrokerException -> treat as offline.
 bool groupIsOnline(DefaultMQAdminExt& admin, const std::string& group, const std::string& addr,
                    ConsumerConnection& out, std::string& err) {
     try {
@@ -67,7 +67,7 @@ bool groupIsOnline(DefaultMQAdminExt& admin, const std::string& group, const std
     }
 }
 
-// 38 的原始答案：组不在时 broker 直接抛 "no consumer for this group"，当空列表。
+// The raw answer of 38: when the group is absent the broker throws "no consumer for this group" directly; treat as an empty list.
 std::vector<std::string> consumerIds(DefaultMQAdminExt& admin, const std::string& group,
                                      const std::string& addr, bool& ok) {
     ok = true;
@@ -110,10 +110,10 @@ int main(int argc, char* argv[]) {
                 topic.c_str(), group.c_str());
 
     try {
-        // ---- A0 建 topic ----
+        // ---- A0 create the topic ----
         admin.createTopicInBroker(master, topic, 4, 4, 6);
 
-        // ---- A1 起拉模式消费者并拉一轮 ----
+        // ---- A1 start the pull-mode consumer and pull one round ----
         consumer = new DefaultMQPullConsumer(group);
         consumer->setNamesrvAddr(nsAddr);
         consumer->setHeartbeatBrokerIntervalMillis(30000);
@@ -128,50 +128,50 @@ int main(int argc, char* argv[]) {
             pulled = true;
             pullStatus = pullStatusName(r.status);
         }
-        check("A1 拉模式消费者启动并成功拉取一轮",
+        check("A1 pull-mode consumer started and completed one pull",
               consumer->heartbeatCount() >= 1 && pulled,
               "queues=" + std::to_string(mqs.size()) + " status=" + pullStatus +
                   " heartbeats=" + std::to_string(consumer->heartbeatCount()));
 
-        // ---- A2 主节点 203 ----
+        // ---- A2 master-side 203 ----
         ConsumerConnection conn;
         std::string err;
         const bool online = groupIsOnline(admin, group, master, conn, err);
-        check("A2 主节点 203 查到本组（心跳已注册）", online,
+        check("A2 master 203 finds this group (registered via heartbeat)", online,
               "connections=" + std::to_string(conn.connectionSet.size()) +
                   (err.empty() ? "" : " err=" + err));
-        check("A2 消费类型是 CONSUME_ACTIVELY",
+        check("A2 consume type is CONSUME_ACTIVELY",
               online && conn.consumeType == ConsumeType::CONSUME_ACTIVELY,
               "consumeType=" + conn.consumeType);
-        check("A2 消费位点是 CONSUME_FROM_LAST_OFFSET",
+        check("A2 consume offset is CONSUME_FROM_LAST_OFFSET",
               online && conn.consumeFromWhere == ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET,
               "consumeFromWhere=" + conn.consumeFromWhere);
-        check("A2 广播/集群口径是 CLUSTERING",
+        check("A2 broadcast/clustering mode is CLUSTERING",
               online && conn.messageModel == MessageModel::CLUSTERING,
               "messageModel=" + conn.messageModel);
 
-        // ---- A2b 订阅集来自 registerTopics（subscriptions():357-385）----
+        // ---- A2b the subscription set comes from registerTopics (subscriptions():357-385) ----
         bool found = false;
         const std::string subString = subStringOf(conn, topic, found);
-        check("A2b 203 的订阅表带 registerTopics 的 topic 且 subString=*",
+        check("A2b the 203 subscription table carries the registerTopics topic with subString=*",
               found && subString == "*", "subscriptionTable=" + conn.subscriptionTable.dump());
 
-        // ---- A3 38 主节点 ----
+        // ---- A3 38 on the master ----
         bool idsOk = false;
         const std::vector<std::string> ids = consumerIds(admin, group, master, idsOk);
         bool hasSelf = false;
         for (const std::string& id : ids) {
             if (id == consumer->clientId()) hasSelf = true;
         }
-        check("A3 主节点 38 查到本 clientId", idsOk && hasSelf,
+        check("A3 master 38 finds this clientId", idsOk && hasSelf,
               "ids=" + std::to_string(ids.size()) + " clientId=" + consumer->clientId());
 
-        // ---- A4 从节点 ----
+        // ---- A4 the slave ----
         if (!slave.empty()) {
             ConsumerConnection slaveConn;
             std::string slaveErr;
             const bool slaveOnline = groupIsOnline(admin, group, slave, slaveConn, slaveErr);
-            check("A4 从节点 203 也查到本组（心跳扇出到从节点）", slaveOnline,
+            check("A4 slave 203 also finds this group (heartbeat fans out to the slave)", slaveOnline,
                   "slave=" + slave + " connections=" +
                       std::to_string(slaveConn.connectionSet.size()));
             bool slaveIdsOk = false;
@@ -180,21 +180,21 @@ int main(int argc, char* argv[]) {
             for (const std::string& id : slaveIds) {
                 if (id == consumer->clientId()) slaveHasSelf = true;
             }
-            check("A4 从节点 38 也查到本 clientId", slaveIdsOk && slaveHasSelf,
+            check("A4 slave 38 also finds this clientId", slaveIdsOk && slaveHasSelf,
                   "ids=" + std::to_string(slaveIds.size()));
         }
 
-        // ---- A5 对照：幽灵组（从未心跳）必须查不到 ----
+        // ---- A5 control: a ghost group (never heartbeated) must not be found ----
         ConsumerConnection ghostConn;
         std::string ghostErr;
         const bool ghostOnline = groupIsOnline(admin, ghost, master, ghostConn, ghostErr);
         bool ghostIdsOk = false;
         const std::vector<std::string> ghostIds = consumerIds(admin, ghost, master, ghostIdsOk);
-        check("A5 对照：未心跳的幽灵组 203 查不到", !ghostOnline, "err=" + ghostErr);
-        check("A5 对照：未心跳的幽灵组 38 空列表", !ghostIdsOk || ghostIds.empty(),
+        check("A5 control: the never-heartbeated ghost group is not found by 203", !ghostOnline, "err=" + ghostErr);
+        check("A5 control: the never-heartbeated ghost group gives an empty 38 list", !ghostIdsOk || ghostIds.empty(),
               "ids=" + std::to_string(ghostIds.size()));
 
-        // ---- A6 shutdown 立刻注销（35）----
+        // ---- A6 shutdown unregisters immediately (35) ----
         const std::string clientId = consumer->clientId();
         consumer->shutdown();
         delete consumer;
@@ -210,9 +210,9 @@ int main(int argc, char* argv[]) {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
-        check("A6 shutdown 后 203 立刻查不到本组（发过 35 注销）", gone, "clientId=" + clientId);
+        check("A6 after shutdown 203 stops finding this group immediately (the 35 unregister was sent)", gone, "clientId=" + clientId);
     } catch (const std::exception& e) {
-        check("联调异常", false, e.what());
+        check("the live verification threw", false, e.what());
     }
 
     if (consumer != nullptr) {

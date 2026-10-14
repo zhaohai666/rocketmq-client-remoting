@@ -1,4 +1,4 @@
-// loopback 怪癖：失败类断言（E 的连不上、D 的超时轮询）都给了 ≥8s 预算。
+// loopback quirk: the failure assertions (E's cannot-connect, D's timeout rounds) all get a budget of >= 8s.
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -49,7 +49,7 @@ void expectInt(long long actual, long long expected, const std::string& name) {
     }
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket helpers
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -73,7 +73,7 @@ bool writeAll(socket_t s, const Bytes& data) {
     return true;
 }
 
-// select 等到可读（100ms 一轮，便于 alive 转 false 后尽快退出），再读一整帧
+// select until readable (one round every 100ms so the thread exits quickly once alive turns false), then read one whole frame
 bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     for (;;) {
         fd_set rfds;
@@ -101,7 +101,7 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// 已被占用过、随后立即释放的回环端口：连它必然被拒（比固定端口可靠）
+// a loopback port that was bound and then released immediately: connecting to it is always refused (more reliable than a fixed port)
 std::string deadAddress() {
     netcompat::ensureInitialized();
     socket_t s = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -118,15 +118,15 @@ std::string deadAddress() {
     return "127.0.0.1:" + std::to_string(port);
 }
 
-// ---------------------------------------------------------------- mock 端点
+// ---------------------------------------------------------------- mock endpoint
 
-// 一条 SEND 请求的脚本化响应
+// the scripted response for one SEND request
 struct SendReply {
     int32_t code = ResponseCode::SUCCESS;
     int delayMillis = 0;
 };
 
-// 一条上线报文的取证
+// the evidence captured for one outbound request
 struct WireRecord {
     int32_t code = 0;
     PropertyMap ext;
@@ -134,14 +134,14 @@ struct WireRecord {
     bool hasBody = false;
 };
 
-// GET_MAX_OFFSET(30) 的应答模式
+// the answer modes for GET_MAX_OFFSET(30)
 enum class ProbeMode {
-    ANSWER,   // SUCCESS + offset=0（broker 全链路正常）
-    SWALLOW,  // 收下请求不回包 —— 客户端在 detectTimeout 处超时
+    ANSWER,   // SUCCESS + offset=0 (the whole broker path is healthy)
+    SWALLOW,  // the request is taken but never answered -- the client times out at detectTimeout
 };
 
-// 同时扮演 name server（回路由）与 broker（按脚本回 SEND / GET_MAX_OFFSET）。
-// 与 rmq_test_send_retry 的 MockEndpoint 同一套 socket 骨架。
+// plays both the name server (answers with a route) and the broker (answers SEND / GET_MAX_OFFSET per the script).
+// It uses the same socket skeleton as MockEndpoint in rmq_test_send_retry.
 class DetectorMock {
 public:
     DetectorMock() {
@@ -195,7 +195,7 @@ public:
 
     void setProbeMode(ProbeMode mode) { probeMode_.store(static_cast<int>(mode)); }
 
-    // 请求码为 code 的上线报文总条数（GET_MAX_OFFSET 计数就用它）
+    // total number of outbound requests with request code code (this is what GET_MAX_OFFSET is counted by)
     int countRequests(int32_t code) {
         std::lock_guard<std::mutex> lk(state_);
         int n = 0;
@@ -205,7 +205,7 @@ public:
         return n;
     }
 
-    // 第 i 笔 `code` 请求的取证；越界返回空记录
+    // evidence for the i-th request of `code`; out of range returns an empty record
     WireRecord recordOf(size_t i, int32_t code) {
         std::lock_guard<std::mutex> lk(state_);
         size_t seen = 0;
@@ -267,7 +267,7 @@ private:
                     requestLog_.push_back({req.code, req.extFields, req.body, req.hasBody});
                 }
                 if (static_cast<ProbeMode>(probeMode_.load()) == ProbeMode::SWALLOW) {
-                    continue;  // 不回包：客户端按 detectTimeout 超时
+                    continue;  // no reply is sent: the client times out at detectTimeout
                 }
                 resp.code = ResponseCode::SUCCESS;
                 resp.extFields["offset"] = "0";
@@ -290,7 +290,7 @@ private:
                     resp.extFields["queueOffset"] = std::to_string(1000 + idx);
                 }
             } else {
-                // HEARTBEAT 等：一律成功；oneway 请求不回响应
+                // HEARTBEAT and the like: always succeed; oneway requests get no response
                 if (req.isOnewayRpc()) continue;
                 resp.code = ResponseCode::SUCCESS;
             }
@@ -330,7 +330,7 @@ Message plainMessage(const std::string& topic) {
     return m;
 }
 
-// 轮询到 cond 为真或预算耗尽（100ms 一轮）
+// poll until cond is true or the budget runs out (one round every 100ms)
 template <typename Cond>
 bool pollFor(Cond&& cond, int budgetMillis) {
     for (int waited = 0; waited < budgetMillis; waited += 100) {
@@ -340,33 +340,33 @@ bool pollFor(Cond&& cond, int budgetMillis) {
     return cond();
 }
 
-// ---------------------------------------------------------------- A. 默认值 / 默认不探测
+// ---------------------------------------------------------------- A. defaults / no probing by default
 
 void testDefaults() {
     LatencyFaultToleranceImpl tol;
-    expectInt(tol.detectTimeout(), 200, "detectTimeout 默认 200");
-    expectInt(tol.detectInterval(), 2000, "detectInterval 默认 2000");
-    expect(!tol.isStartDetectorEnable(), "startDetectorEnable 默认 false");
+    expectInt(tol.detectTimeout(), 200, "detectTimeout defaults to 200");
+    expectInt(tol.detectInterval(), 2000, "detectInterval defaults to 2000");
+    expect(!tol.isStartDetectorEnable(), "startDetectorEnable defaults to false");
 
     MQFaultStrategy s;
-    expect(!s.isStartDetectorEnable(), "策略默认不开探测");
+    expect(!s.isStartDetectorEnable(), "the strategy does not enable probing by default");
     s.setStartDetectorEnable(true);
-    expect(s.isStartDetectorEnable(), "策略开关转发到容忍表");
-    expect(s.latencyFaultTolerance().isStartDetectorEnable(), "容忍表收到开关");
+    expect(s.isStartDetectorEnable(), "the strategy switch is forwarded to the tolerance table");
+    expect(s.latencyFaultTolerance().isStartDetectorEnable(), "the tolerance table receives the switch");
 
     DefaultMQProducer p("PG_detect_defaults");
-    expect(!p.isStartDetectorEnable(), "producer 默认不开探测");
-    expectInt(p.getDetectTimeout(), 200, "producer 默认 detectTimeout=200");
-    expectInt(p.getDetectInterval(), 2000, "producer 默认 detectInterval=2000");
+    expect(!p.isStartDetectorEnable(), "the producer does not enable probing by default");
+    expectInt(p.getDetectTimeout(), 200, "the producer defaults to detectTimeout=200");
+    expectInt(p.getDetectInterval(), 2000, "the producer defaults to detectInterval=2000");
     p.setStartDetectorEnable(true);
     p.setDetectTimeout(1234);
     p.setDetectInterval(5678);
-    expect(p.isStartDetectorEnable(), "setStartDetectorEnable 生效");
-    expectInt(p.getDetectTimeout(), 1234, "setDetectTimeout 生效");
-    expectInt(p.getDetectInterval(), 5678, "setDetectInterval 生效");
+    expect(p.isStartDetectorEnable(), "setStartDetectorEnable takes effect");
+    expectInt(p.getDetectTimeout(), 1234, "setDetectTimeout takes effect");
+    expectInt(p.getDetectInterval(), 5678, "setDetectInterval takes effect");
 }
 
-// 开关默认关：发了失败消息把故障表填上，探测也不会发一笔 GET_MAX_OFFSET
+// The switch is off by default: a failed send fills the fault table, yet probing still issues no GET_MAX_OFFSET
 void testDisabledByDefault(DetectorMock& mock) {
     const std::string topic = "DetectDefaultOff";
     mock.addRoute(topic, makeRoute(mock.address(), "broker-a"));
@@ -381,19 +381,19 @@ void testDisabledByDefault(DetectorMock& mock) {
     } catch (const std::exception&) {
     }
     expect(p.mqFaultStrategy().latencyFaultTolerance().getFaultItem("broker-a") != nullptr,
-           "故障项已入表（否则 0 笔探测没有意义）");
+           "the fault item is in the table (otherwise 0 probes would be meaningless)");
     std::this_thread::sleep_for(std::chrono::seconds(4));
     expectInt(mock.countRequests(RequestCode::GET_MAX_OFFSET), 0,
-              "开关关闭时零笔探测");
+              "zero probes while the switch is off");
     expect(!p.mqFaultStrategy().latencyFaultTolerance().isReachable("broker-a"),
-           "没有人把 broker 放回");
+           "nobody puts the broker back");
     p.shutdown();
 }
 
-// ---------------------------------------------------------------- B. detectByOneRound 离线语义
+// ---------------------------------------------------------------- B. detectByOneRound offline semantics
 
 void testDetectByOneRoundOffline() {
-    // 翻回 reachable + 失败不动标志 + 占坑限频
+    // flipping back to reachable + a failure leaves the flag alone + slot-reservation rate limiting
     {
         LatencyFaultToleranceImpl tol;
         tol.setDetectInterval(200);
@@ -408,9 +408,9 @@ void testDetectByOneRoundOffline() {
         });
         tol.updateFaultItem("broker-a", 1.0, 0, /*reachable=*/false);
         tol.detectByOneRound();
-        expectInt(probes, 1, "到期的故障项被探测一次");
-        expectInt(lastTimeout, 200, "探测带上 detectTimeout");
-        expect(tol.isReachable("broker-a"), "探测成功翻回 reachable");
+        expectInt(probes, 1, "an expired fault item is probed once");
+        expectInt(lastTimeout, 200, "the probe carries detectTimeout");
+        expect(tol.isReachable("broker-a"), "a successful probe flips it back to reachable");
 
         tol.updateFaultItem("broker-b", 1.0, 0, false);
         tol.setServiceDetector([&probes](const std::string&, int32_t) {
@@ -420,14 +420,14 @@ void testDetectByOneRoundOffline() {
         probes = 0;
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         tol.detectByOneRound();
-        expectInt(probes, 2, "detectInterval 到期后两项各探测一次");
-        expect(!tol.isReachable("broker-b"), "探测失败不动 reachable 标志");
-        expect(tol.isReachable("broker-a"), "已可达的 broker 不被失败探测拉黑");
+        expectInt(probes, 2, "after detectInterval expires both items are probed once each");
+        expect(!tol.isReachable("broker-b"), "a failed probe leaves the reachable flag untouched");
+        expect(tol.isReachable("broker-a"), "an already reachable broker is not blacklisted by a failed probe");
 
-        // 占坑限频：立刻再跑一轮，谁都不该被探测
+        // slot reservation: run another round immediately, nobody should be probed
         probes = 0;
         tol.detectByOneRound();
-        expectInt(probes, 0, "checkStamp 占坑：detectInterval 内不重复探测");
+        expectInt(probes, 0, "checkStamp reserves the slot: no repeated probe inside detectInterval");
     }
     {
         LatencyFaultToleranceImpl tol;
@@ -439,24 +439,24 @@ void testDetectByOneRoundOffline() {
         });
         tol.updateFaultItem("broker-gone", 1.0, 0, false);
         tol.detectByOneRound();
-        expectInt(probes, 0, "解析不到地址不探测");
-        expect(tol.getFaultItem("broker-gone") == nullptr, "解析不到地址摘除故障项");
-        expect(tol.isReachable("broker-gone"), "摘除后回到默认可达");
+        expectInt(probes, 0, "no probe when the address cannot be resolved");
+        expect(tol.getFaultItem("broker-gone") == nullptr, "the fault item is removed when the address cannot be resolved");
+        expect(tol.isReachable("broker-gone"), "back to the default reachable state after removal");
     }
-    // 没装 resolver / detector 不炸
+    // no crash when no resolver / detector is installed
     {
         LatencyFaultToleranceImpl tol;
         tol.updateFaultItem("broker-x", 1.0, 0, false);
-        tol.detectByOneRound();  // 没有 resolver：整跳放弃
-        expect(tol.getFaultItem("broker-x") != nullptr, "没有 resolver 什么都不动");
+        tol.detectByOneRound();  // no resolver: the whole round is skipped
+        expect(tol.getFaultItem("broker-x") != nullptr, "nothing changes without a resolver");
         tol.setResolver([](const std::string&) { return std::string("127.0.0.1:1"); });
-        tol.detectByOneRound();  // 没有 detector：跳过该项
-        expect(tol.getFaultItem("broker-x") != nullptr, "没有 detector 什么都不动");
-        expect(!tol.isReachable("broker-x"), "没有 detector 不会误放行");
+        tol.detectByOneRound();  // no detector: this item is skipped
+        expect(tol.getFaultItem("broker-x") != nullptr, "nothing changes without a detector");
+        expect(!tol.isReachable("broker-x"), "without a detector nothing is let through by mistake");
     }
 }
 
-// ---------------------------------------------------------------- C. 周期触发 + 恢复放行
+// ---------------------------------------------------------------- C. periodic trigger + release after recovery
 
 void testPeriodicAndRecovery(DetectorMock& mock) {
     const std::string topic = "DetectRecover";
@@ -476,42 +476,42 @@ void testPeriodicAndRecovery(DetectorMock& mock) {
     } catch (const std::exception&) {
     }
     LatencyFaultToleranceImpl& tol = p.mqFaultStrategy().latencyFaultTolerance();
-    expect(!tol.isReachable("broker-a"), "broker 失败后记为不可达");
-    expect(!tol.isAvailable("broker-a"), "broker 失败后进隔离");
+    expect(!tol.isReachable("broker-a"), "the broker is recorded as unreachable after a failure");
+    expect(!tol.isAvailable("broker-a"), "the broker enters isolation after a failure");
 
-    // 探测周期 3s 一跳：等探测器把它放回（预算 12s，实际第一跳就该命中）
+    // the probe cycle ticks every 3s: wait for the detector to put it back (12s budget, the first tick should already hit)
     const bool recovered = pollFor(
         [&tol]() {
             return tol.isReachable("broker-a");
         },
         12000);
-    expect(recovered, "探测恢复 reachable（恢复后放行）");
+    expect(recovered, "probing restores reachable (let through after recovery)");
 
     const WireRecord probe = mock.recordOf(0, RequestCode::GET_MAX_OFFSET);
-    expectInt(probe.code, RequestCode::GET_MAX_OFFSET, "探测走 GET_MAX_OFFSET(30)");
+    expectInt(probe.code, RequestCode::GET_MAX_OFFSET, "the probe uses GET_MAX_OFFSET(30)");
     const auto t = probe.ext.find("topic");
-    expect(t != probe.ext.end() && t->second == topic, "探测 topic 取发送过的候选 topic");
+    expect(t != probe.ext.end() && t->second == topic, "the probe topic is one of the topics that were sent to");
     const auto q = probe.ext.find("queueId");
-    expect(q != probe.ext.end() && q->second == "0", "探测 queueId 固定 0");
+    expect(q != probe.ext.end() && q->second == "0", "the probe queueId is fixed at 0");
 
-    // 周期触发：再等一跳，探测笔数必须继续增长
+    // periodic trigger: wait one more tick, the probe count must keep growing
     const int afterFirst = mock.countRequests(RequestCode::GET_MAX_OFFSET);
     const bool periodic = pollFor(
         [&mock, afterFirst]() {
             return mock.countRequests(RequestCode::GET_MAX_OFFSET) > afterFirst;
         },
         8000);
-    expect(periodic, "探测按固定节奏周期触发");
+    expect(periodic, "probes are triggered periodically at a fixed cadence");
     p.shutdown();
 }
 
-// ---------------------------------------------------------------- D. 超时置不可用
+// ---------------------------------------------------------------- D. a timeout marks it unavailable
 
 void testTimeoutKeepsUnreachable(DetectorMock& mock) {
     const std::string topic = "DetectTimeout";
     mock.addRoute(topic, makeRoute(mock.address(), "broker-a"));
     mock.scriptSend({{ResponseCode::SERVICE_NOT_AVAILABLE, 0}});
-    // 探测被吞（不回包）：客户端在 detectTimeout（默认 200ms）处超时
+    // the probe is swallowed (no reply): the client times out at detectTimeout (200ms by default)
     mock.setProbeMode(ProbeMode::SWALLOW);
 
     DefaultMQProducer p("PG_detect_timeout");
@@ -526,29 +526,29 @@ void testTimeoutKeepsUnreachable(DetectorMock& mock) {
     } catch (const std::exception&) {
     }
     LatencyFaultToleranceImpl& tol = p.mqFaultStrategy().latencyFaultTolerance();
-    expect(!tol.isReachable("broker-a"), "broker 失败后记为不可达");
+    expect(!tol.isReachable("broker-a"), "the broker is recorded as unreachable after a failure");
 
-    // 至少两轮探测都超时（每轮 3s 跳 + 200ms 超时，预算 10s）—— 超时不能放行
+    // at least two probe rounds both time out (a 3s tick plus a 200ms timeout per round, 10s budget); a timeout must not let it through
     const bool probed = pollFor(
         [&mock]() {
             return mock.countRequests(RequestCode::GET_MAX_OFFSET) >= 2;
         },
         10000);
-    expect(probed, "探测确实跑了两轮以上（每笔在 detectTimeout 处超时）");
-    expect(!tol.isReachable("broker-a"), "探测超时不能把 broker 放回");
+    expect(probed, "the probe really ran at least two rounds (each one times out at detectTimeout)");
+    expect(!tol.isReachable("broker-a"), "a probe timeout cannot put the broker back");
 
-    // broker 开始应答之后：下一轮探测照常放行
+    // after the broker starts answering: the next probe round lets it through as usual
     mock.setProbeMode(ProbeMode::ANSWER);
     const bool recovered = pollFor(
         [&tol]() {
             return tol.isReachable("broker-a");
         },
         10000);
-    expect(recovered, "超时之后 broker 恢复应答仍能被放回");
+    expect(recovered, "the broker is still put back once it resumes answering after the timeouts");
     p.shutdown();
 }
 
-// ---------------------------------------------------------------- E. 传输失败记 unreachable
+// ---------------------------------------------------------------- E. a transport failure records unreachable
 
 void testConnectFailureMarksUnreachable(DetectorMock& mock) {
     const std::string topic = "DetectConnect";
@@ -560,15 +560,15 @@ void testConnectFailureMarksUnreachable(DetectorMock& mock) {
     p.setRetryTimesWhenSendFailed(0);
     p.start();
     try {
-        // loopback 怪癖：连一个刚关掉的端口要 ~2-3s，预算给足
+        // loopback quirk: connecting to a just-closed port takes ~2-3s, so the budget is generous
         p.send(plainMessage(topic), 8000);
     } catch (const std::exception&) {
     }
     const FaultItem* item = p.mqFaultStrategy().latencyFaultTolerance().getFaultItem("broker-a");
-    expect(item != nullptr, "传输失败记录故障项");
+    expect(item != nullptr, "a transport failure records a fault item");
     if (item != nullptr) {
-        expect(!item->isReachable(), "探测开着：传输失败记 unreachable（等探测器放回）");
-        expect(!item->isAvailable(), "传输失败同时隔离该 broker");
+        expect(!item->isReachable(), "probing on: a transport failure records unreachable (the detector puts it back)");
+        expect(!item->isAvailable(), "a transport failure also isolates that broker");
     }
     p.shutdown();
 }

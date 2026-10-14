@@ -1,6 +1,6 @@
-// 这些分支真机集群给不了：真 broker 不会稳定返回 FLUSH_DISK_TIMEOUT / SYSTEM_ERROR，
-// 也不会刚好"路由里的 broker 地址连不上"。所以这里用脚本化的响应码驱动，
-// 走的是**真实的** DefaultMQProducer::send + 真实 socket。
+// Real clusters cannot exercise these branches: a real broker does not reliably return FLUSH_DISK_TIMEOUT / SYSTEM_ERROR,
+// and a broker address in the route does not just happen to be unreachable. So the results here are driven by scripted
+// response codes, while the code path taken is the real DefaultMQProducer::send over a real socket.
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -60,7 +60,7 @@ void expectInt(long long actual, long long expected, const std::string& name) {
     }
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket helpers
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -84,7 +84,7 @@ bool writeAll(socket_t s, const Bytes& data) {
     return true;
 }
 
-// select 等到可读（100ms 一轮，便于 alive 转 false 后尽快退出），再读一整帧
+// select until readable (one round every 100ms so the thread exits quickly once alive turns false), then read one whole frame
 bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     for (;;) {
         fd_set rfds;
@@ -112,7 +112,7 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// 已被占用过、随后立即释放的回环端口：连它必然被拒（比固定端口可靠）
+// a loopback port that was bound and then released immediately: connecting to it is always refused (more reliable than a fixed port)
 std::string deadAddress() {
     netcompat::ensureInitialized();
     socket_t s = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -129,8 +129,8 @@ std::string deadAddress() {
     return "127.0.0.1:" + std::to_string(port);
 }
 
-// 一条被接受的连接：引用计数持有，最后放手的人负责关（否则慢应答会写到已关闭的句柄上，
-// Windows 还会把句柄号复用给别的连接）。
+// an accepted connection: held by a reference count, and whoever releases it last closes it (otherwise a slow reply would write
+// onto an already closed handle, and Windows would also recycle the handle number for another connection).
 struct Conn {
     explicit Conn(socket_t s) : sock(s) {}
     socket_t sock;
@@ -148,9 +148,9 @@ void releaseConn(const ConnRef& c) {
     }
 }
 
-// ---------------------------------------------------------------- mock 端点
+// ---------------------------------------------------------------- mock endpoint
 
-// 一笔上线报文的取证：请求码（V1/V2、路由、心跳…）、extFields 和原始 body
+// the evidence captured for one outbound request: request code (V1/V2, route, heartbeat...), extFields and the raw body
 struct WireRecord {
     int32_t code = 0;
     PropertyMap ext;
@@ -158,17 +158,17 @@ struct WireRecord {
     bool hasBody = false;
 };
 
-// 上线报文取证的条数上限：lite 消费者的拉取循环会持续打，留几百条足够判断"有没有打标"
+// cap on captured outbound requests: the lite consumer's pull loop keeps sending them, a few hundred records are enough to tell whether a tag was set
 constexpr size_t kRequestLogCap = 500;
 
-// 一条 SEND 请求的脚本化响应
+// the scripted response for one SEND request
 struct SendReply {
     int32_t code = ResponseCode::SUCCESS;
     int delayMillis = 0;
 };
 
-// 同时扮演 name server（回路由）与 broker（回发送结果）。路由里所有 broker 都指向本端点，
-// 所以"换 broker 重试"只需要数 SEND 次数即可判断。
+// plays both the name server (answers with a route) and the broker (answers SEND with a result). Every broker in the route points at
+// this endpoint, so switching to another broker on retry only needs the SEND count to be judged.
 class MockEndpoint {
 public:
     MockEndpoint() {
@@ -193,7 +193,7 @@ public:
     ~MockEndpoint() {
         running_.store(false);
         if (acceptor_.joinable()) acceptor_.join();
-        // 连接线程与应答线程都在 100ms / 脚本延迟内收手，join 前不能先关 socket
+        // the accept thread and the reply thread both stop within 100ms / the scripted delay, so the sockets must not be closed before join
         for (;;) {
             std::vector<std::thread> pending;
             {
@@ -210,7 +210,7 @@ public:
 
     std::string address() const { return "127.0.0.1:" + std::to_string(port_); }
 
-    // topic -> 路由；未登记的 topic 一律回 TOPIC_NOT_EXIST（与真 name server 一致）
+    // topic -> route; an unregistered topic always answers TOPIC_NOT_EXIST (same as a real name server)
     void addRoute(const std::string& topic, const TopicRouteData& route) {
         std::lock_guard<std::mutex> lk(state_);
         routes_[topic] = route.encode();
@@ -224,26 +224,26 @@ public:
     }
     int sendCount() const { return sendCount_.load(); }
 
-    // 第 `i` 次 SEND 的取证；越界时返回空记录（调用方按"没有这一笔"处理）。
+    // evidence for the i-th SEND; out of range returns an empty record (the caller treats it as "there is no such request").
     WireRecord sendRecord(size_t i) {
         std::lock_guard<std::mutex> lk(state_);
         if (i >= sendLog_.size()) return WireRecord{};
         return sendLog_[i];
     }
 
-    // 清空"所有上线报文"的取证，钩子用例只关心自己那一段流量。
+    // clear the evidence of all outbound requests; the hook cases only care about their own slice of traffic.
     void clearRequests() {
         std::lock_guard<std::mutex> lk(state_);
         requestLog_.clear();
     }
 
-    // 已记录的上线报文快照（SEND 之外的 GET_ROUTEINFO / HEARTBEAT / PULL 都在里面）。
+    // snapshot of the recorded outbound requests (GET_ROUTEINFO / HEARTBEAT / PULL besides SEND are all in it).
     std::vector<WireRecord> requests() {
         std::lock_guard<std::mutex> lk(state_);
         return requestLog_;
     }
 
-    // 请求码为 `code` 的报文里，有多少条带 key==value 的扩展字段。
+    // among the records with request code `code`, how many carry an extension field key==value.
     int countRequestsWith(int32_t code, const std::string& key, const std::string& value) {
         std::lock_guard<std::mutex> lk(state_);
         int n = 0;
@@ -255,7 +255,7 @@ public:
         return n;
     }
 
-    // 请求码为 `code` 的报文总条数。
+    // total number of records with request code `code`.
     int countRequests(int32_t code) {
         std::lock_guard<std::mutex> lk(state_);
         int n = 0;
@@ -291,7 +291,7 @@ private:
             if (!readFrame(conn->sock, running_, frame)) break;
             RemotingCommand req;
             if (!RemotingCommand::tryDecode(frame, req, nullptr)) break;
-            // 每条请求交给独立线程答复：真 broker 会并发处理，慢请求不该挡住后面的
+            // every request is answered on its own thread: a real broker handles requests concurrently, a slow one must not block the ones behind it
             conn->refs.fetch_add(1);
             {
                 std::lock_guard<std::mutex> lk(workersM_);
@@ -306,8 +306,8 @@ private:
     }
 
     void respond(const ConnRef& conn, RemotingCommand req) {
-        // 每一笔上线报文都留一份证：钩子注入的扩展字段（ReqT / AccessKey / Signature）
-        // 只在客户端编码前才写进 extFields，本地断言看不到，只有这里能取证。
+        // keep a piece of evidence for every outbound request: the extension fields injected by hooks (ReqT / AccessKey / Signature)
+        // are only written into extFields right before the client encodes, so local assertions cannot see them; only here can they be captured.
         {
             std::lock_guard<std::mutex> lk(state_);
             if (requestLog_.size() < kRequestLogCap) {
@@ -344,8 +344,8 @@ private:
                    || req.code == RequestCode::SEND_REPLY_MESSAGE_V2) {
             const int idx = sendCount_.fetch_add(1);
             {
-                // 记录上线的请求码与 extFields：重试分类之外的字段口径（unitMode/batch）
-                // 只能在这里取证。
+                // record the outbound request code and extFields: the field semantics outside retry classification (unitMode/batch)
+                // can only be captured here.
                 std::lock_guard<std::mutex> lk(state_);
                 sendLog_.push_back({req.code, req.extFields, req.body, req.hasBody});
             }
@@ -355,7 +355,7 @@ private:
                 std::lock_guard<std::mutex> lk(state_);
                 if (idx < static_cast<int>(sends_.size())) reply = sends_[idx];
             }
-            // 分段睡：析构时能尽快收手
+            // sleep in slices: so the thread can be stopped quickly when destructing
             for (int i = 0; i < reply.delayMillis / 50 && running_.load(); ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
@@ -368,7 +368,7 @@ private:
                 resp.extFields["queueOffset"] = std::to_string(1000 + idx);
             }
         } else {
-            // HEARTBEAT 等：一律成功；oneway 请求不回响应（broker 也是这么做的）
+            // HEARTBEAT and the like: always succeed; oneway requests get no response (a broker does the same)
             if (req.isOnewayRpc()) return;
             resp.code = ResponseCode::SUCCESS;
         }
@@ -391,7 +391,7 @@ private:
     std::thread acceptor_;
 };
 
-// 造一个 brokers 台 broker、每台 queuesPerBroker 个队列的路由（地址全部指向同一个端点）
+// build a route of `brokers` brokers with `queuesPerBroker` queues each (every address points at the same endpoint)
 TopicRouteData makeRoute(const std::string& brokerAddr, int brokers, int queuesPerBroker) {
     TopicRouteData route;
     for (int b = 0; b < brokers; ++b) {
@@ -410,9 +410,9 @@ Message plainMessage(const std::string& topic) {
     return m;
 }
 
-// ---------------------------------------------------------------- 用例
+// ---------------------------------------------------------------- cases
 
-// 1. 可重试码换 broker；非可重试码立刻抛出且只发一次
+// 1. a retryable code switches broker; a non-retryable code throws immediately and sends only once
 void testRetryResponseCodes(MockEndpoint& mock) {
     const std::string topic = "SendRetryTopicExist";
     mock.addRoute(topic, makeRoute(mock.address(), 2, 1));
@@ -450,7 +450,7 @@ void testRetryResponseCodes(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // addRetryResponseCode 能把非可重试码变成可重试
+        // addRetryResponseCode can turn a non-retryable code into a retryable one
         mock.scriptSend({{ResponseCode::MESSAGE_ILLEGAL, 0}, {ResponseCode::SUCCESS, 0}});
         DefaultMQProducer p("PG_retry_added");
         p.setNamesrvAddr(mock.address());
@@ -464,7 +464,7 @@ void testRetryResponseCodes(MockEndpoint& mock) {
     }
 }
 
-// 2/3. storeOK 重试开关
+// 2/3. the storeOK retry switch
 void testRetryAnotherBrokerWhenNotStoreOK(MockEndpoint& mock) {
     const std::string topic = "SendRetryStoreOk";
     mock.addRoute(topic, makeRoute(mock.address(), 2, 1));
@@ -508,13 +508,13 @@ void testRetryAnotherBrokerWhenNotStoreOK(MockEndpoint& mock) {
     }
 }
 
-// 4. sendMsgMaxTimeoutPerRequest：慢 broker 必须在被压过的单次超时处放弃
+// 4. sendMsgMaxTimeoutPerRequest: a slow broker must give up at the shortened per-request timeout
 void testSendMsgMaxTimeoutPerRequest(MockEndpoint& mock) {
     const std::string topic = "SendRetryCap";
     mock.addRoute(topic, makeRoute(mock.address(), 2, 1));
 
     {
-        // 不开 cap：第一次请求等得到 400ms 的响应，只发一次
+        // without the cap: the first request does get to wait for the 400ms response, so only one send
         mock.scriptSend({{ResponseCode::SUCCESS, 400}, {ResponseCode::SUCCESS, 0}});
         DefaultMQProducer p("PG_cap_off");
         p.setNamesrvAddr(mock.address());
@@ -572,12 +572,12 @@ private:
     int32_t sleepMillis_;
 };
 
-// 5. 总超时用尽 -> RemotingTooMuchRequestException
+// 5. the total timeout runs out -> RemotingTooMuchRequestException
 void testCallTimeout(MockEndpoint& mock) {
     const std::string topic = "SendRetryCallTimeout";
     mock.addRoute(topic, makeRoute(mock.address(), 2, 1));
-    // 第一次尝试：钩子先睡 300ms（> 整个 200ms 预算），broker 回可重试码 -> 继续循环；
-    // 第二次尝试：costTime(300) > timeout(200) -> 直接放弃（callTimeout）。
+    // First attempt: the hook sleeps 300ms (> the whole 200ms budget), the broker returns a retryable code -> keep looping;
+    // second attempt: costTime(300) > timeout(200) -> give up right away (callTimeout).
     mock.scriptSend({{ResponseCode::SYSTEM_ERROR, 0}, {ResponseCode::SUCCESS, 0}});
     DefaultMQProducer p("PG_call_timeout");
     p.setNamesrvAddr(mock.address());
@@ -593,17 +593,17 @@ void testCallTimeout(MockEndpoint& mock) {
         std::printf("  wrong exception: %s\n", e.what());
     }
     expect(tooMuch, "budget exhausted -> RemotingTooMuchRequestException");
-    expectInt(mock.sendCount() - before, 1, "callTimeout 后不再发下一个 broker");
+    expectInt(mock.sendCount() - before, 1, "no further broker is sent to after callTimeout");
     p.shutdown();
 }
 
-// 6. 失败原因 -> ClientErrorCode
+// 6. failure cause -> ClientErrorCode
 void testErrorCodeMapping(MockEndpoint& mock) {
     const std::string deadTopic = "SendRetryDeadBroker";
     mock.addRoute(deadTopic, makeRoute(deadAddress(), 1, 1));
     {
-        // Windows 上连一个刚关掉的 loopback 端口要 ~1s，三次尝试会把预算吃光，
-        // 所以只跑一次并给足预算，确保看到的是"连不上"而不是"总超时"。
+        // on Windows, connecting to a just-closed loopback port takes ~1s and three attempts would burn the whole budget,
+        // so only one attempt is run with a generous budget, to make sure what is seen is "cannot connect", not "total timeout".
         DefaultMQProducer p("PG_connect");
         p.setNamesrvAddr(mock.address());
         p.setRetryTimesWhenSendFailed(0);
@@ -621,7 +621,7 @@ void testErrorCodeMapping(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // 无路由：立即 NOT_FOUND_TOPIC，不把重试次数空转掉
+        // no route: immediate NOT_FOUND_TOPIC, without spinning away the retry count
         DefaultMQProducer p("PG_noroute");
         p.setNamesrvAddr(mock.address());
         p.start();
@@ -638,7 +638,7 @@ void testErrorCodeMapping(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // broker 明确回非可重试码：原码透传
+        // the broker explicitly answers a non-retryable code: the original code is passed through
         const std::string topic = "SendRetryBrokerCode";
         mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
         mock.scriptSend({{ResponseCode::NOT_LEADER_FOR_QUEUE, 0}});
@@ -657,7 +657,7 @@ void testErrorCodeMapping(MockEndpoint& mock) {
     }
 }
 
-// 6b. 寻址故障（10004）不能被说成"这个 topic 没路由"（10005）
+// 6b. an addressing failure (10004) must not be reported as "this topic has no route" (10005)
 namespace {
 struct RouteFunnelProbe : public DefaultMQProducer {
     RouteFunnelProbe() : DefaultMQProducer("PG_funnel_probe") {}
@@ -686,8 +686,8 @@ void testNoNameServerAddressQualifies10004(MockEndpoint& mock) {
                "10004 keeps the reference wording", "msg=" + msg);
     }
     {
-        // 地址在、只是这个 topic 拉不到路由 → 10004 那道闸必须闭嘴，原异常照旧抛
-        // （调用方再按 10005 定性，见下面 producer 那一腿）
+        // the address is there and only this topic has no route -> the 10004 gate must stay silent and the original exception is thrown
+        // (the caller then classifies it as 10005, see the producer leg below)
         MQClientInstance hasAddr("PG_funnel_probe_dead",
                                  std::vector<std::string>{deadAddress()});
         int code = 0;
@@ -790,7 +790,7 @@ void testFaultItemFlags(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // 成功发送写实测延迟，不隔离
+        // a successful send records the measured latency and is not isolated
         const std::string topic = "SendFaultSuccess";
         mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
         mock.scriptSend({{ResponseCode::SUCCESS, 0}});
@@ -803,8 +803,8 @@ void testFaultItemFlags(MockEndpoint& mock) {
             p.mqFaultStrategy().latencyFaultTolerance().getFaultItem("broker-a");
         expect(item != nullptr && item->isAvailable() && item->isReachable(),
                "successful send records latency without isolating");
-        // 回归守卫：本地往返常常不足 1ms，整数毫秒差会把延迟记成 0，
-        // 于是容错表的延迟阈值永远不生效。
+        // regression guard: a local round trip is often under 1ms, an integer millisecond difference records the latency as 0,
+        // which would make the fault-tolerance table's latency thresholds never take effect.
         if (item != nullptr) {
             expect(item->currentLatency() > 0.0,
                    "success records a strictly positive latency",
@@ -847,8 +847,8 @@ void testUnitModeReachesWire(MockEndpoint& mock) {
     }
 }
 
-// 8a2. 发送头里那三个「跟着路由/配置走」的字段：n（brokerName）、c（defaultTopic）、
-// d（defaultTopicQueueNums）。
+// 8a2. the three fields of the send header that follow the route/config: n (brokerName), c (defaultTopic),
+// d (defaultTopicQueueNums).
 void testSendHeaderFieldsReachWire(MockEndpoint& mock) {
     const std::string topic = "SendHeaderFields";
     mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
@@ -871,7 +871,7 @@ void testSendHeaderFieldsReachWire(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // 生产者配置必须真的上线（旧代码：写死，setter 是假的）
+        // the producer configuration must really go on the wire (the old code hardcoded it, making the setter a no-op)
         mock.scriptSend({{ResponseCode::SUCCESS, 0}});
         DefaultMQProducer p("PG_hdr_configured");
         p.setNamesrvAddr(mock.address());
@@ -888,7 +888,7 @@ void testSendHeaderFieldsReachWire(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // 定点发送与批量：同一份建头代码，n/c/d 不能漏
+        // targeted send and batch share the same header-building code: n/c/d must not be dropped
         mock.scriptSend({{ResponseCode::SUCCESS, 0}});
         DefaultMQProducer p("PG_hdr_pinned");
         p.setNamesrvAddr(mock.address());
@@ -914,11 +914,11 @@ void testSendHeaderFieldsReachWire(MockEndpoint& mock) {
     }
 }
 
-// 请求码与 V2 头的单字母键 `m`（batch）是两件事：broker 按 `m` 选 sendBatchMessage
-// 还是单条写入（`SendMessageProcessor:117` 读 requestHeader.isBatch()），码只影响
-// 服务端按码归类（proxy `AbstractRemotingActivity:69` 与 auth
-// `DefaultAuthorizationContextBuilder:230-240` 都把 310/320 列在同一个 case 里）。
-// 所以两个都要取证：只对齐码不对齐 `m`，批量 body 会被按单条解析。
+// The request code and the V2 header's single-letter key `m` (batch) are two different things: the broker uses `m` to pick
+// batch writing versus a single-message write (it reads requestHeader.isBatch()), while the code only affects how the
+// server classifies the request by code (the proxy request handling and the authorization context builder both
+// list 310/320 in the same case, since they carry the same send semantics).
+// So both are captured: aligning only the code but not `m` would have a batch body parsed as a single message.
 void testSendRequestCodeMatchesProtocol(MockEndpoint& mock) {
     const std::string topic = "SendRetryCodeBranch";
     mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
@@ -948,7 +948,7 @@ void testSendRequestCodeMatchesProtocol(MockEndpoint& mock) {
         p.shutdown();
     }
     {
-        // reply 判在 batch 之前：带 MSG_TYPE=reply 的批量仍然走 325。
+        // reply is decided before batch: a batch carrying MSG_TYPE=reply still goes out as 325.
         mock.scriptSend({{ResponseCode::SUCCESS, 0}});
         DefaultMQProducer p("PG_code_reply");
         p.setNamesrvAddr(mock.address());
@@ -965,10 +965,10 @@ void testSendRequestCodeMatchesProtocol(MockEndpoint& mock) {
     }
 }
 
-// 9. 请求钩子的**上线**取证。钩子是在报文编码前的最后一刻才改写 extFields 的，本地断言
-// 看不到结果；而 lite 消费者曾经绕过 composeRequestHooks 直接注册用户钩子，让 `ReqT`
-// 静默漏发（test_acl 锁的是钩子自身的组合与顺序，锁不住 facade 有没有用它）。
-// 所以这里从 socket 这头数扩展字段。
+// 9. evidence of what the request hooks put ON THE WIRE. A hook rewrites extFields at the last moment before encoding, so
+// local assertions cannot see the result; and the lite consumer once registered user hooks around composeRequestHooks, letting `ReqT`
+// go out silently (test_acl pins the hook's own composition and order, not whether the facade actually uses it).
+// So the extension fields are counted here, from the socket side.
 void testRequestHooksReachWire(MockEndpoint& mock) {
     const std::string topic = "SendRetryReqT";
     mock.addRoute(topic, makeRoute(mock.address(), 1, 1));
@@ -1002,7 +1002,7 @@ void testRequestHooksReachWire(MockEndpoint& mock) {
         p.send(plainMessage(topic), 3000);
         p.shutdown();
         const WireRecord rec = mock.sendRecord(0);
-        // 值是 RequestType.STREAM 的 code（"0"），不是枚举名
+        // the value is RequestType.STREAM's code ("0"), not the enumerator name
         const auto reqt = rec.ext.find(std::string(MixAll::REQ_T));
         expect(reqt != rec.ext.end() && reqt->second == "0", "stream on -> ReqT=0 on the wire");
         const auto sig = rec.ext.find(std::string(SessionCredentials::SIGNATURE));
@@ -1034,7 +1034,7 @@ void testRequestHooksReachWire(MockEndpoint& mock) {
                "lite consumer heartbeat carries ReqT");
     }
     {
-        // 显式关掉 stream 的同一条路径必须一条都不带（默认值不是"硬编码开着"）
+        // the same path that explicitly turns stream off must carry not a single one (the default is not "hardcoded on")
         mock.clearRequests();
         DefaultLitePullConsumer c("PG_lite_no_reqt");
         c.setNamesrvAddr(mock.address());
@@ -1059,7 +1059,7 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
     p.start();
 
     {
-        // ① 同步单条 topic 不符：同步文案，零 SEND
+        // (1) synchronous single message with a mismatched topic: the synchronous wording, zero SEND
         const int before = mock.sendCount();
         int threw = 0;
         try {
@@ -1075,19 +1075,19 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
         expectInt(mock.sendCount() - before, 0, "the guard refuses before any SEND reaches the wire");
     }
     {
-        // ② 同 topic：照常上线（守卫不能宽到误伤）
+        // (2) same topic: goes on the wire as usual (the guard must not be so loose that it misfires)
         const int before = mock.sendCount();
         SendResult r = p.send(plainMessage(topic), MessageQueue(topic, "broker-a", 0), 3000);
         expectInt(static_cast<int>(r.sendStatus), static_cast<int>(SendStatus::SEND_OK),
                   "a matching pinned send still goes out");
         expectInt(mock.sendCount() - before, 1, "exactly one SEND on the wire");
         WireRecord rec = mock.sendRecord(static_cast<size_t>(mock.sendCount() - 1));
-        const auto topicField = rec.ext.find("b");  // V2 单字母键：topic
+        const auto topicField = rec.ext.find("b");  // the V2 single-letter key: topic
         expect(topicField != rec.ext.end() && topicField->second == topic,
                "the wire carries the message topic");
     }
     {
-        // ③ 批量（同步内核）走同一处守卫：不符即拒、零 SEND
+        // (3) batch (over the synchronous kernel) hits the same guard: mismatch is rejected, zero SEND
         std::vector<Message> msgs{plainMessage("PinnedGuardOther"), plainMessage("PinnedGuardOther")};
         const int before = mock.sendCount();
         int threw = 0;
@@ -1104,7 +1104,7 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
         expectInt(mock.sendCount() - before, 0, "no SEND leaves for a refused batch");
     }
     {
-        // ④ 同 topic 的批量照发，请求码是批量那条
+        // (4) a batch for the same topic is still sent, with the batch request code
         std::vector<Message> msgs{plainMessage(topic), plainMessage(topic)};
         const int before = mock.sendCount();
         SendResult r = p.sendBatch(msgs, MessageQueue(topic, "broker-a", 0), 3000);
@@ -1126,7 +1126,7 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
             std::printf("  wrong exception: %s\n", e.what());
         }
         expectInt(threw, 0, "the pinned oneway has no guard: a mismatched topic still leaves");
-        // 单向没有应答，客户端写完就走：mock 的收包线程可能还没记账，必须轮询等它落地
+        // oneway gets no reply and the client leaves as soon as it has written: the mock's receive thread may not have booked it yet, so poll until it lands
         bool arrived = false;
         for (int i = 0; i < 60 && !arrived; ++i) {
             arrived = mock.sendCount() - before == 1;
@@ -1145,7 +1145,7 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
     }
     p.shutdown();
 
-    // ⑤ 命名空间：比的是各自包装后的资源名
+    // (5) namespace: what is compared are the respective wrapped resource names
     const std::string nsTopic = "PinnedGuardNs";
     const std::string nsWrapped = "ns1%PinnedGuardNs";
     mock.addRoute(nsWrapped, makeRoute(mock.address(), 1, 1));
@@ -1154,7 +1154,7 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
     ns.setNamespace("ns1");
     ns.start();
     {
-        // 队列 topic 已带前缀（路由返回的就是这个形状）——不能误拒
+        // the queue topic already carries the prefix (that is the shape the route returns) -- must not be rejected by mistake
         const int before = mock.sendCount();
         SendResult r = ns.send(plainMessage(nsTopic), MessageQueue(nsWrapped, "broker-a", 0), 3000);
         expectInt(static_cast<int>(r.sendStatus), static_cast<int>(SendStatus::SEND_OK),
@@ -1166,11 +1166,11 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
                "the wire carries the namespaced resource name");
     }
     {
-        // 裸名队列 topic 同样放行（两边包装后相等）
+        // a bare queue topic passes as well (both sides are equal once wrapped)
         const int before = mock.sendCount();
         int threw = 0;
         try {
-            // 路由按客户端实际查询的名字（mq.topic）注册：这里补一份裸名路由
+            // the route is registered under the name the client actually queries (mq.topic): add a bare-name route here
             mock.addRoute(nsTopic, makeRoute(mock.address(), 1, 1));
             SendResult r = ns.send(plainMessage(nsTopic), MessageQueue(nsTopic, "broker-a", 0), 3000);
             expectInt(static_cast<int>(r.sendStatus), static_cast<int>(SendStatus::SEND_OK),
@@ -1183,7 +1183,7 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
         expectInt(mock.sendCount() - before, 1, "it was really sent");
     }
     {
-        // 另一个命名空间下的同名 topic：是另一个资源，要拒
+        // the same topic name under another namespace: that is another resource, it must be rejected
         const int before = mock.sendCount();
         int threw = 0;
         try {
@@ -1205,7 +1205,7 @@ void testPinnedTopicGuard(MockEndpoint& mock) {
 
 namespace {
 
-// 用例里未预期的异常必须变成可读的失败，而不是把整个进程 terminate 掉
+// An unexpected exception inside a case must become a readable failure instead of terminating the whole process
 void runCase(const char* name, MockEndpoint& mock, void (*fn)(MockEndpoint&)) {
     const auto begin = std::chrono::steady_clock::now();
     try {
@@ -1223,7 +1223,7 @@ void runCase(const char* name, MockEndpoint& mock, void (*fn)(MockEndpoint&)) {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - begin)
             .count());
-    // 用例都是本机 mock，正常在几百毫秒内；超过 2s 说明有请求在等超时，必须能一眼看出是谁
+    // Every case uses a local mock and normally finishes within a few hundred ms; over 2s means some request is waiting for a timeout, and it must be obvious who
     if (ms > 2000) std::printf("SLOW %s: %lldms\n", name, ms);
 }
 

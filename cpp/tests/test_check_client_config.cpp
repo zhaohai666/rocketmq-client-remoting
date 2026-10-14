@@ -1,4 +1,4 @@
-// CHECK_CLIENT_CONFIG(46) 离线单测 —— 不需要集群。
+// Offline unit test for CHECK_CLIENT_CONFIG(46) -- no cluster required.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -55,7 +55,7 @@ void expectInt(long long actual, long long expected, const std::string& name) {
     }
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -79,7 +79,7 @@ bool writeAll(socket_t s, const Bytes& data) {
     return true;
 }
 
-// select 等到可读（100ms 一轮，便于 alive 转 false 后尽快退出），再读一整帧
+// select until readable (one 100ms round, so it exits promptly once alive turns false), then read one whole frame
 bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     for (;;) {
         fd_set rfds;
@@ -107,7 +107,7 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// 已被占用过、随后立即释放的回环端口：连它必然被拒（比固定端口可靠）
+// A loopback port that was occupied and then released immediately: connecting to it is always refused (more reliable than a fixed port)
 std::string deadAddress() {
     netcompat::ensureInitialized();
     socket_t s = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -126,21 +126,21 @@ std::string deadAddress() {
 
 // ---------------------------------------------------------------- mock broker
 
-// 一笔 46 的脚本化应答
+// The scripted reply for one 46
 struct CheckReply {
     int32_t code = ResponseCode::SUCCESS;
     std::string remark;
 };
 
-// 一条 46 请求的取证
+// The evidence kept for one 46 request
 struct CheckRecord {
     int32_t code = 0;
     size_t extCount = 0;
     Bytes body;
 };
 
-// 同时扮演 name server（回路由）与 broker（按脚本回 46 的响应码）。
-// 与 rmq_test_send_retry 的 MockEndpoint 同一套 socket 骨架，只是这里只需要两类请求。
+// Plays both the name server (answers routes) and the broker (answers 46 with the scripted response code).
+// It shares the socket skeleton with the MockEndpoint of rmq_test_send_retry; only two kinds of requests are needed here.
 class MockBroker {
 public:
     MockBroker() {
@@ -165,8 +165,8 @@ public:
     ~MockBroker() {
         running_.store(false);
         if (acceptor_.joinable()) acceptor_.join();
-        // 连接线程在 100ms 一轮的 select 里看到 running_ 转 false 就收手；
-        // joinable 的 std::thread 析构会直接 terminate，所以必须在这里收干净。
+        // Connection threads see running_ turn false inside the 100ms select round and stop;
+        // destroying a joinable std::thread would terminate the process outright, so they must be reaped here.
         for (;;) {
             std::vector<std::thread> pending;
             {
@@ -188,7 +188,7 @@ public:
         routes_[topic] = route.encode();
     }
 
-    // 第 `i` 笔 46 回 `codes[i]`；越界回 SUCCESS
+    // The `i`-th 46 answers `codes[i]`; beyond the script answers SUCCESS
     void scriptChecks(std::vector<CheckReply> replies) {
         std::lock_guard<std::mutex> lk(state_);
         replies_ = std::move(replies);
@@ -204,7 +204,7 @@ public:
         return records_[i];
     }
 
-    // 第 `i` 笔 46 的 body 解出来的 JSON（解不出来回 Null）
+    // The JSON parsed from the body of the `i`-th 46 (Null when it does not parse)
     JsonValue bodyJson(size_t i) {
         CheckRecord r = checkRecord(i);
         JsonValue v;
@@ -288,7 +288,7 @@ private:
     std::thread acceptor_;
 };
 
-// ---------------------------------------------------------------- 用例脚手架
+// ---------------------------------------------------------------- test scaffolding
 
 const char* kGroup = "GID_CheckCfg";
 const char* kTopic = "Sql92Topic";
@@ -306,7 +306,7 @@ SubscriptionData tagSub(const std::string& type = ExpressionType::TAG) {
     return s;
 }
 
-// 起一个实例并把 kTopic 的路由塞进缓存（指向 mock 自己）
+// Starts an instance and puts the route of kTopic into the cache (pointing at the mock itself)
 std::unique_ptr<MQClientInstance> seeded(MockBroker& mock) {
     auto instance = std::make_unique<MQClientInstance>(kClientId,
                                                        std::vector<std::string>{mock.address()});
@@ -319,7 +319,7 @@ std::unique_ptr<MQClientInstance> seeded(MockBroker& mock) {
     return instance;
 }
 
-// ---------------------------------------------------------------- 用例
+// ---------------------------------------------------------------- test cases
 
 void testTagOnlySendsNothing(MockBroker& mock) {
     auto instance = seeded(mock);
@@ -328,7 +328,7 @@ void testTagOnlySendsNothing(MockBroker& mock) {
     subs.push_back(tagSub(ExpressionType::TAG));
     subs.push_back(tagSub(""));
     instance->checkSubscriptionsInBroker(kGroup, subs);
-    expectInt(mock.checkCount(), 0, "TAG / 空 expressionType 都不发 46");
+    expectInt(mock.checkCount(), 0, "neither TAG nor an empty expressionType sends 46");
 }
 
 void testSql92RequestShape(MockBroker& mock) {
@@ -337,18 +337,18 @@ void testSql92RequestShape(MockBroker& mock) {
     std::vector<SubscriptionData> subs;
     subs.push_back(sql92Sub());
     instance->checkSubscriptionsInBroker(kGroup, subs);
-    expectInt(mock.checkCount(), 1, "SQL92 订阅正好一笔 46");
+    expectInt(mock.checkCount(), 1, "an SQL92 subscription sends exactly one 46");
     CheckRecord r = mock.checkRecord(0);
-    expectInt(r.code, RequestCode::CHECK_CLIENT_CONFIG, "请求码是 46");
-    // 请求头 null ⇒ 线上没有 extFields
-    expectInt(static_cast<long long>(r.extCount), 0, "46 请求不带 extFields");
+    expectInt(r.code, RequestCode::CHECK_CLIENT_CONFIG, "request code is 46");
+    // A null request header means no extFields on the wire
+    expectInt(static_cast<long long>(r.extCount), 0, "the 46 request carries no extFields");
 
     JsonValue body = mock.bodyJson(0);
-    expect(body.isObject(), "body 是 JSON 对象");
+    expect(body.isObject(), "body is a JSON object");
     expect(body.get("clientId").stringValue() == kClientId, "body.clientId");
     expect(body.get("group").stringValue() == std::string(kGroup), "body.group");
     const JsonValue* sd = body.find("subscriptionData");
-    expect(sd != nullptr && sd->isObject(), "body.subscriptionData 是对象");
+    expect(sd != nullptr && sd->isObject(), "body.subscriptionData is an object");
     if (sd == nullptr) return;
     expect(sd->get("topic").stringValue() == std::string(kTopic), "subscriptionData.topic");
     expect(sd->get("subString").stringValue() == "a > 10", "subscriptionData.subString");
@@ -359,11 +359,11 @@ void testSql92RequestShape(MockBroker& mock) {
     std::sort(keys.begin(), keys.end());
     const std::vector<std::string> want = {"classFilterMode", "codeSet", "expressionType",
                                            "subString", "subVersion", "tagsSet", "topic"};
-    expect(keys == want, "subscriptionData 只有那 7 个 wire 键", jsonDump(body).c_str());
-    expect(sd->find("filterClassSource") == nullptr, "filterClassSource 不参与序列化");
+    expect(keys == want, "subscriptionData has only those 7 wire keys", jsonDump(body).c_str());
+    expect(sd->find("filterClassSource") == nullptr, "filterClassSource is not serialized");
 }
 
-// 3 / 4. broker 的拒绝码原样带上响应码 —— 这是启动失败的判据
+// 3 / 4. The broker reject code is carried through verbatim -- this is the criterion for a startup failure
 void testBrokerRejectCode(MockBroker& mock, int32_t code, const char* name) {
     auto instance = seeded(mock);
     mock.scriptChecks({{code, "remark-" + std::to_string(code)}});
@@ -382,8 +382,8 @@ void testBrokerRejectCode(MockBroker& mock, int32_t code, const char* name) {
         std::printf("  wrong exception for %s: %s\n", name, e.what());
     }
     expect(threw == 1, name);
-    expectInt(got, code, std::string(name) + " 带上 broker 响应码");
-    expect(msg.find("remark") != std::string::npos, std::string(name) + " 保留 remark", msg);
+    expectInt(got, code, std::string(name) + " carries the broker response code");
+    expect(msg.find("remark") != std::string::npos, std::string(name) + " keeps the remark", msg);
 }
 
 void testNoRouteSkips(MockBroker& mock) {
@@ -393,9 +393,9 @@ void testNoRouteSkips(MockBroker& mock) {
     mock.scriptChecks({});
     std::vector<SubscriptionData> subs;
     subs.push_back(sql92Sub());
-    instance->checkSubscriptionsInBroker(kGroup, subs);  // 缓存里没有这个 topic 的路由
-    expectInt(mock.checkCount(), 0, "无路由的订阅一笔 46 都不发");
-    expect(instance->findBrokerAddrByTopic(kTopic).empty(), "findBrokerAddrByTopic 只读缓存");
+    instance->checkSubscriptionsInBroker(kGroup, subs);  // no route for this topic in the cache
+    expectInt(mock.checkCount(), 0, "a subscription without a route sends not even one 46");
+    expect(instance->findBrokerAddrByTopic(kTopic).empty(), "findBrokerAddrByTopic only reads the cache");
 }
 
 void testTransportErrorWrapped(MockBroker& mock) {
@@ -420,26 +420,26 @@ void testTransportErrorWrapped(MockBroker& mock) {
     } catch (const std::exception& e) {
         std::printf("  wrong exception type: %s\n", e.what());
     }
-    expect(threw == 1, "连不上 broker 也抛 MQClientException");
-    expect(msg.find("SQL92") != std::string::npos, "文案里带上表达式类型", msg);
+    expect(threw == 1, "an unreachable broker still throws MQClientException");
+    expect(msg.find("SQL92") != std::string::npos, "the message includes the expression type", msg);
     expect(msg.find("server has not been upgraded to support") != std::string::npos,
-           "文案与参考实现一致", msg);
-    expectInt(mock.checkCount(), 0, "传输失败时 broker 没收到 46");
+           "the message matches the reference wording", msg);
+    expectInt(mock.checkCount(), 0, "the broker received no 46 when the transport failed");
 }
 
 void testEmptySubs(MockBroker& mock) {
     auto instance = seeded(mock);
     mock.scriptChecks({});
     instance->checkSubscriptionsInBroker(kGroup, std::vector<SubscriptionData>());
-    expectInt(mock.checkCount(), 0, "空订阅不发 46");
+    expectInt(mock.checkCount(), 0, "an empty subscription sends no 46");
 }
 
-// 8. master 优先；只有 master 缺席时才随机取从节点
+// 8. The master is preferred; only when the master is absent is a slave picked at random
 void testMasterPreferred(MockBroker& mock) {
     TopicRouteData route;
     std::map<int64_t, std::string> addrs;
     addrs[0] = mock.address();
-    addrs[1] = deadAddress();  // 从节点：选中它就必然连不上
+    addrs[1] = deadAddress();  // slave: selecting it always fails to connect
     route.brokerDatas.emplace_back("DefaultCluster", "broker-a", addrs);
     mock.addRoute(kTopic, route);
     auto instance = std::make_unique<MQClientInstance>(
@@ -449,32 +449,32 @@ void testMasterPreferred(MockBroker& mock) {
     std::vector<SubscriptionData> subs;
     subs.push_back(sql92Sub());
     for (int i = 0; i < 5; ++i) {
-        instance->checkSubscriptionsInBroker(kGroup, subs);  // 抛异常即测试失败
+        instance->checkSubscriptionsInBroker(kGroup, subs);  // an exception means test failure
     }
-    expectInt(mock.checkCount(), 5, "有 master 时永远只打 master");
+    expectInt(mock.checkCount(), 5, "with a master present only the master is ever called");
 }
 
-// 9. CheckClientRequestBody 往返 + namespace 只在置位时参与序列化
+// 9. CheckClientRequestBody round trip + the namespace is serialized only when the flag is set
 void testBodyRoundTrip() {
     CheckClientRequestBody in;
     in.clientId = "cid";
     in.group = "gid";
     in.subscriptionData = sql92Sub("color = 'red'");
     JsonValue v = in.toJson();
-    expect(v.find("namespace") == nullptr, "namespace 未置位时不序列化");
+    expect(v.find("namespace") == nullptr, "namespace is not serialized while unset");
     CheckClientRequestBody out;
-    expect(CheckClientRequestBody::decode(in.encode(), out), "body 可解回");
-    expect(out.clientId == in.clientId && out.group == in.group, "clientId / group 往返");
+    expect(CheckClientRequestBody::decode(in.encode(), out), "body decodes back");
+    expect(out.clientId == in.clientId && out.group == in.group, "clientId / group round trip");
     expect(out.subscriptionData.topic == kTopic
                && out.subscriptionData.subString == "color = 'red'"
                && out.subscriptionData.expressionType == std::string(ExpressionType::SQL92),
-           "subscriptionData 往返");
+           "subscriptionData round trip");
     in.hasNamespace = true;
     in.clientNamespace = "nsA";
     CheckClientRequestBody out2;
     expect(CheckClientRequestBody::decode(in.encode(), out2) && out2.hasNamespace
                && out2.clientNamespace == "nsA",
-           "namespace 置位后往返");
+           "round trip after the namespace is set");
 }
 
 }  // namespace
@@ -484,7 +484,7 @@ int main() {
     testTagOnlySendsNothing(mock);
     testSql92RequestShape(mock);
     testBrokerRejectCode(mock, ResponseCode::SUBSCRIPTION_PARSE_FAILED, "SUBSCRIPTION_PARSE_FAILED");
-    testBrokerRejectCode(mock, ResponseCode::SYSTEM_ERROR, "未开 enablePropertyFilter 回 SYSTEM_ERROR");
+    testBrokerRejectCode(mock, ResponseCode::SYSTEM_ERROR, "SYSTEM_ERROR without enablePropertyFilter");
     testNoRouteSkips(mock);
     testTransportErrorWrapped(mock);
     testEmptySubs(mock);

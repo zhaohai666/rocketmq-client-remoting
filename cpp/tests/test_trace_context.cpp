@@ -1,5 +1,5 @@
-// W3C traceparent 透传单测：生成/校验/子 span/注入不覆盖/属性提取。
-// 真机（broker TLS + 消息属性跨客户端透传）由 live 脚本验证。
+// W3C traceparent pass-through unit tests: generate/validate/child span/inject-without-overwrite/property extraction.
+// Live-cluster behavior (broker TLS + message property pass-through across clients) is verified by the live scripts.
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -78,18 +78,18 @@ void testInjectExtract() {
     Message msg;
     msg.putProperty("k", "v");
 
-    // 无既有值 -> 注入根上下文
+    // No existing value -> inject the root context
     const std::string injected = injectTraceContext(&msg);
     expectTrue(isValidTraceparent(injected), "injected valid");
     expectEq(extractTraceparent(msg), injected, "extract == injected");
 
-    // 已有值 -> 不覆盖（上游传播优先）
+    // Existing value -> do not overwrite (upstream propagation wins)
     Message msg2;
     msg2.putProperty(kTraceContextProperty, "00-11111111111111111111111111111111-2222222222222222-01");
     const std::string kept = injectTraceContext(&msg2);
     expectEq(kept, "00-11111111111111111111111111111111-2222222222222222-01", "existing not overwritten");
 
-    // 未注入的消息 extract 返回空串
+    // extract on a message that was never injected returns an empty string
     Message msg3;
     expectEq(extractTraceparent(msg3), "", "extract empty when absent");
 }

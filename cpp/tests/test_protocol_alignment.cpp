@@ -30,7 +30,7 @@ static bool parseProtocolConst(const std::string& text, const std::string& name,
     while (true) {
         size_t p = text.find(name, from);
         if (p == std::string::npos) return false;
-        // 名称后应当是空白或 '='
+        // After the name there should be whitespace or '='
         size_t q = p + name.size();
         while (q < text.size() && (text[q] == ' ' || text[q] == '\t')) ++q;
         if (q < text.size() && text[q] == '=') {
@@ -89,7 +89,7 @@ static void checkBuiltinTable() {
           "LanguageCode JAVA/CPP/PYTHON");
     CHECK(SerializeType::JSON == 0 && SerializeType::ROCKETMQ == 1, "SerializeType JSON/ROCKETMQ");
 
-    // valueOf 反查
+    // valueOf reverse lookup
     CHECK(std::string(LanguageCode::valueOf(LanguageCode::CPP)) == "CPP", "LanguageCode::valueOf");
     CHECK(LanguageCode::valueOf(999) == nullptr, "LanguageCode::valueOf unknown -> nullptr");
     CHECK(std::string(SerializeType::valueOf(SerializeType::ROCKETMQ)) == "ROCKETMQ",
@@ -103,7 +103,7 @@ static void checkBuiltinTable() {
     CHECK(ClientErrorCode::REQUEST_TIMEOUT_EXCEPTION == 10006, "REQUEST_TIMEOUT_EXCEPTION==10006");
     CHECK(ClientErrorCode::CREATE_REPLY_MESSAGE_EXCEPTION == 10007,
           "CREATE_REPLY_MESSAGE_EXCEPTION==10007");
-    // 抛出点确实带上了这两个码（以前 RequestTimeoutException 走默认码 1）
+    // The throw sites really carry these two codes (previously RequestTimeoutException used the default code 1)
     CHECK(RequestTimeoutException("x").getResponseCode() == ClientErrorCode::REQUEST_TIMEOUT_EXCEPTION,
           "RequestTimeoutException carries 10006");
 }
@@ -157,8 +157,8 @@ static void checkAgainstProtocolSource() {
     }
 }
 
-// ClientErrorCode.java 单独一趟：上面那个函数在 RequestCode.java 缺失时会提前 return，
-// 不能连带把这张表的回归检查也跳掉。
+// ClientErrorCode.java gets its own pass: the function above returns early when RequestCode.java is missing,
+// so it must not also skip this table's regression check along with it.
 static void checkClientErrorCodeAgainstProtocolSource() {
     const char* src = std::getenv("ROCKETMQ_SERVER_SRC");
     if (src == nullptr || *src == '\0') {

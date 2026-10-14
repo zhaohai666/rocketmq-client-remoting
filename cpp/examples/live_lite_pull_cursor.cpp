@@ -1,20 +1,20 @@
-// 离线单测（tests/test_lite_pull_cursor.cpp）只能证明「脚本回的 nextBeginOffset 被跟了」；
-// 真 broker 才能让下面两件事同时成立：那个 nextBeginOffset 是 **broker 自己算的**，而且
-// 跟过去以后**真的能收到消息**。
+// The offline unit test (tests/test_lite_pull_cursor.cpp) only proves that the
+// nextBeginOffset the stub returns gets followed. Only a real broker makes both statements
+// below true at once: it is **broker-computed**, and following it **really delivers messages**.
 //
-// 场景：
-//   S1 对照组：每条队列钉 1 条 → assign + seek(0) + `*` → 4 条全收（链路要通，
-//      maxOffset == 1 这个标尺也要立住）。
-//   S2 NO_MATCHED_MSG：把 assign 表达式换成永不匹配的 Tag 再 seek(0)。broker 按表达式把
-//      整段滤掉后回的 nextBeginOffset **已经越过整段**（= maxOffset）。断言每条队列的拉取
-//      游标都到 maxOffset（旧实现只在 FOUND 时推游标，这里会永远停在 0，每轮重扫同一段）。
-//      零投递。
-//   S3 OFFSET_ILLEGAL 自愈（决定性一条）：每条队列 seek(maxOffset + 1000)。broker 回纠正值
-//      → 游标必须回到 maxOffset；随后每条队列再钉 1 条，4 条必须**全部收到**。旧实现的游标
-//      永远卡在越界值上：每轮收到同一个「越界纠正」，新消息一条也看不到 —— 越界之后消费者
-//      会**静默**地永远收不到消息。
+// Scenarios:
+//   S1 control group: pin 1 message per queue -> assign + seek(0) + `*` -> all 4 received (the
+//      path has to work, and the maxOffset == 1 yardstick has to hold too).
+//   S2 NO_MATCHED_MSG: replace the assign expression with a Tag that never matches, then
+//      seek(0). With the whole run filtered out by expression the nextBeginOffset returned
+//      is **already past the whole run** (= maxOffset): every queue's pull cursor must get
+//      there; advancing only on FOUND (old code) would sit at 0 rescanning. Zero delivery.
+//   S3 OFFSET_ILLEGAL self-healing (decisive case): seek(maxOffset + 1000) per queue.
+//      The broker corrects it -> the cursor must return to maxOffset; pin 1 more message per
+//      queue and all 4 must **be received**. Old cursor: stuck on the out-of-range value, the
+//      same correction every round, nothing new -- the consumer **silently** stops receiving.
 //
-// 用法：./rmq_live_lite_pull_cursor 127.0.0.1:9876
+// Usage: ./rmq_live_lite_pull_cursor 127.0.0.1:9876
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -82,7 +82,7 @@ struct Fixture {
         ClusterInfo cluster = admin.fetchBrokerClusterInfo();
         const std::vector<std::string> addrs = cluster.getBrokerAddrs();
         if (addrs.empty()) {
-            throw std::runtime_error("nameServer 无 broker 注册");
+            throw std::runtime_error("no broker registered on the name server");
         }
         brokerAddr = addrs[0];
         producer = std::make_shared<DefaultMQProducer>("GID_cpp_live_lite_cursor_pg_" + stamp);
@@ -127,7 +127,7 @@ std::string cursorRow(DefaultLitePullConsumer& c, const std::vector<MessageQueue
     return s;
 }
 
-/// 反复 poll 直到收齐 expect 条（或超时），返回收到的 body。
+/// Poll repeatedly until expect messages arrive (or the timeout); return the bodies received.
 std::vector<std::string> drain(DefaultLitePullConsumer& c, size_t expect, int64_t timeoutMs) {
     std::vector<std::string> out;
     const int64_t deadline = nowMs() + timeoutMs;
@@ -139,7 +139,7 @@ std::vector<std::string> drain(DefaultLitePullConsumer& c, size_t expect, int64_
     return out;
 }
 
-/// 给定窗口里盯住缓冲（断言「不该有交付」时用）。
+/// Watch the buffer during the given window (used to assert that nothing is delivered).
 std::vector<std::string> pollQuiet(DefaultLitePullConsumer& c, int64_t windowMs) {
     std::vector<std::string> out;
     const int64_t deadline = nowMs() + windowMs;
@@ -186,14 +186,14 @@ int main(int argc, char* argv[]) {
         std::printf("topic=%s queues=%d group=%s\n", topic.c_str(), kQueues, group.c_str());
 
         std::vector<MessageQueue> mqs = fx.queues(topic);
-        check("路由可见：4 条队列", mqs.size() == static_cast<size_t>(kQueues),
+        check("route visible: 4 queues", mqs.size() == static_cast<size_t>(kQueues),
               "got=" + std::to_string(mqs.size()));
         if (mqs.size() != static_cast<size_t>(kQueues)) {
             fx.shutdown();
             return 1;
         }
 
-        // ---------------- S1 对照组 ----------------
+        // ---------------- S1 control group ----------------
         for (size_t i = 0; i < mqs.size(); ++i) {
             Message m(topic, "lc-s1-" + std::to_string(i));
             m.setTags("TagA");
@@ -204,7 +204,7 @@ int main(int argc, char* argv[]) {
         c->setNamesrvAddr(fx.namesrv);
         c->setInstanceName("cpp-live-lite-cursor-" + fx.stamp);
         c->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
-        // 位点越界那一腿绝不能把越界值提交上去：关掉自动提交，只看拉取/交付两条游标。
+        // Out-of-range leg must not commit the bad offset: auto-commit off, watch the cursors only.
         c->setAutoCommit(false);
         c->setPullIntervalMillis(200);
         c->assign(mqs);
@@ -215,7 +215,7 @@ int main(int argc, char* argv[]) {
         }
 
         std::vector<std::string> got1 = drain(*c, static_cast<size_t>(kQueues), 30000);
-        check("S1-对照组：* 订阅下 4 条钉到队列的消息全收",
+        check("S1-control group: all 4 queue-pinned messages received under the * subscription",
               got1.size() == static_cast<size_t>(kQueues),
               "got=" + std::to_string(got1.size()) + " bodies=" + join(got1));
 
@@ -234,7 +234,7 @@ int main(int argc, char* argv[]) {
             10000);
         std::string maxDetail;
         for (int64_t m : maxes) maxDetail += std::to_string(m) + " ";
-        check("S1-每条队列 maxOffset == 1（后面两条腿的标尺）", maxOk, maxDetail);
+        check("S1-maxOffset == 1 on every queue (yardstick for the two later legs)", maxOk, maxDetail);
 
         // ---------------- S2 NO_MATCHED_MSG ----------------
         c->setSubExpressionForAssign(topic, kNeverMatch);
@@ -249,10 +249,10 @@ int main(int argc, char* argv[]) {
                 return true;
             },
             20000);
-        check("S2-NO_MATCHED_MSG 后拉取游标越过整段不匹配区间（== maxOffset=1）", s2,
+        check("S2-pull cursor passes the whole non-matching run after NO_MATCHED_MSG (== maxOffset=1)", s2,
               cursorRow(*c, mqs));
         std::vector<std::string> quiet = pollQuiet(*c, 1000);
-        check("S2-空应答期间零投递", quiet.empty(), join(quiet));
+        check("S2-zero delivery while the responses stay empty", quiet.empty(), join(quiet));
 
         // ---------------- S3 OFFSET_ILLEGAL ----------------
         std::string ahead;
@@ -269,10 +269,10 @@ int main(int argc, char* argv[]) {
                 return true;
             },
             20000);
-        check("S3-越界位点被 broker 纠正后游标回到 maxOffset（越界自愈）", s3,
+        check("S3-cursor returns to maxOffset after the broker corrects the out-of-range offset (self-healing)", s3,
               cursorRow(*c, mqs) + " seekedTo=" + ahead);
 
-        // S2 换上的永不匹配表达式要换回来，否则下面 4 条 TagA 会被 broker 原样滤掉。
+        // Put back the never-matching expression set in S2, else the broker filters out the 4 TagA messages below.
         c->setSubExpressionForAssign(topic, "*");
         for (size_t i = 0; i < mqs.size(); ++i) {
             Message m(topic, "lc-s3-" + std::to_string(i));
@@ -281,7 +281,7 @@ int main(int argc, char* argv[]) {
         }
 
         std::vector<std::string> got3 = drain(*c, static_cast<size_t>(kQueues), 40000);
-        check("S3-自愈后新消息全部送达（旧实现：游标卡在 +1000，一条都看不到）",
+        check("S3-all new messages delivered after self-healing (old code: cursor stuck at +1000, nothing visible)",
               got3.size() == static_cast<size_t>(kQueues),
               "got=" + std::to_string(got3.size()) + " bodies=" + join(got3));
         bool bodiesOk = got3.size() == static_cast<size_t>(kQueues);
@@ -293,11 +293,11 @@ int main(int argc, char* argv[]) {
             }
             bodiesOk = found;
         }
-        check("S3-收到的正是越界之后钉进去的那 4 条", bodiesOk, join(got3));
+        check("S3-exactly the 4 messages pinned after the out-of-range seek were received", bodiesOk, join(got3));
 
         c->shutdown();
     } catch (const std::exception& e) {
-        check("场景异常", false, e.what());
+        check("scenario threw", false, e.what());
     }
 
     fx.shutdown();

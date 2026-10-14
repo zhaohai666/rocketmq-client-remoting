@@ -1,12 +1,12 @@
-// 为什么必须离线锁死：这条路径错了是**静默**的两种极端 ——
-//   - 只把拉取游标拨到 nextBeginOffset 而不丢队列/不冻结：broker 刚把位点纠正到合法区间，
-//     这条队列上**已经取回还没 ack** 的旧批次一 ack 又把位点推回非法值，下一轮拉取再被
-//     broker 拒一次 —— 客户端与 broker 之间来回弹跳，永不停歇；
-//   - 纠错后的位点没立刻落盘：进程在下一轮周期落盘（默认 5s）之前崩掉，broker 上留着的
-//     还是非法位点，重启后从非法位点起拉 —— 这条纠错等于没做。
-// 两个方向在真机短期窗口里都看不出差别（消息照消费、只是一直在弹 / 一次崩溃才暴露），
-// 所以断言尽量放离线；真机另有一条链路证明（examples/live_offset_illegal.cpp 的 S1/S2：
-// 「发现延迟 + 重建后位点恢复推进」与「纠错值 0.0-0.5s 内出现在 broker 上且零投递」）。
+// Why this must be locked down offline: getting this path wrong fails **silently** in two extreme ways --
+//   - only the pull cursor is moved to nextBeginOffset without dropping the queue or freezing: the broker has just
+//     corrected the offset into a legal range, but an older batch already fetched and not yet acked on this queue
+//     pushes the offset back to an illegal value when it acks, and the next pull is rejected by the broker again --
+//     bouncing back and forth between the client and the broker, never stopping;
+//   - the corrected offset is not persisted immediately: the process crashes before the next periodic flush (5s by default),
+//     the broker still holds the illegal offset and a restart pulls from it -- the correction never really happened.
+// Both directions are indistinguishable in a short live window (messages keep being consumed while bouncing; only a crash exposes it),
+// so the assertions stay offline as much as possible; a separate live proof chain exists (examples/live_offset_illegal.cpp S1/S2:
 #include <cstdio>
 #include <optional>
 #include <string>
@@ -57,7 +57,7 @@ std::vector<MessageExt> offsetBatch(size_t n) {
     return out;
 }
 
-// 全部认可（ackIndex 保持默认）的 listener，只记调用次数
+// Listener that accepts the whole batch (ackIndex stays default); only records the call count
 class RecordingListener : public MessageListenerConcurrently {
 public:
     ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
@@ -70,8 +70,8 @@ public:
     size_t lastSize = 0;
 };
 
-// 未 start 的消费者即可：handleOffsetIllegal / consumeBatch / correctTagsOffset 全在本地
-// 状态上；onQueuesRevoked 在 mqClient_ 为空时直接返回（本端口不做真 RPC 的分支）。
+// A non-started consumer suffices: handleOffsetIllegal / consumeBatch / correctTagsOffset all work on local
+// state; onQueuesRevoked returns immediately when mqClient_ is null (no real-RPC branch in this port).
 class Harness {
 public:
     Harness() : consumer_(kGroup), key_(DefaultMQPushConsumer::offsetKey(queue0())) {
@@ -80,8 +80,8 @@ public:
         consumer_.setAssignedQueue(key_, queue0());
     }
 
-    // 消费一批并原地推进位点：位点表没有直接写入面，用真实消费路径产生一个已知位点
-    // （离线时 sendMessageBack 必失败，所以这里只用整批认可的批次）。
+    // Consume one batch and advance the offset in place: the offset table has no direct write surface, so a known offset is
+    // produced through the real consumption path (offline sendMessageBack always fails, so only whole-batch-accepted batches are used here).
     void seedConsumed(int64_t uptoOffsetExclusive) {
         std::vector<MessageExt> batch;
         for (int64_t i = 0; i < uptoOffsetExclusive; i++) {
@@ -111,33 +111,33 @@ void expectOffset(Harness& h, std::optional<int64_t> want, const std::string& na
     expect(got == want, name, "want=" + offText(want) + " got=" + offText(got));
 }
 
-// ------------------------------------------------- 纠错 = 冻结 + 丢队列 + 代号 +1
+// ------------------------------------------------- recovery = freeze + drop queue + epoch +1
 
 void testRecoverDropsQueueState() {
     Harness h;
-    h.seedConsumed(3);                    // 位点 3
+    h.seedConsumed(3);                    // offset 3
     expectOffset(h, 3, "recover.seedOffset");
     h.consumer().setPendingMessages(h.key(), {ext(3), ext(4)});
     h.consumer().setLastPullAt(h.key(), 1234567890);
 
     h.recover(0);
 
-    // 队列的本地状态全部作废：缓冲、游标、已消费位点、拉取时刻表（余下由代号与冻结体现）
+    // All local queue state is invalidated: buffer, cursor, consumed offset, pull-time table (the rest is carried by the epoch and the freeze)
     expect(h.consumer().pendingMessages(h.key()).empty(), "recover.pendingCleared");
     expectOffset(h, std::nullopt, "recover.offsetTableCleared");
     expect(h.consumer().queueEpoch(h.key()) == 1, "recover.epochBumped",
            std::to_string(h.consumer().queueEpoch(h.key())));
     expect(h.consumer().offsetFrozen(h.key()), "recover.frozen");
-    // 归属被撤：时刻表清空后旧拉取循环下一轮 ownsQueue 即失败退出（也顺带证明
-    // 纠错走的就是 rebalance 那条 retireQueueLocked，而不是另写一份半套清理）
+    // Ownership revoked: after the time table is cleared the old pull loop fails ownsQueue on the next round and exits (this also
+    // proves recovery goes through rebalance's retireQueueLocked instead of a separate half-baked cleanup)
     expect(h.consumer().lastPullAt(h.key()) == -1, "recover.ownershipDropped",
            std::to_string(h.consumer().lastPullAt(h.key())));
 }
 
 void testRecoverWithoutQueueIsNoop() {
-    // 队列已经不在本实例名下（并发撤销）：没有 mq 就没有可落盘的对象，不能凭空造一条；
-    // 冻结与代号照常（纠错值仍要挡住任何迟到的 ack），且本端口的网络收尾在哨兵判空后
-    // 直接返回 —— 未 start 的消费者上调用不得崩。
+    // The queue is no longer owned by this instance (concurrent revoke): without a MessageQueue there is no object to persist, and one must not
+    // be invented out of thin air; the freeze and epoch bump still happen (the corrected value must still block any late ack), and the network
+    // cleanup of this port returns right after the null sentinel check -- calling on a non-started consumer must not crash.
     Harness h;
     const std::string key = DefaultMQPushConsumer::offsetKey(MessageQueue("T2", kBroker, 7));
     h.consumer().handleOffsetIllegal(key, 5);
@@ -149,8 +149,8 @@ void testRecoverWithoutQueueIsNoop() {
 }
 
 void testSecondRecoverKeepsEpochMonotonic() {
-    // 连续两次纠错（broker 又被重置）：代号只能单调涨，回落成 1 会让**第一次**纠错误丢的
-    // 旧批次突然「代号又对上了」而复活。
+    // Two consecutive recoveries (the broker got reset again): the epoch may only increase; falling back to 1 would let the
+    // batch dropped by the first correction suddenly "match the epoch again" and come back to life.
     Harness h;
     h.recover(0);
     h.recover(0);
@@ -159,12 +159,12 @@ void testSecondRecoverKeepsEpochMonotonic() {
     expect(h.consumer().offsetFrozen(h.key()), "twice.stillFrozen");
 }
 
-// ------------------------------------------------- 冻结：修正值不被在途 ack 推翻
+// ------------------------------------------------- freeze: the corrected value is not overturned by in-flight acks
 
 void testFrozenOffsetIgnoresAck() {
     Harness h;
-    h.seedConsumed(3);                    // 位点 3（纠错前）
-    h.recover(0);                         // 纠错到 0 并冻结
+    h.seedConsumed(3);                    // offset 3 (before correction)
+    h.recover(0);                         // correct to 0 and freeze
     const int callsBefore = h.listener().calls;
 
     const uint64_t epoch = h.consumer().queueEpoch(h.key());
@@ -184,7 +184,7 @@ void testFrozenOffsetIgnoresCorrectTagsOffset() {
 void testFrozenOffsetSurvivesTheDrop() {
     Harness h;
     h.recover(0);
-    h.seedConsumed(2);                    // 试图把位点从「无」推到 2
+    h.seedConsumed(2);                    // try to push the offset from "none" up to 2
     expectOffset(h, std::nullopt, "frozenSurvives.noResurrect");
     expect(h.consumer().offsetFrozen(h.key()), "frozenSurvives.stillFrozen");
 }
@@ -202,7 +202,7 @@ void testConsumeBatchEpochGate() {
         expectOffset(h, std::nullopt, "epochGate.staleNoAck");
     }
     {
-        // 代号一致 ⇒ 正常消费并推进（闸门不能把正常路径也挡掉）
+        // matching epoch => consume normally and advance (the gate must not block the normal path either)
         Harness h;
         const uint64_t epoch = h.consumer().queueEpoch(h.key());
         const bool done = h.consumer().consumeBatch(h.key(), queue0(), offsetBatch(2), epoch);
@@ -213,8 +213,8 @@ void testConsumeBatchEpochGate() {
 }
 
 void testNoCrossQueueInterference() {
-    // 纠错只动这一条队列：兄弟队列的代号/冻结/归属必须原样（一条 "clear 全表" 的
-    // 实现会让同实例的其它队列全部重投）。
+    // Recovery only touches this queue: sibling queues' epoch / freeze / ownership must stay as they were (an implementation
+    // that "clears the whole table" would redeliver every other queue of the same instance).
     Harness h;
     const std::string sibling =
         DefaultMQPushConsumer::offsetKey(MessageQueue(kTopic, kBroker, 1));

@@ -1,22 +1,22 @@
-// Validators / TopicValidator 真机验证。
-// 用法：rmq_validators_live 127.0.0.1:9876
+// Validators / TopicValidator live verification on a real cluster.
+// Usage: rmq_validators_live 127.0.0.1:9876
 //
-// 逐条断言证明「非法名字在本地第一行就被拦掉，合法名字照常在集群收发」。
+// Per-assertion proof that "illegal names are stopped on the first local line, while legal names keep sending and receiving on the cluster".
 //
-// 前置：NameServer + Broker 已起（普通配置，不需要 ACL/TLS/trace）。
+// Prerequisite: NameServer + Broker already running (plain configuration; no ACL/TLS/trace needed).
 //
-// 场景：
-//   S1 发送路径：空白/超长/非法字符 topic、禁发的 broker 内部流水、body 三档、
-//      INNER_MULTI_DISPATCH 分隔符 —— 全部在 <50ms 内本地拒（namesrv 就在场）
-//   S2 批量路径：逐条 checkMessage（成员非法也要拦）+ 同质性检查
-//   S3 生产者 start()：保留组 / 非法字符 / 超长三道门 + 等长(120)边界放行，失败不进 started 态
-//   S4 正腿：合法名字照常在集群收发（push + lite 两路消费者各收到 3 条）
-//   S5 对照腿：合法但**不存在**的 topic 要走真往返（broker 自动建出来），
-//      比本地拒慢一个数量级以上 —— 这条量化了「本地校验省掉的是什么」
-//   S6 pull / lite 的组名门 + 合法 pull 组能查到队列与位点
-//   S7 createTopic 的本地拒（空白 / 非法字符 / 系统 topic）
-//   S8 寻址故障（10004 一个 name server 地址都没有）不能被说成"topic 没路由"（10005）；
-//      地址配了只是连不上（10005）与地址压根没配（10004）是两件事，排障方向完全不同
+// Scenarios:
+//   S1 send path: blank / over-long / illegal-character topics, forbidden broker-internal
+//      topics, the three body tiers, INNER_MULTI_DISPATCH separators — all rejected locally in <50ms (with the name server present)
+//   S2 batch path: per-message checkMessage (an illegal member must also be caught) + homogeneity check
+//   S3 producer start(): reserved group / illegal characters / over-long, three gates + the equal-length(120) boundary passes; failure does not enter started state
+//   S4 positive leg: legal names still send and receive on the cluster (push + lite consumers each receive 3 messages)
+//   S5 control leg: a legal but **nonexistent** topic takes a real round trip (the broker auto-creates it),
+//      an order of magnitude slower than the local rejection — this quantifies "what local validation saves"
+//   S6 pull / lite group-name gates + a legal pull group can look up queues and offsets
+//   S7 createTopic local rejections (blank / illegal characters / system topic)
+//   S8 an addressing failure (10004: not a single name server address) must not be reported as "topic has no route" (10005);
+//      an address configured but unreachable (10005) versus an address never configured at all (10004) are two different things, with entirely different troubleshooting directions
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -48,7 +48,7 @@ int32_t gPass = 0;
 int32_t gFail = 0;
 std::string gNamesrv = "127.0.0.1:9876";
 
-/// 本地校验的超时预算（毫秒）：真往返那一腿是 S5 实测的几十毫秒起步。
+/// Timeout budget (ms) for local validation: the real round-trip leg is tens of measured milliseconds, as seen in S5.
 constexpr double kLocalBudgetMs = 50.0;
 constexpr int32_t kQueueNums = 4;
 
@@ -84,8 +84,8 @@ std::string bodyOf(const MessageExt& m) { return std::string(m.body.begin(), m.b
 
 bool startsWith(const std::string& s, const std::string& p) { return s.rfind(p, 0) == 0; }
 
-/// 跑一个 thunk，把抛出的异常按类型摊平成 (是否抛, 文案, 响应码, 耗时)。
-/// 非 MQClientException（如批量的 std::invalid_argument）码记 0，表示"不在客户端错误码体系里"。
+/// Run a thunk and flatten the thrown exception by type into (threw, message, response code, elapsed).
+/// Anything outside MQClientException (e.g. std::invalid_argument from batches) records code 0, meaning "not in the client error-code system".
 struct Captured {
     bool threw = false;
     std::string what;
@@ -110,24 +110,24 @@ Captured capture(const std::function<void()>& fn) {
     return c;
 }
 
-/// 断言「本地就拒」：抛了、文案命中、码值对、且没慢到像跑了网络。返回实测耗时。
+/// Assert "rejected locally": threw, message matched, code correct, and not so slow it looks like a network trip. Returns the measured elapsed time.
 double expectLocalReject(const std::string& name, const std::function<void()>& fn,
                          const std::string& needle, int32_t wantCode) {
     Captured c = capture(fn);
     check(name,
           c.threw && c.what.find(needle) != std::string::npos && c.code == wantCode &&
               c.elapsedMs < kLocalBudgetMs,
-          (c.threw ? c.what : std::string("没有抛异常")) + "  code=" + std::to_string(c.code) +
+          (c.threw ? c.what : std::string("no exception thrown")) + "  code=" + std::to_string(c.code) +
               "  " + ms(c.elapsedMs));
     return c.elapsedMs;
 }
 
-/// 断言「start() 本地就拒，且失败后没有把自己标成 started」。
+/// Assert "start() rejects locally, and after failing it did not mark itself started".
 double expectStartReject(const std::string& name, const std::function<bool()>& startedFlag,
                          const std::function<void()>& startFn, const std::string& needle) {
     Captured c = capture(startFn);
     check(name, c.threw && c.what.find(needle) != std::string::npos && !startedFlag(),
-          (c.threw ? c.what : std::string("没有抛异常")) + "  " + ms(c.elapsedMs));
+          (c.threw ? c.what : std::string("no exception thrown")) + "  " + ms(c.elapsedMs));
     return c.elapsedMs;
 }
 
@@ -148,7 +148,7 @@ bool waitUntil(const std::function<bool()>& pred, int32_t timeoutMs) {
     return pred();
 }
 
-/// 路由查询在没有路由时会抛（TOPIC_NOT_EXIST / no route），这里摊平成"队列数 0"。
+/// Route queries throw when there is no route (TOPIC_NOT_EXIST / no route); flattened here into "queue count 0".
 size_t routeQueueCount(const std::function<std::vector<MessageQueue>()>& fetch) {
     try {
         return fetch().size();
@@ -157,7 +157,7 @@ size_t routeQueueCount(const std::function<std::vector<MessageQueue>()>& fetch) 
     }
 }
 
-// 收集消费到的消息（并发安全），按 body 前缀筛
+// Collect consumed messages (thread-safe), filtered by body prefix
 class Collector : public MessageListenerConcurrently {
 public:
     ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
@@ -181,10 +181,10 @@ private:
     std::vector<MessageExt> msgs_;
 };
 
-// ---------------------------------------------------------------- S1 发送路径
+// ---------------------------------------------------------------- S1 send path
 
 double s1_sendPathRejects(DefaultMQProducer& p) {
-    std::printf("== S1 发送路径的本地校验（namesrv 在场，仍然不碰网络）==\n");
+    std::printf("== S1 local validation on the send path (name server present, still never touches the network)==\n");
     const std::string longTopic = repeatedChar('a', 128);
     struct Neg {
         const char* label;
@@ -193,13 +193,13 @@ double s1_sendPathRejects(DefaultMQProducer& p) {
         int32_t code;
     };
     const Neg negs[] = {
-        {"S1a 空 topic", "", "The specified topic is blank", ResponseCode::SYSTEM_ERROR},
-        {"S1b 全空白 topic", "   ", "The specified topic is blank", ResponseCode::SYSTEM_ERROR},
-        {"S1c 超长 topic(128)", longTopic, "is longer than topic max length 127",
+        {"S1a empty topic", "", "The specified topic is blank", ResponseCode::SYSTEM_ERROR},
+        {"S1b all-whitespace topic", "   ", "The specified topic is blank", ResponseCode::SYSTEM_ERROR},
+        {"S1c over-long topic(128)", longTopic, "is longer than topic max length 127",
          ResponseCode::SYSTEM_ERROR},
-        {"S1d 带点 topic", "Validators.Live", kIllegalTail, ResponseCode::SYSTEM_ERROR},
-        {"S1e 非 ASCII topic", "Validators中文", kIllegalTail, ResponseCode::SYSTEM_ERROR},
-        {"S1f 禁发的 broker 内部流水", "SCHEDULE_TOPIC_XXXX", "is forbidden",
+        {"S1d topic with a dot", "Validators.Live", kIllegalTail, ResponseCode::SYSTEM_ERROR},
+        {"S1e non-ASCII topic", "Validators中文", kIllegalTail, ResponseCode::SYSTEM_ERROR},
+        {"S1f forbidden broker-internal topic", "SCHEDULE_TOPIC_XXXX", "is forbidden",
          ResponseCode::SYSTEM_ERROR},
     };
     double local = 0.0;
@@ -209,8 +209,8 @@ double s1_sendPathRejects(DefaultMQProducer& p) {
     }
     local /= static_cast<double>(sizeof(negs) / sizeof(negs[0]));
 
-    // body 三档 + LMQ 分隔符：只有这几档带 MESSAGE_ILLEGAL(13)
-    expectLocalReject("S1g 空 body", [&] { p.send(msg("ValidatorsPositive", "")); },
+    // The three body tiers + the LMQ separator: only these tiers carry MESSAGE_ILLEGAL(13)
+    expectLocalReject("S1g empty body", [&] { p.send(msg("ValidatorsPositive", "")); },
                       "the message body length is zero", ResponseCode::MESSAGE_ILLEGAL);
     {
         Message m = msg("ValidatorsPositive", "x");
@@ -218,65 +218,65 @@ double s1_sendPathRejects(DefaultMQProducer& p) {
         expectLocalReject("S1h null body", [&] { p.send(m); }, "the message body is null",
                           ResponseCode::MESSAGE_ILLEGAL);
     }
-    // 超 maxMessageSize 走 Validators（producer 的 checkMessage 是 protected，
-    // 且语义就是转发到 Validators::checkMessage(msg, maxMessageSize_)）
-    expectLocalReject("S1i 超 maxMessageSize",
+    // Exceeding maxMessageSize goes through Validators (the producer's checkMessage is protected,
+    // and its semantics are just forwarding to Validators::checkMessage(msg, maxMessageSize_))
+    expectLocalReject("S1i exceeds maxMessageSize",
                       [&] { Validators::checkMessage(msg("ValidatorsPositive", "12345"), 4); },
                       "the message body size over max value, MAX: 4",
                       ResponseCode::MESSAGE_ILLEGAL);
-    check("S1j 恰好等于 maxMessageSize 放行",
+    check("S1j exactly equal to maxMessageSize passes",
           !capture([&] { Validators::checkMessage(msg("ValidatorsPositive", "1234"), 4); }).threw);
     {
         Message m = msg("ValidatorsPositive", "hello");
         m.setUserProperty(MessageConst::PROPERTY_INNER_MULTI_DISPATCH,
                           std::string("a") + kFileSeparator + "b");
-        expectLocalReject("S1k INNER_MULTI_DISPATCH 带路径分隔符", [&] { p.send(m); },
+        expectLocalReject("S1k INNER_MULTI_DISPATCH with a path separator", [&] { p.send(m); },
                           "INNER_MULTI_DISPATCH", ResponseCode::MESSAGE_ILLEGAL);
     }
     {
         Message legal = msg("ValidatorsPositive", "hello");
         legal.setUserProperty(MessageConst::PROPERTY_INNER_MULTI_DISPATCH, "%LMQ%queue:testCID");
-        check("S1l 常规 LMQ 取值不误杀",
+        check("S1l an ordinary LMQ value is not killed by mistake",
               !capture([&] { Validators::checkMessage(legal, 4 << 20); }).threw);
     }
-    // 顺序：先 topic → 禁发名单 → body。空 body + 非法 topic 必须报 topic
+    // Order: topic first → forbidden list → body. Empty body + illegal topic must report the topic error
     {
         Captured c = capture([&] { p.send(msg("bad topic", "")); });
-        check("S1m 校验顺序：topic 先于 body",
+        check("S1m validation order: topic before body",
               c.threw && c.what.find("contains illegal characters") != std::string::npos,
-              c.threw ? c.what : std::string("没有抛异常"));
+              c.threw ? c.what : std::string("no exception thrown"));
     }
     return local;
 }
 
-// ---------------------------------------------------------------- S2 批量
+// ---------------------------------------------------------------- S2 batches
 
 void s2_batchRejects(DefaultMQProducer& p, const std::string& topic) {
-    std::printf("== S2 批量路径的逐条校验 ==\n");
+    std::printf("== S2 per-message validation on the batch path ==\n");
     expectLocalReject(
-        "S2a 批量里有一条非法 topic",
+        "S2a the batch contains one illegal topic",
         [&] { p.sendBatch({msg(topic, "ok-1"), msg("bad.topic", "ok-2")}); },
         std::string("The specified topic[bad.topic]") + kIllegalTail,
         ResponseCode::SYSTEM_ERROR);
 
     expectLocalReject(
-        "S2b 批量里有一条空 body",
+        "S2b the batch contains one empty body",
         [&] { p.sendBatch({msg(topic, "ok-1"), msg(topic, "")}); },
         "the message body length is zero", ResponseCode::MESSAGE_ILLEGAL);
 
     Captured mixed = capture([&] {
         p.sendBatch({msg(topic, "ok-1"), msg(topic + "Other", "ok-2")});
     });
-    check("S2c 批量 topic 不同质被拒（非 MQClientException 口径）",
+    check("S2c a non-homogeneous batch topic is rejected (non-MQClientException contract)",
           mixed.threw && mixed.what.find("should be the same") != std::string::npos &&
               mixed.code == 0 && mixed.elapsedMs < kLocalBudgetMs,
-          mixed.threw ? mixed.what : std::string("没有抛异常"));
+          mixed.threw ? mixed.what : std::string("no exception thrown"));
 }
 
-// ---------------------------------------------------------------- S3 生产者组名门
+// ---------------------------------------------------------------- S3 producer group-name gates
 
 void s3_producerGroupGates() {
-    std::printf("== S3 生产者 start() 的组名校验门 ==\n");
+    std::printf("== S3 group-name gates of producer start() ==\n");
     const std::string longGroup = repeatedChar('g', 121);
     struct Neg {
         const char* label;
@@ -284,14 +284,14 @@ void s3_producerGroupGates() {
         std::string needle;
     };
     const Neg negs[] = {
-        {"S3a 保留组 DEFAULT_PRODUCER", MixAll::DEFAULT_PRODUCER_GROUP,
+        {"S3a reserved group DEFAULT_PRODUCER", MixAll::DEFAULT_PRODUCER_GROUP,
          "producerGroup can not equal DEFAULT_PRODUCER, please specify another one."},
-        {"S3b 带空格的组", "bad group",
+        {"S3b group with a space", "bad group",
          std::string("the specified group[bad group]") + kIllegalTail},
-        {"S3c 超长组(121)", longGroup, "is longer than group max length: 120"},
+        {"S3c over-long group(121)", longGroup, "is longer than group max length: 120"},
     };
     for (const Neg& n : negs) {
-        // namesrv 指向**真实**集群也照样拒 —— 挡的是本地第一行，与网络可达性无关
+        // Rejected even when the name server points at the **real** cluster — the gate is the first local line, unrelated to network reachability
         DefaultMQProducer p(n.group);
         p.setNamesrvAddr(gNamesrv);
         expectStartReject(n.label, [&] { return p.isStarted(); }, [&] { p.start(); }, n.needle);
@@ -299,17 +299,17 @@ void s3_producerGroupGates() {
     DefaultMQProducer edge(repeatedChar('g', 120));
     edge.setNamesrvAddr(gNamesrv);
     Captured c = capture([&] { edge.start(); });
-    check("S3d 120 字符组名放行（长度判定是 > 而非 >=）",
+    check("S3d a 120-char group name passes (the length test is > not >=)",
           !c.threw || c.what.find("group max length") == std::string::npos,
-          c.threw ? c.what : std::string("start 未因组名长度失败"));
+          c.threw ? c.what : std::string("start did not fail on group-name length"));
     if (edge.isStarted()) edge.shutdown();
 }
 
-// ---------------------------------------------------------------- S4 正腿
+// ---------------------------------------------------------------- S4 positive leg
 
 void s4_positiveLeg(DefaultMQProducer& p, const std::string& topic, const std::string& group,
                     const std::string& prefix) {
-    std::printf("== S4 正腿：合法名字照常在集群收发 ==\n");
+    std::printf("== S4 positive leg: legal names still send and receive on the cluster ==\n");
     auto collector = std::make_shared<Collector>();
     DefaultMQPushConsumer cons(group);
     cons.setNamesrvAddr(gNamesrv);
@@ -317,7 +317,7 @@ void s4_positiveLeg(DefaultMQProducer& p, const std::string& topic, const std::s
     cons.subscribe(topic, "*");
     cons.setMessageListener(collector);
     Captured started = capture([&] { cons.start(); });
-    check("S4a 合法组名的 push 消费者可启动", !started.threw,
+    check("S4a a push consumer with a legal group name can start", !started.threw,
           started.threw ? started.what : std::string("ok"));
     if (started.threw) return;
 
@@ -326,57 +326,57 @@ void s4_positiveLeg(DefaultMQProducer& p, const std::string& topic, const std::s
     lite.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
     lite.subscribe(topic, "*");
     Captured liteStarted = capture([&] { lite.start(); });
-    check("S4b 合法组名的 lite 消费者可启动", !liteStarted.threw,
+    check("S4b a lite consumer with a legal group name can start", !liteStarted.threw,
           liteStarted.threw ? liteStarted.what : std::string("ok"));
 
-    // 消费者先起来再发消息：新组 + CONSUME_FROM_LAST_OFFSET 取的是**启动那一刻**的队尾位点
+    // Bring consumers up before sending: a new group + CONSUME_FROM_LAST_OFFSET takes the queue-tail offset **at the moment of start**
     bool assigned = waitUntil([&] { return !lite.assignment().empty(); }, 20000);
-    check("S4c lite 拿到队列分配", assigned,
-          std::to_string(lite.assignment().size()) + " 个队列");
+    check("S4c lite gets a queue assignment", assigned,
+          std::to_string(lite.assignment().size()) + " queues");
 
     for (int32_t i = 0; i < 3; ++i) {
         Captured s = capture([&] { p.send(msg(topic, prefix + "-body-" + std::to_string(i)), 5000); });
-        check("S4d 合法 topic 发送成功 #" + std::to_string(i), !s.threw,
+        check("S4d legal topic send succeeded #" + std::to_string(i), !s.threw,
               s.threw ? s.what : std::string("SEND_OK"));
     }
 
     bool gotAll = waitUntil([&] { return collector->byPrefix(prefix).size() >= 3; }, 30000);
-    check("S4e push 消费者收到全部 3 条", gotAll,
-          "收到 " + std::to_string(collector->byPrefix(prefix).size()) + " 条");
+    check("S4e the push consumer received all 3 messages", gotAll,
+          "received " + std::to_string(collector->byPrefix(prefix).size()) + " messages");
 
     size_t polled = 0;
     const int64_t deadline = nowMs() + 20000;
     while (polled < 3 && nowMs() < deadline) {
         polled += lite.poll(1000).size();
     }
-    check("S4f lite 消费者 poll 到全部 3 条", polled >= 3, "poll 到 " + std::to_string(polled) + " 条");
+    check("S4f the lite consumer polled all 3 messages", polled >= 3, "polled " + std::to_string(polled) + " messages");
     lite.shutdown();
     cons.shutdown();
 }
 
-// ---------------------------------------------------------------- S5 对照腿
+// ---------------------------------------------------------------- S5 control leg
 
 void s5_controlLeg(DefaultMQProducer& p, double localMs) {
-    std::printf("== S5 对照腿：本地校验省掉的是什么 ==\n");
-    // 合法但**不存在**的 topic：本地放行 → 真往返（broker 按 TBW102 自动建出来）
+    std::printf("== S5 control leg: what local validation saves ==\n");
+    // A legal but **nonexistent** topic: passes locally → real round trip (the broker auto-creates it per TBW102)
     const std::string missing = "ValidatorsMissing" + std::to_string(stamp());
     Captured c = capture([&] { p.send(msg(missing, "x"), 5000); });
-    check("S5a 合法但不存在的 topic 不被本地误伤（broker 自动建出来）",
+    check("S5a a legal-but-missing topic is not falsely hurt locally (the broker auto-creates it)",
           !c.threw || c.what.find(kIllegalTail) == std::string::npos,
           (c.threw ? c.what : std::string("SEND_OK")) + "  " + ms(c.elapsedMs));
     const double baseline = localMs < 0.05 ? 0.05 : localMs;
-    check("S5b 集群腿比本地反腿慢一个数量级以上", c.elapsedMs > 10.0 * baseline,
-          ms(c.elapsedMs) + " vs 本地 " + ms(baseline));
+    check("S5b the cluster leg is more than an order of magnitude slower than the local leg", c.elapsedMs > 10.0 * baseline,
+          ms(c.elapsedMs) + " vs local " + ms(baseline));
 }
 
-// ---------------------------------------------------------------- S6 消费者侧
+// ---------------------------------------------------------------- S6 consumer side
 
 void s6_consumerGates(const std::string& topic) {
-    std::printf("== S6 pull/lite 的组名门 + 合法 pull 组查位点 ==\n");
+    std::printf("== S6 pull/lite group-name gates + a legal pull group querying offsets ==\n");
     {
         DefaultMQPullConsumer pc(MixAll::DEFAULT_CONSUMER_GROUP);
         pc.setNamesrvAddr(gNamesrv);
-        expectStartReject("S6a pull 消费者挡 DEFAULT_CONSUMER", [&] { return pc.isStarted(); },
+        expectStartReject("S6a the pull consumer blocks DEFAULT_CONSUMER", [&] { return pc.isStarted(); },
                           [&] { pc.start(); },
                           "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
     }
@@ -384,7 +384,7 @@ void s6_consumerGates(const std::string& topic) {
         DefaultLitePullConsumer lite(MixAll::DEFAULT_CONSUMER_GROUP);
         lite.setNamesrvAddr(gNamesrv);
         lite.subscribe(topic, "*");
-        expectStartReject("S6b lite 消费者挡 DEFAULT_CONSUMER", [&] { return lite.isStarted(); },
+        expectStartReject("S6b the lite consumer blocks DEFAULT_CONSUMER", [&] { return lite.isStarted(); },
                           [&] { lite.start(); },
                           "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
     }
@@ -392,7 +392,7 @@ void s6_consumerGates(const std::string& topic) {
         DefaultLitePullConsumer lite("bad group");
         lite.setNamesrvAddr(gNamesrv);
         lite.subscribe(topic, "*");
-        expectStartReject("S6c lite 消费者挡非法字符组", [&] { return lite.isStarted(); },
+        expectStartReject("S6c the lite consumer blocks an illegal-character group", [&] { return lite.isStarted(); },
                           [&] { lite.start(); },
                           std::string("the specified group[bad group]") + kIllegalTail);
     }
@@ -410,11 +410,11 @@ void s6_consumerGates(const std::string& topic) {
                 try {
                     maxOffset = pc.maxOffset(mqs[0]);
                 } catch (const std::exception& e) {
-                    std::printf("  ... maxOffset 失败: %s\n", e.what());
+                    std::printf("  ... maxOffset failed: %s\n", e.what());
                 }
             }
         }
-        check("S6d 合法组名的 pull 消费者可启动并查到位点",
+        check("S6d a pull consumer with a legal group name can start and read offsets",
               ok && queues >= static_cast<size_t>(kQueueNums) && maxOffset >= 0,
               started.threw ? started.what
                             : ("queues=" + std::to_string(queues) +
@@ -426,21 +426,21 @@ void s6_consumerGates(const std::string& topic) {
 // ---------------------------------------------------------------- S7 createTopic
 
 void s7_createTopicRejects(DefaultMQProducer& p) {
-    std::printf("== S7 createTopic 的本地拒 ==\n");
-    expectLocalReject("S7a createTopic 挡非法字符", [&] { p.createTopic(MixAll::DEFAULT_TOPIC, "bad topic", 4); },
+    std::printf("== S7 createTopic local rejections ==\n");
+    expectLocalReject("S7a createTopic blocks illegal characters", [&] { p.createTopic(MixAll::DEFAULT_TOPIC, "bad topic", 4); },
                       std::string("The specified topic[bad topic]") + kIllegalTail,
                       ResponseCode::SYSTEM_ERROR);
-    expectLocalReject("S7b createTopic 挡系统 topic",
+    expectLocalReject("S7b createTopic blocks system topics",
                       [&] { p.createTopic(MixAll::DEFAULT_TOPIC, "RMQ_SYS_TRACE_TOPIC", 4); },
                       "is conflict with system topic", ResponseCode::SYSTEM_ERROR);
-    expectLocalReject("S7c createTopic 挡空 topic",
+    expectLocalReject("S7c createTopic blocks an empty topic",
                       [&] { p.createTopic(MixAll::DEFAULT_TOPIC, "", 4); },
                       "The specified topic is blank", ResponseCode::SYSTEM_ERROR);
 }
 
-// ---------------------------------------------------------------- S8 寻址故障
+// ---------------------------------------------------------------- S8 addressing failure
 
-/// 本机上一个没人监听的端口：地址「配了但连不上」，用来和「压根没配」区分开。
+/// A local port with no listener: the address is "configured but unreachable", used to tell it apart from "never configured at all".
 std::string deadAddress() { return "127.0.0.1:19876"; }
 
 struct RouteFunnelProbe : public DefaultMQProducer {
@@ -449,11 +449,11 @@ struct RouteFunnelProbe : public DefaultMQProducer {
 };
 
 void s8_nameServerAddressing(DefaultMQProducer& p, const std::string& topic) {
-    std::printf("== S8 寻址故障（10004）与「topic 没路由」（10005）的分界 ==\n");
+    std::printf("== S8 the boundary between an addressing failure (10004) and 'topic has no route' (10005) ==\n");
     RouteFunnelProbe funnel("GID_validators_live_funnel");
 
     MQClientInstance noAddr("validators_live_noaddr", std::vector<std::string>{});
-    expectLocalReject("S8a 零地址时漏斗报 10004 NO_NAME_SERVER（不是 10005）",
+    expectLocalReject("S8a with zero addresses the funnel reports 10004 NO_NAME_SERVER (not 10005)",
                       [&] { funnel.topicPublishInfo(noAddr, topic); },
                       "No name server address, please set it.",
                       ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
@@ -461,24 +461,24 @@ void s8_nameServerAddressing(DefaultMQProducer& p, const std::string& topic) {
     MQClientInstance deadAddr("validators_live_deadaddr",
                               std::vector<std::string>{deadAddress()});
     Captured f = capture([&] { funnel.topicPublishInfo(deadAddr, topic); });
-    check("S8b 地址连不上时漏斗不冒充 10004（判的是配置，不是可达性）",
+    check("S8b with an unreachable address the funnel does not impersonate 10004 (it judges configuration, not reachability)",
           f.threw && f.code != ClientErrorCode::NO_NAME_SERVER_EXCEPTION &&
               startsWith(f.what, "Can not find Message Queue for topic"),
-          f.threw ? f.what + "  code=" + std::to_string(f.code) : std::string("没有抛异常"));
+          f.threw ? f.what + "  code=" + std::to_string(f.code) : std::string("no exception thrown"));
     {
-        // 端到端：同一条发送路径（同步发送的重试循环把漏斗异常定性成客户端错误码）
+        // End to end: the same send path (the sync-send retry loop qualifies the funnel exception into a client error code)
         DefaultMQProducer mis("GID_validators_live_deadns_" + std::to_string(stamp()));
         mis.setNamesrvAddr(deadAddress());
         Captured started = capture([&] { mis.start(); });
         if (started.threw) {
-            check("S8c 配了但连不上 → 发送定性 10005 NOT_FOUND_TOPIC", false,
-                  "start 先失败: " + started.what);
+            check("S8c configured but unreachable → send qualified as 10005 NOT_FOUND_TOPIC", false,
+                  "start failed first: " + started.what);
         } else {
             Captured s = capture([&] { mis.send(msg(topic, "dead-namesrv"), 3000); });
-            check("S8c 配了但连不上 → 发送定性 10005 NOT_FOUND_TOPIC（不是 10004）",
+            check("S8c configured but unreachable → send qualified as 10005 NOT_FOUND_TOPIC (not 10004)",
                   s.threw && s.code == ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION,
                   s.threw ? s.what + "  code=" + std::to_string(s.code) + "  " + ms(s.elapsedMs)
-                          : std::string("没有抛异常"));
+                          : std::string("no exception thrown"));
             mis.shutdown();
         }
     }
@@ -486,19 +486,19 @@ void s8_nameServerAddressing(DefaultMQProducer& p, const std::string& topic) {
     if (!DefaultTopAddressing::isConfigured()) {
         DefaultMQProducer unaddressed("GID_validators_live_unaddressed");
         Captured started = capture([&] { unaddressed.start(); });
-        check("S8d 完全没配 name server 时 start() 就报 10004，且不进 started 态",
+        check("S8d with no name server configured at all, start() reports 10004 and does not enter started state",
               started.threw && started.code == ClientErrorCode::NO_NAME_SERVER_EXCEPTION &&
                   !unaddressed.isStarted() && started.elapsedMs < kLocalBudgetMs,
-              (started.threw ? started.what : std::string("没有抛异常")) +
+              (started.threw ? started.what : std::string("no exception thrown")) +
                   "  code=" + std::to_string(started.code) + "  " + ms(started.elapsedMs));
     } else {
-        std::printf("  [skip] S8d：ROCKETMQ_NAMESRV_DOMAIN 已配，start() 允许静态地址为空\n");
+        std::printf("  [skip] S8d: ROCKETMQ_NAMESRV_DOMAIN is configured, start() tolerates an empty static address\n");
     }
 
-    // S8e：对照腿（真集群）——寻址正常时同一条 topic 照常 SEND_OK，
-    // 说明 S8a 挡的是寻址，而不是顺手把这条 topic 也判死了。
+    // S8e: the control leg (the real cluster) — with addressing healthy the same topic still returns SEND_OK,
+    // showing S8a blocked addressing rather than condemning this topic as a side effect.
     Captured ok = capture([&] { p.send(msg(topic, "addressing-fine"), 5000); });
-    check("S8e 对照：真集群上寻址正常，同一条 topic 照常 SEND_OK", !ok.threw,
+    check("S8e control: addressing is fine on the real cluster and the same topic still SEND_OK", !ok.threw,
           ok.threw ? ok.what : std::string("SEND_OK"));
 }
 
@@ -523,11 +523,11 @@ int main(int argc, char* argv[]) {
     p.setNamesrvAddr(gNamesrv);
     Captured started = capture([&] { p.start(); });
     if (started.threw) {
-        check("S0 生产者启动", false, started.what);
+        check("S0 producer start", false, started.what);
         report();
         return 1;
     }
-    std::printf("  [PASS] S0 生产者启动  group=%s\n", p.producerGroup().c_str());
+    std::printf("  [PASS] S0 producer start  group=%s\n", p.producerGroup().c_str());
     ++gPass;
 
     const double localMs = s1_sendPathRejects(p);
@@ -536,7 +536,7 @@ int main(int argc, char* argv[]) {
 
     Captured created = capture([&] { p.createTopic(MixAll::DEFAULT_TOPIC, topic, kQueueNums); });
     if (created.threw) {
-        check("S4 前置：建 topic", false, created.what);
+        check("S4 precondition: create topic", false, created.what);
         report();
         p.shutdown();
         return 1;
@@ -545,7 +545,7 @@ int main(int argc, char* argv[]) {
         return routeQueueCount([&] { return p.fetchPublishMessageQueues(topic); });
     };
     bool routed = waitUntil([&] { return queues() >= static_cast<size_t>(kQueueNums); }, 20000);
-    check("S4 前置：路由可发现", routed, "queues=" + std::to_string(queues()));
+    check("S4 precondition: route discoverable", routed, "queues=" + std::to_string(queues()));
     if (routed) {
         s4_positiveLeg(p, topic, group, prefix);
         s6_consumerGates(topic);

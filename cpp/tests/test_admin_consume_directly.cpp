@@ -1,12 +1,12 @@
-// Admin 发起端 CONSUME_MESSAGE_DIRECTLY(309) 单测 —— 不需要集群。
+// Unit test for the admin-initiated CONSUME_MESSAGE_DIRECTLY(309) -- no cluster required.
 //
 //
-// 为什么必须离线锁死：这条链路错起来全是**静默**的 —— msgId 键名写错时 broker 侧头
-// 解析不到、推给消费者的消息对不上号，admin 拿到的结果里 remark/msgId 全错；目标
-// broker 取错（打路由第一台而不是存储主机）在单 broker 集群里完全看不出来，多 broker
-// 时表现为 broker 回 NO_MESSAGE 或把探针推错实例。mock broker 扮演四类请求：
-// 路由(105) / VIEW_MESSAGE_BY_ID(33) / QUERY_MESSAGE(12) / CONSUME_MESSAGE_DIRECTLY(309)，
-// 与 rmq_test_check_client_config 的 MockBroker 同一套 socket 骨架。
+// Why it must be locked down offline: every failure on this path is **silent** -- a wrong msgId key name means the broker-side
+// header cannot be parsed, the message pushed to the consumer matches nothing, and the remark/msgId in the admin result are all wrong;
+// picking the wrong target broker (the first in the route instead of the storage host) is invisible in a single-broker cluster and,
+// with several brokers, shows up as the broker answering NO_MESSAGE or the probe pushed to the wrong instance. The mock broker plays four request types:
+// route(105) / VIEW_MESSAGE_BY_ID(33) / QUERY_MESSAGE(12) / CONSUME_MESSAGE_DIRECTLY(309),
+// sharing the socket skeleton with the MockBroker of rmq_test_check_client_config.
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -60,7 +60,7 @@ void expectInt(long long actual, long long expected, const std::string& name) {
     }
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -84,7 +84,7 @@ bool writeAll(socket_t s, const Bytes& data) {
     return true;
 }
 
-// select 等到可读（100ms 一轮，便于 alive 转 false 后尽快退出），再读一整帧
+// select until readable (one 100ms round, so it exits promptly once alive turns false), then read one whole frame
 bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     for (;;) {
         fd_set rfds;
@@ -114,22 +114,22 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
 
 // ---------------------------------------------------------------- mock broker
 
-// 一笔请求的脚本化应答（309 的应答体是 ConsumeMessageDirectlyResult JSON，
-// 33 / 12 的应答体是 17 段存储格式消息流）
+// The scripted reply for one request (the reply body of 309 is ConsumeMessageDirectlyResult JSON,
+// the reply body of 33 / 12 is a 17-section storage-format message stream)
 struct ScriptedReply {
     int32_t code = ResponseCode::SUCCESS;
     std::string remark;
     Bytes body;
 };
 
-// 一笔请求的取证
+// The evidence kept for one request
 struct WireRecord {
     int32_t code = 0;
     PropertyMap ext;
     Bytes body;
 };
 
-// 同时扮演 name server（回路由）与 broker（33 / 12 / 309 按脚本应答）。
+// Plays both the name server (answers routes) and the broker (33 / 12 / 309 reply per script).
 class MockBroker {
 public:
     MockBroker() {
@@ -154,8 +154,8 @@ public:
     ~MockBroker() {
         running_.store(false);
         if (acceptor_.joinable()) acceptor_.join();
-        // 连接线程在 100ms 一轮的 select 里看到 running_ 转 false 就收手；
-        // joinable 的 std::thread 析构会直接 terminate，所以必须在这里收干净。
+        // Connection threads see running_ turn false inside the 100ms select round and stop;
+        // destroying a joinable std::thread would terminate the process outright, so they must be reaped here.
         for (;;) {
             std::vector<std::thread> pending;
             {
@@ -178,9 +178,9 @@ public:
         routes_[topic] = route.encode();
     }
 
-    // 每类请求各自一套脚本（按到达顺序取用；越界回默认应答）。
-    // 默认：VIEW_MESSAGE_BY_ID / QUERY_MESSAGE 回 NO_MESSAGE（消息不存在），
-    // 309 回 SUCCESS + 空体（触发 admin 的 "no consume result" 分支）。
+    // Each request type has its own script (consumed in arrival order; beyond the script the default reply is used).
+    // Default: VIEW_MESSAGE_BY_ID / QUERY_MESSAGE answer NO_MESSAGE (message absent),
+    // 309 answers SUCCESS + empty body (triggering the admin "no consume result" branch).
     void scriptView(std::vector<ScriptedReply> replies) {
         std::lock_guard<std::mutex> lk(state_);
         viewReplies_ = std::move(replies);
@@ -310,7 +310,7 @@ private:
         netcompat::closeSocket(sock);
     }
 
-    // 取三类脚本里与该请求码对应的那个
+    // Picks the script matching the request code out of the three
     std::vector<ScriptedReply>& repliesFor(int32_t code) {
         if (code == RequestCode::VIEW_MESSAGE_BY_ID) return viewReplies_;
         if (code == RequestCode::QUERY_MESSAGE) return queryReplies_;
@@ -336,7 +336,7 @@ private:
     std::thread acceptor_;
 };
 
-// ---------------------------------------------------------------- 用例脚手架
+// ---------------------------------------------------------------- test scaffolding
 
 const char* kGroup = "GID_DirectConsumeAdmin";
 const char* kTopic = "DirectConsumeAdminTopic";
@@ -344,8 +344,8 @@ const char* kClientId = "127.0.0.1@1234#5678";
 
 MessageExt storedMessage(MockBroker& mock, int64_t commitLogOffset, bool withUniqKey,
                          const std::string& uniqKey) {
-    // broker 存储里的一条消息：存储主机 = mock 自己（309 的目标地址从这来）、
-    // 物理偏移给定（解码侧 msgId / offsetMsgId 都从 storeHost+offset 反推）。
+    // One message in the broker store: storage host = the mock itself (the 309 target address comes from here),
+    // physical offset given (on the decode side both msgId and offsetMsgId are derived from storeHost+offset).
     MessageExt m;
     m.topic = kTopic;
     m.body = "direct-consume-payload";
@@ -361,8 +361,8 @@ MessageExt storedMessage(MockBroker& mock, int64_t commitLogOffset, bool withUni
     return m;
 }
 
-// 消息落在这台 broker 上 ⇒ offsetMsgId = createMessageId(storeAddr, offset)。
-// 本端口解码时 msgId / offsetMsgId 都从 17 段报文的 storeHost + PHYSICALOFFSET 反推。
+// A message stored on this broker means offsetMsgId = createMessageId(storeAddr, offset).
+// While decoding, this port derives both msgId and offsetMsgId from the storeHost + PHYSICALOFFSET of the 17-section payload.
 std::string offsetMsgIdFor(MockBroker& mock, int64_t commitLogOffset) {
     return createMessageId(ipAndPortToBytes("127.0.0.1", mock.port()), commitLogOffset);
 }
@@ -390,26 +390,26 @@ void expectDirectExt(const WireRecord& rec, const std::string& wantMsgId, const 
            it == rec.ext.end() ? "(absent)" : it->second);
 }
 
-// ------------------------------------------------ 309 头键名（发错是静默的）
+// ------------------------------------------------ 309 header key names (a wrong one is silent)
 
 void testExtFieldKeyNames() {
     PropertyMap ext = DefaultMQAdminExt::buildConsumeMessageDirectlyExtFields(
         "TopicA", "GID_A", "cid-1", "msg-1");
-    expectInt(static_cast<long long>(ext.size()), 4, "309 头恰好四个字段");
+    expectInt(static_cast<long long>(ext.size()), 4, "the 309 header has exactly four fields");
     auto it = ext.find("topic");
-    expect(it != ext.end() && it->second == "TopicA", "309 头 topic");
+    expect(it != ext.end() && it->second == "TopicA", "309 header topic");
     it = ext.find("consumerGroup");
-    expect(it != ext.end() && it->second == "GID_A", "309 头 consumerGroup");
+    expect(it != ext.end() && it->second == "GID_A", "309 header consumerGroup");
     it = ext.find("clientId");
-    expect(it != ext.end() && it->second == "cid-1", "309 头 clientId");
+    expect(it != ext.end() && it->second == "cid-1", "309 header clientId");
     it = ext.find("msgId");
-    expect(it != ext.end() && it->second == "msg-1", "309 头 msgId");
-    expect(ext.find("brokerName") == ext.end(), "309 头不带 brokerName");
-    expect(ext.find("topicSysFlag") == ext.end(), "309 头不带 topicSysFlag");
-    expect(ext.find("groupSysFlag") == ext.end(), "309 头不带 groupSysFlag");
+    expect(it != ext.end() && it->second == "msg-1", "309 header msgId");
+    expect(ext.find("brokerName") == ext.end(), "the 309 header omits brokerName");
+    expect(ext.find("topicSysFlag") == ext.end(), "the 309 header omits topicSysFlag");
+    expect(ext.find("groupSysFlag") == ext.end(), "the 309 header omits groupSysFlag");
 }
 
-// ------------------------------------------------ offsetMsgId 直查路径
+// ------------------------------------------------ direct offsetMsgId lookup path
 
 void testOffsetMsgIdPath(DefaultMQAdminExt& admin, MockBroker& mock) {
     const std::string msgId = offsetMsgIdFor(mock, 100);
@@ -427,7 +427,7 @@ void testOffsetMsgIdPath(DefaultMQAdminExt& admin, MockBroker& mock) {
     expect(!r.order, "offsetPath.result.orderFalse");
     expect(r.autoCommit, "offsetPath.result.autoCommitTrue");
 
-    // viewMessage 的 offset 路径：一笔 VIEW_MESSAGE_BY_ID，直接打 msgId 里编的地址
+    // The offset path of viewMessage: one VIEW_MESSAGE_BY_ID, sent straight to the address encoded in the msgId
     expectInt(mock.viewCount(), 1, "offsetPath.viewCount");
     const WireRecord view = mock.viewRecord(0);
     expectInt(view.code, RequestCode::VIEW_MESSAGE_BY_ID, "offsetPath.viewCode");
@@ -435,17 +435,17 @@ void testOffsetMsgIdPath(DefaultMQAdminExt& admin, MockBroker& mock) {
            view.ext.count("offset") ? view.ext.at("offset") : "(absent)");
     expectInt(mock.queryCount(), 0, "offsetPath.noUniqKeyFallback");
 
-    // 309 恰好一笔，目标是消息的存储主机（= mock 自己），msgId 原样透传
+    // Exactly one 309, targeted at the storage host of the message (= the mock itself), msgId passed through verbatim
     expectInt(mock.directCount(), 1, "offsetPath.directCount");
     expectDirectExt(mock.directRecord(0), msgId, "offsetPath.direct");
 }
 
-// ------------------------------------------------ uniqKey 路径 + offsetMsgId 替换
+// ------------------------------------------------ uniqKey path + offsetMsgId substitution
 
 void testUniqKeyPath(DefaultMQAdminExt& admin, MockBroker& mock) {
-    // uniq key 本身不是合法的 offset msgId：viewMessage 先按 offsetMsgId 直查
-    // （这里脚本回 NO_MESSAGE），失败退 uniqKey 检索（QUERY_MESSAGE，body 是
-    // 17 段消息流，msgId 反推后必须等于 key 才算命中）。
+    // The uniq key itself is not a valid offset msgId: viewMessage first tries the direct offsetMsgId lookup
+    // (the script answers NO_MESSAGE here), then falls back on failure to the uniqKey search (QUERY_MESSAGE, whose
+    // body is a 17-section message stream; the derived msgId must equal the key to count as a hit).
     const std::string uniqKey = offsetMsgIdFor(mock, 200);
     const MessageExt stored = storedMessage(mock, 200, /*withUniqKey=*/true, uniqKey);
     mock.scriptView({{ResponseCode::NO_MESSAGE, "message not found", Bytes()}});
@@ -459,7 +459,7 @@ void testUniqKeyPath(DefaultMQAdminExt& admin, MockBroker& mock) {
     expectInt(mock.viewCount(), 1, "uniqKeyPath.viewAttempted");
     expectInt(mock.queryCount(), 1, "uniqKeyPath.queryCount");
 
-    // uniqKey 检索的请求形状：indexType=U + MixAll.UNIQUE_MSG_QUERY_FLAG（键名，不是标志位）
+    // Request shape of the uniqKey search: indexType=U + MixAll.UNIQUE_MSG_QUERY_FLAG (a key name, not a flag bit)
     const WireRecord query = mock.queryRecord(0);
     expectInt(query.code, RequestCode::QUERY_MESSAGE, "uniqKeyPath.queryCode");
     expect(query.ext.count("_UNIQUE_KEY_QUERY") == 1 && query.ext.at("_UNIQUE_KEY_QUERY") == "true",
@@ -473,10 +473,10 @@ void testUniqKeyPath(DefaultMQAdminExt& admin, MockBroker& mock) {
     expectDirectExt(mock.directRecord(0), uniqKey, "uniqKeyPath.direct");
 }
 
-// ------------------------------------------------ broker 拒绝 / 空结果体
+// ------------------------------------------------ broker rejection / empty result body
 
 void testBrokerRejectPropagates(DefaultMQAdminExt& admin, MockBroker& mock) {
-    // 消费者不在线时 broker 无处转推：非 SUCCESS 的响应码原样带上抛出
+    // With the consumer offline the broker has nowhere to forward: a non-SUCCESS response code is thrown with it
     const std::string msgId = offsetMsgIdFor(mock, 300);
     const MessageExt stored = storedMessage(mock, 300, false, "");
     mock.scriptView({{ResponseCode::SUCCESS, "", encodeMessageExt(stored)}});
@@ -526,8 +526,8 @@ void testEmptyResultBodyThrows(DefaultMQAdminExt& admin, MockBroker& mock) {
 }
 
 void testMessageNotFoundSendsNothing(DefaultMQAdminExt& admin, MockBroker& mock) {
-    // msgId 解不出来（非法 hex + uniqKey 也查无此消息）时 viewMessage 抛错，
-    // 309 一笔都不该发 —— 打到哪个 broker 都是无处转推的空转。
+    // When the msgId cannot be decoded (invalid hex and the uniqKey search finds nothing) viewMessage throws,
+    // and not even one 309 should be sent -- whichever broker it reached, there would be nowhere to forward.
     mock.scriptView({});
     mock.scriptQuery({{ResponseCode::QUERY_NOT_FOUND, "", Bytes()}});
     mock.scriptDirect({});
@@ -563,7 +563,7 @@ int main() {
         std::printf("FAIL admin.start: %s\n", e.what());
         return 1;
     }
-    // 把 kTopic 的路由塞进缓存（uniqKey 检索按路由找 broker）
+    // Puts the route of kTopic into the cache (the uniqKey search locates brokers through the route)
     TopicRouteData route;
     std::map<int64_t, std::string> addrs;
     addrs[0] = mock.address();

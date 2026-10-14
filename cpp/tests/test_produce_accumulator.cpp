@@ -1,6 +1,6 @@
-// 与 python/tests/test_produce_accumulator.py（18 例）、
-// csharp/tests/RocketMQ.Client.Tests/ProduceAccumulatorTests.cs（17 例）、
-// rust/src/client/produce_accumulator/tests.rs（16 例）同题。
+// Offline unit tests for the produce accumulator: default parameters and guards, the
+// global byte gate, aggregate keys, sync/async merging, the guard thread, failure paths
+// and the sender attach/detach lifecycle (23 cases below).
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -55,7 +55,7 @@ void expectStr(const std::string& actual, const std::string& expected, const std
     }
 }
 
-// 把 exception_ptr 变成文案（回调只能拿到 exception_ptr，断言要比内容）
+// turn an exception_ptr into text (callbacks only receive an exception_ptr, assertions compare content)
 std::string textOf(const std::exception_ptr& e) {
     if (e == nullptr) return "<null>";
     try {
@@ -77,9 +77,9 @@ bool waitUntil(const std::function<bool()>& pred, int64_t timeoutMillis) {
     return pred();
 }
 
-// ================================================================ 夹具
+// ================================================================ fixtures
 
-// 累加器发出去的一批：批量对象 + 目标队列 + 这次是不是异步（带回调）。
+// One batch handed to the sender: batch object + target queue + whether it is async (with a callback).
 struct BatchSlot {
     MessageBatch batch;
     bool hasMq = false;
@@ -157,7 +157,7 @@ private:
         return error_;
     }
 
-    // 未指定结果时的兜底：`SEND_OK` + `123`
+    // fallback when no result is specified: `SEND_OK` + `123`
     SendResult resolve(const MessageQueue* mq) const {
         std::lock_guard<std::mutex> lk(mutex_);
         if (hasResult_) return result_;
@@ -177,7 +177,7 @@ private:
     std::atomic<bool> throwOnAsync_{false};
 };
 
-// 收集型回调：把每次交付都记下来（用来断言「恰好一次」与内容）。
+// collecting callback: records every delivery (used to assert exactly once and the content).
 class CollectingCallback : public SendCallback {
 public:
     void onSuccess(const SendResult& result) override {
@@ -240,12 +240,12 @@ std::vector<Message> makeMessages(size_t n) {
     return out;
 }
 
-// 对照 body：走 `generateFromList`（与累加器 `buildBatch` 的编码口径同源）
+// Comparison body: via `generateFromList` (same encoding contract as the accumulator's `buildBatch`)
 std::string referenceBatchBody(const std::vector<Message>& messages) {
     return MessageBatch::generateFromList(messages).encode();
 }
 
-// ================================================================ 线程助手
+// ================================================================ thread helpers
 
 struct Outcome {
     bool ok = false;
@@ -262,7 +262,7 @@ void joinCall(SyncCall& call) {
     if (call.thread.joinable()) call.thread.join();
 }
 
-// 起一个线程走一次同步 `send`（真实调用链里调用方线程就是这样阻塞在 `add` 里的）。
+// run one sync `send` on a thread (in the real call chain the caller thread blocks inside `add` exactly like this).
 SyncCall spawnSyncSend(ProduceAccumulator& acc, const Message& msg, const MessageQueue* mq) {
     auto outcome = std::make_shared<Outcome>();
     std::thread thread([&acc, msg, mq, outcome]() {
@@ -282,7 +282,7 @@ SyncCall spawnSyncSend(ProduceAccumulator& acc, const Message& msg) {
     return spawnSyncSend(acc, msg, nullptr);
 }
 
-// 等某个同步批次攒够 `count` 条（`filter` 用来在表里挑出指定的那一批）
+// wait until some sync batch accumulates `count` messages (`filter` picks the intended batch from the table)
 std::shared_ptr<MessageAccumulation> waitForBatch(
     ProduceAccumulator& acc, int64_t count,
     const std::function<bool(const std::shared_ptr<MessageAccumulation>&)>& filter) {
@@ -303,7 +303,7 @@ std::shared_ptr<MessageAccumulation> waitForBatch(ProduceAccumulator& acc, int64
     return waitForBatch(acc, count, [](const std::shared_ptr<MessageAccumulation>&) { return true; });
 }
 
-// ================================================================ 参数
+// ================================================================ parameters
 
 void testDefaultParamsMatchContract() {
     FakeSender sender;
@@ -394,13 +394,13 @@ void testRegistryReusesAccumulatorByClientId() {
     expect(a->hasSender(), "sender still attached after a second getOrCreate");
 }
 
-// ================================================================ 全局字节闸门
+// ================================================================ global byte gate
 
 void testTryAddMessageGateAndRelease() {
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-gate", &sender);
     acc.setTotalBatchMaxBytes(10);
-    const Message msg(TOPIC, std::string(10, 'a'));  // 10 字节
+    const Message msg(TOPIC, std::string(10, 'a'));  // 10 bytes
 
     expect(acc.tryAddMessage(msg), "first message passes the gate");
     expectInt(acc.currentlyHoldSize(), 10, "gate records the body size");
@@ -410,14 +410,14 @@ void testTryAddMessageGateAndRelease() {
     expectInt(acc.currentlyHoldSize(), 0, "releaseHold refunds");
     expect(acc.tryAddMessage(Message(TOPIC, std::string(1, 'b'))), "gate passes again after refund");
 
-    // 空 body 不记账但仍然放行
+    // an empty body is not accounted but still passes
     acc.releaseHold(1);
     acc.setTotalBatchMaxBytes(5);
     expect(acc.tryAddMessage(Message(TOPIC, std::string())), "empty body always passes");
     expectInt(acc.currentlyHoldSize(), 0, "empty body is not accounted");
 }
 
-// ================================================================ 归并键
+// ================================================================ aggregate keys
 
 void testAggregateKeyPartitionsByTopicMqWaitAndTag() {
     const Message msg(TOPIC, std::string(1, 'x'));
@@ -455,7 +455,7 @@ void testAggregateKeyPartitionsByTopicMqWaitAndTag() {
     expect(pinned.hasMq && pinned.mq == mq, "pinned key carries the queue");
     expect(!(base == pinned), "mq partitions the key");
 
-    // 三个不同的键在表里必须互不覆盖（同步表是 keyed by AggregateKey）
+    // three distinct keys must not overwrite each other in the table (the sync table is keyed by AggregateKey)
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-keys-partition", &sender);
     acc.setBatchMaxDelayMs(3000);
@@ -466,7 +466,7 @@ void testAggregateKeyPartitionsByTopicMqWaitAndTag() {
                          spawnSyncSend(acc, otherMsg)};
     const bool three = waitUntil([&]() { return acc.syncBatchCount() == 3; }, 3000);
     expect(three, "three distinct keys land in three distinct batches");
-    // 三条各自成批 → 逐个手动触发发出去，等待的线程才会被放行
+    // each of the three forms its own batch, so trigger them one by one to release the waiting threads
     const auto batches = acc.syncBatchesSnapshot();
     expectInt(static_cast<long long>(batches.size()), 3, "three batches in the table");
     for (const auto& batch : batches) {
@@ -484,11 +484,11 @@ void testAggregateKeyPartitionsByTopicMqWaitAndTag() {
 }
 
 void testDifferentTagsDoNotMerge() {
-    // tag 不同的两条消息必须落进**两个**批次（一个 MessageBatch 只有一个 TAGS 属性），
-    // 而且各自独立发出去。
+    // two messages with different tags must land in **two** batches (one MessageBatch has only one TAGS
+    // property), and each batch is sent out independently.
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-tags", &sender);
-    acc.start();  // 用默认 holdMs(10ms)，让守卫线程把两个批次分别推出去
+    acc.start();  // keep the default holdMs(10ms) and let the guard thread push the two batches out separately
 
     auto send = [&acc](const std::string& tag) {
         auto outcome = std::make_shared<Outcome>();
@@ -508,8 +508,8 @@ void testDifferentTagsDoNotMerge() {
     SyncCall b = send("TagB");
 
     const bool both = waitUntil([&]() { return sender.sentCount() == 2; }, 5000);
-    // 兜底：万一守卫线程没把两个批次都推出去，也要把等待中的调用方放行（`sendSync` 对
-    // 已关闭的批次直接返回，所以这里重复调用是安全的）
+    // fallback: even if the guard thread did not push both batches out, the waiting callers must be
+    // released (`sendSync` returns directly on an already closed batch, so calling it again here is safe)
     for (const auto& batch : acc.syncBatchesSnapshot()) {
         try {
             batch->forceSyncSend();
@@ -532,10 +532,10 @@ void testDifferentTagsDoNotMerge() {
     expect(tags.count("TagA") == 1 && tags.count("TagB") == 1, "TAGS values are TagA / TagB");
 }
 
-// ================================================================ 归并（同步）
+// ================================================================ merging (sync)
 
 void testSyncBatchMergesMessagesAndReturnsPerMessageResults() {
-    // 5 条同键消息攒成 1 个 MessageBatch，各自拿到自己的拆条 SendResult
+    // 5 same-key messages merge into 1 MessageBatch, each getting its own split SendResult
     FakeSender sender;
     SendResult scripted;
     scripted.sendStatus = SendStatus::SEND_OK;
@@ -546,11 +546,11 @@ void testSyncBatchMergesMessagesAndReturnsPerMessageResults() {
     sender.setResult(scripted);
 
     ProduceAccumulator acc("cpp-accum-sync-batch", &sender);
-    // holdMs 拉长到 3s：保证 5 条都进同一批（用例手动触发发送，不等这 3s）
+    // holdMs stretched to 3s: guarantees all 5 join one batch (the case triggers the send manually, no wait for the 3s)
     acc.setBatchMaxDelayMs(3000);
 
     const std::vector<Message> messages = makeMessages(5);
-    // 真实调用链里是 `canBatch` 先 `tryAddMessage` 记账，累加器发完再归还
+    // in the real call chain `canBatch` first accounts via `tryAddMessage`; the accumulator refunds after the send
     for (const Message& m : messages) {
         expect(acc.tryAddMessage(m), "gate accepts a sync message");
     }
@@ -569,7 +569,7 @@ void testSyncBatchMergesMessagesAndReturnsPerMessageResults() {
     expect(batch->keys().empty(), "sync batch collected no keys (messages had none)");
     expect(batch->messages().size() == 5, "batch holds 5 messages");
 
-    // 手动触发（等价于守卫线程在 holdMs 到点后叫醒某一个等待者去发）
+    // manual trigger (equivalent to the guard thread waking one waiter to send once holdMs elapses)
     bool sendOk = true;
     std::string sendError;
     try {
@@ -605,15 +605,15 @@ void testSyncBatchMergesMessagesAndReturnsPerMessageResults() {
         expect(result.messageQueue == scripted.messageQueue, "message queue preserved");
     }
     expectInt(okCount, 5, "all 5 callers returned a result");
-    // 发完归还全局额度
+    // after the send, refund the global hold quota
     expectInt(acc.currentlyHoldSize(), 0, "hold size refunded after the batch is sent");
     expectInt(static_cast<long long>(acc.syncBatchCount()), 1, "sent batch stays in the table");
 }
 
-// ================================================================ 归并（异步）
+// ================================================================ merging (async)
 
 void testAsyncBatchMergesAndFiresEveryCallback() {
-    // 异步：5 条同键消息由守卫线程攒成 1 批，回调各自拿到拆条结果
+    // async: the guard thread merges 5 same-key messages into 1 batch, each callback gets its own split result
     FakeSender sender;
     SendResult scripted;
     scripted.sendStatus = SendStatus::SEND_OK;
@@ -624,7 +624,7 @@ void testAsyncBatchMergesAndFiresEveryCallback() {
     sender.setResult(scripted);
 
     ProduceAccumulator acc("cpp-accum-async-batch", &sender);
-    // holdMs 拉到 200ms：保证 5 条都进同一批（守卫线程每 max(1, holdMs/2)=100ms 扫一轮）
+    // holdMs stretched to 200ms: guarantees all 5 join one batch (the guard thread scans every max(1, holdMs/2)=100ms)
     acc.setBatchMaxDelayMs(200);
     acc.start();
 
@@ -653,8 +653,8 @@ void testAsyncBatchMergesAndFiresEveryCallback() {
     std::vector<std::string> ids;
     std::vector<int64_t> offsets;
     for (const auto& cb : callbacks) {
-        // ⚠ 必须先把快照绑到局部变量：`cb->msgIds().begin()` / `.end()` 若是两次调用，
-        // 拿到的就是**两个不同临时对象**的迭代器（UB）。
+        // ⚠ bind the snapshot to a local first: if `cb->msgIds().begin()` / `.end()` are two separate calls,
+        // they are iterators into **two different temporary objects** (UB).
         const std::vector<std::string> cbIds = cb->msgIds();
         const std::vector<int64_t> cbOffsets = cb->offsets();
         ids.insert(ids.end(), cbIds.begin(), cbIds.end());
@@ -665,7 +665,7 @@ void testAsyncBatchMergesAndFiresEveryCallback() {
 
     expectInt(static_cast<long long>(sender.sentCount()), 1, "exactly one batch was sent");
     expect(sender.at(0).hasCallback, "the async path sends with a callback");
-    // 单线程依次 add → 批内顺序确定，可以逐字节比
+    // single-threaded sequential add gives a deterministic in-batch order, so byte-for-byte comparison works
     expectStr(sender.at(0).batch.encode(), referenceBatchBody(makeMessages(5)),
               "async batch body matches generateFromList byte for byte");
     expect(sender.at(0).batch.properties.count(MessageConst::PROPERTY_KEYS) == 1,
@@ -676,7 +676,7 @@ void testAsyncBatchMergesAndFiresEveryCallback() {
 }
 
 void testSplitResultsAreSharedWhenMsgIdHasNoComma() {
-    // 老 broker / 单条应答：msgId 不含逗号时所有下标指向同一份内容
+    // old broker / single reply: when msgId has no comma all indexes point at the same content
     FakeSender sender;
     SendResult scripted;
     scripted.sendStatus = SendStatus::SEND_OK;
@@ -723,7 +723,7 @@ void testSplitResultsAreSharedWhenMsgIdHasNoComma() {
               "batch body length matches generateFromList");
 }
 
-// ================================================================ 定点队列
+// ================================================================ pinned queue
 
 void testSendWithMessageQueuePinsTheBatch() {
     const MessageQueue mq(TOPIC, "broker-pinned", 2);
@@ -753,7 +753,7 @@ void testSendWithMessageQueuePinsTheBatch() {
     expectInt(static_cast<long long>(sender.sentCount()), 1, "one pinned batch was sent");
     expect(sender.at(0).hasMq && sender.at(0).mq == mq, "the pinned queue reached the sender");
 
-    // 异步 + 指定 mq
+    // async + pinned mq
     FakeSender sender2;
     ProduceAccumulator acc2("cpp-accum-pinned-async", &sender2);
     acc2.setBatchMaxDelayMs(200);
@@ -770,10 +770,10 @@ void testSendWithMessageQueuePinsTheBatch() {
     expect(sender2.at(0).hasMq && sender2.at(0).mq == mq, "the pinned queue reached the sender");
 }
 
-// ================================================================ 批级属性
+// ================================================================ batch-level properties
 
 void testBatchMergesKeysWithSpaceSeparator() {
-    // 同步批次的 KEYS = 全体子消息 keys 的并集，空格 join（MessageConst::KEY_SEPARATOR）
+    // sync batch KEYS = the union of all sub-message keys, space-joined (MessageConst::KEY_SEPARATOR)
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-keys", &sender);
     acc.setBatchMaxDelayMs(3000);
@@ -790,7 +790,7 @@ void testBatchMergesKeysWithSpaceSeparator() {
     auto batch = waitForBatch(acc, 2);
     expect(batch != nullptr, "2 messages land in one batch");
     if (batch != nullptr) {
-        // 批里的 keys 是**并集**（去重）
+        // the batch keys are the **union** (de-duplicated)
         const std::set<std::string> keys = batch->keys();
         expectInt(static_cast<long long>(keys.size()), 3, "keys are de-duplicated");
         expect(keys.count("k1") == 1 && keys.count("k2") == 1 && keys.count("k3") == 1,
@@ -847,7 +847,7 @@ void testBatchWaitStoreMsgOkFollowsAggregateKey() {
     expect(waits.count("false") == 1, "the explicit batch carries WAIT=false");
 }
 
-// ================================================================ 守卫线程
+// ================================================================ guard thread
 
 void testGuardKeepsClosedBatchUntilNextSend() {
     FakeSender sender;
@@ -875,12 +875,12 @@ void testGuardKeepsClosedBatchUntilNextSend() {
 
     expect(first->closed(), "sent batch is closed");
     expectInt(first->messagesSize(), 1, "closed batch keeps its messagesSize (> 0)");
-    // 守卫线程看到 size > 0 → 不摘表
+    // the guard thread sees size > 0 and leaves the batch in the table
     acc.runGuardOnce(true);
     expectInt(static_cast<long long>(acc.syncBatchCount()), 1,
               "guard keeps a non-empty (already sent) batch");
 
-    // 同键再来一条 → 拿到的是那个已关闭的批次 → add 返回 -1 → 摘表重取（新批次）
+    // another same-key message gets the closed batch, add returns -1, so it is removed and re-fetched (new batch)
     expect(acc.tryAddMessage(msg), "gate accepts the second message");
     SyncCall secondCall = spawnSyncSend(acc, msg);
     auto second = waitForBatch(acc, 1, [&](const std::shared_ptr<MessageAccumulation>& b) {
@@ -905,7 +905,7 @@ void testGuardKeepsClosedBatchUntilNextSend() {
 }
 
 void testGuardRemovesEmptyBatchWithoutSending() {
-    // 空批次（还没人 add）由守卫线程置 closed 并摘表，且**不发**任何请求
+    // an empty batch (nobody added yet) is closed and removed by the guard thread, and **no** request is sent
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-empty-batch", &sender);
     acc.setBatchMaxDelayMs(3000);
@@ -951,7 +951,7 @@ void testAccumulatorCanRestartAfterShutdown() {
     expectInt(static_cast<long long>(sender.sentCount()), 1, "one batch was sent after restart");
 }
 
-// ================================================================ 失败路径
+// ================================================================ failure paths
 
 void testSyncSendFailureSurfacesAndReturnsHoldSize() {
     FakeSender sender;
@@ -1015,7 +1015,7 @@ void testAsyncSendFailureReachesEveryCallback() {
                "the exception text is the sender's message",
                texts.empty() ? std::string() : texts[0]);
     }
-    // 异步路径：回调交付时才归还额度
+    // async path: the quota is refunded only when the callback is delivered
     expectInt(acc.currentlyHoldSize(), 0, "hold size refunded by the callback path");
     expectInt(static_cast<long long>(sender.sentCount()), 1, "one batch was attempted");
 }
@@ -1024,7 +1024,7 @@ void testAsyncThrowLeaksHoldSize() {
     FakeSender sender;
     sender.setThrowOnAsync(true);
     ProduceAccumulator acc("cpp-accum-async-throw", &sender);
-    // 把单批阈值压到 1 字节，让 `add` 自己就触发发送（不依赖守卫线程的时间条件）
+    // squeeze the per-batch threshold to 1 byte so `add` itself triggers the send (independent of the guard thread's timing)
     acc.setBatchMaxBytes(1);
     auto cb = std::make_shared<CollectingCallback>();
     const Message msg(TOPIC, std::string(10, 'a'));
@@ -1039,7 +1039,7 @@ void testAsyncThrowLeaksHoldSize() {
     expectInt(acc.currentlyHoldSize(), 10, "hold size is NOT refunded (upstream leak, copied)");
 }
 
-// ================================================================ sender 生命周期（cpp 特有）
+// ================================================================ sender lifecycle (cpp-specific)
 
 void testDetachSenderBlocksSyncBatchSend() {
     FakeSender sender;
@@ -1076,7 +1076,7 @@ void testDetachSenderBlocksSyncBatchSend() {
 void testDetachSenderFailsAsyncBatchWithoutRefund() {
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-detach-async", &sender);
-    acc.setBatchMaxBytes(1);  // 让 `add` 自己触发发送
+    acc.setBatchMaxBytes(1);  // let `add` trigger the send itself
     acc.detachSender();
     auto cb = std::make_shared<CollectingCallback>();
     const Message msg(TOPIC, std::string(10, 'a'));
@@ -1119,15 +1119,15 @@ void testAttachSenderRebindsOnlyWhenDetached() {
     expectInt(static_cast<long long>(second.calls()), 1, "the second sender took over");
 }
 
-// ================================================================ 守卫线程的服务名
+// ================================================================ guard thread service name
 
 void testGuardServiceNamesMatchContract() {
     FakeSender sender;
     ProduceAccumulator acc("cpp-accum-names", &sender);
     acc.start();
-    acc.start();  // 重复 start 是空操作，不能起两根同名线程
+    acc.start();  // a repeated start is a no-op and must not spawn a second thread with the same name
     acc.shutdown();
-    acc.shutdown();  // 重复 shutdown 也是空操作
+    acc.shutdown();  // a repeated shutdown is also a no-op
     expect(acc.instanceName() == "cpp-accum-names", "instanceName drives the guard thread name");
 }
 
@@ -1165,7 +1165,7 @@ const TestCase kTests[] = {
 }  // namespace
 
 int main() {
-    // 不缓冲：本用例会起多线程，万一某处崩了，已跑过的断言不会留在缓冲区里丢掉
+    // unbuffered: this case spawns threads, so if something crashes, assertions already run are not lost in the buffer
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     for (const TestCase& test : kTests) {
         const int beforeFails = fails;

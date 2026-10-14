@@ -1,10 +1,10 @@
-// Request-Reply（5.x）真机验证（场景 S1–S8 逐条断言）。
-// 用法：rmq_live_rr 127.0.0.1:9876
+// Request-Reply (5.x) verified against a real cluster (scenarios S1-S8 asserted one by one).
+// Usage: rmq_live_rr 127.0.0.1:9876
 //
-// 链路：
-//     请求方 producer.request(msg, timeout)             应答方 push consumer
+// Chain:
+//     Requester producer.request(msg, timeout)            Responder push consumer
 //     msg.props[CORRELATION_ID]=uuid
-//     msg.props[REPLY_TO_CLIENT]=clientId ─────────►   收到请求（broker 已写 CLUSTER）
+//     msg.props[REPLY_TO_CLIENT]=clientId ─────────►   receives request (broker already wrote CLUSTER)
 //     msg.props[TTL]=timeoutMillis                      createReplyMessage(req, body)
 //                                                         → topic=<CLUSTER>_REPLY_TOPIC
 //                                                         → MSG_TYPE="reply"
@@ -55,18 +55,18 @@ void prepareTopic(DefaultMQProducer& producer, const std::string& topic, int32_t
     try {
         producer.createTopic("TBW102", topic, queues);
     } catch (const std::exception& e) {
-        std::printf("  预建 topic %s 失败（改用自动创建）: %s\n", topic.c_str(), e.what());
+        std::printf("  pre-creating topic %s failed (falling back to auto-create): %s\n", topic.c_str(), e.what());
     }
     std::this_thread::sleep_for(std::chrono::seconds(3));
 }
 
-// 应答方收到的请求记录：(body, correlationId, replyTo, ttl, cluster)
+// Requests received by the responder: (body, correlationId, replyTo, ttl, cluster)
 struct RequestRecord {
     std::string body;
     std::string correlationId;
     std::string replyTo;
     std::string ttl;
-    // broker 在存储时补的 CLUSTER（S8 要用它证明应答必须建立在投递到的那份消息上）
+    // CLUSTER added by the broker when storing (S8 uses it to prove the reply must be built on the delivered copy)
     std::string cluster;
 };
 
@@ -150,35 +150,35 @@ int main(int argc, char* argv[]) {
     const int64_t stamp = nowMs() % 100000000;
     const std::string topic = "RequestReply_" + std::to_string(stamp);
     const std::string silentTopic = topic + "_NoReplier";
-    // broker.conf 里 brokerClusterName=DefaultCluster
+    // broker.conf sets brokerClusterName=DefaultCluster
     const std::string replyTopic = MixAll::getReplyTopic("DefaultCluster");
     const int32_t requestTimeout = 8000;
 
-    std::printf("== Request-Reply 真机验证  namesrv=%s  topic=%s ==\n", nsAddr.c_str(),
+    std::printf("== Request-Reply real-cluster verification  namesrv=%s  topic=%s ==\n", nsAddr.c_str(),
                 topic.c_str());
-    std::printf("   应答 topic = %s\n", replyTopic.c_str());
+    std::printf("   reply topic = %s\n", replyTopic.c_str());
 
     DefaultMQProducer prep{"PG_RRPrep_" + std::to_string(stamp)};
     prep.setNamesrvAddr(nsAddr);
     prep.start();
     prepareTopic(prep, topic);
 
-    // ---------------- S1 应答 topic 是 broker 系统 topic，客户端不能建 ----------------
+    // ---------------- S1 the reply topic is a broker system topic; clients cannot create it ----------------
     {
         bool rejected = false;
         std::string detail;
         try {
             prep.createTopic("TBW102", replyTopic, 4);
-            detail = "竟然建成功了";
+            detail = "it unexpectedly created successfully";
         } catch (const std::exception& e) {
-            // createTopic 会把「逐个 broker 都失败」包成 MQClientException（message 里带着
-            // broker 的 CODE/DESC，C++ 异常没有 cause 链可解）：直接匹配 broker
-            // 的 INVALID_PARAMETER(29) 文本。
+            // createTopic wraps "every broker failed" into an MQClientException whose message carries
+            // the broker's CODE/DESC (C++ exceptions have no cause chain to unwrap): match the
+            // broker's INVALID_PARAMETER(29) text directly.
             detail = e.what();
             rejected = detail.find("conflict with system topic") != std::string::npos
                        || detail.find("CODE: 29") != std::string::npos;
         }
-        check("S1 客户端 createTopic(应答 topic) 被拒（broker 系统 topic）", rejected, detail);
+        check("S1 client createTopic(reply topic) rejected (broker system topic)", rejected, detail);
     }
 
     DefaultMQProducer requester{"PG_RRReq_" + std::to_string(stamp)};
@@ -188,7 +188,7 @@ int main(int argc, char* argv[]) {
 
     Replier replier(nsAddr, "CG_RRReply_" + std::to_string(stamp), topic);
 
-    // watcher：独立订阅 <cluster>_REPLY_TOPIC，是 S4 的硬证据
+    // watcher: independently subscribes <cluster>_REPLY_TOPIC, the hard evidence for S4
     std::mutex watchMtx;
     std::vector<std::string> watched;
     class Watcher : public MessageListenerConcurrently {
@@ -212,19 +212,19 @@ int main(int argc, char* argv[]) {
     watcher->start();
 
     try {
-        // ---------------- S2/S3 一次完整往返 ----------------
-        std::printf("\nS2/S3 一次完整 request → reply 往返\n");
+        // ---------------- S2/S3 one full round trip ----------------
+        std::printf("\nS2/S3 one full request → reply round trip\n");
         Message ping(topic, "ping-1");
         const int64_t t0 = nowMs();
         Message reply = requester.request(ping, requestTimeout);
         const std::string want = "reply:ping-1";
-        check("S3 request() 拿到应答且 body 正确", reply.body == want,
+        check("S3 request() got the reply with the correct body", reply.body == want,
               "got=" + reply.body + " want=" + want);
-        check("S3 应答 topic 是 <cluster>_REPLY_TOPIC", reply.topic == replyTopic,
+        check("S3 reply topic is <cluster>_REPLY_TOPIC", reply.topic == replyTopic,
               "topic=" + reply.topic);
         const std::string arrive =
             reply.getProperty(MessageConst::PROPERTY_REPLY_MESSAGE_ARRIVE_TIME);
-        check("S3 应答带 REPLY_MESSAGE_ARRIVE_TIME", !arrive.empty(), "value=" + arrive);
+        check("S3 reply carries REPLY_MESSAGE_ARRIVE_TIME", !arrive.empty(), "value=" + arrive);
 
         const std::string requesterClientId = requester.clientId();
         bool gotRequest = waitUntil(
@@ -233,24 +233,24 @@ int main(int argc, char* argv[]) {
                 return !replier.received.empty();
             },
             15000);
-        check("S2 应答方收到请求消息", gotRequest, "received=1");
+        check("S2 responder received the request message", gotRequest, "received=1");
         RequestRecord rec;
         {
             std::lock_guard<std::mutex> lk(replier.mtx);
             if (!replier.received.empty()) rec = replier.received[0];
         }
-        check("S2 请求消息带 CORRELATION_ID（uuid 36 字符）", rec.correlationId.size() == 36,
+        check("S2 request message carries CORRELATION_ID (uuid, 36 chars)", rec.correlationId.size() == 36,
               "corr=" + rec.correlationId);
-        check("S2 请求消息带 REPLY_TO_CLIENT=请求方 clientId", rec.replyTo == requesterClientId,
+        check("S2 request message carries REPLY_TO_CLIENT=requester clientId", rec.replyTo == requesterClientId,
               "replyTo=" + rec.replyTo + " want=" + requesterClientId);
-        check("S2 请求消息带 TTL=timeout", rec.ttl == std::to_string(requestTimeout),
+        check("S2 request message carries TTL=timeout", rec.ttl == std::to_string(requestTimeout),
               "ttl=" + rec.ttl);
         const int64_t roundTrip = nowMs() - t0;
-        check("S3 往返耗时合理（<timeout）", roundTrip < requestTimeout,
+        check("S3 round-trip time is reasonable (<timeout)", roundTrip < requestTimeout,
               "elapsedMs=" + std::to_string(roundTrip));
 
-        // ---------------- S4 应答确实走了 325 且落到 REPLY_TOPIC ----------------
-        std::printf("\nS4 应答走 SEND_REPLY_MESSAGE_V2(325) 且落到 %s\n", replyTopic.c_str());
+        // ---------------- S4 the reply really went through 325 and landed on REPLY_TOPIC ----------------
+        std::printf("\nS4 reply sent via SEND_REPLY_MESSAGE_V2(325) and lands on %s\n", replyTopic.c_str());
         bool replied = waitUntil(
             [&replier]() {
                 std::lock_guard<std::mutex> lk(replier.mtx);
@@ -262,7 +262,7 @@ int main(int argc, char* argv[]) {
             std::lock_guard<std::mutex> lk(replier.mtx);
             for (const auto& e : replier.replyErrors) s4Detail += e + "; ";
         }
-        check("S4 应答方成功发出了应答消息", replied, s4Detail);
+        check("S4 the responder successfully sent the reply message", replied, s4Detail);
         bool seen = waitUntil(
             [&watched, &watchMtx]() {
                 std::lock_guard<std::mutex> lk(watchMtx);
@@ -272,10 +272,10 @@ int main(int argc, char* argv[]) {
                 return false;
             },
             15000);
-        check("S4 订阅应答 topic 的独立消费者能看到该应答", seen, "");
+        check("S4 an independent consumer subscribed to the reply topic sees the reply", seen, "");
 
-        // ---------------- S5 无应答方 → RequestTimeoutException ----------------
-        std::printf("\nS5 无应答方时 request() 抛 RequestTimeoutException\n");
+        // ---------------- S5 no responder -> RequestTimeoutException ----------------
+        std::printf("\nS5 with no responder, request() throws RequestTimeoutException\n");
         prepareTopic(prep, silentTopic);
         const int64_t s5Begin = nowMs();
         bool raisedTimeout = false;
@@ -292,15 +292,15 @@ int main(int argc, char* argv[]) {
             raisedWhat = std::string("wrong exception: ") + e.what();
         }
         const int64_t s5Elapsed = nowMs() - s5Begin;
-        check("S5 抛的是 RequestTimeoutException", raisedTimeout, raisedWhat);
-        check("S5 异常带 10006 REQUEST_TIMEOUT_EXCEPTION",
+        check("S5 the exception thrown is RequestTimeoutException", raisedTimeout, raisedWhat);
+        check("S5 exception carries 10006 REQUEST_TIMEOUT_EXCEPTION",
               raisedCode == ClientErrorCode::REQUEST_TIMEOUT_EXCEPTION,
               "code=" + std::to_string(raisedCode));
-        check("S5 超时时长接近设定值（2s~12s）", s5Elapsed >= 2000 && s5Elapsed <= 12000,
+        check("S5 the wait is close to the configured timeout (2s~12s)", s5Elapsed >= 2000 && s5Elapsed <= 12000,
               "elapsedMs=" + std::to_string(s5Elapsed));
 
-        // ---------------- S6 并发请求不串台 ----------------
-        std::printf("\nS6 并发 3 个 request，各自拿到自己的应答\n");
+        // ---------------- S6 concurrent requests do not cross-talk ----------------
+        std::printf("\nS6 3 concurrent requests, each getting its own reply\n");
         std::mutex resMtx;
         int32_t okCount = 0;
         int32_t concTimeouts = 0;
@@ -320,11 +320,11 @@ int main(int argc, char* argv[]) {
             });
         }
         for (std::thread& t : threads) t.join();
-        check("S6 3 个并发 request 全部拿到自己的应答", okCount == 3 && concTimeouts == 0,
+        check("S6 all 3 concurrent requests got their own replies", okCount == 3 && concTimeouts == 0,
               "ok=" + std::to_string(okCount) + " fail=" + std::to_string(concTimeouts));
 
-        // ---------------- S7 消费者未被 Reply 流量破坏 ----------------
-        std::printf("\nS7 应答方的消费者仍然完好（普通 push 消费不受 Reply 影响）\n");
+        // ---------------- S7 the consumer survives Reply traffic ----------------
+        std::printf("\nS7 the responder's consumer is still healthy (plain push consumption unaffected by Reply)\n");
         requester.send(Message(topic, "plain-after-replies"));
         bool plain = waitUntil(
             [&replier]() {
@@ -335,9 +335,9 @@ int main(int argc, char* argv[]) {
                 return false;
             },
             15000);
-        check("S7 后续普通消息仍被消费", plain, "");
+        check("S7 later plain messages are still consumed", plain, "");
 
-        std::printf("\nS8 CLUSTER 由 broker 写入；造不出应答时报 10007 而不是别的错\n");
+        std::printf("\nS8 CLUSTER is written by the broker; an unbuildable reply reports 10007, not some other error\n");
         RequestRecord pingRec;
         {
             std::lock_guard<std::mutex> lk(replier.mtx);
@@ -345,9 +345,9 @@ int main(int argc, char* argv[]) {
                 if (r.body == "ping-1") pingRec = r;
             }
         }
-        check("S8 投递到的请求消息带 broker 写入的 CLUSTER=DefaultCluster",
+        check("S8 the delivered request message carries broker-written CLUSTER=DefaultCluster",
               pingRec.cluster == "DefaultCluster", "cluster=" + pingRec.cluster);
-        check("S8 客户端手里那份请求消息**没有** CLUSTER（属性确实是 broker 补的）",
+        check("S8 the request message copy in the client's hand has **no** CLUSTER (the property really is added by the broker)",
               ping.getProperty(MessageConst::PROPERTY_CLUSTER).empty(),
               "value=" + ping.getProperty(MessageConst::PROPERTY_CLUSTER));
         int32_t replyCode = 0;
@@ -360,14 +360,14 @@ int main(int argc, char* argv[]) {
         } catch (const std::exception& e) {
             replyWhat = std::string("wrong exception: ") + e.what();
         }
-        check("S8 拿本地那份请求消息造应答 → MQClientException 带 10007",
+        check("S8 building a reply from the local request copy -> MQClientException with 10007",
               replyCode == ClientErrorCode::CREATE_REPLY_MESSAGE_EXCEPTION,
               "code=" + std::to_string(replyCode) + " what=" + replyWhat);
-        check("S8 10007 的文案点到缺失的 CLUSTER 属性（协议原文）",
+        check("S8 the 10007 text points at the missing CLUSTER property (protocol wording)",
               replyWhat.find("property[CLUSTER] is null.") != std::string::npos,
               "what=" + replyWhat);
     } catch (const std::exception& e) {
-        std::printf("  [FATAL] 场景执行异常: %s\n", e.what());
+        std::printf("  [FATAL] scenario execution error: %s\n", e.what());
         ++gFail;
     }
 
@@ -376,6 +376,6 @@ int main(int argc, char* argv[]) {
     watcher->shutdown();
     prep.shutdown();
 
-    std::printf("\n== 结果: PASS=%d FAIL=%d ==\n", gPass, gFail);
+    std::printf("\n== Result: PASS=%d FAIL=%d ==\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }

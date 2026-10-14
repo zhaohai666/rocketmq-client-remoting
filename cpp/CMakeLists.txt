@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.15)
 
 project(rocketmq_client_remoting LANGUAGES CXX VERSION 0.1.0)
 
-# ---------------------------------------------------------------- 全局设置
+# ---------------------------------------------------------------- Global settings
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -12,17 +12,17 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(MSVC)
-    # 源码统一 UTF-8，避免 MSVC 按本地代码页解析中文注释导致 C4819/编译错误
+    # Sources are UTF-8: otherwise MSVC parses non-ASCII comments by the local code page, which gives C4819 warnings or build errors
     add_compile_options(/utf-8 /Zc:__cplusplus)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX)
 else()
     add_compile_options(-Wall -Wextra)
 endif()
 
-# MinGW/GCC 交叉编译到 Windows 时同样必须定义 NOMINMAX：否则 windef.h 会定义
-# min/max 宏，把代码里所有 std::min/std::max 展开成非法表达式而编译失败。
-# WIN32_LEAN_AND_MEAN 可减少 windows.h 的无关依赖，缩短编译时间。
-# （net_compat.h 内部也会兜底定义这两个宏，双保险。）
+# MinGW/GCC cross builds for Windows must define NOMINMAX too: otherwise windef.h
+# defines the min/max macros, expanding every std::min/std::max in the code into an
+# illegal expression, so the build fails. WIN32_LEAN_AND_MEAN trims unrelated
+# windows.h dependencies and cuts compile time (net_compat.h also defines both as a fallback, doubly safe).
 if(WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
@@ -32,7 +32,7 @@ include(GNUInstallDirs)
 option(RMQ_BUILD_TESTS     "Build unit tests"      ON)
 option(RMQ_BUILD_EXAMPLES  "Build selfcheck binary" ON)
 
-# ---------------------------------------------------------------- 静态库
+# ---------------------------------------------------------------- Static library
 set(RMQ_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 set(RMQ_SOURCES
@@ -83,28 +83,28 @@ set(RMQ_SOURCES
     src/client/trace_hook.cpp
 )
 
-# 传输层用到 std::thread / std::mutex，需要显式链接线程库（Linux 上尤其必要）
+# The transport layer uses std::thread / std::mutex, so the thread library must be linked explicitly (especially on Linux)
 find_package(Threads REQUIRED)
 
-# 消息体压缩：对接实现都用标准库 zlib（永远存在）。
-# 这里同样默认要求 zlib（libz 在各平台都自带）。若要构建无 zlib 的精简版，
-# 用 -DRMQ_WITH_ZLIB=OFF；此时**遇到压缩消息会抛异常**而不是静默返回压缩字节，
-# 以免把数据损坏伪装成成功。
+# Message body compression: the peer implementations all use standard zlib, which
+# always exists (libz ships on every platform), so this build requires it by
+# default. A slim zlib-free build uses -DRMQ_WITH_ZLIB=OFF; a compressed
+# message then throws instead of silently returning compressed bytes, which would disguise data corruption as success.
 option(RMQ_WITH_ZLIB "Enable zlib message body (de)compression" ON)
 if(RMQ_WITH_ZLIB)
     find_package(ZLIB REQUIRED)
 endif()
 
-# 消息体压缩的另外两个后端：线上数据的帧格式来自 lz4-java 的 LZ4Frame*Stream 与 zstd-jni；
-# 这里直接链接系统的 liblz4（LZ4 Frame 互操作格式，见 lz4frame.h）与 libzstd。
-# 与 zlib 同一约定：**找不到就只关这一个后端，configure 照样成功**，运行期遇到该算法
-# 的压缩消息一律抛异常，绝不静默把压缩字节当正文交出去（那等于伪装成成功的数据损坏）。
+# The other two backends: wire frames come from lz4-java's LZ4Frame*Stream and zstd-jni; this links
+# the system liblz4 (LZ4 Frame interop format, see lz4frame.h) and libzstd directly. As with zlib:
+# a missing backend disables only that backend and configure still succeeds. At runtime a message
+# on that codec throws instead of handing out compressed bytes as the body: that disguises data corruption as success.
 option(RMQ_WITH_ZSTD "Enable zstd message body (de)compression" ON)
 option(RMQ_WITH_LZ4  "Enable lz4  message body (de)compression" ON)
 
-# 两个后端都用"裸路径查找优先、cmake config 兜底"：brew 只装 dylib + 头文件（没有
-# *-config.cmake），而 vcpkg / 源码安装会导出带 include 路径的 imported target。
-# 搜索前缀覆盖 Intel Mac 的 /usr/local、Apple Silicon 的 /opt/homebrew 与 Linux 默认路径。
+# Both backends search plain paths first and fall back to the cmake config: brew installs only the
+# dylib plus headers (no *-config.cmake), while vcpkg or a source install exports an imported target
+# with include paths. Search prefixes cover /usr/local (Intel Mac), /opt/homebrew (Apple Silicon) and the Linux defaults.
 set(RMQCompression_HINTS /usr/local /opt/homebrew)
 
 set(RMQ_ZSTD_FOUND FALSE)
@@ -136,7 +136,7 @@ endif()
 
 set(RMQ_LZ4_FOUND FALSE)
 if(RMQ_WITH_LZ4)
-    # lz4frame.h 是 Frame 格式的公开头；lz4.h 一并要求（compression.cpp 两处都用）
+    # lz4frame.h is the public header of the Frame format; lz4.h is required too (compression.cpp uses both)
     find_path(RMQ_LZ4_INCLUDE_DIR NAMES lz4frame.h
               HINTS ${RMQCompression_HINTS} PATH_SUFFIXES include)
     find_library(RMQ_LZ4_LIBRARY NAMES lz4 liblz4
@@ -162,9 +162,9 @@ if(RMQ_WITH_LZ4)
     endif()
 endif()
 
-# 传输层 TLS（连接层 SslHandler 的对位）。找到 OpenSSL 就默认编入
-# （test mode 信任 broker 自签证书，配合 PERMISSIVE broker 即配即通）；找不到时静默降级，
-# setTlsEnable(true) 会在运行时抛出带说明的错误，其余路径零影响。
+# Transport TLS, the counterpart of the connection-layer SslHandler. With OpenSSL found it is
+# built in by default: "test mode" trusts the broker self-signed certificate, so a PERMISSIVE
+# broker works right away. Missing OpenSSL degrades silently: setTlsEnable(true) throws a descriptive error, other paths unaffected.
 option(RMQ_ENABLE_TLS "Enable TLS transport (requires OpenSSL)" ON)
 if(RMQ_ENABLE_TLS)
     find_package(OpenSSL QUIET)
@@ -184,12 +184,12 @@ target_link_libraries(rocketmq_remoting PUBLIC Threads::Threads)
 
 if(RMQ_WITH_ZLIB)
     target_link_libraries(rocketmq_remoting PUBLIC ZLIB::ZLIB)
-    # 让 message_decoder / compression.cpp 感知 zlib 是否可用
+    # Lets message_decoder / compression.cpp know whether zlib is available
     target_compile_definitions(rocketmq_remoting PUBLIC ROCKETMQ_HAS_ZLIB=1)
 endif()
 
-# zstd / lz4 同样是 PUBLIC：示例与单测里直接调 CompressorFactory 的代码要看到同一套宏，
-# 否则"编译期关掉的后端"在测试里会被误判成 bug（见 tests/test_compression.cpp 的分支）。
+# zstd / lz4 are PUBLIC too: examples and unit tests call CompressorFactory directly and
+# must see the same macros, else a compile-time-disabled backend looks like a test bug (see the branches in tests/test_compression.cpp).
 if(RMQ_ZSTD_FOUND)
     target_link_libraries(rocketmq_remoting PUBLIC ${RMQ_ZSTD_LIBS})
     if(RMQ_ZSTD_INCLUDE_DIR)
@@ -209,19 +209,19 @@ endif()
 if(RMQ_ENABLE_TLS AND OpenSSL_FOUND)
     target_link_libraries(rocketmq_remoting PUBLIC OpenSSL::SSL OpenSSL::Crypto)
     target_include_directories(rocketmq_remoting PRIVATE ${OPENSSL_INCLUDE_DIR})
-    # 仅 tls_session.cpp 感知（PUBLIC 与否：tests 需要自己的 mock TLS server，也用 OpenSSL）
+    # Only tls_session.cpp needs it (PUBLIC anyway: the tests build their own mock TLS server and use OpenSSL too)
     target_compile_definitions(rocketmq_remoting PUBLIC RMQ_HAS_TLS=1)
     target_sources(rocketmq_remoting PRIVATE src/remoting/tls_session.cpp)
 endif()
 
-# util_all 里 localIp() 用到 socket；Windows 需要链接 winsock
+# localIp() in util_all uses socket, so Windows needs to link winsock
 if(WIN32)
     target_link_libraries(rocketmq_remoting PUBLIC ws2_32)
 endif()
 
 add_library(rocketmq::remoting ALIAS rocketmq_remoting)
 
-# ---------------------------------------------------------------- 子目录
+# ---------------------------------------------------------------- Subdirectories
 if(RMQ_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
@@ -231,7 +231,7 @@ if(RMQ_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-# ---------------------------------------------------------------- 安装
+# ---------------------------------------------------------------- Installation
 install(TARGETS rocketmq_remoting
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

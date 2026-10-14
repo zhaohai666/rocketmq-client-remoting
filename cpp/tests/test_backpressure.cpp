@@ -1,7 +1,7 @@
-// 为什么单独一个文件：整套背压语义都压在这个基元上，而它有两处**不是**随便一个信号量都
-// 满足的行为 —— 「公平」（只有队首能拿，后来者不许插队）和「运行时原地改容量」（在途份数
-// 保留、并且把卡住的等待者叫醒）。生产者那一侧怎么用（拿不到就回调、只还一次、队满就地跑）
-// 在 test_producer_async.cpp 的背压一节。
+// Why a separate file: the whole backpressure semantics rest on this one primitive, and it has two behaviors that
+// no ordinary semaphore gives for free -- "fairness" (only the queue head may acquire; latecomers must not cut in line)
+// and "changing capacity in place at runtime" (in-flight counts are kept and stuck waiters are woken). How the producer
+// side uses it (call back when it cannot acquire, return exactly once, run inline when the queue is full) lives in the backpressure section of test_producer_async.cpp.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -59,13 +59,13 @@ void testTryAcquireTimesOutWithoutThrowing() {
     const int64_t waited = sinceMs(began);
     expect(waited >= 100, "the timeout is not returned early", "waited=" + std::to_string(waited));
     expect(waited < 1000, "the timeout is not waited forever", "waited=" + std::to_string(waited));
-    // 超时的人已经出队，不会把后面的人永久挡在一个已经消失的请求上
+    // The timed-out waiter has left the queue and must not block later waiters forever on a vanished request
     sem.release(1);
     expectEq(sem.waitingCount(), 0, "a timed out waiter leaves the queue");
     expect(sem.tryAcquire(1, 0), "the next acquirer is not blocked by the departed one");
 }
 
-// 2. 非正预算一律不等
+// 2. Non-positive budgets never wait
 void testNonPositiveTimeoutNeverWaits() {
     FairSemaphore sem(0);
     expect(!sem.tryAcquire(1, 0), "zero budget does not wait");
@@ -73,7 +73,7 @@ void testNonPositiveTimeoutNeverWaits() {
     expectEq(sem.waitingCount(), 0, "neither attempt stays queued");
 }
 
-// 3. 公平模式的全部意义：排在别人后面的请求不许插队，哪怕许可现在够它
+// 3. The whole point of fairness: a request queued behind others must not cut in, even if free permits now cover it
 void testOnlyTheQueueHeadIsGranted() {
     FairSemaphore sem(2);
     expect(sem.tryAcquire(2, 0), "drain the semaphore");
@@ -83,7 +83,7 @@ void testOnlyTheQueueHeadIsGranted() {
         bigResult.push_back(got ? "big-got" : "big-lost");
     });
     expect(waitFor([&] { return sem.waitingCount() == 1; }), "the big request gets queued");
-    // 现在空闲 0、队首要 2 个。还 1 个只够小请求 —— 它必须等。
+    // Now 0 free and the head wants 2. Releasing 1 only covers the small request -- it must keep waiting.
     std::vector<std::string> smallResult;
     std::thread small([&]() {
         const bool got = sem.tryAcquire(1, 300);
@@ -95,14 +95,14 @@ void testOnlyTheQueueHeadIsGranted() {
     expect(!smallResult.empty() && smallResult[0] == "small-lost",
            "the later small request must not jump the queue",
            smallResult.empty() ? "no result" : smallResult[0]);
-    sem.release(1);  // 补齐队首要的 2 个
+    sem.release(1);  // top up the 2 the queue head wants
     big.join();
     expect(!bigResult.empty() && bigResult[0] == "big-got", "the head is served first",
            bigResult.empty() ? "no result" : bigResult[0]);
     expectEq(sem.availablePermits(), 0, "both grants consumed the two released permits");
 }
 
-// 4. 归还顺序就是醒来顺序（公平信号量的可观察承诺）
+// 4. Release order is the wake order (the observable promise of a fair semaphore)
 void testReleaseWakesTheHeadInOrder() {
     FairSemaphore sem(1);
     expect(sem.tryAcquire(1, 0), "drain the semaphore");
@@ -126,14 +126,14 @@ void testReleaseWakesTheHeadInOrder() {
            order.empty() ? "no result" : (order[0] + "," + (order.size() > 1 ? order[1] : "")));
 }
 
-// 5. 队首拿走许可之后，剩下的空闲若够后面的人，他必须最终拿到
+// 5. After the head takes its permits, if the remaining free ones cover a later waiter, it must eventually get them
 void testGrantedHeadStillFeedsTheWaiterBehindIt() {
-    // 锁的是「一次 release 只放一个人」不会发生：空闲 6、队首要 5、第二个人要 1，
-    // 两人都该拿到、且都不该等到超时。（tryAcquire 拿到许可后还会再 notify_all 一次，
-    // 为的是第二个人在那次通知**之后**才排上队的排布 —— 那个窗口在这里复现不稳定，
-    // 另一半的回归守卫是下面那条超时退出的用例。）
+    // Locks down that "one release grants only one waiter" never happens: 6 free, the head wants 5, the second wants 1,
+    // both must be granted and neither may hit the timeout. (tryAcquire still notifies once more after acquiring,
+    // covering the layout where the second waiter queues **after** that notification -- that window is
+    // not reliably reproducible here; the other half of the regression guard is the timed-out-exit case below.)
     FairSemaphore sem(6);
-    expect(sem.tryAcquire(5, 0), "five permits are in flight");  // 空闲 1
+    expect(sem.tryAcquire(5, 0), "five permits are in flight");  // 1 free
     std::atomic<int> headResult{0};
     std::atomic<int> secondResult{0};
     std::atomic<int64_t> secondWaitedMs{-1};
@@ -146,22 +146,22 @@ void testGrantedHeadStillFeedsTheWaiterBehindIt() {
         secondResult.store(got ? 1 : -1);
     });
     expect(waitFor([&] { return sem.waitingCount() == 2; }), "the second request queues behind");
-    sem.release(5);  // 空闲 1 → 6：队首够，剩下 1 个正好给第二个
+    sem.release(5);  // free 1 -> 6: the head is covered and the leftover 1 goes exactly to the second
     head.join();
     second.join();
     expectEq(headResult.load(), 1, "the head is granted");
     expectEq(secondResult.load(), 1, "both queued requests are eventually granted");
-    // 拿到许可不该花掉整个预算：睡到 3000ms 就是根本没被叫醒
+    // Acquiring must not burn the whole budget: sleeping to 3000ms means it was never woken
     expect(secondWaitedMs.load() < 2000, "the waiter behind the head is woken promptly",
            "waited=" + std::to_string(static_cast<long long>(secondWaitedMs.load())) + "ms");
     expectEq(sem.availablePermits(), 0, "6 free covered 5 + 1");
 }
 
-// 6. 丢唤醒的回归守卫：队首**超时退出**也必须把机会交给后面的人
+// 6. Lost-wakeup regression guard: even when the head **times out**, it must hand the chance to the waiters behind
 void testTimedOutHeadWakesTheWaiterBehindIt() {
-    // 队首要 4 个 > 总量 3，它永远拿不到；后面那个要 1 个，等得到。
-    // 少了离场时的 notify_all，second 会一路睡满 3000ms：真机上就是异步发送白等满预算，
-    // 再回调一个 semaphoreAsyncNum timeout，而许可早就空出来了。
+    // The head wants 4 > total 3, so it can never succeed; the waiter behind wants 1 and can get it.
+    // Without the exit-path notify_all, second sleeps the full 3000ms: on a real machine an async send would burn
+    // the whole budget for nothing, then call back a semaphoreAsyncNum timeout while permits have long been free.
     FairSemaphore sem(3);
     expect(sem.tryAcquire(3, 0), "drain the semaphore");
     std::atomic<int> headResult{0};
@@ -176,12 +176,12 @@ void testTimedOutHeadWakesTheWaiterBehindIt() {
         secondResult.store(got ? 1 : -1);
     });
     expect(waitFor([&] { return sem.waitingCount() == 2; }), "the small request queues behind");
-    sem.release(3);  // 空闲够 second，但队首是那个贪心的
+    sem.release(3);  // free is enough for second, but the queue head is the greedy one
     head.join();
     second.join();
     expectEq(headResult.load(), -1, "asking for more than the total never succeeds");
     expectEq(secondResult.load(), 1, "the departing head must wake the waiter behind it");
-    // 拿到许可不该花掉整个预算：睡到 3000ms 就是根本没被叫醒
+    // Acquiring must not burn the whole budget: sleeping to 3000ms means it was never woken
     expect(secondWaitedMs.load() < 2000, "the departing head wakes the next waiter",
            "waited=" + std::to_string(static_cast<long long>(secondWaitedMs.load())) + "ms");
 }
@@ -206,7 +206,7 @@ void testShrinkBelowOutstandingGivesNegativeFree() {
     expect(sem.tryAcquire(2, 0), "the shrunk capacity is usable");
 }
 
-// 9. 扩容要把正堵在队列里的人叫醒 —— 这正是本实现不换 Semaphore 对象的理由
+// 9. Growing capacity must wake whoever is blocked in the queue -- exactly why this implementation never swaps the Semaphore object
 void testGrowWakesSomeoneBlockedOnTheOldCapacity() {
     FairSemaphore sem(1);
     expect(sem.tryAcquire(1, 0), "drain the only permit");
@@ -214,7 +214,7 @@ void testGrowWakesSomeoneBlockedOnTheOldCapacity() {
     std::thread waiter([&] { got.push_back(sem.tryAcquire(1, 5000)); });
     expect(waitFor([&] { return sem.waitingCount() == 1; }), "the waiter is blocked on the gate");
     sem.setTotalPermits(5);
-    sem.release(1);          // 在途的那份还回去
+    sem.release(1);          // hand back the in-flight permit
     waiter.join();
     expect(!got.empty() && got[0], "the resize wakes the blocked sender",
            got.empty() ? "no result" : (got[0] ? "got it" : "lost it"));
@@ -225,10 +225,10 @@ void testReleaseBeyondTotalIsAllowed() {
     FairSemaphore sem(1);
     sem.release(3);
     expectEq(sem.availablePermits(), 4, "release does not clamp at total");
-    expectEq(sem.totalPermits(), 1, "… but it does not move the total either");
+    expectEq(sem.totalPermits(), 1, "... but it does not move the total either");
 }
 
-// 11. 非正数的申请/归还都是 no-op 级别的良性输入（批量消息为空时生产者按 1 算，不靠这里）
+// 11. Non-positive acquire/release requests are benign no-op-level inputs (the producer counts an empty batch as 1; it does not rely on this)
 void testNonPositiveRequestsAreBenign() {
     FairSemaphore sem(0);
     expect(sem.tryAcquire(0, 0), "a zero-permit request is satisfied even when empty");
@@ -244,7 +244,7 @@ void testFloorsMatchDefaults() {
 
 }  // namespace
 
-// 用例里未预期的异常必须变成可读的失败，而不是把整个进程 terminate 掉
+// An unexpected exception in a case must become a readable failure instead of terminating the whole process
 static void runCase(const char* name, void (*fn)()) {
     const auto began = std::chrono::steady_clock::now();
     try {
@@ -261,7 +261,7 @@ static void runCase(const char* name, void (*fn)()) {
     const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - began)
                            .count();
-    // 这些用例最长的是「等满超时」那一档，超过 4s 就是有人在信号量上挂死了
+    // The longest cases wait out their timeouts; over 4s means someone hangs dead on a semaphore
     if (ms > 4000) std::printf("SLOW %s: %lldms\n", name, static_cast<long long>(ms));
 }
 

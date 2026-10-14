@@ -48,8 +48,8 @@ std::vector<MessageExt> offsetBatch(size_t n) {
     return out;
 }
 
-// 未 start 的消费者即可：correctTagsOffset / takeBatchForConsume / finishBatchConsume
-// 全在本地状态上，不碰网络。
+// A consumer that was never start()ed is enough: correctTagsOffset / takeBatchForConsume
+// / finishBatchConsume all work on local state only and never touch the network.
 class Harness {
 public:
     explicit Harness() : consumer_(kGroup), key_(DefaultMQPushConsumer::offsetKey(queue0())) {
@@ -85,7 +85,7 @@ void expectOffset(const Harness& h, std::optional<int64_t> want, const std::stri
 }
 
 void testStatuses() {
-    // 空应答的两个状态都推进；其余状态一律不碰位点
+    // Both empty-response statuses advance the offset; every other status leaves it untouched
     for (PullStatus s : {PullStatus::NO_NEW_MSG, PullStatus::NO_MATCHED_MSG}) {
         Harness h;
         h.seedPending({});
@@ -117,14 +117,14 @@ void testIncreaseOnly() {
 
 void testProcessQueueGuard() {
     {
-        // 缓冲里还有没消费的：闸门关上
+        // The buffer still holds unconsumed messages: the gate stays closed
         Harness h;
         h.seedPending({ext(0)});
         h.correct(PullStatus::NO_NEW_MSG, 42);
         expectOffset(h, std::nullopt, "guard.pendingNonEmpty");
     }
     {
-        // 缓冲空了，但有一条在 listener 手里（removeMessage 还没跑）：一样关上
+        // Buffer empty, but one message sits with the listener (removeMessage has not run): closed
         Harness h;
         h.seedPending({ext(0)});
         std::vector<MessageExt> batch = h.take();
@@ -132,13 +132,13 @@ void testProcessQueueGuard() {
         h.correct(PullStatus::NO_MATCHED_MSG, 42);
         expectOffset(h, std::nullopt, "guard.inflightBlocks");
 
-        // 消费收尾（含异常回塞路径）后计数归零，修正才允许生效
+        // Once consume finishing ends (re-queue on exception included) the count is zero and the correction applies
         h.finish();
         h.correct(PullStatus::NO_MATCHED_MSG, 42);
         expectOffset(h, 42, "guard.afterFinish");
     }
     {
-        // 连 pending 表项都没有（从未拉过该队列）按空处理，不能因为缺项漏掉修正
+        // No pending entry at all (never pulled this queue) counts as empty; a missing entry must not skip it
         Harness h;
         h.correct(PullStatus::NO_NEW_MSG, 7);
         expectOffset(h, 7, "guard.missingPendingAllows");
@@ -147,8 +147,8 @@ void testProcessQueueGuard() {
 
 void testTakeFinishWiring() {
     {
-        // takeBatchForConsume 一次按 consumeMessageBatchMaxSize 取走一批，且必须与
-        // 登记在途在同一临界区：这里靠"取走后闸门立刻关上"来观察
+        // takeBatchForConsume removes one batch sized by consumeMessageBatchMaxSize, and it must
+        // register in-flight in the same critical section: seen via "the gate closes right after a take"
         Harness h;
         h.seedPending(offsetBatch(3));
         std::vector<MessageExt> batch = h.take();
@@ -158,12 +158,12 @@ void testTakeFinishWiring() {
         expect(h.pending().size() == 1, "wiring.pendingLeft",
                std::to_string(h.pending().size()));
 
-        // 还有余量没被取走：缓冲非空，同样挡着
+        // Leftovers were not taken: the buffer is non-empty and blocks the same way
         h.finish();
         h.correct(PullStatus::NO_NEW_MSG, 42);
         expectOffset(h, std::nullopt, "wiring.pendingStillBlocks");
 
-        // 第二批发完，闸门全开
+        // Once the second batch finishes too, the gate opens fully
         std::vector<MessageExt> rest = h.take();
         expect(rest.size() == 1, "wiring.restSize", std::to_string(rest.size()));
         h.finish();
@@ -171,11 +171,11 @@ void testTakeFinishWiring() {
         expectOffset(h, 42, "wiring.drainedAllows");
     }
     {
-        // 两批同时在途（两个消费线程）：计数必须累加，一次 finish 不足以放行
+        // Two batches in flight (two consume threads): the count accumulates, one finish cannot open the gate
         Harness h;
         h.seedPending(offsetBatch(4));
-        h.take();      // 2 条
-        h.take();      // 又 2 条：在途 2 批
+        h.take();      // 2 messages
+        h.take();      // another 2: two batches in flight
         h.finish();
         h.correct(PullStatus::NO_NEW_MSG, 42);
         expectOffset(h, std::nullopt, "wiring.stillOneInFlight");
@@ -184,12 +184,12 @@ void testTakeFinishWiring() {
         expectOffset(h, 42, "wiring.bothFinishedAllows");
     }
     {
-        // 计数清零后被擦除的 key 必须能重新登记：第二批在途时闸门要重新关上
+        // A key erased once its count hit zero must be re-registrable: the gate closes again while batch 2 runs
         Harness h;
         h.seedPending(offsetBatch(3));
-        h.take();      // 2 条
+        h.take();      // 2 messages
         h.finish();
-        h.take();      // 第 3 条：在途重新计数
+        h.take();      // the 3rd message: in-flight counting starts over
         h.correct(PullStatus::NO_NEW_MSG, 42);
         expectOffset(h, std::nullopt, "wiring.reRegistered");
         h.finish();
@@ -197,7 +197,7 @@ void testTakeFinishWiring() {
         expectOffset(h, 42, "wiring.reRegisteredFinishAllows");
     }
     {
-        // 对空队列 take 不该凭空记上一笔在途（否则闸门被自己关死）
+        // Taking from an empty queue must not record a phantom in-flight batch, else the gate closes itself
         Harness h;
         h.seedPending({});
         expect(h.take().empty(), "wiring.emptyTake");
@@ -205,7 +205,7 @@ void testTakeFinishWiring() {
         expectOffset(h, 42, "wiring.emptyTakeNoLeak");
     }
     {
-        // finish 打在已被擦掉的 key 上是 no-op，不能把计数恢复出来
+        // finish on an already-erased key is a no-op and must not resurrect the count
         Harness h;
         h.seedPending(offsetBatch(1));
         h.take();

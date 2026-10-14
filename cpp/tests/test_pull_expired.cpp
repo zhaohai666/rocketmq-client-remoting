@@ -1,5 +1,5 @@
-// 这里锁阈值算术与逐队列时刻表；「撤掉之后真能重新消费」要起真线程、还要真 broker
-// 认位点，只能在真机验（examples/live_redelivery.cpp 的 S11 停摆自愈场景）。
+// This locks the threshold arithmetic and the per-queue stamp schedule; "consumption really resumes after removal" needs real threads and a real broker
+// accepting offsets, verifiable only on a live cluster (the S11 stall self-healing scenario in examples/live_redelivery.cpp).
 #include <cstdio>
 #include <string>
 
@@ -35,7 +35,7 @@ void testStallThresholdDefault() {
 }
 
 void testNoStampIsNotStalled() {
-    // 刚分配、还没跑到盖章处的循环不算停摆，否则"起线程 → 立刻被撤"来回抖动。
+    // A freshly assigned loop that has not reached the stamping point is not stalled, otherwise "start thread -> removed at once" would thrash back and forth.
     DefaultMQPushConsumer c(kGroup);
     const std::string key = queueKey(0);
     expect(c.lastPullAt(key) == -1, "table.absent");
@@ -68,8 +68,8 @@ void testOldEnoughStampAlwaysStalls() {
 }
 
 void testLoopExitMarker() {
-    // 拉取循环自己返回了、却仍持有该队列（异常打穿/订阅丢了）：线程包装器把时刻标成 0。
-    // std::thread 死了问不出 is_alive()（joinable() 仍是 true），所以只能自己报到。
+    // The pull loop returned by itself yet still owns the queue (exception punched through / subscription lost): the thread wrapper stamps the time as 0.
+    // A dead std::thread cannot answer is_alive() (joinable() is still true), so it must report in by itself.
     DefaultMQPushConsumer c(kGroup);
     const std::string key = queueKey(0);
     c.setLastPullAt(key, UtilAll::currentTimeMillis());
@@ -79,7 +79,7 @@ void testLoopExitMarker() {
 }
 
 void testStampIsPerQueue() {
-    // 停摆判据是**逐队列**的：一个队列卡住不能把同 topic 其他队列一起撤走（那才是造重复）。
+    // The stall check is **per queue**: one stuck queue must not get other queues of the same topic removed along with it (that is what manufactures duplicates).
     DefaultMQPushConsumer c(kGroup);
     const std::string k0 = queueKey(0);
     const std::string k1 = queueKey(1);

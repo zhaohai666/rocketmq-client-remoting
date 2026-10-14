@@ -1,9 +1,9 @@
-// 发送头三个字段（defaultTopic / defaultTopicQueueNums / brokerName）真机验证。
-// 用法：rmq_live_send_header 127.0.0.1:9876
+// Live-cluster verification of the three send-header fields (defaultTopic / defaultTopicQueueNums / brokerName).
+// Usage: rmq_live_send_header 127.0.0.1:9876
 //
-// 场景 H0–H5 逐条真机断言。
+// Assert every scenario H0-H5 one by one on a real cluster.
 //
-// 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
+// Prerequisites: NameServer + Broker already running, with ``autoCreateTopicEnable=true``.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -64,7 +64,7 @@ bool waitUntil(const std::function<bool()>& pred, int32_t timeoutMs) {
 
 Bytes bytesOf(const std::string& s) { return Bytes(s.begin(), s.end()); }
 
-// 一次异步发送的终态
+// Terminal state of one async send
 class Latch : public SendCallback {
 public:
     void onSuccess(const SendResult& r) override {
@@ -106,7 +106,7 @@ private:
     std::vector<std::string> errors_;
 };
 
-// 环境：一个名字服务地址 + 一组按 stamp 隔离的 topic，跑完自己删干净。
+// Environment: one name server address plus a set of stamp-isolated topics, deleted completely after the run.
 struct Env {
     std::string nsAddr;
     std::string stamp;
@@ -139,7 +139,7 @@ struct Env {
     }
 };
 
-// 读回 broker 上该 topic 的 (read, write) 队列数；还不存在时返回 false。
+// Read back the (read, write) queue numbers of the topic on the broker; false when it does not exist yet.
 bool queueNums(Env& env, const std::string& topic, int32_t& read, int32_t& write) {
     try {
         const TopicConfig cfg = env.admin.examineTopicConfig(env.brokerAddr, topic);
@@ -151,12 +151,12 @@ bool queueNums(Env& env, const std::string& topic, int32_t& read, int32_t& write
     }
 }
 
-// 等 topic 在 broker 上出现（自动建 topic 是发送链路里同步做的，配置落地要一点点时间）
+// Wait until the topic appears on the broker (auto topic creation is done synchronously in the send path, and applying the config takes a little time)
 bool waitForTopic(Env& env, const std::string& topic, int32_t& read, int32_t& write) {
     return waitUntil([&] { return queueNums(env, topic, read, write); }, 10000);
 }
 
-// 该 topic 全 broker 的落库条数（新 topic 的 minOffset 恒为 0）；读不到返回 -1
+// Total stored messages of the topic across all brokers (a new topic always has minOffset 0); -1 when unreadable
 int64_t totalMessages(Env& env, const std::string& topic) {
     try {
         const TopicStatsTable stats = env.admin.examineTopicStats(topic);
@@ -170,7 +170,7 @@ int64_t totalMessages(Env& env, const std::string& topic) {
     }
 }
 
-// 按场景配好并启动一个生产者
+// Configure and start one producer per scenario
 class ScopedProducer {
 public:
     ScopedProducer(Env& env, const std::string& kind, const std::string& createTopicKey = "",
@@ -202,33 +202,33 @@ private:
     DefaultMQProducer producer_;
 };
 
-// ---------------- H0/H1/H2/H3：队列数由 c 和 d 决定 ----------------
+// ---------------- H0/H1/H2/H3: the queue numbers are decided by c and d ----------------
 void checkQueueNums(Env& env) {
     int32_t tbwRead = 0;
     int32_t tbwWrite = 0;
     if (!queueNums(env, MixAll::DEFAULT_TOPIC, tbwRead, tbwWrite)) {
-        check("H0 TBW102 模板可读", false, "examineTopicConfig(TBW102) 读不到");
+        check("H0 TBW102 template readable", false, "cannot read examineTopicConfig(TBW102)");
         return;
     }
-    check("H0 TBW102 模板可读", tbwWrite > 0,
+    check("H0 TBW102 template readable", tbwWrite > 0,
           "read=" + num(tbwRead) + " write=" + num(tbwWrite));
 
-    // H1：什么都不设，d 走 MixAll::DEFAULT_TOPIC_QUEUE_NUMS(4)
+    // H1: set nothing, d falls back to MixAll::DEFAULT_TOPIC_QUEUE_NUMS(4)
     const std::string t1 = env.topic("Def");
     {
         ScopedProducer p(env, "h1");
         const SendResult r = p.send(t1, "h1");
-        check("H1 默认配置发送成功", r.sendStatus == SendStatus::SEND_OK,
+        check("H1 send succeeds with the default configuration", r.sendStatus == SendStatus::SEND_OK,
               "msgId=" + r.msgId + " broker=" + r.messageQueue.brokerName);
     }
     int32_t r1 = 0;
     int32_t w1 = 0;
     waitForTopic(env, t1, r1, w1);
     const int32_t expected1 = std::min(MixAll::DEFAULT_TOPIC_QUEUE_NUMS, tbwWrite);
-    check("H1 默认 d=4 建的 topic 队列数=min(4, TBW102)", w1 == expected1 && r1 == w1,
+    check("H1 default d=4 creates the topic with queue count=min(4, TBW102)", w1 == expected1 && r1 == w1,
           "read=" + num(r1) + " write=" + num(w1) + " (TBW102=" + num(tbwWrite) + ")");
 
-    // H2：d=2 必须把队列数带下去——修之前这里写死 4
+    // H2: d=2 must carry the queue number down; before the fix this was hard-coded to 4
     const std::string t2 = env.topic("Nums");
     {
         ScopedProducer p(env, "h2", "", 2);
@@ -237,25 +237,25 @@ void checkQueueNums(Env& env) {
     int32_t r2 = 0;
     int32_t w2 = 0;
     waitForTopic(env, t2, r2, w2);
-    check("H2 defaultTopicQueueNums=2 建的 topic 只有 2 条队列",
+    check("H2 a topic created with defaultTopicQueueNums=2 has only 2 queues",
           w2 == std::min(2, tbwWrite) && r2 == w2,
-          "read=" + num(r2) + " write=" + num(w2) + "（写死 4 的旧行为会是 " + num(w1) + "）");
+          "read=" + num(r2) + " write=" + num(w2) + " (the old hard-coded-4 behaviour would give " + num(w1) + ")");
 
-    // H3：c 指向自己的模板 topic（必须带 PERM_INHERIT，否则 TopicConfigManager:286 的
-    // isInherited 不通过，broker 直接拒绝自动建 topic）
+    // H3: c points at a self-made template topic (it must carry PERM_INHERIT, otherwise the
+    // isInherited check at TopicConfigManager:286 fails and the broker outright refuses the auto topic creation)
     const std::string src = env.topic("Src");
     try {
         env.admin.createTopicInBroker(env.brokerAddr, src, 3, 3,
                                       PermName::PERM_READ | PermName::PERM_WRITE |
                                           PermName::PERM_INHERIT);
     } catch (const std::exception& e) {
-        check("H3 模板 topic 创建", false, e.what());
+        check("H3 template topic creation", false, e.what());
         return;
     }
     int32_t srcRead = 0;
     int32_t srcWrite = 0;
     waitForTopic(env, src, srcRead, srcWrite);
-    check("H3 模板 topic 建好（3 条队列、带 INHERIT）",
+    check("H3 template topic ready (3 queues, with INHERIT)",
           srcWrite == 3 && !(srcRead == tbwRead && srcWrite == tbwWrite),
           "src=(" + num(srcRead) + "," + num(srcWrite) + ") tbw102=(" + num(tbwRead) + "," +
               num(tbwWrite) + ")");
@@ -268,12 +268,12 @@ void checkQueueNums(Env& env) {
     int32_t r3 = 0;
     int32_t w3 = 0;
     waitForTopic(env, t3, r3, w3);
-    check("H3 createTopicKey=模板 topic 时被继承（min(8,3)=3 而不是 TBW102 的 " +
-              num(tbwWrite) + "）",
+    check("H3 when createTopicKey is the template topic the value is inherited (min(8,3)=3, not TBW102's " +
+              num(tbwWrite) + ")",
           w3 == 3 && r3 == 3, "read=" + num(r3) + " write=" + num(w3));
 }
 
-// ---------------- H4：五种入口都照常落地 ----------------
+// ---------------- H4: all five send entries still land ----------------
 void checkSendEntries(Env& env) {
     const std::string t4 = env.topic("Entries");
     std::map<std::string, bool> landed;
@@ -284,7 +284,7 @@ void checkSendEntries(Env& env) {
         const SendResult rs = p.send(t4, "h4-sync");
         landed["sync"] = rs.sendStatus == SendStatus::SEND_OK;
 
-        // 定点发送：显式给 mq，落在另一条调用链上（broker 名由调用方给）
+        // pinned send: mq given explicitly, on a different call chain (the broker name comes from the caller)
         const MessageQueue mq = rs.messageQueue;
         const SendResult rb = (*p).send(Message(t4, bytesOf("h4-pinned")), mq, 5000);
         landed["pinned"] =
@@ -292,7 +292,7 @@ void checkSendEntries(Env& env) {
 
         try {
             (*p).sendOneway(Message(t4, bytesOf("h4-oneway")));
-            landed["oneway"] = true;  // 单向没有应答，只能靠 H4 的总数兜底
+            landed["oneway"] = true;  // oneway has no response; only the H4 total count can back it up
         } catch (const std::exception& e) {
             landed["oneway"] = false;
             std::printf("  [diag] oneway threw: %s\n", e.what());
@@ -311,17 +311,17 @@ void checkSendEntries(Env& env) {
     for (const char* entry : {"sync", "pinned", "oneway", "batch", "async"}) {
         auto it = landed.find(entry);
         const bool ok = it != landed.end() && it->second;
-        check(std::string("H4 ") + entry + " 入口发送成功", ok,
-              ok ? "" : "该入口没有拿到 SEND_OK");
+        check(std::string("H4 ") + entry + " entry send succeeded", ok,
+              ok ? "" : "this entry never got SEND_OK");
     }
-    // 1 同步 + 1 定点 + 1 单向 + 3 批量 + 1 异步 = 7 条
+    // 1 sync + 1 pinned + 1 oneway + 3 batch + 1 async = 7 messages
     const bool got = waitUntil([&] { return totalMessages(env, t4) >= 7; }, 20000);
     const int64_t total = totalMessages(env, t4);
-    check("H4 七条消息逐条落库（批量按子消息计）", got && total == 7,
+    check("H4 all seven messages stored one by one (the batch counts its sub-messages)", got && total == 7,
           "total=" + num64(total));
 }
 
-// ---------------- H5：落点 broker 名与路由一致 ----------------
+// ---------------- H5: the landed broker name matches the route ----------------
 void checkBrokerName(Env& env) {
     const std::string t5 = env.topic("BrokerName");
     SendResult r5;
@@ -329,9 +329,9 @@ void checkBrokerName(Env& env) {
         ScopedProducer p(env, "h5");
         r5 = p.send(t5, "h5");
     }
-    check("H5 落点 broker 名与路由一致（n 就是它）",
+    check("H5 the landed broker name matches the route (n is exactly it)",
           r5.sendStatus == SendStatus::SEND_OK && r5.messageQueue.brokerName == env.brokerName,
-          "落点=" + r5.messageQueue.brokerName + " 路由=" + env.brokerName);
+          "landed=" + r5.messageQueue.brokerName + " route=" + env.brokerName);
 }
 
 }  // namespace
@@ -351,7 +351,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 集群探活：拿 broker 地址，并反查它的 brokerName（H5 的判据）
+    // Cluster reachability probe: take the broker address and look up its brokerName (the H5 decision value)
     ClusterInfo cluster;
     for (int32_t i = 0; i < 40; ++i) {
         try {
@@ -364,23 +364,23 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     if (cluster.brokerAddrTable.empty()) {
-        check("集群探活", false, "nameServer 无 broker 注册");
+        check("cluster reachability probe", false, "no broker registered on the name server");
         env.cleanup();
         return 1;
     }
     const auto it = cluster.brokerAddrTable.begin();
     env.brokerName = it->first;
     env.brokerAddr = it->second.selectBrokerAddr();
-    check("集群探活", true, "broker=" + env.brokerAddr + " name=" + env.brokerName);
+    check("cluster reachability probe", true, "broker=" + env.brokerAddr + " name=" + env.brokerName);
 
-    std::printf("\n-- H0~H3: c/d 决定自动建 topic 的队列数 --\n");
+    std::printf("\n-- H0~H3: c/d decide the queue count of the auto-created topic --\n");
     checkQueueNums(env);
-    std::printf("\n-- H4: 五种发送入口逐条落地 --\n");
+    std::printf("\n-- H4: all five send entries land one by one --\n");
     checkSendEntries(env);
-    std::printf("\n-- H5: n 就是路由选中的那台 broker --\n");
+    std::printf("\n-- H5: n is exactly the broker the route picked --\n");
     checkBrokerName(env);
 
     env.cleanup();
-    std::printf("\n== 结果: %d/%d 通过 ==\n", gPass, gPass + gFail);
+    std::printf("\n== result: %d/%d passed ==\n", gPass, gPass + gFail);
     return gFail == 0 ? 0 : 1;
 }

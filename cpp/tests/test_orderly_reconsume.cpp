@@ -1,17 +1,17 @@
-// 顺序消费的重投闸门（checkReconsumeTimes / 回投）单测 —— 不需要集群。
+// Offline unit test for the orderly-consumption redelivery gate (checkReconsumeTimes / send-back) -- no cluster required.
 //
 //
-// 外加 DefaultMQProducerImpl.sendKernelImpl:1004-1018 的那次「抬进请求头」：broker 的
-// handleRetryAndDLQ（SendMessageProcessor:197-210）判死信读的是 requestHeader 的
-// reconsumeTimes / maxReconsumeTimes，不是报文属性。
+// Plus the "lift into the request header" step of DefaultMQProducerImpl.sendKernelImpl:1004-1018: the broker
+// handleRetryAndDLQ (SendMessageProcessor:197-210) reads reconsumeTimes / maxReconsumeTimes from the
+// requestHeader when judging a dead letter, not from the message properties.
 //
-// 为什么三处都要离线锁死：坏掉全是**静默**的。少 +1 永远到不了阈值；抬错字段 broker
-// 就退回订阅组默认的 16；回投成功后仍挂起，则一条毒消息永久占住那条队列 —— 真机上
-// 看起来跟「消费者挂了」一模一样。
+// Why all three places must be locked down offline: every breakage is **silent**. Without the +1 the threshold is never
+// reached; lifting the wrong field makes the broker fall back to the consumer group default of 16; and if the queue stays
+// suspended after a successful send-back, one poison message blocks that queue forever -- on a live cluster that looks
+// exactly like "the consumer died".
 //
-// ⚠ 离线只能锁「回投失败」那一支：未 start 的消费者拿不到内部生产者，
-// orderlySendMessageBack 必返 false。「回投成功 → 位点前进、队列不再被堵住」由真机
-// examples/live_redelivery.cpp 的 S12 证明。
+// ⚠ Offline can only lock the "send-back failed" branch: a consumer that never started has no internal producer, so
+// orderlySendMessageBack must return false. "send-back succeeded -> offset advances, queue no longer blocked" is proven on a live cluster by S12 of examples/live_redelivery.cpp.
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -75,7 +75,7 @@ public:
         return *this;
     }
 
-    // 在 context 上指定挂起时长（-1 = 没指定，回落到消费者配置）。
+    // Set the suspend duration on the context (-1 = not set, falls back to the consumer configuration).
     OrderlyListener& asking(int32_t ms) {
         suspendMs_ = ms;
         return *this;
@@ -94,13 +94,13 @@ private:
     std::optional<int32_t> suspendMs_;
 };
 
-// 不碰网络的顺序消费者：位点与待发缓冲手动搭好。
+// An orderly consumer that never touches the network: the offset and the pending buffer are wired up by hand.
 class Harness {
 public:
     explicit Harness(int32_t maxReconsumeTimes) : consumer_(kGroup), key_(
         DefaultMQPushConsumer::offsetKey(queue0())) {
         consumer_.setMaxReconsumeTimes(maxReconsumeTimes);
-        consumer_.setSuspendCurrentQueueTimeMillis(0);  // 单测不干等 1s
+        consumer_.setSuspendCurrentQueueTimeMillis(0);  // unit tests do not wait 1s
         consumer_.setPendingMessages(key_, {});
     }
 
@@ -110,7 +110,7 @@ public:
         return consumer_.consumeBatch(key_, queue0(), batch);
     }
 
-    /// 用指定 listener（可带 autoCommit / 挂起时长设定）跑一批。
+    /// Runs one batch with a given listener (which may set autoCommit / the suspend duration).
     bool runWith(const std::vector<MessageExt>& batch,
                  const std::shared_ptr<MessageListenerOrderly>& listener) {
         consumer_.setMessageListener(listener);
@@ -136,15 +136,15 @@ private:
     std::string key_;
 };
 
-// ------------------------------------------------ -1 的两套含义（顺序 vs 并发）
+// ------------------------------------------------ the two meanings of -1 (orderly vs concurrent)
 
 void testMinusOneMeansUnlimitedForOrderly() {
     DefaultMQPushConsumer c(kGroup);
     c.setMaxReconsumeTimes(-1);
     expect(c.orderlyMaxReconsumeTimes() == kIntMax, "orderly.minusOne.maxValue",
            std::to_string(c.orderlyMaxReconsumeTimes()));
-    // 并发回投兜底仍是 broker 默认的 16：两者并成一个常量就等于给顺序消费凭空造死信，
-    // 或让并发消息无限重投。
+    // The concurrent send-back fallback is still the broker default 16: merging the two into one constant would either invent dead letters
+    // for orderly consumption, or let concurrent messages redeliver forever.
     expect(c.maxReconsumeTimesOrDefault() == 16, "concurrent.minusOne.still16",
            std::to_string(c.maxReconsumeTimesOrDefault()));
     c.setMaxReconsumeTimes(3);
@@ -153,7 +153,7 @@ void testMinusOneMeansUnlimitedForOrderly() {
 }
 
 void testDefaultCapNeverJudgesExhausted() {
-    // 默认配置（-1）下毒消息不该被判定「用尽」：本地计数永远追不上 MAX_VALUE。
+    // Under the default configuration (-1) a poison message must never be judged "exhausted": the local counter can never catch up with MAX_VALUE.
     Harness h(-1);
     std::vector<MessageExt> batch;
     batch.push_back(ext(0, kIntMax - 1));
@@ -162,7 +162,7 @@ void testDefaultCapNeverJudgesExhausted() {
            std::to_string(batch[0].reconsumeTimes));
 }
 
-// ------------------------------------------------ checkReconsumeTimes 三条分支
+// ------------------------------------------------ the three branches of checkReconsumeTimes
 
 void testBelowCapCountsLocallyAndSuspends() {
     Harness h(3);
@@ -170,7 +170,7 @@ void testBelowCapCountsLocallyAndSuspends() {
     batch.push_back(ext(0, 0));
     batch.push_back(ext(1, 2));
     expect(h.c().checkOrderlyReconsumeTimes(batch), "belowCap.suspend");
-    // broker 侧没记这次失败，客户端不就地 +1 就永远到不了阈值
+    // The broker did not record this failure; without a local +1 the client never reaches the threshold
     expect(batch[0].reconsumeTimes == 1 && batch[1].reconsumeTimes == 3, "belowCap.countedUp",
            std::to_string(batch[0].reconsumeTimes) + "/" +
                std::to_string(batch[1].reconsumeTimes));
@@ -191,7 +191,7 @@ void testEmptyBatchDoesNotSuspend() {
     expect(!h.c().checkOrderlyReconsumeTimes(empty), "empty.noSuspend");
 }
 
-// ------------------------------------------------ 回投那条消息长什么样
+// ------------------------------------------------ what the sent-back message looks like
 
 void testRetryMessageFields() {
     Harness h(2);
@@ -213,7 +213,7 @@ void testRetryMessageFields() {
            m.getProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL));  // 3 + 2
     expect(m.getProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID) == poison.msgId,
            "retryMessage.originMsgId", m.getProperty(MessageConst::PROPERTY_ORIGIN_MESSAGE_ID));
-    // 半消息标记必须清掉，否则 broker 会把它再当回查消息处理
+    // The half-message flag must be cleared, otherwise the broker handles it as a check-back message again
     expect(m.getProperty(MessageConst::PROPERTY_TRANSACTION_PREPARED).empty(),
            "retryMessage.transactionCleared",
            m.getProperty(MessageConst::PROPERTY_TRANSACTION_PREPARED));
@@ -221,14 +221,14 @@ void testRetryMessageFields() {
            "retryMessage.hasUniqKey");
 }
 
-// ------------------------------------------------ 消费循环里的接线
+// ------------------------------------------------ wiring inside the consumption loop
 
 void testSuspendRequeuesBatchWhileBelowCap() {
     Harness h(3);
     std::vector<MessageExt> batch;
     batch.push_back(ext(0, 0));
     batch.push_back(ext(1, 1));
-    // 队尾还有下一条（offset 2），本批要按原顺序插到它前面
+    // The next message is still at the queue tail (offset 2), so this batch must be inserted before it in the original order
     MessageExt tail = ext(2, 0);
     h.c().setPendingMessages(DefaultMQPushConsumer::offsetKey(queue0()), {tail});
     expect(!h.run(batch), "wire.requeue.notAdvanced");
@@ -238,7 +238,7 @@ void testSuspendRequeuesBatchWhileBelowCap() {
 }
 
 void testSuccessPathSkipsTheReconsumeGate() {
-    // 阈值 0：一旦走到判据就会回投，所以这里断言「一次都没回投」= 判据没被调用。
+    // Threshold 0: once the gate is reached it sends back, so asserting "never sent back" here means the gate was never called.
     Harness h(0);
     std::vector<MessageExt> batch;
     batch.push_back(ext(0, 0));
@@ -248,7 +248,7 @@ void testSuccessPathSkipsTheReconsumeGate() {
     expect(h.pending().empty(), "wire.success.noRequeue", h.pendingShape());
 }
 
-// ------------------------------------------------ 挂起时长（context 优先 + 钳位）
+// ------------------------------------------------ suspend duration (context wins + clamping)
 
 void testOrderlySuspendMillisResolvesThenClamps() {
     Harness h(0);
@@ -274,7 +274,7 @@ void testOrderlySuspendMillisResolvesThenClamps() {
            std::to_string(h.c().orderlySuspendMillis(ctx)));
 }
 
-// ------------------------------------------------ autoCommit=true 的非法状态
+// ------------------------------------------------ the illegal states under autoCommit=true
 
 void testIllegalCommitAndRollbackUnderAutoCommitAreAcked() {
     for (ConsumeOrderlyStatus status :
@@ -290,7 +290,7 @@ void testIllegalCommitAndRollbackUnderAutoCommitAreAcked() {
     }
 }
 
-// ------------------------------------------------ autoCommit=false（手动提交）
+// ------------------------------------------------ autoCommit=false (manual commit)
 
 void testManualCommitAdvancesWithoutRequeueing() {
     Harness h(0);
@@ -338,7 +338,7 @@ void testManualSuspendNeverCommitsTheOffset() {
     expect(h.pendingShape() == "[0:1]", "manual.suspend.requeuedAndCounted", h.pendingShape());
 }
 
-// ------------------------------------------------ 309 CONSUME_MESSAGE_DIRECTLY 的映射
+// ------------------------------------------------ the 309 CONSUME_MESSAGE_DIRECTLY mapping
 
 void testDirectConsumeOrderlyMapping() {
     const std::pair<ConsumeOrderlyStatus, const char*> cases[] = {
@@ -366,9 +366,9 @@ void testDirectConsumeWithoutListenerIsReturnNull() {
     expect(r.consumeResult == "CR_RETURN_NULL", "direct.noListener.returnNull", r.consumeResult);
 }
 
-// ------------------------------------------------ 抬进请求头（sendKernelImpl:1004-1018）
+// ------------------------------------------------ lifting into the request header (sendKernelImpl:1004-1018)
 
-// 只用建头那一段：建请求不碰网络，抬字段的判据全在这一步的产物里。
+// Only the header-building part is used: building a request touches no network and the whole lifting criterion is in its output.
 std::shared_ptr<SendMessageRequestHeaderV2> buildHeader(MQClientInstance& inst,
                                                        const std::string& topic,
                                                        const PropertyMap& props,
@@ -380,8 +380,8 @@ std::shared_ptr<SendMessageRequestHeaderV2> buildHeader(MQClientInstance& inst,
     RemotingCommand request =
         inst.buildSendRequest("PG", m, MessageQueue(topic, kBroker, 0), /*sysFlag=*/0,
                              /*unitMode=*/false);
-    // createRequestCommand 只挂 customHeader，extFields 要到 encode 那一步才填；
-    // 这里显式展开，断言的才是线上真正的报文。
+    // createRequestCommand only attaches the customHeader; extFields are filled at the encode step;
+    // expanding it explicitly here is what makes the assertion cover the payload actually put on the wire.
     request.makeCustomHeaderToNet();
     if (wire != nullptr) {
         *wire = request.extFields;
@@ -396,12 +396,12 @@ void testRetryTopicPropertiesAreLiftedIntoTheHeader() {
     props[MessageConst::PROPERTY_MAX_RECONSUME_TIMES] = "6";
     PropertyMap wire;
     const auto header = buildHeader(inst, retryTopic(), props, &wire);
-    // broker 判死信看的是请求头；少了这一步它退回订阅组默认的 retryMaxTimes(16)
+    // The broker judges dead letters from the request header; without this step it falls back to the subscription group default retryMaxTimes(16)
     expect(header->reconsumeTimes && *header->reconsumeTimes == 4, "lift.reconsumeTimes",
            header->reconsumeTimes ? std::to_string(*header->reconsumeTimes) : "none");
     expect(header->maxReconsumeTimes && *header->maxReconsumeTimes == 6, "lift.maxReconsumeTimes",
            header->maxReconsumeTimes ? std::to_string(*header->maxReconsumeTimes) : "none");
-    // V2 的短字段名：j=reconsumeTimes、l=maxReconsumeTimes、i=properties
+    // Short field names of V2: j=reconsumeTimes, l=maxReconsumeTimes, i=properties
     expect(wire["j"] == "4", "lift.wireJ", wire["j"]);
     expect(wire["l"] == "6", "lift.wireL", wire["l"]);
     expect(wire["i"].find("RECONSUME_TIME") != std::string::npos, "lift.wireKeepsProperty",
@@ -418,10 +418,10 @@ void testOrdinaryTopicSendIsNotLifted() {
     expect(header->reconsumeTimes && *header->reconsumeTimes == 0, "noLift.reconsumeTimes",
            header->reconsumeTimes ? std::to_string(*header->reconsumeTimes) : "none");
     expect(wire["j"] == "0", "noLift.wireJ", wire["j"]);
-    // 非 %RETRY% 发送不下发 maxReconsumeTimes：broker ≥V3_4_9 无条件采信它，
-    // 固定发 0 会让首投就判定 reconsumeTimes(0) >= 0 直接进 %DLQ%。
-    // ⚠ 不能写成 expect(..., wire["l"])：MSVC 从右往左求值实参，operator[] 会先把
-    //    "l" 插进 map，缺席断言就永远假失败。find 只跑一次、先存后用。
+    // A non-%RETRY% send does not deliver maxReconsumeTimes: brokers >=V3_4_9 adopt it unconditionally,
+    // so always sending 0 would make the very first delivery satisfy reconsumeTimes(0) >= 0 and go straight into %DLQ%.
+    // ⚠ Do not write expect(..., wire["l"]): MSVC evaluates arguments right to left, so operator[] would first
+    //    insert "l" into the map and the absence assertion would fail forever. find runs once, value stored then used.
     auto it = wire.find("l");
     expect(it == wire.end(), "noLift.wireLAbsent", it == wire.end() ? "(absent)" : it->second);
 }

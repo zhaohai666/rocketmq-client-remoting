@@ -1,12 +1,12 @@
-// Request-Reply（5.x）客户端侧单测。
+// Request-Reply (5.x) client-side unit tests.
 //
-// 覆盖三层：
-// 1. 纯数据/等待槽逻辑（RequestResponseFuture / RequestFutureHolder / createReplyMessage）
-//    —— 不需要网络；
-// 2. 线上编码：ReplyMessageRequestHeader 往返；应答消息必须选 SEND_REPLY_MESSAGE_V2(325)
-//    而不是 SEND_MESSAGE_V2(310)，否则 broker 不会走 ReplyMessageProcessor；
-// 3. broker 回推入口 processReplyMessage(326) —— 必须把应答投进等待槽，并且**回一个响应**
-//    （broker 侧是 invokeSync，不回响应它那边会超时）。
+// Coverage spans three layers:
+// 1. Pure data / waiting-slot logic (RequestResponseFuture / RequestFutureHolder / createReplyMessage)
+//    -- no network needed;
+// 2. Wire encoding: ReplyMessageRequestHeader round trip; the reply must use SEND_REPLY_MESSAGE_V2(325)
+//    and not SEND_MESSAGE_V2(310), otherwise the broker never routes it through ReplyMessageProcessor;
+// 3. The broker push entry processReplyMessage(326) -- it must deliver the reply into the waiting slot and **send a response back**
+//    (the broker side uses invokeSync; without a response it times out there).
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -30,7 +30,7 @@ namespace {
 const char* kTopic = "RRUnitTopic";
 
 Message requestMsg() {
-    // 一条「broker 已投递给消费者」的请求消息（带 broker 写入的 CLUSTER）
+    // A request message already delivered to the consumer by the broker (with the CLUSTER written by the broker)
     Message m(kTopic, Bytes{'p', 'i', 'n', 'g'});
     m.putProperty(MessageConst::PROPERTY_CLUSTER, "DefaultCluster");
     m.putProperty(MessageConst::PROPERTY_CORRELATION_ID, "corr-1");
@@ -50,7 +50,7 @@ void expect(bool ok, const std::string& name) {
     }
 }
 
-// 按 broker ReplyMessageProcessor#pushReplyMessage 的字段造一条 326 请求
+// Build a 326 request following the fields of the broker's ReplyMessageProcessor#pushReplyMessage
 RemotingCommand pushReplyCommand(const std::string& correlationId, const Bytes& body) {
     auto h = std::make_shared<ReplyMessageRequestHeader>();
     h->producerGroup = "PG_RR";
@@ -73,7 +73,7 @@ RemotingCommand pushReplyCommand(const std::string& correlationId, const Bytes& 
     h->storeTimestamp = 1700000000001LL;
     RemotingCommand cmd =
         RemotingCommand::createRequestCommand(RequestCode::PUSH_REPLY_MESSAGE_TO_CLIENT, h);
-    // 真实链路上 extFields 由 decode() 从报文填好；这里直接放进去（等价于过了一遍网络）。
+    // On the real wire path extFields is filled by decode() from the packet; it is put in directly here (equivalent to one network trip).
     cmd.extFields = h->toExtFields();
     cmd.body = body;
     return cmd;
@@ -82,12 +82,12 @@ RemotingCommand pushReplyCommand(const std::string& correlationId, const Bytes& 
 }  // namespace
 
 int main() {
-    // ------------------------------------------------ 应答消息构造
+    // ------------------------------------------------ reply message construction
     {
         Message reply = createReplyMessage(requestMsg(), Bytes{'p', 'o', 'n', 'g'});
         expect(reply.topic == "DefaultCluster_REPLY_TOPIC", "reply topic is <cluster>_REPLY_TOPIC");
         expect(reply.body == (Bytes{'p', 'o', 'n', 'g'}), "reply body carried");
-        // 四个属性一个都不能少，且 CORRELATION_ID/REPLY_TO_CLIENT/TTL 原样带回
+        // None of the four properties may be missing, and CORRELATION_ID/REPLY_TO_CLIENT/TTL must be echoed unchanged
         expect(reply.getProperty(MessageConst::PROPERTY_MESSAGE_TYPE) == "reply",
                "reply MSG_TYPE=reply");
         expect(reply.getProperty(MessageConst::PROPERTY_CORRELATION_ID) == "corr-1",
@@ -135,11 +135,11 @@ int main() {
         expect(isReplyMessage(reply), "isReplyMessage true for reply");
         expect(!isReplyMessage(Message(kTopic, Bytes{'x'})), "isReplyMessage false for plain");
         Message upper(kTopic, Bytes{'x'});
-        upper.putProperty(MessageConst::PROPERTY_MESSAGE_TYPE, "Reply");  // 大小写敏感
+        upper.putProperty(MessageConst::PROPERTY_MESSAGE_TYPE, "Reply");  // case sensitive
         expect(!isReplyMessage(upper), "isReplyMessage is case sensitive");
     }
     {
-        // 别把 Request-Reply 的 <cluster>_REPLY_TOPIC 与老的前缀 %REPLY% 搞混
+        // Do not confuse the Request-Reply <cluster>_REPLY_TOPIC with the legacy %REPLY% prefix
         expect(std::string(MixAll::REPLY_TOPIC_POSTFIX) == "REPLY_TOPIC",
                "REPLY_TOPIC_POSTFIX constant");
         expect(std::string(MixAll::REPLY_MESSAGE_FLAG) == "reply", "REPLY_MESSAGE_FLAG constant");
@@ -159,7 +159,7 @@ int main() {
         expect(ids.size() == 50 && allUuidShape, "createCorrelationId: 50 unique uuids");
     }
 
-    // ------------------------------------------------ 等待槽
+    // ------------------------------------------------ waiting slots
     {
         RequestResponseFuture f("c1", 20);
         expect(!f.waitResponseMessage(200), "wait times out returns false");
@@ -200,14 +200,14 @@ int main() {
         expect(holder.removeRequest("ut-c2") == nullptr, "remove is idempotent");
     }
 
-    // ------------------------------------------------ 异常类型
+    // ------------------------------------------------ exception types
     {
         RequestTimeoutException e("timeout");
         MQClientException* base = &e;
         expect(base != nullptr, "RequestTimeoutException extends MQClientException");
     }
 
-    // ------------------------------------------------ header 往返
+    // ------------------------------------------------ header round trip
     {
         RemotingCommand cmd = pushReplyCommand("corr-rt", Bytes{'b'});
         ReplyMessageRequestHeader back;
@@ -218,16 +218,16 @@ int main() {
         expect(back.storeTimestamp.value_or(0) == 1700000000001LL, "header roundtrip storeTimestamp");
     }
 
-    // ------------------------------------------------ 326 回推入口
+    // ------------------------------------------------ 326 push entry
     {
         auto future = std::make_shared<RequestResponseFuture>("corr-326", 5000);
         RequestFutureHolder::getInstance().putRequest("corr-326", future);
         RemotingCommand cmd = pushReplyCommand("corr-326", Bytes{'p', 'o', 'n', 'g'});
         std::optional<RemotingCommand> resp = processReplyMessage(cmd, "127.0.0.1:10911");
-        // 必须回响应：broker 的 Broker2Client.callClient 是 invokeSync(10s)
+        // Must respond: the broker's Broker2Client.callClient uses invokeSync(10s)
         expect(resp.has_value() && resp->code == ResponseCode::SUCCESS,
                "326 handler responds SUCCESS");
-        // 应答被投进等待槽，body 与属性都在
+        // The reply is delivered into the waiting slot with both body and properties present
         expect(future->waitResponseMessage(1000), "326 handler delivers to waiting future");
         MessageExt got = future->responseMessage();
         expect(got.body == (Bytes{'p', 'o', 'n', 'g'}), "reply body delivered");
@@ -239,14 +239,14 @@ int main() {
         RequestFutureHolder::getInstance().removeRequest("corr-326");
     }
     {
-        // 迟到/重复的应答：查不到等待槽只记 warn，仍然要回 SUCCESS
+        // Late/duplicate replies: with no matching waiting slot only a warn is logged, the response must still be SUCCESS
         RemotingCommand cmd = pushReplyCommand("no-such-id", Bytes{'l'});
         std::optional<RemotingCommand> resp = processReplyMessage(cmd, "127.0.0.1:10911");
         expect(resp.has_value() && resp->code == ResponseCode::SUCCESS,
                "unknown correlation still responds SUCCESS");
     }
     {
-        // properties 是非法格式 → 解析抛错 → 必须回 SYSTEM_ERROR 而不是让读线程崩掉
+        // Malformed properties => parsing throws => must respond SYSTEM_ERROR instead of letting the read thread crash
         RemotingCommand cmd = RemotingCommand::createRequestCommand(
             RequestCode::PUSH_REPLY_MESSAGE_TO_CLIENT, nullptr);
         cmd.extFields["properties"] = std::string("\x00\xff broken");

@@ -1,8 +1,8 @@
-// 拉模式消费者的**平衡视图**（fetchMessageQueuesInBalance）离线单测 —— 不需要集群。
+// Offline unit test for the **balance view** (fetchMessageQueuesInBalance) of the pull consumer -- no cluster required.
 //
 //
-// 判据取自**线上报文**：假端点记下 38（GET_CONSUMER_LIST_BY_GROUP）的应答内容与
-// 11（PULL_MESSAGE）的到达，不靠调用方自说自话。
+// Criteria are taken from the **wire traffic**: the fake endpoint records the reply content of 38 (GET_CONSUMER_LIST_BY_GROUP)
+// and the arrival of 11 (PULL_MESSAGE), instead of trusting what the caller claims.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -59,7 +59,7 @@ void expectInt(long long actual, long long expected, const std::string& name,
     }
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -110,10 +110,10 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// ---------------------------------------------------------------- 假端点
+// ---------------------------------------------------------------- fake endpoint
 
-// 一台同时扮演 name server（回路由）与 broker（回 38 / 11）的假端点。
-// 平衡视图只需要「一份路由 + 一份消费者列表」，收件人是谁无所谓，故合成一台。
+// One fake endpoint playing both the name server (answers routes) and the broker (answers 38 / 11).
+// The balance view only needs "one route + one consumer list"; who the recipient is does not matter, so they are merged into one.
 class MockEndpoint {
 public:
     MockEndpoint() {
@@ -162,14 +162,14 @@ public:
         routes_[topic] = route.encode();
     }
 
-    /// 设定 38 的应答内容：本组有哪些 clientId。空列表 = 「broker 不认识这个组」，
-    /// 真实 broker 对没注册过的组也是这么回（不是报错）。
+    /// Sets the reply content of 38: which clientIds this group has. An empty list = "the broker does not know this group";
+    /// a real broker replies the same way for a group that never registered (it is not an error).
     void setCidList(const std::vector<std::string>& cids) {
         std::lock_guard<std::mutex> lk(state_);
         cidList_ = cids;
     }
 
-    /// 收到的 PULL_MESSAGE 队列（topic@queueId），按到达顺序。
+    /// The PULL_MESSAGE queues received (topic@queueId), in arrival order.
     std::vector<std::string> pulledQueues() {
         std::lock_guard<std::mutex> lk(state_);
         return pulled_;
@@ -233,8 +233,8 @@ private:
                     std::lock_guard<std::mutex> lk(state_);
                     pulled_.push_back(topic + "@" + queueId);
                 }
-                // 空 broker 的忠实形态：PULL_NOT_FOUND 并把 nextBeginOffset 回填成请求位点，
-                // 免得客户端把游标推到 0（本用例只关心拉取被记进了本地分配表）。
+                // The faithful shape of an empty broker: PULL_NOT_FOUND with nextBeginOffset echoed back as the requested offset,
+                // so the client does not advance its cursor to 0 (this case only cares that the pull landed in the local allocation table).
                 resp.code = ResponseCode::PULL_NOT_FOUND;
                 resp.extFields["nextBeginOffset"] = "0";
                 resp.extFields["minOffset"] = "0";
@@ -262,7 +262,7 @@ private:
     std::thread acceptor_;
 };
 
-// ---------------------------------------------------------------- 脚手架
+// ---------------------------------------------------------------- scaffolding
 
 const char* kGroup = "PG_BalUnit";
 const char* kTopic = "BalViewTopic";
@@ -275,7 +275,7 @@ public:
                              const std::vector<MessageQueue>&) override {}
 };
 
-/// 队列清单的可读形态，失败时能一眼看出差在哪。
+/// Readable form of the queue list so a failure shows at a glance where it differs.
 std::string describe(const std::vector<MessageQueue>& mqs) {
     std::string s;
     for (const MessageQueue& mq : mqs) {
@@ -285,8 +285,8 @@ std::string describe(const std::vector<MessageQueue>& mqs) {
     return s;
 }
 
-/// `n` 个读队列的那一台 broker（1 个队列时「自己那一份」与「全部」同形，
-/// 什么也证明不了，所以默认 4 个）。
+/// `n` read queues on that one broker (with 1 queue "own share" and "all" have the same shape and
+/// prove nothing, hence the default of 4).
 TopicRouteData routeN(int32_t n, const std::string& broker, const std::string& addr) {
     TopicRouteData route;
     std::map<int64_t, std::string> addrs;
@@ -296,8 +296,8 @@ TopicRouteData routeN(int32_t n, const std::string& broker, const std::string& a
     return route;
 }
 
-/// 起一个指向假端点的拉模式消费者。实例名必须每个用例唯一（同 clientId 会共享实例）。
-/// DefaultMQPullConsumer 不可拷贝，故返回堆上的那一个。
+/// Starts a pull consumer pointing at the fake endpoint. The instance name must be unique per case (the same clientId shares an instance).
+/// DefaultMQPullConsumer is not copyable, so the one on the heap is returned.
 std::unique_ptr<DefaultMQPullConsumer> started(const std::string& instance,
                                                const std::string& group, MockEndpoint& ep,
                                                const std::string& topic,
@@ -319,7 +319,7 @@ std::vector<std::string> sortedCids(const std::vector<std::string>& in) {
     return out;
 }
 
-// ---------------------------------------------------------------- 1. 单实例认领全部
+// ---------------------------------------------------------------- 1. a sole instance claims everything
 
 void testSoleInstanceTakesEveryQueue() {
     MockEndpoint ep;
@@ -329,22 +329,22 @@ void testSoleInstanceTakesEveryQueue() {
     ep.setCidList({cid});
 
     const std::vector<MessageQueue> view = c->fetchMessageQueuesInBalance(kTopic);
-    expectInt(static_cast<long long>(view.size()), kQueues, "单实例认领全部 4 个队列");
+    expectInt(static_cast<long long>(view.size()), kQueues, "a sole instance takes all 4 queues");
     std::vector<int32_t> ids;
     for (const MessageQueue& mq : view) ids.push_back(mq.queueId);
-    expect(ids == std::vector<int32_t>({0, 1, 2, 3}), "队列按 queueId 升序", describe(view));
+    expect(ids == std::vector<int32_t>({0, 1, 2, 3}), "queues ordered by ascending queueId", describe(view));
     bool sameIdentity = true;
     for (const MessageQueue& mq : view) {
         if (mq.topic != kTopic || mq.brokerName != kBrokerKey) sameIdentity = false;
     }
-    expect(sameIdentity, "队列身份未被改写（topic/brokerName 原样）", describe(view));
+    expect(sameIdentity, "queue identity untouched (topic/brokerName verbatim)", describe(view));
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 2. 只拿自己那一份
+// ---------------------------------------------------------------- 2. only its own share
 
-/// `PullConsumer` 的示例用法之所以成立，全靠「每个实例只拿到自己那一份」。
-/// 两个真实例互相对拍：各 2 个、不重叠、合起来覆盖 4 个。
+/// The worked example of `PullConsumer` only holds because "each instance receives only its own share".
+/// Two real instances against each other: 2 queues each, no overlap, together covering all 4.
 void testTwoInstancesSplitTheQueuesWithoutOverlap() {
     MockEndpoint ep;
     ep.addRoute(kTopic, routeN(kQueues, kBrokerKey, ep.address()));
@@ -354,26 +354,26 @@ void testTwoInstancesSplitTheQueuesWithoutOverlap() {
 
     const std::vector<MessageQueue> va = a->fetchMessageQueuesInBalance(kTopic);
     const std::vector<MessageQueue> vb = b->fetchMessageQueuesInBalance(kTopic);
-    expectInt(static_cast<long long>(va.size()), 2, "两个实例分 4 个队列：每个只拿 2 个");
-    expectInt(static_cast<long long>(vb.size()), 2, "另一个也是 2 个");
+    expectInt(static_cast<long long>(va.size()), 2, "two instances split 4 queues: each takes only 2");
+    expectInt(static_cast<long long>(vb.size()), 2, "the other one also takes 2");
     std::vector<MessageQueue> both = va;
     both.insert(both.end(), vb.begin(), vb.end());
     std::sort(both.begin(), both.end());
     std::vector<MessageQueue> dedup = both;
     dedup.erase(std::unique(dedup.begin(), dedup.end()), dedup.end());
-    expectInt(static_cast<long long>(dedup.size()), 4, "两份不重叠（重叠即重复消费）",
+    expectInt(static_cast<long long>(dedup.size()), 4, "the two shares do not overlap (overlap means duplicate consumption)",
               describe(both));
     std::vector<int32_t> ids;
     for (const MessageQueue& mq : dedup) ids.push_back(mq.queueId);
-    expect(ids == std::vector<int32_t>({0, 1, 2, 3}), "两份合起来覆盖全部队列", describe(dedup));
+    expect(ids == std::vector<int32_t>({0, 1, 2, 3}), "the two shares together cover every queue", describe(dedup));
     a->shutdown();
     b->shutdown();
 }
 
-// ---------------------------------------------------------------- 3. 算不动 → 保持现有分配
+// ---------------------------------------------------------------- 3. cannot compute -> keep the current assignment
 
-/// broker 不认识本组（38 回空列表）= **算不动**，不是「算出来是空」：此时保持现有分配
-/// （本地拉过的那些队列），绝不回退成独占全部队列。
+/// The broker does not know this group (38 answers an empty list) = **cannot compute**, not "computed to empty":
+/// the current assignment (the queues pulled locally) is kept, never falling back to claiming all queues.
 void testUnknownGroupKeepsCurrentAssignmentInsteadOfTakingAll() {
     MockEndpoint ep;
     ep.addRoute(kTopic, routeN(kQueues, kBrokerKey, ep.address()));
@@ -381,27 +381,27 @@ void testUnknownGroupKeepsCurrentAssignmentInsteadOfTakingAll() {
     ep.setCidList({});
 
     expect(c->fetchMessageQueuesInBalance(kTopic).empty(),
-           "还没拉过任何队列：现有分配就是空（不是全部 4 个）");
+           "nothing pulled yet: the current assignment is empty (not all 4)");
 
     std::vector<MessageQueue> all = c->fetchSubscribeMessageQueues(kTopic);
-    expectInt(static_cast<long long>(all.size()), kQueues, "订阅信息可查（路由里的 4 个队列）");
+    expectInt(static_cast<long long>(all.size()), kQueues, "subscription info is queryable (the 4 queues in the route)");
     std::sort(all.begin(), all.end());
     const PullResult result = c->pull(all[2], "*", 0, 32);
     (void)result;
     const std::vector<MessageQueue> view = c->fetchMessageQueuesInBalance(kTopic);
-    expectInt(static_cast<long long>(view.size()), 1, "兜底只认领自己拉过的那一个");
+    expectInt(static_cast<long long>(view.size()), 1, "the fallback only claims the one queue it pulled");
     if (view.size() == 1) {
-        expect(view[0] == all[2], "兜底返回的就是拉过的那个队列", describe(view));
+        expect(view[0] == all[2], "the fallback returns exactly the queue that was pulled", describe(view));
     }
-    expect(ep.pulledQueues().size() == 1, "线上报文：确实发过一笔 PULL_MESSAGE");
+    expect(ep.pulledQueues().size() == 1, "wire traffic: one PULL_MESSAGE was actually sent");
 
-    // 兜底同样按 topic 收口：没有路由的另一个 topic 既不抛也不漏给它 T 的队列。
+    // The fallback is also scoped per topic: another topic without a route neither throws nor leaks its queues to T.
     expect(c->fetchMessageQueuesInBalance("NoSuchBalTopic").empty(),
-           "查不到路由时退回本 topic 的现有分配，别的 topic 得空表");
+           "with no route it falls back to this topic's current assignment; other topics get an empty list");
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 4. 广播不看消费者列表
+// ---------------------------------------------------------------- 4. broadcasting ignores the consumer list
 
 void testBroadcastingTakesAllWithoutTheConsumerList() {
     MockEndpoint ep;
@@ -410,12 +410,12 @@ void testBroadcastingTakesAllWithoutTheConsumerList() {
     ep.setCidList({"someone-else"});
 
     const std::vector<MessageQueue> view = c->fetchMessageQueuesInBalance(kTopic);
-    expectInt(static_cast<long long>(view.size()), kQueues, "广播不看消费者列表：全量认领",
+    expectInt(static_cast<long long>(view.size()), kQueues, "broadcasting ignores the consumer list: claims all",
               describe(view));
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 5. 未启动直接抛
+// ---------------------------------------------------------------- 5. not started throws immediately
 
 void testRequiresAStartedConsumer() {
     DefaultMQPullConsumer c("PG_BalNotStarted");
@@ -425,10 +425,10 @@ void testRequiresAStartedConsumer() {
     } catch (const MQClientException& e) {
         threw = std::string(e.what()).find("not started") != std::string::npos;
     }
-    expect(threw, "未启动必须抛 MQClientException（isRunning() 守卫）");
+    expect(threw, "not started must throw MQClientException (isRunning() guard)");
 }
 
-// ---------------------------------------------------------------- 6. 命名空间：返回裸 topic
+// ---------------------------------------------------------------- 6. namespace: returns bare topics
 
 void testNamespacedInstanceReturnsBareTopics() {
     const std::string ns = "MQ_INST_bal";
@@ -442,12 +442,12 @@ void testNamespacedInstanceReturnsBareTopics() {
 
     const std::vector<MessageQueue> view = c->fetchMessageQueuesInBalance(plain);
     expectInt(static_cast<long long>(view.size()), kQueues,
-              "带命名空间照样算得出（路由查询用的是 ns%topic）", describe(view));
+              "still computable with a namespace (route lookup uses ns%topic)", describe(view));
     bool allBare = true;
     for (const MessageQueue& mq : view) {
         if (mq.topic != plain) allBare = false;
     }
-    expect(allBare, "返回的队列已剥掉命名空间（每个实例只拿自己那一份）",
+    expect(allBare, "returned queues have the namespace stripped (each instance takes only its own share)",
           describe(view));
     c->shutdown();
 }

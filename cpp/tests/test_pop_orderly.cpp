@@ -1,11 +1,11 @@
-// 覆盖 POP 顺序监听的语义：
-//   - submitPopConsumeRequest:161-166 —— 分派进顺序骨架，listener 不被调、不 ack
-//     （pq 的 waitAckCount 不动 = 积压只增不减，交给流控把 pop 循环压停）
-//   - submitConsumeRequest:178-191 —— 去重集按 (pq 引用, mq) 判等：同队列重复提交
-//     只入队一次；rebalance 换了**新** PopProcessQueue（指针身份不同）后照常入队
-//   - ConsumeRequest.run:315-324 —— pq 被撤销才摘请求；活队列上是 no-op
-//   - 并发分支不受分流影响（回归护栏：改坏分流 = 要么顺序消息被消费、要么并发的
-//     POP 消息静默消失）
+// Covers the semantics of POP orderly listening:
+//   - submitPopConsumeRequest:161-166 -- dispatch into the orderly skeleton; the listener is not invoked and no ack happens
+//     (pq's waitAckCount does not move = the backlog only grows; flow control is left to stall the pop loop)
+//   - submitConsumeRequest:178-191 -- the dedup set compares (pq reference, mq): repeated submits of the same queue
+//     enqueue only once; after rebalance installs a **new** PopProcessQueue (different pointer identity) it enqueues as usual
+//   - ConsumeRequest.run:315-324 -- the request is removed only when pq is revoked; on a live queue it is a no-op
+//   - the concurrent branch must stay unaffected by the split (regression guard: breaking the split means either orderly
+//     messages get consumed by the wrong path or concurrent POP messages silently vanish)
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -50,8 +50,8 @@ MessageExt ext(int64_t queueOffset) {
     return m;
 }
 
-/// 带上"刚弹出"的 POP_CK：consumePopBatch 的 isPopTimeout 判据靠它，
-/// 没有它并发分支会直接按超时丢弃（listener 不被调）。
+/// POP_CK of a "freshly popped" message: consumePopBatch's isPopTimeout check relies on it;
+/// without it the concurrent branch discards the batch as timed out (the listener is never called).
 void stampFreshPopCk(MessageExt& m) {
     m.putProperty(MessageConst::PROPERTY_POP_CK,
                   extra_info::buildExtraInfo(/*ckQueueOffset=*/m.queueOffset,
@@ -85,25 +85,25 @@ public:
 
 std::vector<MessageExt> batch2() { return {ext(0), ext(1)}; }
 
-// ------------------------------------------------ 分派：顺序进骨架，不调 listener
+// ------------------------------------------------ dispatch: orderly enters the skeleton, listener not invoked
 
 void testOrderlyDispatchNeverInvokesListener() {
     DefaultMQPushConsumer c(kGroup);
     int calls = 0;
     c.setMessageListener(std::make_shared<CountingOrderlyListener>(&calls));
     auto pq = std::make_shared<PopProcessQueue>();
-    // queuePopLoop 在分派前已 incFoundMsg：积压先涨上去
+    // queuePopLoop already incFoundMsg before dispatch: the backlog goes up first
     pq->incFoundMsg(2);
     c.submitPopConsumeRequest(batch2(), pq, queue0());
     expect(calls == 0, "dispatch.orderly.listenerNotCalled", std::to_string(calls));
-    // 不 ack、不延长：积压原样留在 pq 上（broker 侧等 invisibleTime 到期复活重投）
+    // no ack and no renewal: the backlog stays on pq (the broker side waits for invisibleTime to expire, then revives and redelivers)
     expect(pq->waitAckCount() == 2, "dispatch.orderly.neverAcked",
            std::to_string(pq->waitAckCount()));
     expect(c.popOrderlyRequestCount() == 1, "dispatch.orderly.requestKept",
            std::to_string(c.popOrderlyRequestCount()));
 }
 
-// ------------------------------------------------ 分流：并发分支照常消费（回归护栏）
+// ------------------------------------------------ split: the concurrent branch still consumes normally (regression guard)
 
 void testConcurrentDispatchStillConsumes() {
     DefaultMQPushConsumer c(kGroup);
@@ -115,29 +115,29 @@ void testConcurrentDispatchStillConsumes() {
     stampFreshPopCk(msgs[0]);
     c.submitPopConsumeRequest(msgs, pq, queue0());
     expect(calls == 1, "dispatch.concurrent.listenerCalled", std::to_string(calls));
-    // CONSUME_SUCCESS 整批 ack：waitAckCount 回到 0（ackPopMsg 在未 start 时发不出去，
-    // 但 pq->ack() 照走 —— 真机上 ack 由 broker 承认，这里只锁 pq 计数这一半）
+    // CONSUME_SUCCESS acks the whole batch: waitAckCount returns to 0 (ackPopMsg cannot go out while not started,
+    // but pq->ack() still runs -- on a real machine the ack is confirmed by the broker; this locks the pq counter half only)
     expect(pq->waitAckCount() == 0, "dispatch.concurrent.acked",
            std::to_string(pq->waitAckCount()));
 }
 
-// ------------------------------------------------ 去重集的判等（pq 引用 + mq）
+// ------------------------------------------------ dedup equality (pq reference + mq)
 
 void testRequestDedup() {
     DefaultMQPushConsumer c(kGroup);
     int calls = 0;
     c.setMessageListener(std::make_shared<CountingOrderlyListener>(&calls));
     auto pq = std::make_shared<PopProcessQueue>();
-    // 同 (pq, mq) 重复提交：ConcurrentSet.add 返回 false，不重复入队
+    // Repeated submit with the same (pq, mq): ConcurrentSet.add returns false, no duplicate enqueue
     c.submitPopOrderlyRequest(pq, queue0(), /*force=*/false);
     c.submitPopOrderlyRequest(pq, queue0(), /*force=*/false);
     expect(c.popOrderlyRequestCount() == 1, "dedup.samePqSameMq.once",
            std::to_string(c.popOrderlyRequestCount()));
-    // mq 不同 → 新请求
+    // different mq => a new request
     c.submitPopOrderlyRequest(pq, MessageQueue(kTopic, kBroker, 1), false);
     expect(c.popOrderlyRequestCount() == 2, "dedup.differentMq.counted",
            std::to_string(c.popOrderlyRequestCount()));
-    // 同 mq 但**新** PopProcessQueue（rebalance 撤走再分回来）→ 新请求
+    // same mq but a **new** PopProcessQueue (rebalance revoked it and handed it back) => a new request
     auto fresh = std::make_shared<PopProcessQueue>();
     c.submitPopOrderlyRequest(fresh, queue0(), false);
     expect(c.popOrderlyRequestCount() == 3, "dedup.newPq.counted",
@@ -147,7 +147,7 @@ void testRequestDedup() {
            std::to_string(c.popOrderlyRequestCount()));
 }
 
-// ------------------------------------------------ 摘请求：只在 pq 被撤销时
+// ------------------------------------------------ request removal: only when the pq is revoked
 
 void testDroppedRequestIsRemoved() {
     DefaultMQPushConsumer c(kGroup);
@@ -157,19 +157,19 @@ void testDroppedRequestIsRemoved() {
     c.submitPopOrderlyRequest(pq, queue0(), false);
     expect(c.popOrderlyRequestCount() == 1, "dropped.primed",
            std::to_string(c.popOrderlyRequestCount()));
-    // rebalance 撤走 → pq 标 dropped → 请求跑到 dropped 分支：摘掉自己 + 不调 listener
+    // rebalance revokes -> pq marked dropped -> the request hits the dropped branch: erase itself + do not invoke the listener
     pq->setDropped(true);
     c.runPopOrderlyRequest(pq, queue0());
     expect(c.popOrderlyRequestCount() == 0, "dropped.removed",
            std::to_string(c.popOrderlyRequestCount()));
     expect(calls == 0, "dropped.listenerStillNotCalled", std::to_string(calls));
-    // 撤销队列的 submit 路径同样自摘（run 在 dropped 分支返回前擦除）
+    // the submit path on a revoked queue erases itself the same way (run clears the entry before returning from the dropped branch)
     c.submitPopOrderlyRequest(pq, queue0(), false);
     expect(c.popOrderlyRequestCount() == 0, "dropped.submitAlsoCleans",
            std::to_string(c.popOrderlyRequestCount()));
 }
 
-// ------------------------------------------------ 活队列上的 run 是 no-op
+// ------------------------------------------------ run on a live queue is a no-op
 
 void testRunOnLiveQueueIsANoOp() {
     DefaultMQPushConsumer c(kGroup);

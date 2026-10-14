@@ -1,9 +1,9 @@
-// 客户端日志单测：行格式（毫秒 + pid + 线程名 + 文件:行号）、按大小轮转与备份数上限、
-// 级别过滤、以及"关闭文件输出后不再写盘"。
+// Client logging unit test: line format (millisecond + pid + thread name + file:line), rotation
+// by size with a backup-index cap, level filtering, and "no disk write once file output is off".
 //
 //
-// ⚠ 本文件的日志行会同时打到 stderr（logging.h 的设计：stderr + 文件双写），
-//   所以 ctest 输出里出现一堆日志行是**正常的**，不是失败。
+// ⚠ Log lines from this file also reach stderr (logging.h writes to stderr and the file at once),
+//   so a pile of log lines in the ctest output is **normal**, not a failure.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,8 +37,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// 轮转参数必须**极小**，否则测试要写 64MB 才能触发一次轮转。
-// 这两个值在 logging.h 里是"首次使用即缓存"，因此必须在任何日志调用之前 setenv。
+// The rotation parameters must stay **tiny**, or the test would have to write 64MB to rotate once.
+// logging.h caches both values on first use, so setenv has to run before any logging call.
 constexpr std::uintmax_t kTestMaxSize = 1200;
 constexpr int kTestMaxIndex = 3;
 constexpr std::uintmax_t kMaxSizeEnv = 1200;
@@ -88,7 +88,7 @@ std::uintmax_t envUmax(const char* name) {
     return static_cast<std::uintmax_t>(std::strtoull(v, nullptr, 10));
 }
 
-// ::setenv 是 POSIX 专有，MSVC 下不存在（只有 _putenv_s），Windows 原生构建会直接编译失败。
+// ::setenv is POSIX-only and does not exist on MSVC (only _putenv_s), so a native Windows build fails to compile.
 void setEnvVar(const char* name, const char* value) {
 #if defined(_WIN32)
     _putenv_s(name, value);
@@ -100,12 +100,12 @@ void setEnvVar(const char* name, const char* value) {
 }  // namespace
 
 int main() {
-    // ---- 必须在第一次日志调用之前设置：logging.h 的静态缓存取首次读到的环境变量 ----
+    // ---- Must run before the first logging call: logging.h's static cache keeps the first env read ----
     setEnvVar("ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE", "1200");
     setEnvVar("ROCKETMQ_CLIENT_LOG_FILE_MAX_INDEX", "3");
     setEnvVar("ROCKETMQ_CLIENT_LOG_LEVEL", "INFO");
 
-    // 环境变量确实被解析到了（而不是静默回落默认值 64MB/10）
+    // The environment variables really were parsed (not a silent fall back to the 64MB/10 defaults)
     CHECK(logFileMaxSize() == kTestMaxSize, "env max size honored");
     CHECK(logFileMaxIndex() == kTestMaxIndex, "env max index honored");
     CHECK(envUmax("ROCKETMQ_CLIENT_LOG_FILE_MAX_SIZE") == kTestMaxSize, "env raw value");
@@ -125,15 +125,15 @@ int main() {
     const std::string before = currentThreadName();
     setThreadName("ConsumeMessageThread_0");
     CHECK(currentThreadName() == "ConsumeMessageThread_0", "setThreadName updates log name");
-    // 改名是**线程局部**的：另起线程不应继承
+    // Renaming is **thread-local**: another thread must not inherit it
     std::string otherThreadName;
     std::thread t([&otherThreadName]() { otherThreadName = currentThreadName(); });
     t.join();
     CHECK(otherThreadName != "ConsumeMessageThread_0", "thread name is thread-local");
     CHECK(otherThreadName != std::string("main"), "worker thread is not main");
-    setThreadName("ConsumeMessageThread_0");  // 恢复，供下面的格式断言使用
+    setThreadName("ConsumeMessageThread_0");  // restore it for the format assertions below
 
-    // ---------------------------------------------------------------- 行格式
+    // ---------------------------------------------------------------- line format
     const int expectedLine = __LINE__ + 1;
     logger_info("format-check " + before);
     const std::string body = readAll(logPath);
@@ -157,7 +157,7 @@ int main() {
     CHECK(logBaseName("plain.cpp") == std::string("plain.cpp"), "logBaseName keeps bare name");
     CHECK(logBaseName(nullptr) == std::string("?"), "logBaseName handles null");
 
-    // ---------------------------------------------------------------- 级别过滤
+    // ---------------------------------------------------------------- level filtering
     const std::uintmax_t afterOne = sizeOf(logPath);
     setLogLevel(LOG_ERROR);
     logger_info("should-be-suppressed");
@@ -170,12 +170,12 @@ int main() {
     CHECK(afterErr.find("ERROR [") != std::string::npos, "ERROR level name formatted");
     setLogLevel(LOG_INFO);
 
-    // ---------------------------------------------------------------- 轮转
+    // ---------------------------------------------------------------- rotation
     const std::uintmax_t baseBefore = sizeOf(logPath);
     CHECK(baseBefore > 0, "base log non-empty before rotation");
     CHECK(!fs::exists(logPath + ".1"), "no backup before rotation");
 
-    // 每行约 280 字节，需 ~5 行触发一次；写 60 行足以滚满 maxIndex=3
+    // Roughly 280 bytes per line, so ~5 lines trigger one rotation; 60 lines fill maxIndex=3
     const std::string filler = linePayload(200);
     for (int i = 0; i < 60; ++i) {
         logger_warn("rotate-" + std::to_string(i) + " " + filler);
@@ -190,7 +190,7 @@ int main() {
     CHECK(baseAfter > 0, "base log still being written after rotation");
     CHECK(baseAfter <= kMaxSizeEnv, "base log size capped by maxFileSize");
 
-    // 备份里应是**较早**的行：.3 最旧、.1 最新（FixedWindow 语义）
+    // Backups must hold the **older** lines: .3 is the oldest, .1 the newest (FixedWindow semantics)
     const std::string b1 = readAll(logPath + ".1");
     const std::string b3 = readAll(logPath + ".3");
     CHECK(countNonEmpty(splitLines(b1)) > 0, "backup .1 has content");
@@ -200,14 +200,14 @@ int main() {
     CHECK(b3.find("rotate-") != std::string::npos, "oldest surviving lines landed in .3");
     CHECK(readAll(logPath).find("rotate-59") != std::string::npos, "newest line is in base file");
 
-    // ---------------------------------------------------------------- 关闭文件输出
+    // ---------------------------------------------------------------- disabling file output
     setLogFile("");
     const std::uintmax_t frozen = sizeOf(logPath);
     logger_error("after-file-disabled");
     CHECK(sizeOf(logPath) == frozen, "no disk write after setLogFile(\"\")");
     CHECK(!fs::exists(logPath + ".4"), "disabled sink does not rotate");
 
-    // 重新指回文件应能恢复写入
+    // Pointing the log back at a file must resume writing
     setLogFile(logPath);
     logger_error("reopened-after-disable");
     CHECK(readAll(logPath).find("reopened-after-disable") != std::string::npos,

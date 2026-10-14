@@ -1,13 +1,13 @@
-// 路由刷新周期 / 位点落盘周期 真机验证（场景 I1–I3 逐条断言）。
+// Route-refresh interval / offset-persist interval live verification (scenarios I1–I3 asserted one by one).
 //
 //
 //
 //
-//   I3 透传：生产者/消费者 start 之后，真机实例上的 `pollNameServerIntervalMillis()` 就是调用方
-//      设的值（不是只在门面上存着）。
+//   I3 pass-through: after producer/consumer start, the live instance's `pollNameServerIntervalMillis()`
+//      is exactly the value the caller set (not merely stored on the façade).
 //
-// 前置：NameServer + Broker 已起（本仓库 /tmp/rmq_rust_live/broker.conf）。
-// 用法：./rmq_live_scheduled_intervals 127.0.0.1:9876
+// Prerequisite: NameServer + Broker already up (broker.conf at /tmp/rmq_rust_live in this setup).
+// Usage: ./rmq_live_scheduled_intervals 127.0.0.1:9876
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -57,7 +57,7 @@ int64_t nowMs() {
         .count();
 }
 
-// 真机投递受 broker 长轮询/流控与同机负载影响，固定 sleep 会把「实现没问题」测成假失败。
+// Live delivery is affected by broker long polling / flow control and same-host load; a fixed sleep would turn a correct implementation into a false failure.
 bool waitUntil(const std::function<bool()>& pred, int64_t timeoutMs, int64_t intervalMs = 200) {
     const int64_t deadline = nowMs() + timeoutMs;
     while (nowMs() < deadline) {
@@ -99,8 +99,8 @@ private:
     BodySink& sink_;
 };
 
-// broker 上该 group 这条队列的已提交位点（`setZeroIfNotFound=true` ⇒ 没提交过回 0）。
-// 判据是「broker 侧真的收到了位点」，所以只能查 broker。
+// Committed offset of this queue for the group on the broker (`setZeroIfNotFound=true` ⇒ returns 0 when never committed).
+// The criterion is "the broker really received the offset", so only the broker can be queried.
 int64_t brokerOffset(DefaultMQAdminExt& admin, const std::string& group, const MessageQueue& mq) {
     int64_t off = 0;
     if (!admin.client().queryConsumerOffset(group, mq, off, 5000, std::string(), true)) {
@@ -137,18 +137,18 @@ int main(int argc, char* argv[]) {
     try {
         cluster = admin.fetchBrokerClusterInfo();
     } catch (const std::exception& e) {
-        check("集群探活", false, std::string("fetchBrokerClusterInfo: ") + e.what());
+        check("cluster liveness probe", false, std::string("fetchBrokerClusterInfo: ") + e.what());
         admin.shutdown();
         return 1;
     }
     const std::vector<std::string> brokerAddrs = cluster.getBrokerAddrs();
     if (brokerAddrs.empty()) {
-        check("集群探活", false, "nameServer 无 broker 注册");
+        check("cluster liveness probe", false, "no broker registered on the name server");
         admin.shutdown();
         return 1;
     }
     const std::string brokerAddr = brokerAddrs[0];
-    check("集群探活", true, "broker=" + brokerAddr);
+    check("cluster liveness probe", true, "broker=" + brokerAddr);
 
     DefaultMQProducer* producer = nullptr;
     std::shared_ptr<DefaultMQProducer> fastPoll;
@@ -156,7 +156,7 @@ int main(int argc, char* argv[]) {
     std::vector<std::shared_ptr<DefaultMQPushConsumer>> consumers;
 
     try {
-        // ---------------- I1 路由刷新周期 ----------------
+        // ---------------- I1 route refresh interval ----------------
         fastPoll = std::make_shared<DefaultMQProducer>(gPollFast);
         fastPoll->setNamesrvAddr(nsAddr);
         fastPoll->setInstanceName("interval-poll-fast-" + stamp);
@@ -168,55 +168,55 @@ int main(int argc, char* argv[]) {
         slowPoll->setInstanceName("interval-poll-slow-" + stamp);
         slowPoll->start();
 
-        check("I3 生产者实例拿到配置的刷新周期（1s 组）",
+        check("I3 producer instance applies the configured refresh interval (1s group)",
               fastPoll->client().pollNameServerIntervalMillis() == kFastPollMs,
               "client.pollNameServerIntervalMillis=" +
                   std::to_string(fastPoll->client().pollNameServerIntervalMillis()));
-        check("I3 生产者实例默认 30s（对照组）",
+        check("I3 producer instance defaults to 30s (control group)",
               slowPoll->client().pollNameServerIntervalMillis() == kSlowPollMs,
               "client.pollNameServerIntervalMillis=" +
                   std::to_string(slowPoll->client().pollNameServerIntervalMillis()));
 
-        // 把一个还没创建的 topic 登记进周期刷新集合：两个生产者都不会给它发消息，
-        // 所以缓存里何时出现它，只由各自的刷新周期决定。
+        // Register a not-yet-created topic into the periodic-refresh set: neither producer sends
+        // to it, so when it appears in the cache is decided only by each one's refresh interval.
         fastPoll->client().registerTopicInUse(tPoll);
         slowPoll->client().registerTopicInUse(tPoll);
-        check("I1 两个生产者都把 " + tPoll + " 登记进在用 topic 集合（登记本身不拉取）",
+        check("I1 both producers registered " + tPoll + " in the topic-in-use set (registration itself does not pull)",
               !fastPoll->client().isTopicRouteCached(tPoll) &&
                   !slowPoll->client().isTopicRouteCached(tPoll),
-              "登记后两边缓存都为空");
+              "both caches empty after registration");
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
         const int64_t t0 = nowMs();
         admin.createTopic(MixAll::DEFAULT_TOPIC, tPoll, 1);
-        check("I1 admin 建 topic 成功", true, tPoll + " 1 队列");
+        check("I1 admin created topic OK", true, tPoll + " 1 queue");
 
         const bool fastOk =
             waitUntil([&] { return fastPoll->client().isTopicRouteCached(tPoll); }, 6000, 100);
         const int64_t dtFast = nowMs() - t0;
-        check("I1 1s 周期组 ≤6s 从 NameServer 拉到新 topic 路由", fastOk,
-              "dt=" + secs(t0, nowMs()) + " 周期=" + std::to_string(kFastPollMs) + "ms");
-        check("I1 此刻 30s 周期组**还**没拉到（对照：周期决定时机）",
+        check("I1 1s-interval group fetched the new topic route from NameServer within 6s", fastOk,
+              "dt=" + secs(t0, nowMs()) + " interval=" + std::to_string(kFastPollMs) + "ms");
+        check("I1 at this moment the 30s-interval group has **not** fetched yet (control: the interval decides timing)",
               !slowPoll->client().isTopicRouteCached(tPoll),
-              "dt=" + secs(t0, nowMs()) + " 周期=" + std::to_string(kSlowPollMs) + "ms");
+              "dt=" + secs(t0, nowMs()) + " interval=" + std::to_string(kSlowPollMs) + "ms");
 
         const bool slowOk =
             waitUntil([&] { return slowPoll->client().isTopicRouteCached(tPoll); }, 40000, 500);
         const int64_t dtSlow = nowMs() - t0;
-        check("I1 30s 周期组最终也拉到（默认值只是慢，不是坏）", slowOk,
-              "dt=" + secs(t0, nowMs()) + " 周期=" + std::to_string(kSlowPollMs) + "ms");
-        check("I1 两组间隔与配置同量级（30s 组至少晚 20s）", (dtSlow - dtFast) >= 20000,
+        check("I1 the 30s-interval group eventually fetched too (the default is only slow, not broken)", slowOk,
+              "dt=" + secs(t0, nowMs()) + " interval=" + std::to_string(kSlowPollMs) + "ms");
+        check("I1 the two groups' gaps match the configured magnitude (30s group at least 20s later)", (dtSlow - dtFast) >= 20000,
               "fast=" + secs(0, dtFast) + " slow=" + secs(0, dtSlow));
         fastPoll->shutdown();
         slowPoll->shutdown();
 
-        // ---------------- I2 位点落盘周期 ----------------
+        // ---------------- I2 offset persistence interval ----------------
         admin.createTopic(MixAll::DEFAULT_TOPIC, tPersist, 1);
         const TopicRouteData persistRoute = admin.examineTopicRoute(tPersist);
         const std::vector<MessageQueue> persistQueues = persistRoute.getAllMessageQueue(tPersist);
         if (persistQueues.empty()) {
-            throw std::runtime_error("examineTopicRoute 没返回 " + tPersist + " 的队列");
+            throw std::runtime_error("examineTopicRoute returned no " + tPersist + " queues");
         }
         const MessageQueue mq = persistQueues[0];
 
@@ -250,7 +250,7 @@ int main(int argc, char* argv[]) {
         const int64_t tStart = nowMs();
         fastC->start();
         consumers.push_back(fastC);
-        check("I3 消费者实例拿到配置的刷新周期",
+        check("I3 consumer instance applies the configured refresh interval",
               fastC->client().pollNameServerIntervalMillis() == 2000,
               "client.pollNameServerIntervalMillis=" +
                   std::to_string(fastC->client().pollNameServerIntervalMillis()));
@@ -259,22 +259,22 @@ int main(int argc, char* argv[]) {
 
         const bool consumed =
             waitUntil([&] { return sinkFast.size() >= 3 && sinkSlow.size() >= 3; }, 30000);
-        check("I2 两个消费者都消费到 3 条（尚未 commit / shutdown）", consumed,
+        check("I2 both consumers consumed 3 messages (no commit / shutdown yet)", consumed,
               "fast=" + std::to_string(sinkFast.size()) + " slow=" +
                   std::to_string(sinkSlow.size()));
 
-        // 首笔落盘在 start 后 ~10s：消费若在 10s 内完成，此刻两边都还没推上去。
-        // 消费本身慢过 10s 时这一格不再有判别力，记为 SKIP 而不是硬报（真机负载导致的
-        // 时序漂移不该记成客户端问题）。
+        // The first persist happens ~10s after start: if consumption finished within 10s, neither group has pushed anything yet. When consumption itself
+        // takes longer than 10s this check loses discriminating power, so record SKIP instead of a hard failure (timing drift caused by live-cluster
+        // load should not be blamed on the client).
         if (nowMs() - tStart < 9000) {
             const int64_t offFastNow = brokerOffset(admin, gFast, mq);
             const int64_t offSlowNow = brokerOffset(admin, gSlow, mq);
-            check("I2 消费后 broker 位点还没有立刻被推上去", offFastNow < 3 && offSlowNow < 3,
+            check("I2 broker offset is not pushed immediately after consumption", offFastNow < 3 && offSlowNow < 3,
                   "fast=" + std::to_string(offFastNow) + " slow=" + std::to_string(offSlowNow) +
                       " elapsed=" + secs(tStart, nowMs()));
         } else {
-            skip("I2 消费后 broker 位点还没有立刻被推上去",
-                 "消费耗时 " + secs(tStart, nowMs()) + " ≥ 10s，已越过首笔落盘窗口");
+            skip("I2 broker offset is not pushed immediately after consumption",
+                 "consumption took " + secs(tStart, nowMs()) + " ≥ 10s, past the first-persist window");
         }
 
         const bool fastFirst =
@@ -283,60 +283,60 @@ int main(int argc, char* argv[]) {
         const bool slowFirst =
             waitUntil([&] { return brokerOffset(admin, gSlow, mq) == 3; }, 20000, 300);
         const int64_t dtSlowFirst = nowMs() - tStart;
-        check("I2 1s 组首次落盘发生在 initialDelay(~10s) 之后", fastFirst,
-              "dt=" + secs(0, dtFastFirst) + " 周期=" + std::to_string(kFastPersistMs) + "ms");
+        check("I2 the 1s group's first persist happens after initialDelay(~10s)", fastFirst,
+              "dt=" + secs(0, dtFastFirst) + " interval=" + std::to_string(kFastPersistMs) + "ms");
         const double fastFirstSec = static_cast<double>(dtFastFirst) / 1000.0;
-        check("I2 首笔落盘不早于 initialDelay 10s",
+        check("I2 first persist no earlier than initialDelay 10s",
               fastFirst && fastFirstSec >= kPersistInitialDelaySec - 0.5,
               "dt=" + secs(0, dtFastFirst));
-        check("I2 60s 组同样在 ~10s 完成首笔落盘（周期未到，先走 initialDelay）", slowFirst,
-              "dt=" + secs(0, dtSlowFirst) + " 周期=" + std::to_string(kSlowPersistMs) + "ms");
+        check("I2 the 60s group also completes its first persist at ~10s (interval not due yet, initialDelay goes first)", slowFirst,
+              "dt=" + secs(0, dtSlowFirst) + " interval=" + std::to_string(kSlowPersistMs) + "ms");
 
-        // 第二批：两组都会消费到，但 broker 侧位点只由各自的周期任务推上去。
+        // Second batch: both groups consume it, but the broker-side offset is pushed only by each group's own periodic task.
         const int64_t t2 = nowMs();
         for (int i = 0; i < 3; ++i) {
             producer->send(Message(tPersist, "batch2-" + std::to_string(i)));
         }
-        check("I2 两个消费者都消费到第二批（6 条）",
+        check("I2 both consumers consumed the second batch (6 messages)",
               waitUntil([&] { return sinkFast.size() >= 6 && sinkSlow.size() >= 6; }, 20000),
               "fast=" + std::to_string(sinkFast.size()) + " slow=" +
                   std::to_string(sinkSlow.size()));
         const bool fastSecond =
             waitUntil([&] { return brokerOffset(admin, gFast, mq) == 6; }, 5000, 200);
-        check("I2 1s 组一个周期内把第二批位点推上去", fastSecond,
-              "dt=" + secs(t2, nowMs()) + " 周期=" + std::to_string(kFastPersistMs) + "ms");
+        check("I2 the 1s group pushes the second-batch offset within one interval", fastSecond,
+              "dt=" + secs(t2, nowMs()) + " interval=" + std::to_string(kFastPersistMs) + "ms");
         const int64_t offSlowBatch2 = brokerOffset(admin, gSlow, mq);
-        check("I2 此刻 60s 组仍是 3（周期 60s 远未到，且它确实消费到了 6）",
+        check("I2 at this moment the 60s group is still at 3 (the 60s interval is far from due, and it really consumed 6)",
               offSlowBatch2 == 3 && sinkSlow.size() >= 6,
-              "broker=" + std::to_string(offSlowBatch2) + " 已消费=" +
-                  std::to_string(sinkSlow.size()) + " 周期=" + std::to_string(kSlowPersistMs) + "ms");
+              "broker=" + std::to_string(offSlowBatch2) + " consumed=" +
+                  std::to_string(sinkSlow.size()) + " interval=" + std::to_string(kSlowPersistMs) + "ms");
         const int64_t sinceSlowFirst = nowMs() - (tStart + dtSlowFirst);
-        check("I2 60s 组的下一次周期还没到（距首笔落盘 < 周期 60s）",
+        check("I2 the 60s group's next interval has not arrived (< 60s since the first persist)",
               sinceSlowFirst < kSlowPersistMs, "elapsed=" + secs(0, sinceSlowFirst));
 
         slowC->shutdown();
         consumers.erase(consumers.begin() + 1);
         const bool slowSecond =
             waitUntil([&] { return brokerOffset(admin, gSlow, mq) == 6; }, 10000, 300);
-        check("I2 60s 组 shutdown() 时把 6 落盘（persistAllConsumerOffset 收尾）", slowSecond,
+        check("I2 the 60s group persists 6 at shutdown() (persistAllConsumerOffset finishes up)", slowSecond,
               "broker=" + std::to_string(brokerOffset(admin, gSlow, mq)));
     } catch (const std::exception& e) {
-        check("验证过程抛出异常", false, e.what());
+        check("exception thrown during verification", false, e.what());
     }
 
-    // ---------------- 清理 ----------------
+    // ---------------- cleanup ----------------
     for (auto& c : consumers) {
         try {
             c->shutdown();
         } catch (const std::exception& e) {
-            std::printf("    (consumer shutdown 失败: %s)\n", e.what());
+            std::printf("    (consumer shutdown failed: %s)\n", e.what());
         }
     }
     if (producer != nullptr) {
         try {
             producer->shutdown();
         } catch (const std::exception& e) {
-            std::printf("    (producer shutdown 失败: %s)\n", e.what());
+            std::printf("    (producer shutdown failed: %s)\n", e.what());
         }
         delete producer;
     }
@@ -345,7 +345,7 @@ int main(int argc, char* argv[]) {
         try {
             p->shutdown();
         } catch (const std::exception& e) {
-            std::printf("    (producer shutdown 失败: %s)\n", e.what());
+            std::printf("    (producer shutdown failed: %s)\n", e.what());
         }
     }
     for (const std::string& t : {tPoll, tPersist}) {
@@ -353,20 +353,20 @@ int main(int argc, char* argv[]) {
             admin.deleteTopic(t);
             std::printf("    (deleteTopic(%s) OK)\n", t.c_str());
         } catch (const std::exception& e) {
-            std::printf("    (deleteTopic(%s) 失败: %s)\n", t.c_str(), e.what());
+            std::printf("    (deleteTopic(%s) failed: %s)\n", t.c_str(), e.what());
         }
     }
     for (const std::string& g : {gPollFast, gPollSlow, gFast, gSlow}) {
         try {
             admin.deleteSubscriptionGroup(brokerAddr, g, true);
         } catch (const std::exception& e) {
-            std::printf("    (deleteSubscriptionGroup(%s) 失败: %s)\n", g.c_str(), e.what());
+            std::printf("    (deleteSubscriptionGroup(%s) failed: %s)\n", g.c_str(), e.what());
         }
     }
     try {
         admin.shutdown();
     } catch (const std::exception& e) {
-        std::printf("    (admin shutdown 失败: %s)\n", e.what());
+        std::printf("    (admin shutdown failed: %s)\n", e.what());
     }
 
     std::printf("\nPASS=%d FAIL=%d SKIP=%d\n", gPass, gFail, gSkip);

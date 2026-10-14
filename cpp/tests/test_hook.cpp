@@ -1,4 +1,4 @@
-// 钩子单测：CheckForbiddenHook（发送前拦截）与 FilterMessageHook（投递前过滤）——不需要集群。
+// Hook unit test: CheckForbiddenHook (block before send) and FilterMessageHook (filter before delivery) -- no cluster needed.
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -43,7 +43,7 @@ MessageExt makeMsg(const std::string& msgId, const std::string& body, const std:
     return m;
 }
 
-// ---- CheckForbiddenHook：记录调用次数/上下文，可选抛异常 ----
+// ---- CheckForbiddenHook: records call counts/context, optionally throws on purpose ----
 class ForbidHook : public CheckForbiddenHook {
 public:
     explicit ForbidHook(bool forbid, int32_t code = 1)
@@ -77,7 +77,7 @@ private:
     int32_t code_;
 };
 
-// ---- FilterMessageHook：按 body 前缀丢消息 / 抛异常 ----
+// ---- FilterMessageHook: drops messages by body prefix / throws ----
 class DropHook : public FilterMessageHook {
 public:
     explicit DropHook(std::string prefix) : prefix_(std::move(prefix)) {}
@@ -122,23 +122,23 @@ void testSubscriptionFieldParity() {
     SubscriptionData all2 = FilterAPI::buildSubscriptionData("T", "");
     expect(all2.subString == "*" && all2.tagsSet.empty() && all2.codeSet.empty(),
            "sub '': SUB_ALL + empty sets");
-    // 纯空白：isEmpty 只认 null/"" → 走 split → 标签 trim 成空 → 集合空、subString 原样
+    // Blank only: isEmpty accepts null/"" alone -> goes to split -> tags trim to empty -> sets empty, subString verbatim
     SubscriptionData blank = FilterAPI::buildSubscriptionData("T", "   ");
     expect(blank.subString == "   " && blank.tagsSet.empty() && blank.codeSet.empty(),
            "sub blank: split branch, subString preserved, empty sets");
 
-    // "TagA" → tagsSet={TagA}, codeSet={2598919}
+    // "TagA" -> tagsSet={TagA}, codeSet={2598919}
     SubscriptionData one = FilterAPI::buildSubscriptionData("T", "TagA");
     expect(one.tagsSet.size() == 1 && one.tagsSet.count("TagA") == 1, "sub 'TagA': tagsSet");
     expect(one.codeSet.size() == 1 && one.codeSet.count(2598919) == 1, "sub 'TagA': codeSet");
 
-    // "TagA||TagB" → {2598919, 2598920}
+    // "TagA||TagB" -> {2598919, 2598920}
     SubscriptionData two = FilterAPI::buildSubscriptionData("T", "TagA||TagB");
     expect(two.tagsSet.size() == 2 && two.codeSet.size() == 2, "sub 'TagA||TagB': sizes");
     expect(two.codeSet.count(2598919) == 1 && two.codeSet.count(2598920) == 1,
            "sub 'TagA||TagB': codeSet values");
 
-    // " TagA || TagB " → subString 原样保留空格，标签各自 trim
+    // " TagA || TagB " -> subString keeps the spaces verbatim, each tag is trimmed
     SubscriptionData spaced = FilterAPI::buildSubscriptionData("T", " TagA || TagB ");
     expect(spaced.subString == " TagA || TagB ", "sub spaced: subString preserved verbatim");
     expect(spaced.tagsSet.count("TagA") == 1 && spaced.tagsSet.count("TagB") == 1,
@@ -149,7 +149,7 @@ void testSubscriptionFieldParity() {
            "sub '|||': literal '|' tag (only TRAILING empties dropped)");
     expect(pipes.codeSet.count(124) == 1, "sub '|||': codeSet = 124");
 
-    // "*||TagA" → {*, TagA}（表达式里的 "*" 是字面量 tag，不是 SUB_ALL）
+    // "*||TagA" -> {*, TagA} ("*" in an expression is a literal tag, not SUB_ALL)
     SubscriptionData star = FilterAPI::buildSubscriptionData("T", "*||TagA");
     expect(star.tagsSet.size() == 2 && star.codeSet.count(42) == 1,
            "sub '*||TagA': '*' is a literal tag with hash 42");
@@ -209,7 +209,7 @@ void testCheckForbiddenHook() {
     expectInt(hook->calls, 2, "forbidden: first hook ran again");
     expectInt(hook2->calls, 1, "forbidden: second hook also runs");
 
-    // ★ 关键语义：拦截钩子的异常**不被吞掉**，原样传出去
+    // Key semantics: a blocking hook's exception is **not swallowed**; it propagates out unchanged
     DefaultMQProducer blocker("GID_HookUnitBlocker");
     auto strict = std::make_shared<ForbidHook>(/*forbid=*/true, /*code=*/2);
     blocker.registerCheckForbiddenHook(strict);
@@ -229,10 +229,10 @@ void testCheckForbiddenHook() {
     expect(what == "forbidden by unit hook", "forbidden: exception message preserved");
     expectInt(code, 2, "forbidden: exception responseCode preserved");
     expectInt(strict->calls, 1, "forbidden: throwing hook counted");
-    // 异常抛出后，**后面的钩子不再执行** —— 这正是"拦截"的语义（发送已被中止）
+    // Once the exception leaves, **later hooks do not run** -- that is the "forbid" semantics (the send is aborted)
     expectInt(after->calls, 0, "forbidden: hooks after the throwing one are skipped");
 
-    // 没有钩子时 execute 是空操作
+    // With no hook registered, execute is a no-op
     DefaultMQProducer plain("GID_HookUnitPlain");
     plain.executeCheckForbiddenHook(ctx);
     expect(true, "forbidden: execute with no hooks is a no-op");
@@ -252,7 +252,7 @@ void testFilterMessageHook() {
 
     MessageQueue mq("TopicHook", "broker-a", 0);
 
-    // ① 无订阅（sub == nullptr）时只跑钩子
+    // (1) No subscription (sub == nullptr): only the hooks run
     std::vector<MessageExt> msgs{makeMsg("M1", "keep-1", "TagA"),
                                  makeMsg("M2", "drop-2", "TagA"),
                                  makeMsg("M3", "keep-3", "TagA")};
@@ -264,7 +264,7 @@ void testFilterMessageHook() {
     expect(drop->seenGroup == "GID_HookUnitConsumer", "filter: context carries consumerGroup");
     expect(drop->seenUnitMode == false, "filter: unitMode is false");
 
-    // ② 订阅 TagA：tag 过滤在前、钩子在后（先按 tag 摘掉 TagB，再给钩子看剩下的）
+    // (2) Subscribed to TagA: tag filter first, hooks after (TagB is removed by tag, then the hook sees the rest)
     SubscriptionData sub = FilterAPI::buildSubscriptionData("TopicHook", "TagA");
     drop->seenCounts.clear();
     std::vector<MessageExt> mixed{makeMsg("M1", "keep-1", "TagA"),
@@ -276,7 +276,7 @@ void testFilterMessageHook() {
     expect(drop->seenCounts.size() == 1 && drop->seenCounts[0] == 2,
            "filter: hook saw only the tag-matching subset (tag filter runs FIRST)");
 
-    // ③ 订阅 "*"（SUB_ALL）：tagsSet 为空 ⇒ **不做**客户端 tag 过滤
+    // (3) Subscribed to "*" (SUB_ALL): empty tagsSet means client-side tag filtering is **not** done
     SubscriptionData subAll = FilterAPI::buildSubscriptionData("TopicHook", "*");
     auto noop = std::make_shared<DropHook>("nothing-matches-this-");
     DefaultMQPushConsumer plain("GID_HookUnitConsumer2");
@@ -285,7 +285,7 @@ void testFilterMessageHook() {
     expectInt(static_cast<long long>(kept3.size()), 3,
               "filter: SUB_ALL must NOT client-filter tags (tagsSet empty is the switch)");
 
-    // ④ 钩子异常被吞掉，且**后续钩子照常执行**
+    // (4) A hook exception is swallowed, and **later hooks still run**
     auto boom = std::make_shared<BoomHook>();
     auto drop2 = std::make_shared<DropHook>("drop-");
     DefaultMQPushConsumer robust("GID_HookUnitConsumer3");
@@ -296,13 +296,13 @@ void testFilterMessageHook() {
     expectInt(drop2->calls, 1, "filter: hook AFTER the throwing one still runs (swallowed)");
     expectInt(static_cast<long long>(kept4.size()), 2, "filter: boom did not break filtering");
 
-    // ⑤ 空输入：不调用钩子（避免无意义回调）
+    // (5) Empty input: hooks are not called at all (avoid pointless callbacks)
     drop2->calls = 0;
     std::vector<MessageExt> empty;
     std::vector<MessageExt> kept5 = robust.filterMessagesForDelivery(mq, nullptr, empty);
     expect(kept5.empty() && drop2->calls == 0, "filter: empty input short-circuits");
 
-    // ⑥ 差集：POP 路径要给被摘掉的消息补 ack，因此差集必须精确
+    // (6) Difference set: the POP path must ack the dropped messages, so the set has to be exact
     std::vector<MessageExt> orig{makeMsg("A", "keep", ""), makeMsg("B", "drop", ""),
                                  makeMsg("C", "keep2", "")};
     std::vector<MessageExt> keptSet{orig[0], orig[2]};
@@ -317,7 +317,7 @@ void testFilterMessageHook() {
            "dropped: kept >= original -> empty (guards negative reserve)");
 }
 
-// ---------------------------------------------------------------- 上下文默认值
+// ---------------------------------------------------------------- context defaults
 void testContextDefaults() {
     CheckForbiddenContext ck;
     expect(ck.sendResult == nullptr, "ctx: CheckForbiddenContext has no sendResult");

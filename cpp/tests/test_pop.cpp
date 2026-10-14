@@ -1,4 +1,4 @@
-// POP 模式（5.x 轻量消费）单测 —— 不需要集群。
+// POP mode (5.x lightweight consumption) unit test -- no cluster needed.
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -65,7 +65,7 @@ int main() {
     const std::string BROKER = "broker-a";
     const std::string GROUP = "PopUnitTestGroup";
 
-    // ------------------------------------------------ 1. extra_info 拼装/切分
+    // ------------------------------------------------ 1. extra_info build/split
     {
         std::string ck = extra_info::buildExtraInfo(0, 1789613086027LL, 60000, 0, TOPIC, BROKER, 3, 7);
         expect(ck == "0 1789613086027 60000 0 0 broker-a 3 7", "build 8 segments", ck);
@@ -83,7 +83,7 @@ int main() {
         expect(b.size() == 3, "split drops trailing empty (2 spaces)", std::to_string(b.size()));
     }
 
-    // 取值往返
+    // Value round trip
     {
         std::string ck = extra_info::buildExtraInfo(11, 22, 33, 0, TOPIC, BROKER, 5, 123456789);
         std::vector<std::string> seg = extra_info::split(ck);
@@ -97,7 +97,7 @@ int main() {
         expect(extra_info::getQueueOffset(seg) == 123456789, "getQueueOffset");
     }
 
-    // 段数守卫
+    // Segment-count guards
     {
         std::vector<std::string> seg7 = extra_info::split("0 1 2 3 0 broker-a 4");
         expect(throwsInvalidArgument([&] { extra_info::getQueueOffset(seg7); }),
@@ -122,7 +122,7 @@ int main() {
         expect(extra_info::retryOfTopic(extra_info::buildPopRetryTopicV1(TOPIC, GROUP))
                    == extra_info::kRetryTopic,
                "retryOfTopic V1");
-        // V2 也带 %RETRY% 前缀，判定顺序错了会被误判成 V1
+        // V2 also carries the %RETRY% prefix; a wrong check order would misread it as V1
         expect(extra_info::retryOfTopic(extra_info::buildPopRetryTopicV2(TOPIC, GROUP))
                    == extra_info::kRetryTopicV2,
                "retryOfTopic V2 (checked before prefix)");
@@ -131,7 +131,7 @@ int main() {
                "buildPopRetryTopicV1");
         expect(extra_info::buildPopRetryTopicV2(TOPIC, GROUP) == "%RETRY%" + GROUP + "+" + TOPIC,
                "buildPopRetryTopicV2");
-        // 默认（enableRetryTopicV2 关）走 V1
+        // Default (enableRetryTopicV2 off) takes the V1 branch
         expect(extra_info::buildPopRetryTopic(TOPIC, GROUP)
                    == extra_info::buildPopRetryTopicV1(TOPIC, GROUP),
                "buildPopRetryTopic defaults to V1");
@@ -152,7 +152,7 @@ int main() {
                "getRealTopic rejects bad retry");
     }
 
-    // ------------------------------------------------ 解析响应头编码
+    // ------------------------------------------------ decoding the encoded response headers
     {
         auto start = extra_info::parseStartOffsetInfo("0 0 0;0 3 0;0 2 0");
         expect(start.has_value() && start->size() == 3, "parseStartOffsetInfo size");
@@ -192,7 +192,7 @@ int main() {
                "retry topic map key carries retryFlag");
     }
 
-    // ------------------------------------------------ 2. 请求/响应头 extFields 键名
+    // ------------------------------------------------ 2. request/response header extFields key names
     {
         PopMessageRequestHeader h;
         h.consumerGroup = GROUP;
@@ -282,7 +282,7 @@ int main() {
                "ChangeInvisibleTimeResponseHeader parse");
     }
 
-    // ------------------------------------------------ 3. POP_CK 反构
+    // ------------------------------------------------ 3. stamping POP_CK back onto messages
     {
         std::vector<MessageExt> msgs = {makeMsg(TOPIC, 0, 0), makeMsg(TOPIC, 3, 0),
                                         makeMsg(TOPIC, 2, 0)};
@@ -316,7 +316,7 @@ int main() {
         expect(rightOffset, "POP_CK msgQueueOffset comes from msgOffsetInfo");
     }
 
-    // startOffset 取自 startOffsetInfo
+    // ckQueueOffset is taken from startOffsetInfo
     {
         std::vector<MessageExt> msgs = {makeMsg(TOPIC, 3, 0)};
         MQClientInstance::stampPopCk(msgs, BROKER, makeHeader("0 3 99", "0 3 0"));
@@ -324,7 +324,7 @@ int main() {
         expect(extra_info::getCkQueueOffset(seg) == 99, "ckQueueOffset from startOffsetInfo");
     }
 
-    // retry 消息已带 POP_CK：绝不能覆盖
+    // A retry message that already carries POP_CK must never be overwritten
     {
         const std::string existing = "1 1 2 0 1 broker-a 0 0";
         std::vector<MessageExt> msgs = {makeMsg(TOPIC, 3, 0)};
@@ -334,7 +334,7 @@ int main() {
                "does not override existing POP_CK");
     }
 
-    // 同队列多条：按 queueOffset 排序后的下标去取 msgOffsetInfo
+    // Several messages in one queue: index into msgOffsetInfo by the position after sorting queueOffset
     {
         std::vector<MessageExt> msgs = {makeMsg(TOPIC, 3, 10), makeMsg(TOPIC, 3, 11),
                                         makeMsg(TOPIC, 3, 12)};
@@ -351,7 +351,7 @@ int main() {
         expect(ok, "index selects right offset within queue");
     }
 
-    // startOffsetInfo 缺失时的降级分支
+    // Degraded branch when startOffsetInfo is missing
     {
         std::vector<MessageExt> msgs = {makeMsg(TOPIC, 3, 42)};
         MQClientInstance::stampPopCk(msgs, BROKER, makeHeader("", ""));
@@ -363,7 +363,7 @@ int main() {
                "fallback uses own queueOffset for both");
     }
 
-    // 1ST_POP_TIME 只在缺失时补
+    // 1ST_POP_TIME is only filled when it is missing
     {
         std::vector<MessageExt> msgs = {makeMsg(TOPIC, 0, 0), makeMsg(TOPIC, 3, 0)};
         msgs[1].properties[MessageConst::PROPERTY_FIRST_POP_TIME] = "111";
@@ -374,7 +374,7 @@ int main() {
                "1ST_POP_TIME kept when present");
     }
 
-    // 状态名
+    // Status names
     {
         expect(std::string(popStatusName(PopStatus::FOUND)) == "FOUND", "popStatusName FOUND");
         expect(std::string(popStatusName(PopStatus::POLLING_NOT_FOUND)) == "POLLING_NOT_FOUND",

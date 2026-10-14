@@ -1,155 +1,155 @@
-# 单元测试：编解码往返 + 协议对齐守卫
+# Unit tests: encode/decode round-trip + protocol-alignment guards
 add_executable(rmq_test_codec test_codec.cpp)
 target_link_libraries(rmq_test_codec PRIVATE rocketmq::remoting)
 add_test(NAME codec COMMAND rmq_test_codec)
 
-# clientId 口径：IP@instanceName + changeInstanceNameToPID
+# clientId convention: IP@instanceName + changeInstanceNameToPID
 add_executable(rmq_test_client_id test_client_id.cpp)
 target_link_libraries(rmq_test_client_id PRIVATE rocketmq::remoting)
 add_test(NAME client_id COMMAND rmq_test_client_id)
 
-# 协议对齐守卫
+# Protocol-alignment guards
 add_executable(rmq_test_protocol_alignment test_protocol_alignment.cpp)
 target_link_libraries(rmq_test_protocol_alignment PRIVATE rocketmq::remoting)
 add_test(NAME protocol_alignment COMMAND rmq_test_protocol_alignment)
 
-# 路由 / 心跳 / 订阅数据：往返 + 协议字段名守卫
+# Route / heartbeat / subscription data: round-trip + protocol field-name guards
 add_executable(rmq_test_route_heartbeat test_route_heartbeat.cpp)
 target_link_libraries(rmq_test_route_heartbeat PRIVATE rocketmq::remoting)
 add_test(NAME route_heartbeat COMMAND rmq_test_route_heartbeat)
 
-# 传输层：本机真实 TCP 收发（半包重组 / 超时 / 建连失败）
+# Transport layer: real local TCP send/recv (partial-frame reassembly / timeout / connect failure)
 add_executable(rmq_test_transport test_transport.cpp)
 target_link_libraries(rmq_test_transport PRIVATE rocketmq::remoting)
 add_test(NAME transport COMMAND rmq_test_transport)
 
-# SOCKS 代理：本地假 SOCKS5/SOCKS4 服务器锁死握手字节与 CONNECT 目标、
-# RFC 1929 用户名密码子协商的成功/拒绝两条路、隧道上真发一笔 remoting 请求。
-# 失败类断言按 loopback 怪癖给 ≥30s 建连预算。
+# SOCKS proxy: local fake SOCKS5/SOCKS4 servers pin the handshake bytes and the CONNECT target,
+# the accept/reject paths of RFC 1929 username/password sub-negotiation, and one real remoting
+# request sent over the tunnel. Failure-path assertions get a >=30s connect budget per loopback quirks.
 add_executable(rmq_test_socks_proxy test_socks_proxy.cpp)
 target_link_libraries(rmq_test_socks_proxy PRIVATE rocketmq::remoting)
 add_test(NAME socks_proxy COMMAND rmq_test_socks_proxy)
 
-# 断连立刻失败在途请求（failFast / 在途请求集合 requestFail）：真 socket 对端读完就关，
-# 断言"毫秒级判死 + 报 SEND_REQUEST 而不是超时 + 回调只一次 + 不牵连别人家的请求"
+# Disconnect fails in-flight requests immediately (failFast / in-flight request set requestFail): a real socket peer reads then closes;
+# assert "death judged in milliseconds + reports SEND_REQUEST not a timeout + callback fires once + does not drag in another peer's requests"
 add_executable(rmq_test_fail_fast test_fail_fast.cpp)
 target_link_libraries(rmq_test_fail_fast PRIVATE rocketmq::remoting)
 add_test(NAME fail_fast COMMAND rmq_test_fail_fast)
 
-# 压缩：zlib 往返 + 外部夹具交叉验证 + 失败必须显式抛错
+# Compression: zlib round-trip + cross-check against external fixtures + failure must raise explicitly
 add_executable(rmq_test_compression test_compression.cpp)
 target_link_libraries(rmq_test_compression PRIVATE rocketmq::remoting)
 add_test(NAME compression COMMAND rmq_test_compression)
 
-# 管理端：fastjson2 非法 JSON 容忍 + 管理响应体 DTO + TopicConfig/订阅组字段名与默认值
+# Admin side: fastjson2 tolerance of malformed JSON + admin response-body DTO + TopicConfig/subscription-group field names and defaults
 add_executable(rmq_test_admin test_admin.cpp)
 target_link_libraries(rmq_test_admin PRIVATE rocketmq::remoting)
 add_test(NAME admin COMMAND rmq_test_admin)
 
-# Admin 发起端 CONSUME_MESSAGE_DIRECTLY(309)：mock broker 锁死 viewMessage 两条 msgId 路径（offsetMsgId
-# 直查 + uniqKey 检索并替换 offsetMsgId）、309 头恰好四个字段、非 SUCCESS / 空 body 的
-# 报错语义，以及「消息解不出来 309 一笔不发」。消费侧处理器在 rmq_test_orderly_reconsume。
+# Admin-originated CONSUME_MESSAGE_DIRECTLY(309): mock broker pins the two viewMessage msgId paths (direct offsetMsgId
+# lookup + uniqKey search that replaces offsetMsgId), the 309 header carrying exactly four fields, the error semantics of non-SUCCESS / empty
+# body, and "if the message cannot be decoded, not one 309 is sent". The consumer-side handler lives in rmq_test_orderly_reconsume.
 add_executable(rmq_test_admin_consume_directly test_admin_consume_directly.cpp)
 target_link_libraries(rmq_test_admin_consume_directly PRIVATE rocketmq::remoting)
 add_test(NAME admin_consume_directly COMMAND rmq_test_admin_consume_directly)
 
-# 客户端日志：行格式（毫秒/pid/线程名/文件:行）+ 按大小轮转 + maxIndex 上限 + 级别过滤
+# Client logging: line format (ms/pid/thread name/file:line) + size-based rotation + maxIndex cap + level filtering
 add_executable(rmq_test_logging test_logging.cpp)
 target_link_libraries(rmq_test_logging PRIVATE rocketmq::remoting)
 add_test(NAME logging COMMAND rmq_test_logging)
 
-# ACL 鉴权：SHA1/HMAC/Base64 标准向量 + 签名内容与签名值对拍固定向量
+# ACL authentication: SHA1/HMAC/Base64 standard vectors + signed content and signature value checked against fixed vectors
 add_executable(rmq_test_acl test_acl.cpp)
 target_link_libraries(rmq_test_acl PRIVATE rocketmq::remoting)
 add_test(NAME acl COMMAND rmq_test_acl)
 
-# NamespaceRpcHook（5.x namespaceV2 → nsd/ns）：链式语义对拍（空命名空间不加字段）、
-# 链序 Namespace → Stream → ACL（composeRequestHooks 的形态与探针取证）、
-# ACL 签名随 namespaceV2 变化（含 broker 侧算法重放验签），以及五个门面的上线取证。
+# NamespaceRpcHook (5.x namespaceV2 -> nsd/ns): chained-semantics comparison (empty namespace adds no field),
+# chain order Namespace -> Stream -> ACL (the shape of composeRequestHooks and probe evidence),
+# the ACL signature varying with namespaceV2 (including a broker-side algorithm replay and verification), and the online evidence for the five facades.
 add_executable(rmq_test_namespace_hook test_namespace_hook.cpp)
 target_link_libraries(rmq_test_namespace_hook PRIVATE rocketmq::remoting)
 add_test(NAME namespace_hook COMMAND rmq_test_namespace_hook)
 
-# Request-Reply（5.x）：等待槽语义 + createReplyMessage 形状 + 326 回推入口（含迟到/坏包）
+# Request-Reply (5.x): wait-slot semantics + createReplyMessage shape + 326 push-back entry (incl. late/bad packets)
 add_executable(rmq_test_request_reply test_request_reply.cpp)
 target_link_libraries(rmq_test_request_reply PRIVATE rocketmq::remoting)
 add_test(NAME request_reply COMMAND rmq_test_request_reply)
 
-# 发送延迟故障容错：阈值表逐档映射 + 隔离/到期恢复 + 选择退化链（available→reachable→轮询）
+# Send-latency fault tolerance: per-tier threshold-table mapping + isolate/recover-on-expiry + selection degradation chain (available->reachable->round-robin)
 add_executable(rmq_test_latency test_latency.cpp)
 target_link_libraries(rmq_test_latency PRIVATE rocketmq::remoting)
 add_test(NAME latency COMMAND rmq_test_latency)
 
-# 故障规避主动探测（startDetectorEnable/detectTimeout/detectInterval + 匿名
-# ServiceDetector）：detectByOneRound 离线语义（翻回 reachable / 占坑限频 / 失败不动标志 /
-# resolver 摘除）+ 假 broker 上的周期触发、超时置不可用、恢复放行。失败类断言按 loopback
-# 怪癖给 ≥8s 预算。
+# Proactive fault-avoidance probing (startDetectorEnable/detectTimeout/detectInterval + anonymous
+# ServiceDetector): detectByOneRound offline semantics (flip back to reachable / slot-taking rate limit / failure leaves the flag
+# untouched / resolver removal) + periodic triggering on a fake broker, timeout marks unavailable, recovery lets it pass. Failure-path
+# assertions get a >=8s budget per loopback quirks.
 add_executable(rmq_test_fault_detector test_fault_detector.cpp)
 target_link_libraries(rmq_test_fault_detector PRIVATE rocketmq::remoting)
 add_test(NAME fault_detector COMMAND rmq_test_fault_detector)
 
-# 发送重试链路：mock name server + broker，锁死 sendDefaultImpl 的重试分类语义
+# Send-retry chain: mock name server + broker, pin the retry-classification semantics of sendDefaultImpl
 add_executable(rmq_test_send_retry test_send_retry.cpp)
 target_link_libraries(rmq_test_send_retry PRIVATE rocketmq::remoting)
 add_test(NAME send_retry COMMAND rmq_test_send_retry)
 
-# 异步发送链路：AsyncSenderExecutor / NettyClientPublicExecutor 两个池 + 按异常类型分类的
-# 重试链（sendMessageAsync），以及有界队列的 executor rejected
+# Async-send chain: the AsyncSenderExecutor / NettyClientPublicExecutor pools + a retry chain classified
+# by exception type (sendMessageAsync), and executor rejected on the bounded queue
 add_executable(rmq_test_producer_async test_producer_async.cpp)
 target_link_libraries(rmq_test_producer_async PRIVATE rocketmq::remoting)
 add_test(NAME producer_async COMMAND rmq_test_producer_async)
 
-# 异步发送背压基元：公平（只有队首能拿）+ 运行时原地改容量（在途保留、叫醒等待者）
+# Async-send backpressure primitives: fairness (only the head can take) + in-place runtime capacity change (in-flight retained, waiters woken)
 add_executable(rmq_test_backpressure test_backpressure.cpp)
 target_link_libraries(rmq_test_backpressure PRIVATE rocketmq::remoting)
 add_test(NAME backpressure COMMAND rmq_test_backpressure)
 
-# POP 模式：CK 串编解码 + 请求头字段名守卫 + POP_CK 反构
+# POP mode: CK-string encode/decode + request-header field-name guards + POP_CK reconstruction
 add_executable(rmq_test_pop test_pop.cpp)
 target_link_libraries(rmq_test_pop PRIVATE rocketmq::remoting)
 add_test(NAME pop COMMAND rmq_test_pop)
 
-# POP **消费侧**（pop_mode 消费循环）本地单测
+# POP **consumer side** (pop_mode consume loop) local unit tests
 add_executable(rmq_test_pop_consumer test_pop_consumer.cpp)
 target_link_libraries(rmq_test_pop_consumer PRIVATE rocketmq::remoting)
 add_test(NAME pop_consumer COMMAND rmq_test_pop_consumer)
 
-# POP + 顺序监听器（顺序消费的 POP 变体，5.5.0 未完成骨架）：
-# 分派进骨架后 listener 不被调、不 ack，请求集按 (pq, mq) 去重、pq 撤销才摘
+# POP + orderly listener (the POP variant of orderly consumption, an unfinished 5.5.0 skeleton):
+# after dispatch into the skeleton the listener is not called and not acked; the request set is deduped by (pq, mq), removed only when pq is revoked
 add_executable(rmq_test_pop_orderly test_pop_orderly.cpp)
 target_link_libraries(rmq_test_pop_orderly PRIVATE rocketmq::remoting)
 add_test(NAME pop_orderly COMMAND rmq_test_pop_orderly)
 
-# classic 并发消费的 ackIndex 语义（processConsumeResult 的消费结果分派）：部分 ack 的尾巴回投、
-# 回投失败钳住位点、RECONSUME_LATER 覆盖宽 ackIndex、广播丢尾巴
+# ackIndex semantics of classic concurrent consumption (the consume-result dispatch of processConsumeResult): the tail of a partial ack is redelivered,
+# a failed redelivery pins the offset, RECONSUME_LATER overrides a wide ackIndex, broadcast drops the tail
 add_executable(rmq_test_consume_ack_index test_consume_ack_index.cpp)
 target_link_libraries(rmq_test_consume_ack_index PRIVATE rocketmq::remoting)
 add_test(NAME consume_ack_index COMMAND rmq_test_consume_ack_index)
 
-# 顺序消费的重投闸门：-1 的两套含义、
-# 本地 +1、用尽后回投那条消息的字段、回投失败仍挂起，以及 %RETRY% 属性抬进发送头
+# The redelivery gate for orderly consumption: the two meanings of -1,
+# local +1, the fields of the message redelivered after exhaustion, a failed redelivery still suspends, and the %RETRY% attribute lifted into the send header
 add_executable(rmq_test_orderly_reconsume test_orderly_reconsume.cpp)
 target_link_libraries(rmq_test_orderly_reconsume PRIVATE rocketmq::remoting)
 add_test(NAME orderly_reconsume COMMAND rmq_test_orderly_reconsume)
 
-# 消息轨迹：逐字节对拍向量 + javaSplit 语义 + 无 keys SubBefore / 坏记录隔离回归
+# Message trace: byte-for-byte comparison vectors + javaSplit semantics + regression for no-keys SubBefore / isolation of bad records
 add_executable(rmq_test_trace test_trace.cpp)
 target_link_libraries(rmq_test_trace PRIVATE rocketmq::remoting)
 add_test(NAME trace COMMAND rmq_test_trace)
 
-# 钩子：CheckForbiddenHook（不吞异常）与 FilterMessageHook（异常吞掉 + 拉取/POP 差异）
-# 以及订阅语义 tagsSet/codeSet 的对拍向量
+# Hooks: CheckForbiddenHook (does not swallow exceptions) and FilterMessageHook (swallows exceptions + pull/POP difference)
+# and the comparison vectors for subscription semantics tagsSet/codeSet
 add_executable(rmq_test_hook test_hook.cpp)
 target_link_libraries(rmq_test_hook PRIVATE rocketmq::remoting)
 add_test(NAME hook COMMAND rmq_test_hook)
 
-# 消费线程弹性：ConsumeExecutor（core/max 两档）+ updateCorePoolSize 五条守卫 +
-# adjustThreadPool 的上游 no-op 语义 + msgAccCnt
+# Consume-thread elasticity: ConsumeExecutor (core/max two tiers) + five guards for updateCorePoolSize +
+# the upstream no-op semantics of adjustThreadPool + msgAccCnt
 add_executable(rmq_test_consume_thread_pool test_consume_thread_pool.cpp)
 target_link_libraries(rmq_test_consume_thread_pool PRIVATE rocketmq::remoting)
 add_test(NAME consume_thread_pool COMMAND rmq_test_consume_thread_pool)
 
-# 动态 name server：DefaultTopAddressing 的 URL 规则 / clearNewLine / mock 地址服务器
+# Dynamic name server: DefaultTopAddressing URL rules / clearNewLine / mock address server
 add_executable(rmq_test_top_addressing test_top_addressing.cpp)
 target_link_libraries(rmq_test_top_addressing PRIVATE rocketmq::remoting)
 add_test(NAME top_addressing COMMAND rmq_test_top_addressing)
@@ -158,12 +158,12 @@ add_executable(rmq_test_consumer_stats test_consumer_stats.cpp)
 target_link_libraries(rmq_test_consumer_stats PRIVATE rocketmq::remoting)
 add_test(NAME consumer_stats COMMAND rmq_test_consumer_stats)
 
-# W3C traceparent：生成/校验/子 span/注入不覆盖/属性提取
+# W3C traceparent: generation/validation/child span/injection does not overwrite/attribute extraction
 add_executable(rmq_test_trace_context test_trace_context.cpp)
 target_link_libraries(rmq_test_trace_context PRIVATE rocketmq::remoting)
 add_test(NAME trace_context COMMAND rmq_test_trace_context)
 
-# 跨语言互操作（C++ <-> Python 参考客户端）。依赖 python 侧 venv，不存在则跳过。
+# Cross-language interop (C++ <-> Python reference client). Depends on the python-side venv; skipped if absent.
 set(RMQ_PY_VENV "${CMAKE_CURRENT_SOURCE_DIR}/../../python/.venv/bin/python")
 if(EXISTS "${RMQ_PY_VENV}")
     add_test(NAME interop
@@ -171,186 +171,186 @@ if(EXISTS "${RMQ_PY_VENV}")
                      $<TARGET_FILE:rmq_interop>)
 endif()
 
-# 轻量拉取消费者（DefaultLitePullConsumer）：start 前纯状态行为 + 221/309 body wire 形状
+# Lite-pull consumer (DefaultLitePullConsumer): pure state behavior before start + 221/309 body wire shape
 add_executable(rmq_test_lite_pull test_lite_pull.cpp)
 target_link_libraries(rmq_test_lite_pull PRIVATE rocketmq::remoting)
 add_test(NAME lite_pull COMMAND rmq_test_lite_pull)
 
-# 轻量拉取游标：每轮成功拉取都跟随 nextBeginOffset，
-# 不只在 FOUND；顺带锁死 FIRST_OFFSET 不发 GET_MIN_OFFSET（帧内假集群，非 mock）
+# Lite-pull cursor: every successful pull round follows nextBeginOffset,
+# not only on FOUND; also pins that FIRST_OFFSET does not send GET_MIN_OFFSET (in-frame fake cluster, not a mock)
 add_executable(rmq_test_lite_pull_cursor test_lite_pull_cursor.cpp)
 target_link_libraries(rmq_test_lite_pull_cursor PRIVATE rocketmq::remoting)
 add_test(NAME lite_pull_cursor COMMAND rmq_test_lite_pull_cursor)
 
-# 队列分配策略（AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM /
-# MACHINE_ROOM_NEARBY）：分配结果对拍 + 守卫 + 消费者可替换
+# Queue allocation strategies (AVG / AVG_BY_CIRCLE / CONFIG / CONSISTENT_HASH / MACHINE_ROOM /
+# MACHINE_ROOM_NEARBY): allocation-result comparison + guards + consumer replaceability
 add_executable(rmq_test_allocate_strategy test_allocate_strategy.cpp)
 target_link_libraries(rmq_test_allocate_strategy PRIVATE rocketmq::remoting)
 add_test(NAME allocate_strategy COMMAND rmq_test_allocate_strategy)
 
-# 一致性哈希环（CONSISTENT_HASH 的底座）：MD5 官方向量 + 落点/回绕/replica 口径
+# Consistent-hash ring (the basis of CONSISTENT_HASH): MD5 official vectors + landing/wrap-around/replica conventions
 add_executable(rmq_test_consistent_hash test_consistent_hash.cpp)
 target_link_libraries(rmq_test_consistent_hash PRIVATE rocketmq::remoting)
 add_test(NAME consistent_hash COMMAND rmq_test_consistent_hash)
 
-# Validators fast-fail：topic/group 字符表与长度 + checkMessage 文案/顺序/响应码 +
-# start() 组名守卫（非法/保留组不碰网络即失败）
+# Validators fast-fail: topic/group character tables and length + checkMessage wording/order/response code +
+# start() group-name guard (illegal/reserved groups fail without touching the network)
 add_executable(rmq_test_validators test_validators.cpp)
 target_link_libraries(rmq_test_validators PRIVATE rocketmq::remoting)
 add_test(NAME validators COMMAND rmq_test_validators)
 
-# broker 反向推送 40 NOTIFY_CONSUMER_IDS_CHANGED：实例级处理器 + 整组唤醒 + 计数
-#（真机用例注入不了反向请求，只能离线把分派锁死）
+# broker reverse push 40 NOTIFY_CONSUMER_IDS_CHANGED: instance-level handler + whole-group wake-up + counting
+# (a real-machine case cannot inject a reverse request, so only offline dispatch can be pinned)
 add_executable(rmq_test_broker_requests test_broker_requests.cpp)
 target_link_libraries(rmq_test_broker_requests PRIVATE rocketmq::remoting)
 add_test(NAME broker_requests COMMAND rmq_test_broker_requests)
 
-# 定时消息撤回（370）：句柄编解码对拍线上向量 + bname 键名 + 本地校验顺序（不打网络）
+# Scheduled-message recall (370): handle encode/decode compared against the wire vector + bname key name + local validation order (does not hit the network)
 add_executable(rmq_test_recall_message test_recall_message.cpp)
 target_link_libraries(rmq_test_recall_message PRIVATE rocketmq::remoting)
 add_test(NAME recall_message COMMAND rmq_test_recall_message)
 
-# CHECK_CLIENT_CONFIG(46)：mock broker 锁死协议形状与分支语义
-#（SQL92 写错时 broker 静默放行全部消息，只有这笔请求能把它变成启动错误；真机见 rmq_sql92_live）
+# CHECK_CLIENT_CONFIG(46): mock broker pins the protocol shape and branch semantics
+# (when SQL92 is mistyped the broker silently lets all messages through; only this request can turn it into a startup error; for real-machine see rmq_sql92_live)
 add_executable(rmq_test_check_client_config test_check_client_config.cpp)
 target_link_libraries(rmq_test_check_client_config PRIVATE rocketmq::remoting)
 add_test(NAME check_client_config COMMAND rmq_test_check_client_config)
 
-# isPullExpired 停摆自愈：锁阈值算术与逐队列时刻表（判错方向要么静默不消费、要么凭空重投）。
-# 「撤掉之后真能重新消费」要起真线程，只能在真机验（examples/live_consumer.cpp 的停摆场景）。
+# isPullExpired stall self-healing: pin the threshold arithmetic and the per-queue timetable (a wrong direction either silently stops consuming or invents redelivery).
+# "can actually resume consumption after revocation" needs a real thread, so it can only be verified on a real machine (the stall scenario in examples/live_consumer.cpp).
 add_executable(rmq_test_pull_expired test_pull_expired.cpp)
 target_link_libraries(rmq_test_pull_expired PRIVATE rocketmq::remoting)
 add_test(NAME pull_expired COMMAND rmq_test_pull_expired)
 
-# 拉取前流控五个阈值（ProcessQueue 积压水位）：只有条数那条会在小消息场景先命中，其余四条
-# 判错方向是静默的（字节/跨度/topic 级闸门失效 ⇒ 缓冲无限堆），必须离线锁死再上真机。
+# The five pre-pull flow-control thresholds (ProcessQueue backlog watermarks): only the message-count one is hit first in a small-message scenario; the other four
+# judge direction silently (a byte/span/topic-level gate failing => buffers pile up unbounded), so they must be pinned offline before going to a real machine.
 add_executable(rmq_test_flow_control test_flow_control.cpp)
 target_link_libraries(rmq_test_flow_control PRIVATE rocketmq::remoting)
 add_test(NAME flow_control COMMAND rmq_test_flow_control)
 
-# 退出注销 UNREGISTER_CLIENT(35)：mock broker 锁死头的形状（空白组槽位整个不上线）与
-# 「每台 broker 含从节点」的扇出（broker 端判的是 group != null，真机看不出来）。
-# 真机侧的证据在 examples/live_producer_unregister.cpp（抓帧 + 204 前后对比）。
+# Shutdown unregister UNREGISTER_CLIENT(35): mock broker pins the header shape (a blank group slot is not sent online at all) and
+# the "every broker incl. slaves" fan-out (the broker-side check is group != null, invisible on a real machine).
+# The real-machine evidence is in examples/live_producer_unregister.cpp (frame capture + 204 before/after comparison).
 add_executable(rmq_test_producer_unregister test_producer_unregister.cpp)
 target_link_libraries(rmq_test_producer_unregister PRIVATE rocketmq::remoting)
 add_test(NAME producer_unregister COMMAND rmq_test_producer_unregister)
 
-# 推送消费者配置数值闸门（checkConfig）：十三道区间的边界值、越界文案、
-# min/max 相对关系与"坏配置在建 MQClientInstance 之前就被拒"（地址指向没人监听的端口，
-# 报的必须是配置文案而不是连接失败）。真机侧的"边界值真能启动并消费 + broker 查无此组"
-# 在 examples/live_flow_control.cpp 的 S5。
+# Push-consumer config numeric gates (checkConfig): the boundary values of thirteen ranges, out-of-range wording,
+# the min/max relative relationship and "a bad config is rejected before MQClientInstance is built" (the address points at a port nobody
+# listens on; the reported error must be the config wording not a connection failure). The real-machine side of "boundary values can actually start and consume + broker has no such group"
+# is in S5 of examples/live_flow_control.cpp.
 add_executable(rmq_test_consumer_check_config test_consumer_check_config.cpp)
 target_link_libraries(rmq_test_consumer_check_config PRIVATE rocketmq::remoting)
 add_test(NAME consumer_check_config COMMAND rmq_test_consumer_check_config)
 
-# 订阅后置 + 立即心跳（运行中 subscribe 的处理）：
-# start() 之后 subscribe 不再抛 already started，且立刻进活订阅表；unsubscribe 只删表项。
-# 消费者对着连不上的 name server 启动（零 broker ⇒ 心跳一台都发不出去），
-# 报文层面「broker 真收到带新订阅的心跳」由 examples/live_subscribe.cpp 真机验证。
+# Subscribe post-hoc + immediate heartbeat (handling a subscribe while running):
+# after start(), subscribe no longer throws already started and enters the live subscription table at once; unsubscribe only deletes the entry.
+# The consumer starts against an unreachable name server (zero brokers => no heartbeat can be sent to any),
+# the wire-level "the broker really received a heartbeat carrying the new subscription" is verified on a real machine by examples/live_subscribe.cpp.
 add_executable(rmq_test_subscribe_after_start test_subscribe_after_start.cpp)
 target_link_libraries(rmq_test_subscribe_after_start PRIVATE rocketmq::remoting)
 add_test(NAME subscribe_after_start COMMAND rmq_test_subscribe_after_start)
 
-# 广播本地位点文件：fastjson2「对象作 key」格式逐字节对拍 + .bak 滚动 +
-# 主文件缺失回退 .bak（四端互认 ~/.rocketmq_offsets 的底座）
+# Broadcast local offset file: byte-for-byte comparison of the fastjson2 "object-as-key" format + .bak rolling +
+# falling back to .bak when the main file is missing (the basis for clients to mutually recognize ~/.rocketmq_offsets)
 add_executable(rmq_test_local_offsets test_local_offsets.cpp)
 target_link_libraries(rmq_test_local_offsets PRIVATE rocketmq::remoting)
 add_test(NAME local_offsets COMMAND rmq_test_local_offsets)
 
-# 定时任务节奏（MQClientInstance 的 startScheduledTask）：五个门面的
-# pollNameServerInterval=30000 / persistConsumerOffsetInterval=5000 默认值与透传 +
-# 「首跳落在 initialDelay（10ms）而不是 initialDelay+周期」+ 周期真按传入值走。
-# 假 name server 记录 GET_ROUTEINFO_BY_TOPIC 的到达时刻 —— 这两个偏差在真机上只
-# 表现为「慢」，不表现为「错」，只有计时断言能抓住。
+# Scheduled-task cadence (startScheduledTask of MQClientInstance): the default values and pass-through of
+# pollNameServerInterval=30000 / persistConsumerOffsetInterval=5000 across the five facades +
+# "the first hop lands on initialDelay (10ms) not initialDelay+period" + the period really following the passed-in value.
+# The fake name server records the arrival times of GET_ROUTEINFO_BY_TOPIC -- these two deviations on a real machine
+# show only as "slow" not "wrong", so only timing assertions can catch them.
 add_executable(rmq_test_scheduled_intervals test_scheduled_intervals.cpp)
 target_link_libraries(rmq_test_scheduled_intervals PRIVATE rocketmq::remoting)
 add_test(NAME scheduled_intervals COMMAND rmq_test_scheduled_intervals)
 
-# postSubscriptionWhenPull（推送消费者默认 false）+ pullFromWhichNode
-# （recalculatePullFromWhichNode / updatePullFromWhichNode）：
-# findBrokerAddressInSubscribe 的四个分支、按 brokerId 选主/从的真实 socket 报文、
-# 从节点清 COMMIT_OFFSET 位（:219-221）、SUBSCRIPTION 位关闭时 subscription 键不上线、
-# 以及从节点缺席时回退主节点。
+# postSubscriptionWhenPull (push consumer default false) + pullFromWhichNode
+# (recalculatePullFromWhichNode / updatePullFromWhichNode):
+# the four branches of findBrokerAddressInSubscribe, the real-socket packets choosing master/slave by brokerId,
+# clearing the COMMIT_OFFSET bit on slaves (:219-221), the subscription key not being sent online when the SUBSCRIPTION bit is off,
+# and falling back to the master when the slave is absent.
 add_executable(rmq_test_pull_post_subscription test_pull_post_subscription.cpp)
 target_link_libraries(rmq_test_pull_post_subscription PRIVATE rocketmq::remoting)
 add_test(NAME pull_post_subscription COMMAND rmq_test_pull_post_subscription)
 
-# 生产者自动攒批（ProduceAccumulator）：归并键四元组 / 批量 body 组装的
-# ID 顺序 / 四组批级属性口径 / 全局字节闸门 / 守卫线程对空批的清理 / 拆分批量应答 /
-# 同步阻塞语义 / 异步回调与额度归还（含漏还路径）/ sender 生命周期。
+# Producer auto-batching (ProduceAccumulator): the four-tuple merge key / the ID order of batch-body assembly /
+# the conventions of four groups of batch-level attributes / the global byte gate / the guard thread cleaning empty batches / splitting batch replies /
+# synchronous blocking semantics / async callback and permit return (incl. the missing-return path) / sender lifecycle.
 add_executable(rmq_test_produce_accumulator test_produce_accumulator.cpp)
 target_link_libraries(rmq_test_produce_accumulator PRIVATE rocketmq::remoting)
 add_test(NAME produce_accumulator COMMAND rmq_test_produce_accumulator)
 
-# correctTagsOffset：
-# 空应答（NO_NEW_MSG / NO_MATCHED_MSG）且 ProcessQueue 为空时把"已消费位点"抬到
-# 应答的 nextBeginOffset（increaseOnly）；闸门 = pending 为空 **且** 在途批次为 0
-#（msgCount 要等 listener 返回才减）。漏了它位点永久落后、闸门写松则崩溃时静默跳消息。
+# correctTagsOffset:
+# on an empty reply (NO_NEW_MSG / NO_MATCHED_MSG) with an empty ProcessQueue, raise the "consumed offset" to
+# the reply's nextBeginOffset (increaseOnly); the gate = pending empty **and** in-flight batches 0
+# (msgCount only decreases after the listener returns). Missing it leaves the offset permanently behind; loosening the gate silently skips messages on crash.
 add_executable(rmq_test_correct_tags_offset test_correct_tags_offset.cpp)
 target_link_libraries(rmq_test_correct_tags_offset PRIVATE rocketmq::remoting)
 add_test(NAME correct_tags_offset COMMAND rmq_test_correct_tags_offset)
 
-# OFFSET_ILLEGAL 纠错：位点被 broker 纠正时
-# 覆盖写修正值并冻结（ControllableOffset allowToUpdate=false）、撤队列（setDropped）、
-# 立刻落盘（persist）、叫醒 rebalance 重建。冻结/代号写错是静默的两种极端：位点与 broker
-# 来回弹跳，或崩溃后从非法位点重启、纠错白做。
+# OFFSET_ILLEGAL recovery: when the offset is corrected by the broker
+# overwrite with the corrected value and freeze it (ControllableOffset allowToUpdate=false), revoke the queue (setDropped),
+# persist immediately (persist), wake rebalance to rebuild. Getting the freeze/epoch wrong is two silent extremes: the offset bounces back and forth with the broker,
+# or after a crash it restarts from an illegal offset and the correction is wasted.
 add_executable(rmq_test_offset_illegal_recover test_offset_illegal_recover.cpp)
 target_link_libraries(rmq_test_offset_illegal_recover PRIVATE rocketmq::remoting)
 add_test(NAME offset_illegal_recover COMMAND rmq_test_offset_illegal_recover)
 
-# 220 RESET_CONSUMER_CLIENT_OFFSET（MQClientInstance 的 resetOffset）：
-# map/ForC 两种请求体形状（发起方 language=JAVA 时 broker 只推 map；language=CPP 的 SDK
-# 管理端让 broker 推数组，本端口两种都认）+ 重置 = 撤队列（代号 +1 丢掉在途批次）+
-# 新位点经撤销尾巴落盘（广播本地位点文件里必须是新值、且与兄弟队列 merge）。
-# 只写内存表的实现在真机上是静默失效的（旧批次 ack 把位点推回原处），必须离线锁死。
+# 220 RESET_CONSUMER_CLIENT_OFFSET (resetOffset of MQClientInstance):
+# the two request-body shapes map/ForC (when the initiator language=JAVA the broker pushes only the map; a language=CPP SDK
+# admin side makes the broker push an array, and this port accepts both) + reset = revoke the queue (epoch +1 discards in-flight batches) +
+# the new offset persisted via the revoked tail (the broadcast local-offset file must hold the new value and merge with sibling queues).
+# An implementation that only writes the in-memory table fails silently on a real machine (an old batch's ack pushes the offset back), so it must be pinned offline.
 add_executable(rmq_test_reset_offset test_reset_offset.cpp)
 target_link_libraries(rmq_test_reset_offset PRIVATE rocketmq::remoting)
 add_test(NAME reset_offset COMMAND rmq_test_reset_offset)
 
-# 拉模式消费者心跳（#98）：靠实例级周期任务把本组
-# 注册给 broker（consumeType=CONSUME_ACTIVELY、consumeFromWhere=CONSUME_FROM_LAST_OFFSET、
-# 订阅集 setSubVersion(0L)）；轻量拉取同样 ACTIVELY。
-# 判据取线上报文：假端点收 HEART_BEAT 的 JSON body 与 UNREGISTER_CLIENT(35) 的 extFields。
+# Pull-mode consumer heartbeat (#98): relies on the instance-level periodic task to register this group
+# with the broker (consumeType=CONSUME_ACTIVELY, consumeFromWhere=CONSUME_FROM_LAST_OFFSET,
+# subscription set setSubVersion(0L)); lite-pull is also ACTIVELY.
+# The criterion uses the wire packet: a fake endpoint receives the JSON body of HEART_BEAT and the extFields of UNREGISTER_CLIENT(35).
 add_executable(rmq_test_pull_consumer_heartbeat test_pull_consumer_heartbeat.cpp)
 target_link_libraries(rmq_test_pull_consumer_heartbeat PRIVATE rocketmq::remoting)
 add_test(NAME pull_consumer_heartbeat COMMAND rmq_test_pull_consumer_heartbeat)
 
-# 拉模式消费者的平衡视图（fetchMessageQueuesInBalance 的内部口径）：官方示例
-# 靠它决定「只拉自己那一份」。本端口没有后台
-# rebalance 线程，视图按 rebalanceByTopic 的同一条公式当场算，故判据落在：单实例全量、
-# 两实例不重叠且合起来覆盖全部、算不动时保持现有分配（绝不独占全部）、广播不看 cidAll、
-# 未启动直接抛、返回已剥命名空间。
+# The balance view of the pull-mode consumer (the internal convention of fetchMessageQueuesInBalance): the official example
+# relies on it to decide "pull only my share". This port has no background
+# rebalance thread; the view is computed on the spot by the same formula as rebalanceByTopic, so the criteria land on: single instance full set,
+# two instances non-overlapping and together covering all, keeping the current allocation when it cannot compute (never monopolizing all), broadcast ignoring cidAll,
+# throwing directly when not started, and returning the already-stripped namespace.
 add_executable(rmq_test_pull_consumer_balance_view test_pull_consumer_balance_view.cpp)
 target_link_libraries(rmq_test_pull_consumer_balance_view PRIVATE rocketmq::remoting)
 add_test(NAME pull_consumer_balance_view COMMAND rmq_test_pull_consumer_balance_view)
 
-# 发布地址「只要 master」（#100，findBrokerAddressInPublish）：
-# 平表由真的 updateTopicRouteInfoFromNameServer 写入、查不到先刷路由再查
-# （sendKernelImpl）、仍拿不到抛 "The broker[X] not exist" 且码为 -1，以及
-# 管理 offset 查询同口径。
-# 队列集的筛选在 test_route_heartbeat.cpp 里；这条边界是
-# 「本端立刻报错」与「把写请求打到从节点上白挨一轮 SYSTEM_BUSY(2)」的分水岭。
+# Publish address "master only" (#100, findBrokerAddressInPublish):
+# the flat table is written by a real updateTopicRouteInfoFromNameServer; on a miss it refreshes the route then re-queries
+# (sendKernelImpl); still-missing throws "The broker[X] not exist" with code -1, and
+# admin offset queries use the same convention.
+# Queue-set filtering is in test_route_heartbeat.cpp; this boundary is the
+# watershed between "this end errors immediately" and "sending a write request to a slave and pointlessly taking a round of SYSTEM_BUSY(2)".
 add_executable(rmq_test_publish_route_master test_publish_route_master.cpp)
 target_link_libraries(rmq_test_publish_route_master PRIVATE rocketmq::remoting)
 add_test(NAME publish_route_master COMMAND rmq_test_publish_route_master)
 
-# cleanExpiredMsg 挂起逃生口（消费服务与 ProcessQueue 两侧联动）：listener 卡死不返回时唯一的回收路径。离线锁
-# 「只看队首 / 严格大于阈值 / 单轮 16 条 / 回投失败留在原地 / 撤走的队列不再被扫」与
-# 消费路径的配合（在途登记、containsMessage 闸门、隔轮不泄漏）；
-# 「回投成功 → %RETRY% 重投 → reconsumeTimes=1 的第二次投递」只能在真机验
-#（examples/live_clean_expired_msg.cpp）。
+# cleanExpiredMsg suspension escape hatch (coordination on both the consume-service and ProcessQueue sides): the only reclaim path when the listener hangs without returning. Offline pins
+# "look only at the head / strictly greater than the threshold / 16 per round / a failed redelivery stays in place / a revoked queue is no longer scanned" and
+# coordination with the consume path (in-flight registration, the containsMessage gate, no leak across rounds);
+# "successful redelivery -> %RETRY% redelivery -> the second delivery with reconsumeTimes=1" can only be verified on a real machine
+# (examples/live_clean_expired_msg.cpp).
 add_executable(rmq_test_clean_expired_msg test_clean_expired_msg.cpp)
 target_link_libraries(rmq_test_clean_expired_msg PRIVATE rocketmq::remoting)
 add_test(NAME clean_expired_msg COMMAND rmq_test_clean_expired_msg)
 
-# 轻量拉取消费者的 topic 队列集合变更监听：离线锁「集合真的变了才回调一次」「运行中注册
-# 先记快照、当前状态不算变化」「每趟现问 name server」「查不到路由的 topic 只跳过自己」
-#「重复注册覆盖旧监听器」「命名空间口径」「未启动查队列报错」。
+# The lite-pull consumer's topic queue-set change listener: offline pins "the callback fires once only when the set really changed",
+# "registering while running records a snapshot first and the current state is not counted as a change", "each pass re-queries the name server", "a topic whose route is not found skips only itself",
+# "a duplicate registration overwrites the old listener", "namespace conventions", and "querying queues before start errors".
 add_executable(rmq_test_lite_topic_queue_change test_lite_topic_queue_change.cpp)
 target_link_libraries(rmq_test_lite_topic_queue_change PRIVATE rocketmq::remoting)
 add_test(NAME lite_topic_queue_change COMMAND rmq_test_lite_topic_queue_change)
 
-# 静态主题路由：mock broker 名推导 + 端点表（五个口径的用例）
+# Static-topic route: mock broker-name derivation + endpoint table (cases for the five conventions)
 add_executable(rmq_test_static_topic test_static_topic.cpp)
 target_link_libraries(rmq_test_static_topic PRIVATE rocketmq::remoting)
 add_test(NAME static_topic COMMAND rmq_test_static_topic)

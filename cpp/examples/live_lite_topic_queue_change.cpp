@@ -1,18 +1,18 @@
-// LitePull 消费者 topic 队列集合变更监听真机验证。
-// 用法：rmq_live_lite_topic_queue_change 127.0.0.1:9876
+// Live-cluster verification of the LitePull consumer's topic queue-set change listener.
+// Usage: rmq_live_lite_topic_queue_change 127.0.0.1:9876
 //
-// 为什么必须真机：比对趟次每次都现问 nameserver 取订阅队列集合，而普通路由缓存是 30s
-// 才刷一次。假 nameserver 能证比对逻辑，只有真集群能证「现查」。所以这里把检查周期压到
-// 1s 下限、路由轮询保持默认 30s，再把 topic 真的扩容：过了首查延迟的稳定期里，从
-// nameserver 报出新队列数到监听器收到回调只该隔一两趟检查（≤5s）；如果比对读的是 30s
-// 缓存，这个窗口会拖到半分钟以上。
+// Why a real cluster is required: every comparison pass queries the nameserver freshly for the subscribed queue set, while the ordinary
+// route cache only refreshes every 30 s. A fake nameserver can prove the comparison logic; only a real cluster can prove the "fresh query".
+// So here the check interval is squeezed to the 1 s floor, route polling stays at the default 30 s, and the topic really gets
+// scaled out: in the steady period past the first-query delay, from the nameserver reporting the new queue count to the listener receiving the callback
+// there should be only one or two check passes (<=5 s); if the comparison read the 30 s cache, this window would stretch beyond half a minute.
 //
-//   L1  队列没动 ⇒ 监听器不被打扰
-//   L1b 首查那趟真的跑过 ⇒ 依旧静默（运行中注册的快照不算变化）
-//   L2  扩容 2→4：nameserver 认了之后，回调紧跟几趟检查
-//   L3  回调后快照推进 ⇒ 同一套队列不再重复回调
-//   L4  缩容 4→2：同样靠现查看到
-//   L5  没建过的 topic：空队列集算「查不到」，不伪装成缩到 0 队列
+//   L1  queues unchanged => the listener is not disturbed
+//   L1b the first-query pass really ran => still silent (a snapshot registered while running is not a change)
+//   L2  scale out 2→4: once the nameserver agrees, the callback follows within a few check passes
+//   L3  snapshot advances after the callback => the same queue set is not reported again
+//   L4  scale in 4→2: likewise observed through the fresh query
+//   L5  a topic never created: an empty queue set counts as "not found", not disguised as scaled down to 0 queues
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -46,11 +46,11 @@ void check(const std::string& name, bool ok, const std::string& detail = std::st
 
 constexpr int32_t kBaseQueueNum = 2;
 constexpr int32_t kScaledQueueNum = 4;
-// 检查周期压到下限，好把「每趟现查」和「吃 30s 缓存」在时间上分开。
+// Squeeze the check interval to the floor so "a fresh query each pass" and "eating the 30 s cache" separate in time.
 constexpr int32_t kCheckIntervalMs = 1000;
-// 后台比对的首查延迟（与实现里的默认值一致）。
+// First-query delay of the background comparison (matches the default in the implementation).
 constexpr int64_t kFirstDelayMs = 10000;
-// nameserver 见到变化后允许的最大回调间隔。
+// Largest allowed callback gap after the nameserver has seen the change.
 constexpr int64_t kFreshWindowMs = 5000;
 
 std::string idsText(const std::vector<int32_t>& ids) {
@@ -62,7 +62,7 @@ std::string idsText(const std::vector<int32_t>& ids) {
     return s;
 }
 
-/// 只记回调，不改状态；后台线程也会调它，所以自带锁。
+/// Only records callbacks, changes no state; the background thread calls it too, so it carries its own lock.
 class Recorder : public TopicMessageQueueChangeListener {
 public:
     void onChanged(const std::string& topic,
@@ -98,7 +98,7 @@ void sleepMs(int64_t ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
-/// 现查队列集合，直到报出 want 个为止；返回等待毫秒数，超时返回 -1。
+/// Queries the queue set fresh until it reports want queues; returns the waited milliseconds, -1 on timeout.
 int64_t waitQueueNum(DefaultLitePullConsumer& c, const std::string& topic, int32_t want,
                      int64_t timeoutMs) {
     int64_t waited = 0;
@@ -108,7 +108,7 @@ int64_t waitQueueNum(DefaultLitePullConsumer& c, const std::string& topic, int32
                 return waited;
             }
         } catch (const std::exception&) {
-            // 路由还没更新，继续等
+            // the route has not updated yet, keep waiting
         }
         sleepMs(250);
         waited += 250;
@@ -116,7 +116,7 @@ int64_t waitQueueNum(DefaultLitePullConsumer& c, const std::string& topic, int32
     return -1;
 }
 
-/// 等监听器记到 want 条回调；返回等待毫秒数，超时返回 -1。
+/// Waits until the listener records want callbacks; returns the waited milliseconds, -1 on timeout.
 int64_t waitEvents(Recorder& rec, size_t want, int64_t timeoutMs) {
     int64_t waited = 0;
     while (waited < timeoutMs) {
@@ -159,56 +159,56 @@ int main(int argc, char** argv) {
     c.setNamesrvAddr(namesrv);
     c.setInstanceName("lite-qc-live");
     c.setTopicMetadataCheckIntervalMillis(kCheckIntervalMs);
-    check("L0 检查周期压到 1s 下限", c.topicMetadataCheckIntervalMillis() == kCheckIntervalMs,
+    check("L0 check interval squeezed to the 1 s floor", c.topicMetadataCheckIntervalMillis() == kCheckIntervalMs,
           std::to_string(c.topicMetadataCheckIntervalMillis()));
     c.subscribe(topic, "*");
     c.start();
     auto loopStart = std::chrono::steady_clock::now();
 
     int64_t seen = waitQueueNum(c, topic, kBaseQueueNum, 30000);
-    check("L0 路由可见（2 个队列）", seen >= 0, std::to_string(seen) + "ms");
+    check("L0 route visible (2 queues)", seen >= 0, std::to_string(seen) + "ms");
 
     auto rec = std::make_shared<Recorder>();
-    // 运行中注册 ⇒ 立刻记快照 ⇒ 首轮不该回调
+    // Registering while running => the snapshot is recorded at once => the first round must not call back
     c.registerTopicMessageQueueChangeListener(topic, rec);
     sleepMs(3000);
-    check("L1 队列没动 ⇒ 静默", rec->count() == 0, "events=" + std::to_string(rec->count()));
+    check("L1 queues unchanged => silent", rec->count() == 0, "events=" + std::to_string(rec->count()));
 
-    // 等到首查延迟过去，此后只剩 1s 一趟的稳定期
+    // Wait past the first-query delay; from here on only the stable period of one pass per second remains
     int64_t elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - loopStart).count();
     if (elapsed < kFirstDelayMs + 2000) sleepMs(kFirstDelayMs + 2000 - elapsed);
-    check("L1b 首查那趟真的跑过 ⇒ 依旧静默", rec->count() == 0,
+    check("L1b the first-query pass really ran => still silent", rec->count() == 0,
           "events=" + std::to_string(rec->count()));
 
-    // ---- L2 扩容 2→4
+    // ---- L2 scale out 2→4
     scaleTopic(namesrv, topic, "PG_QcUp_" + std::to_string(stamp), kScaledQueueNum);
     int64_t nsMs = waitQueueNum(c, topic, kScaledQueueNum, 45000);
-    check("L2a nameserver 报出 4 个队列", nsMs >= 0, std::to_string(nsMs) + "ms");
+    check("L2a nameserver reports 4 queues", nsMs >= 0, std::to_string(nsMs) + "ms");
     if (nsMs >= 0) {
         int64_t cb = waitEvents(*rec, 1, kFreshWindowMs);
-        check("L2b 比对趟次现查路由（回调紧跟 nameserver，不等 30s 缓存）",
+        check("L2b comparison passes query the route fresh (the callback follows the nameserver, not the 30 s cache)",
               cb >= 0 && rec->lastIds() == seq(kScaledQueueNum),
               std::to_string(cb) + "ms, ids=" + idsText(rec->lastIds()));
     }
 
-    // ---- L3 快照推进
+    // ---- L3 snapshot advances
     sleepMs(3000);
-    check("L3 回调后快照推进 ⇒ 不重复回调", rec->count() == 1,
+    check("L3 snapshot advances after the callback => no repeated callback", rec->count() == 1,
           "events=" + std::to_string(rec->count()));
 
-    // ---- L4 缩容 4→2
+    // ---- L4 scale in 4→2
     scaleTopic(namesrv, topic, "PG_QcDown_" + std::to_string(stamp), kBaseQueueNum);
     nsMs = waitQueueNum(c, topic, kBaseQueueNum, 45000);
-    check("L4a nameserver 报回 2 个队列", nsMs >= 0, std::to_string(nsMs) + "ms");
+    check("L4a nameserver reports back 2 queues", nsMs >= 0, std::to_string(nsMs) + "ms");
     if (nsMs >= 0) {
         int64_t cb = waitEvents(*rec, 2, kFreshWindowMs);
-        check("L4b 缩容同样靠现查路由看到",
+        check("L4b the scale-in is likewise seen through the fresh route query",
               cb >= 0 && rec->lastIds() == seq(kBaseQueueNum),
               std::to_string(cb) + "ms, ids=" + idsText(rec->lastIds()));
     }
 
-    // ---- L5 未知 topic：空队列集算「查不到」
+    // ---- L5 unknown topic: an empty queue set counts as "not found"
     std::string raised;
     try {
         auto queues = c.fetchMessageQueues(ghost);
@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         raised = e.what();
     }
-    check("L5 未知 topic 取队列抛「查不到」而不是返回空",
+    check("L5 fetching queues of an unknown topic throws 'not found' instead of returning an empty set",
           raised.find("Namesrv return empty") != std::string::npos, raised);
 
     c.shutdown();

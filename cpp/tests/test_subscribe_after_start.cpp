@@ -1,16 +1,16 @@
-// 订阅后置 + 立即心跳（#73）离线单测 —— 不需要集群。
+// Subscribe-after-start plus immediate heartbeat (#73) offline unit test -- no cluster needed.
 //
 //
-// 为什么必须锁死：真机上「新订阅没推给 broker」是静默的 —— 只表现为
-// QUERY_TOPIC_CONSUME_BY_WHO(300) 查不到本组、新 topic 分不到队列，客户端一声不响。
+// Why it must be pinned down: "the new subscription was never pushed to the broker" is silent on a
+// real cluster -- no error at all, only QUERY_TOPIC_CONSUME_BY_WHO(300) missing the group and no queue.
 //
-// 离线能测到哪一步：这里让消费者对着一个**连不上**的 name server 启动（路由拉不到 ⇒
-// knownBrokerAddrs 为空 ⇒ 心跳一台都发不出去），因此只能证明
-//   ① start() 之后 subscribe 不再抛「already started」；
-//   ② 新订阅立刻进活订阅表（`subscribedTopics()`，也就是心跳与 rebalance 读的那张表）；
-//   ③ unsubscribe 照旧只删表项。
-// 报文层面「broker 真收到了带新订阅的心跳」由 examples/live_subscribe.cpp 在真机验证
-// （broker 侧 topicGroupTable 的 300 号查询是唯一可信观测）。
+// How far offline testing reaches: the consumer starts against a name server it **cannot reach** (no
+// route => knownBrokerAddrs empty => not one heartbeat can go out), so only these are provable:
+//   (1) subscribe() after start() no longer throws "already started";
+//   (2) the new subscription enters the live table subscribedTopics(), which heartbeat/rebalance read;
+//   (3) unsubscribe still only deletes the table entry.
+// That the broker really received a heartbeat carrying the new subscription is verified on a live
+// cluster by examples/live_subscribe.cpp (the 300 query on the broker-side topicGroupTable is the only proof).
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -39,8 +39,8 @@ void check(bool ok, const std::string& name, const std::string& detail = std::st
     }
 }
 
-// 一个永远连不上的地址：路由拉取当场 ECONNREFUSED（catch 住只记 debug 日志），
-// knownBrokerAddrs() 因此为空 —— 消费者能正常 start()，但一个包都发不出去。
+// An address that can never be reached: route fetching gets ECONNREFUSED at once (caught, logged at
+// debug only), so knownBrokerAddrs() stays empty -- start() works normally but no packet goes out.
 const char* kDeadNamesrv = "127.0.0.1:1";
 
 class NoopListener : public MessageListenerConcurrently {
@@ -94,7 +94,7 @@ void testSubscribeAfterStartIsAllowed() {
     check(hasTopic(c->subscribedTopics(), "LateSqlTopic"),
           "late selector subscription lands in the live subscription table");
 
-    // 零 broker：心跳一台都发不出去，计数器不动（这条同时是「上面没偷偷发包」的对照）。
+    // Zero brokers: no heartbeat can be sent so the counter stays put (control for "nothing sent silently").
     check(c->heartbeatCount() == 0,
           "no broker known → heartbeat count stays 0",
           std::to_string(c->heartbeatCount()));
@@ -116,7 +116,7 @@ void testUnsubscribeOnlyDropsTheEntry() {
     c->shutdown();
 }
 
-// ③ 启动前订阅照旧（回归底线）：老用法不受影响。
+// Subscribing before start() behaves exactly as before (regression floor): the old usage is untouched.
 void testSubscribeBeforeStartStillWorks() {
     DefaultMQPushConsumer c("GID_SubBeforeStartUnit");
     c.subscribe("T_A", "*");

@@ -1,25 +1,25 @@
-// lite-pull **请求码 / broker 开关**（#107）真机验证。
-// 场景 S1–S3（S2 含 a–d 四条对照腿），逐条真机断言。
+// lite-pull **request code / broker switch** (#107) verified against a real cluster.
+// Scenarios S1-S3 (S2 carries four legs a-d), asserted one by one on a live cluster.
 //
-// 为什么必须真机：`FLAG_LITE_PULL_MESSAGE(0x10)` + `LITE_PULL_MESSAGE(361)` 这条链在离线
-// 假 broker 上永远是绿的 —— 少了位、码还是 11 时，报文依然是一个完全合法的 pull，
-// 假 broker（和真 broker 的普通 pull 分支）照常回消息。能把它区分出来的只有真 broker 的
-// `litePullMessageEnable` 开关（`PullMessageProcessor:325-331` **只拦 361**）：把开关在
-// 运行时翻成 false（UPDATE_BROKER_CONFIG，无需重启）：
+// Why a live cluster is mandatory: the `FLAG_LITE_PULL_MESSAGE(0x10)` + `LITE_PULL_MESSAGE(361)` chain is
+// always green against an offline fake broker -- with the bit missing, or the code still 11, the frame remains a
+// perfectly legal pull, and the fake broker (and a real broker's plain pull branch) keeps answering with messages. Only the real
+// broker's `litePullMessageEnable` switch can tell them apart (`PullMessageProcessor:325-331` **blocks only 361**): flip the
+// switch to false at runtime (UPDATE_BROKER_CONFIG, no restart needed):
 //
-//   S1 开关默认 true：lite pull 全链路正常（基线）。
-//   S2 开关 false：
-//      S2a 裸 361 请求 → NO_PERMISSION(16) + "…for lite pull consumer is forbidden"；
-//      S2b 同队列同一位点的裸 11 请求 → 照常 SUCCESS 且拿到消息（**对照**：开关只管
-//          lite，普通 pull 不受影响 —— 没有这条腿，S2a 的失败可能只是 broker 坏了）；
-//      S2c lite 消费者安静饿死：消息明明在，poll 一条不来、拉取游标纹丝不动
-//          （旧实现位不置/码为 11，这条腿会收到消息 → 判别器变红）；
-//      S2d push 消费者照常消费（**对照**：整条消费链路没坏）。
-//   S3 开关还原 true：lite pull 立即恢复。
+//   S1 switch defaults to true: the whole lite pull path works (baseline).
+//   S2 switch false:
+//      S2a bare 361 request -> NO_PERMISSION(16) + "for lite pull consumer is forbidden";
+//      S2b bare 11 request on the same queue and offset -> still SUCCESS with messages (**control**: the switch only governs
+//          lite, plain pull is unaffected -- without this leg an S2a failure could just mean the broker is broken);
+//      S2c the lite consumer quietly starves: messages are there, yet poll never returns one and the pull cursor does not move
+//          (the old implementation left the bit unset / code at 11, so this leg would receive messages -> the discriminator turns red);
+//      S2d the push consumer keeps consuming (**control**: the whole consume chain is not broken).
+//   S3 switch restored to true: lite pull recovers immediately.
 //
-// 退出前**无条件**把 `litePullMessageEnable` 改回原值（与同类真机工具一样）。
+// Before exiting, **unconditionally** restore `litePullMessageEnable` to its original value (same as the other live tools of this kind).
 //
-// 用法：./rmq_live_lite_pull_code 127.0.0.1:9876
+// Usage: ./rmq_live_lite_pull_code 127.0.0.1:9876
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -85,7 +85,7 @@ int32_t liteFlag() {
                                      /*litePull=*/true);
 }
 
-// DefaultMQPullConsumerImpl.pullSyncImpl:248 的 4 参版本，lite 位必须为 0
+// The 4-arg version of DefaultMQPullConsumerImpl.pullSyncImpl:248; the lite bit must be 0
 int32_t classicFlag() {
     return PullSysFlag::buildSysFlag(/*commitOffset=*/false, /*suspend=*/false,
                                      /*subscription=*/true, /*classFilter=*/false);
@@ -161,7 +161,7 @@ struct Fixture {
         ClusterInfo cluster = admin.fetchBrokerClusterInfo();
         const std::vector<std::string> addrs = cluster.getBrokerAddrs();
         if (addrs.empty()) {
-            throw std::runtime_error("nameServer 无 broker 注册");
+            throw std::runtime_error("no broker registered with the name server");
         }
         brokerAddr = addrs[0];
         producer = std::make_shared<DefaultMQProducer>("GID_cpp_lite_code_pg_" + stamp);
@@ -246,29 +246,29 @@ int main(int argc, char* argv[]) {
 
         std::vector<MessageQueue> mqs = fx.queues(topic);
         if (mqs.empty()) {
-            check("路由可见：1 条队列", false, "got=0");
+            check("route visible: 1 queue", false, "got=0");
             fx.shutdown();
             return 1;
         }
         const MessageQueue q0 = mqs.front();
-        check("路由可见：1 条队列", true, "queueId=" + std::to_string(q0.queueId));
+        check("route visible: 1 queue", true, "queueId=" + std::to_string(q0.queueId));
 
         original = readFlag(fx.admin, fx.brokerAddr);
         haveOriginal = !original.empty();
-        check(std::string("R0 能读到 broker 的 ") + kConfigKey, haveOriginal,
+        check(std::string("R0 can read the broker's ") + kConfigKey, haveOriginal,
               "value=" + original);
         if (original != "true") {
-            check(std::string("R0 已临时打开 ") + kConfigKey,
+            check(std::string("R0 temporarily enabled ") + kConfigKey,
                   writeFlag(fx.admin, fx.brokerAddr, "true"));
         }
         if (readFlag(fx.admin, fx.brokerAddr) != "true") {
-            check("R0 开关不在 true，后续检查无意义", false);
+            check("R0 switch is not true, later checks would be meaningless", false);
             fx.shutdown();
             return 1;
         }
 
-        // ---------------- S1 基线 ----------------
-        std::printf("\nS1 开关 true：lite pull 基线\n");
+        // ---------------- S1 baseline ----------------
+        std::printf("\nS1 switch true: lite pull baseline\n");
         fx.producer->send(Message(topic, Bytes("s1")), q0);
         c1 = newLite(nsAddr, group1, q0);
         std::vector<std::string> got1;
@@ -278,19 +278,19 @@ int main(int argc, char* argv[]) {
                 for (const MessageExt& m : c1->poll(500)) got1.push_back(bodyOf(m));
             }
         }
-        check("S1 lite 消费者收到消息", !got1.empty(), "got=" + join(got1));
-        check("S1 拉取游标已推进", c1->pullCursorOf(q0) >= 1,
+        check("S1 lite consumer received the message", !got1.empty(), "got=" + join(got1));
+        check("S1 pull cursor advanced", c1->pullCursorOf(q0) >= 1,
               "cursor=" + std::to_string(c1->pullCursorOf(q0)));
 
-        // ---------------- S2 开关 false ----------------
-        std::printf("\nS2 运行时关闭 %s（UPDATE_BROKER_CONFIG，不重启 broker）\n", kConfigKey);
-        check("S2 开关已改为 false", writeFlag(fx.admin, fx.brokerAddr, "false"));
+        // ---------------- S2 switch false ----------------
+        std::printf("\nS2 disable %s at runtime (UPDATE_BROKER_CONFIG, no broker restart)\n", kConfigKey);
+        check("S2 switch set to false", writeFlag(fx.admin, fx.brokerAddr, "false"));
         const std::string readBack = readFlag(fx.admin, fx.brokerAddr);
-        check("S2 开关读回确认", readBack == "false", "value=" + readBack);
+        check("S2 switch read-back confirms", readBack == "false", "value=" + readBack);
 
         fx.producer->send(Message(topic, Bytes("s2")), q0);
 
-        // S2a：裸 361 → NO_PERMISSION + 固定 remark（走我们自己的客户端 API 选码）
+        // S2a: bare 361 -> NO_PERMISSION + fixed remark (code chosen via our own client API)
         bool denied = false;
         std::string denyDetail;
         try {
@@ -298,7 +298,7 @@ int main(int argc, char* argv[]) {
             client.pullMessage(group1, q0, 0, 32, liteFlag(), 0, "*", 0, "TAG",
                                /*timeoutMillis=*/30000, /*maxMsgBytes=*/-1,
                                /*suspendTimeoutMillis=*/15000, fx.brokerAddr);
-            denyDetail = "竟然 SUCCESS —— lite 位/码没生效";
+            denyDetail = "unexpectedly SUCCESS -- lite bit/code had no effect";
         } catch (const MQBrokerException& e) {
             denied = e.getResponseCode() == 16 &&
                      e.getResponseMessage().find(kDenyRemark) != std::string::npos;
@@ -306,9 +306,9 @@ int main(int argc, char* argv[]) {
         } catch (const std::exception& e) {
             denyDetail = e.what();
         }
-        check("S2a 裸 361 被开关拒绝（NO_PERMISSION=16）", denied, denyDetail);
+        check("S2a bare 361 rejected by the switch (NO_PERMISSION=16)", denied, denyDetail);
 
-        // S2b：同队列同一位点的裸 11 → 照常拿消息（对照组）
+        // S2b: bare 11 on the same queue and offset -> still gets messages (control group)
         bool classicOk = false;
         std::string classicDetail;
         try {
@@ -324,17 +324,17 @@ int main(int argc, char* argv[]) {
         } catch (const std::exception& e) {
             classicDetail = e.what();
         }
-        check("S2b 对照组：裸 11 不受开关影响，照常拿消息", classicOk, classicDetail);
+        check("S2b control: bare 11 is unaffected by the switch and still gets messages", classicOk, classicDetail);
 
-        // S2c：lite 消费者安静饿死
+        // S2c: the lite consumer quietly starves
         c2 = newLite(nsAddr, group2, q0);
         const std::vector<std::string> starved = pollFor(*c2, 8000);
-        check("S2c 开关关闭期间 lite 消费者一条都收不到", starved.empty(),
+        check("S2c the lite consumer receives nothing while the switch is off", starved.empty(),
               "got=" + join(starved));
-        check("S2c 拉取游标纹丝不动", c2->pullCursorOf(q0) == 0,
+        check("S2c pull cursor does not move an inch", c2->pullCursorOf(q0) == 0,
               "cursor=" + std::to_string(c2->pullCursorOf(q0)));
 
-        // S2d：push 消费者照常消费（对照组）
+        // S2d: the push consumer keeps consuming (control group)
         BodySink sink;
         push = std::make_shared<DefaultMQPushConsumer>("GID_CppLiteCode_push_" + fx.stamp);
         push->setNamesrvAddr(nsAddr);
@@ -348,12 +348,12 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
             }
         }
-        check("S2d 对照组：push 消费者照常收到消息（开关只管 lite）", sink.has("s2d"),
+        check("S2d control: the push consumer still receives (the switch only gates lite)", sink.has("s2d"),
               "got=" + join(sink.snapshot()));
 
-        // ---------------- S3 还原 ----------------
-        std::printf("\nS3 开关还原 true：lite 恢复\n");
-        check("S3 开关已还原", writeFlag(fx.admin, fx.brokerAddr, "true"));
+        // ---------------- S3 restore ----------------
+        std::printf("\nS3 switch restored to true: lite recovers\n");
+        check("S3 switch restored", writeFlag(fx.admin, fx.brokerAddr, "true"));
         fx.producer->send(Message(topic, Bytes("s3")), q0);
         c3 = newLite(nsAddr, group3, q0);
         std::vector<std::string> got3;
@@ -363,9 +363,9 @@ int main(int argc, char* argv[]) {
                 for (const MessageExt& m : c3->poll(500)) got3.push_back(bodyOf(m));
             }
         }
-        check("S3 还原后 lite 消费者立即恢复", !got3.empty(), "got=" + join(got3));
+        check("S3 the lite consumer recovers immediately after restoration", !got3.empty(), "got=" + join(got3));
     } catch (const std::exception& e) {
-        check("用例异常", false, e.what());
+        check("case error", false, e.what());
     }
 
     for (DefaultLitePullConsumer* c : {c1.get(), c2.get(), c3.get()}) {

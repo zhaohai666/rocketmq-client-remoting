@@ -1,6 +1,6 @@
-// 这两个偏差在真机上都只表现为「慢」，不表现为「错」：没有报文缺字段、没有异常，
-// 只有「新 topic 的路由要等 30s 才刷新」这种没人会去计时的现象。所以这里起一个
-// 本机假 name server，记录 GET_ROUTEINFO_BY_TOPIC 的**到达时刻**，把节奏钉死。
+// On a real cluster both deviations only look like "slow", never like "wrong": no missing field
+// and no exception, only "the route of a new topic waits 30s to refresh", which nobody times. So
+// a local fake name server times every GET_ROUTEINFO_BY_TOPIC **arrival** to pin the cadence down.
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -56,7 +56,7 @@ int64_t msBetween(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -107,10 +107,10 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// ---------------------------------------------------------------- 假 name server
+// ---------------------------------------------------------------- fake name server
 
-// 只做两件事：回路由、把每一笔 GET_ROUTEINFO_BY_TOPIC 的**到达时刻**记下来。
-// 其余请求（心跳等）一律 SUCCESS —— 本用例只关心节奏，不关心别处的语义。
+// Does two things only: reply with route data and record the **arrival time** of each
+// GET_ROUTEINFO_BY_TOPIC. Other requests (heartbeat and the like) answer SUCCESS; only cadence matters.
 class FakeNamesrv {
 public:
     FakeNamesrv() {
@@ -156,14 +156,14 @@ public:
         routes_[topic] = route.encode();
     }
 
-    // 计时的零点：用例在 start() 之前调它，之后记录的到达时刻都是相对值。
+    // Timing origin: the case calls it before start(), so every arrival time recorded after is relative.
     void markStart() {
         std::lock_guard<std::mutex> lk(state_);
         t0_ = Clock::now();
         arrivals_.clear();
     }
 
-    // topic 的 GET_ROUTEINFO 到达时刻（ms，相对 markStart）。按到达顺序。
+    // GET_ROUTEINFO arrival times for a topic (ms, relative to markStart), in arrival order.
     std::vector<int64_t> arrivalsFor(const std::string& topic) {
         std::lock_guard<std::mutex> lk(state_);
         std::vector<int64_t> out;
@@ -263,7 +263,7 @@ public:
     }
 };
 
-// ---------------------------------------------------------------- 用例
+// ---------------------------------------------------------------- cases
 
 void testFacadeDefaults() {
     DefaultMQProducer producer("PG_intervals_default");
@@ -321,13 +321,13 @@ void testForwardingToInstance(FakeNamesrv& ns) {
     }
 }
 
-// 3/4. 首跳落在 initialDelay（10ms）、周期按传入值走。
+// 3/4. The first tick lands at the initialDelay (10ms); the period follows the configured value.
 //
-// 两代错误写法都会在这里现形：
-//   a. 旧版本：循环头整睡 30s（周期写死）→ 5s 内一笔都没有；
-//   b. 「先睡 initialDelay、再在循环头睡一个周期」的顺序错 → 首跳 ~= 一个周期（1200ms），
-//      超过 period/2 的阈值。
-// 阈值取 period/2：理想首跳是 10ms 加一次本机建连，见 INFO 行；只有顺序错了才会翻倍。
+// Both historical wrong shapes surface here:
+//   a. old version: the loop head slept a whole 30s (hard-coded period) -> no request within 5s;
+//   b. wrong order: sleep initialDelay first, then sleep a full period at the loop head, so the
+//      first tick ~= one period (1200ms) and exceeds the period/2 threshold.
+// The threshold is period/2: an ideal first tick is 10ms plus a loopback connect; only a wrong order doubles it.
 void testRouteRefreshTiming(FakeNamesrv& ns) {
     const std::string topic = "SchedIntervalTick";
     ns.addRoute(topic, makeRoute(ns.address()));
@@ -346,7 +346,7 @@ void testRouteRefreshTiming(FakeNamesrv& ns) {
     ns.markStart();
     instance.start();
 
-    // 等 3 跳齐（首跳 ~10ms + 2 × 1200ms），上限 6s 兜底
+    // Wait until 3 ticks are in (first ~10ms + 2 x 1200ms), capped by a 6s fallback
     const auto deadline = Clock::now() + std::chrono::milliseconds(6000);
     std::vector<int64_t> arrivals;
     while (Clock::now() < deadline) {
@@ -360,7 +360,7 @@ void testRouteRefreshTiming(FakeNamesrv& ns) {
            "route refresh ticks 3 times within 6s",
            "got " + std::to_string(arrivals.size()));
     if (arrivals.empty()) return;
-    // 实测节奏留一行（首跳 ~10ms、间隔 ~1200ms；旧写法这里会是一条都没有）
+    // One line of the measured cadence (first tick ~10ms, gap ~1200ms; the old shape logged none)
     std::printf("  INFO route refresh arrivals (ms since start, period=%dms):", periodMillis);
     for (size_t i = 0; i < arrivals.size() && i < 6; ++i) {
         std::printf(" %lld", static_cast<long long>(arrivals[i]));

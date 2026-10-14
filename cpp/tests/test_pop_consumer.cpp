@@ -1,9 +1,9 @@
-// POP **消费侧**（DefaultMQPushConsumer::setPopMode(true)）单测 —— 不需要集群。
+// POP **consumer side** (DefaultMQPushConsumer::setPopMode(true)) unit tests -- no cluster needed.
 //
-// 为什么单独一个文件：协议管道（test_pop.cpp）过了 ≠ 消费循环对。消费侧有自己一套
-// 容易错的语义，而且错得**很安静** —— 比如 ackIndex 默认值不对，CONSUME_SUCCESS 会
-// 一条都不 ack，消息在 invisibleTime 到期后被 broker 复活重投；如果观测窗口比
-// invisibleTime 短，真机看起来还是"全过"。所以能离线锁的必须先锁死。
+// Why a separate file: the protocol pipeline passing (test_pop.cpp) does not mean the consume loop is right. The consumer side
+// has its own set of easy-to-get-wrong semantics, and they fail **quietly** -- for example with a wrong default ackIndex,
+// CONSUME_SUCCESS acks nothing and the broker revives and redelivers the messages once invisibleTime expires; if the
+// observation window is shorter than invisibleTime a live run still looks like "everything passed". Anything lockable offline must be locked down first.
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -34,7 +34,7 @@ const char* kGroup = "GID_PopCppUnit";
 const char* kTopic = "PopCppUnitTopic";
 const char* kBroker = "broker-a";
 
-// 手工拼 8 段 CK：buildExtraInfo 的 retryFlag 由 topic 推出，而这里要显式指定 retry 段
+// Hand-assembled 8-segment CK: buildExtraInfo derives retryFlag from the topic, but here the retry segment must be set explicitly
 std::string ckSeg(int32_t queueId = 0, int64_t offset = 0, const std::string& retry = "0",
                   int64_t popTime = 1000, int64_t invisible = 60000) {
     char buf[256];
@@ -74,18 +74,18 @@ void testProcessQueue() {
 
 void testDefaults() {
     DefaultMQPushConsumer c(kGroup);
-    // 关掉时必须完全走原来的 pull 路径
+    // When switched off it must take exactly the original pull path
     expect(!c.popMode(), "defaults.popModeOff");
     expect(c.popInvisibleTime() == 60000, "defaults.invisible",
            std::to_string(c.popInvisibleTime()));
     expect(c.popBatchNums() == 32, "defaults.batchNums", std::to_string(c.popBatchNums()));
     expect(c.popThresholdForQueue() == 96, "defaults.threshold",
            std::to_string(c.popThresholdForQueue()));
-    // broker 侧 maxMsgNums > 32 会回 INVALID_PARAMETER
+    // broker side returns INVALID_PARAMETER when maxMsgNums > 32
     expect(c.popBatchNums() <= 32, "defaults.batchNumsLe32");
-    // 长轮询挂起时长必须 < 请求超时，否则客户端先超时、每次都空转
+    // the long-polling suspend time must be < the request timeout, otherwise the client times out first and spins idle every round
     expect(c.popPollTimeMillis() < c.popTimeoutMillis(), "defaults.pollLtTimeout");
-    // 档位表单位秒，首档 10s（send 的延迟档位首档是 1s，别混）
+    // the delay-level table is in seconds and the first level is 10s (the send delay table starts at 1s; do not mix them up)
     const std::vector<int32_t>& t = popDelayLevelTable();
     expect(t[0] == 10, "defaults.levelFirst10");
     expect(t.back() == 7200, "defaults.levelLast7200");
@@ -99,7 +99,7 @@ void testDefaults() {
 void testPopCkTarget() {
     DefaultMQPushConsumer c(kGroup);
 
-    // 普通 topic：原样还原
+    // plain topic: restored as-is
     {
         MessageExt m = makeMsg(kTopic, 3, 0, ckSeg(3, 7));
         auto t = c.popCkTarget(m);
@@ -111,7 +111,7 @@ void testPopCkTarget() {
             expect(t->offset == 7, "ck.normal.offset", std::to_string(t->offset));
         }
     }
-    // retryFlag=1 → 真实 topic 是 %RETRY%<group>_<topic>（V1 下划线）
+    // retryFlag=1 -> the real topic is %RETRY%<group>_<topic> (V1 underscore)
     {
         MessageExt m = makeMsg(kTopic, 1, 2, ckSeg(1, 2, "1"));
         auto t = c.popCkTarget(m);
@@ -121,7 +121,7 @@ void testPopCkTarget() {
                    "ck.retry1.topic", t->topic);
         }
     }
-    // retryFlag=2 → V2 用 '+' 分隔
+    // retryFlag=2 -> V2 separates with '+'
     {
         MessageExt m = makeMsg(kTopic, 0, 0, ckSeg(0, 0, "2"));
         auto t = c.popCkTarget(m);
@@ -131,14 +131,14 @@ void testPopCkTarget() {
                    "ck.retry2.topic", t->topic);
         }
     }
-    // 没有 CK → nullopt（放弃 ack，交给 broker 复活）
+    // no CK -> nullopt (give up the ack and leave it to broker revival)
     expect(!c.popCkTarget(makeMsg()).has_value(), "ck.missing");
-    // 段数不足（7 段）→ nullopt，不能抛
+    // too few segments (7) -> nullopt, must not throw
     {
         std::string seven = extra_info::buildExtraInfo(0, 1, 2, 3, kTopic, kBroker, 4);
         expect(!c.popCkTarget(makeMsg(kTopic, 4, 0, seven)).has_value(), "ck.short7");
     }
-    // 垃圾串 → nullopt
+    // garbage string -> nullopt
     expect(!c.popCkTarget(makeMsg(kTopic, 0, 0, "only two")).has_value(), "ck.garbage");
 }
 
@@ -146,7 +146,7 @@ void testIsPopTimeout() {
     expect(DefaultMQPushConsumer::isPopTimeout(0, 0), "timeout.bothZero");
     expect(DefaultMQPushConsumer::isPopTimeout(0, 60000), "timeout.popTimeZero");
     expect(DefaultMQPushConsumer::isPopTimeout(1000, 0), "timeout.invisibleZero");
-    // 窗口内不算超时（用真实当前时间，别硬编码时间戳）
+    // inside the window is not a timeout (use the real current time, do not hardcode a timestamp)
     const int64_t now = UtilAll::currentTimeMillis();
     expect(!DefaultMQPushConsumer::isPopTimeout(now, 60000), "timeout.within");
     expect(DefaultMQPushConsumer::isPopTimeout(now - 60001, 60000), "timeout.past");
@@ -160,7 +160,7 @@ void testPopPullStats() {
     PopResult found;
     found.status = PopStatus::FOUND;
     found.msgFoundList = {MessageExt(), MessageExt()};
-    // began 取 30ms 前：同一毫秒内取整成 0，"记了"和"记了个 0"就分不开了
+    // began is taken 30ms ago: sampled within the same millisecond the rounded value is 0, and "recorded" vs "recorded a 0" become indistinguishable
     c.recordPopPullStats(stats, kTopic, found, UtilAll::currentTimeMillis() - 30);
     std::shared_ptr<StatsItem> rt = stats.topicAndGroupPullRT().find(key);
     std::shared_ptr<StatsItem> tps = stats.topicAndGroupPullTPS().find(key);
@@ -176,8 +176,8 @@ void testPopPullStats() {
     expect(rt->times() == 2, "stats.empty_found.rt_still");
     expect(tps->times() == 1 && tps->value() == 2, "stats.empty_found.tps_untouched");
 
-    // 长轮询空手而归（POLLING_NOT_FOUND）是 POP 的常态：一格都不许记，
-    // 否则平均拉取耗时被挂起时长稀释成假数据。
+    // a long poll coming back empty (POLLING_NOT_FOUND) is the norm for POP: not a single slot may be recorded,
+    // otherwise the average pull time gets diluted by the suspend duration into fake data.
     PopResult polling;
     polling.status = PopStatus::POLLING_NOT_FOUND;
     c.recordPopPullStats(stats, kTopic, polling, UtilAll::currentTimeMillis() - 5000);

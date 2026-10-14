@@ -83,7 +83,7 @@ bool startsWith(const std::string& s, const std::string& prefix) {
     return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -134,7 +134,7 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// 一条被占用过、随后立即释放的回环端口：连它必然被拒（比固定端口可靠）
+// A loopback port that was once occupied and immediately released: connecting to it is guaranteed to be refused (more reliable than a fixed port)
 std::string deadAddress() {
     netcompat::ensureInitialized();
     socket_t s = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -167,22 +167,22 @@ void releaseConn(const ConnRef& c) {
     }
 }
 
-// ---------------------------------------------------------------- 路由表
+// ---------------------------------------------------------------- route table
 
-// 全进程共享：扮演 name server 的那个 mock 从这里查 topic 路由。
+// Shared process-wide: the mock playing the name server looks up topic routes here.
 std::mutex g_routeMutex;
 std::map<std::string, Bytes> g_routes;
 
-// 一笔上线 SEND 报文的取证（opaque 是异步重试链的关键：每次重发必须换新）
+// Forensics of one on-the-wire SEND request (opaque is key to the async retry chain: every resend must use a fresh one)
 struct Attempt {
     int32_t code = 0;
     int32_t opaque = 0;
     PropertyMap ext;
-    // 上线的 body：批量消息的子消息 ID 只能从编码后的报文里取证
+    // The body on the wire: sub-message IDs of batched messages can only be evidenced from the encoded payload
     Bytes body;
 };
 
-// 一条 SEND 请求的脚本化响应
+// A scripted response for one SEND request
 struct Reply {
     int32_t code = ResponseCode::SUCCESS;
     int delayMillis = 0;
@@ -243,7 +243,7 @@ public:
         return attempts_;
     }
 
-    // 每次重发都会换一个新的 opaque：把这一串取出来，好让用例断言"没有复用"
+    // Each resend swaps in a fresh opaque: take the sequence out so the case can assert"no reuse"
     std::vector<int32_t> opaqueList() {
         std::vector<Attempt> a = attempts();
         std::vector<int32_t> out;
@@ -332,7 +332,7 @@ private:
             for (int i = 0; i < reply.delayMillis / 20 && running_.load(); ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
             }
-            if (reply.silence) return;  // 永不回响应，逼出传输层超时
+            if (reply.silence) return;  // never answers, forcing the transport-layer timeout
             resp.code = reply.code;
             resp.remark = "mock send";
             resp.hasRemark = true;
@@ -362,7 +362,7 @@ private:
     std::thread acceptor_;
 };
 
-// brokers: (brokerName, brokerAddr)；地址可以各指一个 mock，也可以指"连不上"的端口
+// brokers: (brokerName, brokerAddr); addresses may each point to a mock or to a"unconnectable" port
 void installRoute(const std::string& topic,
                   const std::vector<std::pair<std::string, std::string>>& brokers) {
     TopicRouteData route;
@@ -382,9 +382,9 @@ Message plainMessage(const std::string& topic) {
     return m;
 }
 
-// ---------------------------------------------------------------- 取证用回调/钩子
+// ---------------------------------------------------------------- forensics callbacks / hooks
 
-// 记住回调跑在哪个线程、拿到什么结果
+// Remembers which thread the callback ran on and what result it got
 class RecordingCallback : public SendCallback {
 public:
     struct Snapshot {
@@ -394,7 +394,7 @@ public:
         int64_t offset = -1;
         std::string message;
         std::string errorType;
-        int32_t errorCode = 0;  // 仅 MQBrokerException 有意义
+        int32_t errorCode = 0;  // meaningful only for MQBrokerException
         std::string threadName;
         std::thread::id threadId;
     };
@@ -457,7 +457,7 @@ private:
     std::atomic<bool> done{false};
 };
 
-// 只抛一次异常的用户回调（验证"抛异常不能带走 worker"）
+// A user callback that throws once per delivery (verifies"a throw must not take the worker down")
 class ThrowingCallback : public SendCallback {
 public:
     void onSuccess(const SendResult&) override { throw std::runtime_error("boom in callback"); }
@@ -466,7 +466,7 @@ public:
     }
 };
 
-// 记录 sendMessageBefore/After 各自跑在哪个线程；可选地把 before 卡住一段时间
+// Records which thread sendMessageBefore/After each run on; optionally blocks before for a while
 class ThreadNameHook : public SendMessageHook {
 public:
     explicit ThreadNameHook(int32_t blockMillis = 0) : blockMillis_(blockMillis) {}
@@ -503,16 +503,16 @@ public:
     std::atomic<int> afterCount{0};
 
 private:
-    std::string beforeThread;  // 池里有多个线程，读写都要过锁
+    std::string beforeThread;  // the pool has several threads, reads and writes both go through the lock
     std::string afterThread;
     std::string afterException;
     std::mutex nameM;
     int32_t blockMillis_;
 };
 
-// ---------------------------------------------------------------- 日志取证
+// ---------------------------------------------------------------- log forensics
 
-// 把 WARN 及以上重定向到临时文件，返回文件路径；用例从里面数异步重试的行数。
+// Redirect WARN and above to a temp file and return its path; the case counts async-retry lines in it.
 std::string captureLogFile(const std::string& tag) {
     const std::string path = (std::filesystem::temp_directory_path()
                               / ("rmq_async_test_" + tag + ".log")).string();
@@ -547,7 +547,7 @@ std::string fieldOf(const std::string& line, const std::string& key) {
     const size_t begin = line.find(key);
     if (begin == std::string::npos) return std::string();
     const size_t i = begin + key.size();
-    // 值到下一个分隔符为止：',' 是字段分隔，':' 是 brokerName 后面那句错误原因的开头
+    // the value ends at the next separator: ',' separates fields, ':' starts the error reason that follows brokerName
     const size_t comma = line.find(',', i);
     const size_t colon = line.find(':', i);
     size_t end = comma == std::string::npos ? line.size() : comma;
@@ -557,17 +557,17 @@ std::string fieldOf(const std::string& line, const std::string& key) {
 
 }  // namespace
 
-// ================================================================ 用例
+// ================================================================ test cases
 
 namespace {
 
-// 1. sendAsync 立即返回；准备工作在 AsyncSenderExecutor_N，回调在 NettyClientPublicExecutor_N
+// 1. sendAsync returns immediately; preparation runs on AsyncSenderExecutor_N, the callback on NettyClientPublicExecutor_N
 void testNonBlockingAndThreadOwnership() {
     MockServer ns;
     MockServer broker;
     const std::string topic = "AsyncBasic";
     installRoute(topic, {{"broker-a", broker.address()}});
-    broker.script({{ResponseCode::SUCCESS, 500, false}});  // 500ms 后才回
+    broker.script({{ResponseCode::SUCCESS, 500, false}});  // replies only after 500ms
 
     auto hook = std::make_shared<ThreadNameHook>();
     auto cb = std::make_shared<RecordingCallback>();
@@ -579,7 +579,7 @@ void testNonBlockingAndThreadOwnership() {
     const auto began = std::chrono::steady_clock::now();
     p.sendAsync(plainMessage(topic), cb, 3000);
     const int64_t returnedIn = sinceMs(began);
-    // 同步发送会等满 500ms；这里必须立刻返回，否则"异步"只是把阻塞挪了个地方
+    // a sync send would wait out the full 500ms; this must return at once, otherwise"async" just moves the blocking elsewhere
     expect(returnedIn < 200, "sendAsync returns without waiting for the response",
            "returnedIn=" + std::to_string(returnedIn));
     expect(waitFor([&] { return hook->beforeCount.load() >= 1; }, 2000),
@@ -603,14 +603,14 @@ void testNonBlockingAndThreadOwnership() {
     expect(totalMs >= 400, "the callback still waits for the delayed response",
            "totalMs=" + std::to_string(totalMs));
 
-    // 回调抛异常不能带走 worker：下一笔必须照常完成
+    // a throwing callback must not take the worker down: the next send still completes normally
     p.sendAsync(plainMessage(topic), std::make_shared<ThrowingCallback>(), 3000);
     auto cb2 = std::make_shared<RecordingCallback>();
     p.sendAsync(plainMessage(topic), cb2, 3000);
     expect(cb2->waitDone(3000), "the pool survives a throwing user callback");
     expectInt(cb2->snapshot().successCount, 1, "second send still succeeds");
     expectInt(broker.sendCount(), 3, "three sends reached the broker");
-    // 每一笔请求的 opaque 必须唯一（在途表按 opaque 索引，撞号会让两次尝试的应答串台）
+    // every request's opaque must be unique (the in-flight table is indexed by opaque; a collision cross-talks the two attempts' responses)
     std::vector<int32_t> ops = broker.opaqueList();
     expectInt(static_cast<long long>(ops.size()), 3, "one record per send");
     bool unique = ops.size() == 3 && ops[0] != ops[1] && ops[1] != ops[2] && ops[0] != ops[2];
@@ -654,7 +654,7 @@ void testValidationFailureGoesToCallback() {
     p.shutdown();
 }
 
-// 3. 未启动 / 已 shutdown：入口就地抛，不会静默丢消息
+// 3. not started / already shut down: throws at the entry synchronously, never silently drops a message
 void testNotStartedAndShutdown() {
     DefaultMQProducer p("PG_async_lifecycle");
     p.setNamesrvAddr("127.0.0.1:9876");
@@ -688,8 +688,8 @@ void testNotStartedAndShutdown() {
         what2 = e.what();
     }
     expect(threw2, "sendAsync after shutdown() throws");
-    // shutdown() 先摘掉两个池、等队列排空，最后才把 started_ 置回 false。排空之后调用方
-    // 看到的是"未启动"，只有排空窗口里才会看到"already shutdown" —— 两者都是就地拒绝。
+    // shutdown() first detaches the two pools, waits for the queues to drain, and only then sets started_ back to false.
+    // After draining the caller sees"not started"; only inside the drain window would it see"already shutdown" — both are synchronous refusals.
     expect(what2.find("producer") != std::string::npos,
            "the rejection is a producer lifecycle error", what2);
 }
@@ -732,7 +732,7 @@ void testBrokerErrorCodeDoesNotRetry() {
         p.shutdown();
     }
     {
-        // 同一份脚本走同步：SYSTEM_ERROR 在 retryResponseCodes 里，必须重试满 3 次
+        // the same script run synchronously: SYSTEM_ERROR is in retryResponseCodes, so it must retry the full 3 times
         broker.script({{ResponseCode::SYSTEM_ERROR, 0, false},
                        {ResponseCode::SYSTEM_ERROR, 0, false},
                        {ResponseCode::SYSTEM_ERROR, 0, false}});
@@ -763,8 +763,8 @@ void testTimeoutSharesOneBudget() {
     MockServer silent;
     MockServer live;
     const std::string topic = "AsyncTimeout";
-    // 名字决定路由队列表的先后顺序（getAllMessageQueue 按 queueDatas 原序），
-    // "AsyncASilent" 排第一 -> 第一次尝试必定打到永不回响应的那台。
+    // names decide the order of the route queue list (getAllMessageQueue keeps queueDatas order),
+    // "AsyncASilent" sorts first -> the first attempt always hits the server that never replies.
     installRoute(topic, {{"AsyncASilent", silent.address()}, {"AsyncBLive", live.address()}});
     silent.script({{ResponseCode::SUCCESS, 0, true}, {ResponseCode::SUCCESS, 0, true},
                    {ResponseCode::SUCCESS, 0, true}});
@@ -793,7 +793,7 @@ void testTimeoutSharesOneBudget() {
     p.shutdown();
 }
 
-// 6. 建连失败：快、可重试 -> 按 retryTimesWhenSendAsyncFailed 重试，且每次**避开刚失败的那台**
+// 6. connect failure: fast, retryable -> retries per retryTimesWhenSendAsyncFailed, each time **avoiding the broker that just failed**
 void testConnectFailureRetriesOntoAnotherBroker() {
     MockServer ns;
     const std::string topic = "AsyncConnectRetry";
@@ -806,8 +806,8 @@ void testConnectFailureRetriesOntoAnotherBroker() {
     p.setRetryTimesWhenSendAsyncFailed(2);
     p.start();
     const auto began = std::chrono::steady_clock::now();
-    // 本机回环对“刚关闭端口”的拒绝可能被压到 ~2s（加上 1s 粒度的连接轮询即 ~3s/次）：
-    // 默认 8s 预算撑不满 3 次重试，会被判 callTimeout。放宽让重试链自然跑完。
+    // localhost loopback refusals of a"just-closed port" can be stretched to ~2s (plus 1s-granularity connection polling, ~3s per attempt):
+    // the default 8s budget cannot cover 3 retries and would be judged callTimeout. Widened so the retry chain runs to its natural end.
     p.sendAsync(plainMessage(topic), cb, 30000);
     expect(cb->waitDone(40000), "a connect failure still calls back");
     const int64_t totalMs = sinceMs(began);
@@ -815,8 +815,8 @@ void testConnectFailureRetriesOntoAnotherBroker() {
     expectInt(s.exceptionCount, 1, "the failure surfaces through onException");
     expect(s.message.find("connect failed to") != std::string::npos,
            "the raw transport error reaches the callback, not a wrapped one", s.message);
-    // 三次建连失败后链路自然收尾（上面的 connect failed to 已排除 callTimeout 截断）：
-    // 在拒绝是毫秒级的机器上 totalMs 是毫秒级，在 ~2s 拒绝的机器上约 9s
+    // the chain ends naturally after three connect failures (the connect failed to above rules out a callTimeout cutoff):
+    // totalMs is millisecond-level on machines where refusal is millisecond-level, and ~9s on machines with ~2s refusals
     expect(totalMs < 30000, "connect-level failures retry without burning the budget",
            "totalMs=" + std::to_string(totalMs));
 
@@ -838,7 +838,7 @@ void testConnectFailureRetriesOntoAnotherBroker() {
     p.shutdown();
 }
 
-// 7. 建连失败后换到的那台 broker 真的把消息发出去了：链路恢复，回调拿到 SEND_OK
+// 7. after a connect failure the switched-to broker really sends the message: the chain recovers, the callback gets SEND_OK
 void testConnectFailureRecoversOnAnotherBroker() {
     MockServer ns;
     MockServer live;
@@ -883,7 +883,7 @@ void testPinnedQueueNeverSwitchesBroker() {
     p.setRetryTimesWhenSendAsyncFailed(2);
     p.start();
     const MessageQueue pinned(topic, "AsyncPinnedA", 0);
-    // 同 testConnectFailureRetriesOntoAnotherBroker：~2s 的建连拒绝需要 30s 预算
+    // same as testConnectFailureRetriesOntoAnotherBroker: ~2s connect refusals need a 30s budget
     p.sendAsync(plainMessage(topic), pinned, cb, 30000);
     expect(cb->waitDone(40000), "a pinned send still calls back");
     auto s = cb->snapshot();
@@ -898,7 +898,7 @@ void testPinnedQueueNeverSwitchesBroker() {
     p.shutdown();
 }
 
-// 9. AsyncSenderExecutor 队满 -> MQClientException("executor rejected")（就地抛给调用方）
+// 9. AsyncSenderExecutor queue full -> MQClientException("executor rejected") (thrown at the caller synchronously)
 void testQueueFullRejects() {
     MockServer ns;
     MockServer broker;
@@ -908,7 +908,7 @@ void testQueueFullRejects() {
     int32_t cores = static_cast<int32_t>(std::thread::hardware_concurrency());
     if (cores <= 0) cores = 1;
 
-    auto hook = std::make_shared<ThreadNameHook>(400);  // 占住每个 worker
+    auto hook = std::make_shared<ThreadNameHook>(400);  // occupy every worker
     DefaultMQProducer p("PG_async_queue_full");
     p.setNamesrvAddr(ns.address());
     p.setAsyncSenderQueueCapacity(1);
@@ -942,7 +942,7 @@ void testQueueFullRejects() {
     }
     expectInt(completed, static_cast<int>(accepted.size()),
               "every accepted async send eventually calls back");
-    // 被拒的那批**不能**有任何回调：一次投递要么交给池，要么就地抛给调用方
+    // the rejected batch must **not** get any callback: one submission either goes to the pool or throws at the caller on the spot
     for (const std::shared_ptr<RecordingCallback>& cb : rejected) {
         auto s = cb->snapshot();
         expectInt(s.successCount + s.exceptionCount, 0, "a rejected submission calls back never");
@@ -950,15 +950,15 @@ void testQueueFullRejects() {
     p.shutdown();
 }
 
-// ================================================================ 异步发送背压
+// ================================================================ async-send backpressure
 //
 //
-// 占用在途不需要钩子：mock 的 ``delayMillis`` 让 broker 晚回响应，许可在回调之前不会归还。
+// Holding an in-flight request needs no hook: the mock's ``delayMillis`` makes the broker answer late, so the permit is not returned before the callback.
 
 namespace {
 
-// 一台 mock name server + 一台 mock broker；``delayMillis`` 让 broker 晚回响应，
-// 于是这一笔在途（以及它借走的许可）会一直占着，直到响应回来。
+// one mock name server + one mock broker; ``delayMillis`` makes the broker answer late,
+// so this in-flight request (and the permits it borrowed) stays held until the response arrives.
 struct AsyncFixture {
     MockServer ns;
     MockServer broker;
@@ -994,7 +994,7 @@ void testBackPressureDefaultsAndGateOff() {
     p.sendAsync(plainMessage(fx.topic), cb, 3000);
     expect(cb->waitDone(3000), "a send with the gate off still succeeds");
     expectInt(cb->snapshot().successCount, 1, "onSuccess on the off path");
-    // 关着的时候连 tryAcquire 都不该被调用 —— 否则一次开关就永久吃掉一格容量
+    // with the switch off even tryAcquire must not be called — otherwise one toggle permanently eats capacity
     expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 1024, "off path moves no num permit");
     expectInt(p.getSemaphoreAsyncSendSizeAvailablePermits(), 100LL * 1024 * 1024,
              "off path moves no size permit");
@@ -1017,9 +1017,9 @@ void testBackPressureFloors() {
     expectInt(p.getSemaphoreAsyncSendNumAvailablePermits(), 11, "11 > 10 is taken literally");
 }
 
-// 12. 条数闸打满：第 11 笔在**调用方线程**上等满预算后回调，而且一次请求都没发出去
+// 12. num gate saturated: the 11th send calls back on the **caller thread** after waiting out its budget, and not one request was sent
 void testNumGateRejectsOnCallerThread() {
-    AsyncFixture fx("BpNumGate", 600 /* mock 晚 600ms 回包，占住在途 */);
+    AsyncFixture fx("BpNumGate", 600 /* mock replies 600ms late, holding the request in flight */);
     DefaultMQProducer p("PG_bp_num_gate");
     p.setNamesrvAddr(fx.ns.address());
     p.setEnableBackpressureForAsyncMode(true);
@@ -1048,7 +1048,7 @@ void testNumGateRejectsOnCallerThread() {
     expect(!startsWith(s.threadName, "AsyncSenderExecutor_")
                && !startsWith(s.threadName, "NettyClientPublicExecutor_"),
            "the rejection is reported on the caller thread, not on a pool", s.threadName);
-    // 被闸拦下的发送连路由都没查：broker 侧的计数是最硬的证据
+    // a gated send never even queried the route: the broker-side counter is the hardest evidence
     expectInt(fx.broker.sendCount(), kMinAsyncSendNum,
               "a gated request never reaches the broker");
 
@@ -1065,7 +1065,7 @@ void testNumGateRejectsOnCallerThread() {
     p.shutdown();
 }
 
-// 13. 字节闸：第二笔大消息被拦，但**已经拿到的条数许可必须还回去**
+// 13. size gate: the second big message is blocked, but **the num permit already taken must be given back**
 void testSizeGateRejectsAndGivesTheNumPermitBack() {
     AsyncFixture fx("BpSizeGate", 600);
     DefaultMQProducer p("PG_bp_size_gate");
@@ -1103,14 +1103,14 @@ void testSizeGateRejectsAndGivesTheNumPermitBack() {
     p.shutdown();
 }
 
-// 14. 一笔在途同时扣两格：条数 -1、字节 -body 长度（body 是压缩前的原始长度）
+// 14. one in-flight send debits both gates: num -1, size -body length (body is the original uncompressed length)
 void testInFlightSendBorrowsBothPermits() {
     AsyncFixture fx("BpBorrow", 600);
     DefaultMQProducer p("PG_bp_borrow");
     p.setNamesrvAddr(fx.ns.address());
     p.setEnableBackpressureForAsyncMode(true);
     p.start();
-    const Message msg = plainMessage(fx.topic);  // body "hi" = 2 字节
+    const Message msg = plainMessage(fx.topic);  // body "hi" = 2 bytes
     auto cb = std::make_shared<RecordingCallback>();
     p.sendAsync(msg, cb, 8000);
     expect(waitFor([&] { return p.getSemaphoreAsyncSendNumAvailablePermits() == 1023; }, 3000),
@@ -1129,7 +1129,7 @@ void testInFlightSendBorrowsBothPermits() {
 }
 
 void testRuntimeResizeWakesABlockedSender() {
-    AsyncFixture fx("BpResize", 2000 /* 占满 10 格，留出观察窗口 */);
+    AsyncFixture fx("BpResize", 2000 /* saturate the 10 permits, leaving an observation window */);
     DefaultMQProducer p("PG_bp_resize");
     p.setNamesrvAddr(fx.ns.address());
     p.setEnableBackpressureForAsyncMode(true);
@@ -1169,7 +1169,7 @@ void testQueueFullRunsWithBackPressureOn() {
     AsyncFixture fx("BpQueueFull");
     int32_t cores = static_cast<int32_t>(std::thread::hardware_concurrency());
     if (cores <= 0) cores = 1;
-    auto hook = std::make_shared<ThreadNameHook>(400);  // 占住每个 worker
+    auto hook = std::make_shared<ThreadNameHook>(400);  // occupy every worker
     DefaultMQProducer p("PG_bp_queue_full");
     p.setNamesrvAddr(fx.ns.address());
     p.setAsyncSenderQueueCapacity(1);
@@ -1190,7 +1190,7 @@ void testQueueFullRunsWithBackPressureOn() {
             std::printf("unexpected throw %s\n", e.what());
         }
     }
-    // 同一份配置在开关关着时会抛 executor rejected（见 testQueueFullRejects）
+    // the same config throws executor rejected when the switch is off (see testQueueFullRejects)
     expectInt(threw, 0, "with back-pressure on a full queue is absorbed, not thrown");
     int completed = 0;
     for (const std::shared_ptr<RecordingCallback>& cb : cbs) {
@@ -1205,7 +1205,7 @@ void testQueueFullRunsWithBackPressureOn() {
     p.shutdown();
 }
 
-// 17. 失败与重试链都只归还一次：broker 报错、建连失败换 broker 都不留泄漏
+// 17. failures and retry chains each return the permit exactly once: a broker error or a connect-failure broker switch leaves no leak
 void testFailedAndRetriedSendsReleasePermits() {
     {
         MockServer ns;
@@ -1228,7 +1228,7 @@ void testFailedAndRetriedSendsReleasePermits() {
         p.shutdown();
     }
     {
-        // 建连失败会按 retryTimesWhenSendAsyncFailed 换 broker 重试：整条链只扣一格
+        // a connect failure retries onto other brokers per retryTimesWhenSendAsyncFailed: the whole chain borrows one permit
         MockServer ns;
         MockServer live;
         const std::string topic = "BpReleaseRetry";
@@ -1274,12 +1274,12 @@ void testBatchAsyncOneRequestOneCallback() {
     expect(!attempts.empty() && attempts[0].code == RequestCode::SEND_BATCH_MESSAGE,
            "the batch goes out as SEND_BATCH_MESSAGE",
            attempts.empty() ? "no attempt recorded" : std::to_string(attempts[0].code));
-    // 同步批量内核里就有 sendWithHooks，所以批量异步不绕钩子
+    // the sync batch kernel already calls sendWithHooks, so batch async does not bypass hooks
     expectInt(hook->beforeCount.load(), 1, "the batch runs SendMessageHook.before");
     expectInt(hook->afterCount.load(), 1, "and after exactly once — not twice (no async-chain after)");
 
-    // 超长**子消息**：整批就地失败，一条都不发出去。少了逐条 Validators.checkMessage，
-    // 这一批会原样发到 broker，本地校验对批量路径形同虚设。
+    // an oversized **sub-message**: the whole batch fails on the spot and nothing is sent. Without
+    // per-message Validators.checkMessage the batch would go to the broker as-is, making local validation a no-op for the batch path.
     auto bad = std::make_shared<RecordingCallback>();
     std::vector<Message> oversized = {plainMessage(fx.topic), Message(fx.topic, Bytes(4096, 'x'))};
     p.sendBatchAsync(oversized, bad, 3000);
@@ -1290,7 +1290,7 @@ void testBatchAsyncOneRequestOneCallback() {
            "the per-sub-message validation text matches the Validators contract", bad->snapshot().message);
     expectInt(fx.broker.sendCount(), 1, "the rejected batch never reaches the broker");
 
-    // 空批：与同步内核同一句文案，且走回调而不是抛给调用方
+    // empty batch: the same wording as the sync kernel, delivered via the callback instead of thrown at the caller
     auto empty = std::make_shared<RecordingCallback>();
     p.sendBatchAsync(std::vector<Message>{}, empty, 3000);
     expect(empty->waitDone(3000), "an empty batch reaches the callback");
@@ -1300,9 +1300,9 @@ void testBatchAsyncOneRequestOneCallback() {
     p.shutdown();
 }
 
-// 19. 批量消息过字节闸时按**整批**逐条累加长度扣。
-//     写成「1 份」不会让任何一笔发送失败，只会让一批 100 条只占 1 格容量 ——
-//     字节闸对批量形同虚设，得等长跑把队列打爆才暴露。
+// 19. a batch charged to the size gate must sum **every** sub-message's length.
+//     charging it as one unit would not fail any send; it would just let a 100-message batch occupy one unit of capacity —
+//     the size gate would be a no-op for batches, exposed only when a long run blows up the queue.
 void testBatchAsyncChargesTheWholeBatchToTheSizeGate() {
     AsyncFixture fx("BatchBp", 600);
     DefaultMQProducer p("PG_batch_bp");
@@ -1314,7 +1314,7 @@ void testBatchAsyncChargesTheWholeBatchToTheSizeGate() {
 
     std::vector<Message> msgs;
     for (int i = 0; i < 2; ++i) {
-        // 每条 300 KiB，整批 600 KiB：默认 1 MiB 的字节闸扣得下，但扣完只剩 420 KiB
+        // 300 KiB each, 600 KiB per batch: the default 1 MiB size gate can take it, but leaves only 420 KiB
         msgs.push_back(Message(fx.topic, Bytes(300 * 1024, '7')));
     }
     auto first = std::make_shared<RecordingCallback>();
@@ -1341,7 +1341,7 @@ void testBatchAsyncChargesTheWholeBatchToTheSizeGate() {
     p.shutdown();
 }
 
-// 20. 未启动时批量异步与单条异步同一口径：就地抛，一个回调都不交付
+// 20. before start(), batch async and single async share one contract: throw at the entry, deliver no callback
 void testBatchAsyncRejectsBeforeStart() {
     DefaultMQProducer p("PG_batch_async_lifecycle");
     p.setNamesrvAddr("127.0.0.1:9876");
@@ -1392,7 +1392,7 @@ void testBatchAsyncWritesClientIdsBeforeEncodingTheBody() {
     expect(everySubHasOne, "every sub-message carries a 32-hex client UNIQ_KEY");
     expectInt(static_cast<int>(ids.size()), static_cast<int>(subs.size()),
               "and they are all different — one shared ID would look like a duplicate");
-    const auto props = attempts[0].ext.find("i");  // SendMessageRequestHeaderV2 的 properties
+    const auto props = attempts[0].ext.find("i");  // the properties field of SendMessageRequestHeaderV2
     expect(props != attempts[0].ext.end()
                && props->second.find(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
                       != std::string::npos,
@@ -1437,7 +1437,7 @@ void testPinnedTopicGuardAsync() {
     const MessageQueue pinned(fx.topic, fx.topic + "-broker", 0);
 
     {
-        // ① 单条异步 topic 不符：异步文案，零请求
+        // (1) single async with mismatched topic: async wording, zero requests
         auto cb = std::make_shared<RecordingCallback>();
         p.sendAsync(plainMessage("AsyncPinnedGuardOther"), pinned, cb, 3000);
         expect(cb->waitDone(5000), "a refused async send still calls back");
@@ -1449,7 +1449,7 @@ void testPinnedTopicGuardAsync() {
         expectInt(fx.broker.sendCount(), 0, "nothing reached the broker");
     }
     {
-        // ② 同 topic 照发（守卫不能宽到误伤）
+        // (2) same topic still sends (the guard must not be so loose it misfires)
         auto cb = std::make_shared<RecordingCallback>();
         p.sendAsync(plainMessage(fx.topic), pinned, cb, 3000);
         expect(cb->waitDone(5000), "a matching pinned async send settles");
@@ -1457,7 +1457,7 @@ void testPinnedTopicGuardAsync() {
         expectInt(fx.broker.sendCount(), 1, "exactly one request on the wire");
     }
     {
-        // ③ 批量异步共用同一处守卫与同一句文案
+        // (3) batch async shares the same guard and the same wording
         std::vector<Message> bad{plainMessage("AsyncPinnedGuardOther"),
                                  plainMessage("AsyncPinnedGuardOther")};
         auto cb = std::make_shared<RecordingCallback>();
@@ -1479,7 +1479,7 @@ void testPinnedTopicGuardAsync() {
     p.shutdown();
 }
 
-// 用例里未预期的异常必须变成可读的失败，而不是把整个进程 terminate 掉
+// an unexpected exception inside a case must become a readable failure instead of terminating the whole process
 void runCase(const char* name, void (*fn)()) {
     const auto began = std::chrono::steady_clock::now();
     try {
@@ -1494,7 +1494,7 @@ void runCase(const char* name, void (*fn)()) {
         std::printf("FAIL %s threw: unknown error\n", name);
     }
     const int64_t ms = sinceMs(began);
-    // 除超时/队满两个用例外，其余都该在几百毫秒内跑完；慢的用例要能一眼看出是谁
+    // except the timeout / queue-full cases, every case should finish within a few hundred ms; a slow case must stand out at a glance
     if (ms > 4000) std::printf("SLOW %s: %lldms\n", name, static_cast<long long>(ms));
 }
 

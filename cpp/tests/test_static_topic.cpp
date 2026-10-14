@@ -1,8 +1,8 @@
-// 静态主题路由单测 —— 不需要集群。
+// Static topic route unit tests -- no cluster needed.
 //
-// 覆盖：mock broker 名推导、类型化映射解析的缺省值、端点推导
-// （未承载队列 -> "__syslo__none__" 哨兵、scope 不合并、epoch 围栏）、
-// 以及 MQClientInstance::getBrokerNameFromMessageQueue 的重写/透传。
+// Covers: mock broker name derivation, defaults in typed mapping parsing, endpoint derivation
+// (unhosted queue -> "__syslo__none__" sentinel, scopes not merged, epoch fencing),
+// and the rewrite/pass-through of MQClientInstance::getBrokerNameFromMessageQueue.
 #include <cstdio>
 #include <string>
 
@@ -14,9 +14,9 @@
 
 using namespace rocketmq;
 
-// friend 访问器（见 mq_client.h）：离线单测播种端点表。
-// 必须定义在 rocketmq 命名空间作用域 —— friend 声明绑定的是外层命名空间的名字，
-// 匿名命名空间里的是另一个类型。
+// friend accessor (see mq_client.h): seeds the endpoint table for offline unit tests.
+// Must be defined at rocketmq namespace scope -- the friend declaration binds the name in
+// the enclosing namespace; one in an anonymous namespace would be a different type.
 namespace rocketmq {
 struct MQClientInstanceTestAccess {
     static void seedEndPoints(MQClientInstance& inst, const std::string& topic,
@@ -112,7 +112,7 @@ void testEndpointsSingleScope() {
     }
     MessageQueue unhosted("StaticTopic", "__syslo__global__", 3);
     expect(endpoints[unhosted] == "__syslo__none__", "unhosted -> NOT_EXIST sentinel");
-    // 空映射（非静态主题）返回 false。
+    // An empty mapping (non-static topic) returns false.
     std::map<MessageQueue, std::string> none;
     expect(!static_topic::topicRouteData2EndpointsForStaticTopic("T", TopicRouteData(),
                                                                  none),
@@ -138,7 +138,7 @@ void testScopesAndEpochFence() {
 
 void testInstanceRewrite() {
     MQClientInstance inst("static-test@DEFAULT", {"127.0.0.1:9876"});
-    // 直接种端点表（离线没有 namesrv；落库逻辑由纯函数用例覆盖）。
+    // Seed the endpoint table directly (offline there is no name server; the store logic is covered by the pure-function cases).
     std::map<MessageQueue, std::string> endpoints = {
         {MessageQueue("StaticTopic", "__syslo__global__", 0), "broker-a"},
         {MessageQueue("StaticTopic", "__syslo__global__", 1), "broker-b"},
@@ -150,7 +150,7 @@ void testInstanceRewrite() {
     expect(inst.getBrokerNameFromMessageQueue(
                MessageQueue("StaticTopic", "__syslo__global__", 1)) == "broker-b",
            "global 1 rewritten");
-    // 表里没有的队列 / 非静态主题原样透传自己的 broker 名。
+    // Queues absent from the table / non-static topics pass their own broker name through unchanged.
     expect(inst.getBrokerNameFromMessageQueue(
                MessageQueue("StaticTopic", "__syslo__global__", 99)) == "__syslo__global__",
            "unknown queue passes mock name through");

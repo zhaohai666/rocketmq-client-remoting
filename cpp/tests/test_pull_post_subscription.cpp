@@ -1,8 +1,8 @@
-// P5：postSubscriptionWhenPull + pullFromWhichNode / findBrokerAddressInSubscribe 离线单测。
+// P5: offline unit tests for postSubscriptionWhenPull + pullFromWhichNode / findBrokerAddressInSubscribe.
 //
 //
-// 报文形状（SUBSCRIPTION 位、`subscription` 键是否上线、打给 master 还是 slave、
-// COMMIT_OFFSET 是否被清）用进程内假端点从 socket 上取证，不靠调用方自说自话。
+// The wire shape (the SUBSCRIPTION bit, whether the `subscription` key goes on the wire, master vs slave targeting,
+// whether COMMIT_OFFSET is cleared) is evidenced from the socket via in-process fake endpoints, not from the caller's own account.
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -59,7 +59,7 @@ void expectInt(long long actual, long long expected, const std::string& name) {
     }
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -110,15 +110,15 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// ---------------------------------------------------------------- 假端点（name server + broker）
+// ---------------------------------------------------------------- fake endpoints (name server + broker)
 
-// 一条拉取请求的取证：上线原样的 extFields
+// forensics of one pull request: extFields exactly as they went on the wire
 struct PullRecord {
     PropertyMap ext;
 };
 
-// 同时扮演 name server（回路由）与 broker（回 PULL_MESSAGE）。
-// 与 test_check_client_config.cpp 的 MockBroker 同一套 socket 骨架，只是这里关心的是拉取。
+// Plays both the name server (answers routes) and the broker (answers PULL_MESSAGE).
+// Same socket skeleton as MockBroker in test_check_client_config.cpp, except the focus here is pulling.
 class MockEndpoint {
 public:
     MockEndpoint() {
@@ -167,7 +167,7 @@ public:
         routes_[topic] = route.encode();
     }
 
-    // 脚本化 PULL_MESSAGE 的应答头（nextBeginOffset / maxOffset / suggestWhichBrokerId…）
+    // script the PULL_MESSAGE reply header (nextBeginOffset / maxOffset / suggestWhichBrokerId...)
     void scriptPullResponse(const PropertyMap& ext) {
         std::lock_guard<std::mutex> lk(state_);
         pullReply_ = ext;
@@ -249,7 +249,7 @@ private:
                 resp.code = ResponseCode::SUCCESS;
                 resp.extFields = reply;
             } else {
-                // 心跳之类别来烦测试
+                // heartbeats and the like must not bother the test
                 resp.code = ResponseCode::SUCCESS;
             }
             Bytes out = resp.encode();
@@ -271,7 +271,7 @@ private:
     std::thread acceptor_;
 };
 
-// ---------------------------------------------------------------- 脚手架
+// ---------------------------------------------------------------- scaffolding
 
 const char* kGroup = "GID_P5Unit";
 const char* kTopic = "P5PullTopic";
@@ -304,7 +304,7 @@ PropertyMap pullRespExt(bool withSuggest, int64_t suggest, int64_t nextOffset = 
     return ext;
 }
 
-// 起实例并把 kTopic 的路由塞进缓存（真 RPC 走一趟 mock name server）
+// start an instance and seed kTopic's route into the cache (a real RPC round-trip to the mock name server)
 std::unique_ptr<MQClientInstance> seeded(MockEndpoint& namesrv) {
     auto instance = std::make_unique<MQClientInstance>(
         kClientId, std::vector<std::string>{namesrv.address()});
@@ -321,31 +321,31 @@ void testFindBrokerAddressInSubscribeBranches() {
     addrs[2] = "127.0.0.1:10931";
 
     auto hit = MQClientInstance::findBrokerAddressInSubscribe(addrs, 0);
-    expect(hit.first == "127.0.0.1:10911" && !hit.second, "命中 master：地址直取、isSlave=false");
+    expect(hit.first == "127.0.0.1:10911" && !hit.second, "master hit: address taken directly, isSlave=false");
     hit = MQClientInstance::findBrokerAddressInSubscribe(addrs, 1);
-    expect(hit.first == "127.0.0.1:10921" && hit.second, "命中 slave=1：isSlave=true");
+    expect(hit.first == "127.0.0.1:10921" && hit.second, "slave id=1 hit: isSlave=true");
 
     std::map<int64_t, std::string> sparse;
     sparse[0] = "127.0.0.1:10911";
     sparse[2] = "127.0.0.1:10931";
     hit = MQClientInstance::findBrokerAddressInSubscribe(sparse, 1);
-    expect(hit.first == "127.0.0.1:10931" && hit.second, "slave id 缺失按 id+1 再试");
+    expect(hit.first == "127.0.0.1:10931" && hit.second, "missing slave id falls back to trying id+1");
 
     hit = MQClientInstance::findBrokerAddressInSubscribe(addrs, 9);
-    expect(hit.first == "127.0.0.1:10911" && !hit.second, "brokerId 超范围回退到 id 最小者（master）");
+    expect(hit.first == "127.0.0.1:10911" && !hit.second, "out-of-range brokerId falls back to the smallest id (master)");
     std::map<int64_t, std::string> onlySlave;
     onlySlave[1] = "127.0.0.1:10921";
     hit = MQClientInstance::findBrokerAddressInSubscribe(onlySlave, 3);
-    expect(hit.first == "127.0.0.1:10921" && hit.second, "只有从节点时回退到它并判为 slave");
+    expect(hit.first == "127.0.0.1:10921" && hit.second, "with only a slave present, fall back to it and mark isSlave");
 
-    // onlyThisBroker：宁缺毋滥
+    // onlyThisBroker: no substitution rather than a wrong one
     hit = MQClientInstance::findBrokerAddressInSubscribe(addrs, 9, /*onlyThisBroker=*/true);
-    expect(hit.first.empty() && !hit.second, "onlyThisBroker 时不回退");
+    expect(hit.first.empty() && !hit.second, "no fallback when onlyThisBroker");
     hit = MQClientInstance::findBrokerAddressInSubscribe({}, 0);
-    expect(hit.first.empty() && !hit.second, "空地址表返回空");
+    expect(hit.first.empty() && !hit.second, "an empty address table returns empty");
 }
 
-// ---------------------------------------------------------------- 2. 线上报文：选从节点
+// ---------------------------------------------------------------- 2. wire request: choosing the slave
 
 void testPullToSlaveClearsCommitOffsetAndOmitsSubscription() {
     MockEndpoint namesrv;
@@ -359,31 +359,31 @@ void testPullToSlaveClearsCommitOffsetAndOmitsSubscription() {
     const int32_t sysFlag = PullSysFlag::buildSysFlag(/*commitOffset=*/true, /*suspend=*/true,
                                                       /*subscription=*/false,
                                                       /*classFilter=*/false);
-    expect(PullSysFlag::hasCommitOffsetFlag(sysFlag), "前置：sysFlag 带 COMMIT_OFFSET");
+    expect(PullSysFlag::hasCommitOffsetFlag(sysFlag), "precondition: sysFlag carries COMMIT_OFFSET");
 
     PullResult result = instance->pullMessage(
         kGroup, mq, 0, 32, sysFlag, /*commitOffset=*/0, "TagA", 0, ExpressionType::TAG,
         /*timeoutMillis=*/3000, /*maxMsgBytes=*/-1, /*suspendTimeoutMillis=*/15000,
         /*addr=*/std::string(), /*requestSource=*/0, /*brokerId=*/MixAll::MASTER_ID + 1);
 
-    expectInt(static_cast<long long>(slave.pullCount()), 1, "拉取打到 slave");
-    expectInt(static_cast<long long>(master.pullCount()), 0, "master 没收到");
+    expectInt(static_cast<long long>(slave.pullCount()), 1, "the pull reached the slave");
+    expectInt(static_cast<long long>(master.pullCount()), 0, "master received nothing");
 
     PropertyMap sent = slave.pullExt(0);
     const int64_t sentFlag = MockEndpoint::extInt(sent, "sysFlag");
     expect(!PullSysFlag::hasCommitOffsetFlag(static_cast<int32_t>(sentFlag)),
-           "slave 上一次 COMMIT_OFFSET 都没有意义");
-    expect(PullSysFlag::hasSuspendFlag(static_cast<int32_t>(sentFlag)), "suspend 位保持");
+           "COMMIT_OFFSET is meaningless on a slave");
+    expect(PullSysFlag::hasSuspendFlag(static_cast<int32_t>(sentFlag)), "the suspend bit is kept");
     expect(!slave.pullHasKey(0, "subscription"),
-           "SUBSCRIPTION 位关闭时 subscription 键根本不进 extFields");
+           "with the SUBSCRIPTION bit off the subscription key never enters extFields");
     expect(result.suggestWhichBrokerId.has_value() && *result.suggestWhichBrokerId == 0,
-           "应答头 suggestWhichBrokerId 透传给调用方");
+           "the reply header suggestWhichBrokerId passes through to the caller");
 }
 
-// ---------------------------------------------------------------- 3. 线上报文：选主节点
+// ---------------------------------------------------------------- 3. wire request: choosing the master
 
-// brokerId=0（主节点）：打到 master、COMMIT_OFFSET 保留；SUBSCRIPTION 位置位时
-// `subscription` 才上线；老 broker 不带 suggestWhichBrokerId → 透传「没有」。
+// brokerId=0 (master): hits master, COMMIT_OFFSET is kept; `subscription` goes on the wire only
+// when the SUBSCRIPTION bit is set; an old broker without suggestWhichBrokerId passes through nothing.
 void testPullToMasterKeepsCommitOffsetAndPostsSubscription() {
     MockEndpoint namesrv;
     MockEndpoint master;
@@ -402,21 +402,21 @@ void testPullToMasterKeepsCommitOffsetAndPostsSubscription() {
         /*timeoutMillis=*/3000, /*maxMsgBytes=*/-1, /*suspendTimeoutMillis=*/15000,
         /*addr=*/std::string(), /*requestSource=*/0, /*brokerId=*/MixAll::MASTER_ID);
 
-    expectInt(static_cast<long long>(master.pullCount()), 1, "拉取打到 master");
-    expectInt(static_cast<long long>(slave.pullCount()), 0, "slave 没收到");
+    expectInt(static_cast<long long>(master.pullCount()), 1, "the pull reached the master");
+    expectInt(static_cast<long long>(slave.pullCount()), 0, "slave received nothing");
 
     PropertyMap sent = master.pullExt(0);
     const int64_t sentFlag = MockEndpoint::extInt(sent, "sysFlag");
-    expect(PullSysFlag::hasCommitOffsetFlag(static_cast<int32_t>(sentFlag)), "master 上位点照提交");
-    expect(PullSysFlag::hasSubscriptionFlag(static_cast<int32_t>(sentFlag)), "subscription 位置位");
+    expect(PullSysFlag::hasCommitOffsetFlag(static_cast<int32_t>(sentFlag)), "on master the offset is committed as usual");
+    expect(PullSysFlag::hasSubscriptionFlag(static_cast<int32_t>(sentFlag)), "the subscription bit is set");
     auto subIt = sent.find("subscription");
-    expect(subIt != sent.end() && subIt->second == "TagA||TagB", "subscription 内容上线");
-    expectInt(MockEndpoint::extInt(sent, "queueOffset"), 3, "queueOffset 上线");
-    expect(!result.suggestWhichBrokerId.has_value(), "老 broker 不带 suggest → 透传「没有」");
-    expectInt(result.nextBeginOffset, 7, "nextBeginOffset 透传");
+    expect(subIt != sent.end() && subIt->second == "TagA||TagB", "the subscription content is on the wire");
+    expectInt(MockEndpoint::extInt(sent, "queueOffset"), 3, "queueOffset is on the wire");
+    expect(!result.suggestWhichBrokerId.has_value(), "an old broker without suggest passes through nothing");
+    expectInt(result.nextBeginOffset, 7, "nextBeginOffset passes through");
 }
 
-// ---------------------------------------------------------------- 4. 从节点缺席 → 回退主节点
+// ---------------------------------------------------------------- 4. slave missing, fall back to master
 
 void testMissingSlaveFallsBackToMasterAndKeepsCommitOffset() {
     MockEndpoint namesrv;
@@ -434,54 +434,54 @@ void testMissingSlaveFallsBackToMasterAndKeepsCommitOffset() {
                           ExpressionType::TAG, 3000, -1, 15000, std::string(), 0,
                           /*brokerId=*/3);
 
-    expectInt(static_cast<long long>(master.pullCount()), 1, "从节点缺席时回退到 master");
+    expectInt(static_cast<long long>(master.pullCount()), 1, "with the slave missing it falls back to master");
     const int64_t sentFlag = MockEndpoint::extInt(master.pullExt(0), "sysFlag");
     expect(PullSysFlag::hasCommitOffsetFlag(static_cast<int32_t>(sentFlag)),
-           "回退到的是 master，位点照提交（isSlave 按命中的 id 判）");
+           "the fallback lands on master so the offset is still committed (isSlave judged by the id actually hit)");
 }
 
-// ---------------------------------------------------------------- 5. push 侧订阅门控
+// ---------------------------------------------------------------- 5. push-side subscription gating
 
 void testPullSubscriptionGatingFollowsDefault() {
     expect(!DefaultMQPushConsumer::shouldPostSubscriptionWhenPull(false, false),
-           "默认关闭 → 不上送");
+           "default off, nothing posted");
     expect(DefaultMQPushConsumer::shouldPostSubscriptionWhenPull(true, false),
-           "打开且非类过滤 → 上送");
+           "on and not class-filtered, posted");
     expect(!DefaultMQPushConsumer::shouldPostSubscriptionWhenPull(true, true),
-           "类过滤模式即使打开也不上送（表达式是过滤类名，broker 的 TAG 过滤会误判）");
+           "class-filter mode never posts even when on (the expression is a class name and the broker's TAG filter would misjudge it)");
     expect(!DefaultMQPushConsumer::shouldPostSubscriptionWhenPull(false, true),
-           "双关");
+           "both off");
 
     DefaultMQPushConsumer consumer(kGroup);
-    expect(!consumer.isPostSubscriptionWhenPull(), "参考实现默认 false");
+    expect(!consumer.isPostSubscriptionWhenPull(), "the default is false");
     consumer.setPostSubscriptionWhenPull(true);
-    expect(consumer.isPostSubscriptionWhenPull(), "setter 生效");
+    expect(consumer.isPostSubscriptionWhenPull(), "the setter takes effect");
 }
 
-// ---------------------------------------------------------------- 6. 拉消费者的表读写
+// ---------------------------------------------------------------- 6. pull consumer table read/write
 
 void testPullFromWhichNodeRoundTrip() {
     DefaultMQPullConsumer pull(kGroup);
     MessageQueue mq(kTopic, kBroker, 0);
     MessageQueue other(kTopic, kBroker, 1);
 
-    expectInt(pull.recalculatePullFromWhichNode(mq), MixAll::MASTER_ID, "首轮打主节点");
+    expectInt(pull.recalculatePullFromWhichNode(mq), MixAll::MASTER_ID, "the first round targets the master");
 
     PullResult withSuggest;
     withSuggest.suggestWhichBrokerId = MixAll::MASTER_ID + 1;
     pull.updatePullFromWhichNode(mq, withSuggest);
-    expectInt(pull.recalculatePullFromWhichNode(mq), MixAll::MASTER_ID + 1, "suggest 写回表");
+    expectInt(pull.recalculatePullFromWhichNode(mq), MixAll::MASTER_ID + 1, "suggest is written back into the table");
 
-    // 老 broker 不带 suggest：按 master 记账，而不是保留旧值
+    // an old broker without suggest is accounted as master, not keeping the stale value
     pull.updatePullFromWhichNode(mq, PullResult{});
     expectInt(pull.recalculatePullFromWhichNode(mq), MixAll::MASTER_ID,
-              "缺 suggestWhichBrokerId 按 master 记账（协议里它是 long 原语）");
+              "missing suggestWhichBrokerId is accounted as master (a long primitive in the protocol)");
 
     PullResult two;
     two.suggestWhichBrokerId = 2;
     pull.updatePullFromWhichNode(mq, two);
-    expectInt(pull.recalculatePullFromWhichNode(mq), 2, "按队列隔离（本队列已更新）");
-    expectInt(pull.recalculatePullFromWhichNode(other), MixAll::MASTER_ID, "按队列隔离（别的队列不受影响）");
+    expectInt(pull.recalculatePullFromWhichNode(mq), 2, "isolated per queue (this queue updated)");
+    expectInt(pull.recalculatePullFromWhichNode(other), MixAll::MASTER_ID, "isolated per queue (other queues unaffected)");
 }
 
 }  // namespace

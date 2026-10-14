@@ -1,8 +1,8 @@
-// ACL 鉴权单测：SHA1 / HMAC-SHA1 / Base64 原语 + AclClientRPCHook 签名内容与签名值。
+// ACL authentication unit tests: SHA1 / HMAC-SHA1 / Base64 primitives + AclClientRPCHook signed content and signature values.
 //
 //
-// SHA1 / HMAC / Base64 的原语向量则取自公开标准（RFC 3174 / RFC 2202 / RFC 4648），
-// 用来保证即使签名向量通过，也不是"两个错误互相抵消"。
+// The SHA1 / HMAC / Base64 primitive vectors come from public standards (RFC 3174 / RFC 2202 / RFC 4648),
+// ensuring that even when the signature vectors pass, it is not "two errors cancelling each other out".
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -55,7 +55,7 @@ RemotingCommand makeRequest(const std::vector<std::pair<std::string, std::string
     return cmd;
 }
 
-// 记录调用顺序、以及"被调用时看到的 extFields 快照"，用于证明 stream 钩子先跑。
+// Records the call order and the extFields snapshot seen when each hook runs, proving the stream hook executes first.
 class LogHook : public RPCHook {
 public:
     LogHook(std::vector<std::string>& log, std::string name)
@@ -82,7 +82,7 @@ public:
 
 }  // namespace
 
-// ---------------------------------------------------------------- SHA1 原语
+// ---------------------------------------------------------------- SHA1 primitives
 static void testSha1Vectors() {
     CHECK(hex(sha1("")) == "da39a3ee5e6b4b0d3255bfef95601890afd80709",
           "sha1(\"\") standard vector");
@@ -95,19 +95,19 @@ static void testSha1Vectors() {
               == "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12",
           "sha1(quick brown fox) standard vector");
 
-    // 100 万个 'a'：跨多块 + 长度字段超 2^23 bit，专门压块循环与填充
+// 1M 'a' chars: spans multiple blocks and drives the length field past 2^23 bits, stressing the block loop and padding
     std::string million(1000000, 'a');
     CHECK(hex(sha1(million)) == "34aa973cd4c4daa4f61eeb2bdbad27316534016f",
           "sha1(1M x 'a') standard vector");
 
-    // 填充边界：55/56/63/64/65 字节对块循环与填充长度编码最敏感，
-    // 这里统一校验摘要长度恒为 20 字节（内容已由上面的标准向量覆盖）。
+// Padding boundaries: 55/56/63/64/65 bytes are the most sensitive cases for the block loop and padding-length encoding;
+// only the digest length is checked here (always 20 bytes); contents are covered by the standard vectors above.
     for (size_t n : {size_t(55), size_t(56), size_t(63), size_t(64), size_t(65)}) {
         CHECK(sha1(std::string(n, 'x')).size() == 20, "sha1 padding boundary keeps 20 bytes");
     }
 }
 
-// ---------------------------------------------------------------- HMAC-SHA1 原语
+// ---------------------------------------------------------------- HMAC-SHA1 primitives
 static void testHmacVectors() {
     // RFC 2202 test case 1
     CHECK(hex(hmacSha1(std::string(20, static_cast<char>(0x0b)), "Hi There"))
@@ -117,14 +117,14 @@ static void testHmacVectors() {
     CHECK(hex(hmacSha1("Jefe", "what do ya want for nothing?"))
               == "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79",
           "hmac-sha1 RFC2202 #2");
-    // RFC 2202 test case 6：key 长于块大小（64B），必须先 SHA1 压缩
+// RFC 2202 test case 6: key longer than the block size (64B), so the key must be SHA1-compressed first
     CHECK(hex(hmacSha1(std::string(80, static_cast<char>(0xaa)),
                        "Test Using Larger Than Block-Size Key - Hash Key First"))
               == "aa4ae5e15272d00e95705637ce8a3b55ed402112",
           "hmac-sha1 RFC2202 #6 (key longer than block size)");
 }
 
-// ---------------------------------------------------------------- Base64 原语
+// ---------------------------------------------------------------- Base64 primitives
 static void testBase64Vectors() {
     CHECK(base64Encode("") == "", "base64 empty");
     CHECK(base64Encode("M") == "TQ==", "base64 1-byte padding");
@@ -136,7 +136,7 @@ static void testBase64Vectors() {
           "base64 RFC4648 example 3");
     CHECK(base64Encode("any carnal pleasure.") == "YW55IGNhcm5hbCBwbGVhc3VyZS4=",
           "base64 RFC4648 example 1");
-    // 标准字母表必须出现 '+' 与 '/'（URL-safe 会用 -_ 代替）
+// The standard alphabet must contain '+' and '/' (URL-safe alphabets replace them with -_)
     CHECK(base64Encode(Bytes("\xfb\xff\xbf", 3)) == "+/+/", "base64 uses standard alphabet (+/)");
 }
 
@@ -148,7 +148,7 @@ static void testAclSignatureVectors() {
     };
     const Bytes v1Body("\x01\x02\x03\x04\x05", 5);
 
-    // ---- V1：多字段乱序插入 + body + 无 token ----
+// ---- V1: multiple fields inserted out of order + body + no token ----
     {
         RemotingCommand cmd = makeRequest(v1Ext, v1Body);
         AclClientRPCHook hook(SessionCredentials("AK_TEST", sk));
@@ -163,7 +163,7 @@ static void testAclSignatureVectors() {
               "V1 signature matches the reference signer");
     }
 
-    // ---- V2：带 SecurityToken（token 参与签名，结果必须与 V1 不同）----
+// ---- V2: with SecurityToken (the token participates in signing, so the result must differ from V1) ----
     {
         RemotingCommand cmd = makeRequest(v1Ext, v1Body);
         AclClientRPCHook hook(SessionCredentials("AK_TEST", sk, "TOKEN-ABC"));
@@ -179,7 +179,7 @@ static void testAclSignatureVectors() {
               "V2 token actually changes the signature");
     }
 
-    // ---- V3：无 body ----
+// ---- V3: no body ----
     {
         RemotingCommand cmd = makeRequest({{"a", "1"}, {"b", "2"}}, Bytes());
         AclClientRPCHook hook(SessionCredentials("AK", "SK"));
@@ -190,7 +190,7 @@ static void testAclSignatureVectors() {
               "V3 signature matches the reference signer");
     }
 
-    // ---- 插入顺序无关：等价 extFields 必须得到同一签名 ----
+// ---- Insertion-order independence: equivalent extFields must produce the same signature ----
     {
         RemotingCommand a = makeRequest(v1Ext, v1Body);
         RemotingCommand b = makeRequest({{"Zz", "last"}, {"batch", "false"}, {"a", "1"},
@@ -204,20 +204,20 @@ static void testAclSignatureVectors() {
     }
 }
 
-// ---------------------------------------------------------------- Signature 必须被排除
+// ---------------------------------------------------------------- Signature must be excluded
 static void testSignatureExcluded() {
     RemotingCommand withoutSig = makeRequest({{"topic", "MyTopic"}}, Bytes());
     RemotingCommand withFakeSig =
         makeRequest({{"topic", "MyTopic"}, {"Signature", "SHOULD_BE_EXCLUDED"}}, Bytes());
 
-    // 手工调用 buildRequestContent 时（此时还没写入真实 Signature）
+// Calling buildRequestContent manually (before any real Signature has been written)
     CHECK(AclClientRPCHook::buildRequestContent(withFakeSig) == "MyTopic",
           "pre-existing Signature is excluded from signed content");
     CHECK(AclClientRPCHook::buildRequestContent(withoutSig)
               == AclClientRPCHook::buildRequestContent(withFakeSig),
           "content identical with/without a pre-existing Signature field");
 
-    // 再算签名：两者必须一致（证明 Signature 不参与自己的签名）
+// Then compute signatures: both must match (Signature never participates in its own signing)
     const std::string sigA =
         AclClientRPCHook::calcSignature("SK", withoutSig);
     const std::string sigB =
@@ -225,11 +225,11 @@ static void testSignatureExcluded() {
     CHECK(sigA == sigB, "calcSignature ignores an existing Signature field");
 }
 
-// ---------------------------------------------------------------- 未注册钩子时零改动
+// ---------------------------------------------------------------- No hook registered: zero mutation
 static void testNoHookNoMutation() {
     RemotingCommand cmd = makeRequest({{"topic", "MyTopic"}}, Bytes("body", 4));
     const size_t before = cmd.extFields.size();
-    // 不注册钩子 = 不做任何事：extFields 不应被改动
+// Registering no hook = doing nothing: extFields must not be modified
     CHECK(cmd.extFields.size() == before && cmd.extFields.find("AccessKey") == cmd.extFields.end(),
           "no hook => no AccessKey/Signature injected");
     CHECK(cmd.getExtField("Signature").empty(), "no hook => empty signature");
@@ -248,23 +248,23 @@ static void testStreamHookWritesReqT() {
     CHECK(log.size() == 1 && log[0] == "probe#after", "chained doAfterResponse forwards");
 }
 
-// ---------------------------------------------------------------- composeRequestHooks 形态
+// ---------------------------------------------------------------- composeRequestHooks shapes
 static void testComposeRequestHooksShape() {
     auto user = std::make_shared<AclClientRPCHook>(SessionCredentials("AK", "SK"));
 
-    // 都没开：不注册任何钩子（零开销），facade 会跳过 registerRPCHook
+// Neither enabled: no hook registered at all (zero overhead); the facade skips registerRPCHook
     CHECK(composeRequestHooks(false, nullptr) == nullptr, "no stream + no user => no hook");
 
-    // 只有用户钩子：原对象直接返回，不套 ChainedRPCHook 壳
+// User hook only: the original object is returned directly, not wrapped in a ChainedRPCHook shell
     const std::shared_ptr<RPCHook> onlyUser = composeRequestHooks(false, user);
     CHECK(onlyUser.get() == user.get(), "user only => the very same hook instance");
     CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(onlyUser) == nullptr,
           "user only => not wrapped in a chain");
 
-    // stream + 用户钩子：两个钩子必须成链，顺序由上面的链序保证
+// stream + user hook: both hooks must be chained; the order is guaranteed by the chain order above
     CHECK(std::dynamic_pointer_cast<ChainedRPCHook>(composeRequestHooks(true, user)) != nullptr,
           "stream + user => chained");
-    // 只剩一个钩子时不套链壳（与上面「只有用户钩子」同一形态）：门面只开 stream 就是这样
+// A single remaining hook is not wrapped in a chain shell (same shape as "user hook only" above): this is what happens when the facade enables stream alone
     const std::shared_ptr<RPCHook> onlyStream = composeRequestHooks(true, nullptr);
     CHECK(std::dynamic_pointer_cast<StreamTypeRPCHook>(onlyStream) != nullptr,
           "stream only => the single StreamTypeRPCHook, unwrapped");
@@ -302,7 +302,7 @@ static void testStreamRunsBeforeUserHook() {
     CHECK(probe->sawReqT, "user hook already sees ReqT when it runs");
     CHECK(cmd.getExtField(MixAll::REQ_T) == "0", "ReqT survives to the wire");
 
-    // 顺序反过来（先签名后打标签）就是 bug：签的内容里没有 ReqT。
+// Reversed order (sign first, tag afterwards) would be a bug: the signed content would miss ReqT.
     std::vector<std::string> wrongOrder;
     auto signer = std::make_shared<LogHook>(wrongOrder, "acl");
     auto tagger = std::make_shared<LogHook>(wrongOrder, "stream");
@@ -320,12 +320,12 @@ static void testStreamRunsBeforeUserHook() {
 static void testReqTIsCoveredByAclSignature() {
     const SessionCredentials credentials("RocketMQ", "FRo3RvIPW7ih");
 
-    // 1) 正确顺序：chain(Stream, ACL)
+// 1) Correct order: chain(Stream, ACL)
     RemotingCommand chained = makeRequest({{"topic", "MyTopic"}}, Bytes("hello", 5));
     composeRequestHooks(true, std::make_shared<AclClientRPCHook>(credentials))
         ->doBeforeRequest("127.0.0.1:10911", chained);
 
-    // 2) 参照：手工写入 ReqT 后再单独跑 ACL —— 内容与 broker 侧重组出来的一致
+// 2) Reference: write ReqT manually first, then run ACL alone -- the content matches what the broker reassembles
     RemotingCommand reference = makeRequest({{"topic", "MyTopic"}, {MixAll::REQ_T, "0"}},
                                             Bytes("hello", 5));
     AclClientRPCHook(credentials).doBeforeRequest("127.0.0.1:10911", reference);
@@ -335,15 +335,15 @@ static void testReqTIsCoveredByAclSignature() {
     CHECK(!chained.getExtField(SessionCredentials::SIGNATURE).empty(),
           "chain actually produced a signature");
 
-    // 3) 错误顺序（先 ACL 后打标签）：签名里没有 ReqT ⇒ 与 1) 必然不同，
-    //    开了鉴权的 broker 会验签失败。这一条是顺序的回归守卫。
+// 3) Wrong order (ACL first, tag afterwards): ReqT is missing from the signature, so it must differ from case 1,
+//    and a broker with authentication enabled would fail the verification. This case guards the ordering regression.
     RemotingCommand wrong = makeRequest({{"topic", "MyTopic"}}, Bytes("hello", 5));
     AclClientRPCHook(credentials).doBeforeRequest("127.0.0.1:10911", wrong);
     const std::string wrongSig = wrong.getExtField(SessionCredentials::SIGNATURE);
     wrong.addExtField(MixAll::REQ_T, "0");
     CHECK(wrongSig != chained.getExtField(SessionCredentials::SIGNATURE),
           "signing before ReqT produces a different (rejected) signature");
-    // broker 会拿**收到**的全部字段（含 ReqT）重算，故 2) 的内容才是对的
+// The broker recomputes over all fields it received (ReqT included), so the content of case 2) is the correct one
     CHECK(AclClientRPCHook::buildRequestContent(reference).size()
               == AclClientRPCHook::buildRequestContent(chained).size(),
           "signed content matches what the broker recomputes");

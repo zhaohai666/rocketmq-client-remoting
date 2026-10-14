@@ -1,6 +1,6 @@
-// 自检示例：演示协议层的构造 / 编码 / 解码闭环。
+// Self-check example: build / encode / decode round trip of the protocol layer.
 //
-// 不依赖真实集群，用于快速验证 C++ 客户端协议层可用。
+// Needs no real cluster; used to quickly verify that the C++ protocol layer works.
 #include <iostream>
 #include <string>
 
@@ -12,7 +12,7 @@
 using namespace rocketmq;
 
 int main() {
-    // 1) 构造一个心跳请求（JSON header），编码 -> 解码闭环
+    // 1) Build a heartbeat request (JSON header), encode -> decode round trip
     auto hb = std::make_shared<HeartbeatRequestHeader>();
     hb->clientId = "127.0.0.1@10911";
 
@@ -29,7 +29,7 @@ int main() {
     std::cout << (ok ? "[PASS] HEART_BEAT json round-trip\n"
                      : "[FAIL] HEART_BEAT json round-trip\n");
 
-    // 2) ROCKETMQ 二进制 header 闭环
+    // 2) ROCKETMQ binary header round trip
     RemotingCommand req2 = RemotingCommand::createRequestCommand(RequestCode::GET_MAX_OFFSET);
     req2.serializeTypeCurrentRPC = SerializeType::ROCKETMQ;
     req2.addExtField("topic", "TBW102");
@@ -40,7 +40,7 @@ int main() {
     std::cout << (ok2 ? "[PASS] GET_MAX_OFFSET rocketmq-binary round-trip\n"
                       : "[FAIL] GET_MAX_OFFSET rocketmq-binary round-trip\n");
 
-    // 3) 消息体编码 -> 解码闭环
+    // 3) Message body encode -> decode round trip
     MessageExt m;
     m.topic = "SELF_CHECK";
     m.body = "hello-rocketmq-cpp";

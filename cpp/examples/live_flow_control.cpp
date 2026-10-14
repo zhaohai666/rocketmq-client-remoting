@@ -1,19 +1,19 @@
-// 拉取流控阈值真机联调（场景 S0~S5 逐条断言）。
+// Pull flow-control thresholds against a live cluster (per-scenario assertions S0~S5).
 //
-// 离线单测（tests/test_flow_control.cpp）锁的是**判据本身**；这里锁真机上两件离线
-// 永远锁不住的事：
-//   A. 闸门在真实 broker 上**确实会命中**（单位错一位、阈值读错一个字段，离线拿 mock
-//      缓冲照样"能命中"，真机上却永远不命中或永远命中）；
-//   B. 命中之后**一条消息都不许丢**：流控只是"暂停拉取"，不是"丢弃/跳过"。暂停期间
-//      位点不许越过还没消费完的消息，恢复后同一个队列必须继续消费到末尾。
+// Offline unit tests (tests/test_flow_control.cpp) lock down the **decision criterion itself**;
+// this program locks down two things that offline tests can never prove on a real cluster:
+//   A. the gate **really gets hit** on a real broker (one wrong unit digit or one wrong threshold
+//      field, and the offline mock buffer would still "hit", but on a real cluster it never hits or always hits);
+//   B. after a hit, **not a single message may be lost**: flow control only "pauses pulling", it
+//      does not "drop/skip". While paused the offset must not pass messages not yet consumed; after resuming, the same queue must keep consuming to the end.
 //
 //
-// ⚠ 大消息必须是**不可压缩**的随机字节：生产者对超过压缩阈值的 body 先试压，全同字节
-//   的 payload 会被压到几百字节，broker 落盘的 storeSize 跟着变成几百字节，"size 闸门
-//   永不命中"就成了夹具问题而不是实现问题。
-// ⚠ 每个场景都必须**先建 topic 再启动消费者**：消费者不做默认 topic 兜底，没路由就
-//   不分配队列；S1 还必须建**单队列** topic，否则 8 条 400KB 摊到 4 条队列上每条才
-//   800KB，永远够不到 1MiB 这道队列级闸门。
+// ⚠ Big messages must be **incompressible** random bytes: the producer first tries to compress
+//   bodies above the compression threshold; an all-identical-byte payload compresses down to a few
+//   hundred bytes, the storeSize landed by the broker follows, and "the size gate never hits" becomes a fixture problem instead of an implementation problem.
+// ⚠ Every scenario must **create the topic before starting the consumer**: the consumer has no
+//   default-topic fallback, no route means no queue allocation; S1 must also create a topic with
+//   a **single queue**, otherwise 8 × 400KB messages spread over 4 queues put only 800KB on each, never reaching the 1MiB queue-level gate.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -56,8 +56,8 @@ int64_t nowMs() {
         .count();
 }
 
-// 轮询等待条件成立：真机投递受长轮询、流控退避和同机负载影响，固定 sleep 会在机器忙时
-// 把"实现没问题"测成漏消息。
+// Poll until the condition holds: live delivery is affected by long polling, flow-control
+// backoff and same-host load, so a fixed sleep would report a correct implementation as losing messages when the machine is busy.
 bool waitUntil(const std::function<bool()>& pred, int64_t timeoutMs) {
     const int64_t deadline = nowMs() + timeoutMs;
     while (nowMs() < deadline) {
@@ -69,7 +69,7 @@ bool waitUntil(const std::function<bool()>& pred, int64_t timeoutMs) {
 
 std::string num(int64_t v) { return std::to_string(v); }
 
-// 400KB 不可压缩消息体：6 字节前缀 + 随机尾巴（前缀只便于日志辨认，判据一律用条数）
+// 400KB incompressible body: 6-byte prefix + random tail (the prefix only helps read logs; assertions always use message counts)
 Bytes bigBody(int32_t tag) {
     static std::mt19937_64 rng(std::random_device{}());
     std::string body = "FCBIG-" + std::to_string(tag);
@@ -87,12 +87,12 @@ void prepareTopic(DefaultMQProducer& producer, const std::string& topic, int32_t
     try {
         producer.createTopic("init", topic, queues);
     } catch (const std::exception& e) {
-        std::printf("  预建 topic %s 失败（改用自动创建）: %s\n", topic.c_str(), e.what());
+        std::printf("  pre-creating topic %s failed (falling back to auto-creation): %s\n", topic.c_str(), e.what());
     }
     std::this_thread::sleep_for(std::chrono::seconds(3));
 }
 
-// 收消息用的 listener：可选地每批睡 slowMs（制造"已拉未消费"的堆积）
+// Message-collecting listener: optionally sleeps slowMs per batch (creates a "pulled but not consumed" backlog)
 class Sink : public MessageListenerConcurrently {
 public:
     explicit Sink(int32_t slowMs) : slowMs_(slowMs) {}
@@ -154,7 +154,7 @@ int main(int argc, char** argv) {
     try {
         producer.start();
     } catch (const std::exception& e) {
-        std::printf("生产者启动失败：%s\n", e.what());
+        std::printf("producer start failed: %s\n", e.what());
         return 2;
     }
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
     constexpr int32_t kOffCount = 65535;
     constexpr int32_t kOffSizeMiB = 1024;
 
-    // ---------------- S0 默认闸门 + 快消费：不该命中 ----------------
+    // ---------------- S0 default gates + fast consumption: must not trigger ----------------
     {
         const std::string topic = prefix + "_Defaults";
         prepareTopic(producer, topic, 4);
@@ -175,12 +175,12 @@ int main(int argc, char** argv) {
         const bool all = waitUntil([&] { return c.sink->got() >= 12; }, 30000);
         const int64_t fc = c.consumer->flowControlTriggered();
         c.consumer->shutdown();
-        check("S0-默认闸门不命中", fc == 0, "triggered=" + num(fc));
-        check("S0-默认闸门下全部到达", all && c.sink->got() == 12, "got=" + num(c.sink->got()));
-        check("S0-一条不重不丢", c.sink->distinct() == 12, "distinct=" + num(c.sink->distinct()));
+        check("S0-default gates not triggered", fc == 0, "triggered=" + num(fc));
+        check("S0-all arrive under default gates", all && c.sink->got() == 12, "got=" + num(c.sink->got()));
+        check("S0-no duplicate, no loss", c.sink->distinct() == 12, "distinct=" + num(c.sink->distinct()));
     }
 
-    // ---------------- S1 队列级字节闸门（单队列 topic）----------------
+    // ---------------- S1 queue-level byte gate (single-queue topic) ----------------
     {
         const std::string topic = prefix + "_Size";
         prepareTopic(producer, topic, 1);
@@ -199,13 +199,13 @@ int main(int argc, char** argv) {
         const bool all = waitUntil([&] { return c.sink->got() >= 8; }, 40000);
         const int64_t fc = c.consumer->flowControlTriggered();
         c.consumer->shutdown();
-        check("S1-队列级字节闸门真机命中", hit, "triggered=" + num(fc));
-        check("S1-大消息一条不丢", all && c.sink->got() == 8, "got=" + num(c.sink->got()));
-        check("S1-8 条 400KB 消息全不重复", c.sink->distinct() == 8,
+        check("S1-queue-level byte gate hits on live broker", hit, "triggered=" + num(fc));
+        check("S1-no big message lost", all && c.sink->got() == 8, "got=" + num(c.sink->got()));
+        check("S1-all 8 400KB messages distinct", c.sink->distinct() == 8,
               "distinct=" + num(c.sink->distinct()));
     }
 
-    // ---------------- S2 位点跨度闸门 ----------------
+    // ---------------- S2 offset-span gate ----------------
     {
         const std::string topic = prefix + "_Span";
         prepareTopic(producer, topic, 4);
@@ -222,11 +222,11 @@ int main(int argc, char** argv) {
         const bool all = waitUntil([&] { return c.sink->got() >= 14; }, 40000);
         const int64_t fc = c.consumer->flowControlTriggered();
         c.consumer->shutdown();
-        check("S2-跨度闸门真机命中", hit, "triggered=" + num(fc));
-        check("S2-跨度过限后仍全部消费", all && c.sink->got() == 14, "got=" + num(c.sink->got()));
+        check("S2-span gate hits on live broker", hit, "triggered=" + num(fc));
+        check("S2-all still consumed after span exceeded", all && c.sink->got() == 14, "got=" + num(c.sink->got()));
     }
 
-    // ---------------- S3 topic 级条数闸门（跨队列累计）----------------
+    // ---------------- S3 topic-level count gate (accumulated across queues) ----------------
     {
         const std::string topic = prefix + "_Topic";
         prepareTopic(producer, topic, 4);
@@ -244,14 +244,14 @@ int main(int argc, char** argv) {
         const bool all = waitUntil([&] { return c.sink->got() >= 16; }, 40000);
         const int64_t fc = c.consumer->flowControlTriggered();
         c.consumer->shutdown();
-        check("S3-topic 级条数闸门真机命中", hit, "triggered=" + num(fc));
-        check("S3-跨队列累计后仍全部消费", all && c.sink->got() == 16,
+        check("S3-topic-level count gate hits on live broker", hit, "triggered=" + num(fc));
+        check("S3-all still consumed after cross-queue accumulation", all && c.sink->got() == 16,
               "got=" + num(c.sink->got()));
     }
 
-    // ---------------- S4 命中过流控的队列恢复后继续消费 ----------------
-    // 复用 S1 的组与 topic（位点已由 S1 提交到 broker 末尾）。这一条锁的是"暂停 100ms"
-    // 被写成"退出拉取循环"的错误 —— 那条队列会永久停摆，而 S1 已消费完的消息看不出差别。
+    // ---------------- S4 a queue that hit flow control keeps consuming after recovery ----------------
+    // Reuses S1's group and topic (S1 already committed the offset to the broker's tail). This
+    // case locks the mistake of writing "pause 100ms" as "exit the pull loop" — that queue would stall forever, and the messages S1 already consumed show no difference.
     {
         const std::string topic = prefix + "_Size";
         Case c = startConsumer(nsAddr, prefix + "_g1", topic, 300);
@@ -269,11 +269,11 @@ int main(int argc, char** argv) {
         const bool hit = waitUntil([&] { return c.consumer->flowControlTriggered() > 0; }, 10000);
         const int64_t fc = c.consumer->flowControlTriggered();
         c.consumer->shutdown();
-        check("S4-触发过流控的队列恢复后继续消费", all && c.sink->got() == 6,
+        check("S4-queue that triggered flow control keeps consuming after recovery", all && c.sink->got() == 6,
               "got=" + num(c.sink->got()));
-        check("S4-恢复批次仍然命中流控（闸门不会命中一次后失效）", hit,
+        check("S4-recovered batch still hits flow control (the gate does not expire after one hit)", hit,
               "triggered=" + num(fc));
-        check("S4-恢复批次不重复", c.sink->distinct() == 6, "distinct=" + num(c.sink->distinct()));
+        check("S4-recovered batch has no duplicates", c.sink->distinct() == 6, "distinct=" + num(c.sink->distinct()));
     }
 
     {
@@ -300,16 +300,16 @@ int main(int argc, char** argv) {
             c.consumer->start();
         } catch (const std::exception& e) {
             boundaryStarted = false;
-            check("S5-边界值配置能启动", false, e.what());
+            check("S5-boundary-value config can start", false, e.what());
         }
         if (boundaryStarted) {
-            check("S5-边界值配置能启动", true, "isStarted=" + num(c.consumer->isStarted()));
+            check("S5-boundary-value config can start", true, "isStarted=" + num(c.consumer->isStarted()));
             std::this_thread::sleep_for(std::chrono::seconds(3));
             for (int i = 0; i < 10; ++i) {
                 producer.send(Message(topic, bodyBytes("c-" + std::to_string(i))));
             }
             const bool all = waitUntil([&] { return c.sink->got() >= 10; }, 30000);
-            check("S5-边界值配置下 10 条全到达",
+            check("S5-all 10 arrive under boundary-value config",
                   all && c.sink->got() == 10 && c.sink->distinct() == 10,
                   "got=" + num(c.sink->got()) + " distinct=" + num(c.sink->distinct()));
         }
@@ -344,22 +344,22 @@ int main(int argc, char** argv) {
             std::string actual;
             try {
                 bad.start();
-                actual = "start() 居然成功了";
+                actual = "start() unexpectedly succeeded";
                 bad.shutdown();
             } catch (const MQClientException& e) {
                 rejected = true;
                 actual = e.what();
             } catch (const std::exception& e) {
-                actual = std::string("别的异常: ") + e.what();
+                actual = std::string("other exception: ") + e.what();
             }
-            check(std::string("S5-越界配置被拒: ") + b.want, rejected && actual == b.want,
-                  "实际=" + actual);
-            check(std::string("S5-越界配置没留下半启动实例: ") + b.want, !bad.isStarted());
+            check(std::string("S5-out-of-range config rejected: ") + b.want, rejected && actual == b.want,
+                  "actual=" + actual);
+            check(std::string("S5-out-of-range config leaves no half-started instance: ") + b.want, !bad.isStarted());
         }
 
-        // broker 侧反证：被拒的组查不到、边界值组查得到。
-        // 必须用**裸**的 getConsumerListByGroup —— getConsumerIdListByGroup 内部吞异常
-        // 返回空列表，"被拒绝"和"没注册"在调用方看来一模一样。
+        // Broker-side counter-evidence: the rejected group is not found, the boundary-value group is.
+        // Must use the **raw** getConsumerListByGroup — getConsumerIdListByGroup swallows exceptions
+        // internally and returns an empty list, so "rejected" and "not registered" look identical to the caller.
         if (boundaryStarted) {
             MQClientInstance probe("FC_CPP_PROBE_" + num(nowMs()), {nsAddr});
             probe.start();
@@ -368,11 +368,11 @@ int main(int argc, char** argv) {
             if (route != nullptr && !route->brokerDatas.empty()) {
                 addr = route->brokerDatas[0].selectBrokerAddr();
             }
-            check("S5-拿到 broker 地址用于查消费组", !addr.empty(), "addr=" + addr);
+            check("S5-got broker addr for consumer-group lookup", !addr.empty(), "addr=" + addr);
             if (!addr.empty()) {
-                // 从未注册过的组：broker 的 GET_CONSUMER_LIST_BY_GROUP 不回空列表，而是
-                // 直接甩 code=1 "no consumer for this group"。两种形态都算"查无此组"，
-                // 但**绝不能**返回任何 clientId。
+                // A group that was never registered: the broker's GET_CONSUMER_LIST_BY_GROUP does
+                // not return an empty list but throws code=1 "no consumer for this group" directly.
+                // Both forms count as "group not found", but it **must never** return any clientId.
                 bool absent = false;
                 std::string detail;
                 try {
@@ -381,13 +381,13 @@ int main(int argc, char** argv) {
                     detail = "ids=" + num(ids.consumerIdList.size());
                 } catch (const MQBrokerException& e) {
                     absent = true;
-                    detail = "broker 直接拒绝: code=" + num(e.getResponseCode()) + " "
+                    detail = "broker rejected directly: code=" + num(e.getResponseCode()) + " "
                            + e.getResponseMessage();
                 } catch (const std::exception& e) {
                     absent = false;
-                    detail = std::string("探测请求失败: ") + e.what();
+                    detail = std::string("probe request failed: ") + e.what();
                 }
-                check("S5-broker 侧不知道被拒的消费组", absent, detail);
+                check("S5-broker does not know the rejected consumer group", absent, detail);
 
                 std::string goodDetail;
                 size_t goodN = 0;
@@ -395,9 +395,9 @@ int main(int argc, char** argv) {
                     goodN = probe.getConsumerListByGroup(goodGroup, addr, 5000)
                                 .consumerIdList.size();
                 } catch (const std::exception& e) {
-                    goodDetail = std::string("探测失败: ") + e.what();
+                    goodDetail = std::string("probe failed: ") + e.what();
                 }
-                check("S5-broker 侧认下了边界值消费者", goodN == 1,
+                check("S5-broker recognizes the boundary-value consumer", goodN == 1,
                       "n=" + num(static_cast<int32_t>(goodN))
                           + (goodDetail.empty() ? "" : " " + goodDetail));
             }

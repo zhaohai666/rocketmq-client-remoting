@@ -1,36 +1,36 @@
-// C++ 客户端的**真实集群**消息类型联调。
+// **Real-cluster** message-type integration test for the C++ client.
 //
-// 覆盖 11 类消息能力，全部打真实 nameServer + broker，且**每一类都从 broker 读回**再判定
-// （发送状态本身不作数；只有 oneway 无应答，改为靠读回条数证明它真的落库被投递）：
-//   0. 同步普通发送（send → push 消费者读回 1 条）
-//   1. 异步发送（sendAsync + SendCallback）
-//   1b. 定点异步发送（sendAsync(msg, mq, cb)：落到指定队列）
-//   1c. 单向发送（sendOneway，无应答 → 靠读回条数 == 3 证明投递成功）
-//   2. 顺序消息（sendBySelector 同 key 落同队列 + 顺序消费保序）
-//   3. 带 Tag 消息 + 服务端 Tag 过滤
-//   4. 用户属性透传
-//   5. 延迟消息（setDelayTimeLevel 并校验 store_ts - born_ts >= 3000ms）
-//   5b. 定时消息（用户属性 TIMER_DELIVER_MS 置为约 5s 后，同样用 store_ts-born_ts 证明延时生效）
-//   6. 带 Key 消息 + 按 Key 服务端查询（QUERY_MESSAGE）
-//   7. 事务消息（两阶段的提交路径；完整链路见 rmq_live_transaction）+ 落库可消费
-//   8. 批量消息（sendBatch → SEND_BATCH_MESSAGE(320)，broker 按 N 条独立消息投递、offset 连续）
-//   附：消费者心跳注册（HEART_BEAT）
+// Covers 11 message capabilities, all against a real name server + broker, and **every type is read back from the broker** before judging
+// (the send status by itself does not count; only oneway has no reply, so it is proven by the read-back count that it really landed and was delivered):
+//   0. synchronous normal send (send -> push consumer reads back 1 message)
+//   1. asynchronous send (sendAsync + SendCallback)
+//   1b. pinned async send (sendAsync(msg, mq, cb): lands on the specified queue)
+//   1c. one-way send (sendOneway, no reply -> read-back count == 3 proves delivery succeeded)
+//   2. ordered message (sendBySelector same key lands same queue + orderly consumption preserves order)
+//   3. tagged message + server-side tag filtering
+//   4. user property pass-through
+//   5. delayed message (setDelayTimeLevel and verify store_ts - born_ts >= 3000ms)
+//   5b. timer message (user property TIMER_DELIVER_MS set to about 5s later, likewise using store_ts-born_ts to prove the delay took effect)
+//   6. keyed message + server-side query by key (QUERY_MESSAGE)
+//   7. transactional message (two-phase commit path; full chain in rmq_live_transaction) + landed and consumable
+//   8. batch message (sendBatch -> SEND_BATCH_MESSAGE(320), broker delivers as N independent messages with contiguous offsets)
+//   Appendix: consumer heartbeat registration (HEART_BEAT)
 //
-// 本程序自身不启动集群；调用方需先启动 nameServer(9876) + broker(10911) 且
-// autoCreateTopicEnable=true。用法：
+// This program does not start a cluster itself; the caller must first start nameServer(9876) + broker(10911) with
+// autoCreateTopicEnable=true. Usage:
 //   ./rmq_live_message_types [namesrv_addr] [accessKey secretKey]
-// 为免 store 累积造成假象，所有 topic/消费组均带时间戳前缀。
+// To avoid a false picture from store accumulation, all topics/consumer groups carry a timestamp prefix.
 //
-// ACL 集群支持：可选传入 accessKey/secretKey。传入时，本程序启动的**每一个**客户端
-// 门面（生产者 / 消费者）都会带上这对凭据（setCredentials），并对 broker 的签名鉴权
-// 生效；不传时行为与不带凭据的普通集群完全一致。
-// 传入凭据时额外做一条**反向断言**：先起一个**不带**凭据的生产者发送，必须被 broker 拒
-// （NO_PERMISSION=16）。这条负向证明缺了它，在未开鉴权的集群上「全绿」就成了假通过。
-// 关于顺序：本端口每个门面在 start() 里各自 new 一份独立的 MQClientInstance（见
-// DefaultMQProducer::start），RPC 钩子绑在**该实例自己的**传输层上、实例之间不共享，
-// 所以无凭据探针不可能继承到别的客户端已签名的连接。即便如此，仍把探针作为**第一个**
-// 启动的客户端、发送后立刻 shutdown 并留 ~1s 让实例回收，再起带凭据的客户端，确保从
-// 干净状态开始。
+// ACL cluster support: accessKey/secretKey may be passed in. When passed, **every** client facade
+// (producer / consumer) started by this program carries this credential pair (setCredentials), and broker signature auth
+// takes effect; when not passed, behavior is exactly that of a plain cluster without credentials.
+// When credentials are passed, an extra **negative assertion** runs: first start a producer **without** credentials to send, which must be rejected by the broker
+// (NO_PERMISSION=16). Without this negative case, an "all green" on a cluster that has no auth enabled would be a false pass.
+// On ordering: in this port each facade news its own independent MQClientInstance inside start() (see
+// DefaultMQProducer::start); RPC hooks bind to **that instance's own** transport layer and are not shared between instances,
+// so an uncredentialed probe cannot inherit another client's already-signed connection. Even so, run the probe as the **first**
+// client started, shut it down right after sending and leave ~1s for the instance to be reclaimed, then start credentialed clients to ensure
+// a clean starting state.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -61,18 +61,18 @@ namespace {
 
 std::string gNamesrv = "127.0.0.1:9876";
 std::string gPrefix;
-// 可选 ACL 凭据：两者都非空时，本程序启动的每个客户端都带签名；无凭据集群保持全空即可。
+// Optional ACL credentials: when both are non-empty every client this program starts carries a signature; on a no-credential cluster keep both empty.
 std::string gAccessKey;
 std::string gSecretKey;
 std::vector<std::pair<std::string, bool>> gResults;
 int gPass = 0;
 int gFail = 0;
 
-// 凭据是否齐备：为空即视为「普通集群模式」，所有 setCredentials 调用都跳过。
+// Whether credentials are complete: if empty this is treated as plain-cluster mode and all setCredentials calls are skipped.
 bool aclEnabled() { return !gAccessKey.empty() && !gSecretKey.empty(); }
 
-// 生产者的凭据装载。DefaultMQProducer 与 DefaultMQPushConsumer 的同名接口签名一致，
-// 用模板一次覆盖，避免每个客户端类型各写一遍。
+// Producer credential loading. DefaultMQProducer and DefaultMQPushConsumer share an identical method signature,
+// so one template covers both instead of writing it once per client type.
 template <typename Client> void applyCredentials(Client& c) {
     if (aclEnabled()) {
         c.setCredentials(gAccessKey, gSecretKey);
@@ -95,7 +95,7 @@ std::string bytes2str(const Bytes& b) { return std::string(b.begin(), b.end()); 
 
 Bytes str2bytes(const std::string& s) { return Bytes(s.begin(), s.end()); }
 
-// ---------------------------------------------------------------- 监听器
+// ---------------------------------------------------------------- listener
 class CollectingListenerConcurrently : public MessageListenerConcurrently {
 public:
     ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
@@ -134,7 +134,7 @@ private:
     std::vector<MessageExt> msgs_;
 };
 
-// ---------------------------------------------------------------- 异步回调
+// ---------------------------------------------------------------- async callback
 class CollectingCallback : public SendCallback {
 public:
     void onSuccess(const SendResult& r) override {
@@ -167,8 +167,8 @@ private:
     std::vector<std::string> errors_;
 };
 
-// ---------------------------------------------------------------- 事务监听器
-// COMMIT：本地事务直接提交
+// ---------------------------------------------------------------- transaction listener
+// COMMIT: the local transaction commits directly
 class CommitTxListener : public TransactionListener {
 public:
     LocalTransactionState executeLocalTransaction(const Message& /*msg*/,
@@ -180,7 +180,7 @@ public:
     }
 };
 
-// ROLLBACK：本地事务回滚，broker 不应把半消息投递出来
+// ROLLBACK: the local transaction rolls back, and the broker should not deliver the half message
 class RollbackTxListener : public TransactionListener {
 public:
     LocalTransactionState executeLocalTransaction(const Message& /*msg*/,
@@ -192,8 +192,8 @@ public:
     }
 };
 
-// UNKNOW + 回查：本地事务返回 UNKNOW，等 broker 回查时才判 COMMIT。
-// checkCalls 用于证明 **broker 确实回调过**（否则"最终收到"可能只是普通消息路径）。
+// UNKNOW + check-back: the local transaction returns UNKNOW, and COMMIT is only decided when the broker checks back.
+// checkCalls proves **the broker really called back** (otherwise "finally received" might just be the normal-message path).
 class UnknownThenCommitTxListener : public TransactionListener {
 public:
     LocalTransactionState executeLocalTransaction(const Message& /*msg*/,
@@ -207,12 +207,12 @@ public:
     std::atomic<int> checkCalls{0};
 };
 
-// ---------------------------------------------------------------- 消费辅助
-// 活跃等待直至收到 expect 条（或最多 durationSec 秒），再关闭消费者。
-// 用活跃等待而非盲 sleep：消费者冷启动时路由/队列尚未就绪，固定窗口容易偶发 0 条。
+// ---------------------------------------------------------------- consume helper
+// Actively wait until expect messages are received (or at most durationSec seconds), then close the consumer.
+// Use active waiting instead of a blind sleep: on a cold start the route/queues are not ready yet, so a fixed window often yields 0 messages.
 struct ConsumerRun {
     std::vector<MessageExt> msgs;
-    std::shared_ptr<DefaultMQPushConsumer> consumer;  // 已 shutdown，仅用于读取计数
+    std::shared_ptr<DefaultMQPushConsumer> consumer;  // already shut down, only used to read the count
 };
 
 ConsumerRun runConsumer(const std::string& topic, const std::string& subExpr, int durationSec,
@@ -235,8 +235,8 @@ ConsumerRun runConsumer(const std::string& topic, const std::string& subExpr, in
     consumer->setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
     consumer->subscribe(topic, subExpr);
     consumer->setMessageListener(listener);
-    // 关键：单线程顺序长轮询下，空闲队列的 suspend 长轮询会饿死满载队列，
-    // 故把客户端等待与服务端挂起都设短（详见 consumer.h 注释）。
+    // Key point: under single-threaded sequential long-polling, an idle queue's suspend long-poll starves a full queue,
+    // so both the client wait and the server-side suspend are set short (see the consumer.h comments).
     consumer->setPullTimeoutMillis(pullTimeout);
     consumer->setPullSuspendTimeoutMillis(pullSuspend);
     consumer->start();
@@ -255,7 +255,7 @@ ConsumerRun runConsumer(const std::string& topic, const std::string& subExpr, in
     return run;
 }
 
-// 等待 broker 在 nameServer 注册完成（避免端口刚开、注册未落地的竞态）
+// Wait until the broker finishes registering with the name server (avoids the race where the port just opened but registration has not landed)
 std::vector<std::string> waitBroker(DefaultMQProducer& prod) {
     for (int i = 0; i < 40; ++i) {
         try {
@@ -269,7 +269,7 @@ std::vector<std::string> waitBroker(DefaultMQProducer& prod) {
             }
             if (!addrs.empty()) return addrs;
         } catch (const std::exception&) {
-            // 路由还没就绪，继续等
+            // route not ready yet, keep waiting
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
@@ -282,7 +282,7 @@ int main(int argc, char** argv) {
     if (argc >= 2) {
         gNamesrv = argv[1];
     }
-    // 可选位置参数：argv[2]=accessKey argv[3]=secretKey
+    // Optional positional args: argv[2]=accessKey argv[3]=secretKey
     if (argc >= 3) {
         gAccessKey = argv[2];
     }
@@ -292,30 +292,30 @@ int main(int argc, char** argv) {
     const int64_t stamp = UtilAll::currentTimeSeconds();
     gPrefix = "MTCPP_" + std::to_string(stamp);
 
-    std::cout << "=== C++ 客户端消息类型联调（真实集群）===" << std::endl;
+    std::cout << "=== C++ client message-type integration (real cluster) ===" << std::endl;
     std::cout << "namesrv = " << gNamesrv << "  prefix = " << gPrefix << std::endl;
     std::cout << "ACL = " << (aclEnabled() ? "enabled (ak=" + gAccessKey + ")" : "disabled")
               << std::endl;
 
-    // 日志保持干净：默认 INFO，良性长轮询超时（DEBUG）被抑制
-    // 日志保持干净：默认 INFO，良性长轮询超时（DEBUG）被抑制。
-    // 但若外部显式设置了 ROCKETMQ_CLIENT_LOG_LEVEL，则尊重它——真机排查时不改代码即可提级别。
+    // Keep logs clean: default INFO, benign long-poll timeouts (DEBUG) are suppressed
+    // Keep logs clean: default INFO, benign long-poll timeouts (DEBUG) are suppressed.
+    // But if ROCKETMQ_CLIENT_LOG_LEVEL is explicitly set externally, honor it — on live diagnosis you can raise the level without changing code.
     if (!logLevelSetFromEnv()) {
         setLogLevel(LOG_INFO);
     }
 
-    // ---------- 0. ACL 反向断言：无凭据生产者的发送必须被拒 ----------
-    // 开鉴权的集群里，所有 broker RPC 都要合法签名；不带凭据即回 NO_PERMISSION(16)。
-    // 没有这一条，程序在未开鉴权的集群上也会「全绿」，那份全绿证明不了签名真的生效。
-    // 必须排在所有带凭据客户端之前：本端口每个门面各自持有独立的 MQClientInstance，
-    // 钩子绑在各自的传输层上，顺序本不影响隔离；仍先起后立刻 shutdown 并等 ~1s，
-    // 让无凭据探针的实例先释放干净，后续带凭据客户端从干净状态建立连接。
+    // ---------- 0. ACL negative assertion: an uncredentialed producer's send must be rejected ----------
+    // On an auth-enabled cluster every broker RPC needs a valid signature; without credentials it returns NO_PERMISSION(16).
+    // Without this, the program would also show "all green" on a cluster without auth, and that green cannot prove the signature really takes effect.
+    // It must run before all credentialed clients: in this port each facade holds its own independent MQClientInstance,
+    // hooks bind to each own transport layer, so order does not affect isolation; still start it first, shut it down immediately and wait ~1s,
+    // letting the uncredentialed probe's instance release cleanly so later credentialed clients connect from a clean state.
     if (aclEnabled()) {
         const std::string probeTopic = gPrefix + "_AclDenied";
         DefaultMQProducer noCred(gPrefix + "_producer_nocred");
-        noCred.setNamesrvAddr(gNamesrv);  // 故意**不**装凭据
+        noCred.setNamesrvAddr(gNamesrv);  // deliberately do **not** load credentials
         noCred.setSendMsgTimeout(5000);
-        noCred.setRetryTimesWhenSendFailed(0);  // 鉴权失败不必重试三轮
+        noCred.setRetryTimesWhenSendFailed(0);  // an auth failure need not retry three rounds
         bool rejected = false;
         std::string detail;
         try {
@@ -326,12 +326,12 @@ int main(int argc, char** argv) {
             rejected = e.getResponseCode() == ResponseCode::NO_PERMISSION;
             detail = "code=" + std::to_string(e.getResponseCode()) + " " + e.getResponseMessage();
         } catch (const std::exception& e) {
-            // 无队列可用/建 topic 失败会把底层 16 码拼进文案，这里按标记识别。
+            // "no queue available" / topic-creation failure concatenates the underlying 16 code into the text, so match it by marker here.
             detail = e.what();
             rejected = detail.find("CODE: 16") != std::string::npos ||
                        detail.find("NO_PERMISSION") != std::string::npos;
         }
-        check("ACL 反向：无凭据发送被拒(NO_PERMISSION=16)", rejected, detail);
+        check("ACL negative: uncredentialed send rejected (NO_PERMISSION=16)", rejected, detail);
         noCred.shutdown();
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
@@ -343,13 +343,13 @@ int main(int argc, char** argv) {
     try {
         prod.start();
     } catch (const std::exception& e) {
-        std::cout << "[FAIL] 生产者启动: " << e.what() << std::endl;
+        std::cout << "[FAIL] producer startup: " << e.what() << std::endl;
         return 1;
     }
 
     std::vector<std::string> brokers = waitBroker(prod);
     if (brokers.empty()) {
-        check("集群探活", false, "nameServer 无 broker 注册");
+        check("cluster liveness probe", false, "nameServer has no broker registered");
         prod.shutdown();
         return 1;
     }
@@ -358,13 +358,13 @@ int main(int argc, char** argv) {
         if (i) brokerList += ",";
         brokerList += brokers[i];
     }
-    check("集群探活", true, "brokers=" + brokerList);
+    check("cluster liveness probe", true, "brokers=" + brokerList);
 
     const int64_t t0 = UtilAll::currentTimeMillis();
 
-    // ---------- 0a. 同步普通发送：状态之外还必须从 broker 读回 ----------
-    // 发送返回 SEND_OK 只证明 broker 收下了请求，不能证明消息进了可消费的队列，
-    // 所以这一类的判据是 push 消费者按 FIRST_OFFSET 把它读回来。
+    // ---------- 0a. synchronous normal send: beyond the status it must also be read back from the broker ----------
+    // A send returning SEND_OK only proves the broker accepted the request, not that the message entered a consumable queue,
+    // so this case's criterion is the push consumer reading it back via FIRST_OFFSET.
     {
         const std::string topic = gPrefix + "_Sync";
         bool sendOk = false;
@@ -377,39 +377,39 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             detail = std::string("throw: ") + e.what();
         }
-        check("同步普通发送 send()", sendOk, detail);
+        check("synchronous normal send send()", sendOk, detail);
 
         ConsumerRun run = runConsumer(topic, "*", 12, false, "sync", /*expect=*/1);
         bool readBack = false;
         for (const MessageExt& m : run.msgs) {
             if (bytes2str(m.body) == "sync-normal") readBack = true;
         }
-        check("同步普通发送 从 broker 读回", readBack,
+        check("synchronous normal send read back from broker", readBack,
               "received=" + std::to_string(run.msgs.size()));
     }
 
-    // ---------- 0b. 单向发送 sendOneway：没有应答，只能靠读回条数证明 ----------
-    // oneway 是「发出即成功」的无应答语义：客户端拿不到任何 broker 回执，
-    // 所以「发了 3 条」这件事本身不可证。唯一的判据是消费侧读回**恰好** 3 条 ——
-    // 少一条说明请求根本没出去，多一条说明重复投递。
+    // ---------- 0b. one-way send sendOneway: no reply, can only be proven by the read-back count ----------
+    // oneway is a fire-and-forget no-reply semantic: the client gets no broker receipt at all,
+    // so "3 messages sent" cannot be proven by itself. The only criterion is the consumer reading back **exactly** 3 ——
+    // one fewer means the request never went out, one more means duplicate delivery.
     //
-    // 这里先把 topic 显式建好再发：新 topic 的自动创建要等发送的**应答**把路由带回来，
-    // 而 oneway 按协议不产生任何应答，拿不准消息最终落到哪条队列上。topic 先就位，
-    // 读回的条数才是只关于 oneway 的干净证据（三条都在同一个已知 topic 上）。
+    // Create the topic explicitly first, then send: a new topic's auto-creation waits for the send's **reply** to bring back the route,
+    // while oneway per protocol produces no reply, so you cannot be sure which queue a message finally lands on. With the topic in place first,
+    // the read-back count is clean evidence about oneway alone (all three are on the same known topic).
     {
         const std::string topic = gPrefix + "_Oneway";
         const int kOnewayNum = 3;
         bool topicReady = false;
         std::string createDetail;
         try {
-            // 建 topic 的 key 就是发布路由的模板 topic（与生产者的 createTopicKey 同值）。
+            // The key used to create the topic is the template topic for the publish route (same value as the producer's createTopicKey).
             prod.createTopic(MixAll::DEFAULT_TOPIC, topic, 4);
-            // 建完等路由可见，别让单向发送跑在路由之前
+            // After creating it, wait until the route is visible; do not let the one-way send run ahead of the route
             for (int i = 0; i < 30 && !topicReady; ++i) {
                 try {
                     topicReady = prod.fetchPublishMessageQueues(topic).size() >= 4;
                 } catch (const std::exception&) {
-                    // 路由还没落地，稍后再查
+                    // route not landed yet, re-check shortly
                 }
                 if (!topicReady) std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
@@ -417,7 +417,7 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             createDetail = std::string("throw: ") + e.what();
         }
-        check("单向发送 前置建 topic", topicReady, createDetail);
+        check("one-way send pre-created topic", topicReady, createDetail);
 
         std::string detail = "sent=";
         int sent = 0;
@@ -429,8 +429,8 @@ int main(int argc, char** argv) {
                 detail += "[EXC:" + std::string(e.what()) + "]";
             }
         }
-        detail += std::to_string(sent) + " (oneway 无应答，不作判据)";
-        check("单向发送 sendOneway() 调用成功", sent == kOnewayNum, detail);
+        detail += std::to_string(sent) + " (oneway has no reply, not used as a criterion)";
+        check("one-way send sendOneway() call succeeded", sent == kOnewayNum, detail);
 
         ConsumerRun run = runConsumer(topic, "*", 15, false, "oneway", /*expect=*/kOnewayNum);
         std::set<std::string> bodies;
@@ -441,14 +441,14 @@ int main(int argc, char** argv) {
         for (int i = 0; i < kOnewayNum; ++i) {
             if (bodies.count("oneway-" + std::to_string(i)) == 0) exact = false;
         }
-        // 读回条数就是 oneway 唯一的「发送成功」证据。
-        check("单向发送 从 broker 读回 3 条(唯一判据)",
+        // The read-back count is oneway's only "send succeeded" evidence.
+        check("one-way send read back 3 from broker (the only criterion)",
               run.msgs.size() == static_cast<size_t>(kOnewayNum) && exact,
               "received=" + std::to_string(run.msgs.size()) + " distinct="
                   + std::to_string(bodies.size()));
     }
 
-    // ---------- 1. 异步发送 ----------
+    // ---------- 1. asynchronous send ----------
     {
         const std::string topic = gPrefix + "_Async";
         auto cb = std::make_shared<CollectingCallback>();
@@ -456,7 +456,7 @@ int main(int argc, char** argv) {
         try {
             prod.sendAsync(msg, cb);
         } catch (const std::exception& e) {
-            check("异步发送 sendAsync", false, std::string("throw: ") + e.what());
+            check("asynchronous send sendAsync", false, std::string("throw: ") + e.what());
         }
         for (int i = 0; i < 200 && cb->ok() + cb->err() == 0; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -464,11 +464,11 @@ int main(int argc, char** argv) {
         std::vector<SendResult> rs = cb->results();
         bool ok = (cb->ok() == 1) && (cb->err() == 0) && !rs.empty() &&
                   rs[0].sendStatus == SendStatus::SEND_OK;
-        check("异步发送 sendAsync", ok,
+        check("asynchronous send sendAsync", ok,
               "ok=" + std::to_string(cb->ok()) + " err=" + std::to_string(cb->err()));
     }
 
-    // ---------- 1b. 定点异步发送：sendAsync(msg, mq, cb) ----------
+    // ---------- 1b. pinned async send: sendAsync(msg, mq, cb) ----------
     {
         const std::string topic = gPrefix + "_AsyncPinned";
         SendResult probe;
@@ -477,8 +477,8 @@ int main(int argc, char** argv) {
             probe = prod.send(Message(topic, str2bytes("probe")), 5000);
         } catch (const std::exception& e) {
             probed = false;
-            check("定点异步发送 sendAsync(msg, mq)", false,
-                  std::string("建 topic 失败: ") + e.what());
+            check("pinned async send sendAsync(msg, mq)", false,
+                  std::string("create topic failed: ") + e.what());
         }
         if (probed) {
             DefaultMQProducer fresh(gPrefix + "_producer_fresh");
@@ -491,7 +491,7 @@ int main(int argc, char** argv) {
                 fresh.sendAsync(Message(topic, str2bytes("pinned-async")), probe.messageQueue, cb,
                                 5000);
             } catch (const std::exception& e) {
-                check("定点异步发送 sendAsync(msg, mq)", false,
+                check("pinned async send sendAsync(msg, mq)", false,
                       std::string("throw: ") + e.what());
             }
             for (int i = 0; i < 200 && cb->ok() + cb->err() == 0; ++i) {
@@ -502,7 +502,7 @@ int main(int argc, char** argv) {
             const bool ok = (cb->ok() == 1) && (cb->err() == 0) && !rs.empty()
                             && rs[0].sendStatus == SendStatus::SEND_OK && sameQueue
                             && !rs[0].msgId.empty();
-            check("定点异步发送 sendAsync(msg, mq)", ok,
+            check("pinned async send sendAsync(msg, mq)", ok,
                   "ok=" + std::to_string(cb->ok()) + " err=" + std::to_string(cb->err())
                       + (rs.empty()
                              ? std::string()
@@ -513,13 +513,13 @@ int main(int argc, char** argv) {
                                   + " msgId=" + (rs[0].msgId.empty() ? "<empty>" : "set"))));
             if (cb->err() > 0) {
                 std::vector<std::string> errs = cb->errors();
-                std::cout << "       回调异常: " << errs[0] << std::endl;
+                std::cout << "       callback exception: " << errs[0] << std::endl;
             }
             fresh.shutdown();
         }
     }
 
-    // ---------- 2. 顺序消息：同 key 落同队列 + 顺序消费保序 ----------
+    // ---------- 2. ordered message: same key lands same queue + orderly consumption preserves order ----------
     std::vector<Bytes> bodiesOrder;
     {
         const std::string topic = gPrefix + "_Order";
@@ -540,14 +540,14 @@ int main(int argc, char** argv) {
             if (!qidStr.empty()) qidStr += ",";
             qidStr += std::to_string(q);
         }
-        check("顺序发送: 同 key 路由到同一队列", qids.size() == 1,
+        check("ordered send: same key routes to the same queue", qids.size() == 1,
               "distinct_queue_ids=" + (qidStr.empty() ? std::string("?") : qidStr));
 
         ConsumerRun run = runConsumer(topic, "*", 12, /*orderly=*/true, "order",
                                       /*expect=*/10);
-        // 真实保序校验：收到的**顺序**必须与发送顺序一致（而非仅集合相等 ——
-        // 只比 sorted 只能证明"收全了"，证明不了"没乱序"），
-        // 并且同一队列内的 queueOffset 必须严格递增。
+        // Real order check: the received **sequence** must match the send order (not merely set equality ——
+        // comparing only sorted proves "all received" but not "nothing out of order"),
+        // and within the same queue the queueOffset must be strictly increasing.
         std::vector<std::string> recv, expect;
         for (const MessageExt& m : run.msgs) recv.push_back(bytes2str(m.body));
         for (const Bytes& b : bodiesOrder) expect.push_back(bytes2str(b));
@@ -562,10 +562,10 @@ int main(int argc, char** argv) {
         if (!recv.empty()) {
             orderDetail += " first=" + recv.front() + " last=" + recv.back();
         }
-        check("顺序消费保序", run.msgs.size() == 10 && seqOk && offsetOk, orderDetail);
+        check("orderly consumption preserves order", run.msgs.size() == 10 && seqOk && offsetOk, orderDetail);
     }
 
-    // ---------- 3. 带 Tag 消息 + 服务端 Tag 过滤 ----------
+    // ---------- 3. tagged message + server-side tag filtering ----------
     {
         const std::string topic = gPrefix + "_Tag";
         for (int i = 0; i < 3; ++i) {
@@ -583,11 +583,11 @@ int main(int argc, char** argv) {
         for (const MessageExt& m : run.msgs) {
             if (m.getTags() != "TagA") allA = false;
         }
-        check("Tag 过滤消费（仅收到 TagA）", run.msgs.size() == 3 && allA,
+        check("Tag-filtered consumption (only TagA received)", run.msgs.size() == 3 && allA,
               "received=" + std::to_string(run.msgs.size()));
     }
 
-    // ---------- 4. 用户属性透传 ----------
+    // ---------- 4. user property pass-through ----------
     {
         const std::string topic = gPrefix + "_Prop";
         for (int i = 0; i < 3; ++i) {
@@ -604,12 +604,12 @@ int main(int argc, char** argv) {
             if (m.getUserProperty("city") != "Hangzhou") okCity = false;
             if (m.getUserProperty("env") != "prod") okEnv = false;
         }
-        check("用户属性透传(city=Hangzhou, env=prod)",
+        check("user property pass-through(city=Hangzhou, env=prod)",
               okCity && okEnv && run.msgs.size() == 3,
               "received=" + std::to_string(run.msgs.size()));
     }
 
-    // ---------- 5. 延迟消息 ----------
+    // ---------- 5. delayed message ----------
     {
         const std::string topic = gPrefix + "_Delay";
         prod.send(Message(topic, str2bytes("normal-now")));
@@ -626,29 +626,29 @@ int main(int argc, char** argv) {
                 normal.push_back(m);
             }
         }
-        check("延迟消息最终投递", !delayed.empty(),
+        check("delayed message finally delivered", !delayed.empty(),
               "delayed received=" + std::to_string(delayed.size()) + " normal="
                   + std::to_string(normal.size()));
         if (!delayed.empty()) {
             int64_t drift = delayed[0].storeTimestamp - delayed[0].bornTimestamp;
-            check("延迟生效(store_ts-born_ts>=3000ms)", drift >= 3000,
+            check("delay took effect (store_ts-born_ts>=3000ms)", drift >= 3000,
                   "drift=" + std::to_string(drift) + "ms");
         } else {
-            check("延迟生效(store_ts-born_ts>=3000ms)", false, "无延迟消息可校验");
+            check("delay took effect (store_ts-born_ts>=3000ms)", false, "no delayed message to verify");
         }
     }
 
-    // ---------- 5b. 定时消息（用户属性 TIMER_DELIVER_MS，投递时刻为约 5s 之后）----------
-    // 延迟等级只能挑固定的几档；定时消息让发送方直接给出**绝对投递时刻**。
-    // broker 把带 TIMER_DELIVER_MS 的消息收进定时存储，到点才写回真实 topic，
-    // 因此消费侧看到的 store_ts 是「真正投递那一次」的存储时间：
-    // store_ts - born_ts >= 3000ms 就证明延时确实生效，而不是被当普通消息立刻投递。
+    // ---------- 5b. timer message (user property TIMER_DELIVER_MS, delivery about 5s later)----------
+    // A delay level can only pick a few fixed tiers; a timer message lets the sender give an **absolute delivery time** directly.
+    // The broker keeps TIMER_DELIVER_MS messages in timer storage and only writes them back to the real topic at the due time,
+    // so the store_ts the consumer sees is the storage time of "the actual delivery":
+    // store_ts - born_ts >= 3000ms proves the delay really took effect rather than being delivered immediately as a normal message.
     {
         const std::string topic = gPrefix + "_Timer";
         const int64_t deliverInMs = 5000;
         const int64_t deliverAt = UtilAll::currentTimeMillis() + deliverInMs;
         Message tm(topic, str2bytes("timer-deliver"));
-        // 走用户属性：TIMER_DELIVER_MS 是定时消息的协议属性名。
+        // Via user property: TIMER_DELIVER_MS is the protocol property name of a timer message.
         tm.setUserProperty(MessageConst::PROPERTY_TIMER_DELIVER_MS, std::to_string(deliverAt));
         bool sent = false;
         std::string detail;
@@ -660,26 +660,26 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             detail = std::string("throw: ") + e.what();
         }
-        check("定时消息发送(TIMER_DELIVER_MS≈+5s)", sent, detail);
+        check("timer message send (TIMER_DELIVER_MS≈+5s)", sent, detail);
 
         ConsumerRun run = runConsumer(topic, "*", 20, false, "timer", /*expect=*/1);
         std::vector<MessageExt> timed;
         for (const MessageExt& m : run.msgs) {
             if (bytes2str(m.body) == "timer-deliver") timed.push_back(m);
         }
-        check("定时消息最终投递", !timed.empty(),
+        check("timer message finally delivered", !timed.empty(),
               "timer received=" + std::to_string(timed.size()) + " total="
                   + std::to_string(run.msgs.size()));
         if (!timed.empty()) {
             int64_t drift = timed[0].storeTimestamp - timed[0].bornTimestamp;
-            check("定时生效(store_ts-born_ts>=3000ms)", drift >= 3000,
+            check("timer took effect (store_ts-born_ts>=3000ms)", drift >= 3000,
                   "drift=" + std::to_string(drift) + "ms");
         } else {
-            check("定时生效(store_ts-born_ts>=3000ms)", false, "无定时消息可校验");
+            check("timer took effect (store_ts-born_ts>=3000ms)", false, "no timer message to verify");
         }
     }
 
-    // ---------- 6. 带 Key 消息 + 按 Key 查询 ----------
+    // ---------- 6. keyed message + query by key ----------
     {
         const std::string topic = gPrefix + "_Key";
         const std::string key = "MTKEY_" + std::to_string(stamp);
@@ -696,7 +696,7 @@ int main(int argc, char** argv) {
         for (const MessageExt& x : found) {
             if (bytes2str(x.body) == payload) hit = true;
         }
-        check("按 Key 查询(query_message)", hit,
+        check("query by key (query_message)", hit,
               "returned=" + std::to_string(found.size()));
     }
 
@@ -714,14 +714,14 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             stateStr = std::string("throw: ") + e.what();
         }
-        check("事务-COMMIT 发送状态", txOk, "state=" + stateStr);
+        check("transaction-COMMIT send status", txOk, "state=" + stateStr);
 
         ConsumerRun run = runConsumer(topic, "*", 10, false, "tx");
         bool consumed = false;
         for (const MessageExt& m : run.msgs) {
             if (bytes2str(m.body) == "tx-commit") consumed = true;
         }
-        check("事务-COMMIT 落库可被消费", consumed,
+        check("transaction-COMMIT landed and consumable", consumed,
               "received=" + std::to_string(run.msgs.size()));
     }
 
@@ -740,19 +740,19 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             stateStr = std::string("throw: ") + e.what();
         }
-        check("事务-ROLLBACK 发送状态", txOk, "state=" + stateStr);
+        check("transaction-ROLLBACK send status", txOk, "state=" + stateStr);
 
-        // 回滚后 broker 不应投递：等满窗口确认一条都没收到
+        // After rollback the broker should not deliver: wait out the whole window to confirm nothing was received
         ConsumerRun run = runConsumer(topic, "*", 10, false, "txrollback");
         bool consumed = false;
         for (const MessageExt& m : run.msgs) {
             if (bytes2str(m.body) == "tx-rollback") consumed = true;
         }
-        check("事务-ROLLBACK 不被投递", !consumed,
+        check("transaction-ROLLBACK not delivered", !consumed,
               "received=" + std::to_string(run.msgs.size()));
     }
 
-    // ---------- 7.3 UNKNOW + broker 回查 ----------
+    // ---------- 7.3 UNKNOW + broker check-back ----------
     {
         const std::string topic = gPrefix + "_TxCheck";
         UnknownThenCommitTxListener listener;
@@ -767,28 +767,28 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             stateStr = std::string("throw: ") + e.what();
         }
-        check("事务-UNKNOW 发送状态", txOk, "state=" + stateStr);
+        check("transaction-UNKNOW send status", txOk, "state=" + stateStr);
 
-        // 回查节奏取决于 broker：本机集群 transactionCheckInterval 为 30s 一轮，
-        // 半消息在发送后 15~17s 才被提交，故窗口必须覆盖一整个回查周期；
-        // expect=1 让消费者一收到就返回，不必等满。
+        // The check-back cadence depends on the broker: on a local cluster transactionCheckInterval is one round per 30s,
+        // the half message is committed 15~17s after sending, so the window must cover a whole check-back cycle;
+        // expect=1 lets the consumer return as soon as it receives one, without waiting out the window.
         ConsumerRun run = runConsumer(topic, "*", 40, false, "txcheck", /*expect=*/1);
         bool consumed = false;
         for (const MessageExt& m : run.msgs) {
             if (bytes2str(m.body) == "tx-check") consumed = true;
         }
         int checks = listener.checkCalls.load();
-        check("事务-UNKNOW 触发 broker 回查", checks > 0,
+        check("transaction-UNKNOW triggers broker check-back", checks > 0,
               "checkLocalTransaction_calls=" + std::to_string(checks));
-        check("事务-UNKNOW 回查后最终投递", consumed,
+        check("transaction-UNKNOW finally delivered after check-back", consumed,
               "received=" + std::to_string(run.msgs.size()));
     }
 
-    // ---------- 8. 批量消息（SEND_BATCH_MESSAGE 320）----------
-    // 请求码从 310 换成 320 之后，必须在真 broker 上重新证明一次：broker 确实是按
-    // 「批量写入」处理这笔请求的。判据是消费侧看到 **N 条独立消息、offset 连续**：
-    // 如果 broker 把批量 body 当成单条消息存（即 header.batch 没生效），这里只会收到
-    // 1 条 body 为拼接字节的消息，而不是 N 条各自完整的 body。
+    // ---------- 8. batch message (SEND_BATCH_MESSAGE 320)----------
+    // After the request code changed from 310 to 320, it must be re-proven on a real broker that the broker really
+    // handles this request as "batch write". The criterion is the consumer seeing **N independent messages with contiguous offsets**:
+    // if the broker stored the batch body as a single message (i.e. header.batch did not take effect), only
+    // 1 message whose body is the concatenated bytes would arrive, not N each-complete bodies.
     {
         const std::string topic = gPrefix + "_Batch";
         std::vector<Message> group;
@@ -804,7 +804,7 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             batchDetail = std::string("throw: ") + e.what();
         }
-        check("批量发送 sendBatch(3 条)", batchOk, batchDetail);
+        check("batch send sendBatch(3 messages)", batchOk, batchDetail);
 
         ConsumerRun run = runConsumer(topic, "*", 15, false, "batch", /*expect=*/3);
         std::set<std::string> bodies;
@@ -822,7 +822,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 3; ++i) {
             if (bodies.count("batch-" + std::to_string(i)) == 0) exact = false;
         }
-        check("批量消息被 broker 按 3 条独立消息投递", exact && contiguous,
+        check("batch delivered by the broker as 3 independent messages", exact && contiguous,
               "received=" + std::to_string(run.msgs.size()) + " offsets="
                   + [&] {
                         std::string s;
@@ -831,30 +831,30 @@ int main(int argc, char** argv) {
                     }());
     }
 
-    // ---------- 附：心跳注册 ----------
+    // ---------- Appendix: heartbeat registration ----------
     {
         const std::string topic = gPrefix + "_Hb";
         prod.send(Message(topic, str2bytes("hb-probe")));
         ConsumerRun run = runConsumer(topic, "*", 10, false, "hb", /*expect=*/1);
         int64_t hb = run.consumer ? run.consumer->heartbeatCount() : 0;
-        check("消费者心跳注册(HEART_BEAT)", hb > 0,
+        check("consumer heartbeat registration (HEART_BEAT)", hb > 0,
               "heartbeat_ok=" + std::to_string(hb) + " consumed="
                   + std::to_string(run.msgs.size()));
     }
 
     prod.shutdown();
 
-    // ---------- 汇总 ----------
-    std::cout << "\n================ C++ 消息类型联调汇总 ================" << std::endl;
+    // ---------- summary ----------
+    std::cout << "\n================ C++ message-type integration summary ================" << std::endl;
     for (const auto& r : gResults) {
         std::cout << "  [" << (r.second ? "PASS" : "FAIL") << "] " << r.first << std::endl;
     }
     std::cout << "=====================================================" << std::endl;
     std::cout << "  PASS=" << gPass << " FAIL=" << gFail << std::endl;
     if (gFail > 0) {
-        std::cout << "结果: " << gFail << " 项失败" << std::endl;
+        std::cout << "result: " << gFail << " items failed" << std::endl;
         return 1;
     }
-    std::cout << "结果: 全部通过（C++ 客户端对真实集群完成全部消息类型收发）" << std::endl;
+    std::cout << "result: all passed (the C++ client completed every message type against a real cluster)" << std::endl;
     return 0;
 }

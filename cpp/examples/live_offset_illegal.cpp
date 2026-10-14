@@ -1,21 +1,21 @@
-// 位点非法（OFFSET_ILLEGAL）自愈分支真机联调（场景 S1/S2 逐条断言）。
+// Illegal-offset (OFFSET_ILLEGAL) self-healing branch live-cluster test (scenarios S1/S2 asserted one by one).
 //
-// 这条分支做四件事：位点改用 broker 给的修正值（`setNextOffset`）→ 丢掉这条队列上已取回
-// 未消费的消息（`ProcessQueue.setDropped(true)`）→ 把修正位点**立刻**落盘
-//（`updateAndFreezeOffset` + `persist`）→ 撤掉队列让 rebalance 按修正位点重建
-//（`removeProcessQueue` + `rebalanceImmediately`）。离线单测（tests/test_offset_illegal_recover.cpp）
-// 只能锁住本地状态怎么清、哪个 ack 被作废，下面两件事只有真集群能证明：
-//
-//
-//   S2「立刻落盘」——纠错后的位点必须马上推给 broker，不能等周期落盘。做法：利用
-//      resetOffsetByQueueId 两笔 RPC 非原子（第 1 笔 commitOffset 无区间校验先落库、第 2 笔
-//      222 被 resetOffsetInner 拒绝，见 admin.h 里记的 5.5.1 实测）的既有行为，把 broker 上的
-//      已提交位点做成非法值 103，再让一个 persistConsumerOffsetIntervalMillis=60000 的新消费者
-//      从 103 起拉。窗口内唯一能把 103 写回 3（maxOffset）的路径就是纠错分支自带的那次 persist，
-//      且全程零投递。
+// This branch does four things: the offset switches to the corrected value from the broker (`setNextOffset`) → drop
+// the messages already fetched but not consumed on this queue (`ProcessQueue.setDropped(true)`) → persist the corrected offset
+// **immediately** (`updateAndFreezeOffset` + `persist`) → remove the queue so rebalance rebuilds it
+// at the corrected value (`removeProcessQueue` + `rebalanceImmediately`). The offline unit test (tests/test_offset_illegal_recover.cpp)
+// can only lock how local state is cleared and which ack is voided; only a real cluster can prove the two things below:
 //
 //
-// 用法：./rmq_live_offset_illegal 127.0.0.1:9876
+//   S2 "persist immediately" — the corrected offset must be pushed to the broker at once, not waiting for the periodic
+//      persist. Method: exploit the existing behavior that resetOffsetByQueueId's two RPCs are non-atomic (the 1st
+//      commitOffset lands with no range validation; the 2nd, code 222, is rejected by resetOffsetInner — see the 5.5.1
+//      measurements recorded in admin.h): plant the committed offset on the broker as the illegal value 103, then let a
+//      fresh consumer with persistConsumerOffsetIntervalMillis=60000 start pulling from 103. Within the window the only
+//      path that can write 103 back to 3 (maxOffset) is the persist carried by the recovery branch itself, with zero deliveries throughout.
+//
+//
+// Usage: ./rmq_live_offset_illegal 127.0.0.1:9876
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -87,7 +87,7 @@ bool contains(const std::vector<int64_t>& v, int64_t x) {
     return false;
 }
 
-// 第 1 批卡在闸门上（维持"1 条在途 + 其余在缓冲"的窗口），放行后照常返回。
+// The first batch is held at the gate (keeps the "1 in-flight + the rest in buffer" window); after release it returns normally.
 class GatedListener : public MessageListenerConcurrently {
 public:
     ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
@@ -99,7 +99,7 @@ public:
             }
         }
         std::unique_lock<std::mutex> lk(mtx_);
-        // 上限只防死锁：正常路径下由 release() 显式放行，且必须晚于纠错
+        // The cap only prevents deadlock: on the normal path release() opens it explicitly, and it must happen after the recovery
         cv_.wait_for(lk, std::chrono::seconds(90), [this] { return released_; });
         return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
     }
@@ -148,7 +148,7 @@ private:
 struct Row {
     MessageQueue mq;
     int64_t maxOffset = -1;
-    bool hasCommitted = false;  // false = broker 上查无记录（QUERY_NOT_FOUND）
+    bool hasCommitted = false;  // false = no record found on the broker (QUERY_NOT_FOUND)
     int64_t committed = -1;
 };
 
@@ -179,7 +179,7 @@ struct Fixture {
         ClusterInfo cluster = admin.fetchBrokerClusterInfo();
         const std::vector<std::string> addrs = cluster.getBrokerAddrs();
         if (addrs.empty()) {
-            throw std::runtime_error("nameServer 无 broker 注册");
+            throw std::runtime_error("no broker registered on the name server");
         }
         brokerAddr = addrs[0];
         producer = std::make_shared<DefaultMQProducer>("GID_cpp_live_ilo_pg_" + stamp);
@@ -193,8 +193,8 @@ struct Fixture {
         return route.getAllMessageQueue(topicName);
     }
 
-    // [(mq, maxOffset, committed)]；hasCommitted=false 表示 broker 上查无记录。
-    // setZeroIfNotFound=false：空记录 0 与「没记录」必须能分开。
+    // [(mq, maxOffset, committed)]; hasCommitted=false means no record on the broker.
+    // setZeroIfNotFound=false: an empty record of 0 and "no record" must be distinguishable.
     std::vector<Row> offsets(const std::string& group, const std::string& topicName) {
         std::vector<Row> out;
         for (const MessageQueue& mq : queues(topicName)) {
@@ -233,7 +233,7 @@ struct Fixture {
     }
 };
 
-// 消费者视角下该 topic 的队列 key（用路由上的 mq 拼，与 offsetKey 同口径）。
+// The queue key of this topic from the consumer's view (built from the routed mq, same format as offsetKey).
 std::string queueKeyOf(DefaultMQPushConsumer& c, const std::string& topic) {
     for (const MessageQueue& mq : c.fetchSubscribeMessageQueues(topic)) {
         if (mq.queueId == 0) {
@@ -260,10 +260,10 @@ std::shared_ptr<DefaultMQPushConsumer> startConsumer(
     return c;
 }
 
-// ------------------------------------------------ S1：整批作废 + 按修正位点重建
+// ------------------------------------------------ S1: drop the whole batch + rebuild at the corrected offset
 
 void s1DropAndRebuild(Fixture& fx, const std::string& topic, const std::string& group) {
-    std::printf("\n--- S1：OFFSET_ILLEGAL 整批作废在途/缓冲消息并按修正位点重建 ---\n");
+    std::printf("\n--- S1: OFFSET_ILLEGAL voids in-flight/buffered messages as a batch and rebuilds at the corrected offset ---\n");
     auto listener = std::make_shared<GatedListener>();
     std::shared_ptr<DefaultMQPushConsumer> c =
         startConsumer(fx, group, "s1", topic, listener, /*batchSize=*/1, /*persist=*/0);
@@ -272,11 +272,11 @@ void s1DropAndRebuild(Fixture& fx, const std::string& topic, const std::string& 
         Message m(topic, "ilo-" + std::to_string(i));
         fx.producer->send(m);
     }
-    std::printf("S1: 已发送 %d 条（单队列），等 listener 卡住第 1 条...\n", kMsgs);
+    std::printf("S1: sent %d messages (single queue), waiting for the listener to be gated on the 1st...\n", kMsgs);
 
     std::string key = queueKeyOf(*c, topic);
     if (key.empty()) {
-        check("S1-取到队列 key", false, "路由里没有 q0");
+        check("S1-queue key obtained", false, "no q0 in the route");
         listener->release();
         c->shutdown();
         return;
@@ -290,18 +290,18 @@ void s1DropAndRebuild(Fixture& fx, const std::string& topic, const std::string& 
             return pending == static_cast<size_t>(kMsgs - 1) && arrived == 1;
         },
         30000);
-    check("S1-窗口就绪：1 条在途（listener 被闸住）+ " + std::to_string(kMsgs - 1) +
-              " 条留在缓冲",
+    check("S1-window ready: 1 in flight (listener gated) + " + std::to_string(kMsgs - 1) +
+              " left in the buffer",
           arranged, "pending=" + std::to_string(pending) +
                         " arrivals=" + fmtOffsets(listener->arrivals()));
 
-    // 服务端重置到 maxOffset：RPC2 写 resetOffsetTable，下一笔 pull 命中
-    // PullMessageProcessor:539-545 被短路成 OFFSET_RESET（nextBeginOffset=修正值）
+    // Server-side reset to maxOffset: RPC 2 writes the resetOffsetTable, the next pull hits
+    // PullMessageProcessor:539-545 and is short-circuited into OFFSET_RESET (nextBeginOffset = corrected value)
     fx.admin.resetOffsetByQueueId(fx.brokerAddr, group, topic, 0, kMsgs);
-    std::printf("S1: 已发出 resetOffsetByQueueId(->%d)，等下一笔 pull 取走服务端重置...\n", kMsgs);
+    std::printf("S1: issued resetOffsetByQueueId(->%d), waiting for the next pull to consume the server-side reset...\n", kMsgs);
 
     const bool dropped = waitUntil([&] { return c->queueEpoch(key) >= 1; }, 45000);
-    check("S1-broker 判定位点非法后本端丢弃该队列（ProcessQueue.setDropped：代号 +1）", dropped,
+    check("S1-after the broker deems the offset illegal this side drops the queue (ProcessQueue.setDropped: epoch +1)", dropped,
           "epoch=" + std::to_string(c->queueEpoch(key)) +
               " arrivals=" + fmtOffsets(listener->arrivals()));
 
@@ -314,14 +314,14 @@ void s1DropAndRebuild(Fixture& fx, const std::string& topic, const std::string& 
             return !rows.empty();
         },
         20000, 500);
-    check("S1-broker 上的位点停在修正值 " + std::to_string(kMsgs) +
-              "（本场景两笔重置 RPC 已先写过一次，弱断言）",
+    check("S1-the broker-side offset rests at the corrected value " + std::to_string(kMsgs) +
+              " (the two reset RPCs of this scenario already wrote it once; weak assertion)",
           atCorrected, fmtRows(fx.offsets(group, topic)));
 
     listener->release();
     std::this_thread::sleep_for(std::chrono::seconds(6));
     std::vector<int64_t> arr = listener->arrivals();
-    check("S1-缓冲里已取回的 " + std::to_string(kMsgs - 1) + " 条被整批作废（第 1、2 条永不投递）",
+    check("S1-the " + std::to_string(kMsgs - 1) + " fetched messages in the buffer are voided as a batch (the 1st and 2nd are never delivered)",
           !arr.empty() && !contains(arr, 1) && !contains(arr, 2), "arrivals=" + fmtOffsets(arr));
 
     Message after(topic, "ilo-after");
@@ -333,8 +333,8 @@ void s1DropAndRebuild(Fixture& fx, const std::string& topic, const std::string& 
         },
         20000, 500);
     arr = listener->arrivals();
-    check("S1-重建后的队列从修正位点续拉（第 " + std::to_string(kMsgs) +
-              " 条新消息正常投递，历史拿过的不重投）",
+    check("S1-the rebuilt queue keeps pulling from the corrected offset (the " + std::to_string(kMsgs) +
+              "th new message is delivered normally; history already taken is not redelivered)",
           gotNew && !contains(arr, 1) && !contains(arr, 2), "arrivals=" + fmtOffsets(arr));
 
     const bool advanced = waitUntil(
@@ -346,16 +346,16 @@ void s1DropAndRebuild(Fixture& fx, const std::string& topic, const std::string& 
             return !rows.empty();
         },
         25000, 1000);
-    check("S1-冻结随重建解除（新消息的 ack 让 broker 位点继续前进到 " +
-              std::to_string(kMsgs + 1) + "）",
+    check("S1-the freeze lifts with the rebuild (the new message's ack keeps advancing the broker offset to " +
+              std::to_string(kMsgs + 1) + ")",
           advanced, fmtRows(fx.offsets(group, topic)));
     c->shutdown();
 }
 
-// ------------------------------------------------ S2：纠错把修正位点立刻落盘
+// ------------------------------------------------ S2: the recovery persists the corrected offset immediately
 
 void s2ImmediatePersist(Fixture& fx, const std::string& topic, const std::string& group) {
-    std::printf("\n--- S2：纠错把修正位点立刻落盘（不等周期落盘） ---\n");
+    std::printf("\n--- S2: the recovery persists the corrected offset immediately (not waiting for the periodic persist) ---\n");
     auto l1 = std::make_shared<RecordingListener>();
     std::shared_ptr<DefaultMQPushConsumer> c =
         startConsumer(fx, group, "s2a", topic, l1, /*batchSize=*/1, /*persist=*/0);
@@ -366,10 +366,10 @@ void s2ImmediatePersist(Fixture& fx, const std::string& topic, const std::string
     }
     const bool consumed = waitUntil(
         [&] { return l1->arrivals().size() >= static_cast<size_t>(kMsgs); }, 30000, 500);
-    check("S2-前置：消费者先正常消费掉 " + std::to_string(kMsgs) + " 条", consumed,
+    check("S2-setup: the consumer first consumes " + std::to_string(kMsgs) + " messages normally", consumed,
           "arrivals=" + fmtOffsets(l1->arrivals()));
-    // shutdown 会同步 persist 一次，此后 broker 上的位点是 3；必须先停掉它，否则它的
-    // 周期/关停落盘会把下面种进去的非法值覆盖回去。
+    // shutdown persists once synchronously, so the broker offset becomes 3; it must be stopped first,
+    // otherwise its periodic / shutdown persist would overwrite the illegal value planted below.
     c->shutdown();
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
@@ -381,22 +381,22 @@ void s2ImmediatePersist(Fixture& fx, const std::string& topic, const std::string
         rejected = true;
         remark = std::string(e.what()).substr(0, 140);
     }
-    check("S2-前置：越界目标被 resetOffsetInner 拒绝（第 2 笔 RPC）", rejected, remark);
+    check("S2-setup: the out-of-range target is rejected by resetOffsetInner (the 2nd RPC)", rejected, remark);
 
     std::vector<Row> rows = fx.offsets(group, topic);
     bool allIllegal = !rows.empty();
     for (const Row& r : rows) {
         if (!r.hasCommitted || r.committed != kIllegalTarget) allIllegal = false;
     }
-    check("S2-前置：第 1 笔 commitOffset 已把非法位点 " + std::to_string(kIllegalTarget) +
-              " 落库（两笔 RPC 非原子）",
+    check("S2-setup: the 1st commitOffset already persisted the illegal offset " + std::to_string(kIllegalTarget) +
+              " (the two RPCs are non-atomic)",
           allIllegal, fmtRows(rows));
 
     auto l2 = std::make_shared<RecordingListener>();
-    // 周期落盘拉长到 60s：窗口内唯一能改写 broker 位点的路径是纠错分支自带的立即 persist
+    // Stretch the periodic persist to 60s: within the window the only path that can rewrite the broker offset is the immediate persist carried by the recovery branch
     std::shared_ptr<DefaultMQPushConsumer> c2 =
         startConsumer(fx, group, "s2b", topic, l2, /*batchSize=*/1, /*persist=*/60000);
-    std::printf("S2: 新消费者从非法位点 %lld 起拉，等纠错把 broker 位点写回 %d（周期落盘=60s）...\n",
+    std::printf("S2: the new consumer pulls from the illegal offset %lld, waiting for the recovery to write the broker offset back to %d (periodic persist=60s)...\n",
                 static_cast<long long>(kIllegalTarget), kMsgs);
     const int64_t t0 = nowMs();
 
@@ -413,20 +413,20 @@ void s2ImmediatePersist(Fixture& fx, const std::string& topic, const std::string
     char detail[160];
     std::snprintf(detail, sizeof(detail), "elapsed=%.1fs %s", elapsedS,
                   fmtRows(fx.offsets(group, topic)).c_str());
-    check("S2-broker 位点由 " + std::to_string(kIllegalTarget) + " 纠回 " +
-              std::to_string(kMsgs) + "（纠错分支自带的那次 persist）",
+    check("S2-the broker offset is corrected from " + std::to_string(kIllegalTarget) + " back to " +
+              std::to_string(kMsgs) + " (the persist inherent to the recovery branch)",
           back, detail);
 
-    // 再等一个静默窗口：位点被纠回后不会回头重投 0..2，也不会再被改写
+    // Wait one more quiet window: after the offset is corrected it neither redelivers 0..2 nor gets rewritten again
     std::this_thread::sleep_for(std::chrono::seconds(6));
-    check("S2-全程零投递（修正位点落在历史消息之后，一条都不下发）",
+    check("S2-zero deliveries throughout (the corrected offset lands after the history messages, nothing is dispatched)",
           l2->arrivals().empty(), "arrivals=" + fmtOffsets(l2->arrivals()));
     bool still = true;
     rows = fx.offsets(group, topic);
     for (const Row& r : rows) {
         if (!r.hasCommitted || r.committed != kMsgs) still = false;
     }
-    check("S2-静默窗口后位点仍停在 " + std::to_string(kMsgs), still && !rows.empty(),
+    check("S2-after the quiet window the offset still rests at " + std::to_string(kMsgs), still && !rows.empty(),
           fmtRows(rows));
     c2->shutdown();
 }
@@ -443,10 +443,10 @@ int main(int argc, char* argv[]) {
     try {
         fx.start(nsAddr);
     } catch (const std::exception& e) {
-        check("集群探活", false, e.what());
+        check("cluster liveness probe", false, e.what());
         return 1;
     }
-    check("集群探活", true, "broker=" + fx.brokerAddr);
+    check("cluster liveness probe", true, "broker=" + fx.brokerAddr);
 
     const std::string topic1 = "CppLiveIloDrop" + fx.stamp;
     const std::string topic2 = "CppLiveIloPersist" + fx.stamp;
@@ -457,13 +457,13 @@ int main(int argc, char* argv[]) {
         fx.admin.createTopic(MixAll::DEFAULT_TOPIC, topic1, 1);
         fx.admin.createTopic(MixAll::DEFAULT_TOPIC, topic2, 1);
         std::this_thread::sleep_for(std::chrono::seconds(3));
-        std::printf("topic1=%s topic2=%s（各 1 队列，%d 条消息）\n", topic1.c_str(),
+        std::printf("topic1=%s topic2=%s (1 queue each, %d messages)\n", topic1.c_str(),
                     topic2.c_str(), kMsgs);
 
         s1DropAndRebuild(fx, topic1, g1);
         s2ImmediatePersist(fx, topic2, g2);
     } catch (const std::exception& e) {
-        check("验证过程抛出异常", false, e.what());
+        check("exception thrown during verification", false, e.what());
     }
 
     for (const std::string& t : {topic1, topic2}) {
@@ -471,14 +471,14 @@ int main(int argc, char* argv[]) {
             fx.admin.deleteTopic(t);
             std::printf("    (deleteTopic(%s) OK)\n", t.c_str());
         } catch (const std::exception& e) {
-            std::printf("    (deleteTopic(%s) 失败: %s)\n", t.c_str(), e.what());
+            std::printf("    (deleteTopic(%s) failed: %s)\n", t.c_str(), e.what());
         }
     }
     for (const std::string& g : {g1, g2}) {
         try {
             fx.admin.deleteSubscriptionGroup(fx.brokerAddr, g, true);
         } catch (const std::exception& e) {
-            std::printf("    (deleteSubscriptionGroup(%s) 失败: %s)\n", g.c_str(), e.what());
+            std::printf("    (deleteSubscriptionGroup(%s) failed: %s)\n", g.c_str(), e.what());
         }
     }
     fx.shutdown();

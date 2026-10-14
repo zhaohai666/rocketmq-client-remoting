@@ -1,5 +1,5 @@
-// 轻量拉取消费者（DefaultLitePullConsumer）真机验证。
-// 用法：rmq_live_lite_pull 127.0.0.1:9876
+// Lite pull consumer (DefaultLitePullConsumer) live-machine verification.
+// Usage: rmq_live_lite_pull 127.0.0.1:9876
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -79,7 +79,7 @@ std::vector<MessageExt> drain(DefaultLitePullConsumer& c, size_t expect, int32_t
     return collected;
 }
 
-// 按**时间**排空缓冲（不等条数）：策略只分到部分队列时，收条数是未知的
+// Drain the buffer by **time** (not waiting for a count): when the strategy only assigns part of the queues, the received count is unknown
 std::vector<MessageExt> drainFor(DefaultLitePullConsumer& c, int32_t millis) {
     std::vector<MessageExt> collected;
     const int64_t deadline = nowMs() + millis;
@@ -90,7 +90,7 @@ std::vector<MessageExt> drainFor(DefaultLitePullConsumer& c, int32_t millis) {
     return collected;
 }
 
-// 队列集 → key 集合（"brokerName#queueId"）
+// queue set -> key set ("brokerName#queueId")
 std::set<std::string> queueKeys(const std::vector<MessageQueue>& qs) {
     std::set<std::string> keys;
     for (const MessageQueue& q : qs) keys.insert(q.brokerName + "#" + std::to_string(q.queueId));
@@ -103,7 +103,7 @@ std::string keySetText(const std::set<std::string>& keys) {
     return out;
 }
 
-// 等两个实例把队列**分完**（分配收敛要两边各跑一轮心跳 + rebalance），最多 timeoutMs。
+// Wait until the two instances **finish splitting** the queues (allocation convergence needs one heartbeat + rebalance round on each side), at most timeoutMs.
 std::pair<std::vector<MessageQueue>, std::vector<MessageQueue>> waitSplitAssignment(
     DefaultLitePullConsumer& a, DefaultLitePullConsumer& b, size_t total, int32_t timeoutMs = 25000) {
     const int64_t deadline = nowMs() + timeoutMs;
@@ -116,14 +116,14 @@ std::pair<std::vector<MessageQueue>, std::vector<MessageQueue>> waitSplitAssignm
         std::set_union(sa.begin(), sa.end(), sb.begin(), sb.end(), std::inserter(both, both.begin()));
         std::set_intersection(sa.begin(), sa.end(), sb.begin(), sb.end(),
                               std::inserter(overlap, overlap.begin()));
-        // 分完 = 并集覆盖全部队列且两边无交集
+        // finished = union covers all queues and the two sides have no intersection
         if (both.size() == total && overlap.empty() && !sa.empty() && !sb.empty()) return {va, vb};
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
     return {va, vb};
 }
 
-// 给 lite 消费者装上策略 + 订阅（未 start）。S7d~S7f 三个场景都用同一套配置面。
+// Attach a strategy + subscription to the lite consumer (not started yet). S7d~S7f all reuse the same configuration surface.
 void setupConsumer(DefaultLitePullConsumer& c, const std::string& namesrv,
                    const std::string& instanceName,
                    const std::shared_ptr<AllocateMessageQueueStrategy>& strategy,
@@ -131,8 +131,8 @@ void setupConsumer(DefaultLitePullConsumer& c, const std::string& namesrv,
     c.setNamesrvAddr(namesrv);
     c.setInstanceName(instanceName);
     c.setPollTimeoutMillis(1000);
-    // 存量消息在 S2 就发完了，新组默认 LAST 会跳过它们 → 收不到任何一条。
-    // 这里要验的是「策略真的驱动了收发」，所以从队首起消费。
+    // Existing messages were all sent back in S2; a new group defaults to LAST and skips them -> receives nothing.
+    // What we verify here is that "the strategy really drives send/recv", so consume from the head of the queue.
     c.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
     c.setAllocateMessageQueueStrategy(strategy);
     c.subscribe(topic, "*");
@@ -151,12 +151,12 @@ std::string snapshotText(const std::vector<DefaultLitePullConsumer*>& asserted,
     return out;
 }
 
-/// 用**真实**输入（路由给的 mqAll + cidMembers 的真实 clientId 当 cidAll）离线跑策略，
-/// 并**等线上 assignment() 收敛到这份预测**。
+/// Run the strategy OFFLINE with **real** inputs (route mqAll + real cidMembers clientId as cidAll),
+/// and **wait until the online assignment() converges to this prediction**.
 ///
-/// 为什么以预测为收敛条件，而不是「先等不重不漏、再比预测」：哈希环完全可能把 4 个
-/// 队列全分给一个实例，另一边在首轮重平衡之前 assignment() 本来就是空 —— 那种初始态
-/// 同样满足「不重不漏」，比出来的其实是「一边还没算」的快照。
+/// Why use the prediction as the convergence condition instead of "first wait for no-dup-no-loss, then compare":
+/// the hash ring could well assign all 4 queues to one instance, and the other side's assignment() is
+/// empty before the first rebalance -- that initial state also satisfies "no-dup-no-loss".
 bool waitUntilPredictionConverged(const std::string& group, const std::vector<MessageQueue>& mqAll,
                                  const std::vector<DefaultLitePullConsumer*>& cidMembers,
                                  const std::vector<DefaultLitePullConsumer*>& asserted,
@@ -191,10 +191,10 @@ bool waitUntilPredictionConverged(const std::string& group, const std::vector<Me
     }
 }
 
-// NEARBY 的落点：真实集群只有一个 broker，把队列和客户端都记成同一个机房，
-// 于是 NEARBY 必定走「自己机房」那条分支、等价于内层策略。
-// 同时留调用记录 —— 证明 rebalance 真的逐个问过队列和客户端的机房，
-// 而不是策略对象换了个名字却没参与分配。
+// NEARBY landing point: the real cluster has only one broker, record both queue and client as the same machine room,
+// so NEARBY must take the "own machine room" branch, equivalent to the inner strategy.
+// Also keep the call record -- proving rebalance really queried the machine room of each queue and client one by one,
+// rather than the strategy object just renamed itself yet never participated in allocation.
 const char kRoom[] = "room1";
 
 class OneRoom : public MachineRoomResolver {
@@ -238,9 +238,9 @@ int main(int argc, char** argv) {
     const std::string group7 = "LitePG7Cpp_" + stamp;
     const std::string group8 = "LitePG8Cpp_" + stamp;
     const std::string group9 = "LitePG9Cpp_" + stamp;
-    const std::string group10 = "LitePG10Cpp_" + stamp;  // S7d 一致性哈希环
-    const std::string group11 = "LitePG11Cpp_" + stamp;  // S7e 机房就近
-    const std::string group12 = "LitePG12Cpp_" + stamp;  // S7f 机房配错
+    const std::string group10 = "LitePG10Cpp_" + stamp;  // S7d consistent hash ring
+    const std::string group11 = "LitePG11Cpp_" + stamp;  // S7e machine-room nearby
+    const std::string group12 = "LitePG12Cpp_" + stamp;  // S7f mismatched machine room
     const int32_t nMsg = 12;
     const int32_t queueNum = 4;
 
@@ -249,7 +249,7 @@ int main(int argc, char** argv) {
                 topic.c_str(), group1.c_str());
     std::printf("======================================================================\n");
 
-    // ---------------- 建 topic ----------------
+    // ---------------- create topic ----------------
     {
         DefaultMQProducer prep("PG_PrepareLiteCpp_" + stamp);
         prep.setNamesrvAddr(namesrv);
@@ -262,8 +262,8 @@ int main(int argc, char** argv) {
         prep.shutdown();
     }
 
-    // ---------------- S1 subscribe 模式：先起消费者再发消息 ----------------
-    std::printf("\nS1 subscribe 模式启动 + 等待 rebalance 分到位点\n");
+    // ---------------- S1 subscribe mode: start consumer first, then send messages ----------------
+    std::printf("\nS1 subscribe mode start + wait for rebalance to assign offsets\n");
     DefaultLitePullConsumer c1(group1);
     c1.setNamesrvAddr(namesrv);
     c1.setPollTimeoutMillis(1000);
@@ -271,18 +271,18 @@ int main(int argc, char** argv) {
     c1.start();
 
     std::vector<MessageQueue> assigned = waitAssignment(c1);
-    check("S1 rebalance 分配到 " + std::to_string(queueNum) + " 个队列",
+    check("S1 rebalance assigned " + std::to_string(queueNum) + " queues",
           static_cast<int32_t>(assigned.size()) == queueNum,
           "assigned=" + std::to_string(assigned.size()));
     if (assigned.empty()) {
-        std::printf("!! 未分配到队列，后续跳过\n");
+        std::printf("!! no queue assigned, skipping the rest\n");
         c1.shutdown();
         std::printf("\nLitePullConsumer: PASS=%d FAIL=%d\n", gPass, gFail);
         return 1;
     }
 
-    // ---------------- S2 生产 + poll 收全 ----------------
-    std::printf("\nS2 生产 %d 条（交替 TagA/TagB）\n", nMsg);
+    // ---------------- S2 produce + poll to receive all ----------------
+    std::printf("\nS2 produce %d messages (alternating TagA/TagB)\n", nMsg);
     std::set<std::string> sent;
     {
         DefaultMQProducer prod("PG_LiteLiveCpp_" + stamp);
@@ -306,7 +306,7 @@ int main(int argc, char** argv) {
                 std::printf("   send %d failed: %s\n", i, e.what());
             }
         }
-        check("S2 生产 " + std::to_string(nMsg) + " 条成功", sentOk == nMsg,
+        check("S2 produced " + std::to_string(nMsg) + " messages successfully", sentOk == nMsg,
               "sentOk=" + std::to_string(sentOk));
         prod.shutdown();
     }
@@ -321,19 +321,19 @@ int main(int argc, char** argv) {
                             std::inserter(missing, missing.begin()));
         std::set_difference(gotSet.begin(), gotSet.end(), sent.begin(), sent.end(),
                             std::inserter(extra, extra.begin()));
-        check("S2 subscribe+poll 收全 " + std::to_string(nMsg) + " 条且内容一致", gotSet == sent,
+        check("S2 subscribe+poll received all " + std::to_string(nMsg) + " messages with matching content", gotSet == sent,
               "got=" + std::to_string(gotSet.size()) + " missing=[" + join(missing) +
                   "] extra=[" + join(extra) + "]");
     }
 
-    // ---------------- S3 auto-commit 位点 ----------------
-    std::printf("\nS3 auto-commit 位点\n");
+    // ---------------- S3 auto-commit offset ----------------
+    std::printf("\nS3 auto-commit offset\n");
     {
         bool allPositive = false;
         std::string detail;
         const int64_t deadline = nowMs() + 20000;
         for (;;) {
-            const std::vector<MessageExt> idle = c1.poll(500);   // 空转也算一次 poll
+            const std::vector<MessageExt> idle = c1.poll(500);   // an idle round still counts as one poll
             (void)idle;
             allPositive = true;
             detail.clear();
@@ -344,12 +344,12 @@ int main(int argc, char** argv) {
             }
             if (allPositive || nowMs() >= deadline) break;
         }
-        check("S3 继续 poll 过自动提交周期后位点自己落盘（没人调 commit）", allPositive,
+        check("S3 after continued poll past the auto-commit cycle the offset lands on disk by itself (nobody called commit)", allPositive,
               "committed=" + detail);
     }
 
-    // ---------------- S4 assign 模式：assign 全部队列 + seek 到队首重新收全 ----------------
-    std::printf("\nS4 assign 模式：assign 全部队列 + seek 到队首重新收全\n");
+    // ---------------- S4 assign mode: assign all queues + seek to head to re-receive all ----------------
+    std::printf("\nS4 assign mode: assign all queues + seek to head to re-receive all\n");
     {
         DefaultLitePullConsumer c2(group2);
         c2.setNamesrvAddr(namesrv);
@@ -369,13 +369,13 @@ int main(int argc, char** argv) {
         std::vector<MessageExt> got2 = drain(c2, static_cast<size_t>(nMsg));
         std::set<std::string> got2Set;
         for (const MessageExt& m : got2) got2Set.insert(bodyOf(m));
-        check("S4 assign+seek+poll 重新收全 " + std::to_string(nMsg) + " 条", got2Set == sent,
+        check("S4 assign+seek+poll re-received all " + std::to_string(nMsg) + " messages", got2Set == sent,
               "got=" + std::to_string(got2Set.size()));
         c2.shutdown();
     }
 
-    // ---------------- S5 订阅级 tag 过滤 ----------------
-    std::printf("\nS5 订阅 TagA：只收 TagA 的 6 条\n");
+    // ---------------- S5 subscription-level tag filter ----------------
+    std::printf("\nS5 subscribe TagA: only receive the 6 TagA messages\n");
     {
         DefaultLitePullConsumer c3(group3);
         c3.setNamesrvAddr(namesrv);
@@ -389,15 +389,15 @@ int main(int argc, char** argv) {
         for (const MessageExt& m : got3) got3Set.insert(bodyOf(m));
         bool onlyA = got3Set.size() == 6;
         for (const std::string& b : got3Set) {
-            // body 形如 lite-00..lite-11：末位（个位）数字为偶数才是 TagA
+            // body looks like lite-00..lite-11: only when the last (units) digit is even is it TagA
             if (b.size() == 7 && (b[6] - '0') % 2 != 0) onlyA = false;
         }
-        check("S5 仅收 TagA 且恰好 6 条", onlyA, "got=" + std::to_string(got3Set.size()));
+        check("S5 only TagA received and exactly 6 messages", onlyA, "got=" + std::to_string(got3Set.size()));
         c3.shutdown();
     }
 
-    // ---------------- S6 CONSUME_FROM_TIMESTAMP：14 位本地墙钟 ----------------
-    std::printf("\nS6 CONSUME_FROM_TIMESTAMP：墙钟起点收全 + 时间戳→位点映射\n");
+    // ---------------- S6 CONSUME_FROM_TIMESTAMP: 14-digit local wall clock ----------------
+    std::printf("\nS6 CONSUME_FROM_TIMESTAMP: wall-clock start receives all + timestamp-to-offset mapping\n");
     {
         const int64_t wall = UtilAll::currentTimeMillis();
 
@@ -412,8 +412,8 @@ int main(int argc, char** argv) {
         std::vector<MessageExt> got4 = drain(c4, static_cast<size_t>(nMsg));
         std::set<std::string> got4Set;
         for (const MessageExt& m : got4) got4Set.insert(bodyOf(m));
-        check("S6a 起点=" + c4.consumeTimestamp() + " 早于全部消息 → 收全 " +
-                  std::to_string(nMsg) + " 条",
+        check("S6a start=" + c4.consumeTimestamp() + " earlier than all messages -> receive all " +
+                  std::to_string(nMsg) + " messages",
               got4Set == sent, "got=" + std::to_string(got4Set.size()));
         c4.shutdown();
 
@@ -430,15 +430,15 @@ int main(int argc, char** argv) {
             sumPast += c5.offsetForTimestamp(mq, wall - 30 * 60 * 1000);
             sumFuture += c5.offsetForTimestamp(mq, wall + 10 * 60 * 1000);
         }
-        check("S6b 30 分钟前 → 各队列队首", sumPast == 0,
+        check("S6b 30 minutes ago -> head of each queue", sumPast == 0,
               "sumOffset=" + std::to_string(sumPast));
-        check("S6b 10 分钟后 → 越过全部 " + std::to_string(nMsg) + " 条",
+        check("S6b 10 minutes later -> past all " + std::to_string(nMsg) + " messages",
               sumFuture == nMsg, "sumOffset=" + std::to_string(sumFuture));
         c5.shutdown();
     }
 
-    // ---------------- S7 可插拔队列分配策略 ----------------
-    std::printf("\nS7 可插拔队列分配策略（对应 setAllocateMessageQueueStrategy）\n");
+    // ---------------- S7 pluggable queue allocation strategy ----------------
+    std::printf("\nS7 pluggable queue allocation strategy (maps to setAllocateMessageQueueStrategy)\n");
     {
         std::vector<MessageQueue> allQueues;
         try {
@@ -451,7 +451,7 @@ int main(int argc, char** argv) {
 
         DefaultLitePullConsumer probe(group6);
         probe.setNamesrvAddr(namesrv);
-        check("S7a 默认策略名 = AVG",
+        check("S7a default strategy name = AVG",
               probe.allocateMessageQueueStrategy() != nullptr
                   && probe.allocateMessageQueueStrategy()->getName() == "AVG",
               "name=" + (probe.allocateMessageQueueStrategy()
@@ -465,11 +465,11 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             nullRejected =
                 std::string(e.what()).find("allocateMessageQueueStrategy is null") != std::string::npos;
-            check("S7a 策略为 null 时 start() 报协议同款文案", nullRejected, e.what());
+            check("S7a when strategy is null start() reports the protocol-style message", nullRejected, e.what());
         }
         if (!nullRejected) probe.shutdown();
 
-        // S7b AVG_BY_CIRCLE：同组两实例交叉切分，不重不漏
+        // S7b AVG_BY_CIRCLE: two instances in the same group split interleaved, no dup no loss
         auto circle = std::make_shared<AllocateMessageQueueAveragelyByCircle>();
         DefaultLitePullConsumer ca(group7), cb(group7);
         ca.setNamesrvAddr(namesrv);
@@ -478,7 +478,7 @@ int main(int argc, char** argv) {
         cb.setInstanceName("s7cb");
         ca.setAllocateMessageQueueStrategy(circle);
         cb.setAllocateMessageQueueStrategy(circle);
-        check("S7b 替换后策略名 = AVG_BY_CIRCLE",
+        check("S7b strategy name after replacement = AVG_BY_CIRCLE",
               ca.allocateMessageQueueStrategy()->getName() == "AVG_BY_CIRCLE");
         ca.subscribe(topic, "*");
         cb.subscribe(topic, "*");
@@ -491,11 +491,11 @@ int main(int argc, char** argv) {
         std::set_intersection(ka.begin(), ka.end(), kb.begin(), kb.end(),
                               std::inserter(overlap, overlap.begin()));
         std::set_union(ka.begin(), ka.end(), kb.begin(), kb.end(), std::inserter(both, both.begin()));
-        check("S7b 两实例分配无交集", overlap.empty(), "overlap=[" + keySetText(overlap) + "]");
-        check("S7b 并集覆盖全部 " + std::to_string(totalQueues) + " 个队列", both == queueKeys(allQueues),
+        check("S7b two instances have disjoint assignments", overlap.empty(), "overlap=[" + keySetText(overlap) + "]");
+        check("S7b union covers all " + std::to_string(totalQueues) + " queues", both == queueKeys(allQueues),
               "a=" + std::to_string(ka.size()) + " b=" + std::to_string(kb.size()));
-        // 环形分配的签名：拿到的是「按下标取模」的交叉队列而非连续段
-        // （4 队列 / 2 实例 → 各 2 条且下标步长为 2；AVG 会给连续两段）。
+        // Signature of ring allocation: interleaved queues by index modulo, not a contiguous run
+        // (4 queues / 2 instances -> 2 each with index stride 2; AVG would give two contiguous runs).
         std::set<int32_t> posA;
         for (size_t i = 0; i < allQueues.size(); ++i) {
             if (ka.count(allQueues[i].brokerName + "#" + std::to_string(allQueues[i].queueId))) {
@@ -508,12 +508,12 @@ int main(int argc, char** argv) {
             if (prev >= 0 && (p - prev) % 2 != 0) circleShape = false;
             prev = p;
         }
-        check("S7b 分配形状是交叉（步长 2），不是 AVG 的连续段",
+        check("S7b assignment shape is interleaved (stride 2), not AVG's contiguous run",
               totalQueues != 4 || circleShape, "posA=" + std::to_string(posA.size()));
         ca.shutdown();
         cb.shutdown();
 
-        // S7c CONFIG：只分配配置进去的一半队列，poll 到的消息也只能来自这些队列
+        // S7c CONFIG: only assign the configured half of queues, polled messages can only come from those queues
         std::vector<MessageQueue> halfA(allQueues.begin(), allQueues.begin() + totalQueues / 2);
         std::vector<MessageQueue> halfB(allQueues.begin() + totalQueues / 2, allQueues.end());
         auto cfgA = std::make_shared<AllocateMessageQueueByConfig>(halfA);
@@ -533,10 +533,10 @@ int main(int argc, char** argv) {
         c7.start();
         std::vector<MessageQueue> a6 = waitAssignment(c6);
         std::vector<MessageQueue> a7 = waitAssignment(c7);
-        check("S7c CONFIG 只给配置进去的队列（无视 mqAll/cidAll）",
+        check("S7c CONFIG only gives the configured queues (ignores mqAll/cidAll)",
               queueKeys(a6) == queueKeys(halfA) && queueKeys(a7) == queueKeys(halfB),
               "a=" + keySetText(queueKeys(a6)) + " b=" + keySetText(queueKeys(a7)));
-        // 两个 CONFIG 消费者各看一半：并集恰好是全部 12 条、交集为空 → 策略真的驱动了收发
+        // Two CONFIG consumers each see half: union is exactly all 12, intersection empty -> strategy really drives send/recv
         std::vector<MessageExt> g6 = drainFor(c6, 8000);
         std::vector<MessageExt> g7 = drainFor(c7, 8000);
         std::set<std::string> b6, b7, onCfgA, onCfgB;
@@ -553,7 +553,7 @@ int main(int argc, char** argv) {
                 onCfgB.insert(bodyOf(m));
             }
         }
-        check("S7c CONFIG 消费者只收到自己配置队列里的消息", b6 == onCfgA && b7 == onCfgB,
+        check("S7c CONFIG consumer only receives messages from its own configured queues", b6 == onCfgA && b7 == onCfgB,
               "a=" + std::to_string(b6.size()) + " aOnCfg=" + std::to_string(onCfgA.size()) + " b="
                   + std::to_string(b7.size()) + " bOnCfg=" + std::to_string(onCfgB.size()));
         std::set<std::string> unionBodies, interBodies;
@@ -561,7 +561,7 @@ int main(int argc, char** argv) {
                        std::inserter(unionBodies, unionBodies.begin()));
         std::set_intersection(b6.begin(), b6.end(), b7.begin(), b7.end(),
                               std::inserter(interBodies, interBodies.begin()));
-        check("S7c 两半合起来恰好覆盖全部 " + std::to_string(nMsg) + " 条且互不重叠",
+        check("S7c the two halves exactly cover all " + std::to_string(nMsg) + " messages without overlap",
               unionBodies == sent && interBodies.empty(),
               "union=" + std::to_string(unionBodies.size()) + " inter=" + std::to_string(interBodies.size()));
         c6.shutdown();
@@ -572,7 +572,7 @@ int main(int argc, char** argv) {
             DefaultLitePullConsumer d1(group10), d2(group10);
             setupConsumer(d1, namesrv, "s7da", ch, topic);
             setupConsumer(d2, namesrv, "s7db", ch, topic);
-            check("S7d 替换后策略名 = CONSISTENT_HASH",
+            check("S7d strategy name after replacement = CONSISTENT_HASH",
                   d1.allocateMessageQueueStrategy()->getName() == "CONSISTENT_HASH",
                   d1.allocateMessageQueueStrategy()->getName());
             d1.start();
@@ -580,14 +580,14 @@ int main(int argc, char** argv) {
             std::string detail;
             const bool converged = waitUntilPredictionConverged(
                 group10, allQueues, {&d1, &d2}, {&d1, &d2}, {ch, ch}, detail);
-            check("S7d 线上分配收敛到一致性环的离线预测", converged, detail);
+            check("S7d online assignment converges to the consistent-ring offline prediction", converged, detail);
             std::set<std::string> k1 = queueKeys(d1.assignment()), k2 = queueKeys(d2.assignment());
             std::set<std::string> hit, both;
             std::set_intersection(k1.begin(), k1.end(), k2.begin(), k2.end(),
                                   std::inserter(hit, hit.begin()));
             std::set_union(k1.begin(), k1.end(), k2.begin(), k2.end(), std::inserter(both, both.begin()));
-            check("S7d 两实例分配无交集", hit.empty(), "overlap=[" + keySetText(hit) + "]");
-            check("S7d 并集覆盖全部 " + std::to_string(totalQueues) + " 个队列",
+            check("S7d two instances have disjoint assignments", hit.empty(), "overlap=[" + keySetText(hit) + "]");
+            check("S7d union covers all " + std::to_string(totalQueues) + " queues",
                   both == queueKeys(allQueues),
                   "a=" + std::to_string(k1.size()) + " b=" + std::to_string(k2.size()));
             std::vector<MessageExt> g1 = drainFor(d1, 8000), g2 = drainFor(d2, 8000);
@@ -597,13 +597,13 @@ int main(int argc, char** argv) {
             std::set<std::string> joined;
             std::set_union(b1.begin(), b1.end(), b2.begin(), b2.end(),
                            std::inserter(joined, joined.begin()));
-            check("S7d 两实例合起来收到全部 " + std::to_string(nMsg) + " 条（环真的在驱动收发）",
+            check("S7d two instances together received all " + std::to_string(nMsg) + " messages (the ring really drives send/recv)",
                   joined == sent, "union=" + std::to_string(joined.size()));
             d1.shutdown();
             d2.shutdown();
         }
 
-        // S7e MACHINE_ROOM_NEARBY：真实集群只有一个机房 ⇒ 装饰器必须原样透传内层策略。
+        // S7e MACHINE_ROOM_NEARBY: the real cluster has only one machine room => the decorator must pass the inner strategy through unchanged.
         {
             auto inner = std::make_shared<AllocateMessageQueueConsistentHash>();
             auto resolver = std::make_shared<OneRoom>();
@@ -611,7 +611,7 @@ int main(int argc, char** argv) {
             DefaultLitePullConsumer e1(group11), e2(group11);
             setupConsumer(e1, namesrv, "s7ea", nearby, topic);
             setupConsumer(e2, namesrv, "s7eb", nearby, topic);
-            check("S7e 装饰后的策略名 = MACHINE_ROOM_NEARBY-CONSISTENT_HASH",
+            check("S7e decorated strategy name = MACHINE_ROOM_NEARBY-CONSISTENT_HASH",
                   e1.allocateMessageQueueStrategy()->getName() ==
                       "MACHINE_ROOM_NEARBY-CONSISTENT_HASH",
                   e1.allocateMessageQueueStrategy()->getName());
@@ -620,27 +620,27 @@ int main(int argc, char** argv) {
             std::string detail;
             const bool converged = waitUntilPredictionConverged(
                 group11, allQueues, {&e1, &e2}, {&e1, &e2}, {inner, inner}, detail);
-            check("S7e NEARBY 的线上分配 == 内层环的离线预测", converged, detail);
+            check("S7e NEARBY online assignment == inner ring offline prediction", converged, detail);
             std::set<std::string> k1 = queueKeys(e1.assignment()), k2 = queueKeys(e2.assignment());
             std::set<std::string> hit, both;
             std::set_intersection(k1.begin(), k1.end(), k2.begin(), k2.end(),
                                   std::inserter(hit, hit.begin()));
             std::set_union(k1.begin(), k1.end(), k2.begin(), k2.end(), std::inserter(both, both.begin()));
-            check("S7e NEARBY 两实例分配无交集且不漏",
+            check("S7e NEARBY two instances disjoint and no loss",
                   hit.empty() && both == queueKeys(allQueues),
                   "a=" + std::to_string(k1.size()) + " b=" + std::to_string(k2.size()) +
                       " overlap=" + std::to_string(hit.size()));
-            // resolver 真的被 rebalance 调用过，且看到的是真实 brokerName + 两个真实 clientId。
+            // the resolver really was called by rebalance, seeing the real brokerName + two real clientIds.
             const std::vector<std::string> brokerCalls = resolver->brokerCalls();
             const std::vector<std::string> consumerCalls = resolver->consumerCalls();
             std::set<std::string> seenBrokers(brokerCalls.begin(), brokerCalls.end());
             std::set<std::string> realBrokers;
             for (const MessageQueue& mq : allQueues) realBrokers.insert(mq.brokerName);
-            check("S7e resolver 被逐个队列问过机房（" + std::to_string(brokerCalls.size()) + " 次）",
+            check("S7e resolver asked each queue's machine room (" + std::to_string(brokerCalls.size()) + " times)",
                   !brokerCalls.empty() && seenBrokers == realBrokers,
                   "brokers=[" + join(seenBrokers) + "]");
             std::set<std::string> callSet(consumerCalls.begin(), consumerCalls.end());
-            check("S7e resolver 被问过两个真实 clientId",
+            check("S7e resolver was asked about two real clientIds",
                   callSet.count(e1.clientId()) == 1 && callSet.count(e2.clientId()) == 1,
                   "calls=[" + join(std::vector<std::string>(callSet.begin(), callSet.end())) + "]");
             e1.shutdown();
@@ -650,7 +650,7 @@ int main(int argc, char** argv) {
         {
             auto room = std::make_shared<AllocateMessageQueueByMachineRoom>(
                 std::set<std::string>{kRoom});
-            check("S7f 策略名 = MACHINE_ROOM 且白名单能读回",
+            check("S7f strategy name = MACHINE_ROOM and whitelist reads back",
                   room->getName() == "MACHINE_ROOM" && room->getConsumeridcs().count(kRoom) == 1,
                   "idcs=[" + join(room->getConsumeridcs()) + "]");
             auto avg = std::make_shared<AllocateMessageQueueAveragely>();
@@ -660,16 +660,16 @@ int main(int argc, char** argv) {
             f1.start();
             f2.start();
             std::vector<MessageQueue> ctrl = waitAssignment(f2);
-            check("S7f 同组对照组（AVG）正常分到队列", !ctrl.empty(),
+            check("S7f same-group control (AVG) assigns queues normally", !ctrl.empty(),
                   "ctrl=[" + keySetText(queueKeys(ctrl)) + "]");
-            check("S7f 机房不匹配真实 brokerName → 一条都不分（不报错也不误吃）",
+            check("S7f machine room mismatching the real brokerName -> assign nothing (no error, no wrong consumption)",
                   f1.assignment().empty(), "assignment=[" + keySetText(queueKeys(f1.assignment())) + "]");
             std::string detail;
             const bool converged = waitUntilPredictionConverged(
                 group12, allQueues, {&f1, &f2}, {&f1, &f2}, {room, avg}, detail);
-            check("S7f 两边线上分配各自收敛到自己策略的离线预测", converged, detail);
+            check("S7f both sides' online assignments each converge to their own strategy's offline prediction", converged, detail);
             std::vector<MessageExt> starved = drainFor(f1, 5000);
-            check("S7f 被饿死的一方 poll 不到消息也不抛错", starved.empty(),
+            check("S7f the starved side polls no messages and throws no error", starved.empty(),
                   "got=" + std::to_string(starved.size()));
             f1.shutdown();
             f2.shutdown();
@@ -678,11 +678,11 @@ int main(int argc, char** argv) {
 
     c1.shutdown();
 
-    std::printf("\nS8 三张位点表：拉取游标 / 已消费游标 / 提交落点\n");
+    std::printf("\nS8 three offset tables: pull cursor / consumed cursor / commit landing point\n");
     {
         const std::string offTopic = "LiteOffCpp_" + stamp;
         const std::string offGroup = "LiteOffPGCpp_" + stamp;
-        const int32_t nBig = 1200;      // > poll 单次上限 1024 ⇒ 一次交付必然留下没交出去的尾巴
+        const int32_t nBig = 1200;      // > the 1024 per-poll cap => one delivery necessarily leaves an undelivered tail
         {
             DefaultMQProducer prep("PG_PrepareOffCpp_" + stamp);
             prep.setNamesrvAddr(namesrv);
@@ -701,7 +701,7 @@ int main(int argc, char** argv) {
                 }
                 if (qs.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
-            check("S8 准备 topic（1 条队列）", qs.size() == 1,
+            check("S8 prepare the topic (1 queue)", qs.size() == 1,
                   "queues=" + std::to_string(qs.size()));
             int32_t landed = 0;
             if (qs.size() == 1) {
@@ -723,10 +723,10 @@ int main(int argc, char** argv) {
                 }
             }
             prep.shutdown();
-            check("S8 生产 " + std::to_string(nBig) + " 条成功", landed == nBig,
+            check("S8 produced " + std::to_string(nBig) + " messages successfully", landed == nBig,
                   "landed=" + std::to_string(landed));
 
-            // 独立读 broker 位点的探针（自己的组、自己的连接，不碰被测实例的任何内存）
+            // Probe that reads broker offsets independently (own group, own connection, touching none of the tested instance's memory)
             DefaultMQPullConsumer probe(offGroup);
             probe.setNamesrvAddr(namesrv);
             probe.start();
@@ -737,48 +737,48 @@ int main(int argc, char** argv) {
             o.setInstanceName("liteoff");
             o.setPollTimeoutMillis(1000);
             o.setPullBatchSize(32);
-            o.setAutoCommit(false);          // 提交时机全部由场景控制
+            o.setAutoCommit(false);          // commit timing is fully controlled by the scenario
             o.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
             o.assign({q0});
             o.start();
 
-            // S8a 只拉不交付：拉取游标跑到 1200，已消费游标一格都不许动
+            // S8a pull only, deliver nothing: the pull cursor runs up to 1200, the consumed cursor may not move a single step
             std::vector<MessageExt> all;
             const int64_t pullDeadline = nowMs() + 30000;
             while (o.pullCursorOf(q0) < nBig && nowMs() < pullDeadline) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
-            check("S8a 后台把 " + std::to_string(nBig) + " 条全拉进本地缓冲（拉取游标=" +
-                      std::to_string(o.pullCursorOf(q0)) + "）",
+            check("S8a the background pulled " + std::to_string(nBig) + " messages into the local buffer (pullCursor=" +
+                      std::to_string(o.pullCursorOf(q0)) + ")",
                   o.pullCursorOf(q0) == nBig, "pullCursor=" + std::to_string(o.pullCursorOf(q0)));
-            check("S8a 一条都没交付 ⇒ 已消费游标停在 -1", o.consumeCursorOf(q0) == -1,
+            check("S8a nothing delivered => the consumed cursor stays at -1", o.consumeCursorOf(q0) == -1,
                   "consumeCursor=" + std::to_string(o.consumeCursorOf(q0)));
-            // 这条是 #68 的核心：旧实现 commit() 遍历的就是拉取游标，这里会把 1200 发出去，
-            // 调用方在此之前崩掉 ⇒ 1200 条一条都没消费过却再也不会投。
+            // This is the core of #68: the old commit() iterated the pull cursor, so it would publish 1200 here,
+            // while the caller crashed before that => 1200 messages never consumed yet never redelivered.
             o.commit();
             int64_t brokerAfterEmptyCommit = -1;
             probe.fetchConsumeOffset(q0, brokerAfterEmptyCommit);
-            check("S8a 没交付过 ⇒ broker 位点没被推走（旧实现在这里提交 1200）",
+            check("S8a never delivered => the broker offset was not pushed forward (the old implementation committed 1200 here)",
                   brokerAfterEmptyCommit != nBig,
                   "brokerOffset=" + std::to_string(brokerAfterEmptyCommit));
 
-            // S8b poll 单次上限 1024 < 缓冲里的 1200 ⇒ 尾巴那 176 条不算已消费
+            // S8b the 1024 per-poll cap < the 1200 in the buffer => the 176-message tail does not count as consumed
             std::vector<MessageExt> first = o.poll(3000);
-            check("S8b 一次 poll 交出 1024 条（单次交付上限）", first.size() == 1024,
+            check("S8b one poll hands out 1024 messages (per-delivery cap)", first.size() == 1024,
                   "got=" + std::to_string(first.size()));
-            check("S8b 已消费游标 = 交出去的那一格", o.consumeCursorOf(q0) == 1024,
+            check("S8b consumed cursor = the slot that was handed out", o.consumeCursorOf(q0) == 1024,
                   "consumeCursor=" + std::to_string(o.consumeCursorOf(q0)));
-            check("S8b 缓冲里还压着 " + std::to_string(nBig - 1024) + " 条没交付",
+            check("S8b the buffer still holds " + std::to_string(nBig - 1024) + " undelivered messages",
                   o.pullCursorOf(q0) == nBig && o.consumeCursorOf(q0) < o.pullCursorOf(q0),
                   "pull=" + std::to_string(o.pullCursorOf(q0)));
             o.commit();
             int64_t brokerOffset = -1;
             probe.fetchConsumeOffset(q0, brokerOffset);
-            check("S8b 提交给 broker 的正是 1024（不是 1200）", brokerOffset == 1024,
+            check("S8b what gets committed to the broker is exactly 1024 (not 1200)", brokerOffset == 1024,
                   "brokerOffset=" + std::to_string(brokerOffset));
             for (MessageExt& m : first) all.push_back(std::move(m));
 
-            // S8c 指定一个更靠前的位点：只改提交落点，两条游标都不许动
+            // S8c commit an earlier offset: only the commit landing point changes, neither cursor may move
             const int64_t pullBefore = o.pullCursorOf(q0);
             const int64_t consumeBefore = o.consumeCursorOf(q0);
             std::map<MessageQueue, int64_t> rewind;
@@ -786,39 +786,39 @@ int main(int argc, char** argv) {
             o.commit(rewind, true);
             int64_t brokerRewound = -1;
             probe.fetchConsumeOffset(q0, brokerRewound);
-            check("S8c commit(map) 把 broker 位点改到调用方指定的 5", brokerRewound == 5,
+            check("S8c commit(map) moves the broker offset to the caller-specified 5", brokerRewound == 5,
                   "brokerOffset=" + std::to_string(brokerRewound));
-            check("S8c 提交位点不改拉取游标", o.pullCursorOf(q0) == pullBefore,
+            check("S8c committing an offset does not move the pull cursor", o.pullCursorOf(q0) == pullBefore,
                   "pullCursor=" + std::to_string(o.pullCursorOf(q0)));
-            check("S8c 提交位点不改已消费游标", o.consumeCursorOf(q0) == consumeBefore,
+            check("S8c committing an offset does not move the consumed cursor", o.consumeCursorOf(q0) == consumeBefore,
                   "consumeCursor=" + std::to_string(o.consumeCursorOf(q0)));
-            // 位点退回 5 之后，尾巴那 176 条照旧交付（缓冲与 broker 位点无关）
+            // after the offset rewinds to 5, the 176-message tail is still delivered (the buffer does not depend on the broker offset)
             std::vector<MessageExt> tail = o.poll(3000);
             all.insert(all.end(), std::make_move_iterator(tail.begin()),
                        std::make_move_iterator(tail.end()));
-            check("S8c 退回 5 之后缓冲里剩下的 " + std::to_string(nBig - 1024) + " 条照旧交付",
+            check("S8c after rewinding to 5 the " + std::to_string(nBig - 1024) + " messages left in the buffer are still delivered",
                   static_cast<int64_t>(tail.size()) == nBig - 1024,
                   "got=" + std::to_string(tail.size()));
             {
                 std::set<std::string> bodies;
                 for (const MessageExt& m : all) bodies.insert(bodyOf(m));
-                check("S8 全程收全 " + std::to_string(nBig) + " 条且一条不重不漏",
+                check("S8 the whole run received all " + std::to_string(nBig) + " messages with no duplicate and no loss",
                       bodies.size() == static_cast<size_t>(nBig),
                       "distinct=" + std::to_string(bodies.size()));
             }
 
-            // S8d 一个字节都不许上线：committed() 看得见、broker 看不见
+            // S8d not a single byte may go on the wire: committed() sees it, the broker does not
             std::map<MessageQueue, int64_t> memoryOnly;
             memoryOnly[q0] = 777;
             o.commit(memoryOnly, false);
-            check("S8d persist=false：committed() 读到内存表的 777",
+            check("S8d persist=false: committed() reads the 777 from the in-memory table",
                   o.committed(q0) == 777, "committed=" + std::to_string(o.committed(q0)));
             int64_t brokerStill = -1;
             probe.fetchConsumeOffset(q0, brokerStill);
-            check("S8d persist=false：broker 侧还是上一轮的 5", brokerStill == 5,
+            check("S8d persist=false: the broker side still holds the previous round's 5", brokerStill == 5,
                   "brokerOffset=" + std::to_string(brokerStill));
 
-            // S8e 新实例（同组）从 broker 上那一格续消费：内存表不跨实例
+            // S8e a new instance (same group) resumes consumption from the broker's slot: the in-memory table is not shared across instances
             DefaultLitePullConsumer o2(offGroup);
             o2.setNamesrvAddr(namesrv);
             o2.setInstanceName("liteoff2");
@@ -827,60 +827,60 @@ int main(int argc, char** argv) {
             o2.setConsumeFromWhere(ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET);
             o2.assign({q0});
             o2.start();
-            check("S8e 新实例的起点是 broker 上的 5（不是另一个实例内存里的 777）",
+            check("S8e the new instance starts at the broker's 5 (not another instance's in-memory 777)",
                   o2.pullCursorOf(q0) == 5, "pullCursor=" + std::to_string(o2.pullCursorOf(q0)));
             o2.shutdown();
 
-            // S8f seek 同时改写两条游标：重放的段不能被旧位点跳过
+            // S8f seek rewrites both cursors: a replayed span must not be skipped by the old offset
             o.seek(q0, 60);
-            check("S8f seek 改拉取游标", o.pullCursorOf(q0) == 60,
+            check("S8f seek moves the pull cursor", o.pullCursorOf(q0) == 60,
                   "pullCursor=" + std::to_string(o.pullCursorOf(q0)));
-            check("S8f seek 也改已消费游标", o.consumeCursorOf(q0) == 60,
+            check("S8f seek also moves the consumed cursor", o.consumeCursorOf(q0) == 60,
                   "consumeCursor=" + std::to_string(o.consumeCursorOf(q0)));
             o.commit();
             int64_t brokerSeeked = -1;
             probe.fetchConsumeOffset(q0, brokerSeeked);
-            check("S8f seek 之后 commit 落到 60", brokerSeeked == 60,
+            check("S8f the commit after seek lands on 60", brokerSeeked == 60,
                   "brokerOffset=" + std::to_string(brokerSeeked));
 
-            const MessageQueue foreign = assigned[1];   // 另一个 topic 的队列，offGroup 没碰过
-            o.assign({q0, foreign});                   // 只多一条游标，不影响上面的对列
+            const MessageQueue foreign = assigned[1];   // a queue of another topic, offGroup never touched it
+            o.assign({q0, foreign});                   // adds one cursor only, does not affect the pairs reconciled above
             std::map<MessageQueue, int64_t> memoryOnly2;
             memoryOnly2[q0] = 300;
-            o.commit(memoryOnly2, false);              // 只进内存表
-            check("S8g 未落盘的内存值先看得见", o.committed(q0) == 300,
+            o.commit(memoryOnly2, false);              // in-memory table only
+            check("S8g the unpersisted in-memory value is visible first", o.committed(q0) == 300,
                   "committed=" + std::to_string(o.committed(q0)));
             std::set<MessageQueue> none;
             o.commit(none, true);
-            check("S8g 空集合不清表也不发消息", o.committed(q0) == 300,
+            check("S8g an empty set neither clears the table nor sends anything", o.committed(q0) == 300,
                   "committed=" + std::to_string(o.committed(q0)));
             int64_t brokerStill2 = -1;
             probe.fetchConsumeOffset(q0, brokerStill2);
-            check("S8g 空集合没动 broker", brokerStill2 == 60,
+            check("S8g the empty set left the broker untouched", brokerStill2 == 60,
                   "brokerOffset=" + std::to_string(brokerStill2));
-            // 点名一条 foreign 队列：它没有消费记录（-1 守卫拦下写表），
-            // 但 persistAll 扫表时把 q0 那份未落盘的值清了 —— 这才是"提交部分队列"的代价。
+            // Naming one foreign queue: it has no consumption record (the -1 guard blocks the table write),
+            // but while scanning the table persistAll drops q0's unpersisted value -- that is the price of committing only part of the queues.
             std::set<MessageQueue> onlyForeign;
             onlyForeign.insert(foreign);
             o.commit(onlyForeign, true);
-            check("S8g 点名提交会把没点名的内存值清掉（remove unused mq）",
+            check("S8g committing named queues wipes the in-memory value of the unnamed ones (remove unused mq)",
                   o.committed(q0) != 300, "committed=" + std::to_string(o.committed(q0)));
-            check("S8g 清掉之后回读到的是 broker 上那一格",
+            check("S8g after the wipe the read-back is the broker's slot",
                   o.committed(q0) == 60, "committed=" + std::to_string(o.committed(q0)));
             int64_t brokerAfterPrune = -1;
             probe.fetchConsumeOffset(q0, brokerAfterPrune);
-            check("S8g 清理只是丢内存值，没往 broker 写 300", brokerAfterPrune == 60,
+            check("S8g pruning only drops the in-memory value, it never writes 300 to the broker", brokerAfterPrune == 60,
                   "brokerOffset=" + std::to_string(brokerAfterPrune));
-            // commit(Set) 取的是当下已消费游标，不是内存里那格
+            // commit(Set) takes the current consumed cursor, not the slot held in memory
             std::map<MessageQueue, int64_t> rewindAgain;
             rewindAgain[q0] = 300;
             o.commit(rewindAgain, false);
             o.commit({q0}, true);
             int64_t brokerSet = -1;
             probe.fetchConsumeOffset(q0, brokerSet);
-            check("S8g commit(Set) 提交的是已消费游标（60），不是内存里那格 300",
+            check("S8g commit(Set) submits the consumed cursor (60), not the in-memory 300",
                   brokerSet == 60, "brokerOffset=" + std::to_string(brokerSet));
-            check("S8g persistAll 之后内存表回到已消费游标（updateConsumeOffset）",
+            check("S8g after persistAll the in-memory table returns to the consumed cursor (updateConsumeOffset)",
                   o.committed(q0) == 60, "committed=" + std::to_string(o.committed(q0)));
 
             o.shutdown();

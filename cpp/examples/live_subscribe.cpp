@@ -1,5 +1,5 @@
-// 前置：NameServer + Broker 已起（本仓库 /tmp/rmq_rust_live/broker.conf）。
-// 用法：./rmq_live_subscribe 127.0.0.1:9876
+// Prerequisite: NameServer + broker already up (this repo's /tmp/rmq_rust_live/broker.conf).
+// Usage: ./rmq_live_subscribe 127.0.0.1:9876
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -119,17 +119,17 @@ int main(int argc, char* argv[]) {
         const ClusterInfo cluster = admin.fetchBrokerClusterInfo();
         const std::vector<std::string> addrs = cluster.getBrokerAddrs();
         if (addrs.empty()) {
-            check("集群探活", false, "nameServer 无 broker 注册");
+            check("cluster probe", false, "no broker registered on the name server");
             admin.shutdown();
             return 1;
         }
         brokerAddr = addrs[0];
     } catch (const std::exception& e) {
-        check("集群探活", false, std::string("fetchBrokerClusterInfo: ") + e.what());
+        check("cluster probe", false, std::string("fetchBrokerClusterInfo: ") + e.what());
         admin.shutdown();
         return 1;
     }
-    check("集群探活", true, "broker=" + brokerAddr);
+    check("cluster probe", true, "broker=" + brokerAddr);
 
     std::shared_ptr<DefaultMQPushConsumer> consumer;
     std::shared_ptr<DefaultMQProducer> producer;
@@ -146,35 +146,35 @@ int main(int argc, char* argv[]) {
         consumer->subscribe(tBase, "*");
         consumer->start();
 
-        // ---------------- S0 正对照 ----------------
+        // ---------------- S0 positive control ----------------
         const int64_t t0 = nowMs();
         const bool s0 = waitUntil(
             [&] { return contains(admin.queryTopicConsumeByWho(brokerAddr, tBase), group); }, 35000);
-        check("S0-基础 topic B 已登记本组（300 查得到）", s0,
+        check("S0-base topic B already lists this group (queryable through 300)", s0,
               "groupList=" + join(admin.queryTopicConsumeByWho(brokerAddr, tBase)) +
                   " elapsed=" + std::to_string(nowMs() - t0) + "ms");
 
-        // ---------------- S1 负对照 ----------------
+        // ---------------- S1 negative control ----------------
         const std::set<std::string> gotL0 = admin.queryTopicConsumeByWho(brokerAddr, tLate);
-        check("S1-负对照：未订阅的 L 查不到本组", !contains(gotL0, group),
+        check("S1-negative control: the never-subscribed L does not list this group", !contains(gotL0, group),
               "groupList=" + join(gotL0));
 
-        // ---------------- S2 后置订阅立即生效 ----------------
+        // ---------------- S2 post-start subscribe takes effect at once ----------------
         const int64_t t1 = nowMs();
         consumer->subscribe(tLate, "*");
         const int64_t subscribeMs = nowMs() - t1;
         const std::set<std::string> gotL1 = admin.queryTopicConsumeByWho(brokerAddr, tLate);
         const int64_t elapsedMs = nowMs() - t1;
         const bool registered = contains(gotL1, group);
-        check("S2-后置订阅后 broker 立刻登记本组（300 查得到）", registered,
+        check("S2-the broker lists this group right after the post-start subscribe (queryable through 300)", registered,
               "groupList=" + join(gotL1));
-        // 心跳周期默认 30s：只有订阅路径那一轮**同步**心跳才能让登记这么快出现。
-        check("S2-登记耗时远小于 30s 心跳周期（只可能是订阅路径推的）",
+        // The heartbeat period defaults to 30s: only the **synchronous** heartbeat on the subscribe path registers this fast.
+        check("S2-registration took far less than the 30s heartbeat period (only the subscribe path can push it)",
               registered && elapsedMs < kHeartbeatPeriodMs / 6,
-              "subscribe 返回耗时=" + std::to_string(subscribeMs) +
-                  "ms，查询完成耗时=" + std::to_string(elapsedMs) + "ms");
+              "subscribe returned after=" + std::to_string(subscribeMs) +
+                  "ms, query finished after=" + std::to_string(elapsedMs) + "ms");
 
-        // ---------------- S3 后置订阅真会被消费 ----------------
+        // ---------------- S3 the post-start subscription really gets consumed ----------------
         const int64_t t2 = nowMs();
         std::vector<std::string> lateKeys;
         const bool assigned = waitUntil(
@@ -186,7 +186,7 @@ int main(int argc, char* argv[]) {
                 return !lateKeys.empty();
             },
             45000);
-        check("S3-新 topic L 进入本实例分配集（rebalance 生效）", assigned,
+        check("S3-new topic L entered this instance's assigned set (rebalance took effect)", assigned,
               "assigned=" + jsonVec(lateKeys) +
                   " elapsed=" + std::to_string(nowMs() - t2) + "ms");
 
@@ -204,10 +204,10 @@ int main(int argc, char* argv[]) {
                 return false;
             },
             30000);
-        check("S3-后置订阅的 topic 上的消息真的被消费", consumed,
+        check("S3-messages on the post-start subscribed topic are really consumed", consumed,
               "seen=" + jsonVec(sink.snapshot()));
 
-        // ---------------- S4 活订阅表 ----------------
+        // ---------------- S4 live subscription table ----------------
         consumer->unsubscribe(tLate);
         const std::vector<std::string> live = consumer->subscribedTopics();
         bool hasBase = false, hasLate = false;
@@ -215,24 +215,24 @@ int main(int argc, char* argv[]) {
             if (t == tBase) hasBase = true;
             if (t == tLate) hasLate = true;
         }
-        check("S4-unsubscribe 后本组订阅集立刻少掉 L（只删表项，不发心跳）",
+        check("S4-after unsubscribe this group's subscription set drops L at once (table entry only, no heartbeat)",
               !hasLate && hasBase, "live=" + jsonVec(live));
     } catch (const std::exception& e) {
-        check("场景执行", false, e.what());
+        check("scenario execution", false, e.what());
     }
 
     if (consumer != nullptr) {
         try {
             consumer->shutdown();
         } catch (const std::exception& e) {
-            std::printf("    (consumer shutdown 失败: %s)\n", e.what());
+            std::printf("    (consumer shutdown failed: %s)\n", e.what());
         }
     }
     if (producer != nullptr) {
         try {
             producer->shutdown();
         } catch (const std::exception& e) {
-            std::printf("    (producer shutdown 失败: %s)\n", e.what());
+            std::printf("    (producer shutdown failed: %s)\n", e.what());
         }
     }
     for (const std::string& t : {tBase, tLate}) {
@@ -240,18 +240,18 @@ int main(int argc, char* argv[]) {
             admin.deleteTopic(t);
             std::printf("    (deleteTopic(%s) OK)\n", t.c_str());
         } catch (const std::exception& e) {
-            std::printf("    (deleteTopic(%s) 失败: %s)\n", t.c_str(), e.what());
+            std::printf("    (deleteTopic(%s) failed: %s)\n", t.c_str(), e.what());
         }
     }
     try {
         admin.deleteSubscriptionGroup(brokerAddr, group, true);
     } catch (const std::exception& e) {
-        std::printf("    (deleteSubscriptionGroup(%s) 失败: %s)\n", group.c_str(), e.what());
+        std::printf("    (deleteSubscriptionGroup(%s) failed: %s)\n", group.c_str(), e.what());
     }
     try {
         admin.shutdown();
     } catch (const std::exception& e) {
-        std::printf("    (admin shutdown 失败: %s)\n", e.what());
+        std::printf("    (admin shutdown failed: %s)\n", e.what());
     }
 
     std::printf("\nPASS=%d FAIL=%d\n", gPass, gFail);

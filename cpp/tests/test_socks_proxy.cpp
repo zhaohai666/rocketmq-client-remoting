@@ -1,16 +1,16 @@
-// SOCKS 代理传输层单测：本地起假 SOCKS5/SOCKS4 服务器 + 真 remoting 目标服务端，
-// 用 RemotingClient 真连、真握手、真发一笔请求。
+// SOCKS proxy transport unit test: a local fake SOCKS5/SOCKS4 server plus a real remoting
+// target server, so RemotingClient really connects, handshakes and sends one request.
 //
-// 覆盖点：
-//   1. SOCKS5 无认证：CONNECT 建隧道 + 一笔 remoting 请求往返 + 隧道复用
-//   2. SOCKS5 用户名/密码子协商（RFC 1929）：凭据正确 → 成功
-//   3. SOCKS5 认证拒绝（客户端没带凭据，代理回 0xFF）→ RemotingConnectException
-//   4. SOCKS5 密码错误（子协商 status=1）→ RemotingConnectException
-//   5. SOCKS4：IPv4 字面量目标 CONNECT 成功 + 一笔请求
-//   6. SocksProxyConfig::resolveHostPort 的 "host:port" / 裸 IPv6 拆分规则
+// Coverage:
+//   1. SOCKS5 no auth: CONNECT opens the tunnel, one request round trips, tunnel is reused
+//   2. SOCKS5 username/password sub-negotiation (RFC 1929): valid credentials succeed
+//   3. SOCKS5 auth refused (no client credentials, proxy answers 0xFF): RemotingConnectException
+//   4. SOCKS5 wrong password (sub-negotiation status=1): RemotingConnectException
+//   5. SOCKS4: CONNECT to an IPv4 literal target succeeds, plus one request
+//   6. SocksProxyConfig::resolveHostPort split rules for "host:port" and bare IPv6
 //
-// 失败类断言按 loopback 怪癖给足预算（本机刚关闭的端口约 2s 内仍拒绝）：建连超时一律
-// 30s 起步，宁可慢不可假红。
+// Failure assertions get a generous timeout budget for the loopback quirk (a port just closed
+// locally still refuses for about 2s): connect timeouts start at 30s, slow beats a false red.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -78,7 +78,7 @@ bool writeAll(socket_t s, const unsigned char* buf, size_t n) {
     return true;
 }
 
-// TCP connect（阻塞、带超时的 select 写法与传输层一致）
+// TCP connect (blocking, with the same timeout-via-select style as the transport layer)
 socket_t dial(const std::string& host, uint16_t port) {
     struct addrinfo hints;
     std::memset(&hints, 0, sizeof(hints));
@@ -105,7 +105,7 @@ socket_t dial(const std::string& host, uint16_t port) {
     return sock;
 }
 
-// 单线程 select 双向搬运：任一侧 EOF/错误即收口并关掉两个 fd
+// single-threaded select relay in both directions: EOF or an error on either side closes both fds
 void relay(socket_t a, socket_t b) {
     while (true) {
         fd_set rfds;
@@ -142,8 +142,8 @@ void relay(socket_t a, socket_t b) {
     netcompat::closeSocket(b);
 }
 
-// 真正的 remoting 目标服务端：accept -> 解帧 -> 回 SUCCESS（opaque 回填）。
-// 与 test_transport.cpp 的 TestServer(Normal) 同一形状。
+// A real remoting target server: accept -> decode frame -> reply SUCCESS (opaque echoed back).
+// Same shape as TestServer(Normal) in test_transport.cpp.
 class MiniRemotingServer {
 public:
     MiniRemotingServer() {
@@ -232,19 +232,19 @@ private:
     std::thread thread_;
 };
 
-// 假 SOCKS 服务器：最小握手 + CONNECT + 原始字节搬运到目标。
+// Fake SOCKS server: minimal handshake + CONNECT + raw byte relay to the target.
 struct SocksConnectRecord {
-    std::string host;   // CONNECT 请求里的目标主机（字符串原样记录）
+    std::string host;   // target host from the CONNECT request (recorded verbatim)
     int port = 0;
 };
 
 class FakeSocksServer {
 public:
     enum class Mode {
-        Socks5NoAuth,      // 只接受 0x00（无认证）
-        Socks5Auth,        // 要求 0x02，凭据必须等于 expectUser/expectPass
-        Socks5NoCreds,     // 要求 0x02，但客户端没报 0x02 时回 0xFF（拒绝路径）
-        Socks5AlwaysDeny,  // 接受 0x02 但用户名/密码一律判失败（status=1）
+        Socks5NoAuth,      // accepts 0x00 only (no authentication)
+        Socks5Auth,        // requires 0x02, credentials must equal expectUser/expectPass
+        Socks5NoCreds,     // requires 0x02, answers 0xFF when the client never offers it (reject path)
+        Socks5AlwaysDeny,  // accepts 0x02 but always fails the username/password check (status=1)
         Socks4,            // SOCKS4 / 4a
     };
 
@@ -326,7 +326,7 @@ private:
         netcompat::closeSocket(client);
     }
 
-    // 读一行以 0x00 终止的字符串（SOCKS4 userid / 4a hostname）
+    // Read one 0x00-terminated string (SOCKS4 userid / 4a hostname)
     bool readCString(socket_t s, std::string& out) {
         out.clear();
         unsigned char c = 0;
@@ -419,7 +419,7 @@ private:
         }
 
         unsigned char req[4] = {0, 0, 0, 0};
-        if (!readN(client, req, 4) || req[0] != 0x05 || req[1] != 0x01) {  // 只要 CONNECT
+        if (!readN(client, req, 4) || req[0] != 0x05 || req[1] != 0x01) {  // CONNECT only
             return;
         }
         std::string host;
@@ -462,7 +462,7 @@ private:
         }
         socket_t target = dial(host, static_cast<uint16_t>(port));
         if (target == kInvalidSocket) {
-            // 目标连不上：按 ATYP 回 connection refused
+            // target unreachable: reply connection refused for the ATYP in use
             const unsigned char refused[10] = {0x05, 0x05, 0x00, 0x01,
                                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
             writeAll(client, refused, 10);
@@ -489,7 +489,7 @@ private:
         }
         std::string host;
         if (req[4] == 0 && req[5] == 0 && req[6] == 0 && req[7] == 1) {
-            // SOCKS4a 标记：域名跟在 userid 后
+            // SOCKS4a marker: the domain name follows the userid
             if (!readCString(client, host)) {
                 return;
             }
@@ -533,7 +533,7 @@ private:
 
 bool throwsConnectExceptionWith(const std::string& needle, const SocksProxyConfig& proxy,
                                 const std::string& addr) {
-    // 失败类断言的预算 ≥ 30s（loopback 怪癖：刚关闭的端口约 2s 内仍拒绝，宁可慢不可假红）
+    // budget >= 30s for failure assertions (a just-closed loopback port still refuses for ~2s)
     RemotingClient client(30000, 5000);
     client.setSocksProxy(proxy);
     RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
@@ -550,7 +550,7 @@ bool throwsConnectExceptionWith(const std::string& needle, const SocksProxyConfi
 }  // namespace
 
 int main() {
-    // ------------------------------------------------ 0. resolveHostPort 的拆分规则
+    // ------------------------------------------------ 0. resolveHostPort split rules
     {
         SocksProxyConfig plain;
         plain.addr = "10.0.0.9";
@@ -580,7 +580,7 @@ int main() {
         CHECK(host == "::1" && port == "1080", "resolveHostPort: bare IPv6 literal is a host");
     }
 
-    // ------------------------------------------------ 1. SOCKS5 无认证：建隧道 + 请求往返
+    // ------------------------------------------------ 1. SOCKS5 no auth: tunnel setup + request round trip
     {
         MiniRemotingServer target;
         FakeSocksServer proxy(FakeSocksServer::Mode::Socks5NoAuth);
@@ -599,14 +599,14 @@ int main() {
         CHECK(resp.opaque == opaque, "socks5 no-auth: opaque matched");
         CHECK(resp.remark == "via-socks", "socks5 no-auth: response came through the tunnel");
 
-        // 第二次调用复用同一条隧道
+        // the second call reuses the same tunnel
         RemotingCommand req2 = RemotingCommand::createRequestCommand(RequestCode::PULL_MESSAGE);
         RemotingCommand resp2 = client.invokeSync(target.address(), req2);
         CHECK(resp2.code == ResponseCode::SUCCESS, "socks5 no-auth: second invoke reused tunnel");
         CHECK(proxy.connectCount() == 1, "socks5 no-auth: exactly one CONNECT for two invokes");
         CHECK(target.served() == 2, "socks5 no-auth: target served both requests");
 
-        // CONNECT 请求把目标地址正确带到了代理
+        // the CONNECT request carried the real target address to the proxy
         const auto recs = proxy.records();
         CHECK(recs.size() == 1 && recs[0].host == "127.0.0.1" &&
                   recs[0].port == std::stoi(target.address().substr(target.address().find(':') + 1)),
@@ -614,7 +614,7 @@ int main() {
         client.shutdown();
     }
 
-    // ------------------------------------------------ 2. SOCKS5 用户名/密码子协商（正确凭据）
+    // ------------------------------------------------ 2. SOCKS5 username/password sub-negotiation (valid credentials)
     {
         MiniRemotingServer target;
         FakeSocksServer proxy(FakeSocksServer::Mode::Socks5Auth, "socksUser", "socksPass");
@@ -636,13 +636,13 @@ int main() {
         client.shutdown();
     }
 
-    // ------------------------------------- 3. 认证拒绝：客户端没带凭据，代理回 0xFF
+    // ------------------------------------- 3. auth refused: client sends no credentials, proxy answers 0xFF
     {
         MiniRemotingServer target;
         FakeSocksServer proxy(FakeSocksServer::Mode::Socks5NoCreds, "socksUser", "socksPass");
         SocksProxyConfig proxyCfg;
         proxyCfg.addr = "127.0.0.1";
-        proxyCfg.port = proxy.port();  // 不配 username/password
+        proxyCfg.port = proxy.port();  // no username/password configured
         CHECK(throwsConnectExceptionWith("none of the offered methods", proxyCfg,
                                          target.address()),
               "socks5 no-creds vs auth-required proxy -> RemotingConnectException");
@@ -650,7 +650,7 @@ int main() {
         CHECK(target.served() == 0, "socks5 no-creds: target never saw a request");
     }
 
-    // ------------------------------------------- 4. 认证拒绝：密码错误（子协商 status=1）
+    // ------------------------------------------- 4. auth refused: wrong password (sub-negotiation status=1)
     {
         MiniRemotingServer target;
         FakeSocksServer proxy(FakeSocksServer::Mode::Socks5Auth, "socksUser", "socksPass");
@@ -664,7 +664,7 @@ int main() {
         CHECK(target.served() == 0, "socks5 wrong password: target never saw a request");
     }
 
-    // ------------------------------------------------ 5. SOCKS4：IPv4 字面量 CONNECT
+    // ------------------------------------------------ 5. SOCKS4: IPv4 literal CONNECT
     {
         MiniRemotingServer target;
         FakeSocksServer proxy(FakeSocksServer::Mode::Socks4, "uid4");

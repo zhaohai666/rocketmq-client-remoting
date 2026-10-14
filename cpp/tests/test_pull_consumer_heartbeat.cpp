@@ -1,8 +1,8 @@
-// P6（#98）：经典拉模式消费者 / 轻量拉取消费者的**心跳**离线单测。
+// P6 (#98): offline unit test for the **heartbeat** of the classic pull consumer / lite pull consumer.
 //
 //
-// 判据取自**线上报文**：进程内假端点从 socket 上收 HEART_BEAT 的 body（JSON）与
-// UNREGISTER_CLIENT 的 extFields，不靠调用方自说自话。
+// Criteria are taken from the **wire traffic**: the in-process fake endpoint reads the HEART_BEAT body (JSON) and
+// the UNREGISTER_CLIENT extFields off the socket, instead of trusting what the caller claims.
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -58,7 +58,7 @@ void expectInt(long long actual, long long expected, const std::string& name) {
     }
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -109,9 +109,9 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// ---------------------------------------------------------------- 假端点
+// ---------------------------------------------------------------- fake endpoint
 
-// 同时扮演 name server（回路由）与 broker（收 HEART_BEAT / UNREGISTER_CLIENT）。
+// Plays both the name server (answers routes) and the broker (receives HEART_BEAT / UNREGISTER_CLIENT).
 class MockEndpoint {
 public:
     MockEndpoint() {
@@ -165,7 +165,7 @@ public:
         return heartbeats_.size();
     }
 
-    // 第 i 份心跳（按到达顺序）里的第一个 ConsumerData
+    // The first ConsumerData in the i-th heartbeat (in arrival order)
     bool consumerData(size_t i, ConsumerData& out) {
         std::lock_guard<std::mutex> lk(state_);
         if (i >= heartbeats_.size()) return false;
@@ -262,7 +262,7 @@ private:
     std::thread acceptor_;
 };
 
-// ---------------------------------------------------------------- 脚手架
+// ---------------------------------------------------------------- scaffolding
 
 const char* kGroup = "PG_PullHbUnit";
 const char* kTopic = "PullHbTopic";
@@ -279,7 +279,7 @@ TopicRouteData routeOne(const std::string& broker, int64_t id, const std::string
     std::map<int64_t, std::string> addrs;
     addrs[id] = addr;
     route.brokerDatas.emplace_back("DefaultCluster", broker, addrs);
-    // queueDatas 决定 TopicPublishInfo.msgQueueList（fetchSubscribeMessageQueues 的返回）
+    // queueDatas determine TopicPublishInfo.msgQueueList (what fetchSubscribeMessageQueues returns)
     route.queueDatas.emplace_back(broker, 4, 4, 6, 0);
     return route;
 }
@@ -294,7 +294,7 @@ TopicRouteData routeTwo(const std::string& masterAddr, const std::string& slaveA
     return route;
 }
 
-// 等条件成立（默认 5s 上限），返回是否等到
+// Wait until the condition holds (default 5s cap); returns whether it was observed
 template <typename Fn>
 bool waitFor(Fn fn, int timeoutMs = 5000) {
     const int64_t deadline = UtilAll::currentTimeMillis() + timeoutMs;
@@ -305,7 +305,7 @@ bool waitFor(Fn fn, int timeoutMs = 5000) {
     return fn();
 }
 
-// ---------------------------------------------------------------- 1. 启动即注册
+// ---------------------------------------------------------------- 1. start registers immediately
 
 void testStartAnnouncesTheGroupWithTheWireShape() {
     MockEndpoint namesrv;
@@ -319,38 +319,38 @@ void testStartAnnouncesTheGroupWithTheWireShape() {
     consumer.setUnitMode(true);
     consumer.start();
     const bool got = waitFor([&] { return broker.heartbeatCount() >= 1; });
-    expect(got, "start() 后 broker 收到 HEART_BEAT");
-    expectInt(consumer.heartbeatCount(), 1, "启动时同步发一轮（心跳计数=1）");
+    expect(got, "broker receives HEART_BEAT after start()");
+    expectInt(consumer.heartbeatCount(), 1, "one synchronous round at startup (heartbeat count=1)");
 
     ConsumerData cd;
     const bool decoded = broker.consumerData(0, cd);
-    expect(decoded, "心跳 body 能按 wire 字段名解出 ConsumerData");
+    expect(decoded, "heartbeat body decodes to ConsumerData using wire field names");
     if (decoded) {
-        expect(cd.groupName == kGroup, "ConsumerData.groupName 是本组", "got=" + cd.groupName);
-        // DefaultMQPullConsumerImpl:348
+        expect(cd.groupName == kGroup, "ConsumerData.groupName is this group", "got=" + cd.groupName);
+        // The pull consumer reports CONSUME_ACTIVELY: it pulls by hand instead of being pushed to.
         expect(cd.consumeType == ConsumeType::CONSUME_ACTIVELY,
-               "consumeType=CONSUME_ACTIVELY（参考实现同值）",
+               "consumeType=CONSUME_ACTIVELY (same value as the reference implementation)",
                "got=" + cd.consumeType);
-        // :353
+        // A fresh CLUSTERING consumer starts at the tail of the queue, not from the beginning.
         expect(cd.consumeFromWhere == ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET,
-               "consumeFromWhere=CONSUME_FROM_LAST_OFFSET（:353）", "got=" + cd.consumeFromWhere);
+               "consumeFromWhere=CONSUME_FROM_LAST_OFFSET", "got=" + cd.consumeFromWhere);
         expect(cd.messageModel == MessageModel::CLUSTERING,
                "messageModel=CLUSTERING", "got=" + cd.messageModel);
-        expect(cd.unitMode, "unitMode 如实上报（MQClientInstance:1039）");
+        expect(cd.unitMode, "unitMode reported truthfully");
         expectInt(static_cast<long long>(cd.subscriptionDataSet.size()), 1,
-                  "订阅集来自 registerTopics（subscriptions():357-385）");
+                  "subscription set comes from registerTopics");
         if (!cd.subscriptionDataSet.empty()) {
             const SubscriptionData& sub = cd.subscriptionDataSet.front();
-            expect(sub.topic == kTopic, "订阅 topic 原样（不加命名空间）", "got=" + sub.topic);
+            expect(sub.topic == kTopic, "subscribed topic verbatim (no namespace prefix)", "got=" + sub.topic);
             expect(sub.subString == "*", "subString=SUB_ALL", "got=" + sub.subString);
-            expectInt(sub.subVersion, 0, "subVersion=0（缺省即 0）");
+            expectInt(sub.subVersion, 0, "subVersion=0 (the default is 0)");
         }
     }
 
     consumer.shutdown();
 }
 
-// ---------------------------------------------------------------- 2. 扇出到每一台
+// ---------------------------------------------------------------- 2. fan-out to every broker
 
 void testHeartbeatFansOutToEveryBrokerId() {
     MockEndpoint namesrv;
@@ -366,13 +366,13 @@ void testHeartbeatFansOutToEveryBrokerId() {
     const bool both = waitFor([&] {
         return master.heartbeatCount() >= 1 && slave.heartbeatCount() >= 1;
     });
-    expect(both, "主从两台都收到心跳", "master=" + std::to_string(master.heartbeatCount()) +
+    expect(both, "master and slave both receive the heartbeat", "master=" + std::to_string(master.heartbeatCount()) +
                                       " slave=" + std::to_string(slave.heartbeatCount()));
-    expectInt(consumer.heartbeatCount(), 1, "一轮心跳=只算一次（成功台数不重复计数）");
+    expectInt(consumer.heartbeatCount(), 1, "one heartbeat round counts once (successful brokers are not recounted)");
     consumer.shutdown();
 }
 
-// ---------------------------------------------------------------- 3. 没有订阅也要注册本组
+// ---------------------------------------------------------------- 3. the group is registered even without subscriptions
 
 void testHeartbeatStillAnnouncesTheGroupWithoutRegisterTopics() {
     MockEndpoint namesrv;
@@ -382,24 +382,24 @@ void testHeartbeatStillAnnouncesTheGroupWithoutRegisterTopics() {
     DefaultMQPullConsumer consumer(kGroup);
     consumer.setNamesrvAddr(namesrv.address());
     consumer.start();
-    // 无 registerTopics → start() 时路由表为空、那一轮发 0 份；取一次队列把路由灌进来
+    // No registerTopics -> the route table is empty at start() and that round sends 0; fetch queues once to fill the route table
     const std::vector<MessageQueue> mqs = consumer.fetchSubscribeMessageQueues(kTopic);
-    expect(!mqs.empty(), "前置：路由已拉到（mock name server 回的路由）");
+    expect(!mqs.empty(), "precondition: route fetched (route answered by the mock name server)");
     const int32_t sent = consumer.sendHeartbeatToAllBroker();
-    expectInt(sent, 1, "显式心跳发到 1 台");
+    expectInt(sent, 1, "explicit heartbeat sent to 1 broker");
 
     ConsumerData cd;
     const bool decoded = broker.consumerData(0, cd);
-    expect(decoded, "心跳 body 可解");
+    expect(decoded, "heartbeat body decodable");
     if (decoded) {
-        expect(cd.groupName == kGroup, "空订阅也把本组注册上去", "got=" + cd.groupName);
+        expect(cd.groupName == kGroup, "the group is registered even with empty subscriptions", "got=" + cd.groupName);
         expectInt(static_cast<long long>(cd.subscriptionDataSet.size()), 0,
-                  "订阅集为空（没有 registerTopics）");
+                  "subscription set is empty (no registerTopics)");
     }
     consumer.shutdown();
 }
 
-// ---------------------------------------------------------------- 4. 周期循环
+// ---------------------------------------------------------------- 4. periodic loop
 
 void testHeartbeatLoopRepeats() {
     MockEndpoint namesrv;
@@ -413,17 +413,17 @@ void testHeartbeatLoopRepeats() {
     consumer.registerMessageQueueListener(kTopic, listener);
     consumer.start();
     const bool repeated = waitFor([&] { return consumer.heartbeatCount() >= 3; }, 6000);
-    expect(repeated, "心跳循环按周期重复发送", "count=" + std::to_string(consumer.heartbeatCount()));
+    expect(repeated, "the heartbeat loop repeats on its interval", "count=" + std::to_string(consumer.heartbeatCount()));
 
-    // 关掉开关后循环空转（启动时那一轮不受影响）
+    // With the switch off the loop spins empty (the round at startup is unaffected)
     consumer.setHeartbeatEnabled(false);
     const int32_t before = consumer.heartbeatCount();
     std::this_thread::sleep_for(std::chrono::milliseconds(900));
-    expectInt(consumer.heartbeatCount(), before, "heartbeatEnabled=false 后循环不再发");
+    expectInt(consumer.heartbeatCount(), before, "the loop stops sending after heartbeatEnabled=false");
     consumer.shutdown();
 }
 
-// ---------------------------------------------------------------- 5. shutdown 注销
+// ---------------------------------------------------------------- 5. shutdown unregisters
 
 void testShutdownUnregistersTheGroupOnEveryBroker() {
     MockEndpoint namesrv;
@@ -440,25 +440,25 @@ void testShutdownUnregistersTheGroupOnEveryBroker() {
     consumer.shutdown();
 
     const bool bothUnregistered = master.unregisterCount() >= 1 && slave.unregisterCount() >= 1;
-    expect(bothUnregistered, "shutdown 对每台 broker 发 UNREGISTER_CLIENT(35)",
+    expect(bothUnregistered, "shutdown sends UNREGISTER_CLIENT(35) to every broker",
            "master=" + std::to_string(master.unregisterCount()) +
                " slave=" + std::to_string(slave.unregisterCount()));
     if (bothUnregistered) {
         const PropertyMap ext = master.unregisterExt(0);
         expect(ext.count("consumerGroup") && ext.at("consumerGroup") == kGroup,
-               "35 带 consumerGroup", "ext=" + (ext.count("consumerGroup") ? ext.at("consumerGroup")
+               "35 carries consumerGroup", "ext=" + (ext.count("consumerGroup") ? ext.at("consumerGroup")
                                                                            : std::string("<none>")));
-        // 空着的那个槽位不上线（broker ClientManageProcessor:228/237 判的是 group != null）
-        expect(ext.count("producerGroup") == 0, "35 不带 producerGroup 槽位");
+        // The empty slot is not sent (the broker ClientManageProcessor:228/237 checks group != null)
+        expect(ext.count("producerGroup") == 0, "35 omits the producerGroup slot");
     }
-    // 幂等：重复 shutdown 不再发
+    // Idempotent: a repeated shutdown sends nothing more
     const size_t before = master.unregisterCount();
     consumer.shutdown();
     expectInt(static_cast<long long>(master.unregisterCount()), static_cast<long long>(before),
-              "重复 shutdown 幂等");
+              "repeated shutdown is idempotent");
 }
 
-// ---------------------------------------------------------------- 6. 轻量拉取也是 ACTIVELY
+// ---------------------------------------------------------------- 6. the lite pull consumer is ACTIVELY too
 
 void testLitePullHeartbeatIsActivelyTyped() {
     MockEndpoint namesrv;
@@ -470,15 +470,15 @@ void testLitePullHeartbeatIsActivelyTyped() {
     consumer.subscribe(kTopic, "*");
     consumer.start();
     const bool got = waitFor([&] { return broker.heartbeatCount() >= 1; });
-    expect(got, "lite start() 后 broker 收到 HEART_BEAT");
+    expect(got, "lite broker receives HEART_BEAT after start()");
 
     ConsumerData cd;
     const bool decoded = broker.consumerData(0, cd);
-    expect(decoded, "lite 心跳 body 可解");
+    expect(decoded, "lite heartbeat body decodable");
     if (decoded) {
-        expect(cd.groupName == kGroup, "lite ConsumerData.groupName 是本组", "got=" + cd.groupName);
+        expect(cd.groupName == kGroup, "lite ConsumerData.groupName is this group", "got=" + cd.groupName);
         expect(cd.consumeType == ConsumeType::CONSUME_ACTIVELY,
-               "lite consumeType=CONSUME_ACTIVELY（参考实现同值）",
+               "lite consumeType=CONSUME_ACTIVELY (same value as the reference implementation)",
                "got=" + cd.consumeType);
     }
     consumer.shutdown();

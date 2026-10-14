@@ -1,6 +1,6 @@
-// 编解码往返单测：JSON / RocketMQ 二进制 / RemotingCommand / 消息格式 / 工具函数。
+// Codec round-trip unit tests: JSON / RocketMQ binary / RemotingCommand / message format / utilities.
 //
-// 目标：在不依赖真实集群的前提下，证明本端口协议层字节级往返正确。
+// Goal: prove this port's protocol layer round-trips byte-for-byte without depending on a real cluster.
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -39,7 +39,7 @@ static void testJson() {
     CHECK(v.get("d").boolValue() == true, "json bool");
     CHECK(v.get("e").isNull(), "json null");
 
-    // FastJSON 无引号数字键兼容
+    // FastJSON tolerance for unquoted numeric keys
     JsonValue v2;
     CHECK(jsonParse("{\"brokerAddrs\":{0:\"127.0.0.1:10911\"}}", v2),
           "json tolerant numeric key parse");
@@ -47,12 +47,12 @@ static void testJson() {
     CHECK(ba && ba->contains("0") && ba->get("0").stringValue() == "127.0.0.1:10911",
           "json tolerant numeric key value");
 
-    // 转义与 UTF-8
+    // Escapes and UTF-8
     JsonValue v3;
     CHECK(jsonParse("{\"s\":\"a\\nb\\u4e2d\"}", v3), "json escape parse");
     CHECK(v3.get("s").stringValue() == std::string("a\nb\u4e2d"), "json escape round value");
 
-    // dump 后再解析应等价
+    // Re-parsing the dumped text must be equivalent
     JsonValue v4;
     CHECK(jsonParse(v.dump(), v4), "json dump->parse");
     CHECK(v4.get("a").intValue() == 1 && v4.get("c").size() == 3, "json dump->parse equiv");
@@ -66,7 +66,7 @@ static void testRocketMQSerialize() {
     CHECK(len == 6, "writeDecimalLong length field");
     CHECK(buf.substr(4) == std::string("-12345"), "writeDecimalLong digits");
 
-    // writeStr 短/长长度
+    // writeStr short/long length prefix
     Bytes s;
     RocketMQSerializable::writeStr(s, true, "abc");
     CHECK(s.size() == 2 + 3 && static_cast<unsigned char>(s[1]) == 3, "writeStr short length");
@@ -89,7 +89,7 @@ static void testRemotingCommandJson() {
     cmd.body = "payload";
 
     Bytes wire = cmd.encode();
-    // totalLength = 4(headerLen 字段) + header + body
+    // totalLength = 4 (headerLen field) + header + body
     int32_t total = ByteReader::getInt32At(wire, 0);
     CHECK(static_cast<size_t>(total) + 4 == wire.size(), "encode totalLength framing");
 
@@ -102,7 +102,7 @@ static void testRemotingCommandJson() {
     CHECK(dec.getExtField("bornTimestamp") == "1699999999000", "decode extField bornTimestamp");
     CHECK(dec.serializeTypeCurrentRPC == SerializeType::JSON, "decode serializeType JSON");
 
-    // 从 extFields 还原自定义头
+    // Restore the custom header from extFields
     SendMessageRequestHeader back;
     dec.decodeCommandCustomHeader(back);
     CHECK(back.topic.has_value() && *back.topic == "T_TEST", "decodeCommandCustomHeader topic");
@@ -189,7 +189,7 @@ static void testMessageCodec() {
     CHECK(d.getUserProperty("city") == "Hangzhou", "decode user property");
     CHECK(!d.msgId.empty(), "decode msgId non-empty");
 
-    // 多消息流
+    // A stream carrying several messages
     Bytes stream = raw + encodeMessageExt(m, false);
     std::vector<MessageExt> list = decodeMessages(stream, true);
     CHECK(list.size() == 2, "decodeMessages count");
@@ -240,7 +240,7 @@ static void testWaitStoreMsgOkParseBooleanContract() {
     CHECK(!msg.isWaitStoreMsgOk(), "explicit false");
     msg.properties[MessageConst::PROPERTY_WAIT_STORE_MSG_OK] = "TRUE";
     CHECK(msg.isWaitStoreMsgOk(), "case-insensitive true");
-    // 其它值一律 false（不是"非 false 即真"）
+    // Any other value is false (not "anything except false means true")
     for (const char* bad : {"1", "", "yes", "tru"}) {
         msg.properties[MessageConst::PROPERTY_WAIT_STORE_MSG_OK] = bad;
         CHECK(!msg.isWaitStoreMsgOk(), std::string("non-canonical value is false: ") + bad);
@@ -251,7 +251,7 @@ static void testUtilAndHash() {
     MessageQueue mq("A", "B", 0);
     CHECK(mq.hashCode() == 93282, "MessageQueue hashCode protocol semantics");
 
-    // 十六进制（大写）
+    // Hexadecimal, uppercase
     Bytes bs;
     bs.push_back(static_cast<char>(0x00));
     bs.push_back(static_cast<char>(0x1F));
@@ -260,11 +260,11 @@ static void testUtilAndHash() {
     CHECK(UtilAll::string2Bytes("001FFF") == bs, "string2Bytes round");
     CHECK(UtilAll::string2Bytes("ZZ").empty(), "string2Bytes invalid -> empty");
 
-    // 标准 CRC32("123456789") = 0xCBF43926
+    // Standard CRC32("123456789") = 0xCBF43926
     CHECK(UtilAll::crc32("123456789") == 0xCBF43926u, "crc32 known vector");
     CHECK(crc32("123456789") == 0xCBF43926u, "message_decoder::crc32 delegates");
 
-    // msgId 往返
+    // msgId round trip
     Bytes addr = ipAndPortToBytes("127.0.0.1", 10911, false);
     CHECK(addr.size() == 8, "ipAndPortToBytes v4 length");
     std::string msgId = createMessageId(addr, 123456789LL);

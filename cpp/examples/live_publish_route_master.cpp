@@ -1,16 +1,16 @@
-// 主备切换下的发布路由真机联调，场景逐条断言。
+// Live publish-route check under master/slave failover, asserting each scenario in turn.
 //
-// 前置：namesrv + master + slave 都在跑（按本地集群 runbook）；脚本自己**只停一次 master**
-// （scripts/rmq_test_broker.sh 只认 master 的 java 进程），收尾块保证 master 一定回来。
-//
-//
-//
-// 离线单测：tests/test_route_heartbeat.cpp 的发布/订阅信息组锁「队列集判据」，
-// tests/test_publish_route_master.cpp 锁「地址判据」；真机锁的是判据作用在真实路由形状上的
-// 结果 —— 名字服务里 broker-a 真的只剩 {1: slave}。
+// Prerequisite: name server + master + slave all running (per the local cluster runbook); the script itself
+// **stops the master only once** (scripts/rmq_test_broker.sh only knows the master's java process), and the teardown block guarantees the master comes back.
 //
 //
-// 用法：./rmq_live_publish_route_master 127.0.0.1:9876 [127.0.0.1:10911] [127.0.0.1:10931]
+//
+// Offline unit tests: tests/test_route_heartbeat.cpp locks the publish/subscription "queue-set criterion" of the group locks,
+// tests/test_publish_route_master.cpp locks the "address criterion"; the live run locks the result of those
+// criteria applied to real route shapes — broker-a in the name server really does shrink to {1: slave}.
+//
+//
+// Usage: ./rmq_live_publish_route_master 127.0.0.1:9876 [127.0.0.1:10911] [127.0.0.1:10931]
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -69,7 +69,7 @@ double monotonicSeconds() {
         .count();
 }
 
-// 真机窗口里路由/位点的收敛是异步的：超时不算断言失败，由调用方对返回值做断言。
+// In a live window the convergence of routes/offsets is asynchronous: a timeout is not an assertion failure, the caller asserts on the returned value.
 bool waitUntil(const std::function<bool()>& pred, int64_t timeoutMs, int64_t intervalMs = 500) {
     const int64_t deadline = nowMs() + timeoutMs;
     while (nowMs() < deadline) {
@@ -93,8 +93,8 @@ std::string readFile(const std::string& path) {
 
 std::string gBrokerCtl;
 
-/// 跑 scripts/rmq_test_broker.sh。输出走**文件**而不是管道：start 会把 broker 拉成
-/// 常驻进程，谁继承它的写端谁就等不到 EOF。
+/// Run scripts/rmq_test_broker.sh. Its output goes to a **file** rather than a pipe: start turns the broker into
+/// a daemon process, and whoever inherits its write end would never see EOF.
 bool brokerCtl(const std::string& action, std::string& out) {
     const std::string logPath = "/tmp/rmq_pr_master_cpp_broker_ctl." + action + ".log";
     const std::string cmd = "sh '" + gBrokerCtl + "' " + action + " > '" + logPath + "' 2>&1";
@@ -105,10 +105,10 @@ bool brokerCtl(const std::string& action, std::string& out) {
 
 const int32_t kQueues = 4;
 const char* const kBrokerName = "broker-a";
-// 本端失败上界：发布信息为空时压根没有 wire 调用，真机给 500ms 已留量级余量。
+// Upper bound for local-side failures: with empty publish info there is no wire call at all; 500ms on a live machine already leaves an order-of-magnitude margin.
 constexpr double kLocalBudgetMs = 500.0;
 
-// 只收 body：这一趟关心的是"从节点上的 4 条能不能收齐"，不关心位点与顺序。
+// Collect bodies only: this run cares whether the 4 messages on the slave can all be received, not offsets or order.
 struct BodySink {
     std::mutex mtx;
     std::vector<std::string> bodies;
@@ -187,8 +187,8 @@ struct Fixture {
         stamp = std::to_string(nowMs() % 1000000);
         admin.setNamesrvAddr(ns);
         admin.start();
-        // 管理实例与生产者实例的 clientId 不同 ⇒ 进程内是两个 MQClientInstance：
-        // S5 的「旧缓存」看的是发送实例自己那张表，这里要能分别驱动。
+        // The admin instance and the producer instance have different clientIds ⇒ two MQClientInstances inside the process:
+        // S5's "stale cache" looks at the sender instance's own table, so both must be drivable separately here.
         producer = std::make_shared<DefaultMQProducer>("PID_PrMasterCpp_" + stamp);
         producer->setNamesrvAddr(ns);
         producer->setInstanceName("pr_master_cpp_" + stamp);
@@ -197,12 +197,12 @@ struct Fixture {
 
     std::string topic() const { return "PrMasterCpp" + stamp; }
 
-    // 强制刷新后取 broker-a 的 brokerAddrs（刷不到返回空 map）。
+    // Take broker-a's brokerAddrs after a forced refresh (empty map when the refresh fails).
     std::map<int64_t, std::string> routeAddrs(const std::string& t) {
         try {
             admin.client().updateTopicRouteInfoFromNameServer(t, 5000, false);
         } catch (const std::exception& e) {
-            std::printf("    (路由刷新失败: %s)\n", e.what());
+            std::printf("    (route refresh failed: %s)\n", e.what());
         }
         std::shared_ptr<TopicRouteData> route = admin.client().getTopicRouteData(t);
         if (route == nullptr) return std::map<int64_t, std::string>();
@@ -238,13 +238,13 @@ bool hasId(const std::map<int64_t, std::string>& addrs, int64_t id) {
     return addrs.find(id) != addrs.end();
 }
 
-/// 「发布信息组不出队列」的判据：访问器只在发布信息**有队列**时返回，
-/// 否则本端抛 MQClientException("Can not find Message Queue for topic: ...")。
-/// 返回 true 表示确实抛了这条（detail 里带上原文）；意外拿到非空列表时返回 false。
+/// The criterion for "the publish-info group yields no queues": the accessor returns only when the publish info **has queues**,
+/// otherwise it throws MQClientException("Can not find Message Queue for topic: ...") locally.
+/// Returns true when exactly that one was thrown (detail carries the original text); returns false when a non-empty list is unexpectedly obtained.
 bool publishInfoEmpty(MQClientInstance& client, const std::string& topic, std::string& detail) {
     try {
         std::shared_ptr<TopicPublishInfo> info = client.getTopicPublishInfo(topic, false);
-        detail = "意外拿到 " + std::to_string(info->msgQueueList.size()) + " 条队列";
+        detail = "unexpectedly got " + std::to_string(info->msgQueueList.size()) + " queues";
         return false;
     } catch (const MQClientException& e) {
         detail = e.what();
@@ -256,19 +256,19 @@ bool publishInfoEmpty(MQClientInstance& client, const std::string& topic, std::s
 void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
     const std::string topic = fx.topic();
 
-    // ---------------- S0 控制腿 ----------------
-    std::printf("S0 控制腿（master 在）：路由 {0: master, 1: slave}、发布/订阅各 %d 条\n", kQueues);
+    // ---------------- S0 control leg ----------------
+    std::printf("S0 control leg (master up): route {0: master, 1: slave}, publish/subscribe each %d queues\n", kQueues);
     try {
         fx.admin.createTopic(MixAll::DEFAULT_TOPIC, topic, kQueues);
     } catch (const std::exception& e) {
-        check("S0 建 topic（master）", false, e.what());
+        check("S0 create topic (master)", false, e.what());
         return;
     }
-    // 从节点也直建一份，不赌 SlaveSynchronize 的 5s 周期
+    // Also create it directly on the slave instead of betting on SlaveSynchronize's 5s cycle
     try {
         fx.admin.createTopicInBroker(fx.slave, topic, kQueues, kQueues);
     } catch (const std::exception& e) {
-        std::printf("    (从节点建 topic 失败: %s)\n", e.what());
+        std::printf("    (topic creation on the slave failed: %s)\n", e.what());
     }
 
     std::map<int64_t, std::string> addrs;
@@ -278,27 +278,27 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
             return hasId(addrs, 0) && hasId(addrs, 1);
         },
         30000);
-    check("S0 路由含 {0: master, 1: slave}", routeOk, "brokerAddrs=" + fmtAddrs(addrs));
+    check("S0 route contains {0: master, 1: slave}", routeOk, "brokerAddrs=" + fmtAddrs(addrs));
     if (!routeOk) return;
-    check("S0 从节点地址与参数一致", addrs[1] == fx.slave,
+    check("S0 slave address matches the argument", addrs[1] == fx.slave,
           "route=" + addrs[1] + " argv=" + fx.slave);
 
     std::vector<MessageQueue> queues;
     try {
         queues = fx.seedQueues();
     } catch (const std::exception& e) {
-        check("S0 发布队列 4（控制）", false, e.what());
+        check("S0 publish queues 4 (control)", false, e.what());
         return;
     }
-    check("S0 发布队列 4（控制）", queues.size() == static_cast<size_t>(kQueues),
+    check("S0 publish queues 4 (control)", queues.size() == static_cast<size_t>(kQueues),
           "queues=" + fmtQueues(queues));
     const std::vector<MessageQueue> subs = fx.admin.client().getTopicSubscribeInfo(topic);
-    check("S0 订阅队列 4（控制）", subs.size() == static_cast<size_t>(kQueues),
+    check("S0 subscribe queues 4 (control)", subs.size() == static_cast<size_t>(kQueues),
           "queues=" + fmtQueues(subs));
     if (queues.size() != static_cast<size_t>(kQueues)) return;
 
-    // ---------------- S1 预埋 ----------------
-    std::printf("\nS1 预埋 %d 条（每队列定点一条）并等从节点 store 追上\n", kQueues);
+    // ---------------- S1 seeding ----------------
+    std::printf("\nS1 seed %d messages (one pinned per queue) and wait for the slave store to catch up\n", kQueues);
     std::vector<std::string> seeded;
     for (size_t i = 0; i < queues.size(); ++i) {
         const std::string body = "pr-master-" + std::to_string(i);
@@ -308,14 +308,14 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
             if (r.sendStatus == SendStatus::SEND_OK) {
                 seeded.push_back(body);
             } else {
-                check("S1 第 " + std::to_string(i) + " 条预埋 SEND_OK", false,
+                check("S1 seeded message #" + std::to_string(i) + " SEND_OK", false,
                       "status=" + std::to_string(static_cast<int>(r.sendStatus)));
             }
         } catch (const std::exception& e) {
-            check("S1 第 " + std::to_string(i) + " 条预埋 SEND_OK", false, e.what());
+            check("S1 seeded message #" + std::to_string(i) + " SEND_OK", false, e.what());
         }
     }
-    check("S1 4 条预埋全部 SEND_OK", seeded.size() == static_cast<size_t>(kQueues),
+    check("S1 all 4 seeded messages SEND_OK", seeded.size() == static_cast<size_t>(kQueues),
           "seeded=" + std::to_string(seeded.size()));
     if (seeded.size() != static_cast<size_t>(kQueues)) return;
 
@@ -324,7 +324,7 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
         try {
             masterMax.emplace_back(mq, fx.maxOffsetOf(mq, fx.master));
         } catch (const std::exception& e) {
-            std::printf("    (master maxOffset 查询失败: %s)\n", e.what());
+            std::printf("    (master maxOffset query failed: %s)\n", e.what());
         }
     }
     std::vector<std::pair<MessageQueue, int64_t>> slaveMax;
@@ -336,7 +336,7 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
                 try {
                     now.emplace_back(mq, fx.maxOffsetOf(mq, fx.slave));
                 } catch (const std::exception& e) {
-                    std::printf("    (从节点取 maxOffset 失败: %s)\n", e.what());
+                    std::printf("    (slave maxOffset query failed: %s)\n", e.what());
                     return false;
                 }
             }
@@ -351,13 +351,13 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
             return true;
         },
         30000);
-    check("S1 4 条已复制到从节点 store", caughtUp,
+    check("S1 the 4 messages are replicated to the slave store", caughtUp,
           "master=" + fmtMqOffsets(masterMax) + " slave=" + fmtMqOffsets(slaveMax));
 
-    // ---------------- S2 停 master ----------------
-    std::printf("\nS2 停 master（scripts/rmq_test_broker.sh stop），等路由只剩从节点\n");
+    // ---------------- S2 stop master ----------------
+    std::printf("\nS2 stop the master (scripts/rmq_test_broker.sh stop) and wait until the route keeps only the slave\n");
     std::string out;
-    check("S2 master 已优雅停机", brokerCtl("stop", out), out);
+    check("S2 master shut down gracefully", brokerCtl("stop", out), out);
 
     std::map<int64_t, std::string> downAddrs;
     const bool masterless = waitUntil(
@@ -366,29 +366,29 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
             return !hasId(downAddrs, 0) && hasId(downAddrs, 1);
         },
         60000);
-    check("S2 路由里 broker-a 只剩 {1: slave}", masterless, "brokerAddrs=" + fmtAddrs(downAddrs));
+    check("S2 broker-a in the route keeps only {1: slave}", masterless, "brokerAddrs=" + fmtAddrs(downAddrs));
     if (!masterless) return;
 
-    // ---------------- S3 (A) 发布队列 ----------------
-    std::printf("\nS3 (A) 发布信息跳过没有 master 的 broker\n");
+    // ---------------- S3 (A) publish queues ----------------
+    std::printf("\nS3 (A) publish info skips brokers that have no master\n");
     std::string pubDetail;
-    check("S3 停 master 后发布队列 == 0（访问器本端抛「选不到队列」）",
+    check("S3 publish queues == 0 after the master stops (the accessor throws 'no queue selectable' locally)",
           publishInfoEmpty(fx.admin.client(), topic, pubDetail), pubDetail);
 
-    // ---------------- S4 (C) 订阅队列 ----------------
+    // ---------------- S4 (C) subscribe queues ----------------
     const std::vector<MessageQueue> subsDown = fx.admin.client().getTopicSubscribeInfo(topic);
     bool allBrokerA = subsDown.size() == static_cast<size_t>(kQueues);
     for (const MessageQueue& q : subsDown) {
         if (q.brokerName != kBrokerName) allBrokerA = false;
     }
-    check("S4 (C) 订阅队列仍是 4、且都在 broker-a（消费侧不看 master）", allBrokerA,
+    check("S4 (C) subscribe queues are still 4 and all on broker-a (the consumer side does not look at the master)", allBrokerA,
           "queues=" + fmtQueues(subsDown));
 
-    // ---------------- S5 (A 定型) 发送快速失败 ----------------
-    // 分两段看：**缓存还没刷**时（现实中 30s 周期任务未到）发送实例手里还是停前的旧路由，
-    // 地址解析落在死掉的 master 上，快速失败、绝不静默改发从节点；**路由刷成停后形状**后
-    // （周期任务 / 显式刷新），(A) 生效：发布队列为空，发送连一条 wire 都不发。
-    std::printf("\nS5 不指定队列的同步发送：旧缓存快速失败 → 刷新后本端快速失败\n");
+    // ---------------- S5 (A qualified) fast send failure ----------------
+    // Split into two phases: while **the cache has not refreshed** (in practice the 30s periodic task has not fired) the sender instance still holds the
+    // pre-stop route, address resolution lands on the dead master, failing fast and never silently rerouting to the slave; after **the route is
+    // refreshed into the post-stop shape** (periodic task / explicit refresh), (A) takes effect: the publish queue list is empty and the send emits no wire at all.
+    std::printf("\nS5 sync send without a chosen queue: stale-cache fast failure -> local fast failure after refresh\n");
     const double staleBegin = monotonicSeconds();
     std::string staleText;
     bool staleFailed = false;
@@ -401,21 +401,21 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
         staleText = e.what();
     }
     const double staleMs = (monotonicSeconds() - staleBegin) * 1000.0;
-    // 这一腿是机会腿：周期刷新是否已经跑过不由本脚本定。两条腿的共同判据是
-    // "快速失败 + 绝不落到从节点地址上"（旧缓存腿打的是死掉的 master）。
-    check("S5 发送快速失败，且报错里没有从节点地址（绝不改发从节点）",
+    // This leg is opportunistic: whether the periodic refresh already ran is not decided by this script. The shared criterion of both legs is
+    // "fast failure + never land on the slave address" (the stale-cache leg hits the dead master).
+    check("S5 the send fails fast and the error carries no slave address (never rerouted to the slave)",
           staleFailed && staleMs < kLocalBudgetMs &&
               staleText.find(fx.slave) == std::string::npos,
           std::to_string(static_cast<int>(staleMs)) + "ms " + staleText);
 
-    // 让发送实例自己的路由缓存刷成停后形状（与 30s 周期任务同一条代码路径）
+    // Let the sender instance refresh its own route cache into the post-stop shape (the same code path as the 30s periodic task)
     try {
         fx.producer->client().updateTopicRouteInfoFromNameServer(topic, 5000, false);
     } catch (const std::exception& e) {
-        std::printf("    (发送实例路由刷新失败: %s)\n", e.what());
+        std::printf("    (sender route refresh failed: %s)\n", e.what());
     }
     std::string sendPubDetail;
-    check("S5b 发送实例的发布队列也 == 0（(A) 就作用在这里）",
+    check("S5b the sender instance's publish queues also == 0 ((A) applies right here)",
           publishInfoEmpty(fx.producer->client(), topic, sendPubDetail), sendPubDetail);
 
     const double freshBegin = monotonicSeconds();
@@ -435,14 +435,14 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
         freshText = e.what();
     }
     const double freshMs = (monotonicSeconds() - freshBegin) * 1000.0;
-    check("S5c 刷新后：本端 10005 抛「选不到队列」，无 wire 调用（无 BrokersSent）",
+    check("S5c after the refresh: local 10005 throws 'no queue selectable', no wire call (no BrokersSent)",
           freshFailed && freshCode == ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION &&
               freshText.find("Can not find Message Queue for topic") != std::string::npos &&
               freshText.find("BrokersSent") == std::string::npos && freshMs < kLocalBudgetMs,
           std::to_string(static_cast<int>(freshMs)) + "ms code=" + std::to_string(freshCode) +
               ": " + freshText);
 
-    std::printf("\nS5d (B) 对照：定点发到该队列 → 本端报 broker 不存在（不发 wire）\n");
+    std::printf("\nS5d (B) control: pinned send to that queue -> the local side reports the broker does not exist (no wire)\n");
     const double pinnedBegin = monotonicSeconds();
     std::string pinnedText;
     bool pinnedFailed = false;
@@ -452,7 +452,7 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
         SendResult r = fx.producer->send(msg3, MessageQueue(topic, kBrokerName, 0), 20000);
         pinnedText = "Ok(status=" + std::to_string(static_cast<int>(r.sendStatus)) + ")";
     } catch (const MQClientException& e) {
-        // MQBrokerException 不继承 MQClientException：这里能进来说明不是 broker 回的码
+        // MQBrokerException does not derive from MQClientException: reaching here means the code did not come from the broker
         pinnedFailed = true;
         pinnedIsClientError = true;
         pinnedText = e.what();
@@ -461,14 +461,14 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
         pinnedText = e.what();
     }
     const double pinnedMs = (monotonicSeconds() - pinnedBegin) * 1000.0;
-    check("S5d 定点发送本端报「The broker[broker-a] not exist」，无 wire"
-          "（不是从节点回的 SYSTEM_BUSY(2)）",
+    check("S5d the pinned send reports 'The broker[broker-a] not exist' locally, with no wire"
+          " (not SYSTEM_BUSY(2) answered by the slave)",
           pinnedFailed && pinnedIsClientError &&
               pinnedText == "The broker[" + std::string(kBrokerName) + "] not exist" &&
               pinnedMs < kLocalBudgetMs,
           std::to_string(static_cast<int>(pinnedMs)) + "ms " + pinnedText);
 
-    std::printf("\nS5e (D) 顺序锁：停窗口内整台跳过（不刷路由、不发 wire）\n");
+    std::printf("\nS5e (D) order lock: the whole broker is skipped inside the stopped window (no route refresh, no wire)\n");
     const std::string group = "GID_PrMasterCpp_" + fx.stamp;
     const std::string clientId = "pr_master_cpp_lock_" + fx.stamp;
     const std::vector<MessageQueue> lockMqs{MessageQueue(topic, kBrokerName, 0)};
@@ -477,14 +477,14 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
     try {
         locks = fx.admin.client().lockBatchMq(group, clientId, lockMqs, 3000);
     } catch (const std::exception& e) {
-        std::printf("    (lockBatchMq 抛异常: %s)\n", e.what());
+        std::printf("    (lockBatchMq threw: %s)\n", e.what());
     }
     const double lockMs = (monotonicSeconds() - lockBegin) * 1000.0;
-    check("S5e 只剩从节点时一台都锁不上（旧口径会退到从节点上锁）",
+    check("S5e with only the slave left no queue is locked (the old behavior would fall back to locking on the slave)",
           locks.empty() && lockMs < kLocalBudgetMs,
           std::to_string(static_cast<int>(lockMs)) + "ms locked=[" + fmtQueues(locks) + "]");
 
-    // 对照腿：同一份报文直接点名从节点 —— 从节点**本来**就会把锁发出来
+    // Control leg: the same request body names the slave directly — the slave *does* grant the lock by design
     JsonValue lockBody = JsonValue::makeObject();
     lockBody.set("consumerGroup", JsonValue::makeString(group));
     lockBody.set("clientId", JsonValue::makeString(clientId));
@@ -512,11 +512,11 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
             }
         }
     } catch (const std::exception& e) {
-        std::printf("    (从节点锁请求抛异常: %s)\n", e.what());
+        std::printf("    (slave lock request threw: %s)\n", e.what());
     }
-    check("S5e2 对照：点名从节点时锁发得出来（空集不是 broker 拒绝）", slaveOk == 1,
+    check("S5e2 control: naming the slave grants the lock (an empty set is not a broker refusal)", slaveOk == 1,
           "slave lockOKMQSet=" + std::to_string(slaveOk));
-    // 对照腿锁上的那把要还回去（从节点的锁管理器不会有人来解）
+    // The lock taken on the control leg must be handed back (nobody would release it from the slave's lock manager)
     try {
         fx.admin.client().invokeSyncRaw(fx.slave, RequestCode::UNLOCK_BATCH_MQ, PropertyMap(),
                                         lockPayload, true, 3000);
@@ -527,13 +527,13 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
     try {
         fx.admin.client().unlockBatchMq(group, clientId, lockMqs, 3000);
     } catch (const std::exception& e) {
-        std::printf("    (unlockBatchMq 抛异常: %s)\n", e.what());
+        std::printf("    (unlockBatchMq threw: %s)\n", e.what());
     }
     const double unlockMs = (monotonicSeconds() - unlockBegin) * 1000.0;
-    check("S5e3 解锁同样安静跳过（不抛、不发）", unlockMs < kLocalBudgetMs,
+    check("S5e3 unlocking is skipped just as quietly (no throw, no send)", unlockMs < kLocalBudgetMs,
           std::to_string(static_cast<int>(unlockMs)) + "ms");
 
-    std::printf("\nS5f (E) POP 拉取：本端报「The broker[broker-a] not exist」（不发 wire）\n");
+    std::printf("\nS5f (E) POP pull: the local side reports 'The broker[broker-a] not exist' (no wire)\n");
     const double popBegin = monotonicSeconds();
     std::string popText;
     bool popFailed = false;
@@ -550,13 +550,13 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
         popText = e.what();
     }
     const double popMs = (monotonicSeconds() - popBegin) * 1000.0;
-    check("S5f 停窗口内 POP 本端报「The broker[broker-a] not exist」（不是从节点回的错）",
+    check("S5f POP inside the stopped window reports 'The broker[broker-a] not exist' locally (not an error answered by the slave)",
           popFailed && popIsClientError &&
               popText == "The broker[" + std::string(kBrokerName) + "] not exist" &&
               popMs < kLocalBudgetMs,
           std::to_string(static_cast<int>(popMs)) + "ms " + popText);
 
-    std::printf("\nS5g (F) 位点读取：冷实例刷一次路由后放宽到从节点\n");
+    std::printf("\nS5g (F) offset reads: a cold instance refreshes the route once then falls back to the slave\n");
     {
         MQClientInstance cold("pr_master_cpp_cold_" + fx.stamp,
                               std::vector<std::string>{fx.namesrv});
@@ -570,11 +570,11 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
         } catch (const std::exception& e) {
             coldDetail = e.what();
         }
-        check("S5g 冷实例位点读取不报错：刷路由 → 退到从节点由 broker 答复", coldOk, coldDetail);
+        check("S5g the cold instance reads the offset without error: refresh the route -> fall back to the slave and let the broker answer", coldOk, coldDetail);
     }
 
-    // ---------------- S6 (C 端到端) 停窗口内消费 ----------------
-    std::printf("\nS6 停窗口内新起的 push 消费者：4 条队列 + 从从节点收齐预埋的 4 条\n");
+    // ---------------- S6 (C end to end) consuming inside the stopped window ----------------
+    std::printf("\nS6 a push consumer started inside the stopped window: 4 queues + all 4 pre-seeded messages received from the slave\n");
     BodySink sink;
     consumer = std::make_shared<DefaultMQPushConsumer>(group);
     consumer->setNamesrvAddr(fx.namesrv);
@@ -589,14 +589,14 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
         consumer.reset();
         return;
     }
-    // client() 要求已 start（C++ 侧未启动会抛），所以只能在 start 之后取。
+    // client() requires a started consumer (it throws otherwise on the C++ side), so it can only be taken after start.
     try {
         const std::vector<MessageQueue> subsInWindow =
             consumer->client().getTopicSubscribeInfo(topic);
-        check("S6a 窗口内消费者自己的订阅信息也是 4 条",
+        check("S6a the consumer's own subscription info inside the window is also 4 queues",
               subsInWindow.size() == static_cast<size_t>(kQueues), "queues=" + fmtQueues(subsInWindow));
     } catch (const std::exception& e) {
-        check("S6a 窗口内消费者自己的订阅信息也是 4 条", false, e.what());
+        check("S6a the consumer's own subscription info inside the window is also 4 queues", false, e.what());
     }
     std::vector<std::string> expected = seeded;
     std::sort(expected.begin(), expected.end());
@@ -607,13 +607,13 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
             return got == expected;
         },
         60000);
-    check("S6 停 master 期间从从节点收齐 4 条", gotOk, "got=[" + fmtList(sink.snapshot()) + "]");
+    check("S6 all 4 messages received from the slave while the master is down", gotOk, "got=[" + fmtList(sink.snapshot()) + "]");
 
-    // ---------------- S7 负控（先把 master 拉回来） ----------------
-    std::printf("\nS7 负控：master 拉回后发布队列恢复、发送恢复\n");
+    // ---------------- S7 recovery control (bring the master back first) ----------------
+    std::printf("\nS7 recovery control: after the master returns, publish queues recover and sending recovers\n");
     std::string outStart;
     if (!brokerCtl("start", outStart)) {
-        check("S7 master 复位", false, outStart);
+        check("S7 master restart", false, outStart);
     }
 
     std::vector<MessageQueue> queuesBack;
@@ -627,28 +627,28 @@ void scenario(Fixture& fx, std::shared_ptr<DefaultMQPushConsumer>& consumer) {
             }
         },
         60000);
-    check("S7 发布队列恢复 4", publishBack, "queues=" + fmtQueues(queuesBack));
-    // 两条失败发送都没在 broker 上留下消息：每条预埋队列的 maxOffset 仍是 1
+    check("S7 publish queues recovered to 4", publishBack, "queues=" + fmtQueues(queuesBack));
+    // Neither failed send left a message on the broker: every seeded queue's maxOffset is still 1
     std::vector<std::pair<MessageQueue, int64_t>> after;
     for (const MessageQueue& mq : (queuesBack.empty() ? queues : queuesBack)) {
         try {
             after.emplace_back(mq, fx.maxOffsetOf(mq, fx.master));
         } catch (const std::exception& e) {
-            std::printf("    (maxOffset 查询失败: %s)\n", e.what());
+            std::printf("    (maxOffset query failed: %s)\n", e.what());
         }
     }
     bool allOne = !after.empty();
     for (const auto& r : after) {
         if (r.second != 1) allOne = false;
     }
-    check("S7b 两条失败发送没留下消息（maxOffset 仍是 1）", allOne, "maxOffset=" + fmtMqOffsets(after));
+    check("S7b the two failed sends left no messages (maxOffset is still 1)", allOne, "maxOffset=" + fmtMqOffsets(after));
     try {
         Message back(topic, "pr-master-back");
         SendResult r = fx.producer->send(back, 20000);
-        check("S7c 发送恢复 SEND_OK", r.sendStatus == SendStatus::SEND_OK,
+        check("S7c send recovered with SEND_OK", r.sendStatus == SendStatus::SEND_OK,
               "status=" + std::to_string(static_cast<int>(r.sendStatus)));
     } catch (const std::exception& e) {
-        check("S7c 发送恢复 SEND_OK", false, e.what());
+        check("S7c send recovered with SEND_OK", false, e.what());
     }
 }
 
@@ -666,7 +666,7 @@ int main(int argc, char* argv[]) {
                 nsAddr.c_str(), masterAddr.c_str(), slaveAddr.c_str());
     std::string out;
     if (!brokerCtl("status", out)) {
-        std::printf("master 没在跑：先按本地集群 runbook 起 namesrv + master + slave（%s）\n",
+        std::printf("the master is not running: first bring up namesrv + master + slave per the local cluster runbook (%s)\n",
                     out.c_str());
         return 2;
     }
@@ -676,37 +676,37 @@ int main(int argc, char* argv[]) {
     try {
         fx.start(nsAddr, masterAddr, slaveAddr);
     } catch (const std::exception& e) {
-        check("集群探活 / 客户端启动", false, e.what());
+        check("cluster liveness / client start", false, e.what());
         return 1;
     }
 
     try {
         scenario(fx, consumer);
     } catch (const std::exception& e) {
-        check("验证过程抛出异常", false, e.what());
+        check("the verification threw an exception", false, e.what());
     }
 
-    // ---------------- 收尾 ----------------
-    // master 必须回来（start 幂等，异常路径也走到这里）；再关客户端、删 topic。
+    // ---------------- Teardown ----------------
+    // The master must come back (start is idempotent, and the exception paths also reach here); then shut the clients down and delete the topic.
     std::string outBack;
     if (!brokerCtl("start", outBack)) {
-        std::printf("  [FAIL] master 复位失败: %s\n", outBack.c_str());
+        std::printf("  [FAIL] master restart failed: %s\n", outBack.c_str());
         ++gFail;
     }
     if (consumer) {
         try {
             consumer->shutdown();
         } catch (const std::exception& e) {
-            std::printf("    (consumer shutdown 失败: %s)\n", e.what());
+            std::printf("    (consumer shutdown failed: %s)\n", e.what());
         }
     }
     try {
         fx.admin.deleteTopic(fx.topic());
     } catch (const std::exception& e) {
-        std::printf("    (deleteTopic(%s) 失败: %s)\n", fx.topic().c_str(), e.what());
+        std::printf("    (deleteTopic(%s) failed: %s)\n", fx.topic().c_str(), e.what());
     }
     fx.shutdown();
 
-    std::printf("\n== 结果: %d/%d 通过 ==\n", gPass, gPass + gFail);
+    std::printf("\n== result: %d/%d passed ==\n", gPass, gPass + gFail);
     return gFail == 0 ? 0 : 1;
 }

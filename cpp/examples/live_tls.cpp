@@ -1,13 +1,13 @@
-// TLS + traceparent 真机联调（配套 scripts/run_cpp_tls_live.sh）。
+// TLS + traceparent live-cluster verification (paired with scripts/run_cpp_tls_live.sh).
 //
-// 验证点（单进程闭环）：
-//   0. 传输层：逐轮新建 TLS 连接的首包必须落地；一条 TLS 连接上并发请求必须全部拿到应答
-//      （读线程与写线程在同一条 TLS 会话上交叠，正是 OpenSSL 明确不支持共享 SSL 对象的场景）；
-//   1. TLS 生产者/消费者（test-mode，信任 broker 自签证书）真连真发真收；
-//   2. 生产侧注入的 traceparent 属性随消息走完整链路，消费侧可提取且合法；
-//   3. 子 span：消费者所在进程再发一条"带父上下文"的消息时不覆盖已有值。
+// Verification points (a closed loop inside one process):
+//   0. transport layer: the first packet of each freshly created TLS connection per round must land; concurrent requests on one TLS connection must all get responses
+//      (the reader and writer threads overlap on the same TLS session, exactly the shared-SSL-object case OpenSSL explicitly does not support);
+//   1. TLS producer/consumer (test-mode, trusting the broker's self-signed certificate) really connect, really send, really receive;
+//   2. the traceparent property injected on the producer side travels the full chain with the message and is extractable and valid on the consumer side;
+//   3. child span: when the process holding the consumer sends another message "with a parent context", it must not overwrite the existing value.
 //
-// 用法：rmq_tls_live <namesrv> <topic> <group>
+// Usage: rmq_tls_live <namesrv> <topic> <group>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -69,16 +69,16 @@ private:
 
 }  // namespace
 
-// ---- S0 传输层压力（直接用 RemotingClient，不经过 producer/consumer）----
+// ---- S0 transport-layer stress (uses RemotingClient directly, not through producer/consumer) ----
 //
-// 盯的是 TLS 会话的线程口径。OpenSSL 明确不支持两个线程同时用一个 SSL 对象
-// （SSL_read/SSL_pending 与 SSL_write 交叠即属此列），而本传输层是"一连接一读线程 +
-// 调用方线程写"的形状，所以读线程与写线程必然在同一条 TLS 会话上重叠：
-//   * S0a 每轮新建 TLS 连接打首包（建连即起读线程，第一个记录紧跟着就写）；
-//   * S0b 一条 TLS 连接上 16 线程并发请求（读/写彻底交叠），并要求 opaque 逐笔对上，
-//     答不上来或错号都算失败。
-// 判据是"必须在预算内拿到真应答"：nameServer 对不存在的 topic 回 TOPIC_NOT_EXIST(17)
-// 也算落地，等满超时才算丢。
+// What this watches is the thread discipline of the TLS session. OpenSSL explicitly does not support two threads using one SSL object at the same time
+// (SSL_read/SSL_pending overlapping SSL_write is exactly that), and this transport has the shape of "one reader thread per connection plus
+// caller-thread writes", so the reader and writer threads necessarily overlap on the same TLS session:
+//   * S0a sends the first packet on a freshly created TLS connection each round (the reader thread starts at connect and the first record is written right after);
+//   * S0b 16 threads issue concurrent requests on one TLS connection (read/write fully interleaved), and every
+//     opaque must match request by request; a missing response or a mismatched one counts as failure.
+// The decision rule is "a real response must arrive within the budget": a name server answering TOPIC_NOT_EXIST(17)
+// for a non-existent topic also counts as landed; only waiting out the full timeout counts as lost.
 namespace {
 
 constexpr int64_t kFirstPacketBudgetMs = 1500;
@@ -116,16 +116,16 @@ bool runTransportStress(const std::string& namesrv, const TlsOptions& tlsOptions
             if (ms > worstMs) worstMs = ms;
             if (ms > kFirstPacketBudgetMs) {
                 ++lost;
-                std::cout << "  round " << i << " 首包慢到 " << ms << "ms\n";
+                std::cout << "  round " << i << " first packet exceeded the budget at " << ms << "ms\n";
             }
         } catch (const std::exception& e) {
             ++lost;
-            std::cout << "  round " << i << " 首包失败 (" << elapsedMs(began) << "ms): "
+            std::cout << "  round " << i << " first packet failed (" << elapsedMs(began) << "ms): "
                       << e.what() << "\n";
         }
     }
     std::cout << "  [" << (lost == 0 ? "PASS" : "FAIL") << "] S0a " << kFirstPacketRounds
-              << " 轮新建 TLS 连接首包全部落地  lost=" << lost << " worst=" << worstMs << "ms\n";
+              << " rounds of fresh TLS connections, all first packets landed  lost=" << lost << " worst=" << worstMs << "ms\n";
     ok = ok && lost == 0;
 
     RemotingClient shared;
@@ -142,15 +142,15 @@ bool runTransportStress(const std::string& namesrv, const TlsOptions& tlsOptions
                     routeRequest("TlsLiveConcurrent_" + std::to_string(t) + "_" + std::to_string(i));
                 try {
                     const RemotingCommand resp = shared.invokeSync(namesrv, req, 5000);
-                    // opaque 错号 = 响应串台到别的请求，和丢一样严重
+                    // a mismatched opaque = the response crossed into another request, as severe as losing it
                     if (resp.opaque != req.opaque) {
                         ++failures;
-                        std::cout << "  thread " << t << " req " << i << " 响应串台: sent="
+                        std::cout << "  thread " << t << " req " << i << " crossed response: sent="
                                   << req.opaque << " got=" << resp.opaque << "\n";
                     }
                 } catch (const std::exception& e) {
                     ++failures;
-                    std::cout << "  thread " << t << " req " << i << " 失败: " << e.what() << "\n";
+                    std::cout << "  thread " << t << " req " << i << " failed: " << e.what() << "\n";
                 }
             }
         });
@@ -159,15 +159,15 @@ bool runTransportStress(const std::string& namesrv, const TlsOptions& tlsOptions
         w.join();
     }
     const int total = kConcurrentThreads * kConcurrentPerThread;
-    // 总耗时口径：本机 loopback + 真 nameServer 实测，加会话锁那几趟 20~26ms、
-    // 同一台机器不加锁那趟 17~19ms（320 笔，两种都是 0 失败、opaque 逐笔对上）——
-    // 锁本身不是性能问题，它守的是"两个线程同时用一个 SSL 对象"这条 OpenSSL 明确不支持
-    // 的用法。预算给 10s：真被读线程抱锁饿到，量级会是"每笔排队等一次读超时（1s）"的几十秒。
+    // Total-duration baseline: local loopback plus a real name server, measured at 20~26 ms per run with the session lock's few extra
+    // trips, and 17~19 ms without the lock on the same machine (320 requests, both at 0 failures with every opaque matched) -- the lock
+    // itself is not a performance problem; it guards the "two threads using one SSL object" pattern that OpenSSL explicitly does not
+    // support. Budget is 10 s: if a reader thread really starved the lock, the magnitude would be tens of seconds, one queued read timeout (1 s) per request.
     const int64_t concurrentMs = elapsedMs(beganConcurrent);
     std::cout << "  [" << (failures.load() == 0 && concurrentMs < kConcurrentBudgetMs
                           ? "PASS" : "FAIL")
-              << "] S0b 单条 TLS 连接 " << kConcurrentThreads << " 线程并发 " << total
-              << " 笔全部对上号  fail=" << failures.load() << " elapsed=" << concurrentMs
+              << "] S0b one TLS connection, " << kConcurrentThreads << " threads concurrently " << total
+              << " requests, all matched  fail=" << failures.load() << " elapsed=" << concurrentMs
               << "ms\n";
     ok = ok && failures.load() == 0 && concurrentMs < kConcurrentBudgetMs;
     return ok;
@@ -176,11 +176,11 @@ bool runTransportStress(const std::string& namesrv, const TlsOptions& tlsOptions
 
 static int runLive(const std::string& namesrv, const std::string& topic,
                    const std::string& group, const TlsOptions& tlsOptions) {
-    // 0) 传输层压力放在最前：它只要一个能建 TLS 连接的 nameServer 地址，不依赖 topic
-    std::cout << "=== S0 TLS 传输层 ===\n";
+    // 0) transport stress first: it only needs a name server address reachable over TLS, no topic dependency
+    std::cout << "=== S0 TLS transport layer ===\n";
     const bool transportOk = runTransportStress(namesrv, tlsOptions);
 
-    // 1) 预建 topic（约定 5：先建 topic 再起消费者；消费者不做默认 topic 兜底）
+    // 1) pre-create the topic (convention 5: create the topic before starting the consumer; the consumer does no default-topic fallback)
     {
         DefaultMQProducer prep("GID_TLS_PREP");
         prep.setNamesrvAddr(namesrv);
@@ -195,7 +195,7 @@ static int runLive(const std::string& namesrv, const std::string& topic,
         prep.shutdown();
     }
 
-    // 2) TLS 消费者先起
+    // 2) start the TLS consumer first
     auto listener = std::make_shared<CountListener>();
     DefaultMQPushConsumer cons(group);
     cons.setNamesrvAddr(namesrv);
@@ -206,7 +206,7 @@ static int runLive(const std::string& namesrv, const std::string& topic,
     cons.setMessageListener(listener);
     cons.start();
 
-    // 2) TLS 生产者发送 3 条（trace 注入开启）
+    // 2) TLS producer sends 3 messages (trace injection enabled)
     DefaultMQProducer prod("GID_TLS_PROD");
     prod.setNamesrvAddr(namesrv);
     prod.setTlsEnable(true);
@@ -219,7 +219,7 @@ static int runLive(const std::string& namesrv, const std::string& topic,
         if (prod.send(msg).getSendStatus() == SendStatus::SEND_OK) ++sent;
     }
 
-    // 3) 等收齐
+    // 3) wait until everything is received
     for (int i = 0; i < 80 && listener->count() < sent; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
@@ -241,11 +241,11 @@ static int runLive(const std::string& namesrv, const std::string& topic,
 }
 
 int main(int argc, char** argv) {
-    // 三腿：
-    //   plain_tls  test-mode，信任自签（历史行为）
-    //   ca_verify  严格校验：证书链到 caCert + 主机名/SAN 匹配（serverName 覆盖）
-    //   mtls       严格校验 + 客户端证书双向认证
-    // 用法: rmq_tls_live <namesrv> <topic> <group> [leg] [caCert] [serverName] [clientCert] [clientKey]
+    // Three legs:
+    //   plain_tls  test-mode, trusts the self-signed certificate (historical behaviour)
+    //   ca_verify  strict verification: certificate chain up to caCert plus hostname/SAN match (serverName override)
+    //   mtls       strict verification plus client-certificate mutual authentication
+    // Usage: rmq_tls_live <namesrv> <topic> <group> [leg] [caCert] [serverName] [clientCert] [clientKey]
     if (argc < 4 || argc > 9) {
         std::cerr << "usage: rmq_tls_live <namesrv> <topic> <group>"
                      " [plain_tls|ca_verify|mtls] [caCert] [serverName] [clientCert] [clientKey]\n";
@@ -254,7 +254,7 @@ int main(int argc, char** argv) {
     const std::string leg = argc >= 5 ? argv[4] : "plain_tls";
     TlsOptions tlsOptions;
     if (leg == "plain_tls") {
-        // 不带任何选项：test-mode
+        // no options at all: test-mode
     } else if (leg == "ca_verify" || leg == "mtls") {
         if (argc < 6) {
             std::cerr << "leg " << leg << " requires caCert\n";
@@ -275,8 +275,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 #ifndef RMQ_HAS_TLS
-    // 没找到 OpenSSL 时 TLS 实现整体不编译，setTlsEnable(true) 会抛异常；
-    // 显式 SKIP，别让它以未捕获异常的形式崩掉（看上去像用例失败）。
+    // Without OpenSSL found, the TLS implementation is not compiled at all and setTlsEnable(true) throws;
+    // skip explicitly instead of crashing on an uncaught exception (which would look like a case failure).
     std::cout << "SKIP: built without TLS support (OpenSSL not found by CMake)\n";
     return 0;
 #else

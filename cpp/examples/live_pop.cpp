@@ -1,20 +1,20 @@
-// POP 模式（5.x 轻量消费）真机验证。
-// 用法：rmq_live_pop 127.0.0.1:9876
+// Live-cluster verification of POP mode (5.x lightweight consumption).
+// Usage: rmq_live_pop 127.0.0.1:9876
 //
-// POP 与 pull 的语义差异是断言的重心：
-//   - **不提交位点**，靠 ack 确认；不 ack 的消息在 invisibleTime 后被复活重投；
-//   - broker 在普通 topic 消息上**不写** POP_CK，客户端必须自己反构 8 段 CK 串。
+// The semantic differences between POP and pull are the focus of the assertions:
+//   - **no offset commit**, confirmation goes through ack; a message left un-acked is revived and redelivered after invisibleTime;
+//   - the broker does **not** write POP_CK on normal-topic messages, so the client must reconstruct the 8-segment CK string itself.
 //
-// 场景：
-//   S1 建 topic(8 队列) + 发 10 条
-//   S2 多队列 POP（queueId=-1, initMode=0）→ FOUND 且拿到消息
-//   S3 每条消息都被盖上 **8 段** POP_CK，且 brokerName/queueId 与消息实际一致
-//   S4 ack 一条 → SUCCESS
-//   S5 changeInvisibleTime → SUCCESS 且返回**新的** 8 段 extraInfo
-//   S6 校验真的生效：非法 queueId → MESSAGE_ILLEGAL；越界 offset → NO_MESSAGE
-//   S7 单队列 POP（新消费组 + queueId=0）→ FOUND 且消息 queueId 全为 0
-//   S8 不 ack 会复活：小 invisibleTime POP 后不 ack，等待后重 POP 能拿到同一条消息，
-//      且它的 POP_CK 是 retryFlag=1（来自 %RETRY%<group>_<topic>）—— 至少一次语义
+// Scenarios:
+//   S1 create topic (8 queues) + send 10 messages
+//   S2 multi-queue POP (queueId=-1, initMode=0) -> FOUND and messages retrieved
+//   S3 every message is stamped with an **8-segment** POP_CK whose brokerName/queueId match the message itself
+//   S4 ack one message -> SUCCESS
+//   S5 changeInvisibleTime -> SUCCESS and returns a **new** 8-segment extraInfo
+//   S6 the validations really bite: illegal queueId -> MESSAGE_ILLEGAL; out-of-range offset -> NO_MESSAGE
+//   S7 single-queue POP (new consumer group + queueId=0) -> FOUND and every message has queueId 0
+//   S8 no ack revives: POP with a small invisibleTime and do not ack, wait, then re-POP to get the same message back,
+//      and its POP_CK carries retryFlag=1 (from %RETRY%<group>_<topic>) -- at-least-once semantics
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -64,7 +64,7 @@ std::string uniqKeyOf(const MessageExt& m) {
     return m.msgId;
 }
 
-// CK 串取自消息属性；没有则返回空串（说明反构失败）
+// The CK string comes from the message properties; an empty string means reconstruction failed
 std::string popCkOf(const MessageExt& m) {
     auto it = m.properties.find(MessageConst::PROPERTY_POP_CK);
     return it == m.properties.end() ? std::string() : it->second;
@@ -92,8 +92,8 @@ int main(int argc, char** argv) {
     producer.start();
     MQClientInstance& client = producer.client();
 
-    // ------------------------------------------------ S1 建 topic + 发消息
-    std::printf("=== S1 准备 topic 与消息 ===\n");
+    // ------------------------------------------------ S1 create topic + send messages
+    std::printf("=== S1 prepare topic and messages ===\n");
     producer.createTopic(MixAll::DEFAULT_TOPIC, TOPIC, QUEUE_NUM);
     producer.createTopic(MixAll::DEFAULT_TOPIC, TOPIC_REVIVE, REVIVE_QUEUE_NUM);
     for (int32_t i = 0; i < N_MSG; ++i) {
@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
     std::printf("  sent %d msgs to %s\n", N_MSG, TOPIC.c_str());
 
     auto route = client.getTopicRouteData(TOPIC);
-    check("S1 topic 路由可用", route != nullptr && !route->brokerDatas.empty());
+    check("S1 topic route available", route != nullptr && !route->brokerDatas.empty());
     if (route == nullptr || route->brokerDatas.empty()) {
         std::printf("############ PASS=%d FAIL=%d ############\n", gPass, gFail);
         producer.shutdown();
@@ -115,10 +115,10 @@ int main(int argc, char** argv) {
         MQClientInstance::findBrokerAddrInRoute(*route, brokerName);
     std::printf("  brokerName=%s addr=%s\n", brokerName.c_str(), addr.c_str());
 
-    // ------------------------------------------------ S2 多队列 POP
-    std::printf("=== S2 多队列 POP（addr 走自动解析路径）===\n");
+    // ------------------------------------------------ S2 multi-queue POP
+    std::printf("=== S2 multi-queue POP (addr goes through the auto-resolution path) ===\n");
     PopResult res = client.popMessage(GROUP, TOPIC, -1, 32, 60000, 0, 0);
-    check("S2 POP 取到消息", res.isFound() && !res.msgFoundList.empty(),
+    check("S2 POP retrieved messages", res.isFound() && !res.msgFoundList.empty(),
           "status=" + std::string(popStatusName(res.status))
               + " count=" + std::to_string(res.msgFoundList.size())
               + " startOffsetInfo=" + res.startOffsetInfo);
@@ -128,8 +128,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // ------------------------------------------------ S3 POP_CK 反构
-    std::printf("=== S3 POP_CK 反构（8 段）===\n");
+    // ------------------------------------------------ S3 POP_CK reconstruction
+    std::printf("=== S3 POP_CK reconstruction (8 segments) ===\n");
     bool all8 = true;
     bool match = true;
     bool hasFirstPopTime = true;
@@ -156,9 +156,9 @@ int main(int argc, char** argv) {
             sample = ck;
         }
     }
-    check("S3a 每条消息都有 8 段 POP_CK", all8, "sample='" + sample + "'");
-    check("S3b CK 的 brokerName/queueId 与消息一致", match);
-    check("S3c 1ST_POP_TIME 已补", hasFirstPopTime);
+    check("S3a every message has an 8-segment POP_CK", all8, "sample='" + sample + "'");
+    check("S3b CK brokerName/queueId match the message", match);
+    check("S3c 1ST_POP_TIME filled in", hasFirstPopTime);
 
     // ------------------------------------------------ S4 ack
     std::printf("=== S4 ACK ===\n");
@@ -168,7 +168,7 @@ int main(int argc, char** argv) {
     const int32_t qid1 = extra_info::getQueueId(seg1);
     const int64_t off1 = extra_info::getQueueOffset(seg1);
     int32_t ackCode = client.ackMessage(GROUP, TOPIC, qid1, ck1, off1, 3000, brokerName, addr);
-    check("S4 ack 返回 SUCCESS", ackCode == ResponseCode::SUCCESS,
+    check("S4 ack returns SUCCESS", ackCode == ResponseCode::SUCCESS,
           "code=" + std::to_string(ackCode) + " queueId=" + std::to_string(qid1)
               + " offset=" + std::to_string(off1));
 
@@ -180,31 +180,31 @@ int main(int argc, char** argv) {
     ChangeInvisibleTimeResult res5 =
         client.changeInvisibleTime(GROUP, TOPIC, extra_info::getQueueId(seg2), ck2,
                                    extra_info::getQueueOffset(seg2), 30000, 3000, brokerName, addr);
-    check("S5a 延长不可见时间成功", res5.success(),
+    check("S5a invisible time extended successfully", res5.success(),
           "code=" + std::to_string(res5.responseCode) + " popTime=" + std::to_string(res5.popTime)
               + " invisibleTime=" + std::to_string(res5.invisibleTime));
     std::vector<std::string> newSeg =
         res5.extraInfo.empty() ? std::vector<std::string>() : extra_info::split(res5.extraInfo);
-    check("S5b 返回新的 8 段 extraInfo 且用新值",
+    check("S5b returns a new 8-segment extraInfo using the new values",
           newSeg.size() == 8 && extra_info::getInvisibleTime(newSeg) == res5.invisibleTime
               && extra_info::getPopTime(newSeg) == res5.popTime,
           "new='" + res5.extraInfo + "'");
 
-    // ------------------------------------------------ S6 校验真的生效
-    std::printf("=== S6 非法参数必须被拒绝 ===\n");
+    // ------------------------------------------------ S6 the validations really bite
+    std::printf("=== S6 invalid parameters must be rejected ===\n");
     int32_t badQueue =
         client.ackMessage(GROUP, TOPIC, QUEUE_NUM + 90, ck1, off1, 3000, brokerName, addr);
-    check("S6a 非法 queueId 被拒（MESSAGE_ILLEGAL）", badQueue == ResponseCode::MESSAGE_ILLEGAL,
+    check("S6a illegal queueId rejected (MESSAGE_ILLEGAL)", badQueue == ResponseCode::MESSAGE_ILLEGAL,
           "code=" + std::to_string(badQueue));
     int32_t badOffset =
         client.ackMessage(GROUP, TOPIC, qid1, ck1, (static_cast<int64_t>(1) << 40), 3000,
                           brokerName, addr);
-    check("S6b 越界 offset 被拒（NO_MESSAGE）", badOffset == ResponseCode::NO_MESSAGE,
+    check("S6b out-of-range offset rejected (NO_MESSAGE)", badOffset == ResponseCode::NO_MESSAGE,
           "code=" + std::to_string(badOffset));
 
-    // ------------------------------------------------ S7 单队列 POP
-    std::printf("=== S7 单队列 POP ===\n");
-    // 用新消费组：老组在同一 topic 上已有 pop 位点，重复 POP 拿不到东西
+    // ------------------------------------------------ S7 single-queue POP
+    std::printf("=== S7 single-queue POP ===\n");
+    // Use a fresh consumer group: the old group already has a pop offset on the same topic, so re-POPping returns nothing
     PopResult res7 = client.popMessage(GROUP_SINGLE, TOPIC, 0, 32, 60000, 0, 0, "", "", false,
                                        10000, brokerName, addr);
     bool onlyQ0 = true;
@@ -215,13 +215,13 @@ int main(int argc, char** argv) {
             onlyQ0 = false;
         }
     }
-    check("S7 单队列 POP 取到队列 0 的消息",
+    check("S7 single-queue POP retrieved messages from queue 0",
           res7.isFound() && !res7.msgFoundList.empty() && onlyQ0,
           "status=" + std::string(popStatusName(res7.status))
               + " count=" + std::to_string(res7.msgFoundList.size()));
 
-    // ------------------------------------------------ S8 不 ack 会复活
-    std::printf("=== S8 不 ack → 复活重投（至少一次语义）===\n");
+    // ------------------------------------------------ S8 no ack revives
+    std::printf("=== S8 no ack -> revival and redelivery (at-least-once semantics) ===\n");
     for (int32_t i = 0; i < REVIVE_N_MSG; ++i) {
         Message m(TOPIC_REVIVE, "pop-revive-cpp-" + std::to_string(i));
         m.setKeys("rv" + std::to_string(i));
@@ -239,11 +239,11 @@ int main(int argc, char** argv) {
     for (const MessageExt& m : res8a.msgFoundList) {
         firstKeys.insert(uniqKeyOf(m));
     }
-    check("S8a 首轮 POP 取到消息（不 ack）",
+    check("S8a first POP round retrieved messages (left un-acked)",
           res8a.isFound() && !res8a.msgFoundList.empty(),
           "count=" + std::to_string(res8a.msgFoundList.size()));
 
-    std::printf("  等待 %d s 让 broker 复活...\n", REVIVE_WAIT_SEC);
+    std::printf("  waiting %d s for the broker to revive them...\n", REVIVE_WAIT_SEC);
     std::this_thread::sleep_for(std::chrono::seconds(REVIVE_WAIT_SEC));
 
     PopResult res8b = client.popMessage(GROUP_REVIVE, TOPIC_REVIVE, -1, 32, 60000, 0, 0, "", "",
@@ -260,10 +260,10 @@ int main(int argc, char** argv) {
             retryFlags.insert(extra_info::getRetry(extra_info::split(ck)));
         }
     }
-    check("S8b 未 ack 的消息被复活重投", revived > 0,
+    check("S8b un-acked messages were revived and redelivered", revived > 0,
           "revived=" + std::to_string(revived)
               + " total=" + std::to_string(res8b.msgFoundList.size()));
-    check("S8c 复活消息的 POP_CK retryFlag=1（来自 %RETRY%<group>_<topic>）",
+    check("S8c revived messages carry POP_CK retryFlag=1 (from %RETRY%<group>_<topic>)",
           retryFlags.count("1") > 0,
           "retryFlagsSize=" + std::to_string(retryFlags.size()));
 

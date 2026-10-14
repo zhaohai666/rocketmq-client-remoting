@@ -60,7 +60,7 @@ void testSpawnsUpToCoreThenQueues() {
     };
     ex.submit(block);
     ex.submit(block);
-    // 两个 worker 被占住；第 3、4 个任务只能排队（未到 core 时不会建线程）
+    // Both workers are occupied; tasks 3 and 4 can only queue (no thread is built below core)
     ex.submit([]() {});
     ex.submit([]() {});
     sleepMs(100);
@@ -79,7 +79,7 @@ void testRaisingCoreSpawnsForQueuedTasks() {
     for (int i = 0; i < 3; ++i) ex.submit([]() {});
     expectEq(ex.workerCount(), 1, "only core thread before raising");
     expectEq(ex.queuedCount(), 3, "3 tasks queued");
-    ex.setCorePoolSize(4);   // delta=3, queue=3 → 应补 3 个
+    ex.setCorePoolSize(4);   // delta=3, queue=3 -> 3 extra workers are expected
     sleepMs(150);
     expectEq(ex.workerCount(), 4, "delta workers added on core raise");
     expectEq(ex.queuedCount(), 0, "queue drained");
@@ -90,14 +90,14 @@ void testRaisingCoreSpawnsForQueuedTasks() {
 void testExtraThreadRetiresCoreThreadDoesNot() {
     ConsumeExecutor ex(1, 4, 0.2);
     ex.submit([]() {});
-    ex.setCorePoolSize(2);   // 队列空 → 不补线程，core 变 2
+    ex.setCorePoolSize(2);   // queue empty -> no thread added, core becomes 2
     sleepMs(50);
     expectEq(ex.getCorePoolSize(), 2, "core pool size applied");
-    ex.submit([]() {});      // 把 worker 抬到 2（仍 <= core）
+    ex.submit([]() {});      // lifts the worker count to 2 (still <= core)
     sleepMs(50);
     expectEq(ex.workerCount(), 2, "two workers alive");
-    ex.setCorePoolSize(1);   // core 降到 1 → 多出来的那个成为"超编"
-    sleepMs(600);            // 超过 keepAlive
+    ex.setCorePoolSize(1);   // core drops to 1 -> the surplus one becomes "over staffed"
+    sleepMs(600);            // longer than keepAlive
     expectEq(ex.workerCount(), 1, "extra worker retired after keep alive");
     sleepMs(400);
     expectEq(ex.workerCount(), 1, "core worker never retires");
@@ -165,7 +165,7 @@ void testCorePoolSizeMutation() {
     ex.shutdown(true);
 }
 
-// ---------------------------------------------------------------- 消费者侧（不联网）
+// ---------------------------------------------------------------- consumer side (no network)
 
 void testConsumerThreadDefaults() {
     DefaultMQPushConsumer c("GID_ThreadPoolUnit");
@@ -184,7 +184,7 @@ void testUpdateCorePoolSizeGuards() {
     expect(!c.updateCorePoolSize(20), "== consumeThreadMax rejected");
     expect(c.updateCorePoolSize(19), "19 accepted (just below max)");
     expectEq(c.getCorePoolSize(), 19, "core updated to 19");
-    // Short.MAX_VALUE 上界：要把 consumeThreadMax 抬上去才轮得到这条守卫
+    // Short.MAX_VALUE ceiling: this guard is only reached after raising consumeThreadMax
     c.setConsumeThreadMax(40000);
     expect(!c.updateCorePoolSize(32768), "32768 rejected (above Short.MAX_VALUE)");
     expect(c.updateCorePoolSize(32767), "32767 accepted (upper bound itself)");
@@ -227,26 +227,26 @@ void testConsumeThreadMinSetterMovesCoreMaxDoesNot() {
 
 void testMsgAccCntRules() {
     DefaultMQPushConsumer c("GID_ThreadPoolUnit");
-    // accTotal = MAX_OFFSET - queueOffset，取**最后一条**
+    // accTotal = MAX_OFFSET - queueOffset, computed from the **last** message of the batch
     c.updateMsgAccCnt("k1", {makeMsg(10, "100"), makeMsg(12, "100")});
     expectEq(c.msgAccCnt("k1"), 88, "acc = maxOffset - lastQueueOffset");
-    // 非正不更新
+    // A non-positive delta does not update anything
     c.updateMsgAccCnt("k2", {makeMsg(100, "100")});
     expectEq(c.msgAccCnt("k2"), 0, "zero delta ignored");
     c.updateMsgAccCnt("k2", {makeMsg(200, "100")});
     expectEq(c.msgAccCnt("k2"), 0, "negative delta ignored");
-    // 属性缺失 / 非数字 / 带尾巴一律忽略
+    // Missing property / not a number / trailing junk are all ignored
     c.updateMsgAccCnt("k3", {makeMsg(10, "")});
     expectEq(c.msgAccCnt("k3"), 0, "missing property ignored");
     c.updateMsgAccCnt("k3", {makeMsg(10, "not-a-number")});
     expectEq(c.msgAccCnt("k3"), 0, "garbage property ignored");
     c.updateMsgAccCnt("k3", {makeMsg(10, "100abc")});
     expectEq(c.msgAccCnt("k3"), 0, "trailing garbage ignored");
-    // 新一批覆盖旧值
+    // A newer batch overwrites the previous value
     c.updateMsgAccCnt("k4", {makeMsg(10, "500")});
     c.updateMsgAccCnt("k4", {makeMsg(400, "450")});
     expectEq(c.msgAccCnt("k4"), 50, "latest batch overwrites");
-    // 求和：换一个干净的消费者，避免被上面几组 key 的残留值影响
+    // Summing: use a clean consumer so leftover values from the keys above cannot interfere
     DefaultMQPushConsumer sum("GID_ThreadPoolUnit2");
     sum.updateMsgAccCnt("a", {makeMsg(0, "30")});
     sum.updateMsgAccCnt("b", {makeMsg(0, "70")});
@@ -257,22 +257,22 @@ void testMsgAccCntRules() {
 void testAdjustThreadPoolIsNoOp() {
     DefaultMQPushConsumer c("GID_ThreadPoolUnit");
     c.setAdjustThreadPoolNumsThreshold(100);
-    c.updateMsgAccCnt("a", {makeMsg(0, "500")});   // 500 >= 100 → inc 分支
+    c.updateMsgAccCnt("a", {makeMsg(0, "500")});   // 500 >= 100 -> inc branch
     const int32_t before = c.getCorePoolSize();
     c.adjustThreadPool();
     expectEq(c.getCorePoolSize(), before, "inc branch is a no-op");
     c.setAdjustThreadPoolNumsThreshold(1000);
-    c.updateMsgAccCnt("a", {makeMsg(0, "10")});    // 10 < 800 → dec 分支
+    c.updateMsgAccCnt("a", {makeMsg(0, "10")});    // 10 < 800 -> dec branch
     c.adjustThreadPool();
     expectEq(c.getCorePoolSize(), before, "dec branch is a no-op");
-    // 自动 no-op ≠ API 失效
+    // An automatic no-op does not mean the API itself is inert
     expect(c.updateCorePoolSize(11), "explicit update still works after adjustThreadPool");
     expectEq(c.getCorePoolSize(), 11, "explicit core applied");
 }
 
 void testExecutorObservabilityWithoutStart() {
     DefaultMQPushConsumer c("GID_ThreadPoolUnit");
-    // 未 start（未建执行器）时观测值恒为 0，不应崩
+    // Before start() (no executor built yet) the observables are always 0 and must not crash
     expectEq(c.consumeExecutorWorkers(), 0, "no executor before start");
     expectEq(c.consumeExecutorQueued(), 0, "no queued tasks before start");
 }

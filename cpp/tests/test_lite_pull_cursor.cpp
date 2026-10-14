@@ -1,15 +1,15 @@
-// 轻量拉取消费者的**拉取游标**（#105）离线单测 —— 假 namesrv + 假 broker（真 socket），
-// 不碰真集群。
+// Offline unit tests for the lite-pull consumer's **pull cursor** (#105) -- fake name server + fake broker (real sockets), never touching a real cluster.
 //
 //
-// 为什么必须离线锁死：旧实现只在 FOUND 时用 `msgs.back().queueOffset + 1` 推进游标，于是
-// broker 回 NO_MATCHED_MSG（本轮扫过的整段都不匹配）时游标原地不动 —— 下一轮从同一位点
-// 把同一段重扫一遍，永远打转；OFFSET_ILLEGAL 的纠正值也吃不到，越界不自愈。真机窗口里
-// 两者都表现为「消费者活着但永远收不到消息」，很难归因（真机另有一条链路：
-// examples/live_lite_pull.cpp 的 S4/S5/S6 腿）。
+// Why this must be pinned offline: the old implementation advanced the cursor only on FOUND, via
+// `msgs.back().queueOffset + 1`, so a NO_MATCHED_MSG reply (the whole span scanned this round matched
+// nothing) left the cursor where it was -- the next round re-scanned the same span from the same offset
+// and spun forever; OFFSET_ILLEGAL's correction was ignored too, so an out-of-range offset never healed.
+// On real hardware both looked like "the consumer is alive but never receives anything", hard to attribute.
+// On the live side another chain carries the same symptom: the S4/S5/S6 legs of examples/live_lite_pull.cpp.
 //
-// 判据取自**线上报文**：假 broker 按脚本回包，并从 socket 上取回每笔 PULL_MESSAGE 的
-// extFields —— 「游标真的推到 5 了」看的是下一笔请求是不是从 5 起，而不是只看内存表。
+// The evidence comes from the **wire**: the fake broker answers per script and hands back the extFields
+// of every PULL_MESSAGE read off the socket -- "the cursor really moved to 5" is judged by the next request starting at 5, not by an in-memory table.
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -70,7 +70,7 @@ void expectInt(long long actual, long long expected, const std::string& name) {
     }
 }
 
-// ---------------------------------------------------------------- socket 工具
+// ---------------------------------------------------------------- socket utilities
 
 bool readN(socket_t s, char* buf, size_t n) {
     size_t got = 0;
@@ -121,16 +121,16 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
     return true;
 }
 
-// ---------------------------------------------------------------- 假端点
+// ---------------------------------------------------------------- fake endpoint
 
-// 一笔脚本化的 PULL_MESSAGE 应答。
+// One scripted PULL_MESSAGE reply.
 struct PullReply {
     int32_t code = ResponseCode::PULL_NOT_FOUND;
     PropertyMap ext;
     Bytes body;
 };
 
-// 同时扮演 name server（回路由）与 broker（回 QUERY_CONSUMER_OFFSET / PULL_MESSAGE）。
+// Plays both the name server (answers route queries) and the broker (answers QUERY_CONSUMER_OFFSET / PULL_MESSAGE).
 class MockEndpoint {
 public:
     MockEndpoint() {
@@ -155,7 +155,7 @@ public:
     ~MockEndpoint() {
         running_.store(false);
         {
-            // 闸没放行的话先放掉，免得工作线程卡在 wait 上拖住析构。
+            // if the gate was never released, open it first so a worker thread stuck in wait cannot hold up the destructor.
             std::lock_guard<std::mutex> lk(gateMutex_);
             gateOpen_ = true;
             gateCv_.notify_all();
@@ -185,7 +185,7 @@ public:
         routes_[topic] = route.encode();
     }
 
-    /// 排一笔 PULL_MESSAGE 应答（FIFO 命中，每笔只回一次）。
+    /// Queue one PULL_MESSAGE reply (hit in FIFO order, each reply used exactly once).
     void scriptPull(int32_t code, const PropertyMap& ext, const Bytes& body = Bytes()) {
         std::lock_guard<std::mutex> lk(state_);
         PullReply reply;
@@ -195,8 +195,8 @@ public:
         pullScripts_.push_back(reply);
     }
 
-    /// 给下一笔 PULL_MESSAGE 挂发车闸：应答先等 releasePullGate()。用来把「应答还在路上、
-    /// 客户端先 seek 了」这段在途窗口拉成确定性的。
+    /// Arm a departure gate for the next PULL_MESSAGE: the reply waits for releasePullGate() first. Used
+    /// to turn the "reply still in flight while the client already seeked" window into a deterministic one.
     void gateNextPull() {
         std::lock_guard<std::mutex> lk(gateMutex_);
         gateArmed_ = true;
@@ -226,7 +226,7 @@ public:
         return pullCodes_[i];
     }
 
-    /// 第 i 笔拉取请求的**请求码**（11=PULL_MESSAGE / 361=LITE_PULL_MESSAGE）。
+    /// The **request code** of the i-th pull request (11=PULL_MESSAGE / 361=LITE_PULL_MESSAGE).
     int32_t pullRequestCode(size_t i) {
         std::lock_guard<std::mutex> lk(state_);
         if (i >= pullReqCodes_.size()) return -1;
@@ -238,7 +238,7 @@ public:
         return pullReqCodes_.size();
     }
 
-    /// 有没有任何一笔 PULL_MESSAGE 是从 `offset` 起的。
+    /// Whether any PULL_MESSAGE at all started from `offset`.
     bool pullHasOffset(int64_t offset) {
         std::lock_guard<std::mutex> lk(state_);
         for (const PropertyMap& ext : pulls_) {
@@ -248,7 +248,7 @@ public:
         return false;
     }
 
-    /// 收到过该请求码吗（GET_MIN_OFFSET 那类「不该发的报文」断言靠它）。
+    /// Whether this request code was ever received (backs the "must not send this" assertions, e.g. GET_MIN_OFFSET).
     bool sawRequest(int32_t code) {
         std::lock_guard<std::mutex> lk(state_);
         for (int32_t c : codes_) {
@@ -311,8 +311,8 @@ private:
                        req.code == RequestCode::LITE_PULL_MESSAGE) {
                 answerPull(req, resp);
             } else if (req.code == RequestCode::QUERY_CONSUMER_OFFSET) {
-                // 组从未提交过位点：真实 broker 回 QUERY_NOT_FOUND（21/22 号里的 22），
-                // 客户端据此走 consumeFromWhere 分支算起点。
+                // the group never committed an offset: a real broker answers QUERY_NOT_FOUND (the 22 of
+                // 21/22), which is how the client falls into the consumeFromWhere branch to compute the start.
                 std::lock_guard<std::mutex> lk(state_);
                 codes_.push_back(req.code);
                 resp.code = ResponseCode::QUERY_NOT_FOUND;
@@ -328,8 +328,8 @@ private:
         netcompat::closeSocket(sock);
     }
 
-    /// 请求**先于**发车闸记账：闸把「应答还在路上」这段窗口拉长时，pullCount() 必须立刻
-    /// 可见，否则「等第一笔到达」的用例会在闸前空等。pullCodes_ 记的是**应答**码。
+    /// The request is recorded **before** the gate: when the gate stretches the "reply still in flight"
+    /// window, pullCount() must already be visible, else the "wait for the first pull" case idles at the gate. pullCodes_ records the **reply** codes.
     void answerPull(const RemotingCommand& req, RemotingCommand& resp) {
         {
             std::lock_guard<std::mutex> lk(state_);
@@ -347,7 +347,7 @@ private:
         }
         if (gated) {
             std::unique_lock<std::mutex> lk(gateMutex_);
-            // 5s 兜底：用例失败时也不能把工作线程永久卡住（析构会等它）。
+            // 5s fallback: even a failing case must not wedge the worker thread forever (the destructor joins it).
             gateCv_.wait_for(lk, std::chrono::seconds(5), [this] { return gateOpen_; });
         }
         PullReply reply;
@@ -398,7 +398,7 @@ private:
     std::thread acceptor_;
 };
 
-// ---------------------------------------------------------------- 脚手架
+// ---------------------------------------------------------------- scaffolding
 
 const char* kTopic = "LiteCursorTopic";
 const char* kBroker = "broker-a";
@@ -414,7 +414,7 @@ TopicRouteData routeMaster(const std::string& addr) {
     return route;
 }
 
-// 应答头：nextBeginOffset / minOffset / maxOffset
+// Reply header: nextBeginOffset / minOffset / maxOffset
 PropertyMap pullResp(int64_t next, int64_t min = 0, int64_t max = 9) {
     PropertyMap ext;
     ext["nextBeginOffset"] = std::to_string(next);
@@ -423,7 +423,7 @@ PropertyMap pullResp(int64_t next, int64_t min = 0, int64_t max = 9) {
     return ext;
 }
 
-// 等条件成立（默认 5s 上限），返回是否等到
+// Wait until the condition holds (5s cap by default); returns whether it was seen
 template <typename Fn>
 bool waitFor(Fn fn, int timeoutMs = 5000) {
     const int64_t deadline = UtilAll::currentTimeMillis() + timeoutMs;
@@ -434,8 +434,8 @@ bool waitFor(Fn fn, int timeoutMs = 5000) {
     return fn();
 }
 
-// 起一个指向假端点的 lite-pull（assign + FIRST_OFFSET：起点是字面量 0，不做起点位点查询
-// 之外的 RPC，第一笔 PULL_MESSAGE 确定落在 queueOffset=0）。
+// Start a lite-pull consumer pointed at the fake endpoint (assign + FIRST_OFFSET: the start is the
+// literal 0, no RPC beyond the start-offset query, so the first PULL_MESSAGE lands on queueOffset=0 for sure).
 std::unique_ptr<DefaultLitePullConsumer> startedLite(const std::string& group,
                                                      MockEndpoint& cluster) {
     auto c = std::make_unique<DefaultLitePullConsumer>(group);
@@ -456,22 +456,22 @@ void testCursorFollowsNextBeginOffsetOnNoMatchedMsg() {
 
     const MessageQueue mq = queue0();
     expect(waitFor([&] { return c->pullCursorOf(mq) == 5; }),
-           "NO_MATCHED_MSG 后拉取游标跟到 nextBeginOffset=5");
-    // 不是内存表里改了个数：下一笔 PULL_MESSAGE 真的从 5 起
+           "after NO_MATCHED_MSG the pull cursor follows nextBeginOffset=5");
+    // Not just a counter moved in an in-memory table: the next PULL_MESSAGE really starts at 5
     expect(waitFor([&] { return cluster.pullHasOffset(5); }),
-           "下一笔 PULL_MESSAGE 从 5 开始（游标真的上了线）");
+           "the next PULL_MESSAGE starts at 5 (the cursor really went on the wire)");
     expect(!cluster.sawRequest(RequestCode::GET_MIN_OFFSET),
-           "FIRST_OFFSET 起点是字面量 0：一次 minOffset 都不该发");
+           "FIRST_OFFSET start is literal 0: not a single minOffset query may be sent");
     expect(waitFor([&] { return cluster.pullCode(0) == ResponseCode::PULL_RETRY_IMMEDIATELY; }),
-           "前置：第一笔 pull 命中的就是脚本里的 NO_MATCHED_MSG");
-    expect(c->poll(50).empty(), "NO_MATCHED_MSG 没有可交付的消息");
+           "precondition: the first pull hit exactly the scripted NO_MATCHED_MSG");
+    expect(c->poll(50).empty(), "NO_MATCHED_MSG has no deliverable message");
     c->shutdown();
 }
 
 // ---------------------------------------------------------------- 2. OFFSET_ILLEGAL
 
-// OFFSET_ILLEGAL 的 nextBeginOffset 是 broker 对越界位点的纠正值：跟过去才算「越界自愈」，
-// 停在旧位点会每轮收到同一个纠正、原地打转。
+// For OFFSET_ILLEGAL the nextBeginOffset is the broker's correction of an out-of-range offset: only
+// following it counts as self-healing; staying put means receiving the same correction every round.
 void testCursorAdoptsTheBrokersOffsetCorrection() {
     MockEndpoint cluster;
     cluster.addRoute(kTopic, routeMaster(cluster.address()));
@@ -480,13 +480,13 @@ void testCursorAdoptsTheBrokersOffsetCorrection() {
 
     const MessageQueue mq = queue0();
     expect(waitFor([&] { return c->pullCursorOf(mq) == 42; }),
-           "OFFSET_ILLEGAL 后拉取游标采纳 broker 纠正");
+           "after OFFSET_ILLEGAL the pull cursor adopts the broker correction");
     expect(waitFor([&] { return cluster.pullHasOffset(42); }),
-           "下一笔 PULL_MESSAGE 从 42 开始");
+           "the next PULL_MESSAGE starts at 42");
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 3. 在途 seek
+// ---------------------------------------------------------------- 3. In-flight seek
 
 void testInFlightSeekWinsOverThePullResult() {
     MockEndpoint cluster;
@@ -502,19 +502,19 @@ void testInFlightSeekWinsOverThePullResult() {
     cluster.gateNextPull();
     auto c = startedLite("LitePG_CursorSeekRace", cluster);
 
-    expect(waitFor([&] { return cluster.pullCount() >= 1; }), "第一笔拉取到达 broker");
+    expect(waitFor([&] { return cluster.pullCount() >= 1; }), "the first pull reached the broker");
     const MessageQueue mq = queue0();
     c->seek(mq, 99);
     cluster.releasePullGate();
 
     expect(waitFor([&] { return cluster.pullHasOffset(99); }),
-           "seek 之后下一笔 PULL_MESSAGE 从 99 起");
-    expectInt(c->pullCursorOf(mq), 99, "在途应答不得盖掉 seek 写下的位点");
-    expect(c->poll(50).empty(), "被刹车的一轮不许入缓冲");
+           "after seek the next PULL_MESSAGE starts at 99");
+    expectInt(c->pullCursorOf(mq), 99, "an in-flight reply must not overwrite the offset written by seek");
+    expect(c->poll(50).empty(), "the braked round must not enter the buffer");
     c->shutdown();
 }
 
-// ---------------------------------------------------------------- 4. lite 位 / 请求码（#107）
+// ---------------------------------------------------------------- 4. Lite flag / request code (#107)
 
 void testLitePullCarriesTheLiteCodeAndFlag() {
     MockEndpoint cluster;
@@ -522,7 +522,7 @@ void testLitePullCarriesTheLiteCodeAndFlag() {
     auto c = startedLite("LitePG_LiteCode", cluster);
 
     expect(waitFor([&] { return cluster.pullReqCodeCount() >= 1; }),
-           "至少一笔拉取到达 broker");
+           "at least one pull reached the broker");
     const size_t n = cluster.pullReqCodeCount();
     bool all361 = true;
     bool allFlag = true;
@@ -533,20 +533,20 @@ void testLitePullCarriesTheLiteCodeAndFlag() {
             allFlag = false;
         }
     }
-    expect(n >= 1 && all361, "lite 拉取请求码全是 LITE_PULL_MESSAGE(361)");
-    expect(n >= 1 && allFlag, "每笔拉取的 header.sysFlag 都置了 FLAG_LITE_PULL_MESSAGE(0x10)");
+    expect(n >= 1 && all361, "all lite pull request codes are LITE_PULL_MESSAGE(361)");
+    expect(n >= 1 && allFlag, "every pull header.sysFlag sets FLAG_LITE_PULL_MESSAGE(0x10)");
     const PropertyMap ext0 = cluster.pullExt(0);
     const int32_t flag0 = static_cast<int32_t>(MockEndpoint::extInt(ext0, "sysFlag", -1));
     expect(!PullSysFlag::hasCommitOffsetFlag(flag0) && !PullSysFlag::hasSuspendFlag(flag0) &&
                PullSysFlag::hasSubscriptionFlag(flag0) &&
                !PullSysFlag::hasClassFilterFlag(flag0),
-           "lite 拉取的其余标志位与参考实现逐位一致");
+           "the remaining lite-pull flag bits match the pull contract bit for bit");
     const size_t liteCount = cluster.pullReqCodeCount();
     c->shutdown();
-    expect(liteCount >= 1, "lite 消费者至少发出过一笔拉取（下面 11 的对照才有意义）");
+    expect(liteCount >= 1, "the lite consumer sent at least one pull (otherwise the 11 comparison below is meaningless)");
 
-    // 对照：经典拉取（DefaultMQPullConsumerImpl.pullSyncImpl:248 的 4 参 build）必须仍是
-    // 11 且不带 lite 位 —— 少了这条腿，「361」可能只是所有 pull 都被改成了 361。
+    // Comparison: the classic pull (DefaultMQPullConsumer's 4-arg build) must still be code
+    // 11 without the lite bit -- without this leg, "361" could just mean every pull became 361.
     DefaultMQPullConsumer classic("LitePG_LiteCodeClassic");
     classic.setNamesrvAddr(cluster.address());
     classic.start();
@@ -560,12 +560,12 @@ void testLitePullCarriesTheLiteCodeAndFlag() {
             break;
         }
     }
-    expect(classicIdx >= 0, "经典拉取的请求码是 PULL_MESSAGE(11)");
+    expect(classicIdx >= 0, "the classic pull request code is PULL_MESSAGE(11)");
     if (classicIdx >= 0) {
         const int32_t clFlag = static_cast<int32_t>(MockEndpoint::extInt(
             cluster.pullExt(static_cast<size_t>(classicIdx)), "sysFlag", -1));
         expect(!PullSysFlag::hasLitePullFlag(clFlag),
-               "经典拉取的 sysFlag 不带 lite 位（参考实现的 4 参 build）");
+               "the classic pull sysFlag carries no lite bit (the classic 4-arg build)");
     }
 }
 

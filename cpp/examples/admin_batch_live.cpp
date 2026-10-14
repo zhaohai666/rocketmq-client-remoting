@@ -1,7 +1,7 @@
-// C++ 批量 admin 方法的**真实集群**联调。
+// Integration of the C++ **batch** admin methods against a **real cluster**.
 //
 //
-// 本程序自身不启动集群；用 scripts/with_cluster.sh 包一层跑。用法：
+// This program does not start a cluster itself; run it wrapped by scripts/with_cluster.sh. Usage:
 //   ./rmq_admin_batch_live [namesrv_addr]
 #include <chrono>
 #include <cstdint>
@@ -39,7 +39,7 @@ void check(const std::string& name, bool ok, const std::string& detail = "") {
     std::cout << std::endl;
 }
 
-// 记录"端能力差异、本地不成立"的项，不计入失败；skip 必须写清楚原因。
+// Records the items that are implementation-capability differences and do not hold locally; they are not counted as failures, and a skip must state the reason clearly.
 void skip(const std::string& name, const std::string& detail) {
     ++gSkip;
     std::cout << "[SKIP] " << name << "  " << detail << std::endl;
@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // ---------- 0. 集群探活（broker 注册竞态：端口开 != 已注册）----------
+    // ---------- 0. Cluster liveness (the broker registration race: an open port != registered) ----------
     ClusterInfo cluster;
     bool clusterOk = false;
     std::string lastErr;
@@ -92,14 +92,14 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     if (!clusterOk) {
-        check("集群探活", false, "nameServer 无 broker 注册 last_err=" + lastErr);
+        check("cluster liveness", false, "no broker registered in the name server last_err=" + lastErr);
         admin.shutdown();
         return report();
     }
     const std::string brokerAddr = cluster.getBrokerAddrs()[0];
     std::cout << "cluster: master=" << brokerAddr << "\n" << std::endl;
 
-    // ---- 1. 批量建 topic(18)：body={"topicConfigList":[...]}，header 为空 ----
+    // ---- 1. Batch topic creation (18): body={"topicConfigList":[...]}, an empty header ----
     TopicConfig cfgA(topicA);
     cfgA.readQueueNums = 4;
     cfgA.writeQueueNums = 4;
@@ -108,13 +108,13 @@ int main(int argc, char** argv) {
     cfgB.writeQueueNums = 6;
     try {
         admin.createAndUpdateTopicConfigList(brokerAddr, {cfgA, cfgB});
-        check("批量建 topic(18) 请求", true);
+        check("batch topic creation (18) request", true);
     } catch (const std::exception& e) {
-        check("批量建 topic(18) 请求", false, e.what());
+        check("batch topic creation (18) request", false, e.what());
     }
 
-    // 生效校验：两个 topic 都存在，且各自保住批量请求的队列数 —— 这是 body 真被
-    // broker 认下的证据（键名写错时 broker 收到空列表，请求"成功"但什么都不建）。
+    // Effect check: both topics exist and each keeps the queue counts of the batch request -- the proof that the broker really
+    // accepted the body (with a wrong key name the broker receives an empty list, so the request "succeeds" while nothing is created).
     {
         bool ok = true;
         std::string detail;
@@ -133,19 +133,19 @@ int main(int argc, char** argv) {
                 break;
             }
         }
-        check("批量建 topic(18) 生效且队列数正确", ok, detail);
+        check("batch topic creation (18) took effect with the right queue counts", ok, detail);
     }
 
-    // ---- 2. 批量建订阅组(225)：同形，但 body key 是 groupConfigList ----
+    // ---- 2. Batch subscription-group creation (225): the same shape, but the body key is groupConfigList ----
     SubscriptionGroupConfig grpA(groupA);
     grpA.retryQueueNums = 3;
     SubscriptionGroupConfig grpB(groupB);
     grpB.retryMaxTimes = 5;
     try {
         admin.createAndUpdateSubscriptionGroupConfigList(brokerAddr, {grpA, grpB});
-        check("批量建订阅组(225) 请求", true);
+        check("batch subscription-group creation (225) request", true);
     } catch (const std::exception& e) {
-        check("批量建订阅组(225) 请求", false, e.what());
+        check("batch subscription-group creation (225) request", false, e.what());
     }
 
     {
@@ -170,78 +170,78 @@ int main(int argc, char** argv) {
                 break;
             }
         }
-        check("批量建订阅组(225) 生效且字段正确", ok, detail);
+        check("batch subscription-group creation (225) took effect with the right fields", ok, detail);
     }
 
-    // ---- 3. 读禁配(353) 全链：禁读 → 仅查询不改动 → 恢复可读 → 回包字段 ----
+    // ---- 3. The read-forbidden config (353) full chain: forbid reading -> query only without changes -> restore readability -> response fields ----
     try {
         GroupForbidden fb = admin.updateAndGetGroupReadForbidden(brokerAddr, groupA, topicA, false);
-        check("消费组读禁配(353) 设置禁读", !fb.readable,
+        check("consumer group read-forbidden config (353) forbids reading", !fb.readable,
               "readable=" + std::string(fb.readable ? "true" : "false"));
     } catch (const std::exception& e) {
-        check("消费组读禁配(353) 设置禁读", false, e.what());
+        check("consumer group read-forbidden config (353) forbids reading", false, e.what());
     }
 
     try {
-        // 仅查询（readable 不带）：不能把禁读状态翻回去
+        // Query only (no readable supplied): it must not flip the forbidden state back
         GroupForbidden fb = admin.updateAndGetGroupReadForbidden(brokerAddr, groupA, topicA);
-        check("消费组读禁配(353) 仅查询不改动", !fb.readable,
-              "禁读状态被查询调用改掉: readable=" + std::string(fb.readable ? "true" : "false"));
+        check("consumer group read-forbidden config (353) queries without changing anything", !fb.readable,
+              "the query call changed the forbidden state: readable=" + std::string(fb.readable ? "true" : "false"));
     } catch (const std::exception& e) {
-        check("消费组读禁配(353) 仅查询不改动", false, e.what());
+        check("consumer group read-forbidden config (353) queries without changing anything", false, e.what());
     }
 
     bool readableRestored = false;
     try {
         GroupForbidden fb = admin.updateAndGetGroupReadForbidden(brokerAddr, groupA, topicA, true);
         readableRestored = fb.readable;
-        check("消费组读禁配(353) 恢复可读", fb.readable,
+        check("consumer group read-forbidden config (353) restores readability", fb.readable,
               "readable=" + std::string(fb.readable ? "true" : "false"));
     } catch (const std::exception& e) {
-        check("消费组读禁配(353) 恢复可读", false, e.what());
+        check("consumer group read-forbidden config (353) restores readability", false, e.what());
     }
 
     try {
         GroupForbidden fb = admin.updateAndGetGroupReadForbidden(brokerAddr, groupA, topicA);
-        check("消费组读禁配(353) 回包含 group/topic",
+        check("consumer group read-forbidden config (353) carries group/topic in the response",
               fb.group == groupA && fb.topic == topicA,
               "group=" + fb.group + " topic=" + fb.topic);
     } catch (const std::exception& e) {
-        check("消费组读禁配(353) 回包含 group/topic", false, e.what());
+        check("consumer group read-forbidden config (353) carries group/topic in the response", false, e.what());
     }
 
     try {
         bool resumed = admin.resumeCheckHalfMessage(
             brokerAddr, topicA, "0A0F0000000000000000000000000000000000");
-        check("恢复半消息(323) 非半消息返回 false 而非报错", !resumed,
-              std::string("resumed=") + (resumed ? "true，对非半消息竟返回 true" : "false"));
+        check("half-message resume (323) returns false for a non-half message instead of raising", !resumed,
+              std::string("resumed=") + (resumed ? "true, and it even returns true for a non-half message" : "false"));
     } catch (const std::exception& e) {
-        check("恢复半消息(323) 非半消息返回 false 而非报错", false, e.what());
+        check("half-message resume (323) returns false for a non-half message instead of raising", false, e.what());
     }
 
     try {
         admin.resumeCheckHalfMessage(brokerAddr, "", "x");
-        check("恢复半消息(323) 缺 topic 被本地拒绝", false, "空 topic 竟被放行发出");
+        check("half-message resume (323) rejects a missing topic locally", false, "an empty topic was let through and sent");
     } catch (const MQClientException&) {
-        check("恢复半消息(323) 缺 topic 被本地拒绝", true);
+        check("half-message resume (323) rejects a missing topic locally", true);
     } catch (const std::exception& e) {
-        check("恢复半消息(323) 缺 topic 被本地拒绝", false,
-              std::string("应抛 MQClientException，实际 ") + typeid(e).name() + ": " + e.what());
+        check("half-message resume (323) rejects a missing topic locally", false,
+              std::string("it should throw MQClientException, actually ") + typeid(e).name() + ": " + e.what());
     }
 
-    // ---- 5. 顺序 topic 配置（nameserver KV，非集群模式读改写）------------
-    // 非集群模式合并进 ";" 连接的条目表：同 key 写两个 topic 必须两条都在。
+    // ---- 5. Ordering topic config (name server KV, read-modify-write outside cluster mode) ------------
+    // Outside cluster mode the entries merge into a ";"-joined table: writing two topics under one key must keep both.
     try {
         admin.createOrUpdateOrderConf(orderKey, topicA + ":5", false);
         admin.createOrUpdateOrderConf(orderKey, topicB + ":8", false);
         std::string stored;
         bool found = admin.getKvConfig(MixAll::NAMESPACE_ORDER_TOPIC_CONFIG, orderKey, stored);
-        check("顺序 topic 配置 合并两条而非覆盖",
+        check("ordering topic config merges the two entries instead of overwriting",
               found && stored.find(topicA + ":5") != std::string::npos
                   && stored.find(topicB + ":8") != std::string::npos,
               "stored=" + stored);
     } catch (const std::exception& e) {
-        check("顺序 topic 配置 合并两条而非覆盖", false, e.what());
+        check("ordering topic config merges the two entries instead of overwriting", false, e.what());
     }
 
     try {
@@ -250,76 +250,76 @@ int main(int argc, char** argv) {
         bool found = admin.getKvConfig(MixAll::NAMESPACE_ORDER_TOPIC_CONFIG, orderKey, stored);
         bool replaced = found && stored.find(topicA + ":6") != std::string::npos
                         && stored.find(topicA + ":5") == std::string::npos;
-        check("顺序 topic 配置 同 key 覆盖旧值", replaced, "stored=" + stored);
+        check("ordering topic config overwrites the old value under the same key", replaced, "stored=" + stored);
     } catch (const std::exception& e) {
-        check("顺序 topic 配置 同 key 覆盖旧值", false, e.what());
+        check("ordering topic config overwrites the old value under the same key", false, e.what());
     }
 
-    // ---- 6. 清理类 ------------------------------------------------------
-    // 大窗口（1 年）的安全探针：请求必须被接受且什么都不删。
+    // ---- 6. The cleanup family ------------------------------------------------------
+    // A safe probe with a huge window (1 year): the request must be accepted and nothing may be deleted.
     try {
         admin.cleanExpiredConsumerQueue(brokerAddr, 24 * 365);
-        check("清理过期消费队列(306)", true);
+        check("clean expired consume queues (306)", true);
     } catch (const std::exception& e) {
-        check("清理过期消费队列(306)", false, e.what());
+        check("clean expired consume queues (306)", false, e.what());
     }
 
     try {
         std::vector<std::string> failed =
             admin.cleanExpiredConsumerQueueByAddr({brokerAddr}, 24 * 365);
-        check("清理过期消费队列(306) ByAddr", failed.empty(),
+        check("clean expired consume queues (306) ByAddr", failed.empty(),
               "failed=" + (failed.empty() ? std::string("[]") : failed[0]));
     } catch (const std::exception& e) {
-        check("清理过期消费队列(306) ByAddr", false, e.what());
+        check("clean expired consume queues (306) ByAddr", false, e.what());
     }
 
     try {
         admin.deleteExpiredCommitLog(brokerAddr, 24 * 365);
-        check("删除过期 commitlog(329)", true);
+        check("delete expired commitlog (329)", true);
     } catch (const std::exception& e) {
-        check("删除过期 commitlog(329)", false, e.what());
+        check("delete expired commitlog (329)", false, e.what());
     }
 
     try {
         std::vector<std::string> failed = admin.deleteExpiredCommitLogByAddr({brokerAddr}, 24 * 365);
-        check("删除过期 commitlog(329) ByAddr", failed.empty(),
+        check("delete expired commitlog (329) ByAddr", failed.empty(),
               "failed=" + (failed.empty() ? std::string("[]") : failed[0]));
     } catch (const std::exception& e) {
-        check("删除过期 commitlog(329) ByAddr", false, e.what());
+        check("delete expired commitlog (329) ByAddr", false, e.what());
     }
 
-    // 死地址必须被报告而不是被静默吞掉
+    // A dead address must be reported rather than silently swallowed
     try {
         std::vector<std::string> failed = admin.deleteExpiredCommitLogByAddr({"127.0.0.1:1"}, 1);
-        check("清理类 ByAddr 报告失败地址",
+        check("the cleanup ByAddr methods report the failed address",
               failed.size() == 1 && failed[0] == "127.0.0.1:1",
               "dead addr should be reported");
     } catch (const std::exception& e) {
-        check("清理类 ByAddr 报告失败地址", false, e.what());
+        check("the cleanup ByAddr methods report the failed address", false, e.what());
     }
 
-    // ---- 7. 清理未使用 topic(316)：单请求，broker 接受即 PASS ----
+    // ---- 7. Clean unused topics (316): a single request, PASS as soon as the broker accepts it ----
     try {
         admin.cleanUnusedTopicByAddr(brokerAddr);
-        check("清理未使用 topic(316)", true);
+        check("clean unused topics (316)", true);
     } catch (const std::exception& e) {
-        check("清理未使用 topic(316)", false, e.what());
+        check("clean unused topics (316)", false, e.what());
     }
 
-    // ---- 8. 消费时间跨度(303)：路由扇出聚合，返回 consumeTimeSpanSet 数组 ----
+    // ---- 8. Consume time span (303): fanned out over the route and aggregated, returning a consumeTimeSpanSet array ----
     try {
         JsonValue spans = admin.queryConsumeTimeSpan(topicA, groupA);
-        // 空组（从未消费）返回空数组属正常：只断言形态正确、请求全链可达
-        check("消费时间跨度(303) 路由扇出聚合", spans.isArray(),
+        // An empty group (never consumed) legitimately returns an empty array: only assert that the shape is right and the request reaches the whole chain
+        check("consume time span (303) route fan-out aggregation", spans.isArray(),
               "spans=" + (spans.isArray() ? i2s(static_cast<int64_t>(spans.size()))
-                                          : std::string("非数组")));
+                                          : std::string("not an array")));
     } catch (const std::exception& e) {
-        check("消费时间跨度(303) 路由扇出聚合", false, e.what());
+        check("consume time span (303) route fan-out aggregation", false, e.what());
     }
 
-    // ---- 9. nameserver 配置(318/319) 写读回环 ---------------------------
-    // namesrv 的 Configuration.update 只认真实字段（未知 key 被静默丢弃），
-    // 所以用 orderMessageEnable 这个真实字段做回环，测完还原。
+    // ---- 9. Name server config (318/319) write-read round trip ---------------------------
+    // The name server's Configuration.update only accepts real fields (an unknown key is silently dropped),
+    // so the round trip uses the real field orderMessageEnable and restores it once done.
     try {
         std::string oldVal = "false";
         for (const auto& kv : admin.getNameServerConfig()) {
@@ -334,26 +334,26 @@ int main(int argc, char** argv) {
             auto it = kv.second.find("orderMessageEnable");
             if (it != kv.second.end()) val = it->second;
         }
-        // 无论断言结果如何先还原，避免污染集群状态
+        // Restore first no matter what the assertion says, so the cluster state is not polluted
         PropertyMap back;
         back["orderMessageEnable"] = oldVal;
         admin.updateNameServerConfig(back);
-        check("nameserver 配置(318/319) 写读回环", val == "true", "got=" + val + " want='true'");
+        check("name server config (318/319) write-read round trip", val == "true", "got=" + val + " want='true'");
     } catch (const std::exception& e) {
-        check("nameserver 配置(318/319) 写读回环", false, e.what());
+        check("name server config (318/319) write-read round trip", false, e.what());
     }
 
-    // ---- 10. 静态 topic(513)：端能力差异，SKIP ----
-    skip("静态 topic(513)",
-         "mapping 构造需完整 TopicQueueMappingDetail 文档（hostedBrokerIds/scope/"
-         "每队列 mappingInfo），本工具未做真机覆盖；header 布线由单测锁定");
+    // ---- 10. Static topic (513): an implementation capability difference, SKIP ----
+    skip("static topic (513)",
+         "building the mapping needs a full TopicQueueMappingDetail document (hostedBrokerIds/scope/"
+         "per-queue mappingInfo); this tool has no real-cluster coverage, and the header wiring is locked by unit tests");
 
-    // ---- 清理 -----------------------------------------------------------
+    // ---- Cleanup -----------------------------------------------------------
     for (const std::string& t : {topicA, topicB}) {
         try {
             admin.deleteTopicInBroker(brokerAddr, t);
         } catch (const std::exception&) {
-            // 清理失败不影响结论
+            // a cleanup failure does not affect the conclusion
         }
     }
     try {

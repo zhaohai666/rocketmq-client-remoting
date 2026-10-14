@@ -1,16 +1,16 @@
-// broker 主动请求 NOTIFY_CONSUMER_IDS_CHANGED(40) 离线单测 —— 不需要集群。
+// Offline unit test for the broker-pushed NOTIFY_CONSUMER_IDS_CHANGED(40) -- no cluster needed.
 //
-// 为什么单独一个文件：这组请求是 broker 沿**已建立的长连接反向**打进客户端的，
-// 真机用例注入不了（live 工具只能正向往 broker 发请求），所以能离线锁死的部分
-// 必须先锁死，否则「处理器根本没注册」这种错只会在生产上表现为「成员变了却要
-// 等 20s 定时重平衡」，安静得几乎不可见。
+// Why its own file: these requests come back at the client over the **already established**
+// long connection, so a live test cannot inject them (the live tools only send requests outward).
+// What can be pinned offline must be pinned first, or a "handler never registered" kind of bug
+// would only show in production as "members changed, wait 20s for the periodic rebalance", silent.
 //
 //
-// 覆盖：
-//   - 计数 + 整组唤醒（注册两个消费者，两个都被点名）
-//   - unregisterRebalanceWakeup 后不再被叫醒，但通知本身仍被处理
-//   - 缺 consumerGroup 不抛、仍然计数
-//   - 实例 shutdown 清掉唤醒表（对应「回调里捕获 this，实例不能带着悬垂回调存活」）
+// Covered:
+//   - counting plus waking the whole group (two consumers registered, both are named)
+//   - after unregisterRebalanceWakeup no more wakeups, but the notification is still handled
+//   - a missing consumerGroup does not throw and is still counted
+//   - instance shutdown clears the wakeup table (a callback capturing this must not outlive it dangling)
 #include <cstdio>
 #include <string>
 
@@ -33,7 +33,7 @@ void expect(bool ok, const std::string& name, const std::string& detail = "") {
     }
 }
 
-/// broker 发的是 oneway 通知，extFields 里只带 consumerGroup。
+/// The broker sends a oneway notification whose extFields carry only consumerGroup.
 RemotingCommand notifyCmd(const std::string& group) {
     RemotingCommand cmd = RemotingCommand::createRequestCommand(
         RequestCode::NOTIFY_CONSUMER_IDS_CHANGED);
@@ -58,14 +58,14 @@ void testFanOut() {
     expect(wakeA == 2 && wakeB == 2, "notify.blankGroupWakesAll",
            "wakeA=" + std::to_string(wakeA) + " wakeB=" + std::to_string(wakeB));
 
-    // 注销的那一组不再被叫醒，但通知本身照样处理（计数继续走）。
+    // The deregistered group is no longer woken, but the notification itself is still handled.
     instance.unregisterRebalanceWakeup("GID_B");
     instance.processNotifyConsumerIdsChanged(notifyCmd("GID_A"), "127.0.0.1:10911");
     expect(instance.consumerIdsChangedCount() == 3, "notify.countsAfterUnregister");
     expect(wakeA == 3, "notify.stillWakesRegistered", "wakeA=" + std::to_string(wakeA));
     expect(wakeB == 2, "notify.unregisteredNotWoken", "wakeB=" + std::to_string(wakeB));
 
-    // 空表不炸：一个消费者都没注册时（只有生产者、或消费者都已退出）通知仍要吃完。
+    // An empty table must not blow up: with no consumer registered the notice is still consumed.
     instance.unregisterRebalanceWakeup("GID_A");
     instance.rebalanceImmediately();
     expect(instance.consumerIdsChangedCount() == 3, "notify.emptyTableIsNoop");
@@ -78,7 +78,7 @@ void testShutdownClearsWakeups() {
     instance.shutdown();
     instance.rebalanceImmediately();
     expect(woken == 0, "shutdown.clearsWakeups", "woken=" + std::to_string(woken));
-    // shutdown 之后再收到通知（读线程可能还在收尾）也不能抛。
+    // A notification arriving after shutdown (the read thread may still be draining) must not throw.
     instance.processNotifyConsumerIdsChanged(notifyCmd("GID_A"), "127.0.0.1:10911");
     expect(instance.consumerIdsChangedCount() == 1, "notify.afterShutdownStillCounts");
 }

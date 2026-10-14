@@ -1,10 +1,10 @@
-// 覆盖：
-// 1. 阈值表逐档映射（0→0、50→0、550→2000、1800→5000、5000→10000、15000→30000、10000→10000）；
-// 2. 隔离（isolation=true）固定按 10000ms 算档位；
-// 3. FaultItem.updateNotAvailableDuration 只延长不缩短；
-// 4. 容错表无记录 isAvailable/isReachable=true；隔离后 false、到期恢复；
-// 5. 策略关闭时不记录任何故障项；
-// 6. 策略开启：健康 broker 正常选出；单 broker 注入隔离后退化为普通轮询仍能选出队列。
+// Covers:
+// 1. tier-by-tier mapping of the latency threshold table (0->0, 50->0, 550->2000, 1800->5000, 5000->10000, 15000->30000, 10000->10000);
+// 2. isolation (isolation=true) is always computed on the fixed 10000ms tier;
+// 3. FaultItem.updateNotAvailableDuration only extends, never shortens;
+// 4. with no record in the fault table isAvailable/isReachable=true; false after isolation, recovered on expiry;
+// 5. nothing is recorded while the strategy is disabled;
+// 6. strategy enabled: a healthy broker is picked normally; after single-broker isolation it degrades to plain polling and still picks a queue.
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -38,7 +38,7 @@ void fillTpInfo(TopicPublishInfo& tp, const std::string& topic, const std::strin
 }  // namespace
 
 int main() {
-    // ------------------------------------------------ 阈值表逐档映射
+    // ------------------------------------------------ threshold table tier mapping
     {
         MQFaultStrategy s(true);
         expect(s.computeNotAvailableDuration(0) == 0, "lat 0 -> dur 0");
@@ -55,37 +55,37 @@ int main() {
         expect(s.computeNotAvailableDuration(60000) == 30000, "lat 60000 -> dur 30000");
     }
 
-    // ------------------------------------------------ 隔离档位 / 容错表
+    // ------------------------------------------------ isolation tier / fault-tolerance table
     {
         MQFaultStrategy s(true);
         s.updateFaultItem("broker-a", 12.0, /*isolation=*/true, /*reachable=*/false);
         const FaultItem* item = s.latencyFaultTolerance().getFaultItem("broker-a");
         expect(item != nullptr, "isolation records a fault item");
         expect(item->currentLatency() == 12.0, "currentLatency keeps measured value");
-        // 隔离档位固定 10000ms -> 隔离 10000ms（isAvailable 立即为 false）
+        // the isolation tier is fixed at 10000ms -> isolated for 10000ms (isAvailable is false immediately)
         expect(!s.latencyFaultTolerance().isAvailable("broker-a"), "isolated broker unavailable");
         expect(!s.latencyFaultTolerance().isReachable("broker-a"), "isolated broker unreachable");
 
-        // updateNotAvailableDuration 只延长不缩短
+        // updateNotAvailableDuration only extends, never shortens
         FaultItem f("x");
         f.updateNotAvailableDuration(5000);
         const int64_t ts1 = f.startTimestamp();
         f.updateNotAvailableDuration(1000);
         expect(f.startTimestamp() == ts1, "updateNotAvailableDuration only extends");
 
-        // remove 后恢复默认可用
+        // after remove the item is available again by default
         s.latencyFaultTolerance().remove("broker-a");
         expect(s.latencyFaultTolerance().isAvailable("broker-a")
                    && s.latencyFaultTolerance().isReachable("broker-a"),
                "removed item defaults to available/reachable");
 
-        // 无记录的 broker 默认可用/可达
+        // a broker with no record defaults to available/reachable
         expect(s.latencyFaultTolerance().isAvailable("never-seen")
                    && s.latencyFaultTolerance().isReachable("never-seen"),
                "unknown broker defaults available");
     }
 
-    // ------------------------------------------------ 到期恢复
+    // ------------------------------------------------ expiry recovery
     {
         LatencyFaultToleranceImpl tol;
         tol.updateFaultItem("b", 1.0, 50 /*ms*/, true);
@@ -94,7 +94,7 @@ int main() {
         expect(tol.isAvailable("b"), "isolation expires");
     }
 
-    // ------------------------------------------------ 策略关闭：不记录
+    // ------------------------------------------------ strategy off: nothing recorded
     {
         MQFaultStrategy s(false);
         s.updateFaultItem("broker-a", 99999.0, true, false);
@@ -102,9 +102,9 @@ int main() {
                "disabled strategy records nothing");
     }
 
-    // ------------------------------------------------ 队列选择
+    // ------------------------------------------------ queue selection
     {
-        // 双 broker：隔离 broker-a 后开启策略应只选 broker-b
+        // two brokers: after isolating broker-a, the enabled strategy should only pick broker-b
         MQFaultStrategy s(true);
         s.updateFaultItem("broker-a", 99999.0, true, false);
         TopicPublishInfo tp;
@@ -116,7 +116,7 @@ int main() {
         }
     }
     {
-        // 单 broker 全隔离：available/reachable 都选不出 -> 退化普通轮询仍能选出
+        // single broker fully isolated: nothing passes available/reachable -> the plain-polling fallback still picks it
         MQFaultStrategy s(true);
         s.updateFaultItem("broker-a", 99999.0, true, false);
         TopicPublishInfo tp;
@@ -125,7 +125,7 @@ int main() {
         expect(mq.brokerName == "broker-a", "single-broker fallback to plain polling");
     }
     {
-        // lastBrokerName 避开语义：双 broker 下不返回上次的 broker
+        // lastBrokerName avoidance: with two brokers the previous broker is not returned
         MQFaultStrategy s(false);
         TopicPublishInfo tp;
         fillTpInfo(tp, "T", "broker-a", "broker-b");
@@ -133,7 +133,7 @@ int main() {
         expect(mq.brokerName == "broker-b", "lastBrokerName avoided");
     }
     {
-        // resetIndex 后从头轮询
+        // after resetIndex, polling restarts from the head
         MQFaultStrategy s(true);
         TopicPublishInfo tp;
         fillTpInfo(tp, "T", "broker-a", "broker-b");

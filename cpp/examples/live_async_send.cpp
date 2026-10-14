@@ -1,11 +1,11 @@
-// 前置：NameServer + Broker 已起，``autoCreateTopicEnable=true``。
+// Prerequisites: name server + broker already up, with ``autoCreateTopicEnable=true``.
 //
 //
-// ⚠ 三条脚本纪律（沿用 live_backpressure 那一轮真机联调踩出来的口径）：
-//   ① topic 一律带 stamp —— 三语言**依次**跑在同一个 broker 上，固定名会继承上一轮的条数；
-//   ② 「有没有落地」只看 broker 侧各队列 maxOffset-minOffset 之和，不看客户端回调；
-//   ③ 新建 topic 要等 broker 把 topicConfig 注册到 namesrv（秒级到十秒级），所以所有
-//      broker 侧对账都是**轮询到超时**，读一次路由失败不算失败。
+// ! Three script disciplines (the working rules proven during the live_backpressure live run):
+//   (1) topic names always carry the stamp -- successive runs land on the same broker, a fixed name inherits the previous round's message count;
+//   (2) "did it land" is judged only by the broker-side sum of maxOffset-minOffset over the queues, never by client callbacks;
+//   (3) a new topic waits for the broker to register its topicConfig into the name server (seconds up to tens of seconds), so every
+//       broker-side reconciliation polls until timeout; one failed route read is not a failure.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -115,7 +115,7 @@ public:
         return results_;
     }
 
-    // 线程名按下标取（第几笔回调），越界返回空串
+    // Thread name looked up by index (which callback), out of range returns an empty string
     std::string threadAt(size_t i) {
         std::lock_guard<std::mutex> lk(m_);
         return i < threads_.size() ? threads_[i] : std::string();
@@ -149,8 +149,8 @@ private:
     std::vector<std::string> threads_;
 };
 
-// before 钩子睡一段时间：把「准备段」拖慢，才能证明调用方没等它。
-// 顺便记下两件事：钩子跑在哪根线程上、before/after 各跑了几次。
+// The before hook parks for a while: only a slowed-down preparation stage can prove that the caller did not wait for it.
+// It also records two things: which thread the hook runs on, and how many times before/after each ran.
 class TracingHook : public SendMessageHook {
 public:
     explicit TracingHook(int64_t parkMillis) : parkMillis_(parkMillis) {}
@@ -195,7 +195,7 @@ private:
     std::string beforeThread_;
 };
 
-// 只拒绝带 forbidden 标签的消息，并记下它看到的 CommunicationMode
+// Rejects only the messages tagged forbidden, and records the CommunicationMode it sees
 class ForbiddenTagHook : public CheckForbiddenHook {
 public:
     std::string hookName() const override { return "async-forbidden"; }
@@ -225,7 +225,7 @@ private:
     CommunicationMode mode_ = CommunicationMode::SYNC;
 };
 
-// ---------------------------------------------------------------- 环境
+// ---------------------------------------------------------------- environment
 struct Env {
     std::string nsAddr;
     int64_t s = 0;
@@ -236,7 +236,7 @@ struct Env {
     }
 };
 
-// 钩子必须在 start() 之前挂上（与 live_backpressure 同样口径）
+// Hooks must be attached before start() (same discipline as live_backpressure)
 std::shared_ptr<DefaultMQProducer> makeProducer(Env& env, const std::string& instance,
                                                 std::shared_ptr<SendMessageHook> sendHook = nullptr,
                                                 std::shared_ptr<CheckForbiddenHook> forbidHook =
@@ -253,26 +253,26 @@ std::shared_ptr<DefaultMQProducer> makeProducer(Env& env, const std::string& ins
 
 Message msg(const std::string& topic, const std::string& body) { return Message(topic, body); }
 
-// broker 上这个 topic 一共落了多少条（各队列 maxOffset-minOffset 之和）；读不到路由返回 -1
+// How many messages this topic has landed on the broker (sum of maxOffset-minOffset over all queues); -1 when the route cannot be read
 int64_t landedCount(DefaultMQAdminExt& admin, const std::string& topic) {
     std::vector<MessageQueue> queues;
     try {
         queues = admin.examineTopicRoute(topic).getAllMessageQueue(topic);
     } catch (const std::exception&) {
-        return -1;  // 路由还没注册上
+        return -1;  // the route is not registered yet
     }
     int64_t total = 0;
     for (const MessageQueue& mq : queues) {
         try {
             total += admin.maxOffset(mq) - admin.minOffset(mq);
         } catch (const std::exception&) {
-            // 该队列刚建出来还没写过
+            // this queue was just created and has not been written to yet
         }
     }
     return total;
 }
 
-// 等 broker 上至少出现 expected 条，返回最后一次读数（新 topic 注册到 namesrv 是秒级的）
+// Wait until at least expected messages show up on the broker, return the last reading (a new topic reaches the name server with second-scale delay)
 int64_t waitLanded(Env& env, const std::string& topic, int64_t expected, int seconds = 30) {
     const int64_t deadline = nowMs() + seconds * 1000LL;
     int64_t landed = landedCount(*env.admin, topic);
@@ -301,7 +301,7 @@ std::string brokerAddr(Env& env) {
     return "127.0.0.1:10911";
 }
 
-// ------------------------------------------------- A1 立刻返回 + 线程口径 + 读回
+// ------------------------------------------------- A1 immediate return + thread identity + read-back
 void a1NonBlockingAndReadBack(Env& env, const std::string& t) {
     auto hook = std::make_shared<TracingHook>(400);
     auto p = makeProducer(env, "a1", hook);
@@ -310,29 +310,29 @@ void a1NonBlockingAndReadBack(Env& env, const std::string& t) {
     const int64_t began = nowMs();
     p->sendAsync(msg(t, body), rec, 5000);
     const int64_t callerTook = nowMs() - began;
-    check("A1 调用方在准备段（钩子睡 400ms）之前就已返回",
+    check("A1 the caller returned before the preparation stage (the hook sleeps 400ms)",
           callerTook < 200 && hook->before() <= 1,
-          "调用方耗时=" + num(callerTook) + "ms before 已跑=" + num(hook->before()));
-    check("A1 回调恰好一次且 SEND_OK",
+          "caller_elapsed=" + num(callerTook) + "ms before_ran=" + num(hook->before()));
+    check("A1 exactly one callback and SEND_OK",
           waitUntil([&]() { return rec->done() >= 1; }, 20000) && rec->ok() == 1
               && rec->errorCount() == 0,
           rec->summary());
-    check("A1 before 钩子在 AsyncSenderExecutor_N 上跑",
+    check("A1 the before hook runs on AsyncSenderExecutor_N",
           startsWith(hook->beforeThread(), "AsyncSenderExecutor_"),
-          "线程名=" + hook->beforeThread());
-    check("A1 用户回调在 NettyClientPublicExecutor_N 上跑",
+          "thread=" + hook->beforeThread());
+    check("A1 the user callback runs on NettyClientPublicExecutor_N",
           startsWith(rec->threadAt(0), "NettyClientPublicExecutor_"),
-          "线程名=" + rec->threadAt(0));
-    check("A1 before/after 各跑一次", hook->before() == 1 && hook->after() == 1,
+          "thread=" + rec->threadAt(0));
+    check("A1 before/after each ran once", hook->before() == 1 && hook->after() == 1,
           "before=" + num(hook->before()) + " after=" + num(hook->after()));
-    check("A1 broker 落了这一条", waitLanded(env, t, 1) == 1);
+    check("A1 the broker landed this one message", waitLanded(env, t, 1) == 1);
     const std::vector<SendResult> rs = rec->results();
     if (rs.empty()) {
         p->shutdown();
         return;
     }
     const SendResult& r = rs[0];
-    // offsetMsgId 是 broker 给的，只有它能解出 commitLog 偏移 ⇒ 读回来对 body
+    // offsetMsgId is handed out by the broker and only it decodes to the commitLog offset => read the message back and compare the body
     MessageExt back;
     const bool read = waitUntil(
         [&]() {
@@ -340,27 +340,27 @@ void a1NonBlockingAndReadBack(Env& env, const std::string& t) {
                 back = env.admin->viewMessage(t, r.offsetMsgId);
                 return true;
             } catch (const std::exception&) {
-                return false;  // commitLog 还没刷出去
+                return false;  // the commitLog is not flushed out yet
             }
         },
         15000);
-    check("A1 用回调里的 offsetMsgId 能读回这条消息", read && bodyOf(back) == body,
+    check("A1 the offsetMsgId from the callback reads this message back", read && bodyOf(back) == body,
           "body=" + bodyOf(back));
     int64_t maxOffset = -1;
     try {
         maxOffset = env.admin->maxOffset(r.messageQueue);
     } catch (const std::exception&) {
     }
-    check("A1 回调里的 queueOffset 就是它落在的位置", r.queueOffset == maxOffset - 1,
+    check("A1 the queueOffset in the callback is exactly where the message landed", r.queueOffset == maxOffset - 1,
           "queueOffset=" + num(r.queueOffset) + " maxOffset=" + num(maxOffset));
-    // msgId 是客户端补的 UNIQ_KEY（32 位十六进制），不是 broker 的那份
-    check("A1 msgId 是客户端 UNIQ_KEY、与 broker 的 offsetMsgId 不同",
+    // msgId is the UNIQ_KEY filled in by the client (32 hex digits), not the broker's own id
+    check("A1 msgId is the client UNIQ_KEY and differs from the broker's offsetMsgId",
           r.msgId.size() == 32 && r.msgId != r.offsetMsgId,
           "msgId=" + r.msgId + " offsetMsgId=" + r.offsetMsgId);
     p->shutdown();
 }
 
-// ------------------------------------------------- A2 并发不串台
+// ------------------------------------------------- A2 concurrent sends do not cross-talk
 void a2BurstExactlyOnceEach(Env& env, const std::string& t) {
     const int32_t burst = 30;
     auto p = makeProducer(env, "a2");
@@ -372,7 +372,7 @@ void a2BurstExactlyOnceEach(Env& env, const std::string& t) {
                                                               each[static_cast<size_t>(i)], 8000); });
     }
     for (std::thread& th : threads) th.join();
-    check("A2 30 笔并发异步发送每笔都拿到终态",
+    check("A2 each of the 30 concurrent async sends reached a terminal state",
           waitUntil([&]() {
               for (const std::shared_ptr<Recorder>& r : each) {
                   if (r->done() < 1) return false;
@@ -399,27 +399,27 @@ void a2BurstExactlyOnceEach(Env& env, const std::string& t) {
             uniq.insert(s.msgId);
         }
     }
-    check("A2 每笔**恰好一个**终态（不多不少）", multi == 0, "多拿回调的笔数=" + num(multi));
-    check("A2 全部 SEND_OK", notOk == 0, each[0]->summary());
-    check("A2 broker 上正好落 30 条", waitLanded(env, t, burst) == burst);
-    check("A2 各笔的 (broker, queueId, queueOffset) 互不重叠",
-          static_cast<int32_t>(slots.size()) == burst, "去重后=" + num(static_cast<int64_t>(slots.size())));
-    check("A2 每笔的 UNIQ_KEY 都不一样", static_cast<int32_t>(uniq.size()) == burst);
+    check("A2 every send has exactly one terminal state (no more, no less)", multi == 0, "sends_with_extra_callbacks=" + num(multi));
+    check("A2 all SEND_OK", notOk == 0, each[0]->summary());
+    check("A2 exactly 30 messages landed on the broker", waitLanded(env, t, burst) == burst);
+    check("A2 the (broker, queueId, queueOffset) slots of the sends never overlap",
+          static_cast<int32_t>(slots.size()) == burst, "distinct=" + num(static_cast<int64_t>(slots.size())));
+    check("A2 every send's UNIQ_KEY is different", static_cast<int32_t>(uniq.size()) == burst);
     p->shutdown();
 }
 
-// ------------------------------------------------- A3 定点发送
+// ------------------------------------------------- A3 pinned-queue send
 void a3PinnedQueue(Env& env, const std::string& t) {
     auto p = makeProducer(env, "a3");
     auto rec = std::make_shared<Recorder>();
-    // 先把 topic 撑出来（同步发一笔，让 broker 把队列建全），再挑一条定点打。
-    // ⚠ 取基线之前必须等预热那一笔在 broker 侧**已经可读**：刚 ack 的报文落到
-    // consumeQueue 有延迟，基线读成 0、对账时它变成 1，会凭空多出 1 条。
+    // First grow the topic (one synchronous send so the broker creates all queues), then pick one queue and pin to it.
+    // ! Before taking the baseline, wait until the warm-up message is already readable on the broker: a just-acked
+    // report reaches the consumeQueue with a delay, so a baseline read of 0 that turns into 1 during reconciliation would invent one extra message.
     p->send(msg(t, "async-a3-warmup"), 5000);
-    check("A3 预热那一笔已经在 broker 上可读", waitLanded(env, t, 1) >= 1,
+    check("A3 the warm-up message is already readable on the broker", waitLanded(env, t, 1) >= 1,
           "landed=" + num(landedCount(*env.admin, t)));
     const std::vector<MessageQueue> queues = p->fetchPublishMessageQueues(t);
-    check("A3 取到了发布队列", !queues.empty(), "queues=" + num(static_cast<int64_t>(queues.size())));
+    check("A3 fetched the publish queues", !queues.empty(), "queues=" + num(static_cast<int64_t>(queues.size())));
     if (queues.empty()) {
         p->shutdown();
         return;
@@ -429,7 +429,7 @@ void a3PinnedQueue(Env& env, const std::string& t) {
     int64_t othersBefore = 0;
     for (size_t i = 1; i < queues.size(); ++i) othersBefore += std::max<int64_t>(0, queueLanded(*env.admin, queues[i]));
     p->sendAsync(msg(t, "async-a3-pinned"), aimed, rec, 5000);
-    check("A3 定点异步发送拿到终态且 SEND_OK",
+    check("A3 the pinned async send reached a terminal state with SEND_OK",
           waitUntil([&]() { return rec->done() >= 1; }, 20000) && rec->ok() == 1,
           rec->summary());
     const std::vector<SendResult> rs = rec->results();
@@ -438,21 +438,21 @@ void a3PinnedQueue(Env& env, const std::string& t) {
         return;
     }
     const SendResult& r = rs[0];
-    check("A3 结果落在指定的那条队列上",
+    check("A3 the result landed on the queue that was specified",
           r.messageQueue.brokerName == aimed.brokerName
               && r.messageQueue.queueId == aimed.queueId,
           "broker=" + r.messageQueue.brokerName + " queueId=" + num(r.messageQueue.queueId));
-    check("A3 那条队列正好多 1 条",
+    check("A3 that queue grew by exactly 1 message",
           waitUntil([&]() { return queueLanded(*env.admin, aimed) == before + 1; }, 20000),
-          "landed=" + num(queueLanded(*env.admin, aimed)) + " 之前=" + num(before));
+          "landed=" + num(queueLanded(*env.admin, aimed)) + " before=" + num(before));
     int64_t othersAfter = 0;
     for (size_t i = 1; i < queues.size(); ++i) othersAfter += std::max<int64_t>(0, queueLanded(*env.admin, queues[i]));
-    check("A3 别的队列一条都没多", othersAfter == othersBefore,
-          "其它队列 " + num(othersBefore) + " -> " + num(othersAfter));
+    check("A3 no other queue gained a single message", othersAfter == othersBefore,
+          "other_queues " + num(othersBefore) + " -> " + num(othersAfter));
     p->shutdown();
 }
 
-// ------------------------------------------------- A4 拦截钩子
+// ------------------------------------------------- A4 checkForbidden hook
 void a4ForbiddenHook(Env& env, const std::string& t) {
     auto forbidden = std::make_shared<ForbiddenTagHook>();
     auto p = makeProducer(env, "a4", nullptr, forbidden);
@@ -461,37 +461,37 @@ void a4ForbiddenHook(Env& env, const std::string& t) {
     Message bad = msg(t, "async-a4-rejected");
     bad.setTags("forbidden");
     p->sendAsync(bad, rejected, 5000);
-    check("A4 钩子拒绝的异常原样到了回调",
+    check("A4 the exception the hook threw reaches the callback unchanged",
           waitUntil([&]() { return rejected->done() >= 1; }, 10000)
               && rejected->firstError().find("tag forbidden is not allowed") != std::string::npos,
           rejected->summary());
-    check("A4 钩子拒绝的异常类型是 MQClientException（checkForbidden 抛的就是它）",
+    check("A4 the rejection exception type is MQClientException (exactly what checkForbidden throws)",
           rejected->firstErrorType() == "MQClientException", rejected->summary());
-    check("A4 拦截钩子看到的是 ASYNC", forbidden->mode() == CommunicationMode::ASYNC,
+    check("A4 the intercepting hook sees ASYNC", forbidden->mode() == CommunicationMode::ASYNC,
           "mode=" + std::string(forbidden->mode() == CommunicationMode::ASYNC      ? "ASYNC"
                                 : forbidden->mode() == CommunicationMode::ONEWAY ? "ONEWAY"
                                                                                  : "SYNC"));
-    // 这个 topic 除了被拒的这一笔什么都没有 ⇒ 要么读到 0 条，要么连路由都还没
-    // 注册上（-1）。路由是**第一条消息落到 broker** 才会被 autoCreate 建出来的，
-    // 所以「读不到路由」本身就是「broker 没收到过请求」的证据。
+    // This topic holds nothing but the rejected send => either the reading is 0 or the route is not even
+    // registered (-1). autoCreate only builds the route once the first message reaches the broker,
+    // so "the route cannot be read" is itself evidence that the broker never received a request.
     const int64_t afterReject = landedCount(*env.admin, t);
-    check("A4 被拒的这笔在 broker 上没留痕", afterReject <= 0,
-          "landed=" + num(afterReject) + "（-1 = 路由还没建出来，即 broker 一条都没收到）");
+    check("A4 the rejected send left no trace on the broker", afterReject <= 0,
+          "landed=" + num(afterReject) + " (-1 = the route was not created, i.e. the broker received nothing)");
 
     p->sendAsync(msg(t, "async-a4-ok"), passed, 5000);
-    check("A4 同一个生产者换个标签照常落地（拒绝没把池子弄坏）",
+    check("A4 the same producer with another tag still lands (the rejection did not break the pool)",
           waitUntil([&]() { return passed->done() >= 1; }, 20000) && passed->ok() == 1,
           passed->summary());
     const int64_t landed = waitLanded(env, t, 1);
-    check("A4 broker 上正好落 1 条", landed == 1, "landed=" + num(landed));
-    check("A4 钩子一共被调 2 次（一笔被拒、一笔放行）", forbidden->calls() == 2,
+    check("A4 exactly 1 message landed on the broker", landed == 1, "landed=" + num(landed));
+    check("A4 the hook was called 2 times in total (one rejected, one passed)", forbidden->calls() == 2,
           "calls=" + num(forbidden->calls()));
     p->shutdown();
 }
 
-// ------------------------------------------------- A5 批量异步（sendBatchAsync）
+// ------------------------------------------------- A5 batch async (sendBatchAsync)
 
-// 除第 0 条以外的队列合计落地条数（定点批量要证明「别的队列一条都没多」）。
+// Total messages landed on all queues except index 0 (a pinned batch must prove that no other queue gained a message).
 int64_t othersLanded(DefaultMQAdminExt& admin, const std::vector<MessageQueue>& queues) {
     int64_t total = 0;
     for (size_t i = 1; i < queues.size(); ++i) {
@@ -503,32 +503,32 @@ int64_t othersLanded(DefaultMQAdminExt& admin, const std::vector<MessageQueue>& 
 void a5BatchAsync(Env& env, const std::string& t) {
     auto p = makeProducer(env, "a5");
 
-    // ① 一批 5 条：回调恰好一次、SEND_OK，并且 broker 上真的落了 5 条。
-    //    只看回调会被「回调报了 OK 但请求压根没发出去」蒙过去 —— 那条必须靠 broker 侧对账。
+    // (1) A batch of 5: exactly one callback, SEND_OK, and the broker really holds 5 messages.
+    //     Watching only the callback is fooled by "the callback reported OK but the request never left" -- that one needs broker-side reconciliation.
     auto rec = std::make_shared<Recorder>();
     std::vector<Message> batch;
     for (int32_t i = 0; i < 5; ++i) batch.push_back(msg(t, "async-a5-" + num(i)));
     p->sendBatchAsync(batch, rec, 10000);
-    check("A5 一批 5 条：回调恰好一次且 SEND_OK",
+    check("A5 a batch of 5: exactly one callback with SEND_OK",
           waitUntil([&]() { return rec->done() >= 1; }, 20000) && rec->done() == 1
               && rec->ok() == 1 && rec->errorCount() == 0
               && !rec->results().empty() && !rec->results()[0].msgId.empty(),
           rec->summary());
     const int64_t landed = waitLanded(env, t, 5);
-    check("A5 broker 上真落了 5 条（不是回调自己说成功）", landed == 5,
-          "landed=" + num(landed) + "（-1 = 路由还没建出来）");
-    check("*  A5 请求码 = SEND_BATCH_MESSAGE(320) 由离线单测取证", true,
-          "真机看不到上线报文，这一条由 tests/test_producer_async.cpp 在进程内取证");
+    check("A5 the broker really landed 5 messages (not just the callback claiming success)", landed == 5,
+          "landed=" + num(landed) + " (-1 = the route was not created yet)");
+    check("*  A5 request code = SEND_BATCH_MESSAGE(320) is proven by the offline unit test", true,
+          "the live machine cannot see the outgoing report; tests/test_producer_async.cpp proves this one in-process");
 
     const std::vector<SendResult> batchResults = rec->results();
     const SendResult batchResult = batchResults.empty() ? SendResult{} : batchResults[0];
-    // 批量 msgId 口径：客户端为整批生成的 UNIQ_KEY，而不是 broker 那串 offsetMsgId
-    check("A5 批量的 msgId 是客户端 32 位 ID、不是 broker 的 offsetMsgId",
+    // Batch msgId semantics: the UNIQ_KEY the client generated for the whole batch, not the broker's offsetMsgId string
+    check("A5 the batch msgId is the client's 32-character id, not the broker's offsetMsgId",
           batchResult.msgId.size() == 32 && batchResult.msgId.find(',') == std::string::npos
               && batchResult.msgId != batchResult.offsetMsgId,
           "msgId=" + batchResult.msgId + " offsetMsgId=" + batchResult.offsetMsgId);
-    // 批量应答的 offsetMsgId 是 broker **逐条**回的一串（逗号分隔，一条子消息一个 commitLog
-    // 偏移），它本身就是「这一批被拆开存成 5 条」的证据
+    // The offsetMsgId of the batch response is the string the broker returns per sub-message (comma separated, one commitLog
+    // offset each), which is itself the evidence that this batch was split and stored as 5 messages
     std::vector<std::string> subOffsets;
     for (size_t pos = 0; pos <= batchResult.offsetMsgId.size();) {
         size_t comma = batchResult.offsetMsgId.find(',', pos);
@@ -536,7 +536,7 @@ void a5BatchAsync(Env& env, const std::string& t) {
         if (comma > pos) subOffsets.push_back(batchResult.offsetMsgId.substr(pos, comma - pos));
         pos = comma + 1;
     }
-    check("A5 broker 逐条回了 5 个 commitLog 偏移（批量确实被拆开落地）",
+    check("A5 the broker returned 5 per-message commitLog offsets (the batch really was split on storage)",
           subOffsets.size() == 5, "offsetMsgId=" + batchResult.offsetMsgId);
     MessageExt storedSub;
     const bool readSub =
@@ -547,20 +547,20 @@ void a5BatchAsync(Env& env, const std::string& t) {
                        storedSub = env.admin->viewMessage(t, subOffsets.front());
                        return true;
                    } catch (const std::exception&) {
-                       return false;  // commitLog 还没刷出去
+                       return false;  // the commitLog is not flushed out yet
                    }
                },
                15000);
     const std::string storedUniq =
         readSub ? storedSub.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX)
                 : std::string();
-    check("A5 broker 上存的子消息带客户端 UNIQ_KEY（逐条 ID 编在 body 里）",
+    check("A5 the sub-message stored on the broker carries the client UNIQ_KEY (the per-message id is encoded in the body)",
           storedUniq.size() == 32, "stored UNIQ_KEY=" + storedUniq);
 
-    // ② 定点批量：mq 参数真的传到了批量内核，而不是被丢掉后自己挑一条。
+    // (2) Pinned batch: the mq argument really reaches the batch core instead of being dropped and a queue picked on its own.
     const std::vector<MessageQueue> queues = p->fetchPublishMessageQueues(t);
     if (queues.empty()) {
-        check("A5 定点批量取到了发布队列", false, "queues=0");
+        check("A5 the pinned batch fetched the publish queues", false, "queues=0");
         p->shutdown();
         return;
     }
@@ -577,74 +577,74 @@ void a5BatchAsync(Env& env, const std::string& t) {
     const bool landedOnAimed = !pr.empty() && pr[0].messageQueue.brokerName == aimed.brokerName
                             && pr[0].messageQueue.queueId == aimed.queueId;
     int64_t aimedAfter = queueLanded(*env.admin, aimed);
-    check("A5 定点批量那条队列正好多 3 条",
+    check("A5 the pinned batch's queue grew by exactly 3 messages",
           waitUntil([&]() { return (aimedAfter = queueLanded(*env.admin, aimed)) == aimedBefore + 3; },
                     20000),
-          "该队列 " + num(aimedBefore) + " -> " + num(aimedAfter));
+          "this_queue " + num(aimedBefore) + " -> " + num(aimedAfter));
     const int64_t othersAfter = othersLanded(*env.admin, queues);
-    check("A5 定点批量落在指定队列、别的队列一条都没多",
+    check("A5 the pinned batch lands on the specified queue and no other queue gains a message",
           pinnedOk && landedOnAimed && aimedAfter == aimedBefore + 3 && othersAfter == othersBefore,
-          "ok=" + num(static_cast<int64_t>(pinned->ok())) + " 落位=" + std::string(landedOnAimed ? "1" : "0")
-              + " 该队列 " + num(aimedBefore) + "->" + num(aimedAfter)
-              + " 其它 " + num(othersBefore) + "->" + num(othersAfter));
+          "ok=" + num(static_cast<int64_t>(pinned->ok())) + " landed_on_aimed=" + std::string(landedOnAimed ? "1" : "0")
+              + " this_queue " + num(aimedBefore) + "->" + num(aimedAfter)
+              + " others " + num(othersBefore) + "->" + num(othersAfter));
 
     auto mixed = std::make_shared<Recorder>();
     p->sendBatchAsync({msg(t, "async-a5-mixed-1"), msg(env.topic("BatchOther"), "async-a5-mixed-2")},
                       mixed, 5000);
-    check("A5 混 topic 的一批在回调里报错（本地校验没被异步路径绕过）",
+    check("A5 a batch mixing topics reports in the callback (local validation is not bypassed by the async path)",
           waitUntil([&]() { return mixed->done() >= 1; }, 10000) && mixed->done() == 1
               && mixed->ok() == 0
               && mixed->firstError().find("should be the same") != std::string::npos,
           mixed->summary());
 
-    // ④ 空批次：同一口径 —— 错误进回调，一次回调都不欠。
+    // (4) Empty batch: same contract -- the error goes into the callback, not a single callback is left owing.
     auto empty = std::make_shared<Recorder>();
     p->sendBatchAsync(std::vector<Message>(), empty, 5000);
-    check("A5 空批次也是「恰好一次失败回调」，不静默吞掉",
+    check("A5 an empty batch also gets exactly one failing callback, nothing is silently swallowed",
           waitUntil([&]() { return empty->done() >= 1; }, 10000) && empty->done() == 1
               && empty->ok() == 0
               && empty->firstError().find("message list is empty") != std::string::npos,
           empty->summary());
 
-    // ⑤ 背压扣的是**整批**字节，不是「一条」：字节闸压到地板（1 MiB），一批 2×600 KiB
-    //    必须被拦下（整批 1.2 MiB > 1 MiB）；换一批 2×100 KiB 又必须过。只按第一条算
-    //    （600 KiB）或者干脆不扣，这两条就会同时反向。
+    // (5) Backpressure charges the whole batch's bytes, not "one message": with the byte gate at the floor (1 MiB), a batch of 2x600 KiB
+    //     must be blocked (1.2 MiB total > 1 MiB); a batch of 2x100 KiB must pass again. Charging only the first message
+    //     (600 KiB) or not charging at all would flip both of these outcomes at once.
     p->setEnableBackpressureForAsyncMode(true);
     p->setBackPressureForAsyncSendNum(1);
     p->setBackPressureForAsyncSendSize(1024 * 1024);
     auto gated = std::make_shared<Recorder>();
     p->sendBatchAsync({msg(t, std::string(600 * 1024, 'x')), msg(t, std::string(600 * 1024, 'x'))},
                       gated, 2000);
-    check("A5 整批 1.2MiB 被 1MiB 字节闸拦下（回调拿到 TOO_MUCH_REQUEST）",
+    check("A5 the 1.2MiB whole batch is blocked by the 1MiB byte gate (the callback gets TOO_MUCH_REQUEST)",
           waitUntil([&]() { return gated->done() >= 1; }, 15000) && gated->done() == 1
               && gated->ok() == 0
               && gated->firstError().find("semaphoreAsyncSize timeout") != std::string::npos,
           gated->summary());
-    // 同一道闸下的小批次必须照常落地：证明「拦住」是因为整批量，不是因为批量被一概论处
+    // A small batch under the same gate must still land: proof that the block came from the whole-batch size, not from batches being rejected as a class
     auto passed = std::make_shared<Recorder>();
     p->sendBatchAsync({msg(t, std::string(100 * 1024, 'y')), msg(t, std::string(100 * 1024, 'y'))},
                       passed, 10000);
-    check("A5 同一道闸下 200KiB 的一批照常拿到 SEND_OK",
+    check("A5 a 200KiB batch under the same gate still gets SEND_OK",
           waitUntil([&]() { return passed->done() >= 1; }, 20000) && passed->done() == 1
               && passed->ok() == 1,
           passed->summary());
-    // 许可必须原样归还：漏一份就是长跑之后「所有异步发送集体超时」，而单次发送看不出来。
+    // Permits must be returned exactly as taken: leaking one turns into "every async send times out" after a long run, invisible to single sends.
     const int32_t numTotal = p->getBackPressureForAsyncSendNum();
     const int32_t sizeTotal = p->getBackPressureForAsyncSendSize();
-    check("A5 批量路径把两份许可原样归还（空闲量回到总量，含被闸拦下那一笔）",
+    check("A5 the batch path returns both permits exactly (free amounts back to the total, including the gated send)",
           waitUntil(
               [&]() {
                   return p->getSemaphoreAsyncSendNumAvailablePermits() == numTotal
                       && p->getSemaphoreAsyncSendSizeAvailablePermits() == sizeTotal;
               },
               10000),
-          "空闲条数=" + num(p->getSemaphoreAsyncSendNumAvailablePermits()) + " 总量=" + num(numTotal)
-              + " 空闲字节=" + num(p->getSemaphoreAsyncSendSizeAvailablePermits())
-              + " 总量=" + num(sizeTotal));
+          "free_num=" + num(p->getSemaphoreAsyncSendNumAvailablePermits()) + " total=" + num(numTotal)
+              + " free_bytes=" + num(p->getSemaphoreAsyncSendSizeAvailablePermits())
+              + " total=" + num(sizeTotal));
     p->shutdown();
 }
 
-// ------------------------------------------------- A6 关池排空在途准备段
+// ------------------------------------------------- A6 shutting the pool down drains the in-flight preparation stage
 void a6ShutdownDrains(Env& env, const std::string& t) {
     const int32_t cores = std::max<int32_t>(1, static_cast<int32_t>(std::thread::hardware_concurrency()));
     const int32_t sends = cores * 3;
@@ -654,15 +654,15 @@ void a6ShutdownDrains(Env& env, const std::string& t) {
     for (int32_t i = 0; i < sends; ++i) p->sendAsync(msg(t, "async-a6-" + num(i)), rec, 8000);
     p->shutdown();
     const int64_t landed = waitLanded(env, t, sends, 40);
-    check("A6 Shutdown 排空了队列：交进来的每一笔都上线了", landed == sends,
-          "landed=" + num(landed) + " 发送=" + num(sends));
-    check("A6 一笔至多一个终态回调", rec->done() <= static_cast<size_t>(sends),
-          "done=" + num(static_cast<int64_t>(rec->done())) + " 发送=" + num(sends));
+    check("A6 shutdown drained the queue: every accepted send went on the wire", landed == sends,
+          "landed=" + num(landed) + " sent=" + num(sends));
+    check("A6 a send gets at most one terminal callback", rec->done() <= static_cast<size_t>(sends),
+          "done=" + num(static_cast<int64_t>(rec->done())) + " sent=" + num(sends));
 
     auto p2 = makeProducer(env, "a6-after");
     auto after = std::make_shared<Recorder>();
     p2->sendAsync(msg(t, "async-a6-after"), after, 8000);
-    check("A6 关掉的池子不会被别的生产者复用（新生产者接着能发）",
+    check("A6 the shut-down pool is not reused by another producer (a new producer can still send)",
           waitUntil([&]() { return after->done() >= 1; }, 20000) && after->ok() == 1,
           after->summary());
     p2->shutdown();
@@ -685,7 +685,7 @@ int main(int argc, char** argv) {
     const std::string t5 = env.topic("AsyncBatch");
     const std::string t6 = env.topic("AsyncDrain");
 
-    std::printf("############ C++ 异步发送内核真机验证（namesrv=%s stamp=%lld）\n",
+    std::printf("############ C++ async send core live verification (namesrv=%s stamp=%lld)\n",
                 nsAddr.c_str(), static_cast<long long>(env.s));
     try {
         env.admin->start();
@@ -696,7 +696,7 @@ int main(int argc, char** argv) {
         a5BatchAsync(env, t5);
         a6ShutdownDrains(env, t6);
     } catch (const std::exception& e) {
-        check("脚本整体执行", false, e.what());
+        check("whole script executed", false, e.what());
     }
 
     const std::string addr = brokerAddr(env);
@@ -704,7 +704,7 @@ int main(int argc, char** argv) {
         try {
             env.admin->deleteTopicInBroker(addr, topic);
         } catch (const std::exception&) {
-            // 清理失败不影响结论
+            // cleanup failure does not affect the conclusion
         }
     }
     env.admin->shutdown();

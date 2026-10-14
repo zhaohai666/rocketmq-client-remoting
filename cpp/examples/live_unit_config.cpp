@@ -1,17 +1,17 @@
-// C++ 客户端 unitName / unitMode / enableStreamRequestType 真机联调
-// （场景 U1–U5 逐条真机断言）。
+// C++ client unitName / unitMode / enableStreamRequestType live-cluster integration
+// (scenarios U1-U5 asserted one by one on a real cluster).
 //
-// 为什么必须真机：这三个开关在离线单测里只能证明「字段被填了」，证明不了 broker 认不认。
-// broker 侧可见的证据只有这几处：
-//   * 发送带 unitMode → 自动建出来的 topic 的 topicSysFlag 带 UNIT 位；
-//   * 心跳带 ConsumerData.unitMode → %RETRY%group 建出来带 UNIT_SUB 位；
-//   * clientId 的 @unitName/@STREAM 后缀会出现在 broker 记录的连接信息里
-//     （examineConsumerConnectionInfo）—— 这是唯一能证明「上线的确实是拼好的那个
-//     clientId」的观测点。
-// ReqT 本身对普通 broker 是惰性的（只有 proxy/stream 链路读它），所以 stream 在这里只验
-// clientId；钩子顺序（ReqT 必须落在 ACL 签名之内）由 tests/test_acl.cpp 锁死。
+// Why a live cluster is mandatory: offline unit tests of these three switches can only prove "the field was filled in",
+// not that the broker honors it. Broker-visible evidence is limited to:
+//   * send with unitMode -> the auto-created topic's topicSysFlag carries the UNIT bit;
+//   * heartbeat with ConsumerData.unitMode -> the created %RETRY%group carries the UNIT_SUB bit;
+//   * the clientId's @unitName/@STREAM suffix shows up in the connection info recorded by the broker
+//     (examineConsumerConnectionInfo) -- the only observation point that proves
+//     "the clientId that came online really is the assembled one".
+// ReqT itself is inert for a plain broker (only the proxy/stream chain reads it), so stream here only verifies
+// clientId; the hook ordering (ReqT must land inside the ACL signature) is locked by tests/test_acl.cpp.
 //
-// 用法：./rmq_live_unit_config [namesrv]（需本地 5.5.1 集群，autoCreateTopicEnable=true）
+// Usage: ./rmq_live_unit_config [namesrv] (needs a local 5.5.1 cluster with autoCreateTopicEnable=true)
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -95,7 +95,7 @@ private:
     std::mutex mtx_;
 };
 
-// 环境：一个名字服务地址 + 一套按 stamp 隔离的 topic/group，跑完自己扫干净。
+// Environment: one name server address + a stamp-isolated set of topics/groups, cleaned up after the run.
 struct Env {
     std::string nsAddr;
     std::string stamp;
@@ -113,7 +113,7 @@ struct Env {
         groups.push_back(g);
         return g;
     }
-    // 默认 topic 的路由里就有全集群 broker，取第一个当管理端点
+    // The default topic's route already contains every broker in the cluster; take the first as the admin endpoint
     std::string brokerAddr() {
         try {
             const TopicRouteData route = admin.examineTopicRoute(MixAll::DEFAULT_TOPIC);
@@ -144,7 +144,7 @@ struct Env {
             }
         }
         for (const std::string& g : groupList) {
-            // %RETRY%/%DLQ% 随订阅组一起删（只有走删组接口 broker 才会真删 retry topic）
+            // %RETRY%/%DLQ% go away with the subscription group (only the delete-group API makes the broker really drop the retry topic)
             try {
                 admin.deleteSubscriptionGroup(addr, g, true);
             } catch (const std::exception& e) {
@@ -160,8 +160,8 @@ struct Env {
     }
 };
 
-// 按场景配好并启动一个生产者。instanceName 显式给定，clientId 才可预测
-//（默认名 DEFAULT 会被就地改写成 <pid>#<nanoTime>）。
+// Configure and start a producer per scenario. instanceName is given explicitly so the clientId is predictable
+// (the default name DEFAULT is rewritten in place to <pid>#<nanoTime>).
 class ScopedProducer {
 public:
     ScopedProducer(Env& env, const std::string& kind, const std::string& unitName = std::string(),
@@ -193,8 +193,8 @@ private:
     DefaultMQProducer producer_;
 };
 
-// 自动建出来的 topic 要先经 broker→namesrv 注册才查得到路由；wantBit 非 0 时等到该位
-// 出现为止，为 0 时只等路由可见（用于「不该带单元位」的对照）。
+// An auto-created topic must register broker->namesrv before its route is queryable; with wantBit != 0 wait
+// until that bit appears, with 0 just wait for route visibility (the control for "should not carry the unit bit").
 int32_t waitSysFlag(Env& env, const std::string& topic, int32_t wantBit, int seconds) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     int32_t last = -1;
@@ -203,7 +203,7 @@ int32_t waitSysFlag(Env& env, const std::string& topic, int32_t wantBit, int sec
         try {
             queues = env.admin.examineTopicRoute(topic).queueDatas;
         } catch (const std::exception&) {
-            // 还没建出来，继续等
+            // Not created yet, keep waiting
         }
         if (!queues.empty()) {
             last = queues.front().getTopicSysFlag();
@@ -218,30 +218,30 @@ bool routeVisible(Env& env, const std::string& topic, int seconds) {
     return waitSysFlag(env, topic, 0, seconds) >= 0;
 }
 
-// ---------------------------------------------------------------- U1 unitName → clientId
+// ---------------------------------------------------------------- U1 unitName -> clientId
 void u1ClientIdCarriesUnitName(Env& env) {
     ScopedProducer p(env, "u1", "unitA");
     const std::string want = MixAll::cachedIpStr() + "@uc-cpp-u1-" + env.stamp + "@unitA";
     check("U1 clientId = ip@instanceName@unitName", p.clientId() == want,
           "actual=" + p.clientId() + " want=" + want);
     const SendResult r = p.send(env.topic("U1"), "u1");
-    check("U1 带 unitName 仍能正常发送", r.sendStatus == SendStatus::SEND_OK, r.msgId);
+    check("U1 sending still works with unitName", r.sendStatus == SendStatus::SEND_OK, r.msgId);
 
     ScopedProducer ctl(env, "u1ctl");
-    check("U1 不设 unitName 时 clientId 不多出段",
+    check("U1 without unitName the clientId gains no extra segment",
           ctl.clientId() == MixAll::cachedIpStr() + "@uc-cpp-u1ctl-" + env.stamp,
           "actual=" + ctl.clientId());
 }
 
-// ---------------------------------------------------------------- U2 stream 消费者的 clientId
+// ---------------------------------------------------------------- U2 stream consumer clientId
 void u2StreamConsumerIsVisibleOnBroker(Env& env) {
     const std::string t = env.topic("U2");
     const std::string g = env.group("u2");
-    // 先暖一条：topic 建出来 + 路由可见，消费者首 pull 才不会撞 TOPIC_NOT_EXIST
+    // Warm up with one message first: topic created + route visible so the consumer's first pull avoids TOPIC_NOT_EXIST
     {
         ScopedProducer warm(env, "u2warm");
         warm.send(t, "warm");
-        check("U2 预热消息的路由已可见", routeVisible(env, t, 20));
+        check("U2 warm message route is visible", routeVisible(env, t, 20));
     }
 
     std::vector<std::string> bodies;
@@ -255,7 +255,7 @@ void u2StreamConsumerIsVisibleOnBroker(Env& env) {
     c.subscribe(t, "*");
     c.start();
     const std::string wantSuffix = "@unitA" + std::string(kStreamSuffix);
-    check("U2 消费者 clientId 以 @unitA@STREAM 收尾", endsWith(c.clientId(), wantSuffix),
+    check("U2 consumer clientId ends with @unitA@STREAM", endsWith(c.clientId(), wantSuffix),
           "actual=" + c.clientId());
 
     {
@@ -266,9 +266,9 @@ void u2StreamConsumerIsVisibleOnBroker(Env& env) {
     while (!hasBody(bodies, "hello-stream") && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    check("U2 stream 消费者收到消息", hasBody(bodies, "hello-stream"), join(bodies));
+    check("U2 stream consumer received the message", hasBody(bodies, "hello-stream"), join(bodies));
 
-    // broker 侧连接信息是唯一能证明「上线 clientId 就是拼好的那个」的观测点
+    // Broker-side connection info is the only observation point proving "the online clientId is the assembled one"
     bool seenOnBroker = false;
     std::string observed;
     for (int i = 0; i < 20 && !seenOnBroker; ++i) {
@@ -284,40 +284,40 @@ void u2StreamConsumerIsVisibleOnBroker(Env& env) {
         }
         if (!seenOnBroker) std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    check("U2 broker 记录的 clientId 也带 @unitA@STREAM", seenOnBroker, observed);
+    check("U2 the clientId recorded on the broker also carries @unitA@STREAM", seenOnBroker, observed);
     c.shutdown();
 }
 
-// ---------------------------------------------------------------- U3 unitMode 发送 → UNIT 位
+// ---------------------------------------------------------------- U3 unitMode send -> UNIT bit
 void u3UnitModeSendMarksTopic(Env& env) {
     const std::string on = env.topic("U3On");
     const std::string off = env.topic("U3Off");
     {
         ScopedProducer p(env, "u3on", "", /*unitMode=*/true);
         const SendResult r = p.send(on, "unit-on");
-        check("U3 unitMode 发送成功", r.sendStatus == SendStatus::SEND_OK, r.msgId);
+        check("U3 unitMode send succeeded", r.sendStatus == SendStatus::SEND_OK, r.msgId);
     }
     {
         ScopedProducer p(env, "u3off");
         const SendResult r = p.send(off, "unit-off");
-        check("U3 对照发送成功", r.sendStatus == SendStatus::SEND_OK, r.msgId);
+        check("U3 control send succeeded", r.sendStatus == SendStatus::SEND_OK, r.msgId);
     }
     const int32_t onFlag = waitSysFlag(env, on, kFlagUnit, 30);
-    check("U3 unitMode=true 建出的 topic 带 UNIT 位", (onFlag & kFlagUnit) != 0,
+    check("U3 topic created with unitMode=true carries the UNIT bit", (onFlag & kFlagUnit) != 0,
           "sysFlag=" + std::to_string(onFlag));
     const int32_t offFlag = waitSysFlag(env, off, 0, 30);
-    check("U3 unitMode=false 建出的 topic 不带单元位", (offFlag & kFlagUnit) == 0,
+    check("U3 topic created with unitMode=false carries no unit bit", (offFlag & kFlagUnit) == 0,
           "sysFlag=" + std::to_string(offFlag));
 }
 
-// ---------------------------------------------------------------- U4 心跳 unitMode → %RETRY% UNIT_SUB
+// ---------------------------------------------------------------- U4 heartbeat unitMode -> %RETRY% UNIT_SUB
 void u4UnitModeConsumerMarksRetryTopic(Env& env) {
     const std::string t = env.topic("U4");
     const std::string g = env.group("u4");
     {
         ScopedProducer warm(env, "u4warm");
         warm.send(t, "warm");
-        check("U4 预热消息的路由已可见", routeVisible(env, t, 20));
+        check("U4 warm message route is visible", routeVisible(env, t, 20));
     }
     std::vector<std::string> bodies;
     DefaultMQPushConsumer c(g);
@@ -328,14 +328,14 @@ void u4UnitModeConsumerMarksRetryTopic(Env& env) {
     c.setMessageListener(std::make_shared<CollectListener>(bodies));
     c.subscribe(t, "*");
     c.start();
-    // %RETRY%<group> 由 broker 处理心跳时按 ConsumerData.unitMode 建出来
+    // %RETRY%<group> is created by the broker while processing the heartbeat, per ConsumerData.unitMode
     const int32_t flag = waitSysFlag(env, MixAll::getRetryTopic(g), kFlagUnitSub, 40);
-    check("U4 心跳 unitMode=true 让 %RETRY% 带 UNIT_SUB 位", (flag & kFlagUnitSub) != 0,
+    check("U4 heartbeat unitMode=true makes %RETRY% carry the UNIT_SUB bit", (flag & kFlagUnitSub) != 0,
           "sysFlag=" + std::to_string(flag));
     c.shutdown();
 }
 
-// ---------------------------------------------------------------- U5 stream 生产者 + lite 消费者
+// ---------------------------------------------------------------- U5 stream producer + lite consumer
 void u5StreamProducerAndLiteConsumer(Env& env) {
     const std::string t = env.topic("U5");
     const std::string g = env.group("u5");
@@ -347,33 +347,33 @@ void u5StreamProducerAndLiteConsumer(Env& env) {
     lite.setPollTimeoutMillis(1000);
     lite.subscribe(t, "*");
     lite.start();
-    check("U5 lite 消费者默认 clientId 带 @STREAM", endsWith(lite.clientId(), kStreamSuffix),
+    check("U5 lite consumer default clientId carries @STREAM", endsWith(lite.clientId(), kStreamSuffix),
           "actual=" + lite.clientId());
 
     ScopedProducer p(env, "u5", "", /*unitMode=*/false, /*stream=*/true);
-    check("U5 显式开 stream 的生产者 clientId 带 @STREAM", endsWith(p.clientId(), kStreamSuffix),
+    check("U5 producer with stream explicitly enabled has clientId carrying @STREAM", endsWith(p.clientId(), kStreamSuffix),
           "actual=" + p.clientId());
     for (int i = 0; i < 3; ++i) {
         const SendResult r = p.send(t, "m" + std::to_string(i));
-        check("U5 第 " + std::to_string(i) + " 条发送成功", r.sendStatus == SendStatus::SEND_OK,
+        check("U5 send #" + std::to_string(i) + " succeeded", r.sendStatus == SendStatus::SEND_OK,
               r.msgId);
     }
 
-    // 分配必须在**首条消息之后**才等：topic 由第一次发送自动建出来，之前 namesrv 没有
-    // 路由，rebalance 拿到空队列是正确行为（不是客户端 bug）。
+    // The assignment must be waited for only **after the first message**: the topic is auto-created by the first send;
+    // before that the namesrv has no route, so rebalance seeing an empty queue is correct (not a client bug).
     for (int i = 0; i < 40 && lite.assignment().empty(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    check("U5 lite 消费者拿到队列分配", !lite.assignment().empty(),
+    check("U5 lite consumer got queue assignment", !lite.assignment().empty(),
           std::to_string(lite.assignment().size()));
 
     std::vector<std::string> got;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (got.size() < 3 && std::chrono::steady_clock::now() < deadline) {
-        // poll 会掏空本地缓冲，必须跨多次 poll 累加才凑得齐 3 条
+        // poll drains the local buffer, so all 3 messages only add up across repeated polls
         for (const MessageExt& m : lite.poll(1000)) got.push_back(bodyOf(m));
     }
-    check("U5 lite 消费者收到全部 3 条",
+    check("U5 lite consumer received all 3 messages",
           hasBody(got, "m0") && hasBody(got, "m1") && hasBody(got, "m2"), join(got));
     lite.shutdown();
 }
@@ -394,7 +394,7 @@ int main(int argc, char* argv[]) {
         u4UnitModeConsumerMarksRetryTopic(env);
         u5StreamProducerAndLiteConsumer(env);
     } catch (const std::exception& e) {
-        check("联调异常", false, e.what());
+        check("live integration error", false, e.what());
     }
     env.cleanup();
     std::printf("\nPASS=%d FAIL=%d\n", gPass, gFail);

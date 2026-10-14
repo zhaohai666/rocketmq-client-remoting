@@ -1,5 +1,5 @@
-// ConsumerStatsManager + ConsumeStatus/ConsumerRunningInfo(307) 编码单测。
-// 采样链不依赖真实时间窗（sum/tps 用窗口端点差分，测试直接喂采样点）。
+// Unit tests for ConsumerStatsManager + ConsumeStatus/ConsumerRunningInfo(307) encoding.
+// The sampling chain does not rely on real time windows (sum/tps use window-endpoint diffs; tests feed sample points directly).
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -40,13 +40,13 @@ std::string bodyStr(const Bytes& b) { return std::string(b.begin(), b.end()); }
 }  // namespace
 
 void testComputeStatsData() {
-    // 空链全 0
+    // Empty chain yields all zeros
     std::deque<std::tuple<int64_t, int64_t, int64_t>> empty;
     StatsSnapshot ss = computeStatsData(empty);
     expectEq(std::to_string(ss.sum), "0", "empty sum");
     expectEq(std::to_string(ss.times), "0", "empty times");
 
-    // sum = 末点-首点；tps = sum*1000/span；avgpt = sum/timesDiff
+    // sum = last point - first point; tps = sum*1000/span; avgpt = sum/timesDiff
     std::deque<std::tuple<int64_t, int64_t, int64_t>> chain = {
         {1000, 0, 0}, {2000, 300, 10}, {3000, 900, 20}};
     ss = computeStatsData(chain);
@@ -65,7 +65,7 @@ void testStatsItemSampling() {
     StatsSnapshot m = item.getStatsDataInMinute();
     expectEq(std::to_string(m.sum), "200", "minute window sum (differential)");
     expectEq(std::to_string(m.times), "2", "minute window times");
-    // 小时链是独立采样，小时窗口 sum 只到小时点
+    // The hour chain samples independently, so the hour-window sum covers only hour points
     item.sampleHour();
     StatsSnapshot h = item.getStatsDataInHour();
     expectEq(std::to_string(h.sum), "0", "hour chain has single point -> 0");
@@ -74,7 +74,7 @@ void testStatsItemSampling() {
 
 void testManagerConsumeStatus() {
     ConsumerStatsManager m;
-    // 直接注入相隔 1s 的两个采样点（不依赖真实时钟）
+    // Inject two sample points 1s apart directly (no dependency on the real clock)
     const int64_t now = UtilAll::currentTimeMillis();
     auto feed = [&](StatsItemSet& set, int64_t v, int64_t t) {
         set.getAndCreate("StatsTopic@GID_StatsUnit")
@@ -94,15 +94,15 @@ void testManagerConsumeStatus() {
     expectNear(cs.consumeRT, 10.0, 1e-6, "consumeRT = avgpt");
     expectNear(cs.consumeOKTPS, 8.0, 1e-6, "consumeOKTPS");
     expectNear(cs.consumeFailedTPS, 3.0, 1e-6, "consumeFailedTPS");
-    // 未记录的 key 返回全 0
+    // An unrecorded key returns all zeros
     ConsumeStatus zero = m.consumeStatus("GID_StatsUnit", "NoTopic");
     expectNear(zero.pullRT, 0.0, 1e-9, "unknown topic pullRT 0");
 }
 
 void testStartShutdown() {
-    // 生命周期：start 后采样线程在跑，shutdown 干净退出（不挂死）。
-    // 回归守卫：shutdown 曾经不唤醒停在 10s wait_for 的采样线程，
-    // 于是每个生产者/消费者关闭都要卡满一个采样周期。
+    // Lifecycle: after start the sampling thread runs; shutdown exits cleanly (no hang).
+    // Regression guard: shutdown once failed to wake a sampling thread parked in a 10s
+    // wait_for, so every producer/consumer shutdown stalled for a full sampling period.
     ConsumerStatsManager m;
     m.start();
     m.incPullRT("G", "T", 1);
@@ -115,7 +115,7 @@ void testStartShutdown() {
             .count());
     if (ms >= 1000) std::printf("  shutdown blocked %lldms (sampling thread not woken)\n", ms);
     expectTrue(ms < 1000, "shutdown wakes the sampling thread immediately");
-    m.shutdown();  // 幂等
+    m.shutdown();  // idempotent
 }
 
 void testConsumeStatusJson() {
@@ -131,7 +131,7 @@ void testConsumeStatusJson() {
     expectNear(back.pullRT, 1.5, 1e-9, "consumeStatus json roundtrip pullRT");
     expectEq(std::to_string(back.consumeFailedMsgs), "6", "consumeFailedMsgs roundtrip");
 
-    // ConsumerRunningInfo：statusTable/mqPopTable/userConsumerInfo 缺省输出空对象
+    // ConsumerRunningInfo: statusTable/mqPopTable/userConsumerInfo default to empty objects
     ConsumerRunningInfo ri;
     ri.properties[ConsumerRunningInfo::PROP_CONSUME_TYPE] = "CONSUME_PASSIVELY";
     ri.subscriptionSet = JsonValue::makeArray();

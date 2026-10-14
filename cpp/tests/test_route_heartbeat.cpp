@@ -1,4 +1,4 @@
-// 路由 / 心跳 / 订阅数据的编解码往返单测。
+// Unit tests for the route / heartbeat / subscription data encode-decode round trips.
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -76,7 +76,7 @@ static void testSubscriptionData() {
           "sub json must NOT contain filterClassSource (@JSONField serialize=false)");
     CHECK(!contains(json, "class_filter_mode"), "sub json must NOT use snake_case");
 
-    // JSON 往返
+    // JSON round trip
     SubscriptionData back = SubscriptionData::fromJson(sd.toJson());
     CHECK(back.topic == sd.topic && back.subString == sd.subString, "sub round-trip topic/subString");
     CHECK(back.tagsSet == sd.tagsSet && back.codeSet == sd.codeSet, "sub round-trip sets");
@@ -129,10 +129,10 @@ static void testBrokerData() {
     BrokerData back = BrokerData::fromJson(b.toJson());
     CHECK(back == b, "broker round-trip");
 
-    // master(0) 优先
+    // master(id=0) takes priority
     CHECK(b.selectBrokerAddr() == "127.0.0.1:10911", "broker select prefers master(id=0)");
 
-    // 只有从节点时也不崩，返回其中之一
+    // With only slave nodes it must still not crash and return one of them
     std::map<int64_t, std::string> slaves;
     slaves[1] = "127.0.0.1:10912";
     BrokerData onlySlave("c", "b", slaves, "", false);
@@ -140,7 +140,7 @@ static void testBrokerData() {
     BrokerData noAddr("c", "b", {}, "", false);
     CHECK(noAddr.selectBrokerAddr().empty(), "broker select empty when no addrs");
 
-    // 真实 nameserver 会回 fastjson 的裸数字键 {0:"..."}，必须能解析
+    // A real name server replies with fastjson bare numeric keys {0:"..."}; parsing must accept that
     JsonValue v;
     CHECK(jsonParse("{\"brokerAddrs\":{0:\"127.0.0.1:10911\",1:\"127.0.0.1:10912\"},"
                     "\"brokerName\":\"b\",\"cluster\":\"c\"}",
@@ -156,7 +156,7 @@ static void testBrokerData() {
 static void testTopicRouteData() {
     TopicRouteData t;
     t.setOrderTopicConf("");
-    // broker-a: 可读写(perm=6)；broker-b: 只读(perm=4) -> 不应进可写队列
+    // broker-a: read-write (perm=6); broker-b: read-only (perm=4) => must not enter the writable queues
     t.queueDatas.push_back(QueueData("broker-a", 4, 4, PermName::PERM_READ | PermName::PERM_WRITE, 0));
     t.queueDatas.push_back(QueueData("broker-b", 2, 2, PermName::PERM_READ, 0));
     std::map<int64_t, std::string> addrs;
@@ -164,14 +164,14 @@ static void testTopicRouteData() {
     t.brokerDatas.push_back(BrokerData("DefaultCluster", "broker-a", addrs));
     t.brokerDatas.push_back(BrokerData("DefaultCluster", "broker-b", addrs));
 
-    // 只挑可写且有对应 broker 的队列
+    // Only pick queues that are writable and whose broker is present
     std::vector<MessageQueue> mqs = t.getAllMessageQueue("TopicTest");
     CHECK(mqs.size() == 4, "route getAllMessageQueue only writable queues");
     CHECK(mqs[0].topic == "TopicTest" && mqs[0].brokerName == "broker-a" && mqs[0].queueId == 0,
           "route mq topic backfilled + broker");
     CHECK(mqs[3].queueId == 3, "route mq queueId sequence");
 
-    // encode/decode 往返
+    // encode/decode round trip
     Bytes encoded = t.encode();
     TopicRouteData decoded;
     CHECK(TopicRouteData::decode(encoded, decoded), "route decode ok");
@@ -179,7 +179,7 @@ static void testTopicRouteData() {
     CHECK(decoded.queueDatas[0] == t.queueDatas[0], "route decode queue equal");
     CHECK(decoded.brokerDatas[0] == t.brokerDatas[0], "route decode broker equal");
 
-    // 变化检测
+    // Change detection
     CHECK(t.topicRouteDataChanged(nullptr), "route changed vs null");
     CHECK(!t.topicRouteDataChanged(&decoded), "route unchanged after round-trip");
     TopicRouteData other = decoded;
@@ -206,13 +206,13 @@ static void testTopicRouteData() {
     masterless.queueDatas.push_back(
         QueueData("broker-b", 4, 4, PermName::PERM_READ | PermName::PERM_WRITE, 0));
     std::map<int64_t, std::string> slaveOnly;
-    slaveOnly[1] = "127.0.0.1:10931";  // master 掉线后的形状：只剩 brokerId=1
+    slaveOnly[1] = "127.0.0.1:10931";  // shape after the master dies: only brokerId=1 left
     masterless.brokerDatas.push_back(BrokerData("DefaultCluster", "broker-a", slaveOnly));
     masterless.brokerDatas.push_back(BrokerData("DefaultCluster", "broker-b", addrs));
     std::vector<MessageQueue> onlyB = masterless.getAllMessageQueue("T");
     CHECK(onlyB.size() == 4, "route skips broker without master");
     CHECK(onlyB[0].brokerName == "broker-b", "route keeps only the master-bearing broker");
-    // 负控：master 放回去，broker-a 的 4 条立刻回来（跳的是「没有 master」而不是名字）
+    // Negative control: put the master back and broker-a's 4 queues come right back (what is skipped is "no master", not the name)
     masterless.brokerDatas[0].brokerAddrs[0] = "127.0.0.1:10911";
     CHECK(masterless.getAllMessageQueue("T").size() == 8, "route keeps queue once master returns");
 
@@ -221,13 +221,13 @@ static void testTopicRouteData() {
         QueueData("broker-a", 4, 4, PermName::PERM_READ | PermName::PERM_WRITE, 0));
     subscribe.queueDatas.push_back(QueueData("broker-ro", 3, 1, PermName::PERM_READ, 0));
     slaveOnly.clear();
-    slaveOnly[1] = "127.0.0.1:10931";  // 只剩从节点
+    slaveOnly[1] = "127.0.0.1:10931";  // only slave nodes left
     subscribe.brokerDatas.push_back(BrokerData("DefaultCluster", "broker-a", slaveOnly));
     std::vector<MessageQueue> sub = subscribe.getAllSubscribeMessageQueue("T");
     CHECK(sub.size() == 7, "subscribe keeps masterless broker + read-only topic queues");
     CHECK(sub[0].brokerName == "broker-a" && sub[3].queueId == 3, "subscribe broker-a 4 queues");
     CHECK(sub[4].brokerName == "broker-ro" && sub[6].queueId == 2, "subscribe broker-ro 3 queues");
-    // 负控：只写（perm=2）的 queueData 读不出队列，broker-a 不受影响
+    // Negative control: a write-only (perm=2) queueData yields no readable queues; broker-a is unaffected
     TopicRouteData writeOnly = subscribe;
     writeOnly.queueDatas[1].perm = PermName::PERM_WRITE;
     CHECK(writeOnly.getAllSubscribeMessageQueue("T").size() == 4,
@@ -244,7 +244,7 @@ static void testHeartbeatData() {
     CHECK(hb.toJson().dump() == expected, "heartbeat exact json == fastjson2 output");
     CHECK(hb.toJson().dump() == expected, "heartbeat exact json stable");
 
-    // ConsumerData 字段名守卫：本版本**没有** consumeTimestamp / maxReconsumeTimes
+    // ConsumerData field-name guard: this version has **no** consumeTimestamp / maxReconsumeTimes
     ConsumerData cd("cg_probe", ConsumeType::CONSUME_PASSIVELY, MessageModel::CLUSTERING,
                     ConsumeFromWhere::CONSUME_FROM_LAST_OFFSET);
     cd.setUnitMode(false);
@@ -264,8 +264,8 @@ static void testHeartbeatData() {
     CHECK(!contains(cdJson, "maxReconsumeTimes"),
           "consumer json must NOT contain maxReconsumeTimes (absent in this protocol version)");
 
-    // unitMode=true 必须真的上线：broker 只看这一个字段决定 %RETRY%group 建出来
-    // 带不带 UNIT_SUB 位（broker 侧 ClientManageProcessor 的判定）。
+    // unitMode=true must really go on the wire: the broker looks only at this field to decide whether the %RETRY%group
+    // it creates carries the UNIT_SUB bit (the check in the broker's ClientManageProcessor).
     ConsumerData unitCd = cd;
     unitCd.setUnitMode(true);
     CHECK(contains(unitCd.toJson().dump(), "\"unitMode\":true"),
@@ -278,7 +278,7 @@ static void testHeartbeatData() {
     CHECK(unitBack.consumerDataSet.size() == 1 && unitBack.consumerDataSet[0].isUnitMode(),
           "unit heartbeat round-trips unitMode");
 
-    // HeartbeatData 顶层字段守卫
+    // HeartbeatData top-level field guards
     HeartbeatData full("10.0.0.1@12345");
     full.addProducerData(ProducerData("pg_probe"));
     full.addConsumerData(cd);
@@ -289,7 +289,7 @@ static void testHeartbeatData() {
           "heartbeat json withoutSub (not isWithoutSub)");
     CHECK(!contains(fullJson, "isWithoutSub"), "heartbeat json must use withoutSub key");
 
-    // encode/decode 往返
+    // encode/decode round trip
     Bytes enc = full.encode();
     HeartbeatData decoded;
     CHECK(HeartbeatData::decode(enc, decoded), "heartbeat decode ok");
@@ -314,13 +314,13 @@ static void testHeartbeatData() {
           "heartbeat decode isWithoutSub alias ok");
     CHECK(alt.withoutSub && alt.heartbeatFingerprint == 7, "heartbeat isWithoutSub alias value");
 
-    // 空 body 应解码失败而不是崩
+    // An empty body must fail to decode instead of crashing
     HeartbeatData dummy;
     CHECK(!HeartbeatData::decode("", dummy), "heartbeat decode empty fails gracefully");
     CHECK(!HeartbeatData::decode("not-json", dummy), "heartbeat decode garbage fails gracefully");
 }
 
-// ---------------------------------------------------------------- 枚举常量
+// ---------------------------------------------------------------- enum constants
 static void testEnumConstants() {
     CHECK(std::string(ConsumeType::CONSUME_ACTIVELY) == "CONSUME_ACTIVELY", "enum CONSUME_ACTIVELY");
     CHECK(std::string(ConsumeType::CONSUME_PASSIVELY) == "CONSUME_PASSIVELY", "enum CONSUME_PASSIVELY");
@@ -338,7 +338,7 @@ static void testEnumConstants() {
     CHECK(std::string(ExpressionType::SQL92) == "SQL92", "enum ExpressionType.SQL92");
     CHECK(std::string(ExpressionType::CLASS_FILTER) == "CLASS_FILTER", "enum ExpressionType.CLASS_FILTER");
 
-    // subVersion 默认应为当前时间戳量级（非 0）
+    // subVersion should default to the current-timestamp magnitude (non-zero)
     SubscriptionData fresh;
     CHECK(fresh.subVersion > 1600000000000LL, "subVersion defaults to current millis");
 }

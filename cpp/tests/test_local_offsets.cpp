@@ -1,4 +1,4 @@
-// 与 python/tests/test_local_offsets.py、rust/src/client/consumer.rs（mod tests）、
+// Local offset store unit tests: object-as-key wire format, parsing and save/load rotation (offline).
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -25,7 +25,7 @@ void expect(bool ok, const std::string& name, const std::string& detail = "") {
     }
 }
 
-// 真实 fastjson2 2.0.59 + rocketmq-client 5.5.0 的输出（含 pretty 版）
+// Real fastjson2 2.0.59 + rocketmq-client 5.5.0 output (compact form plus the pretty variant)
 const char* kWireCompact =
     "{\"offsetTable\":{{\"brokerName\":\"broker-a\",\"queueId\":1,\"topic\":\"Tt\"}:9,"
     "{\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"Tt\"}:7}}";
@@ -65,7 +65,7 @@ void testBuildUsesObjectAsKeyFormat() {
     std::string text = DefaultMQPushConsumer::buildLocalOffsetsJson(
         items({{"Ttbroker-a0", 7}, {"Ttbroker-a1", 9}}), mqMap());
     expect(text.rfind("{\"offsetTable\":{", 0) == 0, "build_format_prefix", text);
-    // 字段序 brokerName/queueId/topic（fastjson2 字母序），每个 key 是内嵌对象
+    // Field order brokerName/queueId/topic (fastjson2 alphabetical), each key is an embedded object
     expect(text.find("\"brokerName\":\"broker-a\",\"queueId\":0,\"topic\":\"Tt\"}:7") !=
                std::string::npos,
            "build_format_q0");
@@ -124,17 +124,17 @@ void testSaveWritesCompatFormatAndRollsBak() {
     DefaultMQPushConsumer::saveLocalOffsetsAt(path, items({{"Ttbroker-a0", 99}}), map);
     expect(readFile(path + ".bak") == raw, "save_bak_is_previous");
 
-    // 主文件在 → 读主文件
+    // Main file present -> read the main file
     std::map<std::string, int64_t> loaded = DefaultMQPushConsumer::loadLocalOffsetsAt(path);
     expect(loaded["Ttbroker-a0"] == 99, "load_main_wins");
 
-    // 主文件缺失 → .bak（上一代）
+    // Main file missing -> .bak (previous generation)
     std::error_code ec;
     std::filesystem::remove(path, ec);
     loaded = DefaultMQPushConsumer::loadLocalOffsetsAt(path);
     expect(loaded["Ttbroker-a0"] == 7, "load_falls_to_bak");
 
-    // .bak 也缺失 → 空（按首次启动处理）
+    // .bak also missing -> empty (treated as a first startup)
     std::filesystem::remove(path + ".bak", ec);
     expect(DefaultMQPushConsumer::loadLocalOffsetsAt(path).empty(), "load_both_missing_empty");
 

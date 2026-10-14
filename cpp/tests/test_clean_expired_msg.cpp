@@ -1,17 +1,17 @@
-// 为什么必须离线锁死：这条清扫是"listener 卡死不返回"时唯一的回收路径。少了它，一条卡住
-// 的消息会让该队列位点永久停在原地，且没有任何异常、日志或超时可见 —— 真机上只能靠
-// "消息发了却永远不来第二次"这种间接现象暴露；而清扫本身的窗口是分钟级、每轮 16 条上限
-// 也只有在离线用假时刻才能在秒级验证。语义三件套全都"错了很安静"：
-//   - 只看队首（最小位点）：漏判 → 队首卡住时后面的消息永远扫不到；
-//   - 过期判据**严格大于** consumeTimeout：写成 >= 会把边界消息提前回投（凭空重投）；
-//   - 单轮 min(size,16) 且 loop 在进循环前算一次：写成 while 会一轮清空整条队列。
+// Why it must be locked down offline: this sweep is the only reclaim path when "the listener blocks and never returns". Without it,
+// one stuck message pins that queue's offset forever with no exception, log or timeout visible anywhere -- on a live cluster it only
+// shows indirectly as "the message was sent but never arrives a second time"; and the sweep's own window is minutes-long while the
+// 16-entries-per-round cap is only verifiable at second granularity offline with a fake clock. All three semantic cornerstones "fail quietly":
+//   - only the head (smallest offset) is looked at: judged past it -> the messages behind a stuck head are never swept;
+//   - the expiry test is **strictly greater than** consumeTimeout: writing >= sends the boundary message back early (a phantom redelivery);
+//   - one round takes min(size,16) and the loop bound is computed before entering the loop: a while would empty the whole queue in one round.
 //
 //
-// 离线能锁的是「回投失败」这一支：未 start 的消费者 sendMessageBack 必失败（函数按返回值
-// 表态、不抛异常），所以结算断言是"消息留在原地、位点不许动"；「回投成功 → 摘除 →
-// %RETRY% 重投 → reconsumeTimes=1 的第二次投递」只能在真机取证
-//（examples/live_clean_expired_msg.cpp 是真机那一腿）。
-// 与 python/tests/test_clean_expired_msg.py、rust/src/client/consumer.rs、
+// Offline can lock the "send-back failed" branch: for a consumer that never started sendMessageBack always fails (the function reports through
+// its return value and throws nothing), so the settlement assertion is "the message stays put, the offset must not move"; "send-back succeeded -> removed ->
+// %RETRY% redelivery -> the second delivery with reconsumeTimes=1" can only be evidenced on a live cluster
+// (examples/live_clean_expired_msg.cpp is that live leg).
+// The same assertions are covered by the sibling offline clean-expired-message tests in this repository.
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -77,8 +77,8 @@ bool hasOffset(const std::vector<MessageExt>& msgs, int64_t offset) {
     return false;
 }
 
-// 未 start 的消费者即可：清扫/登记/位点推进全在本地状态上，唯一的网络动作是回投
-//（sendMessageBack），未 start 时 client() 必抛、函数按契约吞掉并返回 false。
+// A consumer that never started is enough: sweeping, registration and offset advance are all local state; the only network action is the send-back
+// (sendMessageBack), which must throw through client() when unstarted, and by contract the function swallows it and returns false.
 class Harness {
 public:
     explicit Harness(int32_t consumeTimeoutMinutes = 1)
@@ -112,7 +112,7 @@ public:
     }
 };
 
-// ---------------------------------------------------------------- 判据与节奏
+// ---------------------------------------------------------------- criterion and cadence
 
 void testExpiryArithmetic() {
     expect(!DefaultMQPushConsumer::isConsumeExpired(ext(0), 1, kNow),
@@ -123,11 +123,11 @@ void testExpiryArithmetic() {
     expect(DefaultMQPushConsumer::isConsumeExpired(stamped(0, kNow - 60001), 1, kNow),
            "expiry.oneMsPast.expired");
 
-    // 未来时间戳（时钟回拨/跨机器）也不能被算成过期
+    // A future timestamp (clock rollback / across machines) must not be counted as expired either
     expect(!DefaultMQPushConsumer::isConsumeExpired(stamped(0, kNow + 5000), 1, kNow),
            "expiry.futureStamp.notExpired");
 
-    // 阈值跟消费配置走：同一条消息在默认 15 分钟档还太新
+    // The threshold follows the consume configuration: the same message is still too fresh under the default 15 minute setting
     expect(!DefaultMQPushConsumer::isConsumeExpired(stamped(0, kNow - 60001), 15, kNow),
            "expiry.default15.notExpired");
 
@@ -150,7 +150,7 @@ void testPeriodMatchesSchedule() {
     expect(DefaultMQPushConsumer::cleanExpirePeriodMillis(-5) == 60000, "period.negativeClamps");
 }
 
-// ---------------------------------------------------------------- 选条语义
+// ---------------------------------------------------------------- entry selection semantics
 
 void testOnlyHeadIsConsideredAndExpiryIsStrict() {
     Harness h;
@@ -158,7 +158,7 @@ void testOnlyHeadIsConsideredAndExpiryIsStrict() {
     expect(h.sweep(kNow) == 0, "sweep.unstampedHead.noAttempt");
     expect(offsetsOf(h.entries()) == std::vector<int64_t>({0, 1}), "sweep.unstampedHead.entriesKept");
 
-    // 队首刚盖过章（没过期）同样停
+    // A head stamped just now (not expired) stops the sweep the same way
     Harness fresh;
     fresh.seedInflight({stamped(0, kNow - 1000)});
     expect(fresh.sweep(kNow) == 0, "sweep.fresh.notAttempted");
@@ -198,13 +198,13 @@ void testRemoveOnlyWhenStillHead() {
     h.consumer().removeExpiredEntryIfStillHead(h.key(), ext(3));
     expect(offsetsOf(h.entries()) == std::vector<int64_t>({5}), "remove.stillHeadRemoved");
 
-    // 5 现在挂着，但传进来的是「已经不是队首」的 5：前面若冒出 4，就不许摘 5
+    // 5 is pending now, but what is passed in is a 5 that "is no longer the head": if a 4 appears in front, 5 must not be removed
     h.seedPending({ext(4), ext(5)});
     h.consumer().removeExpiredEntryIfStillHead(h.key(), ext(5));
     expect(hasOffset(h.entries(), 5), "remove.notHeadLeftAlone");
     expect(h.entries().size() == 2, "remove.notHeadNothingRemoved");
 
-    // 表里没有的位点：no-op（不能顺手摘掉别人）
+    // An offset absent from the table: no-op (it must not remove somebody else's entry)
     h.consumer().removeExpiredEntryIfStillHead(h.key(), ext(99));
     expect(h.entries().size() == 2, "remove.absentIsNoop");
 }
@@ -228,7 +228,7 @@ void testEntriesViewIsUnionDeduped() {
     expect(hasOffset(h.entries(), 0) && hasOffset(h.entries(), 2), "union.bothSides");
 }
 
-// ---------------------------------------------------------------- 清扫范围与顺序消费
+// ---------------------------------------------------------------- sweep scope and orderly consumption
 
 void testSweepScopeIsHeldQueuesOnly() {
     DefaultMQPushConsumer c(kGroup);
@@ -245,7 +245,7 @@ void testSweepScopeIsHeldQueuesOnly() {
     c.setAssignedQueue(k1, q1);
     expect(c.cleanExpiredMsgOnce(kNow) == 2, "scope.bothHeld");
 
-    // 队列被撤（OFFSET_ILLEGAL 纠错走的就是 retireQueueLocked）：登记清空、不再被扫
+    // The queue was revoked (the OFFSET_ILLEGAL correction goes through retireQueueLocked): registration cleared, no longer swept
     c.handleOffsetIllegal(k0, 5);
     expect(c.processQueueEntries(k0).empty(), "scope.retiredClearsInflight");
     expect(c.cleanExpiredMsgOnce(kNow) == 1, "scope.retiredNotSwept");
@@ -261,7 +261,7 @@ void testOrderlyConsumerIsNeverSwept() {
     expect(c.processQueueEntries(key).size() == 1, "orderly.entryKept");
 }
 
-// ---------------------------------------------------------------- 与消费路径的配合
+// ---------------------------------------------------------------- interplay with the consumption path
 
 class ObservingListener : public MessageListenerConcurrently {
 public:
@@ -273,13 +273,13 @@ public:
         containsDuring_ = consumer_->processQueueContains(key_, msgs[0]);
         entriesDuring_ = static_cast<int>(consumer_->processQueueEntries(key_).size());
         const auto head = consumer_->processQueueHead(key_);
-        // 登记表里躺的必须是**已盖章**的副本：本端口的批次是值拷贝，盖章与登记的顺序
-        // 反了的话清扫永远看不见这些消息（真机上静默失效）
+        // The entry lying in the registry must be the **stamped** copy: batches in this port are value copies, so if the
+        // stamping and registration order were swapped the sweep would never see these messages (silently broken on a live cluster)
         headStamp_ = head.has_value()
                          ? head->getProperty(MessageConst::PROPERTY_CONSUME_START_TIMESTAMP)
                          : std::string();
         if (reclaim_) {
-            // 模拟"挂起期间清扫成功回投并摘除"（真机上这一步由清扫线程做）
+            // Simulate "during the suspend the sweep sent it back successfully and removed it" (the sweep thread does this on a live cluster)
             consumer_->removeExpiredEntryIfStillHead(key_, msgs[0]);
         }
         return ConsumeConcurrentlyStatus::RECONSUME_LATER;
@@ -313,8 +313,8 @@ void testConcurrentBatchSeesItselfInTheProcessQueue() {
     const std::string key = DefaultMQPushConsumer::offsetKey(queue0());
     auto listener = std::make_shared<ObservingListener>(&c, key, /*reclaim=*/false);
     c.setMessageListener(listener);
-    // 真分发链路里 pending_ 的槽位在这批取走之前就存在（takeBatchLocked 弹出后留一个空
-    // 双端队列），回投失败的条目正是塞回这个槽位 —— 离线补上同样的形状。
+    // In the real dispatch chain the pending_ slot exists before this batch is taken (takeBatchLocked pops and leaves an empty
+    // deque behind), and a failed send-back is pushed back into that very slot -- the offline setup reproduces the same shape.
     c.setPendingMessages(key, {});
 
     std::vector<MessageExt> batch{ext(0)};
@@ -325,11 +325,11 @@ void testConcurrentBatchSeesItselfInTheProcessQueue() {
            std::to_string(listener->entriesDuring_));
     expect(!listener->headStamp_.empty(), "batch.registeredCopyIsStamped");
 
-    // 未 start：回投失败 → 消息塞回队首、位点不动、返回 false（既有 ackIndex 语义）
+    // Not started: the send-back fails -> the message goes back to the queue head, the offset does not move, false is returned (existing ackIndex semantics)
     expect(!advanced, "batch.failedSendBackReturnsFalse");
     expect(offsetsOf(c.pendingMessages(key)) == std::vector<int64_t>({0}), "batch.requeuedToPending");
     expect(!c.consumeOffset(key).has_value(), "batch.offsetUntouched");
-    // 在途侧必须已注销（留下的那一份是"回投失败塞回缓冲"的 pending 副本）
+    // The inflight side must be deregistered (what remains is the pending copy "pushed back after the failed send-back")
     expect(hasOffset(c.processQueueEntries(key), 0) && c.processQueueEntries(key).size() == 1,
            "batch.inflightDeregistered");
 }
@@ -362,7 +362,7 @@ void testConcurrentBatchDeregistersOnSuccessAndAcrossRounds() {
     expect(c.consumeOffset(key) == 1, "ok.offsetAdvanced");
     expect(seen == 1, "ok.listenerCalled");
 
-    // 第二轮：上一批若漏注销，这里的在册视图会看到 2 条（泄漏检测）
+    // Second round: if the previous batch missed a deregistration, the in-register view would show 2 entries here (leak detection)
     std::vector<MessageExt> second{ext(1)};
     expect(c.consumeBatch(key, queue0(), second), "ok.secondReturnsTrue");
     expect(c.processQueueEntries(key).empty(), "ok.noLeakAcrossRounds");
@@ -370,8 +370,8 @@ void testConcurrentBatchDeregistersOnSuccessAndAcrossRounds() {
 }
 
 void testTakeThenConsumeKeepsOneCopy() {
-    // 真分发链路的离线缩微版：takeBatchForConsume（从 pending 取走并登记在途）→
-    // consumeBatch（消费 + 注销）。取走后消息只能存在于在途一侧，两边都在就是重复投递。
+    // An offline miniature of the real dispatch chain: takeBatchForConsume (takes from pending and registers as in-flight) ->
+    // consumeBatch (consume + deregister). After the take the message may exist only on the in-flight side; both sides holding it means duplicate delivery.
     DefaultMQPushConsumer c(kGroup);
     const std::string key = DefaultMQPushConsumer::offsetKey(queue0());
     int seen = 0;
@@ -382,9 +382,9 @@ void testTakeThenConsumeKeepsOneCopy() {
     std::vector<MessageExt> batch = c.takeBatchForConsume(key, &epoch);
     expect(batch.size() == 1, "pipeline.tookOne", std::to_string(batch.size()));
     expect(c.pendingMessages(key).empty(), "pipeline.pendingEmptied");
-    // 取走与"登记在途消息"之间有一个瞬时窗口：消息挂在 inflightCount_（计数器）上，
-    // 还不在并集视图里。清扫取不到它（没有本轮盖章）、correctTagsOffset 的闸门看的是
-    // 计数器 —— 两边都不会误判，所以这里如实锁住窗口的形状。
+    // There is a transient window between the take and "registering the in-flight message": the message hangs on inflightCount_ (a counter),
+    // not yet in the union view. The sweep cannot reach it (no stamp for this round) and the correctTagsOffset gate reads the
+    // counter -- neither side misjudges, so the shape of the window is pinned here exactly as it is.
     expect(c.processQueueEntries(key).empty(), "pipeline.takeWindowNotInUnionView");
 
     expect(c.consumeBatch(key, queue0(), batch, epoch), "pipeline.consumeReturnsTrue");

@@ -1,17 +1,17 @@
-// 跨语言互操作工具：与 Python 参考客户端交叉验证协议字节。
+// Cross-language interop tool: cross-checks protocol bytes with the Python reference client.
 //
-// 用法：
-//   rmq_interop --emit                 打印规范命令的 JSON / ROCKETMQ 两种编码（十六进制）
-//   rmq_interop --decode <hex>         解码给定十六进制帧并打印字段（供 Python -> C++ 验证）
-//   rmq_interop --emit-route           打印规范 TopicRouteData 的 JSON
-//   rmq_interop --emit-heartbeat       打印规范 HeartbeatData 的 JSON
-//   rmq_interop --decode-route <hex>   按 TopicRouteData 解码 hex(body)，回吐重序列化 JSON
-//   rmq_interop --decode-heartbeat <hex>  按 HeartbeatData 解码 hex(body)，回吐重序列化 JSON
+// Usage:
+//   rmq_interop --emit                 print the canonical command as JSON / ROCKETMQ encodings (hex)
+//   rmq_interop --decode <hex>         decode the given hex frame and print its fields (for Python -> C++ checks)
+//   rmq_interop --emit-route           print the JSON of the canonical TopicRouteData
+//   rmq_interop --emit-heartbeat       print the JSON of the canonical HeartbeatData
+//   rmq_interop --decode-route <hex>   decode hex(body) as TopicRouteData, emit the re-serialized JSON
+//   rmq_interop --decode-heartbeat <hex>  decode hex(body) as HeartbeatData, emit the re-serialized JSON
 //
-// "解码后重新序列化再交给 Python 用 json.loads 比对"这种形式，
-// 能把"字段名不一致"暴露成缺失键，而不是靠字符串相等这种脆弱断言。
+// "Decode, re-serialize, then have the other side compare the JSON with json.loads" exposes a
+// field-name mismatch as a missing key, instead of relying on the fragile string-equality assertion.
 //
-// 规范命令（两侧必须一致）：
+// Canonical command (both sides must use the same one):
 //   code=10, language=1(CPP), opaque=7, version=0, flag=0,
 //   remark="hello", extFields{topic=T_TEST, queueId=2}, body="payload"
 #include <iostream>
@@ -75,7 +75,7 @@ HeartbeatData canonicalHeartbeat() {
     return hb;
 }
 
-// 解码 hex 后按指定结构重序列化，输出单行 JSON
+// Decode the hex, re-serialize it with the given structure, print one line of JSON
 template <typename DecodeFn>
 int decodeAndDump(const char* hex, DecodeFn fn) {
     Bytes raw = UtilAll::string2Bytes(hex);

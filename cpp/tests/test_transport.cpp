@@ -1,13 +1,13 @@
-// 传输层单测：真实起一个本机 TCP 服务端，用 RemotingClient 真连、真发、真收。
+// Transport-layer unit test: really starts a local TCP server, uses RemotingClient to really connect, really send, really receive.
 //
-// 覆盖点（都是真实 socket 行为，不用 mock）：
-//   1. invokeSync 正常收发 + opaque 匹配 + 连接复用
-//   2. 半包/粘包：服务端把响应拆成两段发送，客户端必须正确重组
-//   3. invokeAsync 回调在读线程触发
-//   4. invokeOneway 发出即返回
-//   5. 建连失败 -> RemotingConnectException
-//   6. 服务端不回 -> RemotingTimeoutException（且不污染后续调用）
-//   7. closeChannel / isChannelWritable / shutdown 幂等
+// Coverage (all real socket behavior, no mocks):
+//   1. invokeSync normal send/receive + opaque matching + connection reuse
+//   2. partial / coalesced frames: the server splits the response into two sends, the client must reassemble correctly
+//   3. invokeAsync callback fires on the reader thread
+//   4. invokeOneway returns as soon as it is sent
+//   5. connect failure -> RemotingConnectException
+//   6. server never replies -> RemotingTimeoutException (and does not poison later calls)
+//   7. closeChannel / isChannelWritable / shutdown are idempotent
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -40,19 +40,19 @@ static int g_fail = 0;
         }                                                                      \
     } while (0)
 
-// 每进一段打一行进度标记（行首 `[`）。CI 上整条用例被 ctest 在 120s 掐掉时，
-// --output-on-failure 捕获的部分输出能指明停在第几段，配合栈看门狗定位到帧。
-// 带累计毫秒是为了区分两种红：某段自己就吃掉几十秒（预算被重试放大），
-// 和进了段之后彻底不动（真 parked）。本机永远绿（macOS 关 fd 会唤醒阻塞中的
-// recv），这类信息只能从 CI 拿。
+// Print one progress marker line (leading `[`) on entering each section. When CI kills the whole case at 120s via ctest,
+// the partial output captured by --output-on-failure shows which section it stopped in, and with the stack watchdog pinpoints the frame.
+// The accumulated milliseconds distinguish two kinds of red: a section that itself burns tens of seconds (the budget amplified by retries),
+// and being fully parked after entering the section (truly parked). Locally it is always green (on macOS closing the fd wakes a blocked recv),
+// so this kind of information can only be obtained from CI.
 //
-// 起点必须是**共享**的那一个：把 static 直接写在宏里，每个 `}` 块会各自初始化一份，
-// 于是每行都打 +0ms，等于没有时长信息。
+// The start point must be the **shared** one: writing the static directly in the macro initializes one copy per `}` block,
+// so every line prints +0ms, which is as good as having no duration information at all.
 #define STEP(label) std::cout << "[transport] " << (label) << " +" << transportElapsedMs() << "ms" << std::endl
 
 namespace {
 
-// 进程起来至今的毫秒数：所有 STEP 共享这一个起点。
+// Milliseconds since process start: all STEP lines share this single start point.
 int64_t transportElapsedMs() {
     static const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -64,21 +64,21 @@ using netcompat::socket_t;
 using netcompat::socklen_type;
 using netcompat::kInvalidSocket;
 
-// 每一步的等待都给显式上限，不落在构造函数的默认值上。
+// Every wait gets an explicit upper bound; do not fall back on the constructor defaults.
 //
-// 默认 invoke 超时是 15s：这条用例有七次同步调用，最坏路径（全部超时）累计要 100s+，
-// 低配 CI runner 上整条用例会以「***Timeout 120 sec」收场 —— 断言结果一条都看不到，
-// 无法区分"慢"和"挂"。预算压到秒级后，同样的最坏情况也能跑完并打印出具体哪条 FAIL。
+// The default invoke timeout is 15s: this case has seven synchronous calls, and the worst path (all of them timing out) accumulates 100s+;
+// on a low-spec CI runner the whole case ends as "***Timeout 120 sec" — not a single assertion result is visible, making "slow" and "hung"
+// indistinguishable. With the budget squeezed to seconds, the same worst case still finishes and prints exactly which assertion FAILed.
 constexpr int32_t kConnectTimeoutMs = 1000;
 constexpr int32_t kInvokeTimeoutMs = 4000;
-// GO_AWAY 的超时是「首试 + 重连 + 重发」共用的预算，多留一档
+// The GO_AWAY deadline is the budget shared by "first try + reconnect + resend"; keep one extra tier
 constexpr int32_t kGoAwayDeadlineMs = 5000;
 
-// 阻塞读取 n 字节；返回 false 表示对端关闭、出错或收到停止请求。
+// Blocking read of n bytes; returning false means the peer closed, an error occurred, or a stop request was received.
 //
-// 用 select 轮询而不是裸 recv：POSIX 上关闭本端 fd 不会唤醒阻塞在 recv 里的线程，
-// 服务端线程只要卡在"等下一个请求"上，~TestServer 的 join 就只能等 ctest 超时。
-// 100ms 一跳既能及时看到 stop_，也不空转烧 CPU。
+// Poll with select instead of a bare recv: on POSIX, closing the local fd does not wake a thread blocked in recv;
+// while a server thread is stuck "waiting for the next request", ~TestServer's join can only wait for the ctest timeout.
+// A 100ms tick both sees stop_ in time and does not spin the CPU.
 bool readN(socket_t s, char* buf, size_t n, const std::atomic<bool>& stop) {
     size_t got = 0;
     while (got < n) {
@@ -93,7 +93,7 @@ bool readN(socket_t s, char* buf, size_t n, const std::atomic<bool>& stop) {
             if (stop.load()) {
                 return false;
             }
-            continue;  // 没数据也没停机信号，接着等
+            continue;  // no data and no stop signal, keep waiting
         }
         if (ready < 0) {
             return false;
@@ -107,7 +107,7 @@ bool readN(socket_t s, char* buf, size_t n, const std::atomic<bool>& stop) {
     return true;
 }
 
-// 读取一个完整帧（含 4 字节 totalLength 前缀）
+// Read one complete frame (including the 4-byte totalLength prefix)
 bool readFrame(socket_t s, Bytes& out, const std::atomic<bool>& stop) {
     char lenBuf[4];
     if (!readN(s, lenBuf, 4, stop)) {
@@ -141,13 +141,13 @@ bool writeAll(socket_t s, const Bytes& data) {
 }
 
 enum class ServerMode {
-    Normal,    // 正常响应
-    HalfSplit, // 响应拆两段发（测半包重组）
-    Silent,    // 收到但永不回复（测超时）
-    GoAway     // 前 goAwayConns_ 条连接一律回 GO_AWAY(1500)，之后的连接正常响应
+    Normal,    // reply normally
+    HalfSplit, // split the response into two sends (tests partial-frame reassembly)
+    Silent,    // receive but never reply (tests timeout)
+    GoAway     // the first goAwayConns_ connections all reply GO_AWAY(1500); later connections respond normally
 };
 
-// 本机回环测试服务端：accept 一个连接，按 mode 处理若干请求
+// Local loopback test server: accepts one connection and handles a few requests per mode
 class TestServer {
 public:
     explicit TestServer(ServerMode mode, int maxRequests = 8, int goAwayConns = 0)
@@ -160,7 +160,7 @@ public:
         struct sockaddr_in addr;
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;  // 让内核分配端口
+        addr.sin_port = 0;  // let the kernel assign a port
         ::bind(listenSock_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
         ::listen(listenSock_, 4);
         socklen_type len = sizeof(addr);
@@ -170,10 +170,10 @@ public:
     }
 
     ~TestServer() {
-        // 先置位、再 join、最后关监听 socket：Windows 上 closesocket 不会唤醒阻塞在
-        // accept 里的线程，join 前先关句柄反而会让 serve() 使用已失效的 socket。
-        // accept 与连接内的读都走 100ms select 轮询并检查 stop_，所以这条 join 有上界；
-        // 客户端有没有及时关掉连接、甚至根本没关，都不影响线程退出。
+        // Set the flag first, then join, only then close the listen socket: on Windows closesocket does not
+        // wake a thread blocked in accept, so closing the handle before the join would let serve() use an
+        // already-invalidated socket. accept and the per-connection reads both poll with select for 100ms
+        // and check stop_, so this join is bounded whether or not the client ever closed its connection.
         stop_.store(true);
         if (thread_.joinable()) {
             thread_.join();
@@ -184,7 +184,7 @@ public:
     std::string address() const { return "127.0.0.1:" + std::to_string(port_); }
     int served() const { return served_.load(); }
     int connections() const { return conns_.load(); }
-    // 服务端见过的 opaque：GO_AWAY 重发必须是**新** opaque，用这个断言
+    // opaques the server has seen: a GO_AWAY resend must carry a **new** opaque, asserted via this
     std::vector<int32_t> opaques() const {
         std::lock_guard<std::mutex> lk(opaqueMutex);
         return opaqueLog_;
@@ -192,9 +192,9 @@ public:
 
 private:
     void serve() {
-        // 循环 accept：closeChannel 后客户端会重连，服务端必须愿意接第二次。
-        // 用 select 轮询而不是裸 accept：这样 stop_ 置位后线程能在 100ms 内退出
-        // （Windows 的 closesocket 不会唤醒阻塞中的 accept）。
+        // accept in a loop: the client reconnects after closeChannel, so the server must be
+        // willing to accept a second time. Poll with select instead of a bare accept: that way
+        // the thread exits within 100ms after stop_ is set (Windows' closesocket does not wake a blocked accept).
         while (!stop_.load() && served_.load() < maxRequests_) {
             fd_set rfds;
             FD_ZERO(&rfds);
@@ -204,10 +204,10 @@ private:
             tv.tv_usec = 100 * 1000;
             const int ready = ::select(netcompat::selectNfds(listenSock_), &rfds, nullptr, nullptr, &tv);
             if (ready == 0) {
-                continue;  // 超时，回去看 stop_
+                continue;  // timed out, go back and check stop_
             }
             if (ready < 0) {
-                break;  // 监听 socket 已被关闭
+                break;  // the listen socket has been closed
             }
             socket_t conn = ::accept(listenSock_, nullptr, nullptr);
             if (conn == kInvalidSocket) {
@@ -222,7 +222,7 @@ private:
         while (!stop_.load() && served_.load() < maxRequests_) {
             Bytes frame;
             if (!readFrame(conn, frame, stop_)) {
-                break;  // 对端关闭或半包中断
+                break;  // peer closed, or a partial frame was interrupted
             }
             RemotingCommand req;
             if (!RemotingCommand::tryDecode(frame, req, nullptr)) {
@@ -234,9 +234,9 @@ private:
                 opaqueLog_.push_back(req.opaque);
             }
             if (mode_ == ServerMode::Silent) {
-                // 不回复，而且**不关连接**：这条用例要测的是"对端一直不收口"下的超时清理
-                // （scanResponseTable 口径）。早先这里睡 1200ms 就返回，等于在 timeout + 宽限
-                // 之前把连接关了 —— 断连 failFast 会先一步把回调投递掉，报的就不是 TIMEOUT。
+                // Do not reply, and **do not close the connection**: this case tests timeout cleanup when the
+                // peer never stops receiving (the scanResponseTable contract). An earlier version slept 1200ms
+                // and returned, i.e. closed before timeout + grace — failFast delivered the callback first.
                 while (!stop_.load()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
@@ -246,14 +246,14 @@ private:
             resp.code = mode_ == ServerMode::GoAway && connIndex < goAwayConns_
                             ? ResponseCode::GO_AWAY
                             : ResponseCode::SUCCESS;
-            resp.opaque = req.opaque;  // 必须回填同一个 opaque
+            resp.opaque = req.opaque;  // must echo back the same opaque
             resp.markResponseType();
             resp.remark = "ok";
             resp.hasRemark = true;
             resp.extFields["echoCode"] = std::to_string(req.code);
             Bytes out = resp.encode();
             if (mode_ == ServerMode::HalfSplit && out.size() > 4) {
-                // 先发 3 字节（不足长度前缀），再发剩余 —— 强制客户端处理半包
+                // send 3 bytes first (short of the length prefix), then the rest — forces the client to handle a partial frame
                 Bytes head = out.substr(0, 3);
                 Bytes tail = out.substr(3);
                 writeAll(conn, head);
@@ -307,7 +307,7 @@ bool throwsTimeoutException(const std::string& addr) {
 }  // namespace
 
 int main() {
-    // ---------------------------------------------------------- 1. 正常同步调用 + 连接复用
+    // ---------------------------------------------------------- 1. normal sync call + connection reuse
     STEP("1 sync + reuse");
     {
         TestServer server(ServerMode::Normal, 4);
@@ -326,7 +326,7 @@ int main() {
         CHECK(client.isChannelWritable(addr), "isChannelWritable true after invoke");
         CHECK(client.connectionCount() == 1, "one connection established");
 
-        // 第二次调用应复用同一连接
+        // the second call should reuse the same connection
         RemotingCommand req2 = RemotingCommand::createRequestCommand(RequestCode::PULL_MESSAGE);
         RemotingCommand resp2 = client.invokeSync(addr, req2);
         CHECK(resp2.code == ResponseCode::SUCCESS, "second invokeSync ok (connection reused)");
@@ -337,7 +337,7 @@ int main() {
         client.shutdown();
     }
 
-    // ---------------------------------------------------------- 2. 半包重组
+    // ---------------------------------------------------------- 2. partial-frame reassembly
     STEP("2 half-split");
     {
         TestServer server(ServerMode::HalfSplit, 2);
@@ -350,7 +350,7 @@ int main() {
         client.shutdown();
     }
 
-    // ---------------------------------------------------------- 3. 异步回调
+    // ---------------------------------------------------------- 3. async callback
     STEP("3 async callback");
     {
         TestServer server(ServerMode::Normal, 2);
@@ -383,9 +383,9 @@ int main() {
         client.shutdown();
     }
 
-    // ------------------------------------------------------ 3b. 异步超时回调
-    // 对端收下请求但永不回复：timeoutMillis 必须生效，回调仍要触发**一次**（带 error）。
-    // 修复前该参数被直接丢弃，在途表项和回调都会永久悬挂。
+    // ------------------------------------------------------ 3b. async timeout callback
+    // The peer takes the request but never replies: timeoutMillis must take effect and the callback must still
+    // fire **once** (with an error). Before the fix the parameter was dropped, so both the in-flight entry and the callback hung forever.
     STEP("3b async timeout");
     {
         TestServer server(ServerMode::Silent, 1);
@@ -413,7 +413,7 @@ int main() {
         client.shutdown();
     }
 
-    // ---------------------------------------------------------- 4. 单向调用
+    // ---------------------------------------------------------- 4. one-way call
     STEP("4 oneway");
     {
         TestServer server(ServerMode::Normal, 2);
@@ -427,7 +427,7 @@ int main() {
         }
         CHECK(!threw, "invokeOneway does not throw");
         CHECK(req.isOnewayRpc(), "invokeOneway marks oneway flag");
-        // 等服务端确实收到
+        // wait until the server really received it
         for (int i = 0; i < 100 && server.served() < 1; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -435,14 +435,14 @@ int main() {
         client.shutdown();
     }
 
-    // ---------------------------------------------------------- 5. 建连失败
+    // ---------------------------------------------------------- 5. connect failure
     STEP("5 connect failure");
     {
-        // 127.0.0.1:1 基本不可能有服务
+        // 127.0.0.1:1 almost certainly has no service
         CHECK(throwsConnectException("127.0.0.1:1"), "connect failure -> RemotingConnectException");
     }
 
-    // ---------------------------------------------------------- 6. 超时
+    // ---------------------------------------------------------- 6. timeout
     STEP("6 no response");
     {
         TestServer server(ServerMode::Silent, 2);
@@ -462,19 +462,19 @@ int main() {
         client.closeChannel(addr);
         CHECK(!client.isChannelWritable(addr), "channel not writable after close");
         CHECK(client.connectionCount() == 0, "connection removed after closeChannel");
-        // 关闭后仍能重新建连
+        // still able to reconnect after close
         RemotingCommand req2 = RemotingCommand::createRequestCommand(RequestCode::HEART_BEAT);
         RemotingCommand resp2 = client.invokeSync(addr, req2);
         CHECK(resp2.code == ResponseCode::SUCCESS, "reconnect after closeChannel works");
         client.shutdown();
-        client.shutdown();  // 幂等
+        client.shutdown();  // idempotent
         CHECK(client.connectionCount() == 0, "connectionCount 0 after shutdown");
         CHECK(!client.isChannelWritable(addr), "not writable after shutdown");
     }
 
     STEP("8.1 goaway retry");
     {
-        // 8.1 第一条连接回 GO_AWAY，第二条正常 -> 调用方只看到成功
+        // 8.1 the first connection answers GO_AWAY, the second responds normally -> the caller only sees success
         TestServer server(ServerMode::GoAway, 4, 1);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
         const std::string addr = server.address();
@@ -491,7 +491,7 @@ int main() {
     }
     STEP("8.2 goaway twice");
     {
-        // 8.2 两次都 GO_AWAY -> 抛错而不是无限重连
+        // 8.2 both attempts GO_AWAY -> throw instead of reconnecting forever
         TestServer server(ServerMode::GoAway, 4, 1000);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
         RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE_V2);
@@ -513,7 +513,7 @@ int main() {
     }
     STEP("8.3 goaway flag off");
     {
-        // 8.3 开关关掉：直接失败，一条连接都不重连
+        // 8.3 with the switch off: fail directly, no reconnect on any connection
         TestServer server(ServerMode::GoAway, 4, 1000);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
         client.setEnableReconnectForGoAway(false);
@@ -562,7 +562,7 @@ int main() {
     }
     STEP("8.5 async goaway twice");
     {
-        // 8.5 异步两次 GO_AWAY -> 折成回调错误，不能悄悄吞掉
+        // 8.5 async with two GO_AWAYs -> folded into a callback error, must not be silently swallowed
         TestServer server(ServerMode::GoAway, 4, 1000);
         RemotingClient client(kConnectTimeoutMs, kInvokeTimeoutMs);
         RemotingCommand req = RemotingCommand::createRequestCommand(RequestCode::SEND_MESSAGE_V2);
@@ -587,7 +587,7 @@ int main() {
         client.shutdown();
     }
 
-    // ---------------------------------------------------------- 9. 地址解析
+    // ---------------------------------------------------------- 9. address parsing
     STEP("9 parse address");
     {
         std::string h;

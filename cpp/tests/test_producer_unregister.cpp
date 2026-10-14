@@ -1,15 +1,15 @@
-// 退出注销 UNREGISTER_CLIENT(35) 的离线单测 —— 不需要集群。
+// Offline unit test for UNREGISTER_CLIENT(35) at shutdown -- no cluster required.
 //
 //
 //
-// 覆盖：
-//   1. 生产者侧头形状：只有 clientID + producerGroup，consumerGroup 整个字段不上线
-//   2. 消费者侧头形状：只有 clientID + consumerGroup
-//   3. 两侧都有时三个键都在
-//   4. 扇出含从节点（改回只打 master 的用例必然失败），且每台各一发
-//   5. 单台 broker 回 SYSTEM_ERROR：`unregisterClient` 抛、`unregisterClientAllBrokers` 吞
-//   6. 心跳的收件人分流：helper 层面（`getRouteOfAllBrokers` 只给 master /
-//      `getAllBrokerAddrs` 主从都给）+ 行为层面（真起一个消费者，主从各收一发心跳）
+// Coverage:
+//   1. Producer-side header shape: only clientID + producerGroup, the consumerGroup field is not sent
+//   2. Consumer-side header shape: only clientID + consumerGroup
+//   3. When both sides exist, all three keys are present
+//   4. Fan-out includes slaves (an implementation sending only to master must fail here), one send each
+//   5. One broker answers SYSTEM_ERROR: `unregisterClient` throws, `unregisterClientAllBrokers` swallows
+//   6. Heartbeat recipient split: helper level (`getRouteOfAllBrokers` master only /
+//      `getAllBrokerAddrs` master and slave) plus behavior level (a real consumer, master and slave each receive one heartbeat)
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -131,12 +131,12 @@ bool readFrame(socket_t s, const std::atomic<bool>& alive, Bytes& out) {
 struct Record {
     int32_t code = 0;
     PropertyMap ext;
-    /// 请求体原样（心跳的消费组只在 body 里，extFields 是空的）。
+    /// The request body verbatim (the heartbeat consumer group is only in the body; extFields is empty).
     Bytes body;
 };
 
-// 扮演 broker：按请求码回脚本化的响应码，并把每一帧的 extFields 留证。
-// 只有路由请求会被特殊对待（name server 与 broker 同一套骨架，这里只服务路由 + 注销）。
+// Plays a broker: replies with scripted response codes per request code and keeps the extFields of every frame as evidence.
+// Only route requests get special treatment (name server and broker share one skeleton; here it serves route + unregister only).
 class MockBroker {
 public:
     explicit MockBroker(bool servesRoutes = false) : servesRoutes_(servesRoutes) {
@@ -182,7 +182,7 @@ public:
         routes_[topic] = route.encode();
     }
 
-    // 第 i 笔 35 回 codes[i]（越界回 SUCCESS）；取证与计数一起清零，脚本才对得上
+    // The i-th 35 answers codes[i] (beyond the script answers SUCCESS); evidence and counter clear together so the script lines up
     void scriptUnregisters(std::vector<int32_t> codes) {
         std::lock_guard<std::mutex> lk(state_);
         unregCodes_ = std::move(codes);
@@ -256,7 +256,7 @@ private:
                     resp.code = ResponseCode::SUCCESS;
                 }
             } else if (req.code == RequestCode::HEART_BEAT) {
-                // 心跳只留证不脚本化：收件人是谁由计数与 body 断言。
+                // Heartbeats are only recorded, never scripted: who received them is asserted via counts and body.
                 std::lock_guard<std::mutex> lk(state_);
                 records_.push_back({req.code, req.extFields, req.body});
                 resp.code = ResponseCode::SUCCESS;
@@ -284,7 +284,7 @@ private:
     std::thread acceptor_;
 };
 
-// ---------------------------------------------------------------- 用例脚手架
+// ---------------------------------------------------------------- test scaffolding
 
 const char* kClientId = "127.0.0.1@1234";
 const char* kGroup = "PID_Unregister";
@@ -320,60 +320,60 @@ void testHeaderShape() {
     broker.scriptUnregisters({});
     instance->unregisterClient(broker.address(), kClientId, kGroup, "");
     std::vector<Record> got = broker.recordsOf(RequestCode::UNREGISTER_CLIENT);
-    expectInt(static_cast<long long>(got.size()), 1, "生产者注销正好一笔 35");
+    expectInt(static_cast<long long>(got.size()), 1, "producer unregister sends exactly one 35");
     if (!got.empty()) {
         PropertyMap want;
         want["clientID"] = kClientId;
         want["producerGroup"] = kGroup;
-        expect(got[0].ext == want, "生产者侧只有 clientID + producerGroup", keyText(got[0].ext));
+        expect(got[0].ext == want, "producer side carries only clientID + producerGroup", keyText(got[0].ext));
     }
 
     broker.scriptUnregisters({});
     instance->unregisterClient(broker.address(), kClientId, "", kGroup);
     got = broker.recordsOf(RequestCode::UNREGISTER_CLIENT);
-    expectInt(static_cast<long long>(got.size()), 1, "消费者注销正好一笔 35");
+    expectInt(static_cast<long long>(got.size()), 1, "consumer unregister sends exactly one 35");
     if (!got.empty()) {
         PropertyMap want;
         want["clientID"] = kClientId;
         want["consumerGroup"] = kGroup;
-        expect(got[0].ext == want, "消费者侧只有 clientID + consumerGroup", keyText(got[0].ext));
+        expect(got[0].ext == want, "consumer side carries only clientID + consumerGroup", keyText(got[0].ext));
     }
 
     broker.scriptUnregisters({});
     instance->unregisterClient(broker.address(), kClientId, kGroup, kGroup);
     got = broker.recordsOf(RequestCode::UNREGISTER_CLIENT);
-    expectInt(static_cast<long long>(got.size()), 1, "两侧都有时正好一笔 35");
+    expectInt(static_cast<long long>(got.size()), 1, "both sides present sends exactly one 35");
     if (!got.empty()) {
         std::vector<std::string> keys;
         for (const auto& kv : got[0].ext) keys.push_back(kv.first);
         std::sort(keys.begin(), keys.end());
         const std::vector<std::string> want = {"clientID", "consumerGroup", "producerGroup"};
-        expect(keys == want, "三个键都在", keyText(got[0].ext));
+        expect(keys == want, "all three keys present", keyText(got[0].ext));
     }
 
     broker.scriptUnregisters({});
     instance->unregisterClient(broker.address(), kClientId, "   ", kGroup);
     got = broker.recordsOf(RequestCode::UNREGISTER_CLIENT);
     expect(got.empty() || got[0].ext.count("producerGroup") == 0,
-           "空白 producerGroup 不上线", got.empty() ? "" : keyText(got[0].ext));
+           "blank producerGroup is not sent", got.empty() ? "" : keyText(got[0].ext));
 }
 
-// 4. 扇出含从节点：每台各一发（只用 master 的实现这里必然少一发）
+// 4. Fan-out includes slaves: one send per broker (a master-only implementation is short one send here)
 void testFanOutIncludesSlaves(MockBroker& namesrv, MockBroker& master, MockBroker& slave) {
     auto instance = seeded(namesrv, master, slave);
     master.scriptUnregisters({});
     slave.scriptUnregisters({});
     instance->unregisterClientAllBrokers(kClientId, kGroup, "");
-    expectInt(master.countOf(RequestCode::UNREGISTER_CLIENT), 1, "master 收到一发 35");
-    expectInt(slave.countOf(RequestCode::UNREGISTER_CLIENT), 1, "slave 也收到一发 35");
+    expectInt(master.countOf(RequestCode::UNREGISTER_CLIENT), 1, "master receives one 35");
+    expectInt(slave.countOf(RequestCode::UNREGISTER_CLIENT), 1, "slave also receives one 35");
     std::vector<Record> m = master.recordsOf(RequestCode::UNREGISTER_CLIENT);
     if (!m.empty()) {
-        expect(m[0].ext.count("consumerGroup") == 0, "扇出的每一发都不带 consumerGroup",
+        expect(m[0].ext.count("consumerGroup") == 0, "no send in the fan-out carries consumerGroup",
                keyText(m[0].ext));
     }
 }
 
-// 5. 单台失败只吞不抛；直接调用的那一层照旧抛出带码的异常
+// 5. A single failure is swallowed, not thrown; the direct call layer still throws an exception carrying the code
 void testFailureIsSwallowed(MockBroker& namesrv, MockBroker& master, MockBroker& slave) {
     auto instance = seeded(namesrv, master, slave);
     master.scriptUnregisters({ResponseCode::SYSTEM_ERROR});
@@ -383,13 +383,13 @@ void testFailureIsSwallowed(MockBroker& namesrv, MockBroker& master, MockBroker&
         instance->unregisterClientAllBrokers(kClientId, kGroup, "");
     } catch (const std::exception& e) {
         threw = 1;
-        std::printf("  不该抛: %s\n", e.what());
+        std::printf("  should not throw: %s\n", e.what());
     }
-    expect(threw == 0, "单台 broker 报错不会把 shutdown 打断");
-    expectInt(master.countOf(RequestCode::UNREGISTER_CLIENT), 1, "报错那台也照样发过");
-    expectInt(slave.countOf(RequestCode::UNREGISTER_CLIENT), 1, "报错之后下一台继续发");
+    expect(threw == 0, "one broker error does not interrupt shutdown");
+    expectInt(master.countOf(RequestCode::UNREGISTER_CLIENT), 1, "the failing broker was still sent to");
+    expectInt(slave.countOf(RequestCode::UNREGISTER_CLIENT), 1, "the next broker is still sent to after an error");
 
-    // 底层单发不吞：调用方要能拿到 broker 的响应码
+    // The single-send layer does not swallow: the caller must be able to read the broker response code
     master.scriptUnregisters({ResponseCode::SYSTEM_ERROR});
     int32_t code = 0;
     try {
@@ -397,27 +397,27 @@ void testFailureIsSwallowed(MockBroker& namesrv, MockBroker& master, MockBroker&
     } catch (const MQBrokerException& e) {
         code = e.getResponseCode();
     } catch (const std::exception& e) {
-        std::printf("  异常类型不对: %s\n", e.what());
+        std::printf("  wrong exception type: %s\n", e.what());
     }
-    expectInt(code, ResponseCode::SYSTEM_ERROR, "unregisterClient 把非 SUCCESS 抛成 MQBrokerException");
+    expectInt(code, ResponseCode::SYSTEM_ERROR, "unregisterClient throws non-SUCCESS as MQBrokerException");
 }
 
-// 6. 心跳的收件人分流：helper 层面 + 行为层面
+// 6. Heartbeat recipient split: helper level plus behavior level
 //
-// helper：`getRouteOfAllBrokers` 每个 brokerName 只挑一台（生产者心跳用），
-//         `getAllBrokerAddrs` 主从都给（消费者心跳、注销用）。
-// 行为：真起一个消费者（订阅一个在假 nameserver 上有路由的 topic），start() 里的首轮心跳
-//       必须主、从各落一发；从节点拿到的 body 里带消费组（它据此建自己的 ConsumerGroupInfo，
-//       否则指向它的拉取会被 `PullMessageProcessor`:420-427 回 SUBSCRIPTION_NOT_EXIST）。
+// helper: `getRouteOfAllBrokers` picks one broker per brokerName (producer heartbeats use it),
+//         `getAllBrokerAddrs` returns master and slave (consumer heartbeats and unregistration use it).
+// behavior: a real consumer is started (subscribing to a topic with a route in the fake name server); the first heartbeat
+//       round in start() must land once on the master and once on the slave; the body the slave receives carries the consumer
+//       group (it builds its own ConsumerGroupInfo from it, otherwise pulls to it answer SUBSCRIPTION_NOT_EXIST per `PullMessageProcessor`:420-427).
 void testHeartbeatFanOut(MockBroker& namesrv, MockBroker& master, MockBroker& slave) {
     {
         auto instance = seeded(namesrv, master, slave);
         std::vector<std::string> masterOnly = instance->getRouteOfAllBrokers();
-        expectInt(static_cast<long long>(masterOnly.size()), 1, "getRouteOfAllBrokers 只给 master");
-        if (!masterOnly.empty()) expect(masterOnly[0] == master.address(), "那台就是 master");
+        expectInt(static_cast<long long>(masterOnly.size()), 1, "getRouteOfAllBrokers returns master only");
+        if (!masterOnly.empty()) expect(masterOnly[0] == master.address(), "that broker is the master");
         std::vector<std::string> all = instance->getAllBrokerAddrs();
-        expectInt(static_cast<long long>(all.size()), 2, "getAllBrokerAddrs 主从都给");
-        expect(std::find(all.begin(), all.end(), slave.address()) != all.end(), "从节点在表里");
+        expectInt(static_cast<long long>(all.size()), 2, "getAllBrokerAddrs returns master and slave");
+        expect(std::find(all.begin(), all.end(), slave.address()) != all.end(), "the slave is in the table");
     }
 
     master.scriptUnregisters({});
@@ -427,13 +427,13 @@ void testHeartbeatFanOut(MockBroker& namesrv, MockBroker& master, MockBroker& sl
     consumer.subscribe(kTopic, "*");
     consumer.setMessageListener(std::make_shared<NoopListener>());
     consumer.start();
-    expectInt(master.countOf(RequestCode::HEART_BEAT) >= 1 ? 1 : 0, 1, "master 收到心跳");
-    // 这条就是本用例的存在意义：扇出只打 master 的实现这里必然 0
-    expectInt(slave.countOf(RequestCode::HEART_BEAT) >= 1 ? 1 : 0, 1, "slave 也收到心跳");
+    expectInt(master.countOf(RequestCode::HEART_BEAT) >= 1 ? 1 : 0, 1, "master receives a heartbeat");
+    // This assertion is the reason the case exists: a fan-out sending only to master is 0 here
+    expectInt(slave.countOf(RequestCode::HEART_BEAT) >= 1 ? 1 : 0, 1, "slave also receives a heartbeat");
     std::vector<Record> onSlave = slave.recordsOf(RequestCode::HEART_BEAT);
     if (!onSlave.empty()) {
         const std::string body(onSlave[0].body.begin(), onSlave[0].body.end());
-        expect(body.find(kGroup) != std::string::npos, "从节点拿到的 body 带消费组", body);
+        expect(body.find(kGroup) != std::string::npos, "the body the slave receives carries the consumer group", body);
     }
     consumer.shutdown();
 }

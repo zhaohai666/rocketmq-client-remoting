@@ -1,6 +1,6 @@
-// 另外两组是**真机踩出来的回归守卫**，勿删：
-//   * 无 keys 的 SubBefore（末段为空）解出来只剩 7 段，必须能解出而不是被跳过/越界；
-//   * 一条坏记录不能毁掉整条 trace data（真机表现：2 条轨迹消息只解出 1 条记录）。
+// The other two groups are **regression guards earned on live clusters**; do not delete them:
+//   * a SubBefore without keys (empty last segment) decodes to only 7 segments and must parse, not be skipped or run out of bounds;
+//   * one broken record must not ruin the whole trace data (live symptom: only 1 of 2 trace records was decoded).
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -16,7 +16,7 @@ namespace {
 int fails = 0;
 int checks = 0;
 
-// 把控制字符转成可读形式，失败时才看得懂
+// Render control characters in readable form so a failure printout stays legible
 std::string esc(const std::string& s) {
     std::string out;
     for (char c : s) {
@@ -134,7 +134,7 @@ std::shared_ptr<TraceContext> pubContext(const std::string& topic, const std::st
     return ctx;
 }
 
-// 捕获发送的假分发器（sendTraceMessage 是 protected 虚函数 seam，不打真实网络）
+// Capturing fake dispatcher (sendTraceMessage is a protected virtual seam; no real network is hit)
 class CapturingDispatcher : public AsyncTraceDispatcher {
 public:
     struct Sent {
@@ -172,7 +172,7 @@ int main() {
         expect(tb.has_value(), "pub: encoder returns value");
         if (tb.has_value()) {
             expectEq(tb->transData, expectedPub(), "pub: matches the recorded wire vector");
-            // trans_key = msgId + 按空格拆开的业务 keys
+            // trans_key = msgId + business keys split on spaces
             expect(tb->transKey.size() == 3 && tb->transKey.count(MSG_ID_1) == 1 &&
                        tb->transKey.count("KeyA") == 1 && tb->transKey.count("KeyB") == 1,
                    "pub: trans_key = msgId + business keys");
@@ -255,7 +255,7 @@ int main() {
     expect(!TraceDataEncoder::encoderFromContextBean(nullptr).has_value(),
            "encoder(nullptr) -> nullopt");
     {
-        TraceContext ctx;  // 未设置 traceType
+        TraceContext ctx;  // traceType left unset
         expect(!TraceDataEncoder::encoderFromContextBean(&ctx).has_value(),
                "encoder(no traceType) -> nullopt");
         expect(ctx.accessChannelOrLocal() == AccessChannel::LOCAL,
@@ -276,7 +276,7 @@ int main() {
         expect(parts.size() == 1 && parts[0] == "abc", "javaSplit: no separator");
     }
 
-    // ================================================= 3. 解码：往返一致
+    // ================================================= 3. decoding: round-trip consistency
     {
         auto records = TraceDataEncoder::decoderFromTraceDataString(expectedPub());
         expectInt(static_cast<long long>(records.size()), 1, "decode pub: 1 record");
@@ -315,8 +315,8 @@ int main() {
         expect(b.transactionId == "TRAN-001" && b.transactionState == "COMMIT_MESSAGE",
                "decode end_tx: transaction id/state");
         expect(!b.fromTransactionCheck, "decode end_tx: fromTransactionCheck");
-        // 向量里的 msgType 段来自 makeBean()（NORMAL=0）；真实客户端发 END_TRANSACTION 轨迹时
-        // 钩子会填 Trans_msg_Commit(2)，但编码/解码本身只看 ordinal。
+        // The msgType segment in the vector comes from makeBean() (NORMAL=0); a real client sending an END_TRANSACTION trace
+        // fills Trans_msg_Commit(2) via the hook, but encode/decode itself only looks at the ordinal.
         expectInt(b.msgType, 0, "decode end_tx: msgType ordinal from vector");
     }
     {
@@ -325,7 +325,7 @@ int main() {
         expect(records[0].isSuccess, "decode recall: success=true");
     }
     {
-        // 老版本 Pub（13 段，无 offsetMsgId）
+        // old-version Pub (13 segments, no offsetMsgId)
         std::string old = joinFields({"Pub", "1700000000000", "DefaultRegion", "GID_test",
                                       "TopicTest", MSG_ID_1, "TagA", "KeyA KeyB",
                                       "127.0.0.1:10911", "42", "7", "0", "true"}) + STX;
@@ -335,7 +335,7 @@ int main() {
         expect(records[0].traceBeans[0].offsetMsgId.empty(), "decode pub v13: no offsetMsgId");
     }
     {
-        // 带 clientHost 的 15 段形式
+        // the 15-segment form carrying clientHost
         std::string v15 = joinFields({"Pub", "1700000000000", "DefaultRegion", "GID_test",
                                       "TopicTest", MSG_ID_1, "TagA", "KeyA KeyB",
                                       "127.0.0.1:10911", "42", "7", "0", OFFSET_MSG_ID, "true",
@@ -349,7 +349,7 @@ int main() {
     expect(TraceDataEncoder::decoderFromTraceDataString(STX + STX).empty(),
            "decode bare separators -> no records");
 
-    // ================================================= 4. 回归守卫：无 keys 的 SubBefore
+    // ================================================= 4. regression guard: keyless SubBefore
     {
         std::string raw = joinFields({"SubBefore", "1700000000000", "DefaultRegion",
                                       "GID_trace_live", "REQ-001", MSG_ID_1, "0", ""}) + STX;
@@ -362,9 +362,9 @@ int main() {
         expectInt(records[0].traceBeans[0].retryTimes, 0, "keyless SubBefore: retryTimes");
     }
 
-    // ================================================= 5. 回归守卫：坏记录隔离
+    // ================================================= 5. regression guard: broken-record isolation
     {
-        std::string broken = joinFields({"SubAfter", "REQ-9", MSG_ID_2}) + STX;  // 段数不足
+        std::string broken = joinFields({"SubAfter", "REQ-9", MSG_ID_2}) + STX;  // too few segments
         std::string goodSub = joinFields({"SubBefore", "1700000000000", "R", "G", "REQ-1",
                                           MSG_ID_1, "0", "K"}) + STX;
         auto records =
@@ -376,14 +376,14 @@ int main() {
             expect(records[1].traceType == TraceType::SUB_BEFORE,
                    "bad record isolated: sub_before kept after");
         }
-        // 未知类型只跳过自己
+        // an unknown type skips only itself
         std::string unknown = joinFields({"SomethingNew", "1", "2"}) + STX;
         auto r2 = TraceDataEncoder::decoderFromTraceDataString(unknown + expectedRecall());
         expectInt(static_cast<long long>(r2.size()), 1, "unknown kind: only itself skipped");
         expect(r2[0].traceType == TraceType::RECALL, "unknown kind: recall survives");
     }
 
-    // ================================================= 6. 分发器：分组 / keys / 跳过规则
+    // ================================================= 6. dispatcher: grouping / keys / skip rules
     {
         CapturingDispatcher d("GID_trace_test", TraceDispatcherType::PRODUCE, 20, "");
         expect(d.getTraceTopicName() == "RMQ_SYS_TRACE_TOPIC", "dispatcher: default trace topic");
@@ -404,7 +404,7 @@ int main() {
                    "dispatcher: sends to trace topic");
             expectEq(d.sent[0].body, rec1 + rec2, "dispatcher: body concatenates records");
             expectInt(countOf(d.sent[0].body, STX), 2, "dispatcher: 2 records in body");
-            // keys 里含两个 msgId 与业务 key（控制台按 keys 反查轨迹）
+            // keys carries both msgIds and the business keys (the console looks up traces by keys)
             const std::string& k = d.sent[0].keys;
             expect(k.find(MSG_ID_1) != std::string::npos &&
                        k.find(MSG_ID_2) != std::string::npos &&
@@ -415,7 +415,7 @@ int main() {
         expectInt(d.discardCount(), 0, "dispatcher: nothing discarded");
     }
     {
-        // 不同业务 topic -> 各自一条轨迹消息
+        // different business topics -> one trace message each
         CapturingDispatcher d("G", TraceDispatcherType::PRODUCE, 20, "");
         d.append(pubContext("TopicA", MSG_ID_1, "K"));
         d.append(pubContext("TopicB", MSG_ID_2, "K"));
@@ -458,7 +458,7 @@ int main() {
         }
     }
 
-    // ================================================= 7. 模型默认值
+    // ================================================= 7. model defaults
     {
         TraceBean b;
         expectInt(b.msgType, 0, "bean: default msgType = Normal_Msg");

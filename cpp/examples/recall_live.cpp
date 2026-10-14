@@ -1,12 +1,12 @@
-// C++ 客户端「定时消息撤回（RECALL_MESSAGE 370）」真机联调
+// Live-cluster check of timed-message recall (RECALL_MESSAGE 370) for the C++ client
 //
-// 为什么必须真机：句柄不是客户端能自己拼出来的。只有 broker 在
-// SendMessageProcessor#attachRecallHandle 里（且仅当消息带 TIMER_* 延迟属性）才会把句柄
-// 挂回 SEND 响应头；撤回是否真的生效也只能靠「到点没投递」来证明。离线单测
-// （tests/test_recall_message.cpp）锁的是编解码、报文键名和本地校验顺序，证不了语义。
+// Why a real cluster: the handle is not client-assemblable. Only the broker, in
+// SendMessageProcessor#attachRecallHandle (and only for messages with TIMER_* delay properties),
+// attaches it back to the SEND response header; only "no delivery at the due time" proves the recall.
+// The offline unit test (tests/test_recall_message.cpp) pins codec, wire keys and check order only.
 //
 //
-// 用法：./rmq_recall_live [namesrv]（需本地 5.5.1 集群，且 timerWheelEnable=true）
+// Usage: ./rmq_recall_live [namesrv] (needs a local 5.5.1 cluster with timerWheelEnable=true)
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -135,19 +135,19 @@ int main(int argc, char* argv[]) {
         std::string addr = producer.client().brokerAddrOf(kBrokerName);
         if (addr.empty()) addr = "127.0.0.1:10911";
         original = readFlag(admin, addr);
-        check("R0 能读到 broker 的 recallMessageEnable", !original.empty(), "value=" + original);
+        check("R0 broker's recallMessageEnable is readable", !original.empty(), "value=" + original);
         if (original != "true") {
             opened = writeFlag(admin, addr, "true");
-            check("R0 已临时打开 recallMessageEnable", opened);
+            check("R0 recallMessageEnable temporarily switched on", opened);
         }
         if (readFlag(admin, addr) != "true") {
-            check("R0 recall 未在 broker 上开启，后续检查无意义", false);
+            check("R0 recall is not enabled on the broker, later checks are meaningless", false);
             admin.shutdown();
             producer.shutdown();
             return 1;
         }
 
-        // ---- R1/R2：定时消息才带句柄，且句柄内容与发送结果一致 ----
+        // ---- R1/R2: only timed messages carry a handle, and the handle matches the send result ----
         Message toRecall(topic, bytesOf("to-recall"));
         toRecall.putProperty("TIMER_DELAY_SEC", std::to_string(kDelaySec));
         Message control(topic, bytesOf("control"));
@@ -158,24 +158,24 @@ int main(int argc, char* argv[]) {
         SendResult rControl = producer.send(control);
         SendResult rPlain = producer.send(plain);
         const bool hasHandle = rRecall.recallHandle.has_value() && !rRecall.recallHandle->empty();
-        check("R1 定时消息带回 recallHandle", hasHandle,
+        check("R1 timed message returns a recallHandle", hasHandle,
               hasHandle ? rRecall.recallHandle.value() : std::string());
-        check("R1 普通消息不带 recallHandle", !rPlain.recallHandle.has_value());
+        check("R1 plain message carries no recallHandle", !rPlain.recallHandle.has_value());
 
         HandleV1 parsed;
         try {
             parsed = decodeRecallHandle(rRecall.recallHandle.value_or(""));
-            check("R2 broker 的句柄能被我们的编解码器解开", true);
+            check("R2 the broker handle decodes with our codec", true);
         } catch (const std::exception& e) {
-            check("R2 broker 的句柄能被我们的编解码器解开", false, e.what());
+            check("R2 the broker handle decodes with our codec", false, e.what());
         }
-        check("R2 句柄里的 topic/brokerName 与发送目标一致",
+        check("R2 topic/brokerName in the handle match the send target",
               parsed.topic == topic && parsed.brokerName == kBrokerName,
               parsed.topic + "/" + parsed.brokerName);
-        check("R2 句柄里的 uniqKey 就是这条消息的 UNIQ_KEY", parsed.messageId == rRecall.msgId,
+        check("R2 the uniqKey in the handle is this message's UNIQ_KEY", parsed.messageId == rRecall.msgId,
               "handle=" + parsed.messageId + " send=" + rRecall.msgId);
 
-        // ---- R4/R5：本地校验必须在打网络之前跑完 ----
+        // ---- R4/R5: local validation must finish before any network traffic ----
         std::string msg;
         try {
             (void)producer.recallMessage(MixAll::getRetryTopic(group), rRecall.recallHandle.value_or(""));
@@ -183,7 +183,7 @@ int main(int argc, char* argv[]) {
         } catch (const std::exception& e) {
             msg = e.what();
         }
-        check("R4 %RETRY% topic 被拒", msg == "topic is not supported", msg);
+        check("R4 %RETRY% topic is rejected", msg == "topic is not supported", msg);
 
         const int64_t began = nowMs();
         try {
@@ -193,16 +193,16 @@ int main(int argc, char* argv[]) {
             msg = e.what();
         }
         const int64_t cost = nowMs() - began;
-        check("R5 非法句柄本地即拒", msg == "recall handle is invalid" && cost < 200,
+        check("R5 invalid handle is rejected locally", msg == "recall handle is invalid" && cost < 200,
               msg + " (" + std::to_string(cost) + "ms)");
 
-        // ---- R3/R6：真的撤掉了，且没牵连对照消息 ----
+        // ---- R3/R6: the recall really took effect, and the control message was unharmed ----
         try {
             const std::string recalled = producer.recallMessage(topic, rRecall.recallHandle.value());
-            check("R3 recallMessage 返回被撤回消息的 uniqKey", recalled == rRecall.msgId,
+            check("R3 recallMessage returns the uniqKey of the recalled message", recalled == rRecall.msgId,
                   "resp=" + recalled + " send=" + rRecall.msgId);
         } catch (const std::exception& e) {
-            check("R3 recallMessage 返回被撤回消息的 uniqKey", false, e.what());
+            check("R3 recallMessage returns the uniqKey of the recalled message", false, e.what());
         }
 
         std::vector<std::string> bodies;
@@ -216,14 +216,14 @@ int main(int argc, char* argv[]) {
             std::this_thread::sleep_for(std::chrono::seconds(kConsumeWindowSec));
             consumer->shutdown();
         }
-        check("R6 对照定时消息按时投递", hasBody(bodies, "control"), joinBodies(bodies));
-        check("R6 普通消息已投递", hasBody(bodies, "plain"), joinBodies(bodies));
-        check("R6 被撤回的定时消息永远没投递", !hasBody(bodies, "to-recall"), joinBodies(bodies));
+        check("R6 control timed message delivered on time", hasBody(bodies, "control"), joinBodies(bodies));
+        check("R6 plain message delivered", hasBody(bodies, "plain"), joinBodies(bodies));
+        check("R6 the recalled timed message is never delivered", !hasBody(bodies, "to-recall"), joinBodies(bodies));
     } catch (const std::exception& e) {
-        check("联调异常", false, e.what());
+        check("live run threw", false, e.what());
     }
 
-    // 无论成功失败都要还原：这是共享的开发 broker，不能把开关留在打开状态。
+    // Restore either way, pass or fail: the development broker is shared, the flag must not stay on.
     bool restored = false;
     if (!original.empty()) {
         try {
@@ -235,9 +235,9 @@ int main(int argc, char* argv[]) {
             std::printf("  [diag] restore failed: %s\n", e.what());
         }
     } else {
-        restored = !opened;  // 没读到也没改过 —— 视为无需还原
+        restored = !opened;  // neither read nor changed -- taken as nothing to restore
     }
-    check(std::string("R7 broker 的 recallMessageEnable 已还原为 ") + original, restored);
+    check(std::string("R7 broker's recallMessageEnable restored to ") + original, restored);
 
     admin.shutdown();
     producer.shutdown();

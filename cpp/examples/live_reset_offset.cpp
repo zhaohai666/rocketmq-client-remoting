@@ -1,31 +1,31 @@
-// 重置消费位点（220 推送链路）真机联调，场景逐条断言。
+// Live runbook for consumer-offset reset (the 220 push chain), asserting each scenario in turn.
 //
-// 220 是 broker 推给**消费端**的重置指令；管理端那笔 INVOKE_BROKER_TO_RESET_OFFSET(222)
-// 的响应只是一张「每个队列重置到哪」的表，真正让消费端改位点的是 broker 随后 oneway 推的
-// 220（Broker2Client.resetOffset:181-238）。broker 只在 useServerSideResetOffset=false
-// 时才走这条推送路径（默认 true 在 AdminBrokerProcessor:2255-2263 直接服务端改位点、一台
-// 消费端都不通知），所以本验证先把该开关热改成 false（回读确认），跑完还原。
+// 220 is the reset command the broker pushes to the **consumer side**; the admin-side
+// INVOKE_BROKER_TO_RESET_OFFSET(222) response is only a table of "which offset each queue resets to" -- what truly
+// makes the consumer side change its offset is the 220 the broker then pushes oneway (Broker2Client.resetOffset:181-238).
+// The broker only takes this push path when useServerSideResetOffset=false
+// (the default true changes offsets server-side directly in AdminBrokerProcessor:2255-2263 without notifying a single consumer), so this verification first hot-updates the switch to false (confirmed by read-back) and restores it after the run.
 //
-// 离线单测（tests/test_reset_offset.cpp）锁死了请求体两种形状与「撤队列 + 代号 +1 + 新位点
-// 经撤销尾巴落盘」的本地状态；下面这些事只有真集群能证明：
+// The offline unit tests (tests/test_reset_offset.cpp) already lock the two request-body shapes and the local state of "queue removal
+// + code +1 + new offset landing on disk through the revoked tail"; only a real cluster can prove the following:
 //
-//   S1「回退重置立刻生效 + 在途批次作废」——位点从 10 往回重置到 3，三段判据：
-//      a) broker 上的已提交位点在 ~2s 内变成 3：窗口内**只有**重置路径那次 persist 会写它
-//         （周期落盘已拉长到 60s），只写内存表的实现在这里原地不动（broker 停在 10）；
-//      b) listener 里卡着的旧批次（重置前取回的 offset 10）放行后，它的 ack 必须整批作废
-//         —— 采样点：放行旧批次、新队列的**第一批**已进 listener 且还没 ack 时，本地已消费
-//         位点必须还是"没有记录 / ≤3"；没有代号闸门的实现这时会跳到 11；
-//      c) 队列被真正重建：3..14 每一批都**重投一次**（旧缓冲里没 ack 的 11..14 也随之
-//         作废，只能作为重投的一部分出现），放行一轮断言一轮。
+//   S1 "backward reset takes effect immediately + in-flight batches voided" — the offset is reset backward from 10 to 3, with three criteria:
+//      a) the committed offset on the broker becomes 3 within ~2s: inside the window **only** that one persist of the reset path writes it
+//         (periodic flushing has been stretched to 60s); an implementation that only writes the in-memory table stands still here (the broker stays at 10);
+//      b) after the stuck old batch in the listener (fetched offset 10 before the reset) is released, its ack must be voided as a whole batch
+//         — sampling point: after releasing the old batch, when the **first** batch of the new queue is in the listener but not yet acked, the local consumed
+//         offset must still be "no record / <=3"; an implementation without the epoch gate jumps to 11 here;
+//      c) the queue is truly rebuilt: every batch of 3..14 is **redelivered once** (the un-acked 11..14 in the old buffer are voided along with it and
+//         can only appear as part of the redelivery), release one round and assert one round.
 //
-//   S2「前跳 + 恢复」——timestamp=-1 重置到 maxOffset：位点直接跳到 10，中间 4..9 一条都不
-//      投；随后新消息照常消费、位点继续前进。
+//   S2 "forward skip + recovery" — reset to maxOffset with timestamp=-1: the offset jumps straight to 10 and none of 4..9 is
+//      delivered; afterwards new messages are consumed normally and the offset keeps advancing.
 //
-// 说明：为什么必须在 listener 里逐批设闸——"重置生效"的失败模式在真机上只表现为"位点没动、
-// 消息照旧不重投"，admin 侧完全看不出异常；而把时序判断塞进离线单测又依赖不了真 broker 的
-// 推送与 offset 表。逐批可控才有"旧批次已放行、新队列第一批还没 ack"这个采样点。
+// Rationale: why the gate must be per batch in the listener — on a real machine the failure mode of "the reset took effect" only shows as "the offset never moved and
+// messages are never redelivered", invisible from the admin side; and putting the timing judgement into an offline unit test cannot rely on a real broker's
+// pushes and offset table. Per-batch control is what creates the sampling point "the old batch is released, the new queue's first batch is not yet acked".
 //
-// 用法：./rmq_live_reset_offset 127.0.0.1:9876
+// Usage: ./rmq_live_reset_offset 127.0.0.1:9876
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -74,10 +74,10 @@ int64_t nowMs() {
         .count();
 }
 
-// 墙钟毫秒（Unix epoch）。**按时间戳重置只用它，不用 nowMs()**：broker 的
-// `getOffsetInQueueByTime` 拿它跟消息的 storeTimestamp（broker 的墙钟）比大小，而
-// steady_clock 在 macOS 上是"开机以来的毫秒"（比真实 epoch 小三个数量级）——用错时钟的
-// 症状是静默的：目标位点恒定 0（时间戳落在所有消息之前），重置"成功"但把整条队列从头发。
+// Wall-clock milliseconds (Unix epoch). **Timestamp-based resets use only this, never nowMs()**: the broker's
+// `getOffsetInQueueByTime` compares it against each message's storeTimestamp (the broker's wall clock), while
+// steady_clock on macOS is "milliseconds since boot" (three orders of magnitude below the real epoch) — the symptom of
+// the wrong clock is silent: the target offset is constantly 0 (the timestamp falls before every message), the reset "succeeds" but replays the whole queue from the head.
 int64_t wallMs() {
     return UtilAll::currentTimeMillis();
 }
@@ -91,7 +91,7 @@ bool waitUntil(const std::function<bool()>& pred, int64_t timeoutMs, int64_t int
     return pred();
 }
 
-// 用于"很快就要发生"的断言：采样比 waitUntil 密。
+// For assertions about "something that is about to happen very soon": sampled denser than waitUntil.
 bool waitBefore(const std::function<bool()>& pred, int64_t windowMs) {
     return waitUntil(pred, windowMs, 50);
 }
@@ -118,10 +118,10 @@ std::string fmtTable(const std::map<MessageQueue, int64_t>& table) {
     return s + "}";
 }
 
-// 逐批设闸：每一批都停在闸门上，由测试逐批放行 —— 批与批之间的本地状态因此可以被采样。
+// Per-batch gating: every batch stops at the gate and the test releases it batch by batch -- the local state between batches can therefore be sampled.
 //
-// S1 的关键采样点（旧批次已放行、新队列第一批还没 ack）只有在"逐批可控"时才存在；一次性
-// 放行的 listener 会把 11（旧批次 ack）与随后的重投混在一个瞬间里。
+// S1's key sampling point (old batch released, the new queue's first batch not yet acked) only exists with per-batch control; a listener
+// released all at once would mix 11 (the old batch's ack) and the following redelivery into one instant.
 class SteppingListener : public MessageListenerConcurrently {
 public:
     ConsumeConcurrentlyStatus consumeMessage(const std::vector<MessageExt>& msgs,
@@ -135,9 +135,9 @@ public:
             batches_.push_back(batch);
         }
         std::unique_lock<std::mutex> lk(mtx_);
-        // 上限只防死锁：正常路径由测试逐批 release()
+        // The cap only guards against deadlock: the normal path is released batch by batch by the test
         cv_.wait_for(lk, std::chrono::seconds(90), [this] { return released_; });
-        released_ = false;  // 一批一放：放行后复位，等待下一批 release()
+        released_ = false;  // one release per batch: reset after releasing and wait for the next batch's release()
         return ConsumeConcurrentlyStatus::CONSUME_SUCCESS;
     }
 
@@ -198,7 +198,7 @@ private:
 struct Row {
     MessageQueue mq;
     int64_t maxOffset = -1;
-    bool hasCommitted = false;  // false = broker 上查无记录（QUERY_NOT_FOUND）
+    bool hasCommitted = false;  // false = no record found on the broker (QUERY_NOT_FOUND)
     int64_t committed = -1;
 };
 
@@ -229,7 +229,7 @@ struct Fixture {
         ClusterInfo cluster = admin.fetchBrokerClusterInfo();
         const std::vector<std::string> addrs = cluster.getBrokerAddrs();
         if (addrs.empty()) {
-            throw std::runtime_error("nameServer 无 broker 注册");
+            throw std::runtime_error("the name server has no registered broker");
         }
         brokerAddr = addrs[0];
         producer = std::make_shared<DefaultMQProducer>("GID_cpp_live_ro_pg_" + stamp);
@@ -243,8 +243,8 @@ struct Fixture {
         return route.getAllMessageQueue(topicName);
     }
 
-    // [(mq, maxOffset, committed)]；hasCommitted=false 表示 broker 上查无记录。
-    // setZeroIfNotFound=false：空记录 0 与「没记录」必须能分开。
+    // [(mq, maxOffset, committed)]; hasCommitted=false means no record found on the broker.
+    // setZeroIfNotFound=false: an empty record 0 and "no record" must stay distinguishable.
     std::vector<Row> offsets(const std::string& group, const std::string& topicName) {
         std::vector<Row> out;
         for (const MessageQueue& mq : queues(topicName)) {
@@ -307,7 +307,7 @@ bool setServerSideReset(Fixture& fx, const std::string& value) {
     return readFlag(fx.admin, fx.brokerAddr, kSwitchKey) == value;
 }
 
-// 消费者视角下该 topic 的队列 key（用路由上的 mq 拼，与 offsetKey 同口径）。
+// The queue key of this topic from the consumer's point of view (built from the routed mq, same convention as offsetKey).
 std::string queueKeyOf(DefaultMQPushConsumer& c, const std::string& topic) {
     for (const MessageQueue& mq : c.fetchSubscribeMessageQueues(topic)) {
         if (mq.queueId == 0) {
@@ -317,7 +317,7 @@ std::string queueKeyOf(DefaultMQPushConsumer& c, const std::string& topic) {
     return std::string();
 }
 
-// 本端口内存里的「已消费位点」；nullopt = 该队列在表里没有记录。
+// The "consumed offset" in this client's in-memory table; nullopt = this queue has no record in the table.
 std::optional<int64_t> localOffset(DefaultMQPushConsumer& c, const std::string& topic) {
     const std::map<MessageQueue, int64_t> status = c.getConsumerStatus(topic);
     for (const auto& kv : status) {
@@ -356,11 +356,11 @@ bool brokerIs(Fixture& fx, const std::string& group, const std::string& topic, i
     return true;
 }
 
-// ------------------------------------------------ S1：回退重置 + 在途批次作废
+// ------------------------------------------------ S1: backward reset + in-flight batches voided
 
 void s1BackwardReset(Fixture& fx, const std::string& topic, const std::string& group) {
-    std::printf("\n--- S1：回退重置（10 → 3）立刻落盘 + 在途批次整批作废 ---\n");
-    // 前置：先用普通 listener 把 broker 上的位点做成 10（reset 要求该组在 broker 上有记录）
+    std::printf("\n--- S1: backward reset (10 -> 3) persisted at once + the in-flight batch voided as a whole ---\n");
+    // Precondition: first use a plain listener to bring the offset on the broker to 10 (a reset requires the group to have a record there)
     auto l0 = std::make_shared<RecordingListener>();
     std::shared_ptr<DefaultMQPushConsumer> c0 =
         startConsumer(fx, group, "s1seed", topic, l0, /*batchSize=*/1, /*persist=*/0);
@@ -371,23 +371,23 @@ void s1BackwardReset(Fixture& fx, const std::string& topic, const std::string& g
         fx.producer->send(m);
         if (i == 2) {
             tMid = wallMs();
-            // 让第 3 条（offset 3）与前面三条拉开存储时间，后面按时间戳重置才能稳定命中 3
+            // Leave a store-time gap between the message at offset 3 and the three before it, so the later timestamp-based reset reliably hits 3
             std::this_thread::sleep_for(std::chrono::seconds(2));
         }
     }
     const bool seeded =
         waitUntil([&] { return l0->offsets().size() == static_cast<size_t>(kMsgs); }, 30000, 200);
-    check("S1-前置：消费者消费掉 " + std::to_string(kMsgs) + " 条", seeded,
+    check("S1-precondition: the consumer consumes " + std::to_string(kMsgs) + " messages", seeded,
           "arrivals=" + fmtOffsets(l0->offsets()));
 
     bool primed = waitUntil([&] { return brokerIs(fx, group, topic, kMsgs); }, 20000, 500);
-    check("S1-前置：broker 位点周期落盘到 " + std::to_string(kMsgs) +
-              "（reset 要求组在 broker 上有记录）",
+    check("S1-precondition: the broker offset is periodically persisted to " + std::to_string(kMsgs) +
+              " (a reset requires the group to have a record on the broker)",
           primed, fmtRows(fx.offsets(group, topic)));
     c0->shutdown();
     std::this_thread::sleep_for(std::chrono::seconds(1));
 
-    // 主力消费者：逐批闸住 + 周期落盘 60s ⇒ 窗口内唯一能改 broker 位点的路径是重置自带的那次
+    // The main consumer: batches gated one by one + a 60s periodic flush => inside the window the only path that can move the broker offset is the persist carried by the reset itself
     auto listener = std::make_shared<SteppingListener>();
     std::shared_ptr<DefaultMQPushConsumer> c =
         startConsumer(fx, group, "s1", topic, listener, /*batchSize=*/1, /*persist=*/60000);
@@ -409,7 +409,7 @@ void s1BackwardReset(Fixture& fx, const std::string& topic, const std::string& g
         },
         30000, 50);
     const std::vector<int64_t> firstArrivals = listener->offsets();
-    check("S1-窗口就绪：1 条在途（offset 10 卡在 listener）+ 4 条留在缓冲",
+    check("S1-window ready: 1 message in flight (offset 10 stuck in the listener) + 4 left in the buffer",
           arranged && !firstArrivals.empty() && firstArrivals[0] == kMsgs,
           "arrivals=" + fmtOffsets(firstArrivals) + " pending=" + std::to_string(pending));
     if (!arranged || key.empty()) {
@@ -419,40 +419,40 @@ void s1BackwardReset(Fixture& fx, const std::string& topic, const std::string& g
     }
 
     waitUntil([&] { return nowMs() - tStart > 12000; }, 15000, 200);
-    check("S1-首跳周期落盘已过（此后 60s 内不再有周期写）",
+    check("S1-the initial periodic flush has passed (no further periodic write for the next 60s)",
           nowMs() - tStart > 12000 && brokerIs(fx, group, topic, kMsgs),
           fmtRows(fx.offsets(group, topic)));
 
-    // 按时间戳重置到 3：tMid 落在第 3 条与第 4 条之间 ⇒ getOffsetInQueueByTime 命中 3，
-    // 3 < consumerOffset(10) 且 isForce=true ⇒ broker 推 {mq: 3}
+    // Reset to 3 by timestamp: tMid falls between the 3rd and the 4th message => getOffsetInQueueByTime hits 3,
+    // and 3 < consumerOffset(10) with isForce=true => the broker pushes {mq: 3}
     const int64_t resetTs = tMid + 500;
     const int64_t t0 = nowMs();
     std::map<MessageQueue, int64_t> table =
         fx.admin.resetOffsetByTimestamp(topic, group, resetTs, /*isForce=*/true);
-    check("S1-222 响应里的目标位点就是 3",
+    check("S1-the target offset in the 222 response is exactly 3",
           table.size() == 1 && table.begin()->second == kBackTarget, fmtTable(table));
 
     const bool in2s = waitBefore([&] { return brokerIs(fx, group, topic, kBackTarget); }, 2000);
     char detail[160];
     std::snprintf(detail, sizeof(detail), "elapsed=%.1fs %s", (nowMs() - t0) / 1000.0,
                   fmtRows(fx.offsets(group, topic)).c_str());
-    check("S1-broker 位点 ~2s 内变成 3（重置路径自带的那次 persist，周期落盘=60s）", in2s,
+    check("S1-the broker offset becomes 3 within ~2s (the persist carried by the reset path; periodic flush=60s)", in2s,
           detail);
 
     std::optional<int64_t> off = localOffset(*c, topic);
-    check("S1-重置后本地表里没有旧位点（removeOffset；新位点经撤销尾巴出去）",
+    check("S1-no old offset left in the local table after the reset (removeOffset; the new offset goes out through the revoked tail)",
           !off.has_value(),
           "local_offset=" + offText(off) + " epoch=" + std::to_string(c->queueEpoch(key)));
 
-    // 放行旧批次：它的 ack 属于已被撤销的 ProcessQueue，必须作废
+    // Release the old batch: its ack belongs to the already revoked ProcessQueue and must be voided
     listener->release();
     const bool second = waitBatches(*listener, 2, 20000);
     off = localOffset(*c, topic);
-    check("S1-旧批次 ack 作废（放行后新队列第一批 offset 3 已在途时，本地位点仍未越过 3）",
+    check("S1-the old batch ack is voided (after the release, while the new queue's first batch at offset 3 is already in flight, the local offset still has not passed 3)",
           second && (!off.has_value() || *off <= kBackTarget),
           "local_offset=" + offText(off) + " arrivals=" + fmtOffsets(listener->offsets()));
 
-    // 逐批放行走完重投：3..14 每条重投一次（旧缓冲里 11..14 也已作废，只能作为重投出现）
+    // Release batch by batch through the whole redelivery: each of 3..14 is redelivered once (11..14 in the old buffer are voided too and can only appear as redelivery)
     std::vector<int64_t> expected;
     expected.push_back(kMsgs);
     for (int64_t i = kBackTarget; i < kMsgs + 5; ++i) {
@@ -465,7 +465,7 @@ void s1BackwardReset(Fixture& fx, const std::string& topic, const std::string& g
         }
     }
     const std::vector<int64_t> arr = listener->offsets();
-    check("S1-队列被真正重建：重投序列是 " + fmtOffsets(expected), arr == expected,
+    check("S1-the queue is truly rebuilt: the redelivery sequence is " + fmtOffsets(expected), arr == expected,
           "arrivals=" + fmtOffsets(arr));
     waitUntil([&] { return localOffset(*c, topic) == std::optional<int64_t>(kMsgs + 5); }, 10000,
               50);
@@ -475,25 +475,25 @@ void s1BackwardReset(Fixture& fx, const std::string& topic, const std::string& g
     for (const Row& r : rows) {
         if (!r.hasCommitted || r.committed != kBackTarget) allBack = false;
     }
-    check("S1-窗口内只有重置那次写 broker（位点仍停在 3，周期落盘=60s）", allBack,
+    check("S1-only the reset itself wrote the broker inside the window (the offset still sits at 3, periodic flush=60s)", allBack,
           fmtRows(rows));
 
-    // 关停会同步落盘一次：重投的 ack 才是最终值（15 = 最后一条 14 的 +1）
+    // Shutdown flushes once synchronously: only then do the redelivered acks give the final value (15 = the last message 14 plus one)
     c->shutdown();
     const bool advanced = waitUntil([&] { return brokerIs(fx, group, topic, kMsgs + 5); }, 15000,
                                     500);
-    check("S1-关停落盘把重投的 ack 写回 broker（位点前进到 15）", advanced,
+    check("S1-the shutdown flush writes the redelivered acks back to the broker (the offset advances to 15)", advanced,
           fmtRows(fx.offsets(group, topic)));
 }
 
-// ------------------------------------------------ S2：前跳重置 + 恢复
+// ------------------------------------------------ S2: forward skip reset + recovery
 
 void s2ForwardSkip(Fixture& fx, const std::string& topic, const std::string& group) {
-    std::printf("\n--- S2：前跳重置（timestamp=-1 → maxOffset）不重投 + 新消息照常消费 ---\n");
+    std::printf("\n--- S2: forward skip reset (timestamp=-1 -> maxOffset), no redelivery + new messages consumed as usual ---\n");
     auto listener = std::make_shared<SteppingListener>();
-    // 周期落盘用默认 5s：本场景要先靠首跳（start 后 10s）在 broker 上给这个组建记录
-    //（Broker2Client.resetOffset 对 queryOffset==-1 的组直接回 SYSTEM_ERROR），
-    // 再等一个 >5s 的窗口做重置 —— 重置那笔 persist 与周期写不同刻，判据仍然干净。
+    // The periodic flush keeps the default 5s: this scenario first relies on the initial flush (10s after start) to build a record for the group on the broker
+    // (Broker2Client.resetOffset answers SYSTEM_ERROR outright for a group whose queryOffset==-1),
+    // then waits for a window of more than 5s to reset -- the reset's persist and the periodic write land at different instants, so the criterion stays clean.
     std::shared_ptr<DefaultMQPushConsumer> c =
         startConsumer(fx, group, "s2", topic, listener, /*batchSize=*/1, /*persist=*/0);
     const int64_t tStart = nowMs();
@@ -503,7 +503,7 @@ void s2ForwardSkip(Fixture& fx, const std::string& topic, const std::string& gro
         fx.producer->send(m);
     }
 
-    // 逐批放行前 3 条：第 4 条（offset 3）留在 listener 里当"在途批次"
+    // Release the first 3 messages batch by batch: the 4th (offset 3) stays in the listener as the "in-flight batch"
     for (int n = 1; n <= 4; ++n) {
         if (!waitBatches(*listener, static_cast<size_t>(n), 30000)) break;
         if (n < 4) listener->release();
@@ -511,7 +511,7 @@ void s2ForwardSkip(Fixture& fx, const std::string& topic, const std::string& gro
     std::vector<int64_t> arr = listener->offsets();
     const bool arranged = listener->batchCount() >= 4 && arr.size() >= 4 && arr[0] == 0 &&
                           arr[1] == 1 && arr[2] == 2 && arr[3] == 3;
-    check("S2-窗口就绪：前 3 条已 ack、第 4 条卡在 listener", arranged,
+    check("S2-window ready: the first 3 are acked, the 4th is stuck in the listener", arranged,
           "arrivals=" + fmtOffsets(arr));
     if (!arranged) {
         listener->release();
@@ -519,30 +519,30 @@ void s2ForwardSkip(Fixture& fx, const std::string& topic, const std::string& gro
         return;
     }
 
-    // 等首跳落盘把组建出来（本地已消费位点 3 = 前三条的 ack），并留出 >5s 的静默窗口
+    // Wait for the initial flush to create the group (the local consumed offset 3 = the ack of the first three) and leave a silent window of more than 5s
     const bool primed = waitUntil(
         [&] { return nowMs() - tStart > 12000 && brokerIs(fx, group, topic, kBackTarget); },
         20000, 500);
-    check("S2-前置：broker 上该组有记录（q0:3），且下一笔周期写还在 5s 之外", primed,
+    check("S2-precondition: the group has a record on the broker (q0:3) and the next periodic write is still more than 5s away", primed,
           fmtRows(fx.offsets(group, topic)));
 
     const int64_t t0 = nowMs();
     std::map<MessageQueue, int64_t> table =
         fx.admin.resetOffsetByTimestamp(topic, group, /*timestamp=*/-1, /*isForce=*/true);
-    check("S2-222 响应里的目标位点就是 maxOffset(10)",
+    check("S2-the target offset in the 222 response is exactly maxOffset(10)",
           table.size() == 1 && table.begin()->second == kMsgs, fmtTable(table));
 
     const bool in2s = waitBefore([&] { return brokerIs(fx, group, topic, kMsgs); }, 2000);
     char detail[160];
     std::snprintf(detail, sizeof(detail), "elapsed=%.1fs %s", (nowMs() - t0) / 1000.0,
                   fmtRows(fx.offsets(group, topic)).c_str());
-    check("S2-broker 位点 ~2s 内前跳到 10（重置路径自带的那次 persist）", in2s, detail);
+    check("S2-the broker offset skips forward to 10 within ~2s (the persist carried by the reset path)", in2s, detail);
 
     listener->release();
     std::this_thread::sleep_for(std::chrono::seconds(3));
     arr = listener->offsets();
     const std::vector<int64_t> seedArrivals = {0, 1, 2, 3};
-    check("S2-被跳过的 4..9 一条都不投（在途那条的 ack 也作废）", arr == seedArrivals,
+    check("S2-none of the skipped 4..9 is delivered (the ack of the in-flight one is voided too)", arr == seedArrivals,
           "arrivals=" + fmtOffsets(arr));
 
     Message after(topic, "rs-new");
@@ -551,17 +551,17 @@ void s2ForwardSkip(Fixture& fx, const std::string& topic, const std::string& gro
     listener->release();
     arr = listener->offsets();
     const std::vector<int64_t> wantArrivals = {0, 1, 2, 3, kMsgs};
-    check("S2-重建后的队列从队尾续跑（新消息 offset 10 正常投递）",
+    check("S2-the rebuilt queue continues from the queue tail (the new message at offset 10 is delivered normally)",
           gotNew && arr == wantArrivals, "arrivals=" + fmtOffsets(arr));
 
-    // release() 只让 listener 返回；ack 是消费线程随后落的。不等本地位点真的推到 11 就
-    // 关停，关停那次 persist 可能跑在 ack 之前（写回的还是 10）——这是断言竞态，不是语义问题。
+    // release() only lets the listener return; the ack is persisted afterwards by the consumer thread. Shutting down without waiting
+    // for the local offset to really reach 11 lets the shutdown persist run before the ack (writing back 10) -- an assertion race, not a semantics issue.
     waitUntil([&] { return localOffset(*c, topic) == std::optional<int64_t>(kMsgs + 1); }, 10000,
               50);
     c->shutdown();
     const bool advanced = waitUntil([&] { return brokerIs(fx, group, topic, kMsgs + 1); }, 15000,
                                     500);
-    check("S2-关停落盘把新消息的 ack 写回 broker（位点前进到 11）", advanced,
+    check("S2-the shutdown flush writes the new message's ack back to the broker (the offset advances to 11)", advanced,
           fmtRows(fx.offsets(group, topic)));
 }
 
@@ -577,10 +577,10 @@ int main(int argc, char* argv[]) {
     try {
         fx.start(nsAddr);
     } catch (const std::exception& e) {
-        check("集群探活", false, e.what());
+        check("cluster liveness", false, e.what());
         return 1;
     }
-    check("集群探活", true, "broker=" + fx.brokerAddr);
+    check("cluster liveness", true, "broker=" + fx.brokerAddr);
 
     const std::string topic1 = "CppLiveRoBack" + fx.stamp;
     const std::string topic2 = "CppLiveRoSkip" + fx.stamp;
@@ -588,21 +588,21 @@ int main(int argc, char* argv[]) {
     const std::string g2 = "GID_cpp_live_ro_skip_" + fx.stamp;
 
     try {
-        // 开关热改：useServerSideResetOffset=false（220 推送路径的前提）
-        check("开关热改：useServerSideResetOffset=false（220 推送路径的前提）",
+        // Hot-update the switch: useServerSideResetOffset=false (the precondition of the 220 push path)
+        check("Hot-update the switch: useServerSideResetOffset=false (the precondition of the 220 push path)",
               setServerSideReset(fx, "false"),
-              "回读 useServerSideResetOffset=" + readFlag(fx.admin, fx.brokerAddr, kSwitchKey));
+              "read back useServerSideResetOffset=" + readFlag(fx.admin, fx.brokerAddr, kSwitchKey));
 
         fx.admin.createTopic(MixAll::DEFAULT_TOPIC, topic1, 1);
         fx.admin.createTopic(MixAll::DEFAULT_TOPIC, topic2, 1);
         std::this_thread::sleep_for(std::chrono::seconds(3));
-        std::printf("topic1=%s topic2=%s（各 1 队列，各 %d 条消息）\n", topic1.c_str(),
+        std::printf("topic1=%s topic2=%s (1 queue each, %d messages each)\n", topic1.c_str(),
                     topic2.c_str(), kMsgs);
 
         s1BackwardReset(fx, topic1, g1);
         s2ForwardSkip(fx, topic2, g2);
     } catch (const std::exception& e) {
-        check("验证过程抛出异常", false, e.what());
+        check("the verification threw an exception", false, e.what());
     }
 
     for (const std::string& t : {topic1, topic2}) {
@@ -610,18 +610,18 @@ int main(int argc, char* argv[]) {
             fx.admin.deleteTopic(t);
             std::printf("    (deleteTopic(%s) OK)\n", t.c_str());
         } catch (const std::exception& e) {
-            std::printf("    (deleteTopic(%s) 失败: %s)\n", t.c_str(), e.what());
+            std::printf("    (deleteTopic(%s) failed: %s)\n", t.c_str(), e.what());
         }
     }
     for (const std::string& g : {g1, g2}) {
         try {
             fx.admin.deleteSubscriptionGroup(fx.brokerAddr, g, true);
         } catch (const std::exception& e) {
-            std::printf("    (deleteSubscriptionGroup(%s) 失败: %s)\n", g.c_str(), e.what());
+            std::printf("    (deleteSubscriptionGroup(%s) failed: %s)\n", g.c_str(), e.what());
         }
     }
-    check("还原 useServerSideResetOffset=true", setServerSideReset(fx, "true"),
-          "回读 useServerSideResetOffset=" + readFlag(fx.admin, fx.brokerAddr, kSwitchKey));
+    check("Restore useServerSideResetOffset=true", setServerSideReset(fx, "true"),
+          "read back useServerSideResetOffset=" + readFlag(fx.admin, fx.brokerAddr, kSwitchKey));
     fx.shutdown();
 
     std::printf("\nPASS=%d FAIL=%d\n", gPass, gFail);

@@ -32,7 +32,7 @@ static void expectEq(const std::string& actual, const std::string& expected, con
     CHECK(actual == expected, (std::string(what) + " (actual=" + actual + ", expected=" + expected + ")").c_str());
 }
 
-/** `<IP>@<pid>#<纳秒>`：只有默认 instanceName 被改写后才长成这样。 */
+/** `<IP>@<pid>#<nanoseconds>`: this shape appears only after the default instanceName has been rewritten. */
 static bool isRewrittenClientId(const std::string& id) {
     const std::string bare =
         id.size() > kStreamSuffix.size() && id.compare(id.size() - kStreamSuffix.size(),
@@ -46,45 +46,45 @@ static bool isRewrittenClientId(const std::string& id) {
            bare.find('@', at + 1) == std::string::npos;
 }
 
-// ---------------------------------------------------------------- 纯字符串部分
+// ---------------------------------------------------------------- pure string part
 static void testBuildMqClientId() {
-    expectEq(buildMqClientId("10.0.0.1", "inst"), "10.0.0.1@inst", "clientId 以 IP 开头");
+    expectEq(buildMqClientId("10.0.0.1", "inst"), "10.0.0.1@inst", "clientId starts with the IP");
     expectEq(buildMqClientId("10.0.0.1", "inst", "unit-a"), "10.0.0.1@inst@unit-a",
-             "unitName 是第三段后缀");
-    expectEq(buildMqClientId("10.0.0.1", "inst", "   "), "10.0.0.1@inst", "空白 unitName 不拼");
-    expectEq(buildMqClientId("10.0.0.1", "inst", ""), "10.0.0.1@inst", "空 unitName 不拼");
+             "unitName is the suffix of the third segment");
+    expectEq(buildMqClientId("10.0.0.1", "inst", "   "), "10.0.0.1@inst", "a blank unitName is not appended");
+    expectEq(buildMqClientId("10.0.0.1", "inst", ""), "10.0.0.1@inst", "an empty unitName is not appended");
     expectEq(buildMqClientId("10.0.0.1", "inst", "", false), "10.0.0.1@inst",
-             "stream 关闭时不加后缀");
+             "no suffix is added when stream is off");
     expectEq(buildMqClientId("10.0.0.1", "inst", "", true), "10.0.0.1@inst@STREAM",
-             "stream 开启时 @STREAM 收尾");
+             "@STREAM ends the id when stream is on");
     expectEq(buildMqClientId("10.0.0.1", "inst", "unit-a", true), "10.0.0.1@inst@unit-a@STREAM",
-             "unitName 与 STREAM 同时存在时的顺序");
+             "ordering when unitName and STREAM are both present");
     expectEq(buildMqClientId("10.0.0.1", "inst", "  ", true), "10.0.0.1@inst@STREAM",
-             "空白 unitName 不占位，STREAM 仍紧跟 instanceName");
+             "a blank unitName takes no slot, STREAM still follows instanceName");
 }
 
 static void testChangeInstanceNameToPID() {
-    expectEq(changeInstanceNameToPID("inst"), "inst", "显式设置的 instanceName 原样保留");
-    expectEq(changeInstanceNameToPID("ADMIN"), "ADMIN", "admin 的默认名不是默认的 DEFAULT");
+    expectEq(changeInstanceNameToPID("inst"), "inst", "an explicitly set instanceName is kept verbatim");
+    expectEq(changeInstanceNameToPID("ADMIN"), "ADMIN", "the admin default name is not the DEFAULT one");
     const std::string rewritten = changeInstanceNameToPID(MixAll::DEFAULT_INSTANCE_NAME);
-    CHECK(rewritten.rfind(kPidPrefix, 0) == 0, "默认名换成 <pid>#<nanoTime>");
-    expectEq(changeInstanceNameToPID(rewritten), rewritten, "改写是幂等的");
+    CHECK(rewritten.rfind(kPidPrefix, 0) == 0, "the default name becomes <pid>#<nanoTime>");
+    expectEq(changeInstanceNameToPID(rewritten), rewritten, "the rewrite is idempotent");
     CHECK(changeInstanceNameToPID(MixAll::DEFAULT_INSTANCE_NAME) != rewritten,
-          "同进程两次改写给出不同名字");
+          "two rewrites in the same process give different names");
 }
 
 static void testBuildClientId() {
     expectEq(buildClientId("inst"), MixAll::cachedIpStr() + "@inst",
-             "默认 clientId = 本机 IP@instanceName");
+             "default clientId = local IP@instanceName");
     expectEq(buildClientId("inst", "unit-a", true),
              MixAll::cachedIpStr() + "@inst@unit-a@STREAM",
-             "buildClientId 与 buildMQClientId 同口径（unitName 在前、STREAM 收尾）");
-    CHECK(MixAll::cachedIpStr() == MixAll::cachedIpStr(), "本机 IP 只探测一次");
+             "buildClientId matches buildMQClientId (unitName first, STREAM last)");
+    CHECK(MixAll::cachedIpStr() == MixAll::cachedIpStr(), "the local IP is probed only once");
 }
 
-// ---------------------------------------------------------------- facade 盖章
-// 名字服务地址指向 127.0.0.1:1（不会有 broker 监听）：clientId 是在建实例**之前**
-// 盖好的，所以无论 start() 是否因为网络失败抛错，都能读回盖好的值。
+// ---------------------------------------------------------------- facade stamping
+// The name server address points at 127.0.0.1:1 (no broker listens there): the clientId is stamped
+// **before** the instance is built, so the stamped value can be read back whether or not start() throws on network failure.
 template <typename T>
 static std::string stampedClientId(T& client) {
     try {
@@ -103,13 +103,13 @@ static void testProducerStampsClientId() {
     DefaultMQProducer p("PG_clientid_shape");
     p.setNamesrvAddr("127.0.0.1:1");
     const std::string id = stampedClientId(p);
-    CHECK(isRewrittenClientId(id), ("生产者 clientId 是 IP@<pid>#<nanoTime>: " + id).c_str());
+    CHECK(isRewrittenClientId(id), ("producer clientId is IP@<pid>#<nanoTime>: " + id).c_str());
     CHECK(id.find(MixAll::DEFAULT_INSTANCE_NAME) == std::string::npos,
-          ("生产者不该留着 DEFAULT instanceName: " + id).c_str());
+          ("a producer must not keep the DEFAULT instanceName: " + id).c_str());
 }
 
 static void testTwoProducersDoNotCollide() {
-    // 旧口径的秒级时间戳在同一秒内必然撞车，撞了就是两个生产者共用一个 clientId
+    // The old second-granularity timestamp always collides inside the same second; a collision means two producers share one clientId
     DefaultMQProducer a("PG_clientid_a");
     DefaultMQProducer b("PG_clientid_b");
     a.setNamesrvAddr("127.0.0.1:1");
@@ -117,7 +117,7 @@ static void testTwoProducersDoNotCollide() {
     const std::string idA = stampedClientId(a);
     const std::string idB = stampedClientId(b);
     CHECK(!idA.empty() && !idB.empty() && idA != idB,
-          ("同进程两个生产者 clientId 不同: " + idA + " / " + idB).c_str());
+          ("two producers in the same process get different clientIds: " + idA + " / " + idB).c_str());
 }
 
 static void testExplicitInstanceNameIsKept() {
@@ -125,7 +125,7 @@ static void testExplicitInstanceNameIsKept() {
     p.setInstanceName("clientid-parity-fixed");
     p.setNamesrvAddr("127.0.0.1:1");
     expectEq(stampedClientId(p), MixAll::cachedIpStr() + "@clientid-parity-fixed",
-             "显式 instanceName 原样进 clientId");
+             "an explicit instanceName enters the clientId verbatim");
 }
 
 static void testBroadcastConsumerKeepsDefaultInstanceName() {
@@ -134,13 +134,13 @@ static void testBroadcastConsumerKeepsDefaultInstanceName() {
     c.setMessageModel(MessageModel::BROADCASTING);
     c.subscribe("clientid-parity-topic", "*");
     expectEq(stampedClientId(c), MixAll::cachedIpStr() + "@DEFAULT" + kStreamSuffix,
-             "广播消费者保持 DEFAULT");
+             "a broadcasting consumer keeps DEFAULT");
 
     DefaultLitePullConsumer clustered("CID_clientid_clustering");
     clustered.setNamesrvAddr("127.0.0.1:1");
     clustered.subscribe("clientid-parity-topic", "*");
     const std::string id = stampedClientId(clustered);
-    CHECK(isRewrittenClientId(id), ("CLUSTERING 消费者改写 instanceName: " + id).c_str());
+    CHECK(isRewrittenClientId(id), ("a CLUSTERING consumer rewrites the instanceName: " + id).c_str());
 }
 
 static void testUnitAndStreamDefaultsPerFacade() {
@@ -149,28 +149,28 @@ static void testUnitAndStreamDefaultsPerFacade() {
     DefaultLitePullConsumer lite("CID_clientid_lite_defaults");
     DefaultMQPushConsumer push("CID_clientid_push_defaults");
     DefaultMQAdminExt admin;
-    CHECK(!producer.isEnableStreamRequestType(), "生产者默认不开 stream");
-    CHECK(!push.isEnableStreamRequestType(), "推送消费者默认不开 stream");
-    CHECK(!admin.isEnableStreamRequestType(), "admin 默认不开 stream");
-    CHECK(pull.isEnableStreamRequestType(), "pull 消费者默认开 stream");
-    CHECK(lite.isEnableStreamRequestType(), "lite 消费者默认开 stream");
+    CHECK(!producer.isEnableStreamRequestType(), "a producer does not enable stream by default");
+    CHECK(!push.isEnableStreamRequestType(), "a push consumer does not enable stream by default");
+    CHECK(!admin.isEnableStreamRequestType(), "admin does not enable stream by default");
+    CHECK(pull.isEnableStreamRequestType(), "a pull consumer enables stream by default");
+    CHECK(lite.isEnableStreamRequestType(), "a lite consumer enables stream by default");
     CHECK(!producer.isUnitMode() && !pull.isUnitMode() && !lite.isUnitMode() &&
               !push.isUnitMode(),
-          "unitMode 默认为 false");
-    // unitName 默认为空：clientId 不该凭空多出 @段
+          "unitMode defaults to false");
+    // unitName defaults to empty: the clientId must not gain an extra @segment out of nowhere
     CHECK(producer.unitName().empty() && pull.unitName().empty() && lite.unitName().empty() &&
               push.unitName().empty() && admin.unitName().empty(),
-          "unitName 默认为空");
+          "unitName defaults to empty");
 }
 
 static void testUnitNameAndStreamReachClientId() {
-    // 显式 instanceName 让 clientId 可预测，这样断言的是拼接顺序而不是改写逻辑。
+    // An explicit instanceName makes the clientId predictable, so the assertions cover concatenation order rather than the rewrite logic.
     DefaultMQProducer p("PG_clientid_unit_stream");
     p.setNamesrvAddr("127.0.0.1:1");
     p.setInstanceName("clientid-unit-stream");
     p.setUnitName("unitA");
     expectEq(stampedClientId(p), MixAll::cachedIpStr() + "@clientid-unit-stream@unitA",
-             "生产者 clientId 带上 unitName（stream 关时不带 @STREAM）");
+             "producer clientId carries unitName (no @STREAM while stream is off)");
 
     DefaultMQProducer ps("PG_clientid_stream_on");
     ps.setNamesrvAddr("127.0.0.1:1");
@@ -179,16 +179,16 @@ static void testUnitNameAndStreamReachClientId() {
     ps.setEnableStreamRequestType(true);
     expectEq(stampedClientId(ps),
              MixAll::cachedIpStr() + "@clientid-stream-on@unitA" + kStreamSuffix,
-             "打开 stream 后 clientId 以 @STREAM 收尾");
+             "with stream enabled the clientId ends in @STREAM");
 
-    // pull 消费者默认就开 stream：unitName + @STREAM 一起出现
+    // A pull consumer enables stream by default: unitName + @STREAM appear together
     DefaultMQPullConsumer pc("CID_clientid_pull_stream");
     pc.setNamesrvAddr("127.0.0.1:1");
     pc.setInstanceName("clientid-pull-stream");
     pc.setUnitName("unitB");
     expectEq(stampedClientId(pc),
              MixAll::cachedIpStr() + "@clientid-pull-stream@unitB" + kStreamSuffix,
-             "pull 消费者 clientId = IP@instance@unit@STREAM");
+             "pull consumer clientId = IP@instance@unit@STREAM");
 }
 
 int main() {
