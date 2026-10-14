@@ -134,9 +134,15 @@ std::string formatAddr(const std::string& addr) { return addr; }
 
 // ---------------------------------------------------------------- Impl
 struct RemotingClient::Impl {
+    // 读线程任何一次阻塞的上界：与 select 的 300ms 同量级，退出时最多再等一个 tick。
+    static constexpr int32_t kReaderTimeoutMs = 300;
+
     struct Connection {
         std::string addr;
-        socket_t sock = kInvalidSocket;
+        // 读线程每一轮都要重新认领它（见 readLoop）：别的线程会在写失败、closeChannel、
+        // shutdown 时关掉 fd 并置回 kInvalidSocket，而 fd 号会被内核立刻发给新连接。
+        // 裸 int 让这种跨线程读写成为数据竞争，atomic 是唯一诚实的写法。
+        std::atomic<socket_t> sock{kInvalidSocket};
         std::mutex writeMutex;
         std::atomic<bool> readerDone{false};
         // TLS 会话（tlsEnable 时非空；read/write 走 SSL_*）
@@ -304,9 +310,22 @@ struct RemotingClient::Impl {
 
     void readLoop(const std::shared_ptr<Connection>& conn) {
         Bytes buf;
-        const socket_t sock = conn->sock;
         char chunk[65536];
+        socket_t sock = kInvalidSocket;
         while (running.load()) {
+            // 每一轮重新认领 fd。线程启动时缓存一份（早先的做法）在 CI 上挂死过：
+            // closeChannel 关掉旧连接、紧接着重连拿到**同一个 fd 号**，旧读线程还睡在
+            // 这个号上，于是它读的是新连接的字节 —— 新连接等不到响应，旧连接又永远退不出，
+            // 最后 shutdown() 的 join 一起挂住（Linux 关 fd 不会唤醒阻塞中的 recv）。
+            const socket_t current = conn->sock;
+            if (current == kInvalidSocket) {
+                break;
+            }
+            if (current != sock) {
+                sock = current;
+                // fd 换号 = 新连接：接收超时按连接设一次即可。
+                netcompat::setRecvTimeout(sock, kReaderTimeoutMs);
+            }
             // TLS：SSL 内部可能还有未交付的解密字节（select 对 fd 会漏报），此时跳过 select
             if (!(conn->tls && conn->tls->pending() > 0)) {
                 fd_set rfds;
@@ -336,6 +355,10 @@ struct RemotingClient::Impl {
                 }
             } else {
                 n = static_cast<int>(::recv(sock, chunk, sizeof(chunk), 0));
+                if (n < 0 && (netcompat::isWouldBlock() || netcompat::isInterrupted())) {
+                    // SO_RCVTIMEO 到点 / 被信号打断：连接没坏，回到 select 重新认领 fd
+                    continue;
+                }
             }
             if (n <= 0) {
                 logger_debug("remoting reader: connection " + conn->addr + " closed, recv=" +
@@ -385,9 +408,12 @@ struct RemotingClient::Impl {
     // close 会关错人），也不会出现"一个线程在 send、另一个线程把 fd 抽走"的窗口。
     void closeConnectionSocket(const std::shared_ptr<Connection>& conn) {
         std::lock_guard<std::mutex> wlk(conn->writeMutex);
-        if (conn->sock != kInvalidSocket) {
-            closeSocket(conn->sock);
+        const socket_t sock = conn->sock;
+        if (sock != kInvalidSocket) {
+            // 先摘号再关：读线程每轮重新认领 fd，看到 kInvalidSocket 就退出，
+            // 不会拿着一个即将被新连接复用的号继续 recv。
             conn->sock = kInvalidSocket;
+            closeSocket(sock);
         }
     }
 
@@ -770,10 +796,16 @@ struct RemotingClient::Impl {
         }
         Bytes data = response.encode();
         std::lock_guard<std::mutex> wlk(conn->writeMutex);
-        const bool ok = conn->tls ? conn->tls->writeAll(conn->sock,
+        const socket_t sock = conn->sock;
+        if (sock == kInvalidSocket) {
+            logger_warn("remoting: cannot answer broker request from " + addr +
+                        ", connection is gone");
+            return;
+        }
+        const bool ok = conn->tls ? conn->tls->writeAll(sock,
                                                         reinterpret_cast<const char*>(data.data()),
                                                         data.size())
-                                  : sendAll(conn->sock, data);
+                                  : sendAll(sock, data);
         if (!ok) {
             logger_warn("remoting: failed to write response to " + addr);
         }
@@ -789,16 +821,21 @@ struct RemotingClient::Impl {
         auto conn = getOrCreateConnection(addr);
         Bytes data = request.encode();
         std::lock_guard<std::mutex> lk(conn->writeMutex);
-        const bool sentOk = conn->tls ? conn->tls->writeAll(conn->sock,
-                                                            reinterpret_cast<const char*>(data.data()),
-                                                            data.size())
-                                      : sendAll(conn->sock, data);
+        // 只在 writeMutex 内读一次 fd：读线程/关闭路径会改它，取两次可能得到两个号。
+        const socket_t sock = conn->sock;
+        const bool sentOk = sock == kInvalidSocket
+            ? false
+            : (conn->tls ? conn->tls->writeAll(sock,
+                                               reinterpret_cast<const char*>(data.data()),
+                                               data.size())
+                         : sendAll(sock, data));
         if (!sentOk) {
             // 幂等关闭：读线程可能已经先一步关掉它并把 fd 置空（对端同时断了），
             // 拿已经还给内核的 fd 号再 close 一次会关错新连接。
             if (conn->sock != kInvalidSocket) {
-                closeSocket(conn->sock);
+                const socket_t dead = conn->sock;
                 conn->sock = kInvalidSocket;
+                closeSocket(dead);
             }
             {
                 std::lock_guard<std::mutex> clk(connMutex);
@@ -829,10 +866,15 @@ struct RemotingClient::Impl {
             }
             conns.clear();
         }
-        // 关闭 socket 让阻塞中的 reader 立刻返回
+        // 关闭 socket 让 reader 立刻返回：先摘号（读线程下一轮认领就看到 kInvalidSocket
+        // 并退出），再 close —— closeSocket 内部先 shutdown(SHUT_RDWR)，这正是唤醒睡在
+        // recv/select 里的读线程与阻塞发送的唯一手段（Linux 上单靠 close 唤不醒）。
+        // 这里刻意**不**持 writeMutex：持锁等待一个卡在 sendAll 里的线程，等于把同一类
+        // 无界挂起从读路径搬到写路径。
         for (auto& c : all) {
-            closeSocket(c->sock);
+            const socket_t sock = c->sock;
             c->sock = kInvalidSocket;
+            closeSocket(sock);
         }
         std::lock_guard<std::mutex> lk(threadMutex);
         for (auto& t : threads) {

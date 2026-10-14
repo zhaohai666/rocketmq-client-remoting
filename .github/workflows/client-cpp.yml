@@ -47,7 +47,10 @@ jobs:
       # client_id / send_retry / producer_async / namespace_hook 存在偶发挂起
       # （与死地址假 NS + 进程退出路径相关，见 2026-10-12 记录），CI 先排除；
       # 修好挂起后移除 -E。
-      # 失败用例名走 ::error:: 打印：Actions 原始日志只有登录后可见，注解是公开可读的。
+      # 2026-10-14：transport 的同类挂起已定位到「关 fd 唤不醒睡在 recv 里的读线程，
+      # 退出路径的 join 无限等」并在 closeSocket 里修掉；这四条大概率同因，等 transport
+      # 压测连续绿之后再逐条放回 -E 之外验证，别一次放开四条。
+      # 失败用例名走 ::error:: 打印，在 Actions 页面顶部直接可读（匿名 API 拿不到日志）。
       - name: Run ctest
         working-directory: cpp/build
         run: |
@@ -107,11 +110,11 @@ jobs:
           fi
           exit $rc
 
-      # 诊断脚手架（定位后删除）：transport 只在 ubuntu runner 上偶发整条挂死
-      # （run 13/15 停在 `***Timeout 120 sec`，run 12/16 全绿），本机 macOS 一次都不复现，
-      # 唯一能拿到栈的环境就是这里。单次跑是掷硬币，这里把 3 份并发 × 8 轮塞满 2 核
-      # runner，把竞态放大成必然复现；一挂就当场抓栈并停住，绿跑只多花一分钟。
-      - name: Reproduce intermittent transport hang
+      # transport 曾经只在 ubuntu runner 上偶发整条挂死（run 13/15 停在 `***Timeout 120 sec`，
+      # run 12/16/17 全绿），本机 macOS 一次都不复现：Linux 关 fd 不会唤醒睡在 recv 里的线程。
+      # 单次跑是掷硬币，把 3 份并发 × 8 轮塞满 2 核 runner 才是可靠的复现，因此这里长期留着
+      # 当回归闸 —— 一旦复发，段进度 + wchan + 全线程栈会直接指出停在哪一帧。
+      - name: Stress transport for the Linux-only reader park
         if: always()
         working-directory: cpp/build
         run: |

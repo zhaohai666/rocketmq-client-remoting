@@ -53,8 +53,10 @@ const socket_t kInvalidSocket = INVALID_SOCKET;
 
 inline bool isValid(socket_t s) { return s != INVALID_SOCKET; }
 
+// 关 socket 前先 shutdown(SD_BOTH)：见 POSIX 分支里同一段注释。
 inline void closeSocket(socket_t s) {
     if (isValid(s)) {
+        ::shutdown(s, SD_BOTH);
         ::closesocket(s);
     }
 }
@@ -81,8 +83,13 @@ const socket_t kInvalidSocket = -1;
 
 inline bool isValid(socket_t s) { return s >= 0; }
 
+// 关 socket 前先 shutdown(SHUT_RDWR)：POSIX 上 close(fd) **不会**唤醒已经睡在
+// recv/select 里的线程（macOS 会，所以这类挂起只在 Linux 上暴露）。少了这一步，
+// 还在读这条连接的线程会一直挂着，而 join 它的退出路径（shutdown/析构）永远回不来。
+// shutdown 失败无所谓（未连接/已断开的 fd 返回 ENOTCONN），紧接着照常 close。
 inline void closeSocket(socket_t s) {
     if (isValid(s)) {
+        ::shutdown(s, SHUT_RDWR);
         ::close(s);
     }
 }
@@ -108,6 +115,41 @@ inline void tuneSocket(socket_t s) {
 #if !defined(_WIN32) && defined(SO_NOSIGPIPE)
     ::setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE,
                  reinterpret_cast<const char*>(&one), sizeof(one));
+#endif
+}
+
+// 给阻塞 recv 挂一个上界。select 报"可读"和真正 recv 之间还有一次 fd 被抽走/复用的
+// 窗口（见 remoting_client.cpp 的 readLoop），单靠 select 的超时盖不住睡在 recv 里的那
+// 一瞬间；SO_RCVTIMEO 到点会以 EAGAIN 失败返回，于是读线程任何一轮阻塞都有界。
+inline void setRecvTimeout(socket_t s, int millis) {
+#ifdef _WIN32
+    DWORD timeout = static_cast<DWORD>(millis);
+    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+    struct timeval tv;
+    tv.tv_sec = millis / 1000;
+    tv.tv_usec = (millis % 1000) * 1000;
+    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&tv), sizeof(tv));
+#endif
+}
+
+// "这次没读到数据"而不是"连接断了"：SO_RCVTIMEO 到点、被信号打断，都必须接着等，
+// 否则一条空闲连接会被自己的读线程误当成断开。
+inline bool isWouldBlock() {
+#ifdef _WIN32
+    return lastError() == WSAEWOULDBLOCK;
+#else
+    return lastError() == EAGAIN || lastError() == EWOULDBLOCK;
+#endif
+}
+
+inline bool isInterrupted() {
+#ifdef _WIN32
+    return lastError() == WSAEINTR;
+#else
+    return lastError() == EINTR;
 #endif
 }
 
