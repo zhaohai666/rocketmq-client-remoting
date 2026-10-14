@@ -390,7 +390,7 @@ int main(int argc, char** argv) {
 
     // ---------- 0b. one-way send sendOneway: no reply, can only be proven by the read-back count ----------
     // oneway is a fire-and-forget no-reply semantic: the client gets no broker receipt at all,
-    // so "3 messages sent" cannot be proven by itself. The only criterion is the consumer reading back **exactly** 3 ——
+    // so "3 messages sent" cannot be proven by itself. The only criterion is the consumer reading back **exactly** 3 --
     // one fewer means the request never went out, one more means duplicate delivery.
     //
     // Create the topic explicitly first, then send: a new topic's auto-creation waits for the send's **reply** to bring back the route,
@@ -545,7 +545,7 @@ int main(int argc, char** argv) {
 
         ConsumerRun run = runConsumer(topic, "*", 12, /*orderly=*/true, "order",
                                       /*expect=*/10);
-        // Real order check: the received **sequence** must match the send order (not merely set equality ——
+        // Real order check: the received **sequence** must match the send order (not merely set equality --
         // comparing only sorted proves "all received" but not "nothing out of order"),
         // and within the same queue the queueOffset must be strictly increasing.
         std::vector<std::string> recv, expect;

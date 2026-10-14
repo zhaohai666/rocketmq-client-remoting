@@ -6,10 +6,10 @@
 //
 //
 // ⚠ Three script disciplines:
-//   ① topics always carry the stamp — the three-language tools run **sequentially** against the same broker, and fixed names would inherit the previous round's message counts;
-//   ② "a rejected send never even issued the request" can only be checked via broker-side stored counts (the sum of maxOffset-minOffset over queues);
+//   (1) topics always carry the stamp -- successive live runs share the same broker, and fixed names would inherit the previous round's message counts;
+//   (2) "a rejected send never even issued the request" can only be checked via broker-side stored counts (the sum of maxOffset-minOffset over queues);
 //      client callbacks alone can be fooled by implementations that error the callback yet still send the request;
-//   ③ a newly created topic must wait for the broker to incrementally register its topicConfig with the name server (seconds to tens of seconds), so every
+//   (3) a newly created topic must wait for the broker to incrementally register its topicConfig with the name server (seconds to tens of seconds), so every
 //      broker-side reconciliation **polls until timeout**; a single failed route read is not a failure.
 #include <atomic>
 #include <chrono>

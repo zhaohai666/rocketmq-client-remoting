@@ -18,9 +18,9 @@
 //   S11 a POP-path dropped message is acked (observation window > invisibleTime, no revival redelivery)
 //
 // ⚠ Two disciplines of the script itself (found during the last trace runbook):
-//   ① topic / consumer group names always carry the stamp — the three-language live tools run **sequentially** against the
+//   (1) topic / consumer group names always carry the stamp -- successive live runs share the
 //      same broker, and fixed names would inherit the previous round's committed offsets;
-//   ② assertions **filter by body prefix** — warm-up messages and asynchronous broker consumequeue dispatch can make a consumer receive extra messages.
+//   (2) assertions **filter by body prefix** -- warm-up messages and asynchronous broker consumequeue dispatch can make a consumer receive extra messages.
 #include <algorithm>
 #include <atomic>
 #include <chrono>

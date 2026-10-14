@@ -664,7 +664,7 @@ int main(int argc, char* argv[]) {
         producer.send(Message(topic, str2bytes("dlq-me")));
         // Redelivery tier = 3 + reconsumeTimes => level3(10s) + level4(30s): theoretically closes in 40s.
         // Give the timeout budget 150s: when four live cases run on the same host the 3rd delivery was measured
-        // dragging past 100s (a slow environment, not a wrong implementation); how slow is exposed directly by times=[…]@Ns.
+        // dragging past 100s (a slow environment, not a wrong implementation); how slow is exposed directly by times=[...]@Ns.
         std::vector<Arrival> firstThree;
         {
             int64_t deadline = nowMs() + 150000;
