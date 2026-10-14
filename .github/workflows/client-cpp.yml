@@ -44,12 +44,11 @@ jobs:
       - name: Build
         run: cmake --build cpp/build -j
 
-      # client_id / send_retry / producer_async / namespace_hook 存在偶发挂起
-      # （与死地址假 NS + 进程退出路径相关，见 2026-10-12 记录），CI 先排除；
-      # 修好挂起后移除 -E。
-      # 2026-10-14：transport 的同类挂起已定位到「关 fd 唤不醒睡在 recv 里的读线程，
-      # 退出路径的 join 无限等」并在 closeSocket 里修掉；这四条大概率同因，等 transport
-      # 压测连续绿之后再逐条放回 -E 之外验证，别一次放开四条。
+      # client_id / send_retry / producer_async / namespace_hook 曾经因偶发挂起被 -E 排除
+      # （2026-10-12 记录：死地址假 NS + 进程退出路径）。2026-10-14 定位到同一条链：
+      # 关 fd 唤不醒睡在 recv 里的读线程，退出路径的 join 于是无限等 —— 已在 closeSocket
+      # 里补 shutdown(SHUT_RDWR) 修掉，四条全部放回套件。若某条再挂，下面的看门狗会留下
+      # 全线程栈，按栈处理而不是重新排除。
       # 失败用例名走 ::error:: 打印，在 Actions 页面顶部直接可读（匿名 API 拿不到日志）。
       - name: Run ctest
         working-directory: cpp/build
@@ -89,7 +88,7 @@ jobs:
             done
           ) > /tmp/bt.log 2>&1 &
           watcher=$!
-          ctest --output-on-failure --timeout 120 -E "^(client_id|send_retry|producer_async|namespace_hook)$" > /tmp/ctest.log 2>&1
+          ctest --output-on-failure --timeout 120 > /tmp/ctest.log 2>&1
           rc=$?
           kill "${watcher}" 2>/dev/null
           cat /tmp/ctest.log
