@@ -1,5 +1,5 @@
-// 1) 17 段存储格式 MessageDecoder.encode(MessageExt, needCompress) / decode(ByteBuffer)
-//    broker 写入与 pull/get 返回的消息体：
+// 1) 17-field storage format MessageDecoder.encode(MessageExt, needCompress) / decode(ByteBuffer)
+//    the message body the broker writes and returns from pull/get:
 //
 //    TOTALSIZE(4) | MAGICCODE(4, v1=-626843481 / v2=-626843477) | BODYCRC(4) | QUEUEID(4)
 //    | FLAG(4) | QUEUEOFFSET(8) | PHYSICALOFFSET(8) | SYSFLAG(4) | BORNTIMESTAMP(8)
@@ -7,10 +7,10 @@
 //    | RECONSUMETIMES(4) | PREPAREDTRANSACTIONOFFSET(8)
 //    | BODY(4 + len) | TOPIC(1B v1 / 2B v2 + bytes) | PROPERTIES(2 + len)
 //
-// 2) 6 段轻量格式 MessageDecoder.encodeMessage(Message) / decodeMessage(ByteBuffer)
-//    仅用于**批量消息**的 body，不含 topic / crc：
+// 2) 6-field lightweight format MessageDecoder.encodeMessage(Message) / decodeMessage(ByteBuffer)
+//    used only for the body of **batch messages**, without topic / crc:
 //
-//    TOTALSIZE(4) | MAGICCODE(4, 固定 0) | BODYCRC(4, 固定 0) | FLAG(4)
+//    TOTALSIZE(4) | MAGICCODE(4, always 0) | BODYCRC(4, always 0) | FLAG(4)
 //    | BODY(4 + len) | PROPERTIES(2 + len)
 #ifndef ROCKETMQ_COMMON_MESSAGE_DECODER_H
 #define ROCKETMQ_COMMON_MESSAGE_DECODER_H
@@ -24,7 +24,7 @@
 
 namespace rocketmq {
 
-constexpr int32_t CHARSET_UTF8_SEPARATOR = 0;  // 占位：C++ 侧统一使用 UTF-8
+constexpr int32_t CHARSET_UTF8_SEPARATOR = 0;  // Placeholder: the C++ side always uses UTF-8
 constexpr uint8_t NAME_VALUE_SEPARATOR = 1;
 constexpr uint8_t PROPERTY_SEPARATOR = 2;
 
@@ -40,9 +40,9 @@ constexpr size_t PHY_POS_POSITION = 4 + 4 + 4 + 4 + 4 + 8;
 constexpr size_t SYSFLAG_POSITION = 4 + 4 + 4 + 4 + 4 + 8 + 8;
 constexpr size_t MESSAGE_STORE_TIMESTAMP_POSITION = 56;
 
-// ---------------------------------------------------------------- 基础工具
+// ---------------------------------------------------------------- basic utilities
 
-// IP + port -> 8B(v4) / 20B(v6)，与 broker 侧 InetSocketAddress 编码一致
+// IP + port -> 8B(v4) / 20B(v6), matching the broker-side InetSocketAddress encoding
 Bytes ipAndPortToBytes(const std::string& ip, int32_t port, bool v6 = false);
 
 // 8B / 20B -> (ip, port)
@@ -52,7 +52,7 @@ uint32_t crc32(const Bytes& data);
 
 std::string bytes2String(const Bytes& bs);
 
-// ------------------------------------------------------- 属性串 <-> Map
+// ------------------------------------------------------- property string <-> Map
 
 std::string messagePropertiesToString(const PropertyMap& properties);
 
@@ -60,22 +60,22 @@ PropertyMap stringToMessageProperties(const std::string& propertiesStr);
 
 // ---------------------------------------------------------------- msgId
 
-// ip+port(8 或 20B) + 8B commitLogOffset -> 大写十六进制 msgId
+// ip+port(8 or 20B) + 8B commitLogOffset -> upper-case hexadecimal msgId
 std::string createMessageId(const Bytes& addrBytes, int64_t offset);
 
 bool decodeMessageId(const std::string& msgId, std::string& ip, int32_t& port, int64_t& offset);
 
-// ------------------------------------------- 1) 17 段存储格式：MessageExt
+// ------------------------------------------- 1) 17-field storage format: MessageExt
 
 Bytes encodeMessageExt(const MessageExt& messageExt, bool needCompress = false);
 
 bool decodeMessage(const Bytes& raw, MessageExt& out, bool readBody = true,
                    bool decompressBody = true, bool isClient = true, bool checkCrc = false);
 
-// 消息流 -> MessageExt 列表（对应 MessageDecoder.decodes，用于 pull 结果）
+// Message stream -> list of MessageExt (decoding of the storage format, used for pull results)
 std::vector<MessageExt> decodeMessages(const Bytes& raw, bool readBody = true);
 
-// --------------------------------------- 2) 6 段轻量格式：批量消息 body
+// --------------------------------------- 2) 6-field lightweight format: batch message body
 
 Bytes encodeMessage(const Message& message);
 

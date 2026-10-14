@@ -34,7 +34,7 @@ void ConsumeExecutor::submit(std::function<void()> task) {
     if (shutdown_) {
         throw RejectedExecutionError("ConsumeExecutor has been shut down");
     }
-    // 入队失败（队列满）才考虑开一个非 core 线程，再不行就 reject
+    // Only a failed enqueue (full queue) may start a non-core thread; otherwise reject
     const bool queueFull = maxQueueSize_ > 0 && static_cast<int32_t>(queue_.size()) >= maxQueueSize_;
     const bool canGrow = workers_ < max_;
     if (queueFull && !canGrow) {
@@ -42,9 +42,9 @@ void ConsumeExecutor::submit(std::function<void()> task) {
                                      + std::to_string(maxQueueSize_) + ")");
     }
     queue_.push_back(std::move(task));
-    // 无界队列语义：只有 poolSize < corePoolSize 才新建线程；否则入队等待。
-    // workers == 0 是 core=0 配置下的兜底分支，
-    // 队满且还能涨时也要补线程，否则任务永远排在一个已经不再干活的队列里。
+    // Unbounded-queue semantics: a new thread is started only while poolSize < corePoolSize; otherwise the task queues.
+    // workers == 0 is the fallback branch for the core=0
+    // configuration, and when the queue is full while growth is still allowed a thread must be added, otherwise tasks queue forever in a pool that no longer works.
     if (workers_ < core_ || (queueFull && canGrow) || workers_ == 0) {
         spawnLocked();
     }
@@ -59,10 +59,10 @@ void ConsumeExecutor::setCorePoolSize(int32_t n) {
     const int32_t delta = n - core_;
     core_ = n;
     if (n > max_) {
-        max_ = n;  // 允许 core > max（等价于把 max 抬到 core）
+        max_ = n;  // allow core > max (equivalent to raising max to core)
     }
     if (delta > 0 && !shutdown_) {
-        // 扩 core 的启发式：按 min(delta, 队列长度) 补线程，队列一空就停。
+        // Core-growth heuristic: add min(delta, queue length) threads and stop as soon as the queue empties.
         int32_t k = std::min(delta, static_cast<int32_t>(queue_.size()));
         while (k > 0 && workers_ < max_) {
             spawnLocked();
@@ -103,8 +103,8 @@ void ConsumeExecutor::shutdown(bool wait) {
         cv_.notify_all();
     }
     if (!wait) return;
-    // 等待所有线程退出（含已自然退出的：join 立即返回）。
-    // ⚠ 必须保证没有线程在自己身上 join —— 这里只由外部调用者（析构/stop）触发。
+    // Wait for all threads to exit (including those that already finished: join returns at once).
+    // ⚠ No thread may join itself -- this path is only entered by an external caller (destructor/stop).
     std::vector<std::thread> pending;
     {
         std::lock_guard<std::mutex> lk(m_);
@@ -116,7 +116,7 @@ void ConsumeExecutor::shutdown(bool wait) {
 }
 
 void ConsumeExecutor::spawnLocked() {
-    // 调用方必须已持有 m_
+    // The caller must already hold m_
     ++workers_;
     const std::string name = prefix_ + nameSep_ + std::to_string(seq_++);
     threads_.emplace_back([this, name]() {
@@ -135,8 +135,8 @@ void ConsumeExecutor::run() {
                 cv_.wait_for(lk, std::chrono::milliseconds(static_cast<int64_t>(keepAliveSeconds_ * 1000.0)));
                 --idle_;
                 if (!queue_.empty() || shutdown_) break;
-                // 空闲超时：只有超编线程（> core）才退出；core 以内的线程永不退出
-                // （等价于 allowCoreThreadTimeOut=false 的默认口径）。
+                // Idle timeout: only over-comitted threads (> core) exit; core-sized threads never
+                // exit (the default allowCoreThreadTimeOut=false behaviour).
                 if (workers_ > core_) {
                     --workers_;
                     return;
@@ -152,7 +152,7 @@ void ConsumeExecutor::run() {
         try {
             task();
         } catch (const std::exception& e) {
-            // 任务异常不能杀 worker（worker 必须继续消费队列，效果等价于销毁后补新线程）。
+            // A task exception must not kill the worker (it must keep draining the queue; equivalent to destroying it and creating a new one).
             handlerExceptions_.fetch_add(1, std::memory_order_relaxed);
             logger_error(std::string("consume executor task raised: ") + e.what());
         } catch (...) {

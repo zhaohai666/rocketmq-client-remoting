@@ -49,13 +49,13 @@ bool allZero(const std::string& s) {
 }  // namespace
 
 std::string generateTraceparent() {
-    // 00-<trace-id 32hex>-<parent-id 16hex>-01（flags 01 = recorded）
+    // 00-<trace-id 32hex>-<parent-id 16hex>-01 (flags 01 = recorded)
     return "00-" + randomHex(32) + "-" + randomHex(16) + "-01";
 }
 
 bool isValidTraceparent(const std::string& value) {
     if (value.empty()) return false;
-    // 宽松：允许首尾空白，段内按小写比对
+    // Lenient: surrounding whitespace allowed, fields compared in lower case
     std::string v = value;
     // trim
     size_t b = v.find_first_not_of(" \t\r\n");
@@ -63,7 +63,7 @@ bool isValidTraceparent(const std::string& value) {
     if (b == std::string::npos) return false;
     v = v.substr(b, e - b + 1);
 
-    // 按 '-' 切 4 段
+    // Split into 4 fields on '-'
     std::vector<std::string> parts;
     size_t pos = 0;
     while (true) {
@@ -80,7 +80,7 @@ bool isValidTraceparent(const std::string& value) {
     const std::string traceId = toLower(parts[1]);
     const std::string parentId = toLower(parts[2]);
     const std::string flags = toLower(parts[3]);
-    // version：00 或 2 位 hex 且不是 ff
+    // version: 00, or 2 hex digits that are not ff
     if (version == "ff") return false;
     if (version != "00") {
         if (version.size() != 2 || !allHex(version)) return false;
@@ -93,7 +93,7 @@ bool isValidTraceparent(const std::string& value) {
 
 std::string childTraceparent(const std::string& parent) {
     if (!isValidTraceparent(parent)) return std::string();
-    // 同一 trace-id，换 parent-id（对齐 W3C：子 span 复用 trace-id）
+    // Same trace-id with a new parent-id (per W3C: child spans reuse the trace-id)
     size_t first = parent.find('-');
     size_t second = parent.find('-', first + 1);
     const std::string traceId = toLower(parent.substr(first + 1, second - first - 1));
@@ -103,7 +103,7 @@ std::string childTraceparent(const std::string& parent) {
 std::string injectTraceContext(Message* msg) {
     if (msg == nullptr) return std::string();
     const std::string existing = msg->getProperty(kTraceContextProperty);
-    if (!existing.empty()) return existing;  // 上游传播优先，不覆盖
+    if (!existing.empty()) return existing;  // upstream propagation wins; never overwrite
     const std::string tp = generateTraceparent();
     msg->putProperty(kTraceContextProperty, tp);
     return tp;

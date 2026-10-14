@@ -15,7 +15,7 @@ struct MixAll {
     static constexpr const char* DEFAULT_TOPIC = "TBW102";
     static constexpr const char* BENCHMARK_TOPIC = "BenchmarkTest";
     static constexpr const char* DEFAULT_PRODUCER_GROUP = "DEFAULT_PRODUCER";
-    // instanceName 的默认值（配置项 rocketmq.client.name，缺省 "DEFAULT"）
+    // Default value of instanceName (config rocketmq.client.name, "DEFAULT" when absent)
     static constexpr const char* DEFAULT_INSTANCE_NAME = "DEFAULT";
     static constexpr const char* DEFAULT_CONSUMER_GROUP = "DEFAULT_CONSUMER";
     static constexpr const char* CLIENT_INNER_PRODUCER_GROUP = "CLIENT_INNER_PRODUCER";
@@ -29,11 +29,11 @@ struct MixAll {
     static constexpr const char* RETRY_GROUP_TOPIC_PREFIX = "%RETRY%";
     static constexpr const char* DLQ_GROUP_TOPIC_PREFIX = "%DLQ%";
     static constexpr const char* REPLY_TOPIC_PREFIX = "%REPLY%";
-    // Request-Reply（5.x）：应答 topic 名 = <clusterName>_REPLY_TOPIC。
-    // ⚠ 注意与上面的 REPLY_TOPIC_PREFIX("%REPLY%") 不是一回事：后者是旧版
-    // 「消费者把消息回投到自己的 %REPLY%<topic>」的约定，5.x 的 request-reply 用的是下面这个。
+    // Request-Reply (5.x): the reply topic name = <clusterName>_REPLY_TOPIC.
+    // ⚠ Note this is not the same as REPLY_TOPIC_PREFIX ("%REPLY%") above: the latter is the
+    // older convention where "a consumer sends the reply back to its own %REPLY%<topic>"; 5.x request-reply uses the one below.
     static constexpr const char* REPLY_TOPIC_POSTFIX = "REPLY_TOPIC";
-    // 应答消息的 MSG_TYPE 属性值（协议 MixAll.REPLY_MESSAGE_FLAG）
+    // MSG_TYPE property value of a reply message (protocol MixAll.REPLY_MESSAGE_FLAG)
     static constexpr const char* REPLY_MESSAGE_FLAG = "reply";
     static constexpr const char* SYSTEM_TOPIC_PREFIX = "rmq_sys_";
     static constexpr const char* TOOLS_CONSUMER_GROUP = "TOOLS_CONSUMER";
@@ -48,9 +48,9 @@ struct MixAll {
     static constexpr const char* CID_ONSAPI_PULL_GROUP = "CID_ONSAPI_PULL";
     static constexpr const char* CID_SYS_RMQ_TRANS = "CID_SYS_RMQ_TRANS";
 
-    // ⚠ 协议里 UNIQUE_MSG_QUERY_FLAG 是 extFields 里的**键名**（取值 "true"/"false"），
-    // 不是一个整数标志位：整数发出去后 key 会变成数字键，uniqKey 查询路由不到 RocksDB 索引分支。
-    // 按 key 查消息的三种模式见 QueryMsgType。
+    // ⚠ In the protocol UNIQUE_MSG_QUERY_FLAG is the **key name** in extFields (value "true"/"false"),
+    // not an integer flag bit: sent as an integer the key becomes a numeric key and a uniqKey query cannot route to the RocksDB index branch.
+    // The three modes of querying messages by key are in QueryMsgType.
     static constexpr const char* UNIQUE_MSG_QUERY_FLAG = "_UNIQUE_KEY_QUERY";
     static constexpr const char* SCHEDULE_TOPIC = "SCHEDULE_TOPIC_XXXX";
     static constexpr const char* LMQ_PREFIX = "%LMQ%";
@@ -61,17 +61,17 @@ struct MixAll {
     static constexpr const char* RMQ_SYS_TRANS_OP_HALF_TOPIC = "RMQ_SYS_TRANS_OP_HALF_TOPIC";
     static constexpr int32_t TRANS_CHECK_MAX_TIME = 15;
     static constexpr const char* UNIT_PREFIX = "unit_";
-    // 协议 MixAll.REQ_T：请求类型标记的 extFields 键，由 StreamTypeRPCHook 写入。
-    // broker 侧只有 proxy/stream 链路读它，普通 broker 忽略。
+    // Protocol MixAll.REQ_T: the extFields key marking the request type, written by StreamTypeRPCHook.
+    // Only the broker-side proxy/stream chain reads it; a plain broker ignores it.
     static constexpr const char* REQ_T = "ReqT";
-    // clientId 拼串用的是 `RequestType.STREAM.name()`，即字面量 "STREAM"
-    // （⚠ 与 extFields 里那个**枚举 code** 不同，见 StreamTypeRPCHook）。
+    // The clientId string uses `RequestType.STREAM.name()`, i.e. the literal "STREAM"
+    // (⚠ different from that **enum code** in extFields, see StreamTypeRPCHook).
     static constexpr const char* STREAM_REQUEST_TYPE = "STREAM";
-    // 5.x 新命名空间（namespaceV2，阿里云实例 ID 形态）的两枚 extFields 键，
-    // 协议 MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD / _NAMESPACE_FIELD
-    // ，由 NamespaceRpcHook 写入。
-    // ⚠ 与上面的 setNamespace（老命名空间，客户端把 topic 改写成 "ns%topic"）是**两套
-    // 机制**：这一套不改 topic 名，broker 靠请求头把资源解析到实例下。
+    // The two extFields keys of the 5.x namespace (namespaceV2, Alibaba Cloud instance-id shaped),
+    // protocol MixAll.RPC_REQUEST_HEADER_NAMESPACED_FIELD / _NAMESPACE_FIELD
+    // , written by NamespaceRpcHook.
+    // ⚠ These are **two mechanisms** distinct from setNamespace above (the old namespace, where the client rewrites the topic into "ns%topic"):
+    // this one leaves the topic name untouched and the broker resolves the resource into the instance from the request header.
     static constexpr const char* RPC_REQUEST_HEADER_NAMESPACED_FIELD = "nsd";
     static constexpr const char* RPC_REQUEST_HEADER_NAMESPACE_FIELD = "ns";
 
@@ -91,8 +91,8 @@ struct MixAll {
         return std::string(RETRY_GROUP_TOPIC_PREFIX) + consumerGroup;
     }
 
-    // 协议 MixAll.brokerVIPChannel：VIP 通道 = 端口 - 2。
-    // 端口不可解析时原样返回（不让传输层因此崩掉）。
+    // Protocol MixAll.brokerVIPChannel: the VIP channel = port - 2.
+    // When the port cannot be parsed the address is returned unchanged (so the transport never crashes over it).
     static std::string brokerVipChannel(bool isChange, const std::string& brokerAddr) {
         if (!isChange) return brokerAddr;
         size_t colon = brokerAddr.rfind(':');
@@ -117,9 +117,9 @@ struct MixAll {
         return topic.rfind(DLQ_GROUP_TOPIC_PREFIX, 0) == 0;
     }
 
-    // 协议 MixAll.getReplyTopic(clusterName) = clusterName + "_REPLY_TOPIC"。
-    // 该 topic 由 broker 在启动时注册为**系统 topic**（TopicConfigManager.init），
-    // 客户端不可 createTopic 建它（会被 INVALID_PARAMETER「conflict with system topic」拒）。
+    // Protocol MixAll.getReplyTopic(clusterName) = clusterName + "_REPLY_TOPIC".
+    // The broker registers this topic as a **system topic** at startup (TopicConfigManager.init), so
+    // a client must not createTopic it (rejected with INVALID_PARAMETER "conflict with system topic").
     static std::string getReplyTopic(const std::string& clusterName) {
         return clusterName + "_" + REPLY_TOPIC_POSTFIX;
     }
@@ -128,17 +128,17 @@ struct MixAll {
         return topic.rfind(SYSTEM_TOPIC_PREFIX, 0) == 0;
     }
 
-    // 协议 MixAll.isLmq（LMQ topic 以 %LMQ% 开头）
+    // Protocol MixAll.isLmq (an LMQ topic starts with %LMQ%)
     static bool isLmq(const std::string& lmqMetaData) {
         return lmqMetaData.rfind(LMQ_PREFIX, 0) == 0;
     }
 
-    // 协议 MixAll.isSysConsumerGroup（CID_RMQ_SYS_ 前缀）
+    // Protocol MixAll.isSysConsumerGroup (CID_RMQ_SYS_ prefix)
     static bool isSysConsumerGroup(const std::string& consumerGroup) {
         return consumerGroup.rfind(CID_RMQ_SYS_PREFIX, 0) == 0;
     }
 
-    // 协议 MixAll.isPredefinedGroup（PREDEFINE_GROUP_SET 命中）
+    // Protocol MixAll.isPredefinedGroup (a hit in PREDEFINE_GROUP_SET)
     static bool isPredefinedGroup(const std::string& consumerGroup);
 
     static std::string resetRetryAndDlqTopic(const std::string& topic) {
@@ -151,27 +151,27 @@ struct MixAll {
         return topic;
     }
 
-    // 本机出口 IP（UDP connect 探测，无外网回落 gethostname -> 127.0.0.1）
+    // Local egress IP (probed with a UDP connect; falls back to gethostname -> 127.0.0.1 when there is no external network)
     static std::string getIpStr();
-    // 进程内只探测一次的本机 IP：探测一次后固定，故同一客户端的 clientId 稳定
-    // （每次重新探测既慢，又可能在换网卡后让重启的客户端换一个 clientId）。
+    // Local IP probed only once per process: fixed after the first probe, so the clientId of a client stays stable
+    // (re-probing every time is both slower and, after a NIC change, could give a restarting client a different clientId).
     static const std::string& cachedIpStr();
     static int32_t pid();
 
     // ---------------- Properties <-> String ----------------
-    // 协议 MixAll.properties2String / string2Properties。
+    // Protocol MixAll.properties2String / string2Properties.
     //
-    // 这是管理端最容易踩的坑：**GET_BROKER_CONFIG 的响应体是 properties 文本**
-    // （每行 "key=value"），不是 JSON、也不是 KVTable。用 JSON 解析器去解必然失败。
+    // This is the easiest trap on the admin side: **the GET_BROKER_CONFIG response body is properties text**
+    // (each line "key=value"), not JSON and not a KVTable. Parsing it with a JSON parser must fail.
     //
-    // 注：PropertyMap 是 std::map，天然按 key 有序，因此输出顺序确定；
-    // broker 侧按行解析，顺序不影响语义。
+    // Note: PropertyMap is a std::map, naturally ordered by key, so the output order is deterministic;
+    // the broker parses line by line, so the order carries no semantics.
     static std::string properties2String(const PropertyMap& properties);
     static PropertyMap string2Properties(const std::string& text);
 };
 
-// QueryMsgType：按 key 查消息的三种模式。
-// 与 MixAll::UNIQUE_MSG_QUERY_FLAG（extFields 键名）不是一回事。
+// QueryMsgType: the three modes of querying messages by key.
+// Not the same thing as MixAll::UNIQUE_MSG_QUERY_FLAG (an extFields key name).
 struct QueryMsgType {
     static constexpr int32_t ALL_MESSAGE = 0;
     static constexpr int32_t UNIQUE_KEY = 1;

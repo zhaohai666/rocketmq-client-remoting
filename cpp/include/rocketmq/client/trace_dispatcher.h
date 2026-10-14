@@ -1,10 +1,10 @@
-// 职责：钩子把 TraceContext 丢进内存队列（``append``），后台线程按
-// 「攒够 batchNum 条 或 距上次发送超过 5s」两个条件触发刷写，再把编码后的文本
-// 用**独立的内部生产者**发到轨迹 topic（默认 RMQ_SYS_TRACE_TOPIC）。
+// Responsibility: hooks drop TraceContext into an in-memory queue (`append`); a background thread flushes when
+// either "batchNum contexts accumulated" or "more than 5s since the last send" triggers, then sends the encoded text
+// to the trace topic (default RMQ_SYS_TRACE_TOPIC) via **a separate internal producer**.
 //
 //
-// ⚠ 防递归：内部生产者自身的 enableTrace 必须为 false，且 SendMessageTraceHook 会跳过
-//   topic 以轨迹 topic 开头的消息 —— 两道保险都要有，否则轨迹会自我复制到无限。
+// ⚠ Recursion guard: the internal producer's own enableTrace must be false, and SendMessageTraceHook skips
+//   messages whose topic starts with the trace topic prefix — both safeguards are required, otherwise traces self-replicate infinitely.
 #ifndef ROCKETMQ_CLIENT_TRACE_DISPATCHER_H
 #define ROCKETMQ_CLIENT_TRACE_DISPATCHER_H
 
@@ -21,15 +21,15 @@
 
 namespace rocketmq {
 
-class DefaultMQProducer;        // 仅前向声明：避免与 producer.h 形成包含环
-class DefaultMQPushConsumer;     // 同上
+class DefaultMQProducer;        // Forward declaration only: avoids an include cycle with producer.h
+class DefaultMQPushConsumer;     // same as above
 
 class TraceDispatcher {
 public:
     virtual ~TraceDispatcher() = default;
     virtual bool append(const std::shared_ptr<TraceContext>& ctx) = 0;
     virtual std::string getTraceTopicName() const = 0;
-    // 宿主客户端的 clientId（EndTransaction 轨迹的 clientHost 用它），默认空串。
+    // The host client's clientId (the EndTransaction trace's clientHost uses it); defaults to empty string.
     virtual std::string clientId() const { return std::string(); }
 };
 
@@ -38,7 +38,7 @@ enum class TraceDispatcherType {
     CONSUME = 1,
 };
 
-// 异步轨迹分发器：全内存、单后台刷写线程、独立的内部生产者不追踪自身。
+// Async trace dispatcher: fully in-memory, a single background flush thread, an independent internal producer that does not trace itself.
 class AsyncTraceDispatcher : public TraceDispatcher {
 public:
     static constexpr int32_t QUEUE_CAPACITY = 2048;
@@ -47,7 +47,7 @@ public:
     static constexpr int32_t WAIT_FOR_SHUTDOWN = 5000;
     static constexpr int32_t MAX_MSG_SIZE = 128000;
 
-    // batchNum 默认 10、最大 20；traceTopicName 缺省 RMQ_SYS_TRACE_TOPIC。
+    // batchNum defaults to 10, max 20; traceTopicName defaults to RMQ_SYS_TRACE_TOPIC.
     AsyncTraceDispatcher(const std::string& group, TraceDispatcherType type,
                          int32_t batchNum = 10, const std::string& traceTopicName = std::string(),
                          std::shared_ptr<void> rpcHook = nullptr);
@@ -56,7 +56,7 @@ public:
     AsyncTraceDispatcher(const AsyncTraceDispatcher&) = delete;
     AsyncTraceDispatcher& operator=(const AsyncTraceDispatcher&) = delete;
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
     void start(const std::string& nameSrvAddr,
                AccessChannel accessChannel = AccessChannel::LOCAL);
     void shutdown();
@@ -64,7 +64,7 @@ public:
     bool append(const std::shared_ptr<TraceContext>& ctx);
     void flush();
 
-    // ---------------- 访问 ----------------
+    // ---------------- Accessors ----------------
     std::string getTraceTopicName() const { return traceTopicName_; }
     void setHostProducer(DefaultMQProducer* host) { hostProducer_ = host; }
     void setHostConsumer(DefaultMQPushConsumer* host) { hostConsumer_ = host; }
@@ -77,8 +77,8 @@ public:
     bool isStarted() const { return started_.load(); }
 
 protected:
-    // 虚方法 seam：便于单测用假生产者捕获发送（不打真实网络）。
-    // 默认实现用内部生产者发到 traceTopic（body 即编码后的轨迹文本，keys 为反查键）。
+    // Virtual-method seam: lets unit tests capture sends with a fake producer (no real network).
+    // Default implementation sends to the traceTopic with the internal producer (body is the encoded trace text, keys are the lookup keys).
     virtual void sendTraceMessage(const std::string& traceTopic, const std::string& body,
                                   const std::string& keys);
 
@@ -119,7 +119,7 @@ private:
     std::mutex cvMutex_;
     std::atomic<int64_t> lastFlushTime_{0};
 
-    // 进程级递增计数器（用于内部生产者组名后缀）
+    // Process-level monotonically increasing counter (suffix for the internal producer's group name)
     static std::atomic<int32_t> instanceCounter_;
     static std::atomic<int32_t> groupCounter_;
 };

@@ -1,4 +1,4 @@
-// 全局基础类型别名。
+// Global fundamental type aliases.
 #ifndef ROCKETMQ_COMMON_TYPES_H
 #define ROCKETMQ_COMMON_TYPES_H
 

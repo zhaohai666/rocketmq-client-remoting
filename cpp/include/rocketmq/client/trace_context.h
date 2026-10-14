@@ -1,4 +1,4 @@
-// W3C Trace Context（traceparent）透传 —— OpenTracing/OTel 场景的消息级上下文。
+// W3C Trace Context (traceparent) propagation — message-level context for OpenTracing/OTel scenarios.
 #ifndef ROCKETMQ_CLIENT_TRACE_CONTEXT_H
 #define ROCKETMQ_CLIENT_TRACE_CONTEXT_H
 
@@ -11,22 +11,22 @@ namespace rocketmq {
 inline constexpr const char* kTraceContextProperty = "traceparent";
 inline constexpr const char* kTraceStateProperty = "tracestate";
 
-// 生成合法的根 traceparent：`00-<32hex>-<16hex>-01`（记录采样）。
+// Generates a valid root traceparent: `00-<32hex>-<16hex>-01` (sampled flag recorded).
 std::string generateTraceparent();
 
-// 按 W3C 语法与"不全 0"规则校验。宽松接受大写 hex（转发不重写）。
+// Validates W3C syntax and the "not all zeros" rule; uppercase hex is accepted leniently (forwarding does not rewrite).
 bool isValidTraceparent(const std::string& value);
 
-// 同一 trace-id 下生成子 span（换 parent-id）；parent 非法返回空串。
+// Generates a child span (new parent-id) under the same trace-id; returns an empty string when the parent is invalid.
 std::string childTraceparent(const std::string& parent);
 
-// 消息没有 traceparent 属性时注入根上下文；返回（注入后的）值。
+// Injects a root context when the message has no traceparent property; returns the (injected) value.
 std::string injectTraceContext(Message* msg);
 
-// 从消息属性里取出 traceparent（未注入/为空返回空串）。
+// Reads the traceparent from the message properties (empty string when not injected or empty).
 std::string extractTraceparent(const Message& msg);
 
-// env `ROCKETMQ_TRACE_CONTEXT_ENABLE`。
+// Environment variable `ROCKETMQ_TRACE_CONTEXT_ENABLE`.
 bool traceContextEnabledFromEnv();
 
 }  // namespace rocketmq

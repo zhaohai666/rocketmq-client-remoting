@@ -125,8 +125,8 @@ ConsumerStatsManager::ConsumerStatsManager()
 ConsumerStatsManager::~ConsumerStatsManager() { shutdown(); }
 
 void ConsumerStatsManager::start() {
-    // start() 收敛为一个统一采样线程（采样也可挂在每个 StatsItem 上，此处不做），
-    // 精度不变（10s）。
+    // start() converges on a single sampling thread (sampling could also hang off each StatsItem; not done here),
+    // keeping the same 10s resolution.
     std::lock_guard<std::mutex> lk(sampleMutex_);
     if (started_) return;
     stop_ = false;
@@ -140,7 +140,7 @@ void ConsumerStatsManager::shutdown() {
         if (!started_) return;
         stop_ = true;
     }
-    // 采样线程停在 wait_for(10s) 上，必须显式唤醒，否则 shutdown 要等满一个采样周期
+    // The sampling thread parks in wait_for(10s), so it must be woken explicitly; otherwise shutdown waits a full sampling period
     sampleCond_.notify_all();
     if (sampleThread_ && sampleThread_->joinable()) {
         sampleThread_->join();
@@ -156,7 +156,7 @@ void ConsumerStatsManager::sampleLoop() {
         bool stopped = false;
         {
             std::unique_lock<std::mutex> lk(sampleMutex_);
-            // wait_for 返回 true 表示被 notify 唤醒（stop）；超时即到采样点。
+            // wait_for returning true means notify woke it (stop); a timeout means the sampling point is due.
             stopped = sampleCond_.wait_for(lk, std::chrono::duration<double>(kSamplingIntervalSeconds),
                                            [this]() { return stop_; });
         }
@@ -167,7 +167,7 @@ void ConsumerStatsManager::sampleLoop() {
         topicAndGroupConsumeRT_.sampleAll();
         topicAndGroupConsumeOKTPS_.sampleAll();
         topicAndGroupConsumeFailedTPS_.sampleAll();
-        if (rounds % 60 == 0) {  // 60 × 10s = 10 分钟
+        if (rounds % 60 == 0) {  // 60 x 10s = 10 minutes
             topicAndGroupPullRT_.sampleHourAll();
             topicAndGroupPullTPS_.sampleHourAll();
             topicAndGroupConsumeRT_.sampleHourAll();

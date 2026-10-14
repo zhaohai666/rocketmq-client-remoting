@@ -29,7 +29,7 @@ namespace rocketmq {
 class LiteMessageQueueListener {
 public:
     virtual ~LiteMessageQueueListener() = default;
-    // mqAll=当前订阅的全部队列；mqDivided=本次新分配给本实例的队列。
+    // mqAll = every queue of the current subscription; mqDivided = queues newly assigned to this instance.
     virtual void messageQueueChanged(const std::vector<MessageQueue>& mqAll,
                                     const std::vector<MessageQueue>& mqDivided) = 0;
 };
@@ -50,7 +50,7 @@ public:
     DefaultLitePullConsumer(const DefaultLitePullConsumer&) = delete;
     DefaultLitePullConsumer& operator=(const DefaultLitePullConsumer&) = delete;
 
-    // ---------------- 配置 ----------------
+    // ---------------- Configuration ----------------
     void setNamesrvAddr(const std::string& addr);
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     void setInstanceName(const std::string& name) { instanceName_ = name; }
@@ -60,7 +60,7 @@ public:
     void setUnitMode(bool unitMode) { unitMode_ = unitMode; }
     bool isUnitMode() const { return unitMode_; }
 
-    // true 时每个请求带扩展字段 `ReqT=0`，且 clientId 末尾多一段 `@STREAM`。
+    // When true every request carries the extension field `ReqT=0`, and the clientId gains a trailing `@STREAM` segment.
     void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
@@ -107,27 +107,27 @@ public:
     bool isStarted() const { return started_; }
     bool isRunning() const { return running_; }
 
-    // ---------------- 订阅 / 分配 ----------------
-    // subscribe 模式：登记 topic 订阅（支持 tag 表达式），自动 rebalance 分配队列。
+    // ---------------- Subscription / assignment ----------------
+    // Subscribe mode: registers a topic subscription (tag expressions supported), rebalance assigns queues automatically.
     void subscribe(const std::string& topic, const std::string& subExpression = "*");
     void subscribe(const std::string& topic, const std::string& subExpression,
                    std::shared_ptr<LiteMessageQueueListener> messageQueueListener);
     void registerTopicMessageQueueChangeListener(
         const std::string& topic, std::shared_ptr<TopicMessageQueueChangeListener> listener);
-    // 后台比对的**一趟**：遍历已注册的队列变更监听器，逐 topic 现查队列集合，与上次快照
-    // 按集合相等比较，只有真的变了才更新快照并回调。公开是为了让单测能自己驱动这一趟，
-    // 不必等后台线程的首查延迟。
+    // One **pass** of the background comparison: walk the registered queue-change listeners, re-query
+    // each topic's queue set, compare it for set equality with the last snapshot, and update the
+    // snapshot and call back only on a real change. Public so tests need not wait for the background first check.
     void fetchTopicMessageQueuesAndCompare();
     void setSubExpressionForAssign(const std::string& topic, const std::string& subExpression);
-    // assign 模式：显式指定队列，不走 rebalance。
+    // Assign mode: queues are given explicitly, no rebalance involved.
     void assign(const std::vector<MessageQueue>& messageQueues);
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
     void start();
     void shutdown();
 
-    // ---------------- 拉取 / poll ----------------
-    // 从本地缓冲批量取消息，阻塞至多 timeoutMillis 毫秒。返回取到的消息（可能为空）。
+    // ---------------- Pull / poll ----------------
+    // Batch-read from the local buffer, blocking at most timeoutMillis ms; returns what was taken (may be empty).
     std::vector<MessageExt> poll(int32_t timeoutMillis = -1);
 
     void seek(const MessageQueue& mq, int64_t offset);
@@ -142,12 +142,12 @@ public:
     int64_t pullCursorOf(const MessageQueue& mq);
     int64_t consumeCursorOf(const MessageQueue& mq);
 
-    // ---------------- 队列查询 / 控制 ----------------
-    // 该 topic 的全部可消费队列（按 broker 路由取，已套命名空间）。
+    // ---------------- Queue query / control ----------------
+    // All consumable queues of the topic (taken from the broker route, namespace already applied).
     std::vector<MessageQueue> fetchMessageQueues(const std::string& topic);
-    // 当前分配给本实例的队列。
+    // The queues currently assigned to this instance.
     std::vector<MessageQueue> assignment();
-    // 暂停 / 恢复某些队列的拉取。
+    // Pause / resume pulling from specific queues.
     void pause(const std::vector<MessageQueue>& messageQueues);
     void resume(const std::vector<MessageQueue>& messageQueues);
 
@@ -156,9 +156,9 @@ private:
         return namespace_.empty() ? topic : NamespaceUtil::wrapNamespace(namespace_, topic);
     }
 
-    // 收集订阅的全部队列（listener 回调用）
+    // Collect every queue of the subscription (for the listener callback)
     std::vector<MessageQueue> mqAllOfSubscription() const;
-    // std::set<MessageQueue> -> vector（listener 回调用）
+    // std::set<MessageQueue> -> vector (for the listener callback)
     std::vector<MessageQueue> newSetAsVector(const std::set<MessageQueue>& s) const;
 
     void rebalance();
@@ -168,16 +168,16 @@ private:
     bool filterTags(const std::string& topic, std::vector<MessageExt>& msgs, const std::string& sub);
     void enqueue(const std::vector<MessageExt>& msgs);
     void maybeAutoCommit();
-    // commit() 的三个入口共用的那半段：写内存位点表 + 按需 persistAll。
+    // The half shared by commit()'s three entry points: write the in-memory offset table + persistAll on demand.
     void commitOffsets(const std::map<MessageQueue, int64_t>& targets,
                        const std::set<MessageQueue>& scope, bool persist);
     void persistOffset(const MessageQueue& mq);
     void persistOffsetTable(const std::set<MessageQueue>& mqs);
-    // poll() 交付之后推进「已消费游标」，对位 assignedMessageQueue.updateConsumeOffset。
+    // Advance the consumed cursor after poll() delivers, mirroring assignedMessageQueue.updateConsumeOffset.
     void advanceConsumeOffset(const std::vector<MessageExt>& msgs);
     int64_t resolveInitialOffset(const MessageQueue& mq);
 
-    // 心跳（把 tag 订阅注册给 broker）
+    // Heartbeat (registers the tag subscriptions with the broker)
     HeartbeatData buildHeartbeat() const;
     int32_t sendHeartbeatToAllBroker();
     void heartbeatLoop();
@@ -208,26 +208,26 @@ private:
     std::vector<std::string> nameServerAddrs_;
     std::shared_ptr<RPCHook> rpcHook_;
 
-    // subscribe 模式的订阅表（topic -> sub_expression，已套命名空间）
+    // Subscription table in subscribe mode (topic -> sub_expression, namespace already applied)
     std::map<std::string, std::string> subscription_;
-    // 订阅对应的 SubscriptionData（带 tagsSet），用于发给 broker 的心跳做 tag 过滤注册
+    // SubscriptionData per subscription (with tagsSet), used by the heartbeat sent to the broker to register tag filtering
     std::map<std::string, SubscriptionData> subscriptionData_;
-    // assign 模式：topic -> tag 过滤表达式（透传给 pull）
+    // Assign mode: topic -> tag filter expression (passed through to pull)
     std::map<std::string, std::string> assignSubExpr_;
-    // assign 模式与 subscribe 模式互斥；拉取线程每轮都读它，赋值方是调用方线程，
-    // 所以是原子量而不是 stateMutex_ 下的普通 bool（读点很多，不值得为它加锁）。
+    // Assign and subscribe modes are mutually exclusive; the pull thread reads this every round while the
+    // setter runs on the caller thread, so it is atomic rather than a plain bool under stateMutex_ (many read sites, not worth locking).
     std::atomic<bool> assignMode_{false};
-    // 分配与位点的全部可变状态（assigned_ / 三张游标表 / 自动提交截止时刻 / 暂停集合）
-    // 由这一把 stateMutex_ 保护：拉取线程在推进拉取游标、rebalance 在改分配，
-    // 试用 poll/commit 的调用方线程同时在读，无锁就是数据竞争（C++ 里是 UB）。
-    // 两条铁律：拿着这把锁**不做网络 I/O**，也**不去拿 bufferMutex_**。
+    // All mutable assignment and offset state (assigned_ / the three cursor tables / the auto-commit
+    // deadline / the paused set) is guarded by this single stateMutex_: the pull thread advances the
+    // pull cursor, rebalance rewrites the assignment and poll/commit caller threads read at the same
+    // time, so unlocked access is a data race (undefined behavior). Rules: **no network I/O** under it, never take bufferMutex_.
     mutable std::mutex stateMutex_;
     std::set<MessageQueue> assigned_;
 
     std::shared_ptr<LiteMessageQueueListener> messageQueueListener_;
 
-    // per-subscription 监听器（subscribe 的三参重载）与队列变化监听器，都按
-    // topic（已套命名空间）登记；各自的注册/遍历由 topicListenerMutex_ 保护。
+    // Per-subscription listeners (the three-argument subscribe overload) and queue-change listeners, all
+    // keyed by topic (namespace already applied); their registration and iteration are under topicListenerMutex_.
     mutable std::mutex topicListenerMutex_;
     std::map<std::string, std::shared_ptr<LiteMessageQueueListener>> topicListeners_;
     std::map<std::string, std::shared_ptr<TopicMessageQueueChangeListener>> topicChangeListeners_;

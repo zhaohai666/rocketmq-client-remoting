@@ -29,15 +29,15 @@ struct TopicValidator {
 
     static constexpr const char* SYSTEM_TOPIC_PREFIX = "rmq_sys_";
 
-    // 字符表判定：**空串返回 false**（空/纯空白由 UtilAll::isBlank 单独管）。
+    // Character-table check: **an empty string returns false** (empty/pure whitespace is handled separately by UtilAll::isBlank).
     static bool isTopicOrGroupIllegal(const std::string& name);
 
-    // 命中系统 topic 名单或 rmq_sys_ 前缀
+    // Hit the system topic list or the rmq_sys_ prefix
     static bool isSystemTopic(const std::string& topic);
 
-    // 客户端**不能直接发**的 topic：这几个是 broker 内部状态流水（半消息、延迟、
-    // 轨迹校验…），用户发进去会污染 broker 的事务/延迟/校验逻辑。
-    // ⚠ %RETRY% 前缀 topic **不在**名单里：sendMessageBack 就是往 %RETRY%group 写的。
+    // Topics the client **must not send to directly**: these are broker-internal state streams (half
+    // messages, delay, trace check-back, ...); sending into them would corrupt the broker's transaction/delay/check logic.
+    // ⚠ %RETRY% prefixed topics are **not** in the list: sendMessageBack writes to %RETRY%group on purpose.
     static bool isNotAllowedSendTopic(const std::string& topic);
 
     static const std::set<std::string>& systemTopicSet();

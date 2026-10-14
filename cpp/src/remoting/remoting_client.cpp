@@ -1,10 +1,10 @@
-// RemotingClient 的实现：基于阻塞 socket + 每连接读线程的请求/响应模型。
+// RemotingClient implementation: a request/response model over blocking sockets with one reader thread per connection.
 //
-// 两个容易踩的坑，这里都做了处理：
-//   1. SIGPIPE：向已被对端关闭的 socket 写入会触发 SIGPIPE，默认行为是**杀掉进程**。
-//      Linux 上用 send(..., MSG_NOSIGNAL)，macOS/BSD 上用 SO_NOSIGPIPE 套接字选项。
-//   2. 读线程退出：不能靠阻塞 recv 长时间挂着，否则 shutdown 时无法及时回收。
-//      这里用 select() 带 300ms 超时轮询，既能及时退出也不会空转烧 CPU。
+// Two easy traps, both handled here:
+//   1. SIGPIPE: writing to a socket already closed by the peer raises SIGPIPE, whose default action **kills the process**.
+//      On Linux use send(..., MSG_NOSIGNAL); on macOS/BSD use the SO_NOSIGPIPE socket option.
+//   2. Reader exit: readers must not sit in a blocking recv for long, otherwise shutdown cannot reap them promptly.
+//      select() with a 300ms timeout is used instead: prompt exit without a CPU-burning spin.
 #include "rocketmq/remoting/remoting_client.h"
 
 #include <atomic>
@@ -30,15 +30,15 @@
 #include "tls_session.h"
 
 #ifndef _WIN32
-#include <fcntl.h>  // 非阻塞 connect 用（fcntl/F_GETFL/F_SETFL）
+#include <fcntl.h>  // used for non-blocking connect (fcntl/F_GETFL/F_SETFL)
 #endif
 
 namespace rocketmq {
 
 namespace {
 
-// 平台 socket 原语统一来自 netcompat（见 include/rocketmq/common/net_compat.h）。
-// 用 using 声明引入文件作用域，保持下面代码里 socket_t/closeSocket 等名字不变。
+// Platform socket primitives all come from netcompat (see include/rocketmq/common/net_compat.h).
+// using declarations bring them into file scope so names like socket_t/closeSocket stay unchanged below.
 using netcompat::closeSocket;
 using netcompat::ensureInitialized;
 using netcompat::kInvalidSocket;
@@ -46,7 +46,7 @@ using netcompat::sendFlags;
 using netcompat::socket_t;
 using netcompat::tuneSocket;
 
-// 带超时的 connect：先置非阻塞，select 等可写，再恢复阻塞
+// connect with a timeout: set non-blocking first, select for writability, then restore blocking mode
 socket_t connectWithTimeout(const std::string& host, const std::string& port,
                             int32_t timeoutMillis, std::string& err) {
     struct addrinfo hints;
@@ -83,7 +83,7 @@ socket_t connectWithTimeout(const std::string& host, const std::string& port,
             tv.tv_usec = (timeoutMillis % 1000) * 1000;
             int sel = ::select(netcompat::selectNfds(sock), nullptr, &wfds, nullptr, &tv);
             if (sel > 0) {
-                // 可写不代表连上了，必须用 SO_ERROR 复核
+                // Writability does not prove the connection succeeded; SO_ERROR must confirm it
                 int soErr = 0;
                 netcompat::socklen_type len = sizeof(soErr);
                 ::getsockopt(sock, SOL_SOCKET, SO_ERROR,
@@ -92,7 +92,7 @@ socket_t connectWithTimeout(const std::string& host, const std::string& port,
             }
         }
         if (connected) {
-            // 恢复阻塞模式，读循环用 select() 控制节奏
+            // Restore blocking mode; the read loop paces itself with select()
 #ifdef _WIN32
             u_long blk = 0;
             ::ioctlsocket(sock, FIONBIO, &blk);
@@ -113,7 +113,7 @@ socket_t connectWithTimeout(const std::string& host, const std::string& port,
     return sock;
 }
 
-// 写全部字节；返回 false 表示对端已关闭或出错
+// Write all bytes; false means the peer closed the connection or an error occurred
 bool sendAll(socket_t sock, const Bytes& data) {
     size_t sent = 0;
     const int flags = sendFlags();
@@ -134,18 +134,18 @@ std::string formatAddr(const std::string& addr) { return addr; }
 
 // ---------------------------------------------------------------- Impl
 struct RemotingClient::Impl {
-    // 读线程任何一次阻塞的上界：与 select 的 300ms 同量级，退出时最多再等一个 tick。
+    // Upper bound on any single blocking wait in the reader: the same order as select's 300ms, so exiting waits at most one more tick.
     static constexpr int32_t kReaderTimeoutMs = 300;
 
     struct Connection {
         std::string addr;
-        // 读线程每一轮都要重新认领它（见 readLoop）：别的线程会在写失败、closeChannel、
-        // shutdown 时关掉 fd 并置回 kInvalidSocket，而 fd 号会被内核立刻发给新连接。
-        // 裸 int 让这种跨线程读写成为数据竞争，atomic 是唯一诚实的写法。
+        // The reader re-claims it every round (see readLoop): other threads close the fd and reset it
+        // to kInvalidSocket on write failure, closeChannel and shutdown, and the kernel immediately hands the
+        // recycled fd number to a new connection. A plain int makes this cross-thread read/write a data race; atomic is the only honest form.
         std::atomic<socket_t> sock{kInvalidSocket};
         std::mutex writeMutex;
         std::atomic<bool> readerDone{false};
-        // TLS 会话（tlsEnable 时非空；read/write 走 SSL_*）
+        // TLS session (non-null when tlsEnable; read/write go through SSL_*)
         std::unique_ptr<TlsSession> tls;
     };
 
@@ -186,13 +186,13 @@ struct RemotingClient::Impl {
     std::mutex respMutex;
     std::unordered_map<int32_t, std::shared_ptr<Future>> respTable;
 
-    // broker 主动请求处理器表：requestCode -> handler。仅用于事务回查
-    // (CHECK_TRANSACTION_STATE=39) 这类「服务端反过来找我」的命令。
+    // Broker-initiated request handler table: requestCode -> handler. Used only for transaction
+    // check-back (CHECK_TRANSACTION_STATE=39) and other commands where the server calls back into us.
     std::mutex procMutex;
     std::unordered_map<int32_t, RequestProcessor> processors;
 
-    // RPC 钩子（ACL 等）。注册发生在 start 阶段；发送路径只在锁内取一次
-    // shared_ptr 拷贝，**绝不持锁调用钩子**（钩子内部可能做签名计算甚至 I/O）。
+    // RPC hooks (ACL etc.). Registration happens during the start phase; the send path takes only one
+    // shared_ptr copy under the lock and **never calls a hook while holding it** (hooks may compute signatures or even do I/O).
     std::mutex hookMutex;
     std::shared_ptr<RPCHook> rpcHook;
 
@@ -201,8 +201,8 @@ struct RemotingClient::Impl {
         return rpcHook;
     }
 
-    // 读线程账本：<连接, 线程>。线程结束后置 connection->readerDone，
-    // 由 pruneThreadsLocked 回收（join 后从账本移除），避免线程句柄无限堆积。
+    // Reader thread ledger: <connection, thread>. A finished thread sets connection->readerDone and
+    // pruneThreadsLocked reaps it (join, then remove from the ledger), so thread handles never pile up unboundedly.
     std::mutex threadMutex;
     std::vector<std::pair<std::shared_ptr<Connection>, std::thread>> threads;
 
@@ -224,11 +224,11 @@ struct RemotingClient::Impl {
         pruneThreadsLocked();
     }
 
-    // 取出并创建/复用连接；不持有 connMutex 的调用方负责传入已锁定的上下文
+    // Fetch and create/reuse a connection; callers that do not hold connMutex must pass an already-locked context
     std::shared_ptr<Connection> getOrCreateConnection(const std::string& addr) {
-        // shutdown 之后不再建连：读线程退出时会投递回调（failFast / 正常响应），回调里
-        // 若重进传输层，就会在 shutdown 正持有 threadMutex 等 join 的当口往账本里塞新线程
-        // ——轻则迭代器失效，重则线程句柄永不回收、~std::thread(joinable) 直接 terminate。
+        // No new connections after shutdown: reader threads deliver callbacks on exit (failFast / normal
+        // response), and a callback re-entering the transport would push a new thread into the ledger exactly
+        // while shutdown holds threadMutex waiting to join -- at worst iterator invalidation, at worst thread handles never reclaimed and ~std::thread(joinable) calling terminate.
         if (!running.load()) {
             throw RemotingConnectException("remoting client is shut down, " + addr);
         }
@@ -239,7 +239,7 @@ struct RemotingClient::Impl {
                 return it->second;
             }
         }
-        // 建连放到锁外，避免慢 connect 阻塞其它地址
+        // Connect outside the lock so a slow connect does not block other addresses
         std::string host;
         std::string port;
         RemotingClient::parseAddress(addr, host, port);
@@ -287,7 +287,7 @@ struct RemotingClient::Impl {
 
         {
             std::lock_guard<std::mutex> lk(connMutex);
-            // 并发建连：若已有别人先建成，放弃自己的 socket
+            // Concurrent connect: if another thread already established one, give up our own socket
             auto it = conns.find(addr);
             if (it != conns.end() && it->second->sock != kInvalidSocket) {
                 closeSocket(sock);
@@ -313,32 +313,32 @@ struct RemotingClient::Impl {
         char chunk[65536];
         socket_t sock = kInvalidSocket;
         while (running.load()) {
-            // 每一轮重新认领 fd。线程启动时缓存一份（早先的做法）在 CI 上挂死过：
-            // closeChannel 关掉旧连接、紧接着重连拿到**同一个 fd 号**，旧读线程还睡在
-            // 这个号上，于是它读的是新连接的字节 —— 新连接等不到响应，旧连接又永远退不出，
-            // 最后 shutdown() 的 join 一起挂住（Linux 关 fd 不会唤醒阻塞中的 recv）。
+            // Re-claim the fd every round. Caching it once at thread start (the earlier approach) hung in CI:
+            // closeChannel closed the old connection, the immediate reconnect got **the same fd number**, and the stale
+            // reader still slept on that number, so it read the new connection's bytes -- the new connection never got
+            // its response, the old reader never exited, and shutdown()'s join blocked too (on Linux closing an fd does not wake a blocked recv).
             const socket_t current = conn->sock;
             if (current == kInvalidSocket) {
                 break;
             }
             if (current != sock) {
                 sock = current;
-                // fd 换号 = 新连接：接收超时按连接设一次即可。
+                // A changed fd number means a new connection: the receive timeout only needs setting once per connection.
                 netcompat::setRecvTimeout(sock, kReaderTimeoutMs);
             }
-            // TLS：SSL 内部可能还有未交付的解密字节（select 对 fd 会漏报），此时跳过 select
+            // TLS: SSL may still hold decrypted bytes not yet delivered (select on the fd would miss them); skip select in that case
             if (!(conn->tls && conn->tls->pending() > 0)) {
                 fd_set rfds;
                 FD_ZERO(&rfds);
                 FD_SET(sock, &rfds);
                 struct timeval tv;
                 tv.tv_sec = 0;
-                tv.tv_usec = 300000;  // 300ms：既能及时退出，也不空转
+                tv.tv_usec = 300000;  // 300ms: exits promptly without spinning
                 int sel = ::select(static_cast<int>(sock) + 1, &rfds, nullptr, nullptr, &tv);
                 if (sel < 0) {
-                    // shutdown() 关闭 fd 后 select 必然失败，属正常退出路径。这里统一记 DEBUG：
-                    // 默认 INFO 级别下不可见（不会出现"退出时的假异常"噪声），
-                    // 需要看连接生命周期时 ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG 即可。
+                    // After shutdown() closes the fd, select necessarily fails; this is the normal exit path. Logged at DEBUG:
+                    // invisible at the default INFO level (no "bogus error on exit" noise), and
+                    // ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG shows the connection lifecycle when it needs inspecting.
                     logger_debug("remoting reader: select failed on " + conn->addr + ", reader exiting");
                     break;
                 }
@@ -350,13 +350,13 @@ struct RemotingClient::Impl {
             if (conn->tls) {
                 n = conn->tls->read(sock, chunk, sizeof(chunk));
                 if (n == -2) {
-                    // SO_RCVTIMEO 到点（或 want-write）：回到 select 循环
+                    // SO_RCVTIMEO expired (or want-write): go back to the select loop
                     continue;
                 }
             } else {
                 n = static_cast<int>(::recv(sock, chunk, sizeof(chunk), 0));
                 if (n < 0 && (netcompat::isWouldBlock() || netcompat::isInterrupted())) {
-                    // SO_RCVTIMEO 到点 / 被信号打断：连接没坏，回到 select 重新认领 fd
+                    // SO_RCVTIMEO expired / interrupted by a signal: the connection is fine, go back to select and re-claim the fd
                     continue;
                 }
             }
@@ -366,7 +366,7 @@ struct RemotingClient::Impl {
                 break;
             }
             buf.append(chunk, static_cast<size_t>(n));
-            // 按 totalLength 前缀切帧；粘包/半包都由这里处理
+            // Split frames on the totalLength prefix; partial / coalesced frames are handled here
             while (true) {
                 if (buf.size() < 4) {
                     break;
@@ -380,7 +380,7 @@ struct RemotingClient::Impl {
                     break;
                 }
                 if (buf.size() < static_cast<size_t>(4 + totalLen)) {
-                    break;  // 半包，继续收
+                    break;  // partial frame, keep receiving
                 }
                 Bytes frame = buf.substr(0, static_cast<size_t>(4 + totalLen));
                 buf.erase(0, static_cast<size_t>(4 + totalLen));
@@ -395,30 +395,30 @@ struct RemotingClient::Impl {
             }
         }
         closeConnectionSocket(conn);
-        // failFast 在**本读线程**上投递业务回调，必须赶在 readerDone 置位之前做完：
-        // 回调只要重进传输层就会走到 getOrCreateConnection -> pruneThreads，而那里会
-        // join 掉所有 readerDone 的线程句柄——包括我们自己，std::thread::join join 自己
-        // 直接抛 std::system_error，读线程当场 terminate。
+        // failFast delivers business callbacks **on this reader thread** and must finish before readerDone is set:
+        // a callback that re-enters the transport reaches getOrCreateConnection -> pruneThreads, which joins
+        // every thread handle whose readerDone is set -- including our own, and std::thread::join on itself
+        // throws std::system_error right there, terminating the reader.
         failFast(conn);
         conn->readerDone.store(true);
     }
 
-    // 关掉一条连接的 fd，幂等。writeMutex 同时也是 socket 生命周期的锁：写路径失败时
-    // 持锁关掉它，这里也持同一把锁，于是既不会重复 close（fd 号可能被新连接复用，重复
-    // close 会关错人），也不会出现"一个线程在 send、另一个线程把 fd 抽走"的窗口。
+    // Close a connection's fd, idempotent. writeMutex also guards the socket lifetime: the write path
+    // closes it under this lock on failure and so does here, which avoids both a double close (the fd number
+    // may already be reused by a new connection, and closing again would hit the wrong one) and a window where one thread sends while another takes the fd away.
     void closeConnectionSocket(const std::shared_ptr<Connection>& conn) {
         std::lock_guard<std::mutex> wlk(conn->writeMutex);
         const socket_t sock = conn->sock;
         if (sock != kInvalidSocket) {
-            // 先摘号再关：读线程每轮重新认领 fd，看到 kInvalidSocket 就退出，
-            // 不会拿着一个即将被新连接复用的号继续 recv。
+            // Unpublish the fd before closing: the reader re-claims the fd each round, sees kInvalidSocket and exits,
+            // so it never keeps recv'ing on a number about to be reused by a new connection.
             conn->sock = kInvalidSocket;
             closeSocket(sock);
         }
     }
 
-    /// 按 Connection **对象身份**认领，不按地址串：地址相同但连接已换新是常见形状
-    /// （GO_AWAY 换连接重发、写失败后关连接），旧读线程收尾时不能把新连接的请求一起误杀。
+    /// Claim by Connection **object identity**, not by address string: the same address with a replaced connection is a common shape
+    /// (GO_AWAY reconnect-and-resend, close after a write failure), so a retiring reader must not kill the new connection's requests.
     int failFast(const std::shared_ptr<Connection>& conn) {
         std::vector<std::pair<std::shared_ptr<Future>, int32_t>> doomed;
         {
@@ -448,7 +448,7 @@ struct RemotingClient::Impl {
                 }
             }
             f->cv.notify_all();
-            // 与 sweepExpired 同理：回调必须在 respMutex 之外投递
+            // Same reasoning as sweepExpired: callbacks must be delivered outside respMutex
             if (mine && f->callback) {
                 f->callback(RemotingCommand(), error);
             }
@@ -465,7 +465,7 @@ struct RemotingClient::Impl {
         if (!RemotingCommand::tryDecode(frame, cmd, nullptr)) {
             logger_warn("remoting reader: drop undecodable frame (" + std::to_string(frame.size()) +
                         " bytes) from " + from);
-            return;  // 解不出的帧直接丢，不影响其它请求
+            return;  // drop an undecodable frame; other requests are unaffected
         }
         std::shared_ptr<Future> future;
         {
@@ -477,8 +477,8 @@ struct RemotingClient::Impl {
             }
         }
         if (future == nullptr) {
-            // 在途表里查不到：要么是迟到的响应，要么是 **broker 主动发来的请求**。
-            // 后者由已注册的处理器接管（典型：事务回查 CHECK_TRANSACTION_STATE=39）。
+            // Missing from the in-flight table: either a late response or a **broker-initiated request**.
+            // The latter is taken over by a registered processor (typically transaction check-back CHECK_TRANSACTION_STATE=39).
             if (!cmd.isResponseType()) {
                 RequestProcessor proc;
                 {
@@ -489,8 +489,8 @@ struct RemotingClient::Impl {
                     }
                 }
                 if (proc) {
-                    // 处理器在读线程里执行：异常必须兜住，否则读线程会死掉，
-                    // 导致该连接上其余响应全部丢失（比丢一条回查严重得多）。
+                    // The processor runs on the reader thread: exceptions must be caught, otherwise the reader dies
+                    // and every remaining response on this connection is lost (far worse than losing one check-back).
                     std::optional<RemotingCommand> resp;
                     try {
                         resp = proc(cmd, from);
@@ -510,12 +510,12 @@ struct RemotingClient::Impl {
                         sendResponseByAddr(from, *resp);
                     }
                 } else {
-                    // 没有注册处理器属于预期情况（未开启事务时 broker 不会发），别用 warn
+                    // Having no registered processor is expected (the broker does not send this when transactions are off), so do not warn
                     logger_debug("remoting: no processor for broker request code " +
                                  std::to_string(cmd.code) + " from " + from);
                 }
             }
-            return;  // 迟到的响应 / 已处理完的 broker 请求
+            return;  // late response / already-handled broker request
         }
         InvokeCallback cb;
         {
@@ -534,7 +534,7 @@ struct RemotingClient::Impl {
         }
     }
 
-    // 取得一个**在途请求中唯一**的 opaque，并在同一把锁内登记 future。
+    // Acquire an opaque **unique among in-flight requests** and register the future under the same lock.
     std::shared_ptr<Future> registerFutureAcquiringOpaque(RemotingCommand& request,
                                                           InvokeCallback cb,
                                                           const std::string& addr = std::string(),
@@ -543,7 +543,7 @@ struct RemotingClient::Impl {
         future->callback = std::move(cb);
         future->addr = addr;
         future->timeoutMs = timeoutMillis;
-        // timeoutMillis == 0 表示不交给清理线程（同步路径自己等、自己摘）。
+        // timeoutMillis == 0 means the sweeper is not involved (the sync path waits and unregisters on its own).
         future->deadlineMs = timeoutMillis > 0 ? Future::monoNowMs() + timeoutMillis : 0;
         std::lock_guard<std::mutex> lk(respMutex);
         if (respTable.find(request.opaque) != respTable.end()) {
@@ -565,7 +565,7 @@ struct RemotingClient::Impl {
 
     RemotingCommand invokeOnce(const std::string& addr, RemotingCommand& request,
                                int32_t timeoutMillis) {
-        // timeoutMillis 传 0：同步路径自己等、自己摘，不交给清理线程重复判超时。
+        // Pass 0 as timeoutMillis: the sync path waits and unregisters itself instead of letting the sweeper judge the timeout twice.
         auto future = registerFutureAcquiringOpaque(request, nullptr, addr, 0);
         const int32_t opaque = request.opaque;
         try {
@@ -603,8 +603,8 @@ struct RemotingClient::Impl {
             conn = it->second;
             conns.erase(it);
         }
-        // 关闭 socket 会让读线程的 select()/recv() 立刻返回并自行退出；
-        // 它退出时负责把这条连接名下的在途请求 failFast 掉（见 readLoop 末尾）。
+        // Closing the socket makes the reader's select()/recv() return at once and exit on its own;
+        // on exit it is responsible for failFasting this connection's in-flight requests (see the end of readLoop).
         closeConnectionSocket(conn);
     }
 
@@ -620,7 +620,7 @@ struct RemotingClient::Impl {
             throw RemotingTimeoutException(addr + " GO_AWAY retry budget exhausted, opaque="
                                            + std::to_string(request.opaque));
         }
-        // 重发必须是**新** opaque：旧请求已经拿到应答，复用会让下一次响应错配。
+        // The resend must use a **new** opaque: the old request already received its answer, and reusing the number would mismatch the next response.
         RemotingCommand retry = request;
         retry.opaque = RemotingCommand::nextOpaque();
         const RemotingCommand response = invokeOnce(addr, retry, static_cast<int32_t>(remaining));
@@ -636,9 +636,9 @@ struct RemotingClient::Impl {
     std::thread sweeper;
     bool sweeperStarted = false;
 
-    // 异步调用收到 GO_AWAY 后的重发任务。必须在**非读线程**上执行：重发要建新连接并
-    // 等新连接的读线程投递响应，而在读线程里等就是把这条连接上其它在途请求的投递堵住。
-    // 复用清理线程（而不是 detach 一个线程），生命周期才跟着 RemotingClient 走。
+    // Resend job after an async call receives GO_AWAY. It must run on a **non-reader thread**: resending builds a new
+    // connection and waits for that connection's reader to deliver the response, and waiting inside a reader blocks delivery of
+    // every other in-flight request on this connection. Reusing the sweeper thread (instead of detaching one) keeps the lifetime tied to RemotingClient.
     struct GoAwayRetry {
         std::string addr;
         RemotingCommand request;
@@ -653,7 +653,7 @@ struct RemotingClient::Impl {
             std::lock_guard<std::mutex> lk(retryMutex);
             retryQueue.push_back(std::move(job));
         }
-        sweepCv.notify_all();  // 立刻来干，别等下一个 100ms tick
+        sweepCv.notify_all();  // work immediately instead of waiting for the next 100ms tick
     }
 
     void drainGoAwayRetries() {
@@ -685,7 +685,7 @@ struct RemotingClient::Impl {
         }
     }
 
-    // 退出前把还没重发的任务交还给业务：回调一次都不触发比触发成错误更难排查。
+    // Hand not-yet-resent jobs back to the business layer before exiting: a callback that never fires is harder to debug than one that fires with an error.
     void failPendingRetries(const std::string& reason) {
         std::vector<GoAwayRetry> jobs;
         {
@@ -710,8 +710,8 @@ struct RemotingClient::Impl {
                     if (!running.load() || !sweeperStarted) {
                         return true;
                     }
-                    // 嵌套加锁顺序固定为 sweepMutex -> retryMutex：scheduleGoAwayRetry
-                    // 只在**放掉** retryMutex 之后才 notify，不会反向持锁，故无死锁环。
+                    // The nested lock order is fixed as sweepMutex -> retryMutex: scheduleGoAwayRetry
+                    // notifies only after **releasing** retryMutex and never holds them in reverse, so there is no deadlock cycle.
                     std::lock_guard<std::mutex> rlk(retryMutex);
                     return !retryQueue.empty();
                 });
@@ -750,8 +750,8 @@ struct RemotingClient::Impl {
                 }
             }
         }
-        // 回调必须在 respMutex **之外**执行：回调里常常还要回到传输层或业务层，
-        // 持锁回调既会和 shutdown 抢同一把锁，也可能自锁。
+        // Callbacks must run **outside** respMutex: they often re-enter the transport or business layer, and
+        // calling back under the lock both contends with shutdown for the same mutex and can self-deadlock.
         for (auto& kv : expired) {
             const std::shared_ptr<Future>& f = kv.first;
             bool mine = false;
@@ -765,7 +765,7 @@ struct RemotingClient::Impl {
             }
             f->cv.notify_all();
             if (mine && f->callback) {
-                // 类型必须是 TIMEOUT：异步发送的重试判据就靠它区分"等等看"和"换一台"
+                // The kind must be TIMEOUT: async send retry decisions rely on it to tell "wait and see" from "switch broker"
                 f->callback(RemotingCommand(),
                             InvokeError(InvokeError::Kind::TIMEOUT,
                                         f->addr + " async invoke timeout "
@@ -775,11 +775,11 @@ struct RemotingClient::Impl {
         }
     }
 
-    // 把响应写回**已存在**的连接（不新建）。
+    // Write the response back to an **existing** connection (never create one).
     //
-    // 用途：broker 主动请求（典型 PUSH_REPLY_MESSAGE_TO_CLIENT=326）的响应必须原路返回，
-    // 而 dispatch() 只有对端地址字符串，故这里按地址查连接表。连接已被关掉时只记一条
-    // warn —— 应答本身已经投递给业务了，丢一个响应不该影响读线程。
+    // Use: responses to broker-initiated requests (typically PUSH_REPLY_MESSAGE_TO_CLIENT=326) must go back over the same path,
+    // and dispatch() only has the peer address string, so the connection table is looked up by address here. When the connection was
+    // already closed only a warn is logged -- the answer itself was delivered to business code, and losing a response must not affect the reader.
     void sendResponseByAddr(const std::string& addr, RemotingCommand& response) {
         std::shared_ptr<Connection> conn;
         {
@@ -812,16 +812,16 @@ struct RemotingClient::Impl {
     }
 
     std::shared_ptr<Connection> sendRequest(const std::string& addr, RemotingCommand& request) {
-        // RPC 钩子必须在 encode() **之前**执行：ACL 钩子把 AccessKey/Signature
-        // 写进 extFields，而签名覆盖的正是「即将上线的这份 extFields + body」。
-        // 先取快照再调用，避免持锁跑钩子。
+        // RPC hooks must run **before** encode(): the ACL hook writes AccessKey/Signature
+        // into extFields, and the signature covers exactly this extFields + body that is about to go on the wire.
+        // Take a snapshot before invoking so no lock is held while the hook runs.
         if (auto hook = currentHook()) {
             hook->doBeforeRequest(addr, request);
         }
         auto conn = getOrCreateConnection(addr);
         Bytes data = request.encode();
         std::lock_guard<std::mutex> lk(conn->writeMutex);
-        // 只在 writeMutex 内读一次 fd：读线程/关闭路径会改它，取两次可能得到两个号。
+        // Read the fd exactly once inside writeMutex: the reader and close paths mutate it, and two reads could yield two different numbers.
         const socket_t sock = conn->sock;
         const bool sentOk = sock == kInvalidSocket
             ? false
@@ -830,8 +830,8 @@ struct RemotingClient::Impl {
                                                data.size())
                          : sendAll(sock, data));
         if (!sentOk) {
-            // 幂等关闭：读线程可能已经先一步关掉它并把 fd 置空（对端同时断了），
-            // 拿已经还给内核的 fd 号再 close 一次会关错新连接。
+            // Idempotent close: the reader may already have closed it and cleared the fd (the peer disconnected at the same time), and
+            // closing an fd number already returned to the kernel would close a new connection by mistake.
             if (conn->sock != kInvalidSocket) {
                 const socket_t dead = conn->sock;
                 conn->sock = kInvalidSocket;
@@ -852,11 +852,11 @@ struct RemotingClient::Impl {
     void shutdown() {
         bool expected = true;
         if (!running.compare_exchange_strong(expected, false)) {
-            return;  // 已关闭
+            return;  // already shut down
         }
-        // 先停清理线程：它会在回调里回到业务层，不能让它看到半关闭的客户端。
+        // Stop the sweeper first: its callbacks re-enter business code, so it must not see a half-shut client.
         stopSweeper();
-        // 排队里还没重发完的 GO_AWAY 任务交给业务一个错误回调，不能悄悄吞掉。
+        // Queued GO_AWAY jobs that have not been resent get an error callback; they must not be swallowed silently.
         failPendingRetries("remoting client shutdown, GO_AWAY retry abandoned");
         std::vector<std::shared_ptr<Connection>> all;
         {
@@ -866,11 +866,11 @@ struct RemotingClient::Impl {
             }
             conns.clear();
         }
-        // 关闭 socket 让 reader 立刻返回：先摘号（读线程下一轮认领就看到 kInvalidSocket
-        // 并退出），再 close —— closeSocket 内部先 shutdown(SHUT_RDWR)，这正是唤醒睡在
-        // recv/select 里的读线程与阻塞发送的唯一手段（Linux 上单靠 close 唤不醒）。
-        // 这里刻意**不**持 writeMutex：持锁等待一个卡在 sendAll 里的线程，等于把同一类
-        // 无界挂起从读路径搬到写路径。
+        // Close sockets so readers return immediately: unpublish the fd first (the reader sees kInvalidSocket on its
+        // next claim and exits), then close -- closeSocket calls shutdown(SHUT_RDWR) first internally, which is the only
+        // way to wake a reader sleeping in recv/select and a blocked send (on Linux close alone does not wake them).
+        // writeMutex is deliberately **not** held here: waiting under a lock for a thread stuck inside sendAll would just move the
+        // same unbounded hang from the read path to the write path.
         for (auto& c : all) {
             const socket_t sock = c->sock;
             c->sock = kInvalidSocket;
@@ -888,7 +888,7 @@ struct RemotingClient::Impl {
     }
 };
 
-// ---------------------------------------------------------------- 公开接口
+// ---------------------------------------------------------------- Public interface
 RemotingClient::RemotingClient(int32_t connectTimeoutMillis, int32_t invokeTimeoutMillis)
     : impl_(new Impl()), connectTimeoutMillis_(connectTimeoutMillis),
       invokeTimeoutMillis_(invokeTimeoutMillis) {
@@ -905,7 +905,7 @@ RemotingClient::~RemotingClient() {
 
 void RemotingClient::parseAddress(const std::string& addr, std::string& host,
                                   std::string& port) {
-    if (!addr.empty() && addr[0] == '[') {  // IPv6 字面量：[::1]:10911
+    if (!addr.empty() && addr[0] == '[') {  // IPv6 literal: [::1]:10911
         size_t end = addr.find(']');
         if (end != std::string::npos) {
             host = addr.substr(1, end - 1);
@@ -914,7 +914,7 @@ void RemotingClient::parseAddress(const std::string& addr, std::string& host,
             return;
         }
     }
-    // IPv4 / 主机名：最后一个 ':' 之后是端口
+    // IPv4 / hostname: everything after the last ':' is the port
     size_t colon = addr.rfind(':');
     if (colon == std::string::npos) {
         host = addr;
@@ -1025,7 +1025,7 @@ void RemotingClient::setTlsEnable(bool enable) {
 void RemotingClient::setTlsOptions(const TlsOptions& options) {
     impl_->tlsOptions = options;
     if (impl_->tlsEnable) {
-        // 已开启：options 变了 ctx 必须重建（比如 ca_verify 换成 mtls）
+        // Already enabled: when options change, the ctx must be rebuilt (e.g. ca_verify switching to mtls)
         std::string err;
         std::shared_ptr<void> ctx;
         if (!impl_->tlsOptions.caCert.empty()) {
@@ -1046,8 +1046,8 @@ void RemotingClient::setTlsOptions(const TlsOptions& options) {
 bool RemotingClient::tlsEnable() const { return impl_->tlsEnable; }
 
 void RemotingClient::setSocksProxy(const SocksProxyConfig& proxy) {
-    // 必须在首条连接建立前设置（与 TLS 同一口径）；这里不重建已有连接，
-    // 已建连接继续走原来的隧道，新建连接按新配置走。
+    // Must be set before the first connection is established (same rule as TLS); existing connections are not rebuilt here,
+    // they keep using the original tunnel while newly created connections follow the new configuration.
     impl_->socksProxy = proxy;
 }
 
@@ -1068,7 +1068,7 @@ void RemotingClient::setEnableReconnectForGoAway(bool enable) {
 bool RemotingClient::enableReconnectForGoAway() const { return impl_->enableReconnectForGoAway; }
 
 void RemotingClient::updateNameServerAddressList(const std::vector<std::string>& /*addrs*/) {
-    // 由上层 MQClientInstance 维护 NameServer 列表；传输层不持有
+    // The upper MQClientInstance maintains the name server list; the transport layer does not hold it
 }
 
 void RemotingClient::shutdown() { impl_->shutdown(); }

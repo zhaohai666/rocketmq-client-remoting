@@ -1,4 +1,4 @@
-// TopicConfig 实现。
+// TopicConfig implementation.
 #include "rocketmq/common/topic_config.h"
 
 #include <string>

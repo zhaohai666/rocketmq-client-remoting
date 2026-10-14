@@ -1,11 +1,11 @@
-// 字段名与默认值以 broker 侧序列化探针实测为准：
+// Field names and defaults were measured against the broker-side serialization probe:
 //   JSON.toJSONString(new SubscriptionGroupConfig("MyGroup")) ->
 //   {"attributes":{},"brokerId":0,"consumeBroadcastEnable":true,"consumeEnable":true,
 //    "consumeFromMinEnable":true,"consumeMessageOrderly":false,"consumeTimeoutMinute":15,
 //    "groupName":"MyGroup","groupRetryPolicy":{"type":"CUSTOMIZED"},"groupSysFlag":0,
 //    "notifyConsumerIdsChangedEnable":true,"retryMaxTimes":16,"retryQueueNums":1,
 //    "whichBrokerWhenConsumeSlowly":1}
-// fastjson2 **跳过 null 字段**（subscriptionDataSet 为 null 时整个键不出现）。
+// fastjson2 **skips null fields** (when subscriptionDataSet is null the whole key is absent).
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_SUBSCRIPTION_H
 #define ROCKETMQ_REMOTING_PROTOCOL_SUBSCRIPTION_H
 
@@ -26,19 +26,19 @@ struct GroupRetryPolicyType {
     static constexpr const char* CUSTOMIZED = "CUSTOMIZED";
 };
 
-// 对应 GroupRetryPolicy。两个子策略在协议里默认是 new 出来的实例，但 broker 侧 fastjson
-// 的探针输出里只有 {"type":"CUSTOMIZED"} —— 说明它们实际序列化时被跳过。
-// 因此这里同样只在显式设置时输出（用 JsonValue 透传，避免过度建模）。
+// Mirrors the GroupRetryPolicy wire structure. The two sub-policies default to freshly created instances in the
+// protocol, but the broker-side fastjson probe output only shows {"type":"CUSTOMIZED"} — they are skipped when serialized.
+// So this side also emits them only when set explicitly (passed through as JsonValue to avoid over-modeling).
 struct GroupRetryPolicy {
     std::string type = GroupRetryPolicyType::CUSTOMIZED;
-    JsonValue exponentialRetryPolicy;  // isNull() 表示不输出
-    JsonValue customizedRetryPolicy;   // isNull() 表示不输出
+    JsonValue exponentialRetryPolicy;  // isNull() means "do not emit"
+    JsonValue customizedRetryPolicy;   // isNull() means "do not emit"
 
     JsonValue toJson() const;
     static GroupRetryPolicy fromJson(const JsonValue& v);
 };
 
-// 对应 SimpleSubscriptionData
+// Mirrors the SimpleSubscriptionData wire structure
 struct SimpleSubscriptionData {
     std::string topic;
     std::string expressionType = "TAG";
@@ -49,7 +49,7 @@ struct SimpleSubscriptionData {
     static SimpleSubscriptionData fromJson(const JsonValue& v);
 };
 
-// 对应 SubscriptionGroupConfig
+// Mirrors the SubscriptionGroupConfig wire structure
 struct SubscriptionGroupConfig {
     // MixAll.MASTER_ID
     static constexpr int32_t MASTER_ID = 0;
@@ -68,7 +68,7 @@ struct SubscriptionGroupConfig {
     int32_t groupSysFlag = 0;
     int32_t consumeTimeoutMinute = 15;
     PropertyMap attributes;
-    // 该字段为 null 时 broker 侧 fastjson 整个键不输出
+    // When this field is null the broker-side fastjson omits the whole key
     std::vector<SimpleSubscriptionData> subscriptionDataSet;
     bool hasSubscriptionDataSet = false;
 
@@ -86,8 +86,8 @@ struct SubscriptionGroupConfig {
 
 struct SubscriptionGroupWrapper {
     std::map<std::string, SubscriptionGroupConfig> subscriptionGroupTable;
-    JsonValue forbiddenTable;  // 透传（本实现不解释其内容）
-    JsonValue dataVersion;     // 透传：翻页请求要原样回传，避免重排/丢精度
+    JsonValue forbiddenTable;  // Passed through (this implementation does not interpret its content)
+    JsonValue dataVersion;     // Pass-through: a paging request must return it verbatim, avoiding reordering or lost precision
 
     JsonValue toJson() const;
     static SubscriptionGroupWrapper fromJson(const JsonValue& v);
@@ -95,7 +95,7 @@ struct SubscriptionGroupWrapper {
     Bytes encode() const;
     static bool decode(const Bytes& data, SubscriptionGroupWrapper& out);
 
-    // 合并另一页（getAllSubscriptionGroup 分页累积用）
+    // Merge another page (used to accumulate getAllSubscriptionGroup pages)
     void mergeFrom(const SubscriptionGroupWrapper& other);
 };
 

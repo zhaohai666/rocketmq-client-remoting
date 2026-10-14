@@ -1,25 +1,25 @@
-// 实现 `ConsistentHashRouter` / `Node` / `VirtualNode` / `HashFunction` 四个类型加
-// 默认 `MD5Hash`；目前唯一的用户是队列分配策略 `AllocateMessageQueueConsistentHash`。
+// Implements the four types `ConsistentHashRouter` / `Node` / `VirtualNode` / `HashFunction` plus the
+// default `MD5Hash`; its only user today is the queue allocation strategy `AllocateMessageQueueConsistentHash`.
 //
-// ## 为什么整套照搬而不是"等价改写"
+// ## Why the scheme is followed exactly instead of being "equivalently rewritten"
 //
-// 环上的落点由三处细节共同决定，任何一处不同都会让**全体**队列换主，与同组其它按此
-// 约定实现的消费者混跑时表现为重复消费 / 漏消费，而不是"分得稍有不均"：
+// The landing point on the ring is decided jointly by three details; a difference in any one of them makes **all** queues
+// change owner, i.e. duplicate / missed consumption when mixed with other consumers of the group, not merely "slightly uneven":
 //
-// 1. 哈希函数只取 MD5 摘要的**前 4 个字节**按大端拼成整数
-//    （`for (int i = 0; i < 4; i++) { h <<= 8; h |= digest[i] & 0xFF; }`），不是完整 128 bit；
-// 2. 虚拟节点的 key 是 `物理节点key + "-" + 副本序号`，序号从 `existingReplicas` 起算；
-// 3. 查找用 `TreeMap#tailMap(hashVal)`，它**含端点**，所以等价于 `std::map::lower_bound`
-//    （相等的 hash 归自己），越过环末尾时回绕到 `begin()`。
+// 1. The hash function takes only the **first 4 bytes** of the MD5 digest, assembled big-endian into an integer
+//    (`for (int i = 0; i < 4; i++) { h <<= 8; h |= digest[i] & 0xFF; }`), not the full 128 bit;
+// 2. A virtual node's key is `physicalNodeKey + "-" + replicaIndex`, the index starting at `existingReplicas`;
+// 3. Lookup takes the first ring entry with hash >= the target hash — the **endpoint is inclusive** — so it equals
+//    `std::map::lower_bound` (an equal hash belongs to that node itself), wrapping to `begin()` past the ring end.
 //
-// ## 有意差异
+// ## Intentional differences
 //
-// 1. 环在这里用 `std::map<int64_t, VirtualNode>`；物理节点用 `std::shared_ptr<Node>`
-//    做动态分发，`routeNode` 因而交出 `std::shared_ptr<Node>`（可能为 nullptr = 空）。
-// 2. `virtualNodeCnt < 0` 抛 `MQClientException`（本端口对"非法配置"的统一口径）。
-// 3. MD5 是自带实现（`md5Digest`），不引第三方库：与 `src/remoting/rpchook.cpp` 自带
-//    SHA1/HMAC 同一个理由 —— 定长算法几十行，自带反而便于逐字节对拍。
-//    只用于算环上的落点，**不当密码学原语用**。
+// 1. The ring is a `std::map<int64_t, VirtualNode>` here; physical nodes are held as `std::shared_ptr<Node>` for
+//    dynamic dispatch, so `routeNode` hands out a `std::shared_ptr<Node>` (nullptr possible = empty).
+// 2. `virtualNodeCnt < 0` throws `MQClientException` (the uniform stance of this codebase for "illegal configuration").
+// 3. MD5 is implemented in-tree (`md5Digest`) without a third-party library, for the same reason as the in-tree
+//    SHA1/HMAC in `src/remoting/rpchook.cpp` — a fixed-length algorithm is a few tens of lines, and owning it makes
+//    byte-for-byte cross-checking easier. It is only used to compute ring positions, **not as a cryptographic primitive**.
 #ifndef ROCKETMQ_COMMON_CONSISTENT_HASH_H
 #define ROCKETMQ_COMMON_CONSISTENT_HASH_H
 
@@ -31,16 +31,16 @@
 
 namespace rocketmq {
 
-// `Node#getKey`：能被映到环上的东西，物理节点和虚拟节点都算。
+// `Node::getKey`: whatever can be mapped onto the ring counts, both physical and virtual nodes.
 struct Node {
     virtual ~Node() = default;
     virtual std::string getKey() const = 0;
 };
 
-// `AllocateMessageQueueConsistentHash.ClientNode`：key 就是 clientId。
+// `ClientNode` of the consistent-hash allocation strategy: the key is just the clientId.
 //
-// 注：参考实现里它是策略的 private 静态内部类，本端口与 `common` 的其它节点类型放在一起
-// （C++ 没有"内部类前置声明"的等价物）。
+// Note: it sits with the other node types of `common` instead of being nested inside the strategy (C++ has no
+// forward declaration equivalent for nested classes).
 struct ClientNode : public Node {
     std::string clientId;
 
@@ -49,66 +49,66 @@ struct ClientNode : public Node {
     std::string getKey() const override { return clientId; }
 };
 
-// `HashFunction#hash(String)`：把字符串映射到环上的位置。
+// `HashFunction::hash`: maps a string key to a position on the ring.
 struct HashFunction {
     virtual ~HashFunction() = default;
     virtual int64_t hash(const std::string& key) const = 0;
 };
 
-// `ConsistentHashRouter.MD5Hash`（默认哈希函数）。
+// `Md5Hash`: the default hash function of the router.
 //
-// ⚠ 只取摘要前 4 字节（不是完整 128 bit）；换取法环上落点就变了。
+// ⚠ Only the first 4 digest bytes are taken (not the full 128 bit); another derivation changes every ring position.
 struct Md5Hash : public HashFunction {
     int64_t hash(const std::string& key) const override;
 };
 
-// RFC 1321 MD5 摘要（16 字节，字序同标准库 `MessageDigest#digest` 输出）。
-// 暴露出来给单测对拍官方向量用；生产路径只经 `Md5Hash` 使用它。
+// RFC 1321 MD5 digest (16 bytes, in the byte order of a standard digest output).
+// Exposed so tests can cross-check the official vectors; production paths reach it only through `Md5Hash`.
 std::vector<uint8_t> md5Digest(const std::string& input);
 
-// `ConsistentHashRouter`：虚拟节点环 + "顺时针找最近物理节点"。
+// `ConsistentHashRouter`: the virtual node ring plus "nearest physical node clockwise".
 class ConsistentHashRouter {
 public:
-    // `ConsistentHashRouter(Collection<T>, int)`：用默认 MD5Hash。
+    // The node-list plus count constructor: uses the default MD5Hash.
     ConsistentHashRouter(const std::vector<std::shared_ptr<Node>>& pNodes, int32_t vNodeCount);
 
-    // `ConsistentHashRouter(Collection<T>, int, HashFunction)`。
-    // `hashFunction == nullptr` 走默认 MD5Hash（"空即默认"，与
-    // `AllocateMessageQueueConsistentHash` 的 customHashFunction 判空口径一致）。
+    // The node-list, count and hash-function constructor.
+    // `hashFunction == nullptr` falls back to the default MD5Hash ("null means default", the same stance as the
+    // customHashFunction null check in `AllocateMessageQueueConsistentHash`).
     ConsistentHashRouter(const std::vector<std::shared_ptr<Node>>& pNodes, int32_t vNodeCount,
                          const std::shared_ptr<const HashFunction>& hashFunction);
 
-    // `#addNode`：`i + existingReplicas` 那段不是冗余 —— 同一个物理节点分两次
-    // addNode 时，靠已有副本数把虚拟节点编号继续往后排；从 0 重编会让两批虚拟节点
-    // 撞在同一个 hash 上（环上插入是覆盖语义 ⇒ 实际少一半节点）。
+    // `addNode`: the `i + existingReplicas` offset is not redundant — when the same physical node is added through
+    // addNode twice, the existing replica count keeps numbering virtual nodes onward; restarting from 0 would make the
+    // two batches collide on the same hash (ring insertion overwrites ⇒ half the nodes would silently disappear).
     void addNode(const std::shared_ptr<Node>& pNode, int32_t vNodeCount);
 
-    // `#removeNode`：摘掉该物理节点的全部虚拟节点（按 key 判定）。
+    // `removeNode`: drop every virtual node of this physical node (matched by key).
     void removeNode(const std::shared_ptr<Node>& pNode);
 
-    // `#routeNode`：环空返回 nullptr，否则返回顺时针第一个（含同 hash）
-    // 虚拟节点所属的物理节点。
+    // `routeNode`: nullptr on an empty ring, otherwise the physical node owning the first virtual node
+    // clockwise (an equal hash included).
     std::shared_ptr<Node> routeNode(const std::string& objectKey) const;
 
-    // `#getExistingReplicas`。
+    // `getExistingReplicas`.
     int32_t getExistingReplicas(const std::shared_ptr<Node>& pNode) const;
 
-    // 环上的 hash 集合（调试与单测用；顺序即 hash 升序）。
+    // The hash set on the ring (for debugging and tests; the order is ascending by hash).
     std::vector<int64_t> ringHashes() const;
 
 private:
-    // std::map 的 lower_bound 就是含端点的 tailMap。
-    // value 即 `VirtualNode`：物理节点指针 + 副本序号（`getKey()` = key + "-" + 序号）。
+    // lower_bound of std::map is exactly the endpoint-inclusive tail view.
+    // The value is a `VirtualNode`: physical node pointer plus replica index (`getKey()` = key + "-" + index).
     struct VirtualNode {
         std::shared_ptr<Node> physicalNode;
         int32_t replicaIndex;
 
-        // `VirtualNode#getKey`。
+        // `VirtualNode::getKey`.
         std::string getKey() const {
             return physicalNode->getKey() + "-" + std::to_string(replicaIndex);
         }
 
-        // `VirtualNode#isVirtualNodeOf`：只比 `getKey()`，从不比对象身份。
+        // `VirtualNode::isVirtualNodeOf`: compares only `getKey()`, never object identity.
         bool isVirtualNodeOf(const std::shared_ptr<Node>& pNode) const {
             return physicalNode->getKey() == pNode->getKey();
         }

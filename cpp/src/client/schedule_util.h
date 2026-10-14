@@ -1,7 +1,7 @@
-// 真机量化过：macOS 上 100ms 的 sleep_for / ManualResetEventSlim.Wait 实测量到 104~131ms
-// （系统定时器多给一个 tick），于是「按 100ms 切片睡满 30s」实际要 31~39s，路由刷新、
-// 位点落盘、心跳的周期全被拉长。这里每段都重新对着**绝对 deadline** 算，误差不再累积；
-// 分段只为让 stop 标志在 100ms 内生效（join 不被整段 sleep 拖住）。
+// Measured on real machines: on macOS a 100ms sleep_for / ManualResetEventSlim.Wait takes 104~131ms
+// (the system timer adds one tick), so "sleep 30s in 100ms slices" actually costs 31~39s and stretches the
+// route refresh, offset persistence and heartbeat periods. Each slice here is recomputed against the **absolute deadline** so errors no longer accumulate;
+// slicing only exists so the stop flag takes effect within 100ms (join is not held up by a whole sleep).
 #pragma once
 
 #include <algorithm>
@@ -12,7 +12,7 @@
 
 namespace rocketmq {
 
-// 睡到 deadline（steady_clock 口径）；stop 变 true 时立刻返回，由调用方的循环条件收尾。
+// Sleep until the deadline (steady_clock based); return immediately when stop becomes true and let the caller's loop condition finish.
 inline void sleepUntilDeadline(const std::atomic<bool>& stop,
                                std::chrono::steady_clock::time_point deadline) {
     while (!stop.load()) {

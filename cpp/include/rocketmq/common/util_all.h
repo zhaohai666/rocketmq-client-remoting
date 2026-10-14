@@ -29,31 +29,31 @@ struct UtilAll {
 
     static bool isIpv4(const std::string& addr);
 
-    // IP 字符串 -> 4B(v4) / 16B(v6) 网络序字节
+    // IP string -> 4B(v4) / 16B(v6) bytes in network order
     static bool ipToBytes(const std::string& ip, bool v6, Bytes& out);
 
-    // 网络序字节 -> IP 字符串（v4: 4B, v6: 16B）
+    // Network-order bytes -> IP string (v4: 4B, v6: 16B)
     static bool bytesToIp(const Bytes& raw, std::string& ip);
 
     static uint32_t crc32(const Bytes& data);
 
     static int32_t charToByte(char c);
 
-    // 逐字节转大写十六进制
+    // Byte-by-byte conversion to upper-case hexadecimal
     static std::string bytes2String(const Bytes& bs);
 
-    // 十六进制字符串 -> 字节串；非法字符返回空串
+    // Hexadecimal string -> byte string; returns an empty string on invalid characters
     static Bytes string2Bytes(const std::string& hexString);
 
     static std::string localIp();
 
     static std::string userHome();
 
-    // 跨平台的 warmup/pretty 名字
+    // Cross-platform warmup/pretty name
     static std::string nextMillisString();
 };
 
-// MessageClientIDSetter 的 C++ 对应：IP(4|16B) + PID(2B) + hash(4B) + 当日毫秒(4B) + 自增(2B)
+// Uniq client message id: IP(4|16B) + PID(2B) + hash(4B) + millis of the current day(4B) + counter(2B)
 struct InnerIdGenerator {
     static std::string createUniqId();
 };

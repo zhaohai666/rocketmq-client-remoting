@@ -1,6 +1,6 @@
-// 覆盖：Topic 增删查/配置、Broker 集群信息与运行时信息/配置、NameServer KV 配置、
-// 订阅组管理、消费者/生产者连接、消费统计、offset 管理（含真实 broker 位点重置）、
-// 消息查询（key / uniqKey / msgId / ConsumeQueue）。
+// Coverage: topic add/delete/query and configuration, broker cluster info plus runtime info/config,
+// name server KV configuration, subscription-group management, consumer/producer connections,
+// consume statistics, offset management (incl. real offset reset on a live broker), message queries (key / uniqKey / msgId / ConsumeQueue).
 #ifndef ROCKETMQ_CLIENT_ADMIN_H
 #define ROCKETMQ_CLIENT_ADMIN_H
 
@@ -45,13 +45,13 @@ struct GroupForbidden {
     std::string group;
     bool readable = false;
 
-    // 解析失败返回 false（不抛异常）
+    // Returns false on a parse failure (never throws)
     static bool decode(const Bytes& data, GroupForbidden& out);
 };
 
 class DefaultMQAdminExt {
 public:
-    // 对应 DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3
+    // Matches DefaultMQAdminExt.DEFAULT_TIMEOUT = 5000 * 3
     static constexpr int32_t DEFAULT_TIMEOUT = 5000 * 3;
 
     explicit DefaultMQAdminExt(const std::string& instanceName = "ADMIN");
@@ -59,14 +59,14 @@ public:
     DefaultMQAdminExt& operator=(const DefaultMQAdminExt&) = delete;
     ~DefaultMQAdminExt();
 
-    // ---------------- 配置与生命周期 ----------------
-    void setNamesrvAddr(const std::string& addr);  // 分号分隔
+    // ---------------- Configuration and lifecycle ----------------
+    void setNamesrvAddr(const std::string& addr);  // Semicolon-separated
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     void setInstanceName(const std::string& name) { instanceName_ = name; }
 
     void setUnitName(const std::string& unitName) { unitName_ = unitName; }
     const std::string& unitName() const { return unitName_; }
-    // true 时每个请求带扩展字段 `ReqT=0`，且 clientId 末尾多一段 `@STREAM`。
+    // When true every request carries the extension field `ReqT=0`, and the clientId gains a trailing `@STREAM` segment.
     void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
@@ -96,7 +96,7 @@ public:
     MQClientInstance& getMQClientInstance();
     MQClientInstance& client() { return getMQClientInstance(); }
 
-    // ---------------- Topic 管理 ----------------
+    // ---------------- Topic management ----------------
     void createTopic(const std::string& key, const std::string& newTopic,
                      int32_t queueNum = 4, int32_t topicSysFlag = 0);
     void createAndUpdateTopicConfig(const std::string& addr, const TopicConfig& config);
@@ -127,64 +127,64 @@ public:
 
     void createAndUpdateTopicConfigList(const std::string& brokerAddr,
                                         const std::vector<TopicConfig>& configs);
-    // UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225)：同形，但 body key 是
-    // `groupConfigList`（注意与单组版 200 的裸对象不同）。
+    // UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225): same shape, but the body key is
+    // `groupConfigList` (note the difference from the bare object used by single-group 200).
     void createAndUpdateSubscriptionGroupConfigList(
         const std::string& brokerAddr, const std::vector<SubscriptionGroupConfig>& configs);
-    // UPDATE_AND_CREATE_STATIC_TOPIC(513)：header 复用 CreateTopicRequestHeader 字段
-    // （bool 转 "true"/"false" 小写），body 是 TopicQueueMappingDetail 的 JSON 文档。
+    // UPDATE_AND_CREATE_STATIC_TOPIC(513): the header reuses CreateTopicRequestHeader fields
+    // (bools become lowercase "true"/"false"), the body is the TopicQueueMappingDetail JSON document.
     void createStaticTopic(const std::string& brokerAddr, const std::string& defaultTopic,
                            const TopicConfig& config, const JsonValue& mappingDetail,
                            bool force = false);
-    // UPDATE_AND_GET_GROUP_FORBIDDEN(353)：readable 仅在非 nullopt 时下发；
-    // 返回 broker 解码出的 GroupForbidden。
+    // UPDATE_AND_GET_GROUP_FORBIDDEN(353): readable is sent only when not nullopt;
+    // returns the GroupForbidden decoded from the broker.
     GroupForbidden updateAndGetGroupReadForbidden(
         const std::string& brokerAddr, const std::string& group, const std::string& topic,
         const std::optional<bool>& readable = std::nullopt);
     bool resumeCheckHalfMessage(const std::string& brokerAddr, const std::string& topic,
                                 const std::string& msgId = std::string());
-    // **不是独立请求**：NameServer KV namespace=ORDER_TOPIC_CONFIG 上的读改写。
-    // isCluster 时 value 原样 putKVConfig；否则把存储值当 ";" 分隔的 "key:value"
-    // 条目列表，替换/追加 key 匹配的条目后整体写回。
+    // **Not a standalone request**: a read-modify-write on the name server KV namespace=ORDER_TOPIC_CONFIG.
+    // With isCluster the value goes to putKVConfig verbatim; otherwise the stored value is treated as a
+    // ";"-separated list of "key:value" entries, the entry with a matching key is replaced or appended, then the whole list is written back.
     void createOrUpdateOrderConf(const std::string& key, const std::string& value,
                                  bool isCluster = false);
 
     void cleanExpiredConsumerQueue(const std::string& brokerAddr, int32_t timeHours);
-    // 逐地址调用 306，返回**失败的地址**列表（不 fail-fast）
+    // Call 306 per address and return the list of **failed addresses** (no fail-fast)
     std::vector<std::string> cleanExpiredConsumerQueueByAddr(
         const std::vector<std::string>& addrs, int32_t timeHours);
-    // DELETE_EXPIRED_COMMITLOG(329)：header `time`
+    // DELETE_EXPIRED_COMMITLOG(329): header `time`
     void deleteExpiredCommitLog(const std::string& brokerAddr, int32_t timeHours);
-    // 同 329 的多地址形态
+    // Multi-address form of 329
     std::vector<std::string> deleteExpiredCommitLogByAddr(
         const std::vector<std::string>& addrs, int32_t timeHours);
-    // CLEAN_UNUSED_TOPIC(316)：**单请求**，由 broker 自行清理。绝不要在客户端遍历
-    // topic 表逐个删除（broker 自建 topic 会被拒）。
+    // CLEAN_UNUSED_TOPIC(316): a **single request**, the broker cleans up by itself. Never iterate the
+    // client-side topic table and delete one by one (broker-created topics would be rejected).
     void cleanUnusedTopicByAddr(const std::string& brokerAddr);
-    // QUERY_CONSUME_TIME_SPAN(303)：按 topic 路由扇出到每个 master，聚合响应 body 里
-    // consumeTimeSpanSet JSON 数组（返回聚合后的数组）。
+    // QUERY_CONSUME_TIME_SPAN(303): fan out to every master along the topic route and aggregate the
+    // consumeTimeSpanSet JSON arrays from the response bodies (the aggregated array is returned).
     JsonValue queryConsumeTimeSpan(const std::string& topic, const std::string& group);
     std::set<std::string> getTopicClusterList(const std::string& topic);
-    // SET_MESSAGE_REQUEST_MODE(401)：popShareQueueNum 仅在 >0 时带。
+    // SET_MESSAGE_REQUEST_MODE(401): popShareQueueNum is carried only when > 0.
     void setMessageRequestMode(const std::string& brokerAddr, const std::string& topic,
                                const std::string& consumerGroup, const std::string& mode,
                                int32_t popShareQueueNum = 0);
 
     void updateNameServerConfig(const PropertyMap& properties, int32_t timeoutMillis = -1);
-    // 逐个查询（默认全部 NameServer），body 按 properties 文本解析；
-    // 返回 {地址: properties 字典}。
+    // Query one by one (all name servers by default); the body is parsed as properties text and
+    // the result is an {address: properties map}.
     std::map<std::string, PropertyMap> getNameServerConfig(
         const std::vector<std::string>& namesrvAddrs = std::vector<std::string>(),
         int32_t timeoutMillis = -1);
 
-    // ---------------- 集群 / Broker ----------------
+    // ---------------- Cluster / broker ----------------
     ClusterInfo fetchBrokerClusterInfo();
     ClusterInfo examineBrokerClusterInfo() { return fetchBrokerClusterInfo(); }
     KVTable fetchBrokerRuntimeStats(const std::string& brokerAddr, int32_t timeoutMillis = -1);
     KVTable getBrokerRuntimeInfo(const std::string& brokerAddr, int32_t timeoutMillis = -1) {
         return fetchBrokerRuntimeStats(brokerAddr, timeoutMillis);
     }
-    // GET_BROKER_CONFIG 的响应体是 **properties 文本**，这里解析成 k=v
+    // The GET_BROKER_CONFIG response body is **properties text**, parsed here into k=v
     PropertyMap getBrokerConfig(const std::string& brokerAddr, int32_t timeoutMillis = -1);
     void updateBrokerConfig(const std::string& brokerAddr, const PropertyMap& properties,
                             int32_t timeoutMillis = -1);
@@ -195,21 +195,21 @@ public:
     JsonValue viewBrokerStatsData(const std::string& brokerAddr, const std::string& statsName,
                                   const std::string& statsKey);
 
-    // ---------------- NameServer KV 配置 ----------------
+    // ---------------- Name server KV configuration ----------------
     void createAndUpdateKvConfig(const std::string& ns, const std::string& key,
                                  const std::string& value);
     void putKvConfig(const std::string& ns, const std::string& key, const std::string& value) {
         createAndUpdateKvConfig(ns, key, value);
     }
-    // 返回 false 表示该 key 不存在
+    // Returns false when the key does not exist
     bool getKvConfig(const std::string& ns, const std::string& key, std::string& outValue);
     void deleteKvConfig(const std::string& ns, const std::string& key);
     KVTable getKvListByNamespace(const std::string& ns);
 
-    // ---------------- 订阅组管理 ----------------
+    // ---------------- Subscription group management ----------------
     void createAndUpdateSubscriptionGroupConfig(const std::string& addr,
                                                 const SubscriptionGroupConfig& config);
-    // 返回 false 表示该订阅组不存在
+    // Returns false when the subscription group does not exist
     bool examineSubscriptionGroupConfig(const std::string& addr, const std::string& group,
                                         SubscriptionGroupConfig& out);
     bool getSubscriptionGroupConfig(const std::string& addr, const std::string& group,
@@ -221,7 +221,7 @@ public:
     void deleteSubscriptionGroup(const std::string& addr, const std::string& groupName,
                                  bool removeOffset = false);
 
-    // ---------------- 消费者 / 生产者连接 ----------------
+    // ---------------- Consumer / producer connections ----------------
     ConsumerConnection examineConsumerConnectionInfo(
         const std::string& consumerGroup, const std::string& brokerAddr = std::string());
     ConsumerConnection examineConsumerConnection(
@@ -236,7 +236,7 @@ public:
     GetConsumerListByGroupResponseBody getConsumerListByGroup(
         const std::string& consumerGroup, const std::string& brokerAddr = std::string());
 
-    // ---------------- 消费统计 ----------------
+    // ---------------- Consume statistics ----------------
     ConsumeStats examineConsumeStats(const std::string& brokerAddr,
                                      const std::string& consumerGroup,
                                      const std::string& topic = std::string(),
@@ -262,14 +262,14 @@ public:
                           const std::string& destGroup, const std::string& topic,
                           bool offline = false);
 
-    // ---------------- Offset 管理 ----------------
+    // ---------------- Offset management ----------------
     int64_t maxOffset(const MessageQueue& mq);
     int64_t minOffset(const MessageQueue& mq);
     int64_t searchOffset(const MessageQueue& mq, int64_t timestamp);
     int64_t searchLowerBoundaryOffset(const MessageQueue& mq, int64_t timestamp);
     int64_t searchUpperBoundaryOffset(const MessageQueue& mq, int64_t timestamp);
     int64_t earliestMsgStoreTime(const MessageQueue& mq);
-    // 返回 false 表示该消费组在该队列上尚无位点
+    // Returns false when the consumer group has no offset on this queue yet
     bool examineConsumerOffset(const std::string& consumerGroup, const MessageQueue& mq,
                                int64_t& outOffset);
     void updateConsumerOffset(const std::string& consumerGroup, const MessageQueue& mq,
@@ -293,10 +293,10 @@ public:
                                                  const std::string& group, int64_t timestamp,
                                                  bool isForce, int32_t queueId, int64_t offset);
 
-    // ---------------- 消息查询 ----------------
+    // ---------------- Message query ----------------
     std::vector<MessageExt> queryMessage(const std::string& topic, const std::string& key,
                                          int32_t maxNum, int64_t begin, int64_t end);
-    // 返回 false 表示未命中（注意：默认文件索引下 uniqKey 查询需要 RocksDB 索引）
+    // Returns false on a miss (note: with the default file index, uniqKey queries need the RocksDB index)
     bool queryMessageByUniqKey(const std::string& topic, const std::string& uniqKey,
                                MessageExt& out);
     std::vector<MessageExt> queryMessageByKey(const std::string& topic, const std::string& key,
@@ -307,10 +307,10 @@ public:
                                                    int64_t index, int32_t count = 32,
                                                    const std::string& consumerGroup = std::string());
 
-    // ---------------- 直接消费探针（CONSUME_MESSAGE_DIRECTLY(309)）----------------
-    // 309 是 admin → broker 的请求：broker 收到后**转推**给 clientId 对应的在线消费者
-    // （见 DefaultMQPushConsumer 的客户端处理器），把该消费者本地真实消费一次的判据
-    // （ConsumeMessageDirectlyResult body）带回来。
+    // ---------------- Direct-consume probe (CONSUME_MESSAGE_DIRECTLY(309)) ----------------
+    // 309 is an admin -> broker request: after the broker receives it, it **pushes it on** to the online
+    // consumer for that clientId (see the client handler in DefaultMQPushConsumer) and brings back the
+    // verdict of that consumer really consuming the message once locally (the ConsumeMessageDirectlyResult body).
     ConsumeMessageDirectlyResult consumeMessageDirectly(const std::string& consumerGroup,
                                                         const std::string& clientId,
                                                         const std::string& topic,
@@ -326,9 +326,9 @@ public:
         const std::string& msgId);
 
 private:
-    // ---------------- 底层调用助手 ----------------
+    // ---------------- Low-level invoke helpers ----------------
     MQClientInstance& requireClient();
-    // broker 类请求的目标地址：VIP 开关打开时端口 - 2。NameServer 类请求不走这里。
+    // Target address of broker requests: port - 2 when the VIP switch is on. Name server requests do not go through here.
     std::string vipAddr(const std::string& addr) const {
         return MixAll::brokerVipChannel(vipChannelEnabled_, addr);
     }
@@ -353,7 +353,7 @@ private:
     int32_t timeoutMillis_ = DEFAULT_TIMEOUT;
 
     std::unique_ptr<MQClientInstance> mqClient_;
-    // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
+    // ACL hook, bound to the MQClientInstance transport at start()
     std::shared_ptr<RPCHook> rpcHook_;
     bool started_ = false;
 };

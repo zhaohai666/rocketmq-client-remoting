@@ -1,5 +1,5 @@
-// 复合且管理端不需要解释内容的字段（subscriptionTable / mqTable / statsList 等）
-// 一律用 JsonValue 透传，避免过度建模导致字段丢失。
+// Composite fields whose content the admin side does not need to interpret (subscriptionTable / mqTable / statsList, ...)
+// are always passed through as JsonValue, so over-modeling cannot drop fields.
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_BODY_H
 #define ROCKETMQ_REMOTING_PROTOCOL_BODY_H
 
@@ -52,15 +52,15 @@ struct GetConsumerListByGroupResponseBody {
     static bool decode(const Bytes& data, GetConsumerListByGroupResponseBody& out);
 };
 
-// 只被 CHECK_CLIENT_CONFIG(46) 用到：broker 侧 ClientManageProcessor#checkClientConfig
-// 拿 clientId/group 记日志，真正被校验的只有 subscriptionData 的 expressionType 与
-// subString。协议里定义了 namespace 字段但发送端不填，这里同样保留字段而不写值
-// （未置位时不参与 JSON，与 broker 侧不序列化 null 字段的约定一致）。
+// Used only by CHECK_CLIENT_CONFIG(46): the broker's ClientManageProcessor#checkClientConfig
+// logs clientId/group, and what actually gets validated is only the expressionType and
+// subString of subscriptionData. The protocol defines a namespace field but the sender leaves it unset, so
+// the field is kept here without a value as well (an unset field takes no part in the JSON, matching the broker's convention of not serializing null fields).
 struct CheckClientRequestBody {
     std::string clientId;
     std::string group;
     SubscriptionData subscriptionData;
-    std::string clientNamespace;  // 协议字段名 namespace（C++ 里 namespace 是关键字）
+    std::string clientNamespace;  // Protocol field name namespace (namespace is a keyword in C++)
     bool hasNamespace = false;
 
     JsonValue toJson() const;
@@ -74,9 +74,9 @@ struct ClusterInfo {
     std::map<std::string, BrokerData> brokerAddrTable;
     std::map<std::string, std::vector<std::string>> clusterAddrTable;
 
-    // 收集所有 broker 地址（去重，按 brokerName、brokerId 顺序）
+    // Collect every broker address (deduplicated, ordered by brokerName then brokerId)
     std::vector<std::string> getBrokerAddrs() const;
-    // 按集群名列出其下所有 broker 地址（clusterName 为空则返回全部）
+    // List all broker addresses under a cluster name (returns everything when clusterName is empty)
     std::vector<std::string> getBrokerAddrsOfCluster(const std::string& clusterName) const;
 
     JsonValue toJson() const;
@@ -86,10 +86,10 @@ struct ClusterInfo {
     static bool decode(const Bytes& data, ClusterInfo& out);
 };
 
-// ConsumerConnection.connectionSet 的单个连接元素
+// A single connection element of ConsumerConnection.connectionSet
 struct Connection {
     std::string clientId;
-    std::string clientAddr;  // 协议字段名 clientAddr
+    std::string clientAddr;  // Protocol field name clientAddr
     std::string language;
     int32_t version = 0;
 
@@ -99,7 +99,7 @@ struct Connection {
 
 struct ConsumerConnection {
     std::vector<Connection> connectionSet;
-    JsonValue subscriptionTable;  // 透传（Map<String, SubscriptionData>）
+    JsonValue subscriptionTable;  // Pass-through (Map<String, SubscriptionData>)
     std::string consumeType;
     std::string messageModel;
     std::string consumeFromWhere;
@@ -134,20 +134,20 @@ struct ConsumeStatus {
 };
 
 struct ConsumerRunningInfo {
-    // ConsumerRunningInfo.properties 的固定键（键名由协议约定）
+    // Fixed keys of ConsumerRunningInfo.properties (key names fixed by the protocol)
     static constexpr const char* PROP_NAMESERVER_ADDR = "PROP_NAMESERVER_ADDR";
     static constexpr const char* PROP_THREADPOOL_CORE_SIZE = "PROP_THREADPOOL_CORE_SIZE";
-    static constexpr const char* PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY";  // 协议键名无下划线
+    static constexpr const char* PROP_CONSUME_ORDERLY = "PROP_CONSUMEORDERLY";  // The protocol key has no underscore
     static constexpr const char* PROP_CONSUME_TYPE = "PROP_CONSUME_TYPE";
     static constexpr const char* PROP_CLIENT_VERSION = "PROP_CLIENT_VERSION";
     static constexpr const char* PROP_CONSUMER_START_TIMESTAMP = "PROP_CONSUMER_START_TIMESTAMP";
 
     PropertyMap properties;
-    JsonValue subscriptionSet;  // 透传（List<SubscriptionData>）
-    JsonValue mqTable;          // 透传（Map<MessageQueue, ProcessQueueInfo>）
-    JsonValue mqPopTable;       // 透传（Map<MessageQueue, ProcessQueueInfo>，POP 模式）
-    JsonValue statusTable;      // 透传（Map<String, ConsumeStatus>）
-    JsonValue userConsumerInfo; // 透传（Map<String, String>）
+    JsonValue subscriptionSet;  // Pass-through (List<SubscriptionData>)
+    JsonValue mqTable;          // Pass-through (Map<MessageQueue, ProcessQueueInfo>)
+    JsonValue mqPopTable;       // Pass-through (Map<MessageQueue, ProcessQueueInfo>, POP mode)
+    JsonValue statusTable;      // Pass-through (Map<String, ConsumeStatus>)
+    JsonValue userConsumerInfo; // Pass-through (Map<String, String>)
     std::string jstack;
     bool hasJstack = false;
 
@@ -158,14 +158,14 @@ struct ConsumerRunningInfo {
     static bool decode(const Bytes& data, ConsumerRunningInfo& out);
 };
 
-// ⚠ JSON 键是协议字段名 consumeStatsList，不是 statsList：写错时真机响应会
-// 解析成空列表，看着像「这个 broker 没有积压」。
+// ⚠ The JSON key is the protocol field name consumeStatsList, not statsList: a wrong key parses a real
+// broker response into an empty list, which looks like "this broker has no backlog".
 struct ConsumeStatsList {
-    JsonValue statsList;  // 透传
+    JsonValue statsList;  // Pass-through
     std::string brokerAddr;
     bool hasBrokerAddr = false;
-    // int64_t（不是 long long）：在 LP64 上 int64_t==long 与 long long 是不同类型，
-    // `tryGetInt(key, int64_t&)` 无法绑定 long long& 左值（CI 的 gcc 直接报错）。
+    // int64_t (not long long): on LP64 int64_t==long is a different type from long long, so
+    // `tryGetInt(key, int64_t&)` cannot bind a long long& lvalue (the CI gcc errors out directly).
     int64_t totalDiff = 0;
     int64_t totalInflightDiff = 0;
 
@@ -176,9 +176,9 @@ struct ConsumeStatsList {
     static bool decode(const Bytes& data, ConsumeStatsList& out);
 };
 
-// ⚠ 协议字段 offsetTable 是 Map<MessageQueue, Long>，**不是** topic->queueId->offset
-// 的嵌套 map；写错时真实 broker 响应解析不出来。
-// broker 侧 fastjson 会把 MessageQueue 键内联成 JSON 对象，故用 admin_body 的键工具解析。
+// ⚠ The protocol field offsetTable is Map<MessageQueue, Long>, **not** a nested
+// topic->queueId->offset map; a wrong shape makes a real broker response unparseable.
+// The broker's fastjson inlines the MessageQueue key as a JSON object, so the key helpers of admin_body parse it.
 struct ResetOffsetBody {
     std::map<MessageQueue, int64_t> offsetTable;
 

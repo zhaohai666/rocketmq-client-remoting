@@ -1,4 +1,4 @@
-// 队列分配策略实现；行为口径见头文件「行为口径」一节。
+// Queue allocation strategy implementations; for the behaviour contract see the "behaviour contract" section of the header.
 #include "rocketmq/client/allocate_strategy.h"
 
 #include <algorithm>
@@ -12,14 +12,14 @@ namespace rocketmq {
 
 namespace {
 
-// 在 cidAll 里找下标：找不到返回 -1（indexOf 口径）。
+// Find the index in cidAll: -1 when absent (indexOf semantics).
 int32_t indexOfCid(const std::vector<std::string>& cidAll, const std::string& currentCid) {
     auto it = std::find(cidAll.begin(), cidAll.end(), currentCid);
     if (it == cidAll.end()) return -1;
     return static_cast<int32_t>(it - cidAll.begin());
 }
 
-// 把 mqAll 的 [start, start+range) 拷进结果，越界一律截断。
+// Copy mqAll's [start, start+range) into the result, clamping any out-of-range bound.
 std::vector<MessageQueue> slice(const std::vector<MessageQueue>& mqAll, int32_t start, int32_t range) {
     std::vector<MessageQueue> result;
     const int32_t total = static_cast<int32_t>(mqAll.size());
@@ -32,8 +32,8 @@ std::vector<MessageQueue> slice(const std::vector<MessageQueue>& mqAll, int32_t 
 }  // namespace
 
 std::vector<std::string> javaSplit(const std::string& text, char sep) {
-    // 先按分隔符全切，再裁掉末尾空段；
-    // 但**一次都没命中**时整串原样早返回（哪怕它本身是空串），不裁尾。
+    // Split on the separator everywhere first, then drop trailing empty segments;
+    // but when the separator **never matches**, return the whole string unchanged (even if it is empty) without trimming.
     std::vector<std::string> parts;
     size_t pos = 0;
     bool matched = false;
@@ -60,7 +60,7 @@ int32_t checkAllocateConfig(const std::string& consumerGroup, const std::string&
     if (cidAll.empty()) return -1;
     int32_t index = indexOfCid(cidAll, currentCid);
     if (index < 0) {
-        // 本客户端不在 cidAll 里的日志文案是运维侧匹配的固定条款，保持不变。
+        // The log text for this client missing from cidAll is a fixed phrase matched on the ops side; keep it unchanged.
         std::string cids;
         for (size_t i = 0; i < cidAll.size(); ++i) {
             if (i) cids += ", ";
@@ -98,9 +98,9 @@ std::vector<MessageQueue> AllocateMessageQueueAveragelyByCircle::allocate(
     int32_t index = checkAllocateConfig(consumerGroup, currentCid, mqAll, cidAll);
     if (index < 0) return {};
 
-    // 从下标 index 起步进，步长 cidAll.size()：凡 `i % cidAll.size() == index` 的队列归本消费者。
+    // Walk from index with stride cidAll.size(): every queue with `i % cidAll.size() == index` belongs to this consumer.
     std::vector<MessageQueue> result;
-    const int32_t step = static_cast<int32_t>(cidAll.size());  // 守卫保证 >= 1
+    const int32_t step = static_cast<int32_t>(cidAll.size());  // the guard guarantees >= 1
     for (int32_t i = index; i < static_cast<int32_t>(mqAll.size()); i += step) {
         result.push_back(mqAll[static_cast<size_t>(i)]);
     }
@@ -125,7 +125,7 @@ std::vector<MessageQueue> AllocateMessageQueueByConfig::getMessageQueueList() co
 std::vector<MessageQueue> AllocateMessageQueueByConfig::allocate(
     const std::string& /*consumerGroup*/, const std::string& /*currentCid*/,
     const std::vector<MessageQueue>& /*mqAll*/, const std::vector<std::string>& /*cidAll*/) const {
-    // 不做 check；未配置时返回空列表（且是副本，不交出共享可变引用）。
+    // No validation; returns an empty list when unconfigured (a copy, so no shared mutable reference escapes).
     return getMessageQueueList();
 }
 
@@ -133,8 +133,8 @@ std::vector<MessageQueue> AllocateMessageQueueByConfig::allocate(
 AllocateMessageQueueConsistentHash::AllocateMessageQueueConsistentHash(
     int32_t virtualNodeCnt, const std::shared_ptr<const HashFunction>& customHashFunction)
     : virtualNodeCnt_(virtualNodeCnt), customHashFunction_(customHashFunction) {
-    // 负数虚拟节点数是**构造期**错误（不在 rebalance 后台路径上），头文件口径 1 的
-    // 「守卫返回空」不适用，直接抛。
+    // A negative virtual-node count is a **construction-time** error (not on the rebalance background path), so the
+    // header contract 1 "guard returns empty" does not apply: throw directly.
     if (virtualNodeCnt < 0) {
         throw MQClientException("illegal virtualNodeCnt :" + std::to_string(virtualNodeCnt));
     }
@@ -145,7 +145,7 @@ std::vector<MessageQueue> AllocateMessageQueueConsistentHash::allocate(
     const std::vector<MessageQueue>& mqAll, const std::vector<std::string>& cidAll) const {
     if (checkAllocateConfig(consumerGroup, currentCid, mqAll, cidAll) < 0) return {};
 
-    // cidAll 逐个包成 ClientNode 建环；customHashFunction == nullptr 时环自带 MD5Hash。
+    // Wrap each cidAll entry as a ClientNode to build the ring; with customHashFunction == nullptr the ring uses MD5Hash.
     std::vector<std::shared_ptr<Node>> cidNodes;
     cidNodes.reserve(cidAll.size());
     for (const std::string& cid : cidAll) {
@@ -155,8 +155,8 @@ std::vector<MessageQueue> AllocateMessageQueueConsistentHash::allocate(
 
     std::vector<MessageQueue> result;
     for (const MessageQueue& mq : mqAll) {
-        // 环的 key 是 MessageQueue 的全量串（toString），路由到节点后再比节点 key 与 currentCid。
-        // nullptr 分支真的会走到：虚拟节点数可以是 0 ⇒ 环空 ⇒ 谁都拿不到队列。
+        // The ring key is the MessageQueue's full string (toString); after routing to a node, its key is compared with currentCid.
+        // The nullptr branch is genuinely reachable: the virtual-node count may be 0 => empty ring => nobody gets any queue.
         const std::shared_ptr<Node> node = router.routeNode(mq.toString());
         if (node != nullptr && node->getKey() == currentCid) result.push_back(mq);
     }
@@ -185,23 +185,23 @@ std::vector<MessageQueue> AllocateMessageQueueByMachineRoom::allocate(
     if (currentIndex < 0) return {};
 
     const std::set<std::string> rooms = getConsumeridcs();
-    // 判据：broker 名切分后**正好 2 段**且首段在配置机房集合里。
-    // 必须是 javaSplit：`"room1@"` 切出 1 段 ⇒ **不参与**分配，朴素切分则会给它。
+    // Test: the split broker name has **exactly 2 segments** and the first is in the configured machine-room set.
+    // It must be javaSplit: `"room1@"` yields 1 segment => it does **not** take part in allocation, while a naive split would include it.
     std::vector<MessageQueue> premqAll;
     for (const MessageQueue& mq : mqAll) {
         const std::vector<std::string> temp = javaSplit(mq.brokerName, '@');
         if (temp.size() == 2 && rooms.count(temp[0]) > 0) premqAll.push_back(mq);
     }
 
-    // 注意这条切分算式与 AVG **不同**：余数队列按 `rem > currentIndex` 分给**前 rem 个**
-    // 消费者，且每人的区间长度恒为 mod（AVG 是多拿的人区间也更长）。
-    const int32_t cidSize = static_cast<int32_t>(cidAll.size());  // 守卫保证 >= 1
+    // This split formula **differs from AVG**: the remainder queues go to the **first rem** consumers via `rem > currentIndex`,
+    // and every consumer's range length stays exactly mod (under AVG, those taking more also get longer ranges).
+    const int32_t cidSize = static_cast<int32_t>(cidAll.size());  // the guard guarantees >= 1
     const int32_t mod = static_cast<int32_t>(premqAll.size()) / cidSize;
     const int32_t rem = static_cast<int32_t>(premqAll.size()) % cidSize;
     std::vector<MessageQueue> result = slice(premqAll, mod * currentIndex, mod);
     if (rem > currentIndex) {
-        // 越界不可能：`currentIndex < rem` 且 `rem < cidSize`
-        // ⇒ `currentIndex + mod*cidSize < rem + mod*cidSize == premqAll.size()`。
+        // Out-of-range is impossible: `currentIndex < rem` and `rem < cidSize`
+        // imply `currentIndex + mod*cidSize < rem + mod*cidSize == premqAll.size()`.
         result.push_back(premqAll[static_cast<size_t>(currentIndex + mod * cidSize)]);
     }
     return result;
@@ -213,11 +213,11 @@ AllocateMachineRoomNearby::AllocateMachineRoomNearby(
     const std::shared_ptr<MachineRoomResolver>& machineRoomResolver)
     : allocateMessageQueueStrategy_(allocateMessageQueueStrategy),
       machineRoomResolver_(machineRoomResolver) {
-    // 参数缺失用 MQClientException 表达「非法配置」（头文件口径 2）；
-    // 文案保留 `... is null` 既有句式，调用方按原文匹配。
+    // Missing arguments are reported as MQClientException meaning "invalid configuration" (header contract 2);
+    // the text keeps the existing `... is null` phrasing because callers match it literally.
     if (allocateMessageQueueStrategy == nullptr) throw MQClientException("allocateMessageQueueStrategy is null");
     if (machineRoomResolver == nullptr) throw MQClientException("machineRoomResolver is null");
-    // 名字 = "MACHINE_ROOM_NEARBY-" + 内层名；构造期算好。
+    // Name = "MACHINE_ROOM_NEARBY-" + the delegate name; computed at construction.
     name_ = "MACHINE_ROOM_NEARBY-" + allocateMessageQueueStrategy->getName();
 }
 
@@ -226,12 +226,12 @@ std::vector<MessageQueue> AllocateMachineRoomNearby::allocate(
     const std::vector<MessageQueue>& mqAll, const std::vector<std::string>& cidAll) const {
     if (checkAllocateConfig(consumerGroup, currentCid, mqAll, cidAll) < 0) return {};
 
-    // 按机房分组：std::map ⇒ 机房按**字典序**遍历，分配结果与分组顺序口径一致。
+    // Group by machine room: std::map => rooms are visited in **lexicographic order**, matching the required grouping order contract.
     std::map<std::string, std::vector<MessageQueue>> mr2Mq;
     for (const MessageQueue& mq : mqAll) {
         const std::string brokerMachineRoom = machineRoomResolver_->brokerDeployIn(mq);
-        // 机房串为空即「机房未知」→ 抛异常。
-        // 照抛而不返回空：静默返回等于把整个 topic 的队列撤走（头文件口径 1 的例外）。
+        // An empty machine-room string means "room unknown" -> throw.
+        // Throwing instead of returning empty: a silent return would withdraw every queue of the topic (an exception to header contract 1).
         if (brokerMachineRoom.empty()) {
             throw MQClientException("Machine room is null for mq " + mq.toString());
         }
@@ -248,8 +248,8 @@ std::vector<MessageQueue> AllocateMachineRoomNearby::allocate(
 
     std::vector<MessageQueue> allocateResults;
 
-    // 1. 与本消费者同机房的队列只分给同机房的消费者。
-    //    先把本机房队列从 mr2Mq 摘走（remove），第 2 步共享遍历才不会重复分它。
+    // 1. Queues in this consumer's machine room go only to consumers in the same room.
+    //    They are removed from mr2Mq first, so the shared traversal in step 2 does not allocate them again.
     const std::string currentMachineRoom = machineRoomResolver_->consumerDeployIn(currentCid);
     std::vector<MessageQueue> mqInThisMachineRoom;
     auto mqIt = mr2Mq.find(currentMachineRoom);
@@ -257,8 +257,8 @@ std::vector<MessageQueue> AllocateMachineRoomNearby::allocate(
         mqInThisMachineRoom = std::move(mqIt->second);
         mr2Mq.erase(mqIt);
     }
-    // 查不到就给内层策略传空列表；守卫保证 currentCid ∈ cidAll，而上面的分组
-    // 已把 cidAll 全部放进 mr2c ⇒ 必然命中，查不到是"空"而非"缺"。
+    // A miss passes an empty list to the delegate; the guard ensures currentCid is in cidAll, and the grouping above
+    // put all of cidAll into mr2c => a hit is guaranteed, so a miss means "empty", not "absent".
     std::vector<std::string> consumerInThisMachineRoom;
     auto cidIt = mr2c.find(currentMachineRoom);
     if (cidIt != mr2c.end()) consumerInThisMachineRoom = cidIt->second;
@@ -268,7 +268,7 @@ std::vector<MessageQueue> AllocateMachineRoomNearby::allocate(
         allocateResults.insert(allocateResults.end(), got.begin(), got.end());
     }
 
-    // 2. 没有任何存活消费者的机房，其队列由全部消费者共享（否则无人消费）。
+    // 2. Rooms without any live consumer have their queues shared by all consumers (otherwise nothing would be consumed).
     for (const auto& machineRoomEntry : mr2Mq) {
         if (mr2c.count(machineRoomEntry.first) > 0) continue;
         const std::vector<MessageQueue> got = allocateMessageQueueStrategy_->allocate(

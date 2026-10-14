@@ -15,7 +15,7 @@ namespace rocketmq {
 
 namespace {
 
-// 与 pull_consumer.cpp 同款：按 ';' 切分 namesrv 地址。
+// Same as in pull_consumer.cpp: split the name server address list on ';'.
 std::vector<std::string> splitSemicolon(const std::string& addr) {
     std::vector<std::string> out;
     size_t start = 0;
@@ -75,8 +75,8 @@ int64_t parseConsumeTimestamp(const std::string& ts) {
 }  // namespace
 
 DefaultLitePullConsumer::DefaultLitePullConsumer(const std::string& consumerGroup) {
-    // 与 push consumer 同款首道守卫：只挡空白组名（⚠ 旧实现用 empty()，纯空白漏过，
-    // 改为 UtilAll::isBlank）；完整校验在 start() 里走 Validators::checkGroup。
+    // First guard, same as in the push consumer: blocks blank group names only (the old empty() check
+    // let all-blank names pass, hence UtilAll::isBlank); full validation runs in start() via Validators::checkGroup.
     if (UtilAll::isBlank(consumerGroup)) {
         throw MQClientException("consumerGroup is empty");
     }
@@ -92,7 +92,7 @@ DefaultLitePullConsumer::~DefaultLitePullConsumer() {
     }
 }
 
-// ---------------------------------------------------------------- 配置
+// ---------------------------------------------------------------- Configuration
 void DefaultLitePullConsumer::setNamesrvAddr(const std::string& addr) {
     nameServerAddrs_ = splitSemicolon(addr);
 }
@@ -111,7 +111,7 @@ DefaultLitePullConsumer::allocateMessageQueueStrategy() const {
     return allocateStrategy_;
 }
 
-// ---------------------------------------------------------------- 订阅 / 分配
+// ---------------------------------------------------------------- Subscribe / assign
 void DefaultLitePullConsumer::subscribe(const std::string& topic, const std::string& subExpression) {
     assignMode_ = false;
     std::string ns = withNamespace(topic);
@@ -233,7 +233,7 @@ void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQue
             if (nextOffset_.find(mq) == nextOffset_.end()) toResolve.push_back(mq);
         }
     }
-    // resolveInitialOffset 要发 RPC，绝不能抱着 stateMutex_ 做。
+    // resolveInitialOffset issues an RPC, so it must never run while stateMutex_ is held.
     for (const MessageQueue& mq : toResolve) {
         int64_t offset = 0;
         try {
@@ -243,14 +243,14 @@ void DefaultLitePullConsumer::assign(const std::vector<MessageQueue>& messageQue
             continue;
         }
         std::lock_guard<std::mutex> lk(stateMutex_);
-        // 期间可能被 rebalance/assign 改过：只给当下还持有的队列写回游标。
+        // rebalance/assign may have changed things meanwhile: write the cursor back only for queues still held.
         if (assigned_.find(mq) != assigned_.end() && nextOffset_.find(mq) == nextOffset_.end()) {
             nextOffset_[mq] = offset;
         }
     }
 }
 
-// ---------------------------------------------------------------- 生命周期
+// ---------------------------------------------------------------- Lifecycle
 void DefaultLitePullConsumer::start() {
     if (started_) return;
     if (!namespace_.empty()) {
@@ -316,10 +316,10 @@ void DefaultLitePullConsumer::start() {
             }
         }
     }
-    // 先把 tag 订阅注册给 broker（心跳），再启动后台拉取，避免首轮拉取因 broker 不认订阅而丢消息。
+    // Register the tag subscription with the broker (heartbeat) before background pulling starts, so the first pull round cannot lose messages because the broker does not know the subscription.
     sendHeartbeatToAllBroker();
-    // running_ 必须在心跳线程起来**之前**置位：heartbeatLoop 的循环条件是它，
-    // 线程先跑起来会看到 false 直接退出，本实例就再也不会周期心跳（broker 120s 后踢掉）。
+    // running_ must be set before the heartbeat thread starts: heartbeatLoop loops on it, so a thread that
+    // starts first sees false and exits, and this instance never heartbeats again (the broker drops it after 120s).
     running_ = true;
     heartbeatThread_ = std::thread(&DefaultLitePullConsumer::heartbeatLoop, this);
     started_ = true;
@@ -358,7 +358,7 @@ void DefaultLitePullConsumer::shutdown() {
     }
 }
 
-// ---------------------------------------------------------------- 拉取服务
+// ---------------------------------------------------------------- Pull service
 void DefaultLitePullConsumer::pullServiceLoop() {
     while (running_) {
         bool gotAny = false;
@@ -371,7 +371,7 @@ void DefaultLitePullConsumer::pullServiceLoop() {
                 rebalance();
                 lastRebalanceTs_ = now;
             }
-            // assigned_ / paused_ 会被调用方线程的 assign()、pause() 改，先快照再遍历。
+            // assign() and pause() on the caller thread mutate assigned_ / paused_: snapshot under the lock first, then iterate.
             std::set<MessageQueue> snapshot;
             std::set<MessageQueue> paused;
             {
@@ -387,7 +387,7 @@ void DefaultLitePullConsumer::pullServiceLoop() {
         } catch (...) {
             logger_debug("lite pull service error");
         }
-        // 退避：轮询空时放慢，避免打爆 broker；有消息则尽快回填缓冲。
+        // Backoff: slow down while polls come up empty so the broker is not flooded; refill the buffer quickly when there were messages.
         auto backoff = gotAny ? std::chrono::milliseconds(5)
                               : std::chrono::milliseconds(pullIntervalMillis_);
         std::this_thread::sleep_for(backoff);
@@ -414,7 +414,7 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
         }
     }
     if (!known) {
-        // 首次拉取要问 broker 起点，这一步是 RPC：绝不能抱着 stateMutex_ 做。
+        // The first pull has to ask the broker for a start offset, which is an RPC: never do it while holding stateMutex_.
         int64_t resolved = 0;
         try {
             resolved = resolveInitialOffset(mq);
@@ -461,8 +461,8 @@ bool DefaultLitePullConsumer::pullOne(const MessageQueue& mq) {
     std::vector<MessageExt> msgs = std::move(result.msgFoundList);
     filterTags(mq.topic, msgs, sub);
     if (msgs.empty()) {
-        // 全被 tag 过滤掉：窗口在 broker 眼里已经读过（游标上面推过了），
-        // 只是没有可交付的——不能像旧实现那样原地重拉同一窗口。
+        // Everything was filtered out by the tag: the broker already counts this window as read (the cursor was advanced
+        // above), there was simply nothing deliverable - unlike the old behaviour, the same window is not re-pulled in place.
         return false;
     }
     enqueue(msgs);
@@ -537,8 +537,8 @@ int64_t DefaultLitePullConsumer::resolveInitialOffset(const MessageQueue& mq) {
 // ---------------------------------------------------------------- rebalance
 void DefaultLitePullConsumer::rebalance() {
     std::set<MessageQueue> newSet;
-    // per-subscription 监听器回调要用的 mqAll（按 topic）；循环里顺手记下来，
-    // 免得回调阶段再打一轮订阅信息 RPC。
+    // mqAll (per topic) for the per-subscription listener callbacks; recorded inside the loop so the
+    // callback phase does not need another round of subscription-info RPCs.
     std::map<std::string, std::vector<MessageQueue>> mqAllByTopic;
     for (const auto& kv : subscription_) {
         std::vector<MessageQueue> mqAll = mqClient_->getTopicSubscribeInfo(kv.first);
@@ -581,8 +581,8 @@ void DefaultLitePullConsumer::rebalance() {
                     auto ot = offsetTable_.find(mq);
                     if (ot != offsetTable_.end()) revoked.push_back(*ot);
                     nextOffset_.erase(mq);
-                    // AssignedMessageQueue 的条目（连着 consumeOffset）一起丢掉：
-                    // 留着就是一个再没人提交的陈旧值。
+                    // Drop the AssignedMessageQueue entry together with consumeOffset: keeping it
+                    // would leave a stale offset that nobody ever commits again.
                     consumeOffset_.erase(mq);
                     offsetTable_.erase(mq);
                     seekOffset_.erase(mq);
@@ -591,7 +591,7 @@ void DefaultLitePullConsumer::rebalance() {
         }
     }
     if (!changed) return;
-            // 撤手之前把最后那次提交补发出去，别让新持有者从上一个窗口起重新投一遍。
+            // Flush the last commit before letting go, so the new owner does not redeliver from the previous window.
     for (const auto& kv : revoked) {
         try {
             mqClient_->updateConsumerOffset(consumerGroup_, kv.first, kv.second);
@@ -643,7 +643,7 @@ void DefaultLitePullConsumer::rebalance() {
     }
 }
 
-// 收集订阅的全部队列（listener 回调用）——与 rebalance 同口径：订阅信息。
+// Collect every queue of the subscription (for listener callbacks) - same source as rebalance: topic subscribe info.
 std::vector<MessageQueue> DefaultLitePullConsumer::mqAllOfSubscription() const {
     std::vector<MessageQueue> all;
     for (const auto& kv : subscription_) {
@@ -658,7 +658,7 @@ std::vector<MessageQueue> DefaultLitePullConsumer::newSetAsVector(const std::set
     return std::vector<MessageQueue>(s.begin(), s.end());
 }
 
-// ---------------------------------------------------------------- poll / 位点
+// ---------------------------------------------------------------- poll / consumer offset
 std::vector<MessageExt> DefaultLitePullConsumer::poll(int32_t timeoutMillis) {
     int32_t timeout = timeoutMillis > 0 ? timeoutMillis : pollTimeoutMillis_;
     if (autoCommit_) maybeAutoCommit();
@@ -861,7 +861,7 @@ int64_t DefaultLitePullConsumer::consumeCursorOf(const MessageQueue& mq) {
     return it == consumeOffset_.end() ? -1 : it->second;
 }
 
-// ---------------------------------------------------------------- 队列查询 / 控制
+// ---------------------------------------------------------------- Queue lookup / control
 std::vector<MessageQueue> DefaultLitePullConsumer::fetchMessageQueues(const std::string& topic) {
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
@@ -870,7 +870,7 @@ std::vector<MessageQueue> DefaultLitePullConsumer::fetchMessageQueues(const std:
     try {
         mqClient_->updateTopicRouteInfoFromNameServer(fullTopic);
     } catch (const std::exception& e) {
-        // 抖动时退回当下缓存再判一次（外层 catch 会把"仍然没队列"报成一条 error 日志）。
+        // On route jitter fall back to the currently cached route and test again (the outer catch reports "still no queues" as one error log).
         logger_debug("fetch queues: route refresh for " + fullTopic + " failed: " + e.what());
     }
     std::vector<MessageQueue> queues = mqClient_->getTopicSubscribeInfo(fullTopic);
@@ -898,7 +898,7 @@ void DefaultLitePullConsumer::resume(const std::vector<MessageQueue>& messageQue
     }
 }
 
-// ---------------------------------------------------------------- 心跳
+// ---------------------------------------------------------------- Heartbeat
 HeartbeatData DefaultLitePullConsumer::buildHeartbeat() const {
     HeartbeatData hb(clientId_);
     ConsumerData cd(consumerGroup_, ConsumeType::CONSUME_ACTIVELY, messageModel_,
@@ -933,7 +933,7 @@ void DefaultLitePullConsumer::heartbeatLoop() {
         } catch (...) {
             logger_debug("lite heartbeat loop error");
         }
-        // 5s 心跳间隔（与 push 消费者一致）
+        // 5s heartbeat interval (same as the push consumer)
         for (int i = 0; i < 50; ++i) {
             if (!running_) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

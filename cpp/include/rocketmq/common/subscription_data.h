@@ -1,5 +1,5 @@
-// 用途：Consumer 注册到 broker 的心跳里携带 SubscriptionData，broker 依据
-// tagsSet / codeSet 做 TAG 过滤；subString 为 "||" 分隔的 tag 表达式。
+// Purpose: the SubscriptionData carried in a consumer's heartbeat registration to the broker; the broker
+// performs TAG filtering from tagsSet / codeSet; subString is the "||" separated tag expression.
 #ifndef ROCKETMQ_COMMON_SUBSCRIPTION_DATA_H
 #define ROCKETMQ_COMMON_SUBSCRIPTION_DATA_H
 
@@ -24,7 +24,7 @@ public:
     std::string subString;
     std::set<std::string> tagsSet;
     std::set<int64_t> codeSet;
-    int64_t subVersion = 0;  // 默认取当前毫秒时间戳（见构造函数）
+    int64_t subVersion = 0;  // Defaults to the current millisecond timestamp (see the constructors)
     std::string expressionType = ExpressionType::TAG;
     std::string filterClassSource;
 

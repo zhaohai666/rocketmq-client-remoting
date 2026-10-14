@@ -1,4 +1,4 @@
-// ProducerData / ConsumerData / HeartbeatData 的实现。
+// ProducerData / ConsumerData / HeartbeatData implementations.
 #include "rocketmq/remoting/protocol/heartbeat.h"
 
 #include <string>
@@ -133,7 +133,7 @@ HeartbeatData HeartbeatData::fromJson(const JsonValue& v) {
         hb.heartbeatFingerprint = static_cast<int32_t>(n);
     }
     bool b = false;
-    // 同时兼容 withoutSub 与协议字段名 isWithoutSub 两种写法
+    // Accepts both withoutSub and the protocol field name isWithoutSub
     if (v.tryGetBool("withoutSub", b)) {
         hb.withoutSub = b;
     } else if (v.tryGetBool("isWithoutSub", b)) {

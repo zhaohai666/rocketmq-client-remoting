@@ -1,4 +1,4 @@
-// MixAll 的实现（properties 与分组判定部分）。
+// MixAll implementation (the properties and group-classification parts).
 #include "rocketmq/common/mix_all.h"
 
 #include <string>
@@ -43,7 +43,7 @@ std::string trimBoth(const std::string& s) {
     return s.substr(b, e - b);
 }
 
-// 按 \r\n / \n / \r 切行
+// Split into lines on \r\n / \n / \r
 std::vector<std::string> splitLines(const std::string& text) {
     std::vector<std::string> lines;
     std::string cur;
@@ -76,7 +76,7 @@ bool MixAll::isPredefinedGroup(const std::string& consumerGroup) {
 std::string MixAll::getIpStr() { return UtilAll::localIp(); }
 
 const std::string& MixAll::cachedIpStr() {
-    // 函数内静态：C++11 起局部静态初始化是线程安全的，客户端可能在多个线程里同时 start
+    // Function-local static: since C++11 its initialization is thread-safe, and the client may start on several threads at once
     static const std::string ip = UtilAll::localIp();
     return ip;
 }
@@ -97,7 +97,7 @@ std::string MixAll::properties2String(const PropertyMap& properties) {
 PropertyMap MixAll::string2Properties(const std::string& text) {
     PropertyMap result;
 
-    // 先把续行合并成逻辑行
+    // Merge continuation lines into logical lines first
     std::vector<std::string> logical;
     std::string pending;
     bool hasPending = false;
@@ -108,7 +108,7 @@ PropertyMap MixAll::string2Properties(const std::string& text) {
             pending.clear();
             hasPending = false;
         }
-        // 行尾反斜杠个数为奇数 => 续行
+        // An odd number of trailing backslashes means a continuation line
         size_t trailing = 0;
         for (size_t i = line.size(); i > 0 && line[i - 1] == '\\'; --i) ++trailing;
         if (trailing % 2 == 1) {
@@ -131,9 +131,9 @@ PropertyMap MixAll::string2Properties(const std::string& text) {
         size_t keyStart = i;
         while (i < n && line[i] != '=' && line[i] != ':' && !isSpaceChar(line[i])) ++i;
         std::string key = line.substr(keyStart, i - keyStart);
-        // 跳过分隔符前的空白
+        // Skip whitespace before the separator
         while (i < n && isSpaceChar(line[i])) ++i;
-        // 可选的 '=' / ':' 及其后的空白
+        // The optional '=' / ':' and the whitespace after it
         if (i < n && (line[i] == '=' || line[i] == ':')) {
             ++i;
             while (i < n && isSpaceChar(line[i])) ++i;

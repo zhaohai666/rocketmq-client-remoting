@@ -16,8 +16,8 @@ struct SocksProxyConfig {
 
     Type type = Type::SOCKS5;
     std::string addr;
-    int32_t port = 1080;   // 代理端口；addr 自带 ":port" 时以 addr 为准
-    std::string username;  // 可选凭据（SOCKS5 用户名密码子协商 / SOCKS4 userid）
+    int32_t port = 1080;   // Proxy port; addr wins when it already carries ":port"
+    std::string username;  // Optional credentials (SOCKS5 username/password sub-negotiation / SOCKS4 userid)
     std::string password;
 
     bool empty() const { return addr.empty(); }
@@ -25,16 +25,16 @@ struct SocksProxyConfig {
     void resolveHostPort(std::string& host, std::string& portStr) const;
 };
 
-// 在**已连到代理**的 socket 上完成 SOCKS 握手（CONNECT），建立到
-// targetHost:targetPort 的隧道。
+// Completes the SOCKS handshake (CONNECT) on a socket **already connected to the proxy**,
+// establishing a tunnel to targetHost:targetPort.
 //
-//   * SOCKS5：先发方法协商（配了 username/password 只报 0x02，否则只报 0x00），
-//     选中 0x02 时继续 RFC 1929 用户名/密码子协商；
-//   * SOCKS4：目标必须是 IPv4 字面量（本地直填）；否则按 SOCKS4a 扩展把域名交给
-//     代理解析（4 字节地址填 0.0.0.1 标记 + 域名后缀）。
+//   * SOCKS5: send method negotiation first (offer only 0x02 when username/password are
+//     configured, otherwise only 0x00); once 0x02 is selected, continue RFC 1929 username/password
+//   * SOCKS4: the target must be an IPv4 literal (filled in locally); otherwise the domain name is
+//     resolved by the proxy via the SOCKS4a extension (4-byte address set to the 0.0.0.1 marker plus the domain suffix).
 //
-// 成功返回 true，sock 即为通往目标的隧道；失败返回 false 并在 err 给出原因
-// （含 SOCKS5 REP / SOCKS4 code 的文案），调用方负责关闭 socket。
+// Returns true on success, and sock becomes the tunnel to the target; returns false on failure and
+// puts the reason in err (including the SOCKS5 REP / SOCKS4 code wording); the caller closes the socket.
 bool socksConnect(netcompat::socket_t sock, const SocksProxyConfig& proxy,
                   const std::string& targetHost, const std::string& targetPort,
                   int32_t timeoutMillis, std::string& err);

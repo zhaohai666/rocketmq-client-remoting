@@ -1,21 +1,21 @@
-// 协议回顾：
+// Protocol recap:
 //
-//     请求方 (producer.request)                    应答方 (push consumer)
-//     ─────────────────────────                    ──────────────────────
+//     Requester (producer.request)                   Responder (push consumer)
+//     ─────────────────────────                      ──────────────────────
 //     msg.properties[CORRELATION_ID] = uuid
-//     msg.properties[REPLY_TO_CLIENT] = clientId ─► 收到请求消息（broker 已写入 CLUSTER）
+//     msg.properties[REPLY_TO_CLIENT] = clientId ─► request message received (broker already wrote to CLUSTER)
 //     msg.properties[TTL] = timeoutMillis           createReplyMessage(requestMsg, body):
 //                                                      topic       = <CLUSTER>_REPLY_TOPIC
-//                                                      CORRELATION_ID / REPLY_TO_CLIENT / TTL 原样带回
+//                                                      CORRELATION_ID / REPLY_TO_CLIENT / TTL carried back unchanged
 //                                                      MSG_TYPE    = "reply"
 //     ◄── PUSH_REPLY_MESSAGE_TO_CLIENT(326) ──────  producer.send(reply) → SEND_REPLY_MESSAGE_V2(325)
-//         由 broker 按 REPLY_TO_CLIENT 找到请求方连接推回
+//         the broker finds the requester's connection by REPLY_TO_CLIENT and pushes the reply back
 //
-// 两个关键点（错了真机就不通）：
-// 1. 应答消息必须带 MSG_TYPE == "reply"，客户端据此把请求码从 SEND_MESSAGE_V2(310) 换成
-//    SEND_REPLY_MESSAGE_V2(325)；broker 的 ReplyMessageProcessor 只注册在 324/325 上。
-// 2. REPLY_TO_CLIENT 是**请求方的 clientId**，broker 用它在 ProducerManager 的
-//    clientChannelTable 里反查 channel —— 所以请求方必须先发过心跳（已注册为 producer）。
+// Two critical points (get them wrong and it will not work against a real broker):
+// 1. The reply message must carry MSG_TYPE == "reply"; the client uses it to switch the request code from SEND_MESSAGE_V2(310) to
+//    SEND_REPLY_MESSAGE_V2(325); the broker's ReplyMessageProcessor is only registered on 324/325.
+// 2. REPLY_TO_CLIENT is **the requester's clientId**; the broker uses it to look up the channel in ProducerManager's
+//    clientChannelTable — so the requester must have sent a heartbeat first (registered as a producer).
 #ifndef ROCKETMQ_CLIENT_REQUEST_REPLY_H
 #define ROCKETMQ_CLIENT_REQUEST_REPLY_H
 
@@ -54,11 +54,11 @@ public:
     bool waitResponseMessage(int32_t timeoutMillis);
 
     void putResponseMessage(const MessageExt& responseMessage);
-    // 无应答的唤醒（发送阶段就失败时用它，避免等待方白等到超时）。
+    // Wake-up without a response (used when the send stage already failed, so the waiter does not wait until timeout for nothing).
     void putResponseMessage();
 
     bool hasResponse() const;
-    MessageExt responseMessage() const;  // 未收到时返回空 MessageExt
+    MessageExt responseMessage() const;  // returns an empty MessageExt when none was received
 
     void setSendRequestOk(bool ok) { sendRequestOk_ = ok; }
     bool isSendRequestOk() const { return sendRequestOk_; }
@@ -122,7 +122,7 @@ std::string createCorrelationId();
 
 Message createReplyMessage(const Message& requestMessage, const Bytes& body);
 
-// MSG_TYPE == "reply" 的发送要走 SEND_REPLY_MESSAGE_V2(325)。
+// Sending a MSG_TYPE == "reply" message must go through SEND_REPLY_MESSAGE_V2(325).
 bool isReplyMessage(const Message& msg);
 
 std::optional<RemotingCommand> processReplyMessage(const RemotingCommand& cmd,

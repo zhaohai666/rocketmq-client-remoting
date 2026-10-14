@@ -1,8 +1,8 @@
-// 与 push 消费者的区别：**由调用方自己拉、自己管位点**。
-// 没有后台拉取线程、没有 rebalance、没有消费监听器；只有：
+// Difference from the push consumer: **the caller pulls and manages the offsets itself**.
+// There is no background pull thread, no rebalance and no message listener; only:
 //   fetchSubscribeMessageQueues / fetchMessageQueuesInBalance / pull / pullBlockIfNotFound /
 //   fetchConsumeOffset / updateConsumeOffset / searchOffset / maxOffset / minOffset /
-//   earliestMsgStoreTime / sendMessageBack / createTopic。
+//   earliestMsgStoreTime / sendMessageBack / createTopic.
 #ifndef ROCKETMQ_CLIENT_PULL_CONSUMER_H
 #define ROCKETMQ_CLIENT_PULL_CONSUMER_H
 
@@ -45,7 +45,7 @@ public:
     DefaultMQPullConsumer(const DefaultMQPullConsumer&) = delete;
     DefaultMQPullConsumer& operator=(const DefaultMQPullConsumer&) = delete;
 
-    // ---------------- 配置 ----------------
+    // ---------------- configuration ----------------
     void setNamesrvAddr(const std::string& addr);
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     void setInstanceName(const std::string& name) { instanceName_ = name; }
@@ -55,7 +55,7 @@ public:
     void setUnitMode(bool unitMode) { unitMode_ = unitMode; }
     bool isUnitMode() const { return unitMode_; }
 
-    // true 时每个请求带扩展字段 `ReqT=0`，且 clientId 末尾多一段 `@STREAM`。
+    // When true, every request carries the extension field `ReqT=0` and clientId gets an extra `@STREAM` suffix segment.
     void setEnableStreamRequestType(bool enable) { enableStreamRequestType_ = enable; }
     bool isEnableStreamRequestType() const { return enableStreamRequestType_; }
     void setPollNameServerIntervalMillis(int32_t millis) { pollNameServerIntervalMillis_ = millis; }
@@ -96,10 +96,10 @@ public:
     const std::string& namespaceOf() const { return namespace_; }
     const std::set<std::string>& registerTopics() const { return registerTopics_; }
     bool isStarted() const { return started_; }
-    // 心跳成功轮数（真机验证用）。
+    // Number of successful heartbeat rounds (for real-environment verification).
     int32_t heartbeatCount() const { return heartbeatCount_.load(); }
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- lifecycle ----------------
     void start();
     void shutdown();
 
@@ -118,8 +118,8 @@ public:
 
     void updatePullFromWhichNode(const MessageQueue& mq, const PullResult& result);
 
-    // ---------------- 位点管理 ----------------
-    // 返回 false 表示该消费组在该队列上尚无位点（broker 回 QUERY_NOT_FOUND）。
+    // ---------------- offset management ----------------
+    // false means the consumer group has no offset on this queue yet (the broker answers QUERY_NOT_FOUND).
     bool fetchConsumeOffset(const MessageQueue& mq, int64_t& outOffset);
     void updateConsumeOffset(const MessageQueue& mq, int64_t offset);
     void persistConsumeOffset(const MessageQueue& mq, int64_t offset) {
@@ -135,7 +135,7 @@ public:
     void createTopic(const std::string& key, const std::string& newTopic, int32_t queueNum = 4);
 
 private:
-    // 心跳三件套：刷路由（有地址才有人可发）、拼 ConsumerData、常驻循环。
+    // The heartbeat trio: refresh the route (only with addresses is there anyone to send to), assemble ConsumerData, run the resident loop.
     void refreshRouteForHeartbeat();
     HeartbeatData buildHeartbeat() const;
     void startHeartbeatLoop();

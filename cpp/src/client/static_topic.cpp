@@ -1,4 +1,4 @@
-// 静态主题路由：类型化解析 + 端点推导（见 static_topic.h 的 wire 事实说明）。
+// Static topic routing: typed parsing + endpoint derivation (see the wire-format facts in static_topic.h).
 #include "rocketmq/client/static_topic.h"
 
 #include <algorithm>
@@ -31,7 +31,7 @@ bool parseTopicQueueMappingInfo(const JsonValue& raw, TopicQueueMappingInfo& out
     const JsonValue* currIdMap = raw.find("currIdMap");
     if (currIdMap != nullptr && currIdMap->isObject()) {
         for (const auto& kv : currIdMap->objectItems()) {
-            // 键是 globalId 的十进制字符串；解析失败的条目跳过（宽松解析，不让单条脏数据炸掉整份映射）。
+            // Keys are decimal globalId strings; unparsable entries are skipped (lenient parsing, so one bad record cannot break the whole mapping).
             try {
                 std::size_t consumed = 0;
                 const int gid = std::stoi(kv.first, &consumed);
@@ -86,7 +86,7 @@ bool topicRouteData2EndpointsForStaticTopic(
             if (info.epoch >= maxTotalNumOfEpoch && info.totalQueues > maxTotalNums) {
                 maxTotalNums = info.totalQueues;
             }
-            // 只有 global id（键）形状决定端点集；物理 id 是 broker 内部的。
+            // Only the global id (key) shape determines the endpoint set; physical ids are broker-internal.
             for (const auto& gid : info.currIdMap) {
                 MessageQueue mq(topic, mockName, gid.first);
                 auto old = mqEndPoints.find(mq);
@@ -96,8 +96,8 @@ bool topicRouteData2EndpointsForStaticTopic(
             }
         }
 
-        // 补齐静态逻辑队列：total 之下的每个 id 都存在；没有承载者的指向
-        // NOT_EXIST 哨兵。
+        // Fill in the static logical queues: every id below total exists; ones without
+        // a host queue point at the NOT_EXIST sentinel.
         for (int32_t i = 0; i < maxTotalNums; ++i) {
             MessageQueue mq(topic, mockName, i);
             auto holder = mqEndPoints.find(mq);

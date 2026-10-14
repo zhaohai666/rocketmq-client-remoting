@@ -1,4 +1,4 @@
-// 线格式：totalLength(4) | headerLength(高 8 位放序列化类型, 4) | header | body
+// Wire format: totalLength(4) | headerLength (top 8 bits carry the serialization type, 4) | header | body
 //
 //   header(JSON)      : {"code":..,"language":..,"version":..,"opaque":..,"flag":..,
 //                        "remark":"..","extFields":{..}}
@@ -43,7 +43,7 @@ public:
     RemotingCommand(int32_t code, std::shared_ptr<CommandCustomHeader> header,
                     const std::string& remark, int32_t opaque, int32_t flag, const Bytes& body);
 
-    // ---------------- 工厂方法 ----------------
+    // ---------------- factory methods ----------------
     static RemotingCommand createRequestCommand(int32_t code,
                                                 std::shared_ptr<CommandCustomHeader> header = nullptr);
     static RemotingCommand createResponseCommandWithHeader(
@@ -51,12 +51,12 @@ public:
     static RemotingCommand createResponseCommand(int32_t code, const std::string& remark);
     static RemotingCommand buildErrorResponse(int32_t code, const std::string& remark);
 
-    // 全局是否为本次 RPC 使用 ROCKETMQ 二进制序列化（由 setSerializeTypeConfig 控制）
+    // Whether this RPC globally uses ROCKETMQ binary serialization (controlled by setSerializeTypeConfig)
     static void setSerializeTypeConfig(uint8_t type);
     static uint8_t getSerializeTypeConfig();
 
-    // ---------------- 帧工具 ----------------
-    // 帧协议 getProtocolType：取首字节（这里按整型高 8 位同理）
+    // ---------------- frame utilities ----------------
+    // Frame-protocol getProtocolType: take the first byte (here the same as the top 8 bits of the int)
     static uint8_t getProtocolType(int32_t source) {
         return static_cast<uint8_t>((static_cast<uint32_t>(source) >> 24) & 0xFF);
     }
@@ -76,22 +76,22 @@ public:
                                 : RemotingCommandType::REQUEST_COMMAND;
     }
 
-    // ---------------- 编解码 ----------------
-    // 把 customHeader 的非空字段展开到 extFields（与 broker 侧反射取字段的约定一致）
+    // ---------------- encode / decode ----------------
+    // Expand the non-empty fields of customHeader into extFields (matching the broker's reflection-based field convention)
     void makeCustomHeaderToNet();
 
     JsonValue toJsonObject() const;
 
     Bytes headerEncode();
     Bytes encode();
-    // 只编码头部（body 长度另算），用于分帧发送
+    // Encode only the header (the body length is added separately), used for framed sending
     Bytes encodeHeader(int32_t bodyLength = 0);
 
-    // 解析失败抛 RemotingCommandException
+    // A parse failure throws RemotingCommandException
     static bool tryDecode(const Bytes& data, RemotingCommand& out, std::string* err = nullptr);
     static RemotingCommand decode(const Bytes& data);
 
-    // 把 extFields 映射回自定义头部对象
+    // Map extFields back onto the custom header object
     void decodeCommandCustomHeader(CommandCustomHeader& header) const;
 
     void addExtField(const std::string& key, const std::string& value) { extFields[key] = value; }

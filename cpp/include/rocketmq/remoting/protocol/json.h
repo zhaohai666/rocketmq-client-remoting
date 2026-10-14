@@ -1,12 +1,12 @@
-// 极简 JSON 解析 / 生成（仅满足 RemotingSerializable 的需求，零第三方依赖）。
+// Minimal JSON parsing / generation (covers only what RemotingSerializable needs; zero third-party dependencies).
 //
-// 之所以自带实现：RocketMQ 的 JSON 序列化只用得到 object / array / string / number /
-// bool / null 六种类型，引入第三方库会带来不必要的构建负担。
+// The reason for a built-in implementation: RocketMQ JSON serialization only uses the six types object / array /
+// string / number / bool / null, and a third-party library would add unnecessary build burden.
 //
-// 约束：
-//   - Object 保序（vector + 覆盖式插入），因此 encode -> decode 的键顺序稳定；
-//   - 数字区分 int64 与 double：整数字段原样输出，避免 long 型 timestamp 被写成浮点；
-//   - 字符串默认按 UTF-8 原样输出（不做 \uXXXX 转义）。
+// Constraints:
+//   - Object keeps insertion order (vector plus overwrite-on-set), so the key order is stable across encode -> decode;
+//   - numbers distinguish int64 from double: integer fields are printed verbatim, so a long timestamp is not written as a float;
+//   - strings are printed as UTF-8 by default (no \uXXXX escaping).
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_JSON_H
 #define ROCKETMQ_REMOTING_PROTOCOL_JSON_H
 
@@ -62,15 +62,15 @@ public:
     void pushArray(const JsonValue& v);
 
     // ---- object ----
-    // 保序的键值对视图（供遍历；顺序与插入/解析顺序一致）
+    // Order-preserving key/value view (for traversal; the order matches insertion/parse order)
     const Object& objectItems() const { return obj_; }
     bool contains(const std::string& key) const;
     const JsonValue* find(const std::string& key) const;
-    // 找不到时返回静态 Null 引用，便于链式取值
+    // Returns a reference to a static Null when the key is absent, so lookups can be chained
     const JsonValue& get(const std::string& key) const;
     void set(const std::string& key, const JsonValue& v);
 
-    // 便捷取值：key 存在且类型匹配才返回 true
+    // Convenience accessors: return true only when the key exists and the type matches
     bool tryGetString(const std::string& key, std::string& out) const;
     bool tryGetInt(const std::string& key, int64_t& out) const;
     bool tryGetBool(const std::string& key, bool& out) const;
@@ -78,7 +78,7 @@ public:
     std::string dump() const;
 
 private:
-    // 递归序列化实现（object 保序遍历需要访问私有存储）
+    // Recursive serialization implementation (ordered object traversal needs access to the private storage)
     void dumpImpl(std::string& out) const;
 
     Type type_ = Type::Null;
@@ -91,10 +91,10 @@ private:
     Object obj_;
 };
 
-// 解析失败返回 false，err 为可空的输出信息
+// Returns false on parse failure; err is an optional output message
 bool jsonParse(const std::string& text, JsonValue& out, std::string* err = nullptr);
 
-// 序列化
+// Serialize to JSON text
 std::string jsonDump(const JsonValue& v);
 
 }  // namespace rocketmq

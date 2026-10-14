@@ -1,10 +1,10 @@
-// 签名内容：先 makeCustomHeaderToNet()，再按 key 字典序取 extFields 的**全部**
-// value（排除 Signature 键自身；拼接时只有 value，不带 key、不带 `=`/`&` 等分隔符），
-// 最后拼上 body 原始字节。
-// 签名值：标准 Base64( HMAC-SHA1(key = secretKey, data = 上述内容) )。
+// Signed content: first makeCustomHeaderToNet(), then take **all** values of extFields in
+// lexicographic key order (excluding the Signature key itself; concatenation carries only values, no key and no
+// `=`/`&` separators), and finally append the raw body bytes.
+// Signature value: standard Base64( HMAC-SHA1(key = secretKey, data = the content above) ).
 //
-// SHA1 / HMAC / Base64 在本模块内自带实现，**不引入 OpenSSL 依赖**
-// （与仓库「除 zlib 外零外部依赖」的约定一致）。
+// SHA1 / HMAC / Base64 are implemented inside this module, **without adding an OpenSSL dependency**
+// (consistent with the repository convention of zero external dependencies except zlib).
 #ifndef ROCKETMQ_REMOTING_RPCHOOK_H
 #define ROCKETMQ_REMOTING_RPCHOOK_H
 
@@ -23,7 +23,7 @@ class RPCHook {
 public:
     virtual ~RPCHook() = default;
 
-    // 发送前调用。实现**必须**自行保证线程安全；传输层不持锁调用本方法。
+    // Called before sending. Implementations **must** provide their own thread safety; the transport calls this without holding a lock.
     virtual void doBeforeRequest(const std::string& remoteAddr, RemotingCommand& request) = 0;
 
     virtual void doAfterResponse(const std::string& remoteAddr, const RemotingCommand& request,
@@ -62,7 +62,7 @@ public:
     explicit AclClientRPCHook(SessionCredentials credentials)
         : credentials_(std::move(credentials)) {}
 
-    // AccessKey / SecurityToken 先写入（它们参与签名），再算签名，最后写 Signature。
+    // Write AccessKey / SecurityToken first (they take part in the signature), then compute the signature, and finally write Signature.
     void doBeforeRequest(const std::string& remoteAddr, RemotingCommand& request) override;
 
     const SessionCredentials& credentials() const { return credentials_; }
@@ -92,7 +92,7 @@ private:
     std::function<std::string()> namespaceV2_;
 };
 
-// 按注册顺序依次执行的组合钩子。
+// Combined hook that runs the registered hooks in registration order.
 class ChainedRPCHook : public RPCHook {
 public:
     explicit ChainedRPCHook(std::vector<std::shared_ptr<RPCHook>> hooks)
@@ -102,15 +102,15 @@ public:
     void doAfterResponse(const std::string& remoteAddr, const RemotingCommand& request,
                          const RemotingCommand* response) override;
 
-    // 链上的钩子（注册顺序）。单测用它直接断言 composeRequestHooks 装出来的链序。
+    // The hooks on the chain, in registration order. Tests use it to assert the order composeRequestHooks builds.
     const std::vector<std::shared_ptr<RPCHook>>& hooks() const { return hooks_; }
 
 private:
     std::vector<std::shared_ptr<RPCHook>> hooks_;
 };
 
-// 各 facade 在 start() 里统一走这里，顺序就不会写反 —— 反了会让 ACL 签名的内容
-// 里缺 `nsd`/`ns`/`ReqT`，开鉴权的 broker 直接验签失败。
+// Every facade goes through this in start(), so the order cannot be inverted — an inverted order would leave
+// `nsd`/`ns`/`ReqT` out of the ACL signature content, and an auth-enabled broker would fail the signature check.
 std::shared_ptr<RPCHook> composeRequestHooks(bool enableStreamRequestType,
                                              const std::shared_ptr<RPCHook>& userHook,
                                              const std::function<std::string()>& namespaceV2Getter =

@@ -1,4 +1,4 @@
-// Validators 实现：校验错误文案与判定顺序是调用方和文档匹配的合同，保持稳定。
+// Validators implementation: the validation error texts and the check order are a contract matched by callers and documentation, so they stay stable.
 #include "rocketmq/client/validators.h"
 
 #include <string>
@@ -55,15 +55,15 @@ void Validators::isNotAllowedSendTopic(const std::string& topic) {
 }
 
 void Validators::checkMessage(const Message& msg, int32_t maxMessageSize) {
-    // 第一分支"msg 为 null"在 C++ 没有对应物：Message 是值类型，
-    // 调用方（producer.cpp 各发送入口）拿到的永远是实体而不是 null，故此分支跳过。
+    // The first branch, "msg is null", has no C++ counterpart: Message is a value type,
+    // so callers (the producer.cpp send entry points) always receive an object, never null, and this branch is skipped.
 
-    // topic：先 checkTopic，再挡禁发 topic
+    // topic: checkTopic first, then block publishing to forbidden topics
     checkTopic(msg.topic);
     isNotAllowedSendTopic(msg.topic);
 
-    // body：判 null / 零长 / 超限三段；C++ 用 hasBody 标志位表达"null body"
-    // （Bytes 即 std::string，本身无 null 态，见 message.h 的 hasBody 注释）。
+    // body: three checks -- null / zero length / over limit; C++ expresses "null body" with the hasBody flag
+    // (Bytes is std::string and has no null state; see the hasBody comment in message.h).
     if (!msg.hasBody) {
         throw MQClientException("the message body is null", ResponseCode::MESSAGE_ILLEGAL);
     }
@@ -76,7 +76,7 @@ void Validators::checkMessage(const Message& msg, int32_t maxMessageSize) {
                                 ResponseCode::MESSAGE_ILLEGAL);
     }
 
-    // 多队列分发（LMQ）的路径里带文件系统分隔符会让 broker 侧建队列时拼出越界路径
+    // A filesystem separator in a multi-queue dispatch (LMQ) path would make the broker build an out-of-bounds queue path
     const std::string lmqPath = msg.getUserProperty(MessageConst::PROPERTY_INNER_MULTI_DISPATCH);
     if (!lmqPath.empty() && lmqPath.find(kFileSeparator) != std::string::npos) {
         throw MQClientException(std::string("INNER_MULTI_DISPATCH ") + lmqPath +

@@ -1,14 +1,14 @@
-// 职责：钩子把 TraceContext 丢进内存队列（``append``），后台线程按
-// 「攒够 batchNum 条 或 距上次发送超过 5s」两个条件触发刷写，再把编码后的文本
-// 用**独立的内部生产者**发到轨迹 topic（默认 RMQ_SYS_TRACE_TOPIC）。
+// Responsibility: hooks hand TraceContext objects to an in-memory queue (``append``), a background thread
+// flushes when "batchNum records collected" or "more than 5s since the last send", and the encoded text
+// is sent to the trace topic (default RMQ_SYS_TRACE_TOPIC) by a **dedicated internal producer**.
 //
-// 上报协议语义（轨迹消费端按这些常量解析，不可改）：队列 2048、batchNum=min(n,20)、
-// maxMsgSize=128000、5s 刷新、
-// 按 (业务 topic, 轨迹 topic) 分组、累积 keys、按 maxMsgSize 切块异步发送、
-// 空 region / 空 bean 跳过、CLOUD 时轨迹 topic 用 "rmq_sys_TRACE_DATA_" + regionId。
+// Reporting protocol semantics (the trace consumer parses with these constants; they must not change): queue 2048, batchNum=min(n,20),
+// maxMsgSize=128000, a 5s flush,
+// grouping by (business topic, trace topic), accumulated keys, chunking to maxMsgSize for async sends,
+// skipping empty region / empty bean, and "rmq_sys_TRACE_DATA_" + regionId as the trace topic in CLOUD mode.
 //
-// ⚠ 防递归：内部生产者自身的 trace 必须关闭（见 start()/构造），且 SendMessageTraceHook
-//   会跳过 topic 以轨迹 topic 开头的消息 —— 两道保险都要有，否则轨迹会自我复制到无限。
+// ⚠ Anti-recursion: the internal producer's own tracing must stay off (see the constructor/start()), and SendMessageTraceHook
+//   skips messages whose topic starts with the trace topic name -- both safeguards are required, otherwise trace records replicate themselves without end.
 #include "rocketmq/client/trace_dispatcher.h"
 
 #include <algorithm>
@@ -30,7 +30,7 @@
 
 namespace rocketmq {
 
-// 进程级递增计数器（用于内部生产者组名后缀 / 实例编号）
+// Process-wide incrementing counter (suffix of the internal producer group / instance index)
 std::atomic<int32_t> AsyncTraceDispatcher::instanceCounter_{0};
 std::atomic<int32_t> AsyncTraceDispatcher::groupCounter_{0};
 
@@ -56,9 +56,9 @@ AsyncTraceDispatcher::AsyncTraceDispatcher(const std::string& group, TraceDispat
       batchNum_(std::min(batchNum, MAX_BATCH_NUM)),
       traceTopicName_(traceTopicName.empty() ? std::string(MixAll::TRACE_TOPIC) : traceTopicName),
       rpcHook_(std::move(rpcHook)) {
-    // 内部生产者：独立组名，关闭自身轨迹，避免自我复制。
-    // ⚠ DefaultMQProducer 没有 enableTrace 开关（C++ 侧由钩子侧 Anti-recursion 兜底），
-    //   这里只需保证它不注册任何 trace 钩子即可。
+    // Internal producer: its own group name and no self tracing, to avoid replicating trace records.
+    // ⚠ DefaultMQProducer has no enableTrace switch (the anti-recursion guard lives on the hook side),
+    //   so it is enough to ensure it registers no trace hooks.
     traceProducer_ = std::make_unique<DefaultMQProducer>(genGroupNameForTrace());
     traceProducer_->setSendMsgTimeout(5000);
     traceProducer_->setMaxMessageSize(maxMsgSize_);
@@ -68,7 +68,7 @@ AsyncTraceDispatcher::~AsyncTraceDispatcher() {
     try {
         shutdown();
     } catch (...) {
-        // 析构不抛
+        // The destructor must not throw
     }
 }
 
@@ -86,8 +86,8 @@ void AsyncTraceDispatcher::start(const std::string& nameSrvAddr, AccessChannel a
             traceProducer_->setNamesrvAddr(nameSrvAddr);
             traceProducer_->setInstanceName(
                 std::string(TraceConstants::TRACE_INSTANCE_NAME) + "_" + nameSrvAddr);
-            // 轨迹生产者继承宿主的 5.x 命名空间：
-            // 必须在 traceProducer_->start()（钩子装链）之前设好，首包才带上 nsd/ns。
+            // The trace producer inherits the host's 5.x namespace:
+            // it must be set before traceProducer_->start() (which installs the hook chain) so the first batch carries nsd/ns.
             traceProducer_->setNamespaceV2(namespaceV2_);
             traceProducer_->start();
             started_.store(true);
@@ -160,7 +160,7 @@ void AsyncTraceDispatcher::asyncRun() {
         } catch (const std::exception& e) {
             logger_error("trace flushTraceContext error: " + std::string(e.what()));
         }
-        // 防止忙等，5ms 轮询
+        // Poll every 5ms to avoid busy waiting
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
@@ -196,14 +196,14 @@ void AsyncTraceDispatcher::asyncSendTraceMessage(
 
 void AsyncTraceDispatcher::sendTraceData(
     const std::vector<std::shared_ptr<TraceContext>>& contextList) {
-    // 按 (业务 topic, 轨迹 topic) 分组。
+    // Group by (business topic, trace topic).
     std::map<std::string, std::vector<TraceTransferBean>> beanMap;
     for (const auto& ctx : contextList) {
         if (ctx == nullptr) continue;
         AccessChannel ch = ctx->accessChannel.value_or(accessChannel_);
         const std::string& regionId = ctx->regionId;
         if (regionId.empty() || ctx->traceBeans.empty()) {
-            continue;  // 空 region / 空 bean 跳过
+            continue;  // skip empty region / empty bean
         }
         std::string traceTopic;
         if (ch == AccessChannel::CLOUD) {
@@ -229,7 +229,7 @@ void AsyncTraceDispatcher::sendTraceData(
 
 void AsyncTraceDispatcher::flushData(const std::vector<TraceTransferBean>& transBeanList,
                                     const std::string& topic, const std::string& traceTopic) {
-    // 签名带 topic 但实现只用 traceTopic —— 参数是接口合同的一部分，保留并显式标注未使用。
+    // The signature carries topic but the implementation only uses traceTopic -- the parameter is part of the interface contract, so it is kept and explicitly marked unused.
     (void)topic;
     if (transBeanList.empty()) return;
     std::string buffer;
@@ -242,7 +242,7 @@ void AsyncTraceDispatcher::flushData(const std::vector<TraceTransferBean>& trans
         buffer += bean.transData;
         ++count;
         if (static_cast<int32_t>(buffer.size()) >= maxMsgSize_) {
-            // 拼装 keys：原始消息 msgId + 业务 keys，控制台靠它反查轨迹
+            // Build keys: the original message msgId + business keys; the console looks traces up through them
             std::string keys;
             for (auto it = keySet.begin(); it != keySet.end(); ++it) {
                 if (!keys.empty()) keys += TraceConstants::KEY_SEPARATOR;

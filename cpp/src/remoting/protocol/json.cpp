@@ -1,15 +1,15 @@
-// 极简 JSON 解析 / 生成实现（零第三方依赖）。
+// Minimal JSON parsing / generation implementation (no third-party dependencies).
 //
-// 行为约定：
-//   - Object 保序：底层用 vector<pair>，set() 覆盖同名键时**保留原位置**（线上解析器即如此）；
-//   - 数字区分 int64 / double：整数字段原样输出，避免 long 型 timestamp 被写成浮点；
-//   - 字符串按 UTF-8 原样输出（不解码为 \uXXXX），解析时兼容 \uXXXX 与代理对；
-//   - 解析对 fastjson2 的非标准写法宽容：
-//       * {0:"x"} 这类**无引号数字键**；
-//       * {{"k":"v"}:{...}} 这类**对象作为 map 键**（非法 JSON，管理端 offsetTable 必现）——
-//         键名保留原始 JSON 文本，由 parseMessageQueueKey() 还原；
-//       * NaN / Infinity / -Infinity；
-//       * 尾随逗号。
+// Behaviour contract:
+//   - Objects keep insertion order: backed by vector<pair>, and set() **keeps the original position** when overwriting an existing key (as the online parser does);
+//   - numbers distinguish int64 / double: integer fields are emitted as-is so a long timestamp is not written as a float;
+//   - strings are emitted as raw UTF-8 (not escaped to \uXXXX), while parsing accepts \uXXXX including surrogate pairs;
+//   - parsing tolerates fastjson2's non-standard output:
+//       * **unquoted numeric keys** such as {0:"x"};
+//       * **objects used as map keys** such as {{"k":"v"}:{...}} (invalid JSON, always present in the admin-side offsetTable) --
+//         the key keeps the raw JSON text and is restored by parseMessageQueueKey();
+//       * NaN / Infinity / -Infinity;
+//       * trailing commas.
 #include "rocketmq/remoting/protocol/json.h"
 
 #include <cctype>
@@ -23,7 +23,7 @@ namespace rocketmq {
 
 namespace {
 
-// ---------------------------------------------------------------- 序列化
+// ---------------------------------------------------------------- Serialisation
 
 void appendUtf8Escaped(std::string& out, const std::string& s) {
     out.push_back('"');
@@ -42,7 +42,7 @@ void appendUtf8Escaped(std::string& out, const std::string& s) {
                     std::snprintf(buf, sizeof(buf), "\\u%04x", c);
                     out += buf;
                 } else {
-                    // UTF-8 字节原样输出，不做 \uXXXX 转义
+                    // Emit UTF-8 bytes as-is, no \uXXXX escaping
                     out.push_back(static_cast<char>(c));
                 }
         }
@@ -51,17 +51,17 @@ void appendUtf8Escaped(std::string& out, const std::string& s) {
 }
 
 void appendDouble(std::string& out, double v) {
-    // 不能用 std::isnan / std::isinf：MinGW 的 math.h 把这两个名字定义成**函数式宏**
-    // （`#define isnan(x) ...`，且 C++ 模式下同样生效），会把 <cmath> 里的
-    // `using ::isnan;` 展开成非法代码，导致 `std::isnan` 成为"unresolved using
-    // declaration"。这里改用 <limits> 的常量做等价判断，完全绕开宏。
+    // std::isnan / std::isinf cannot be used: MinGW's math.h defines both names as **function-like macros**
+    // (`#define isnan(x) ...`, active in C++ mode too), which breaks the
+    // `using ::isnan;` declaration in <cmath> and turns `std::isnan` into an "unresolved using
+    // declaration". <limits> constants are used instead for the equivalent test, avoiding the macros entirely.
     const double inf = std::numeric_limits<double>::infinity();
     if (v != v || v == inf || v == -inf) {  // NaN / ±Inf
-        out += "null";  // JSON 无 NaN/Inf
+        out += "null";  // JSON has no NaN/Inf
         return;
     }
     char buf[40];
-    // %.17g 保证 double 往返精度；再确保带小数/指数点，避免被当成整数解析
+    // %.17g guarantees double round-trip precision; then ensure a decimal/exponent point so it is not parsed as an integer
     std::snprintf(buf, sizeof(buf), "%.17g", v);
     std::string s(buf);
     if (s.find_first_of(".eE") == std::string::npos) {
@@ -72,7 +72,7 @@ void appendDouble(std::string& out, double v) {
 
 }  // namespace
 
-// ---------------------------------------------------------------- JsonValue 工厂
+// ---------------------------------------------------------------- JsonValue factories
 
 JsonValue JsonValue::makeBool(bool v) {
     JsonValue j;
@@ -157,7 +157,7 @@ void JsonValue::set(const std::string& key, const JsonValue& v) {
     type_ = Type::Object;
     for (auto& kv : obj_) {
         if (kv.first == key) {
-            kv.second = v;  // 覆盖式插入：保留原位置
+            kv.second = v;  // overwrite in place: keeps the original position
             return;
         }
     }
@@ -232,7 +232,7 @@ void JsonValue::dumpImpl(std::string& out) const {
     }
 }
 
-// ---------------------------------------------------------------- 解析
+// ---------------------------------------------------------------- Parsing
 
 namespace {
 
@@ -281,9 +281,9 @@ private:
             }
             case 't': case 'f': return parseLiteral(out);
             case 'n': return parseNull(out);
-            // fastjson2 在 WriteMapNullValue=false / 浮点越界时会写出这三种非标准字面量，
-            // 标准 JSON 没有它们。用 <limits> 常量构造，避开 MinGW 把 isnan/isinf
-            // 定义成函数式宏的问题（见 appendDouble 的注释）。
+            // fastjson2 writes these three non-standard literals when WriteMapNullValue=false / floating point is out of range;
+            // standard JSON does not have them. Built from <limits> constants to dodge
+            // MinGW's function-like isnan/isinf macros (see the appendDouble comment).
             case 'N': return parseNonFinite(out, "NaN", std::numeric_limits<double>::quiet_NaN());
             case 'I': return parseNonFinite(out, "Infinity", std::numeric_limits<double>::infinity());
             case '-':
@@ -353,7 +353,7 @@ private:
         return true;
     }
 
-    // 解析带引号字符串；\uXXXX 转 UTF-8（含代理对）
+    // Parse a quoted string; decode \uXXXX to UTF-8 (including surrogate pairs)
     bool parseString(std::string& out) {
         if (peek() != '"') return false;
         ++pos_;
@@ -379,7 +379,7 @@ private:
                 case 'u': {
                     uint32_t cp = 0;
                     if (!parseHex4(cp)) return false;
-                    // 代理对处理
+                    // Surrogate pair handling
                     if (cp >= 0xD800 && cp <= 0xDBFF && s_.compare(pos_, 2, "\\u") == 0) {
                         size_t save = pos_;
                         pos_ += 2;
@@ -431,11 +431,11 @@ private:
         }
     }
 
-    // 宽容读取键名，覆盖 fastjson2 的两种非标准写法：
-    //   1) 无引号数字键：{"offsetTable":{0:1,1:2}}；
-    //   2) **对象/数组作为 map 键**（非法 JSON，管理端必现）：MessageQueue 会被内联成
-    //      {"offsetTable":{{"brokerName":"b","queueId":3,"topic":"t"}:{...}}}。
-    // 内联键保留**原始 JSON 文本**作为键名，调用方再用 parseMessageQueueKey() 还原。
+    // Read key names leniently, covering fastjson2's two non-standard forms:
+    //   1) unquoted numeric keys: {"offsetTable":{0:1,1:2}};
+    //   2) **an object/array used as a map key** (invalid JSON, always present on the admin side): a MessageQueue is inlined as
+    //      {"offsetTable":{{"brokerName":"b","queueId":3,"topic":"t"}:{...}}}.
+    // An inlined key keeps the **raw JSON text** as its name; the caller restores it with parseMessageQueueKey().
     bool parseKey(std::string& out) {
         skipWs();
         char c = peek();
@@ -449,7 +449,7 @@ private:
             out = s_.substr(start, pos_ - start);
             return true;
         }
-        // 无引号：读到冒号或空白前（数字键 / true / false / null 等裸字面量）
+        // Unquoted: read until a colon or whitespace (numeric keys / bare literals such as true / false / null)
         size_t start = pos_;
         while (pos_ < s_.size()) {
             char k = s_[pos_];
@@ -481,7 +481,7 @@ private:
             if (c == ',') {
                 ++pos_;
                 skipWs();
-                if (peek() == '}') { ++pos_; return true; }  // 容忍尾随逗号
+                if (peek() == '}') { ++pos_; return true; }  // tolerate a trailing comma
                 continue;
             }
             if (c == '}') { ++pos_; return true; }
@@ -504,7 +504,7 @@ private:
             if (c == ',') {
                 ++pos_;
                 skipWs();
-                if (peek() == ']') { ++pos_; return true; }  // 容忍尾随逗号
+                if (peek() == ']') { ++pos_; return true; }  // tolerate a trailing comma
                 continue;
             }
             if (c == ']') { ++pos_; return true; }

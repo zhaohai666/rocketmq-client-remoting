@@ -18,7 +18,7 @@ namespace rocketmq {
 
 namespace {
 
-// 标准 CRC32 查表（poly 0xEDB88320）
+// Standard CRC32 lookup table (poly 0xEDB88320)
 struct Crc32Table {
     uint32_t t[256];
     Crc32Table() {
@@ -161,7 +161,7 @@ int32_t UtilAll::charToByte(char c) {
     for (int i = 0; i < 16; ++i) {
         if (hex[i] == c) return i;
     }
-    // 兼容小写输入
+    // Accept lowercase input as well
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     if (c >= '0' && c <= '9') return c - '0';
@@ -182,21 +182,21 @@ Bytes UtilAll::string2Bytes(const std::string& hexString) {
     Bytes out;
     if (hexString.empty()) return out;
     size_t len = hexString.size();
-    if (len % 2 != 0) return out;  // 非法长度
+    if (len % 2 != 0) return out;  // invalid length
     out.resize(len / 2);
     for (size_t i = 0; i < len / 2; ++i) {
         int hi = charToByte(hexString[i * 2]);
         int lo = charToByte(hexString[i * 2 + 1]);
-        if (hi < 0 || lo < 0) return Bytes();  // 非法字符 -> 空串
+        if (hi < 0 || lo < 0) return Bytes();  // invalid character -> empty
         out[i] = static_cast<char>((hi << 4) | lo);
     }
     return out;
 }
 
 std::string UtilAll::localIp() {
-    // 注意：Windows 的 socket 句柄是 SOCKET(UINT_PTR)，**不能**用 int 接（64 位会截断），
-    // 关闭也必须用 closesocket 而不是 ::close（::close 在 Windows 上根本不存在）。
-    // 这些差异统一由 netcompat 处理。
+    // Note: a Windows socket handle is SOCKET(UINT_PTR) and must **not** be held in an int (it would be truncated on 64 bits),
+    // and closing must go through closesocket rather than ::close (::close does not exist on Windows).
+    // netcompat absorbs all of these differences.
     netcompat::ensureInitialized();
     netcompat::socket_t fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (netcompat::isValid(fd)) {

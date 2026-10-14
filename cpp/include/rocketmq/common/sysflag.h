@@ -24,7 +24,7 @@ struct MessageSysFlag {
     static constexpr int32_t COMPRESSION_TYPE_COMPARATOR = 0x7 << 8;
     static constexpr int32_t COMPRESSION_TYPE_SHIFT = 8;
 
-    // compression_type 数值（getCompressionType 的返回值）
+    // compression_type values (return value of getCompressionType)
     static constexpr int32_t LZ4_TYPE = 1;
     static constexpr int32_t ZSTD_TYPE = 2;
     static constexpr int32_t ZLIB_TYPE = 3;

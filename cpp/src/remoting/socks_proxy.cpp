@@ -1,10 +1,10 @@
-// SOCKS 代理握手的实现（SOCKS5 RFC 1928 + RFC 1929 用户名密码认证 / SOCKS4 + 4a 扩展）。
+// SOCKS proxy handshake implementation (SOCKS5 RFC 1928 + RFC 1929 username/password auth / SOCKS4 + the 4a extension).
 //
-// 全部走阻塞 socket：调用方（RemotingClient::getOrCreateConnection）刚用
-// connectWithTimeout 连上代理并恢复了阻塞模式，这里先把 SO_RCVTIMEO/SO_SNDTIMEO
-// 设成剩余预算，之后每个阶段一次 recv/send。任何一步不符预期都带着**阶段名 + 原因**
-// 返回 false —— 排障时最好能直接看出是「方法协商被拒」还是「认证失败」还是「CONNECT
-// 被 远端拒绝」。
+// Everything runs on a blocking socket: the caller (RemotingClient::getOrCreateConnection) has just
+// reached the proxy through connectWithTimeout and restored blocking mode, so SO_RCVTIMEO/SO_SNDTIMEO
+// is set to the remaining budget first and each stage then does one recv/send. Any unexpected step
+// returns false with the **stage name + reason** -- troubleshooting should tell at a glance whether
+// method negotiation was rejected, authentication failed or CONNECT was refused by the remote.
 #include "rocketmq/remoting/socks_proxy.h"
 
 #include <chrono>
@@ -27,7 +27,7 @@ namespace rocketmq {
 
 namespace {
 
-// 单字节 / 定长读取。依赖 SO_RCVTIMEO 兜底超时；返回 false 表示对端关闭或超时。
+// Single-byte / fixed-length reads, relying on SO_RCVTIMEO as the fallback timeout; false means the peer closed or timed out.
 bool readFull(netcompat::socket_t sock, unsigned char* buf, size_t n) {
     size_t got = 0;
     while (got < n) {
@@ -62,7 +62,7 @@ void setIoTimeout(netcompat::socket_t sock, int32_t timeoutMillis) {
     ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
 }
 
-// RFC 1928 的 reply code 文案（CONNECT 响应第 2 字节）
+// RFC 1928 reply code texts (second byte of the CONNECT response)
 const char* socks5RepMessage(unsigned char rep) {
     switch (rep) {
         case 0x00: return "succeeded";
@@ -78,7 +78,7 @@ const char* socks5RepMessage(unsigned char rep) {
     }
 }
 
-// SOCKS4 响应第 2 字节（0x5A=90 是唯一成功码）
+// Second byte of the SOCKS4 response (0x5A=90 is the only success code)
 const char* socks4ReplyMessage(unsigned char code) {
     switch (code) {
         case 0x5A: return "succeeded";
@@ -89,19 +89,19 @@ const char* socks4ReplyMessage(unsigned char code) {
     }
 }
 
-// 剩余毫秒数：整个握手共用一个预算，阶段间对账，防止慢代理把每一步都拖满超时
+// Remaining milliseconds: the whole handshake shares one budget, reconciled between stages so a slow proxy cannot burn the full timeout at every step
 int32_t remainingMs(int64_t deadlineMs) {
     const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now().time_since_epoch())
                             .count();
     if (now >= deadlineMs) {
-        return 1;  // 至少给 IO 一次立刻失败的机会
+        return 1;  // still leave IO one chance to fail immediately
     }
     return static_cast<int32_t>(deadlineMs - now);
 }
 
-// ---- SOCKS5：方法协商 + 可选的 RFC 1929 子协商 ----
-// 超时统一由 setIoTimeout 设好的 SO_RCVTIMEO/SO_SNDTIMEO 兜底。
+// ---- SOCKS5: method negotiation plus the optional RFC 1929 subnegotiation ----
+// Timeouts are covered uniformly by the SO_RCVTIMEO/SO_SNDTIMEO set by setIoTimeout.
 bool socks5Greeting(netcompat::socket_t sock, const SocksProxyConfig& proxy, std::string& err) {
     const bool useAuth = !proxy.username.empty() || !proxy.password.empty();
     unsigned char greeting[4] = {0x05, 0x01,
@@ -125,7 +125,7 @@ bool socks5Greeting(netcompat::socket_t sock, const SocksProxyConfig& proxy, std
         return false;
     }
     if (picked[1] == 0x02) {
-        // RFC 1929：ver(1) ulen(1) uname ulen plen(1) passwd plen
+        // RFC 1929: ver(1) ulen(1) uname ulen plen(1) passwd plen
         std::string user = proxy.username;
         std::string pass = proxy.password;
         if (user.size() > 255 || pass.size() > 255) {
@@ -160,7 +160,7 @@ bool socks5Greeting(netcompat::socket_t sock, const SocksProxyConfig& proxy, std
     }
     if (picked[1] == 0x00) {
         if (useAuth) {
-            // 只报了 0x02 还被选中 0x00 属于服务端违规，继续走必然对不上账
+            // advertising only 0x02 yet selecting 0x00 is a server-side violation, and going on can never work out
             err = "proxy picked no-auth although credentials were configured";
             return false;
         }
@@ -170,7 +170,7 @@ bool socks5Greeting(netcompat::socket_t sock, const SocksProxyConfig& proxy, std
     return false;
 }
 
-// 把目标地址按 ATYP 编码（IPv4 字面量 / IPv6 字面量 / 域名直传）
+// Encode the target address according to ATYP (IPv4 literal / IPv6 literal / domain passed through)
 bool socks5EncodeTarget(const std::string& host, const std::string& portStr,
                         std::vector<unsigned char>& out, std::string& err) {
     int port = 0;
@@ -219,7 +219,7 @@ bool socks5Connect(netcompat::socket_t sock, const std::string& targetHost,
         err = "send CONNECT request failed";
         return false;
     }
-    // 先读定长 4 字节头，再按 ATYP 把 BND.ADDR/BND.PORT 消费干净
+    // Read the fixed 4-byte header first, then consume BND.ADDR/BND.PORT in full according to ATYP
     unsigned char head[4] = {0, 0, 0, 0};
     if (!readFull(sock, head, 4)) {
         err = "read CONNECT reply failed";
@@ -283,22 +283,22 @@ bool socks4Connect(netcompat::socket_t sock, const std::string& targetHost,
     if (isV4) {
         request.insert(request.end(), ip, ip + 4);
     } else {
-        // SOCKS4a：目标不是 IPv4 字面量时用 0.0.0.x（x != 0）标记 + userid 后的域名。
-        // 0.0.0.1 是惯例取值（curl / openssh 同）。
+        // SOCKS4a: when the target is not an IPv4 literal, mark it with 0.0.0.x (x != 0) plus the domain after the userid.
+        // 0.0.0.1 is the conventional value (curl / openssh do the same).
         request.push_back(0);
         request.push_back(0);
         request.push_back(0);
         request.push_back(1);
     }
     request.insert(request.end(), proxy.username.begin(), proxy.username.end());
-    request.push_back(0x00);  // userid 终止符
+    request.push_back(0x00);  // userid terminator
     if (!isV4) {
         if (targetHost.empty() || targetHost.size() > 255) {
             err = "target host must be 1..255 bytes for SOCKS4a domain encoding";
             return false;
         }
         request.insert(request.end(), targetHost.begin(), targetHost.end());
-        request.push_back(0x00);  // 域名终止符
+        request.push_back(0x00);  // domain name terminator
     }
     if (!writeFull(sock, request.data(), request.size())) {
         err = "send SOCKS4 CONNECT request failed";
@@ -331,7 +331,7 @@ void SocksProxyConfig::resolveHostPort(std::string& host, std::string& portStr) 
     }
     const size_t colon = addr.rfind(':');
     if (colon != std::string::npos && addr.find(':') == colon) {
-        // 单个 ':' —— "host:port" 形式；多个 ':' 是裸 IPv6 字面量，整体当 host
+        // a single ':' is the "host:port" form; several ':' mean a bare IPv6 literal, taken as the host in full
         host = addr.substr(0, colon);
         portStr = addr.substr(colon + 1);
         return;
@@ -362,7 +362,7 @@ bool socksConnect(netcompat::socket_t sock, const SocksProxyConfig& proxy,
     if (!ok) {
         return false;
     }
-    // 隧道建好后恢复默认 IO 超时（读线程自己用 select 控节奏，不留 SO_RCVTIMEO 干扰）
+    // Once the tunnel is up the default IO timeout is restored (the reader thread paces itself with select, so no SO_RCVTIMEO is left to interfere)
     setIoTimeout(sock, 0);
     return true;
 }

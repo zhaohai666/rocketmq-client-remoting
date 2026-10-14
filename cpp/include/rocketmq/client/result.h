@@ -1,4 +1,4 @@
-// 客户端结果类型与回调/监听器接口。
+// Client result types and callback/listener interfaces.
 #ifndef ROCKETMQ_CLIENT_RESULT_H
 #define ROCKETMQ_CLIENT_RESULT_H
 
@@ -18,7 +18,7 @@
 
 namespace rocketmq {
 
-// ---------------------------------------------------------------- 发送结果
+// ---------------------------------------------------------------- send result
 enum class SendStatus {
     SEND_OK = 0,
     FLUSH_DISK_TIMEOUT = 1,
@@ -44,8 +44,8 @@ struct SendResult {
     int64_t queueOffset = 0;
     std::string transactionId;
     std::string regionId;
-    // broker 是否开启轨迹（由 SEND 响应头 TRACE_ON 解析，默认 true）。
-    // 轨迹钩子据此决定是否落轨迹（traceOn=false 或 regionId 为空则不落）。
+    // Whether the broker has tracing enabled (parsed from the TRACE_ON header of the SEND response, default true).
+    // The trace hook uses it to decide whether to emit trace data (nothing emitted when traceOn=false or regionId is empty).
     bool traceOn = true;
     std::optional<std::string> recallHandle;
 
@@ -66,7 +66,7 @@ struct SendResult {
     }
 };
 
-// ---------------------------------------------------------------- 事务
+// ---------------------------------------------------------------- transaction
 enum class LocalTransactionState {
     COMMIT_MESSAGE = 0,
     ROLLBACK_MESSAGE = 1,
@@ -90,14 +90,14 @@ struct TransactionSendResult : public SendResult {
 class TransactionListener {
 public:
     virtual ~TransactionListener() = default;
-    // 执行本地事务，返回提交/回滚/未知
+    // Execute the local transaction, returning commit/rollback/unknown.
     virtual LocalTransactionState executeLocalTransaction(const Message& msg,
                                                           const std::string& arg) = 0;
-    // broker 回查本地事务状态
+    // Check back the local transaction state when the broker asks.
     virtual LocalTransactionState checkLocalTransaction(const MessageExt& msg) = 0;
 };
 
-// ---------------------------------------------------------------- 异步回调
+// ---------------------------------------------------------------- async send callback
 class SendCallback {
 public:
     virtual ~SendCallback() = default;
@@ -105,7 +105,7 @@ public:
     virtual void onException(const std::exception_ptr& error) = 0;
 };
 
-// ---------------------------------------------------------------- 拉取结果
+// ---------------------------------------------------------------- pull result
 enum class PullStatus {
     FOUND = 0,
     NO_NEW_MSG = 1,
@@ -135,7 +135,7 @@ struct PullResult {
     bool isNoNewMsg() const { return status == PullStatus::NO_NEW_MSG; }
 };
 
-// ---------------------------------------------------------------- POP 模式
+// ---------------------------------------------------------------- POP mode
 
 enum class PopStatus {
     FOUND = 0,
@@ -168,8 +168,8 @@ struct PopResult {
     bool isFound() const { return status == PopStatus::FOUND; }
 };
 
-// changeInvisibleTime 的结果。extraInfo 是用响应里**新的** popTime/invisibleTime/
-// reviveQid 重建的 8 段 CK 串，后续 ACK 要用它（不是请求时传进去的那个旧串）。
+// Result of changeInvisibleTime. extraInfo is the 8-segment CK string rebuilt from the
+// **new** popTime/invisibleTime/reviveQid in the response; later ACKs must use it, not the old one passed in the request.
 struct ChangeInvisibleTimeResult {
     int32_t responseCode = 0;
     int64_t popTime = 0;
@@ -180,7 +180,7 @@ struct ChangeInvisibleTimeResult {
     bool success() const { return responseCode == 0; }
 };
 
-// ---------------------------------------------------------------- 消费状态
+// ---------------------------------------------------------------- consume status
 enum class ConsumeConcurrentlyStatus {
     CONSUME_SUCCESS = 0,
     RECONSUME_LATER = 1,
@@ -224,7 +224,7 @@ struct ConsumeOrderlyContext {
 class MessageListener {
 public:
     virtual ~MessageListener() = default;
-    // true 表示顺序消费，false 表示并发消费
+    // true means orderly consumption, false means concurrent consumption
     virtual bool orderly() const = 0;
 };
 
@@ -242,7 +242,7 @@ public:
                                                 ConsumeOrderlyContext& context) = 0;
 };
 
-// ---------------------------------------------------------------- 队列选择器
+// ---------------------------------------------------------------- queue selector
 class MessageQueueSelector {
 public:
     virtual ~MessageQueueSelector() = default;

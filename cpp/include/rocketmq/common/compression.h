@@ -19,8 +19,8 @@ struct CompressionType {
     static int32_t getCompressionFlag(int32_t value);
 };
 
-// 当前构建是否编入了对应后端。CMake 找不到库时会关掉相应宏，届时
-// CompressorFactory 抛异常而不是静默透传压缩字节（见 compression.cpp 顶部说明）。
+// Whether this build compiled in the corresponding backend. When CMake cannot find the library it disables
+// the macro, and then CompressorFactory throws instead of silently passing compressed bytes through.
 bool hasZlibSupport();
 bool hasZstdSupport();
 bool hasLz4Support();

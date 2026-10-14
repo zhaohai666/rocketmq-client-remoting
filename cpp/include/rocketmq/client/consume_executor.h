@@ -32,7 +32,7 @@ class ConsumeExecutor {
 
     void submit(std::function<void()> task);
 
-    // 对应 ThreadPoolExecutor.setCorePoolSize。
+    // Resize the core pool at runtime; workers above the new core count are left to time out.
     void setCorePoolSize(int32_t n);
 
     int32_t getCorePoolSize() const;
@@ -61,8 +61,8 @@ class ConsumeExecutor {
     int32_t idle_ = 0;
     int32_t seq_ = 0;
     bool shutdown_ = false;
-    // 所有**曾经**创建过的线程句柄都留在这里（只增不减）：退出的线程仍然是 joinable 的，
-    // 若从容器里摘掉再析构 std::thread 会直接 std::terminate。它们已退出，join 立即返回。
+    // Handles of **every** thread ever created stay here (the vector only grows): an exited thread is
+    // still joinable, and dropping it here then destroying the std::thread would call std::terminate. Already-exited threads join immediately.
     std::vector<std::thread> threads_;
     std::atomic<int64_t> handlerExceptions_{0};
 };

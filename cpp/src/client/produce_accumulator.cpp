@@ -1,5 +1,5 @@
-// ProduceAccumulator / MessageAccumulation / AggregateKey 的实现。
-// 契约与四端差异见 produce_accumulator.h 的文件头。
+// ProduceAccumulator / MessageAccumulation / AggregateKey implementation.
+// The contract and the deliberate behavioural choices are documented in the produce_accumulator.h file header.
 #include "rocketmq/client/produce_accumulator.h"
 
 #include <algorithm>
@@ -18,7 +18,7 @@
 namespace rocketmq {
 namespace {
 
-// ---------------------------------------------------------------- 小工具
+// ---------------------------------------------------------------- Small utilities
 
 std::vector<std::string> split(const std::string& text, char sep) {
     std::vector<std::string> parts;
@@ -52,9 +52,9 @@ void ensureUniqId(Message& msg) {
     }
 }
 
-// 为什么不直接把 `MessageAccumulation*` 交给回调：`finish()` 是私有的，而这里只需要
-// 「一个终点函数」。用 `std::function` 让 `sendAsyncNow()` 在成员函数里组一个闭包，
-// 就不必为了跨类访问再开一条 friend。
+// Why the callback is not given a `MessageAccumulation*` directly: `finish()` is private and all this needs is
+// "a completion function". Using `std::function` lets `sendAsyncNow()` build a closure inside a member
+// function, so no extra friend declaration is needed for cross-class access.
 class AccumulationCallback : public SendCallback {
 public:
     using Reducer = std::function<void(const SendResult*, const std::exception_ptr&)>;
@@ -68,7 +68,7 @@ private:
     Reducer reducer_;
 };
 
-// 进程级复用表（见头文件 getOrCreateProduceAccumulator 的注释）。
+// Process-wide reuse table (see the comment on getOrCreateProduceAccumulator in the header).
 std::mutex& registryMutex() {
     static std::mutex m;
     return m;
@@ -381,7 +381,7 @@ void MessageAccumulation::sendAsyncNow() {
             MQClientException("defaultMQProducer is null, can not send message")));
         return;
     }
-    // 批量发送完成的回执：拆条后按序交付给本批收集到的所有用户回调，并归还字节额度。
+    // Completion receipt of a batch send: split per message and deliver in order to every user callback collected for the batch, then release the byte quota.
     auto reducer = std::make_shared<AccumulationCallback>(
         [this](const SendResult* r, const std::exception_ptr& e) { finish(r, e); });
     try {
@@ -407,7 +407,7 @@ ProduceAccumulator::~ProduceAccumulator() {
     try {
         shutdown();
     } catch (...) {
-        // 析构不抛
+        // The destructor must not throw
     }
 }
 
@@ -428,12 +428,12 @@ void ProduceAccumulator::shutdown() {
     std::thread asyncGuard;
     {
         std::lock_guard<std::mutex> lk(guardMutex_);
-        // 幂等：没起来就直接把标志压成"停"（`start()` 会再翻回来）
+        // Idempotent: when not started, force the flag to "stopped" (`start()` will flip it back)
         stopped_.store(true);
         syncGuard = std::move(syncGuard_);
         asyncGuard = std::move(asyncGuard_);
     }
-    // 在锁外 join（守卫循环本身不碰 guardMutex_，但 join 期间不该占着它）
+    // Join outside the lock (the guard loop never touches guardMutex_, but it should not hold it while joining)
     if (syncGuard.joinable()) {
         syncGuard.join();
     }
@@ -466,7 +466,7 @@ void ProduceAccumulator::setTotalBatchMaxBytes(int32_t totalHoldSize) {
     totalHoldSize_.store(totalHoldSize);
 }
 
-// ---------------- 全局字节闸门 ----------------
+// ---------------- Global byte gate ----------------
 bool ProduceAccumulator::tryAddMessage(const Message& message) {
     std::lock_guard<std::mutex> lk(holdMutex_);
     if (currentlyHoldSize_ >= totalHoldSize_.load()) {
@@ -565,7 +565,7 @@ SendResult ProduceAccumulator::sendWithMq(const Message& msg, const MessageQueue
     }
 }
 
-// ⚠ 每次循环传的是 `callback` 的**副本**：`add` 会把它存进本批的回调表，下一轮还要用同一个。
+// ⚠ Each iteration passes a **copy** of `callback`: `add` stores it in this batch's callback table, and the next round needs the original.
 void ProduceAccumulator::sendAsync(const Message& msg, std::shared_ptr<SendCallback> callback) {
     const AggregateKey partitionKey = AggregateKey::ofMessage(msg);
     while (true) {
@@ -591,8 +591,8 @@ void ProduceAccumulator::sendAsyncWithMq(const Message& msg, const MessageQueue&
     }
 }
 
-// ⚠ 发完的批次 `messagesSize` 仍 > 0（`send` 只置 closed，不清 size），所以它**留在表里**，
-// 直到下一次同键 `send` 拿到它、`add` 返回 -1 / false 才被摘掉重取 —— 不是守卫清的。
+// ⚠ A sent batch still has `messagesSize` > 0 (`send` only marks closed, it does not clear size), so it **stays in the table**
+// until the next `send` on the same key picks it up and `add` returns -1 / false, at which point it is dropped and re-created -- not by the guard.
 void ProduceAccumulator::guardOnce(bool sync) {
     std::vector<std::shared_ptr<MessageAccumulation>> batches;
     if (sync) {
@@ -650,7 +650,7 @@ void ProduceAccumulator::guardLoop(bool sync, const std::string& name) {
     logger_info(name + " service end");
 }
 
-// ---------------- sender 生命周期 ----------------
+// ---------------- sender lifecycle ----------------
 void ProduceAccumulator::detachSender() {
     std::lock_guard<std::mutex> lk(senderMutex_);
     sender_ = nullptr;
@@ -668,7 +668,7 @@ bool ProduceAccumulator::hasSender() const {
     return sender_ != nullptr;
 }
 
-// ---------------- 取证 / 测试接缝 ----------------
+// ---------------- Diagnostics / test seams ----------------
 size_t ProduceAccumulator::syncBatchCount() const {
     std::lock_guard<std::mutex> lk(syncTableMutex_);
     return syncBatches_.size();
@@ -708,7 +708,7 @@ std::shared_ptr<MessageAccumulation> ProduceAccumulator::putEmptySyncBatch(const
 
 void ProduceAccumulator::runGuardOnce(bool sync) { guardOnce(sync); }
 
-// ---------------------------------------------------------------- 进程级注册表
+// ---------------------------------------------------------------- Process-wide registry
 
 std::shared_ptr<ProduceAccumulator> getOrCreateProduceAccumulator(const std::string& clientId,
                                                                  AccumulatorSender* sender) {

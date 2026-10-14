@@ -1,4 +1,4 @@
-// SubscriptionData / FilterAPI 的实现。
+// SubscriptionData / FilterAPI implementations.
 #include "rocketmq/common/subscription_data.h"
 
 #include <cstdint>
@@ -57,7 +57,7 @@ SubscriptionData::SubscriptionData(const std::string& topic, const std::string& 
     : topic(topic), subString(subString), subVersion(UtilAll::currentTimeMillis()) {}
 
 JsonValue SubscriptionData::toJson() const {
-    // 键按字母序，与 fastjson2 输出一致
+    // Keys in alphabetical order, matching what the broker emits
     JsonValue o = JsonValue::makeObject();
     o.set("classFilterMode", JsonValue::makeBool(classFilterMode));
     o.set("codeSet", setToJson(codeSet));

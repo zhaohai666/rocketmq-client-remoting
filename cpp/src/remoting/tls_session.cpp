@@ -17,7 +17,7 @@ namespace rocketmq {
 
 namespace {
 
-// 握手/读写期间给 socket 挂的 SO_RCVTIMEO（秒 + 微秒 helper）
+// SO_RCVTIMEO helper applied to the socket during handshake/read-write (seconds + microseconds)
 void setRcvTimeout(netcompat::socket_t sock, int millis) {
     struct timeval tv;
     tv.tv_sec = millis / 1000;
@@ -62,7 +62,7 @@ std::shared_ptr<void> createClientSslContext(std::string& err,
             return nullptr;
         }
     }
-    // 老 broker/新 broker 兼容：默认协议集即可（TLS 1.2/1.3），不锁死版本
+    // Old/new broker compatibility: the default protocol set is enough (TLS 1.2/1.3); do not pin a version
     SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3);
     return std::shared_ptr<void>(ctx, [](void* p) {
         SSL_CTX_free(static_cast<SSL_CTX*>(p));
@@ -117,7 +117,7 @@ bool TlsSession::handshake(netcompat::socket_t sock, const std::string& host, in
         return false;
     }
     if (!host.empty()) {
-        // SNI：broker 侧 PERMISSIVE 不校验，但带上是标准客户端行为
+        // SNI: the broker side does not verify under PERMISSIVE, but sending it is standard client behaviour
         SSL_set_tlsext_host_name(ssl_, host.c_str());
     }
     if (SSL_CTX_get_verify_mode(ctx) & SSL_VERIFY_PEER) {
@@ -145,14 +145,14 @@ bool TlsSession::handshake(netcompat::socket_t sock, const std::string& host, in
             return false;
         }
     }
-    // 用 SO_RCVTIMEO/SO_SNDTIMEO 给阻塞握手兜底（超时表现为 WANT_READ/WANT_WRITE）
+    // SO_RCVTIMEO/SO_SNDTIMEO bound the blocking handshake (a timeout surfaces as WANT_READ/WANT_WRITE)
     setRcvTimeout(sock, timeoutMillis);
     setSndTimeout(sock, timeoutMillis);
     for (;;) {
         int rc = SSL_connect(ssl_);
         if (rc == 1) {
-            // 会话级兜底：读 1s / 写 5s。读线程用 select 控节奏，这个超时只防
-            // "select 报可读但记录只到了一半"的极端对端停摆把读线程永久挂住。
+            // Session-level fallback: 1s read / 5s write. The reader paces itself with select, so this timeout only guards
+            // against a peer stall where select reports readability but only half a record has arrived, which would hang the reader forever.
             setRcvTimeout(sock, 1000);
             setSndTimeout(sock, 5000);
             logger_debug("tls handshake ok with " + host + " (" + SSL_get_version(ssl_) + " "
@@ -161,7 +161,7 @@ bool TlsSession::handshake(netcompat::socket_t sock, const std::string& host, in
         }
         int e = SSL_get_error(ssl_, rc);
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
-            // SO_*TIMEO 到点
+            // SO_*TIMEO expired
             err = "tls handshake timeout with " + host + " (" + std::to_string(timeoutMillis) + "ms)";
             return false;
         }
@@ -172,7 +172,7 @@ bool TlsSession::handshake(netcompat::socket_t sock, const std::string& host, in
 
 int TlsSession::read(netcompat::socket_t sock, char* buf, int len) {
     (void)sock;
-    // 整个调用在会话锁内：里面只有 SSL_read 与 EINTR 重试，没有任何睡眠。
+    // The whole call runs under the session lock: it only contains SSL_read and EINTR retries, no sleeping.
     std::lock_guard<std::mutex> lk(ioMutex_);
     for (;;) {
         int n = SSL_read(ssl_, buf, len);
@@ -180,14 +180,14 @@ int TlsSession::read(netcompat::socket_t sock, char* buf, int len) {
         int e = SSL_get_error(ssl_, n);
         switch (e) {
             case SSL_ERROR_ZERO_RETURN:
-                return 0;  // 对端正常关闭（close_notify）
+                return 0;  // peer closed cleanly (close_notify)
             case SSL_ERROR_WANT_READ:
             case SSL_ERROR_WANT_WRITE:
-                // SO_RCVTIMEO 到点或 want-write：让上层 select 循环重试
+                // SO_RCVTIMEO expired or want-write: let the upper select loop retry
                 return -2;
             case SSL_ERROR_SYSCALL:
-                // EAGAIN/EWOULDBLOCK = SO_RCVTIMEO 到点（某些 OpenSSL 版本归入 SYSCALL）；
-                // EINTR 重试；其余为真错误
+                // EAGAIN/EWOULDBLOCK = SO_RCVTIMEO expired (some OpenSSL versions report it as SYSCALL);
+                // EINTR retries; anything else is a real error
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
                 if (errno == EINTR) continue;
                 return -1;
@@ -198,14 +198,14 @@ int TlsSession::read(netcompat::socket_t sock, char* buf, int len) {
 }
 
 bool TlsSession::writeAll(netcompat::socket_t sock, const char* data, size_t len) {
-    (void)sock;  // SSL_write 绑定在握手时的 fd 上；形参仅为签名一致
+    (void)sock;  // SSL_write is bound to the fd used at handshake; the parameter only keeps the signature uniform
     size_t sent = 0;
     while (sent < len) {
         int n;
         int err;
         {
-            // 锁只圈住这一次 SSL_write（连同读它错误码的 SSL_get_error）：下面那 10ms
-            // 重试睡眠必须在锁外，否则读线程（以及同一会话上的其它写者）会被对端满窗口堵住。
+            // The lock covers only this SSL_write (plus the SSL_get_error that reads its result): the 10ms
+            // retry sleep below must stay outside it, otherwise the reader (and other writers on the same session) would be blocked by a full peer window.
             std::lock_guard<std::mutex> lk(ioMutex_);
             n = SSL_write(ssl_, data + sent, static_cast<int>(len - sent));
             err = SSL_get_error(ssl_, n);
@@ -216,7 +216,7 @@ bool TlsSession::writeAll(netcompat::socket_t sock, const char* data, size_t len
         }
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
             if (errno == EINTR) continue;
-            // SO_SNDTIMEO 到点：短暂等待后重试（对端 TCP 窗口满）
+            // SO_SNDTIMEO expired: retry after a short wait (the peer's TCP window is full)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
@@ -233,7 +233,7 @@ int TlsSession::pending() {
 void TlsSession::shutdown() {
     std::lock_guard<std::mutex> lk(ioMutex_);
     if (ssl_ != nullptr) {
-        // best-effort：对端可能已关，失败不处理
+        // best-effort: the peer may already have closed; failures are ignored
         SSL_shutdown(ssl_);
         SSL_free(ssl_);
         ssl_ = nullptr;

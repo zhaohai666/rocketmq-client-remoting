@@ -16,7 +16,7 @@ struct TopicFilterType {
 };
 
 struct TopicConfig {
-    // TopicConfig.defaultReadQueueNums / defaultWriteQueueNums
+    // Default read/write queue numbers used by a topic configuration
     static constexpr int32_t DEFAULT_READ_QUEUE_NUMS = 16;
     static constexpr int32_t DEFAULT_WRITE_QUEUE_NUMS = 16;
     // PermName.PERM_READ | PermName.PERM_WRITE
@@ -40,7 +40,7 @@ struct TopicConfig {
     static TopicConfig fromJson(const JsonValue& v);
 
     Bytes encode() const;
-    // 解析失败返回 false（不抛异常）
+    // Returns false on parse failure (does not throw)
     static bool decode(const Bytes& data, TopicConfig& out);
 
     std::string toString() const;

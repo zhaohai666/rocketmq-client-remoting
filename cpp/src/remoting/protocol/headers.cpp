@@ -1,14 +1,14 @@
-// 请求/响应自定义头 <-> extFields 的映射实现。
+// Mapping between request/response custom headers and extFields.
 //
-// 字段名/键名以 broker 侧协议 header/* 定义为准：
-//   - toExtFields()：仅输出已设置（optional 有值）的字段（"非空才写"）；
-//   - fromExtFields()：从 extFields 读回，缺省保持 nullopt；
-//   - V2 用短字段名 a..n 缩减头部体积，并可无损与 V1 互转。
+// Field names and key names follow the broker-side protocol header/* definitions:
+//   - toExtFields(): emits only the fields that are set (an optional holding a value), the write-if-non-null rule;
+//   - fromExtFields(): reads back from extFields and leaves absent values as nullopt;
+//   - V2 uses short field names a..n to shrink the header payload and converts to/from V1 losslessly.
 #include "rocketmq/remoting/protocol/headers.h"
 
 namespace rocketmq {
 
-// ---------------------------------------------------------------- 发送消息
+// ---------------------------------------------------------------- Send message
 
 PropertyMap SendMessageRequestHeader::toExtFields() const {
     PropertyMap out;
@@ -168,7 +168,7 @@ void RecallMessageResponseHeader::fromExtFields(const PropertyMap& ext) {
     msgId = getOptStr(ext, "msgId");
 }
 
-// ---------------------------------------------------------------- Request-Reply 应答推送
+// ---------------------------------------------------------------- Request-Reply response push
 
 PropertyMap ReplyMessageRequestHeader::toExtFields() const {
     PropertyMap out;
@@ -206,7 +206,7 @@ void ReplyMessageRequestHeader::fromExtFields(const PropertyMap& ext) {
     storeTimestamp = getOptLong(ext, "storeTimestamp");
 }
 
-// ---------------------------------------------------------------- 拉取消息
+// ---------------------------------------------------------------- Pull message
 
 PropertyMap PullMessageRequestHeader::toExtFields() const {
     PropertyMap out;
@@ -264,7 +264,7 @@ void PullMessageResponseHeader::fromExtFields(const PropertyMap& ext) {
     forbidCommitOffset = getOptBool(ext, "forbidCommitOffset");
 }
 
-// ---------------------------------------------------------------- 消费位点
+// ---------------------------------------------------------------- Consumer offsets
 
 PropertyMap QueryConsumerOffsetRequestHeader::toExtFields() const {
     PropertyMap out;
@@ -306,7 +306,7 @@ void UpdateConsumerOffsetRequestHeader::fromExtFields(const PropertyMap& ext) {
     commitOffset = getOptLong(ext, "commitOffset");
 }
 
-// ---------------------------------------------------------------- offset 查询
+// ---------------------------------------------------------------- Offset queries
 
 PropertyMap GetMaxOffsetRequestHeader::toExtFields() const {
     PropertyMap out;
@@ -378,7 +378,7 @@ void SearchOffsetResponseHeader::fromExtFields(const PropertyMap& ext) {
     offset = getOptLong(ext, "offset");
 }
 
-// ---------------------------------------------------------------- 其它常用头部
+// ---------------------------------------------------------------- Other common headers
 
 PropertyMap ViewMessageRequestHeader::toExtFields() const {
     PropertyMap out;
@@ -521,7 +521,7 @@ PropertyMap CheckTransactionStateRequestHeader::toExtFields() const {
     putOptInt(out, "commitLogOffset", commitLogOffset);
     putOptStr(out, "msgId", msgId);
     putOptStr(out, "transactionId", transactionId);
-    putOptStr(out, "offsetMsgId", offsetMsgId);  // 协议字段是 String，不是 long
+    putOptStr(out, "offsetMsgId", offsetMsgId);  // the protocol field is a String, not a long
     putOptStr(out, "bname", bname);
     return out;
 }
@@ -564,7 +564,7 @@ void CreateTopicRequestHeader::fromExtFields(const PropertyMap& ext) {
     force = getOptBool(ext, "force");
 }
 
-// ---------------------------------------------------------------- POP 模式
+// ---------------------------------------------------------------- POP mode
 
 PropertyMap PopMessageRequestHeader::toExtFields() const {
     PropertyMap out;
@@ -578,7 +578,7 @@ PropertyMap PopMessageRequestHeader::toExtFields() const {
     putOptInt32(out, "initMode", initMode);
     putOptStr(out, "expType", expType);
     putOptStr(out, "exp", exp);
-    // 非 optional：协议里 order 是非 null Boolean（默认 false），总是写出
+    // Not optional: order is a non-null Boolean in the protocol (default false), so it is always written
     putOptBool(out, "order", std::optional<bool>(order));
     putOptStr(out, "attemptId", attemptId);
     return out;
@@ -650,7 +650,7 @@ PropertyMap ChangeInvisibleTimeRequestHeader::toExtFields() const {
     putOptInt(out, "offset", offset);
     putOptInt(out, "invisibleTime", invisibleTime);
     putOptStr(out, "liteTopic", liteTopic);
-    // 非 optional：协议里 suspend 是原始 boolean（默认 false），总是写出
+    // Not optional: suspend is a primitive boolean in the protocol (default false), so it is always written
     putOptBool(out, "suspend", std::optional<bool>(suspend));
     return out;
 }

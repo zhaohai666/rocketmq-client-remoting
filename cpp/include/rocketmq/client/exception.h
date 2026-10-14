@@ -21,9 +21,9 @@ struct ClientErrorCode {
 };
 
 struct MQClientException : public std::runtime_error {
-    // 构造参数 (message, response_code)；默认 1（UNKNOWN）。
-    // 管理端靠它把 broker 响应码透传出来——例如 resetOffsetNew 需要区分
-    // CONSUMER_NOT_ONLINE 才能退化到 resetOffsetByTimestampOld。
+    // Constructor arguments (message, response_code); the default is 1 (UNKNOWN).
+    // The admin side relies on it to pass the broker response code through — for instance,
+    // resetOffsetNew must be able to tell CONSUMER_NOT_ONLINE apart in order to fall back to resetOffsetByTimestampOld.
     int32_t responseCode = 1;
 
     explicit MQClientException(const std::string& msg, int32_t code = 1)

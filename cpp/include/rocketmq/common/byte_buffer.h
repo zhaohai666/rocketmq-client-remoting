@@ -9,7 +9,7 @@
 
 namespace rocketmq {
 
-// 二进制字节串。std::string 二进制安全，且便于与 body/属性串互操作。
+// Binary byte string. std::string is binary safe and interoperates easily with body/property strings.
 using Bytes = std::string;
 
 inline void putInt8(Bytes& buf, uint8_t v) {
@@ -89,7 +89,7 @@ inline int32_t javaStringHash(const std::string& s) {
     return static_cast<int32_t>(h >= 0x80000000L ? h - 0x100000000L : h);
 }
 
-// 只读游标。越界抛 std::out_of_range，由上层按"解码失败"处理。
+// Read-only cursor. Out-of-range access throws std::out_of_range, handled by the caller as "decode failure".
 class ByteReader {
 public:
     ByteReader(const Bytes& data, size_t offset = 0) : data_(data), pos_(offset) {}
@@ -153,7 +153,7 @@ public:
         return out;
     }
 
-    // 静态版本：从任意偏移读取，不持有游标
+    // Static variants: read from an arbitrary offset without holding a cursor
     static int32_t readInt32At(const Bytes& b, size_t offset) { return getInt32At(b, offset); }
 
     static int32_t getInt32At(const Bytes& b, size_t offset) {

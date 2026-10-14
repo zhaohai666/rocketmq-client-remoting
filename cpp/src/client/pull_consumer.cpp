@@ -54,9 +54,9 @@ int64_t extInt(const RemotingCommand& r, const std::string& key, int64_t fallbac
 }  // namespace
 
 DefaultMQPullConsumer::DefaultMQPullConsumer(const std::string& consumerGroup) {
-    // 与 push/lite-pull 生产者同款首道守卫：只挡空白组名。完整校验
-    // （长度/字符表/DEFAULT_CONSUMER 保留名）在 start() 里走 Validators::checkGroup。
-    // ⚠ 旧实现用 empty()，纯空白组名会漏过——改为 UtilAll::isBlank。
+    // First guard, same as in the push and lite-pull consumer constructors: rejects blank group
+    // names only. Full validation (length / character set / DEFAULT_CONSUMER reserved name) runs in
+    // start() via Validators::checkGroup. empty() let all-blank names pass, hence UtilAll::isBlank.
     if (UtilAll::isBlank(consumerGroup)) {
         throw MQClientException("consumerGroup is empty");
     }
@@ -70,7 +70,7 @@ DefaultMQPullConsumer::~DefaultMQPullConsumer() {
     }
 }
 
-// ---------------------------------------------------------------- 配置
+// ---------------------------------------------------------------- Configuration
 void DefaultMQPullConsumer::setNamesrvAddr(const std::string& addr) {
     nameServerAddrs_ = splitSemicolon(addr);
 }
@@ -88,7 +88,7 @@ void DefaultMQPullConsumer::registerMessageQueueListener(
     }
 }
 
-// ---------------------------------------------------------------- 生命周期
+// ---------------------------------------------------------------- Lifecycle
 void DefaultMQPullConsumer::start() {
     if (started_) return;
     if (!namespace_.empty()) {
@@ -151,7 +151,7 @@ void DefaultMQPullConsumer::shutdown() {
     }
 }
 
-// ---------------------------------------------------------------- 队列
+// ---------------------------------------------------------------- Queues
 std::vector<MessageQueue> DefaultMQPullConsumer::fetchSubscribeMessageQueues(
     const std::string& topic) {
     if (mqClient_ == nullptr) {
@@ -165,7 +165,7 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchSubscribeMessageQueues(
     return route->getAllSubscribeMessageQueue(realTopic);
 }
 
-// ---------------------------------------------------------------- 平衡视图
+// ---------------------------------------------------------------- Balanced queue view
 std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
     const std::string& topic) {
     if (mqClient_ == nullptr) {
@@ -173,7 +173,7 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
     }
     const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
 
-    // 现有分配：本地拉过的那个 topic 的队列（键由 pull() 写入，topic 已是 realTopic）。
+    // Current assignment: queues of the topic pulled locally (keys written by pull(), topic is already realTopic).
     std::vector<MessageQueue> pulled;
     for (const auto& kv : pullFromWhichNode_) {
         if (kv.first.topic == realTopic) pulled.push_back(kv.first);
@@ -221,7 +221,7 @@ std::vector<MessageQueue> DefaultMQPullConsumer::fetchMessageQueuesInBalance(
     return result;
 }
 
-// ---------------------------------------------------------------- 拉取
+// ---------------------------------------------------------------- Pull
 PullResult DefaultMQPullConsumer::pull(const MessageQueue& mq, const std::string& subExpression,
                                       int64_t offset, int32_t maxNums, int32_t timeoutMillis) {
     if (mqClient_ == nullptr) {
@@ -278,7 +278,7 @@ void DefaultMQPullConsumer::updatePullFromWhichNode(const MessageQueue& mq,
     pullFromWhichNode_[mq] = result.suggestWhichBrokerId.value_or(MixAll::MASTER_ID);
 }
 
-// ---------------------------------------------------------------- 位点管理
+// ---------------------------------------------------------------- Consumer offset management
 bool DefaultMQPullConsumer::fetchConsumeOffset(const MessageQueue& mq, int64_t& outOffset) {
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
@@ -357,22 +357,22 @@ void DefaultMQPullConsumer::createTopic(const std::string& key, const std::strin
     if (mqClient_ == nullptr) {
         throw MQClientException("consumer not started, call start() first");
     }
-    // C++ 的 createTopicInRoute 忽略 key 形参，统一走默认 topic（MixAll.DefaultTopic）建路由
+    // createTopicInRoute ignores the key parameter and always builds the route via MixAll::DEFAULT_TOPIC.
     (void)key;
     const std::string real = NamespaceUtil::wrapNamespace(namespace_, newTopic);
     mqClient_->createTopicInRoute(real, queueNum, queueNum, /*perm=*/6);
 }
 
-// ---------------------------------------------------------------- 心跳
-// 为什么拉模式也必须心跳：broker 的 `ConsumerManager.consumerTable` 是**按台**的，
-// 只有心跳（或带订阅标志的拉取）才会建表。没有心跳时：
-//   1. `consumerConnection`/`mqadmin consumerConnection`（`AdminBrokerProcessor:1971`）
-//      看不到本组，`GET_CONSUMER_LIST_BY_GROUP(38)` 也是空的；
-//   2. `isRejectPullConsumerEnabled=true` 的 broker 会给本组每次拉取都回
-//      `the pull consumer is rejected by server`（`PullMessageProcessor:493-505`）。
-// 而 `ClientManageProcessor:87-92` **跳过** ACTIVELY 类型心跳的订阅注册 ——
-// 拉模式靠自带订阅标志的拉取走补偿分支（`PullMessageProcessor:397-412`），所以
-// 缺心跳的失效是静默的：拉取照样成功，只是 broker 侧完全不知道本组存在。
+// ---------------------------------------------------------------- Heartbeat
+// Why pull mode must heartbeat too: the broker's consumer table is per broker instance, and only
+// a heartbeat (or a pull carrying the subscription flag) creates the entry. Without heartbeats:
+//   1. consumerConnection lookups never show this group and GET_CONSUMER_LIST_BY_GROUP(38) is
+//      empty;
+//   2. a broker with isRejectPullConsumerEnabled=true answers every pull of this group with
+//      "the pull consumer is rejected by server".
+// Heartbeat subscription registration is skipped for CONSUME_ACTIVELY heartbeats, so pull mode
+// relies on subscription-flagged pulls hitting the compensation branch: missing heartbeats fail
+// silently - pulls keep succeeding while the broker never learns that the group exists.
 void DefaultMQPullConsumer::refreshRouteForHeartbeat() {
     if (mqClient_ == nullptr) return;
     for (const std::string& t : registerTopics_) {
@@ -432,7 +432,7 @@ int32_t DefaultMQPullConsumer::sendHeartbeatToAllBroker() {
 }
 
 void DefaultMQPullConsumer::startHeartbeatLoop() {
-    // std::thread 一构造就跑：先备好停机标志位（构造前已置 false），线程起来即可用。
+    // std::thread runs on construction, so the stop flag is prepared beforehand (false before the ctor) and usable at once.
     heartbeatThread_ = std::thread([this]() {
         setThreadName("PullConsumerHeartbeatThread");
         heartbeatLoop();
@@ -443,7 +443,7 @@ void DefaultMQPullConsumer::heartbeatLoop() {
     while (!heartbeatStop_.load()) {
         {
             std::unique_lock<std::mutex> lk(heartbeatLock_);
-            // 停机时由 shutdown() 置位并 notify，最多等一个周期就醒。
+            // On shutdown, shutdown() sets the flag and notifies, so the wait wakes after at most one period.
             if (heartbeatCv_.wait_for(lk, std::chrono::milliseconds(heartbeatBrokerIntervalMillis_),
                                       [this] { return heartbeatStop_.load(); })) {
                 break;
@@ -452,8 +452,8 @@ void DefaultMQPullConsumer::heartbeatLoop() {
         if (!heartbeatEnabled_) {
             continue;
         }
-        // 常驻循环的边界：线程里逃出异常 = std::terminate（整个进程陪葬）。心跳失败
-        // 已在 sendHeartbeatToAllBroker 内部逐台接住，这里再兜一层（比如拼心跳时的异常）。
+        // Boundary of the resident loop: an exception escaping the thread means std::terminate, taking the process down.
+        // sendHeartbeatToAllBroker already catches per-broker failures; this fallback covers e.g. heartbeat assembly.
         try {
             sendHeartbeatToAllBroker();
         } catch (const std::exception& e) {

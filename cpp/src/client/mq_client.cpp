@@ -1,4 +1,4 @@
-// MQClientInstance 实现：客户端实例级的路由、发送、拉取、POP、位点与心跳底座。
+// MQClientInstance implementation: instance-level routing, send, pull, POP, offset and heartbeat plumbing.
 #include "rocketmq/client/mq_client.h"
 
 #include <algorithm>
@@ -38,7 +38,7 @@ namespace rocketmq {
 
 namespace {
 
-// 拉取响应码 -> PullStatus（经典 remoting 协议对 PULL_* 响应码的口径）
+// Pull response code -> PullStatus (the classic remoting protocol meaning of the PULL_* codes)
 bool mapPullStatus(int32_t code, PullStatus& out) {
     switch (code) {
         case ResponseCode::SUCCESS:
@@ -58,12 +58,12 @@ bool mapPullStatus(int32_t code, PullStatus& out) {
     }
 }
 
-// 发送请求码：先判应答消息，再判批量。应答必须走 325（broker 只在 324/325 上注册
-// ReplyMessageProcessor）；批量走 SEND_BATCH_MESSAGE(320)，判据是「这条消息是不是批量」
-// （`msg.isBatch`）。
-// 服务端对 310/320 走同一条路（broker 按 header.batch 选写入方式，proxy 和 auth
-// 把两个码列在同一个 case 里），所以这不是修 bug，只是在请求码这一层把批量与单条
-// 分开，免得服务端按码统计/限流时把批量当成单条。
+// Send request code: reply messages first, then batches. A reply must use 325 (the broker registers
+// ReplyMessageProcessor only for 324/325); a batch uses SEND_BATCH_MESSAGE(320), decided by "is this
+// message a batch" (`msg.isBatch`).
+// The server handles 310/320 through the same path (the broker picks the write mode from header.batch,
+// and proxy and auth list both codes in the same case), so this is not a bug fix: it only separates batch
+// from single messages at the request-code layer so server-side per-code metrics and throttling do not count a batch as one message.
 int32_t sendRequestCode(const Message& msg) {
     if (isReplyMessage(msg)) {
         return RequestCode::SEND_REPLY_MESSAGE_V2;
@@ -76,7 +76,7 @@ int32_t sendRequestCode(const Message& msg) {
 // ---------------------------------------------------------------- clientId
 namespace {
 
-// 单调纳秒时钟：数值原点任意，只用来保证同进程内不重复（供 clientId 生成）。
+// Monotonic nanosecond clock: the origin is arbitrary, it only guarantees uniqueness within the process (used to build the clientId).
 uint64_t nanoTime() {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -102,12 +102,12 @@ std::string changeInstanceNameToPID(const std::string& instanceName) {
 
 std::string buildMqClientId(const std::string& clientIp, const std::string& instanceName,
                             const std::string& unitName, bool enableStreamRequestType) {
-    // 经典 remoting 协议规定的 clientId 拼接格式：
+    // The clientId concatenation format required by the classic remoting protocol:
     //   clientIP + "@" + instanceName
-    //   unitName 非空白时再拼 "@" + unitName
-    //   enableStreamRequestType 时再拼 "@" + "STREAM"
-    // 末段拼的是**请求类型名**（"STREAM"），不是 code；code 只出现在 extFields 的
-    // ReqT 里。
+    //   append "@" + unitName when unitName is not blank
+    //   append "@" + "STREAM" when enableStreamRequestType is set
+    // The trailing segment is the **request type name** ("STREAM"), not the code; the code only appears in
+    // extFields ReqT.
     std::string id = clientIp + "@" + instanceName;
     if (!isBlank(unitName)) {
         id += "@" + unitName;
@@ -128,7 +128,7 @@ MessageQueue TopicPublishInfo::selectOneMessageQueue() {
     if (msgQueueList.empty()) {
         throw MQClientException("no message queue for publish info");
     }
-    // 游标用原子自增：生产端可能被多线程并发调用，且游标是跨调用共享状态
+    // The cursor uses an atomic increment: publishing may be called concurrently from several threads and the cursor is shared across calls
     uint64_t idx = index_.fetch_add(1);
     return msgQueueList[static_cast<size_t>(idx % msgQueueList.size())];
 }
@@ -137,7 +137,7 @@ MessageQueue TopicPublishInfo::selectOneMessageQueue(const std::string& lastBrok
     if (msgQueueList.empty()) {
         throw MQClientException("no message queue for publish info");
     }
-    // 重试时尽量避开上次失败的 broker；若全是同一 broker 则退化为轮询
+    // On retry, avoid the previously failed broker when possible; if every queue is the same broker, fall back to round-robin
     for (size_t i = 0; i < msgQueueList.size(); ++i) {
         uint64_t idx = index_.fetch_add(1);
         const MessageQueue& mq = msgQueueList[static_cast<size_t>(idx % msgQueueList.size())];
@@ -155,8 +155,8 @@ std::optional<MessageQueue> TopicPublishInfo::selectOneMessageQueue(
     if (msgQueueList.empty()) {
         throw MQClientException("no message queue for publish info");
     }
-    // 带过滤器的选择：游标照常推进，
-    // 一轮内全部不匹配返回 nullopt（由调用方退化选择，不在这里兜底）。
+    // Filtered selection: the cursor still advances,
+    // and nullopt is returned when nothing in one full round matches (the caller picks the fallback; no fallback here).
     const size_t n = msgQueueList.size();
     for (size_t i = 0; i < n; ++i) {
         uint64_t idx = index_.fetch_add(1);
@@ -168,12 +168,12 @@ std::optional<MessageQueue> TopicPublishInfo::selectOneMessageQueue(
     return std::nullopt;
 }
 
-// ---------------------------------------------------------------- 生命周期
+// ---------------------------------------------------------------- Lifecycle
 bool MQClientInstance::tlsEnabledFromEnv() {
     const char* v = std::getenv("ROCKETMQ_TLS_ENABLE");
     if (v == nullptr) return false;
     std::string s(v);
-    // 简单归一：1/true/yes（大小写不敏感）
+    // Simple normalisation: 1/true/yes (case-insensitive)
     for (auto& c : s) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
     return s == "1" || s == "true" || s == "yes";
 }
@@ -206,7 +206,7 @@ MQClientInstance::~MQClientInstance() { shutdown(); }
 
 void MQClientInstance::start() {
     started_ = true;
-    // TLS：必须在首条连接建立前打开（之后建的所有连接都走握手）
+    // TLS: must be enabled before the first connection is established (every later connection performs the handshake)
     if (tlsEnable_) {
         remotingClient_->setTlsEnable(true);
     }
@@ -281,7 +281,7 @@ void MQClientInstance::shutdown() {
     }
     consumerStats_.shutdown();
     if (remotingClient_) {
-        // 40 的回调捕获了 this：实例析构前必须摘掉，否则读线程可能回调悬垂对象
+        // The code 40 callback captures this: it must be removed before the instance is destroyed, otherwise a reader thread could call back into a dangling object
         remotingClient_->unregisterProcessor(RequestCode::NOTIFY_CONSUMER_IDS_CHANGED);
         remotingClient_->shutdown();
     }
@@ -378,7 +378,7 @@ void MQClientInstance::checkResponseCode(const RemotingCommand& response) {
     }
 }
 
-// ---------------------------------------------------------------- 路由管理
+// ---------------------------------------------------------------- Route management
 bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& topic,
                                                          int32_t timeoutMillis,
                                                          bool isDefault) {
@@ -387,9 +387,9 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
                                 ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
     }
 
-    // lastRouteError：全部 NS 都不可达时的最后一个失败原因（TLS 握手 CA 校验失败、
-    // 连接拒绝…）。不透出去的话，getTopicPublishInfo 只能黑盒报
-    // "Can not find Message Queue"，用户会往"建 topic"方向查，而真正坏的是链路/证书。
+    // lastRouteError: the last failure reason when every name server is unreachable (TLS handshake CA
+    // validation failed, connection refused...). Without surfacing it, getTopicPublishInfo can only report
+    // "Can not find Message Queue" as a black box, sending users to look for a missing topic while the real fault is the link/certificate.
     std::string lastRouteError;
     auto fetch = [&](const std::string& t, TopicRouteData& out) -> bool {
         RemotingCommand request =
@@ -402,8 +402,8 @@ bool MQClientInstance::updateTopicRouteInfoFromNameServer(const std::string& top
                 if (response.code == ResponseCode::SUCCESS && !response.body.empty()) {
                     return TopicRouteData::decode(response.body, out);
                 }
-                // 第一个可达的 NS 明确返回非 SUCCESS（如 TOPIC_NOT_EXIST）就停止轮询；
-                // 这是"真实回答"，不算链路故障，清掉遗留的错误串。
+                // Stop polling as soon as a reachable NS explicitly returns non-SUCCESS (e.g. TOPIC_NOT_EXIST);
+                // that is a real answer, not a link fault, so the leftover error string is cleared.
                 lastError.clear();
                 break;
             } catch (const RemotingException& e) {
@@ -480,8 +480,8 @@ std::shared_ptr<TopicPublishInfo> MQClientInstance::getTopicPublishInfo(const st
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
     auto it = topicPublishInfoTable_.find(topic);
     if (it == topicPublishInfoTable_.end() || it->second == nullptr || !it->second->ok()) {
-        // 带上路由拉取的真实失败原因（TLS/CA 校验失败、连接拒绝…）。没有失败记录
-        // （NS 可达且明确回答 topic 不存在）时保持原文案 —— 那才是"建 topic"语义。
+        // Include the real route-fetch failure reason (TLS/CA validation failed, connection refused...). With no
+        // failure recorded (the NS was reachable and explicitly answered topic-not-found) the original text stays -- that is the "create the topic" meaning.
         std::string msg = "Can not find Message Queue for topic: " + topic;
         {
             std::lock_guard<std::mutex> lk(lastRouteErrorMutex_);
@@ -513,7 +513,7 @@ std::shared_ptr<TopicRouteData> MQClientInstance::getTopicRouteData(const std::s
     try {
         updateTopicRouteInfoFromNameServer(topic);
     } catch (const std::exception&) {
-        // 路由刷新失败不抛，交给下面的查表返回空
+        // A failed route refresh does not throw; the table lookup below returns empty instead
     }
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
     auto it = topicRouteTable_.find(topic);
@@ -612,8 +612,8 @@ std::string MQClientInstance::publishAddrFor(const std::string& brokerName,
 }
 
 std::string MQClientInstance::publishAddrInAdmin(const MessageQueue& mq) {
-    // 与 publishAddrFor 同形，单独一层只是
-    // 让 offset 查询的调用点读起来是「按 mq 解析」。
+    // Same shape as publishAddrFor; the extra layer only makes
+    // offset-query call sites read as "resolve by mq".
     return publishAddrFor(mq.brokerName, mq.topic);
 }
 
@@ -630,7 +630,7 @@ std::string MQClientInstance::resolvePopAddr(const std::string& topic, std::stri
         brokerName = route->brokerDatas.front().brokerName;
     }
     if (!addrIn.empty()) {
-        return addrIn;  // 调用方点名了地址：只借路由把 brokerName 补上，不动地址
+        return addrIn;  // The caller named the address: the route is only used to fill in brokerName, the address is untouched
     }
     return publishAddrFor(brokerName, topic);
 }
@@ -650,13 +650,13 @@ std::string MQClientInstance::getBrokerNameFromMessageQueue(const MessageQueue& 
 std::string MQClientInstance::popAckAddrFor(const std::string& topic,
                                             const std::string& brokerName,
                                             int32_t queueId, const std::string& addrIn) {
-    // 调用方点名了地址：原样返回（与 resolvePopAddr 同口径）。
+    // The caller named the address: return it as is (same rule as resolvePopAddr).
     if (!addrIn.empty()) {
         return addrIn;
     }
     std::string name = brokerName;
     if (name.empty()) {
-        // 与 resolvePopAddr 相同的便利口径：按路由挑一台，挑完照样只认它的 master。
+        // The same convenience rule as resolvePopAddr: pick one broker from the route, and only its master counts.
         auto route = getTopicRouteData(topic);
         if (route == nullptr) {
             throw MQClientNoRouteException(topic);
@@ -686,8 +686,8 @@ std::string MQClientInstance::popAckAddrFor(const std::string& topic,
 }
 
 std::string MQClientInstance::consumerOffsetAddr(const MessageQueue& mq) {
-    // 与 publishAddrInAdmin 的差别只在最后那一步：管理侧的 offset 查询一律打主、主没了就
-    // 报错；位点读取允许退到从节点。
+    // Differs from publishAddrInAdmin only in the last step: admin-side offset queries always hit the master and
+    // fail when it is gone, while offset reading may fall back to a slave.
     std::string addr = findBrokerAddressInPublish(mq.brokerName);
     if (addr.empty()) {
         updateTopicRouteInfoFromNameServer(mq.topic, 5000, false);
@@ -716,7 +716,7 @@ std::vector<std::string> MQClientInstance::getRouteOfAllBrokers() {
 std::vector<std::string> MQClientInstance::knownBrokerAddrs() { return getRouteOfAllBrokers(); }
 
 std::vector<std::string> MQClientInstance::getAllBrokerAddrs() {
-    // 与 getRouteOfAllBrokers 的唯一区别：不挑主，每个 brokerId 都算一台。
+    // The only difference from getRouteOfAllBrokers: no master selection, every brokerId counts as one.
     std::vector<std::string> addrs;
     std::lock_guard<std::recursive_mutex> lk(routeLock_);
     for (const auto& kv : topicRouteTable_) {
@@ -784,8 +784,8 @@ RemotingCommand MQClientInstance::buildSendRequest(const std::string& producerGr
     header->brokerName =
         mq.brokerName.empty() ? std::nullopt : std::optional<std::string>(mq.brokerName);
 
-    // 请求码选择（reply / batch / 普通）见 sendRequestCode：应答走 325、批量走 320，
-    // 否则才是普通的 SEND_MESSAGE_V2(310)。
+    // Request-code selection (reply / batch / normal) is in sendRequestCode: a reply uses 325 and a batch uses 320,
+    // otherwise plain SEND_MESSAGE_V2(310).
     RemotingCommand request = RemotingCommand::createRequestCommand(sendRequestCode(msg), header);
     request.body = msg.body;
     request.hasBody = true;
@@ -893,7 +893,7 @@ void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const
     const std::string addr = publishAddrFor(mq.brokerName, mq.topic);
     (void)timeoutMillis;
 
-    // 请求码选择（reply / batch / 普通）见 sendRequestCode；建头细节与同步/异步共用一份
+    // Request-code selection (reply / batch / normal) is in sendRequestCode; the header-building details are shared with the sync/async paths
     RemotingCommand request =
         buildSendRequest(producerGroup, msg, mq, sysFlag, unitMode, createTopicKey,
                          defaultTopicQueueNums);
@@ -901,7 +901,7 @@ void MQClientInstance::sendMessageOneway(const std::string& producerGroup, const
     remotingClient_->invokeOneway(addr, request);
 }
 
-// ---------------------------------------------------------------- 消息拉取
+// ---------------------------------------------------------------- Message pull
 PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const MessageQueue& mq,
                                         int64_t queueOffset, int32_t maxMsgNums, int32_t sysFlag,
                                         int64_t commitOffset, const std::string& subscription,
@@ -987,13 +987,13 @@ PullResult MQClientInstance::pullMessage(const std::string& consumerGroup, const
     return result;
 }
 
-// ---------------------------------------------------------------- POP 模式
+// ---------------------------------------------------------------- POP mode
 
-// 给 POP 出来的消息反构 POP_CK 与 1ST_POP_TIME。
+// Reconstruct POP_CK and 1ST_POP_TIME for POP-ed messages.
 //
 //
-// 注意调用时机：必须在**改写消息 topic 之前**调用，因为 retryFlag 是从消息的
-// 原始 topic 推出来的（broker 可能改写 topic）。
+// Call-site requirement: it must run **before the message topic is rewritten**, because retryFlag is
+// derived from the message's original topic (the broker may rewrite the topic).
 void MQClientInstance::stampPopCk(std::vector<MessageExt>& msgs, const std::string& brokerName,
                                   const PopMessageResponseHeader& respHeader) {
     using namespace extra_info;
@@ -1038,7 +1038,7 @@ void MQClientInstance::stampPopCk(std::vector<MessageExt>& msgs, const std::stri
         }
 
         for (MessageExt& m : msgs) {
-            // retry topic 弹回来的消息 broker 已经写好 POP_CK，不能覆盖。
+            // Messages returned from a retry topic already carry the POP_CK written by the broker; it must not be overwritten.
             if (m.properties.find(MessageConst::PROPERTY_POP_CK) != m.properties.end()) {
                 continue;
             }
@@ -1094,7 +1094,7 @@ PopResult MQClientInstance::popMessage(const std::string& consumerGroup, const s
     header->maxMsgNums = maxMsgNums;
     header->invisibleTime = invisibleTime;
     header->pollTime = pollTime;
-    // bornTime 填 0 会让 broker 判定"超时太久"直接回 POLLING_TIMEOUT(210)
+    // A bornTime of 0 makes the broker judge the request as far too old and answer POLLING_TIMEOUT(210) directly
     header->bornTime = UtilAll::currentTimeMillis();
     header->initMode = initMode;
     if (!expression.empty()) {
@@ -1174,7 +1174,7 @@ ChangeInvisibleTimeResult MQClientInstance::changeInvisibleTime(
     if (brokerName.empty() && !extraInfo.empty()) {
         brokerName = extra_info::getBrokerName(extra_info::split(extraInfo));
     }
-    // mock 名重写同 ack 路径。
+    // The mock-name rewrite follows the ack path.
     const std::string addr = popAckAddrFor(topic, brokerName, queueId, addrIn);
 
     auto header = std::make_shared<ChangeInvisibleTimeRequestHeader>();
@@ -1205,7 +1205,7 @@ ChangeInvisibleTimeResult MQClientInstance::changeInvisibleTime(
     return result;
 }
 
-// ---------------------------------------------------------------- 消费位点
+// ---------------------------------------------------------------- Consumer offset
 bool MQClientInstance::queryConsumerOffset(const std::string& consumerGroup,
                                           const MessageQueue& mq, int64_t& outOffset,
                                           int32_t timeoutMillis, const std::string& addrIn,
@@ -1245,7 +1245,7 @@ void MQClientInstance::updateConsumerOffset(const std::string& consumerGroup,
     checkResponseCode(response);
 }
 
-// ---------------------------------------------------------------- 队列锁（顺序消费）
+// ---------------------------------------------------------------- Queue locks (sequential consumption)
 namespace {
 
 JsonValue buildMqSetJson(const std::vector<MessageQueue>& mqs) {
@@ -1286,7 +1286,7 @@ std::vector<MessageQueue> MQClientInstance::lockBatchMq(const std::string& consu
             invokeSyncRaw(addr, RequestCode::LOCK_BATCH_MQ, PropertyMap{}, payload,
                           /*hasBody=*/true, timeoutMillis);
         checkResponseCode(response);
-        // LockBatchResponseBody：{"lockOKMQSet":[{topic,brokerName,queueId}]}
+        // LockBatchResponseBody: {"lockOKMQSet":[{topic,brokerName,queueId}]}
         std::string text(response.body.begin(), response.body.end());
         JsonValue root;
         std::string err;
@@ -1392,7 +1392,7 @@ int64_t MQClientInstance::searchOffsetByBoundary(const MessageQueue& mq, int64_t
     return respHeader.offset.value_or(0);
 }
 
-// ---------------------------------------------------------------- 按 Key 查询
+// ---------------------------------------------------------------- Query by key
 bool MQClientInstance::queryMessage(const std::string& topic, const std::string& key,
                                    int32_t maxNum, int64_t beginTimestamp, int64_t endTimestamp,
                                    Bytes& outBody, int32_t timeoutMillis,
@@ -1459,7 +1459,7 @@ std::vector<MessageExt> MQClientInstance::queryMessageAllBrokers(
             } else {
                 std::string keys = m.getKeys();
                 if (!keys.empty()) {
-                    // KEYS 以空格（MessageConst::KEY_SEPARATOR）分隔
+                    // KEYS is space separated (MessageConst::KEY_SEPARATOR)
                     size_t pos = 0;
                     bool hit = false;
                     while (pos <= keys.size()) {
@@ -1487,7 +1487,7 @@ std::vector<MessageExt> MQClientInstance::queryMessageAllBrokers(
     return messages;
 }
 
-// ---------------------------------------------------------------- 心跳 / 注销
+// ---------------------------------------------------------------- Heartbeat / unregister
 void MQClientInstance::sendHeartbeat(const std::string& addr, const HeartbeatData& heartbeatData,
                                     int32_t timeoutMillis) {
     RemotingCommand request =
@@ -1515,7 +1515,7 @@ void MQClientInstance::unregisterClient(const std::string& addr, const std::stri
     checkResponseCode(response);
 }
 
-// ---------------------------------------------------------------- 通用同步调用
+// ---------------------------------------------------------------- Generic synchronous invocation
 RemotingCommand MQClientInstance::invokeSyncRaw(const std::string& addr, int32_t code,
                                                const PropertyMap& extFields, const Bytes& body,
                                                bool hasBody, int32_t timeoutMillis,
@@ -1544,7 +1544,7 @@ RemotingCommand MQClientInstance::invokeSync(const std::string& addr, int32_t co
     return response;
 }
 
-// ---------------------------------------------------------------- 管理类
+// ---------------------------------------------------------------- Administrative calls
 void MQClientInstance::createTopicInBroker(const std::string& brokerAddr,
                                           const std::string& defaultTopic,
                                           const std::string& topic, int32_t readQueueNums,
@@ -1575,7 +1575,7 @@ void MQClientInstance::createTopicInBroker(const std::string& brokerAddr,
             checkResponseCode(response);
             return;
         } catch (const MQBrokerException&) {
-            // broker 明确拒绝（如 TOPIC_EXIST_ALREADY）不重试，直接上抛
+            // An explicit broker rejection (e.g. TOPIC_EXIST_ALREADY) is not retried and propagates directly
             throw;
         } catch (const std::exception& e) {
             lastError = e.what();
@@ -1635,7 +1635,7 @@ void MQClientInstance::deleteTopicInNamesrv(const std::string& topic, int32_t ti
     throw MQClientException("Failed to delete topic " + topic + " in name server: " + lastError);
 }
 
-// ---------------------------------------------------------------- 集群 / Topic / 消费者列表
+// ---------------------------------------------------------------- Cluster / topic / consumer lists
 ClusterInfo MQClientInstance::getBrokerClusterInfo(int32_t timeoutMillis) {
     PropertyMap none;
     for (const std::string& nsAddr : nameServerAddrs_) {
@@ -1765,11 +1765,11 @@ void MQClientInstance::checkSubscriptionsInBroker(const std::string& group,
     for (const SubscriptionData& sub : subs) {
         if (sub.expressionType.empty() || sub.expressionType == ExpressionType::TAG) continue;
         const std::string addr = findBrokerAddrByTopic(sub.topic);
-        if (addr.empty()) continue;  // 查不到路由 → 跳过，不报错
+        if (addr.empty()) continue;  // No route found -> skip, do not raise
         try {
             checkClientConfig(addr, group, clientId_, sub, kMqClientApiTimeoutMillis);
         } catch (const MQClientException&) {
-            throw;  // 已带 broker 响应码，原样上抛
+            throw;  // Already carries a broker response code; propagate unchanged
         } catch (const std::exception& e) {
             logger_warn("checkClientConfig failed, addr=" + addr + ": " + e.what());
             throw MQClientException(
@@ -1783,7 +1783,7 @@ void MQClientInstance::checkSubscriptionsInBroker(const std::string& group,
     }
 }
 
-// ---------------------------------------------------------------- 工具
+// ---------------------------------------------------------------- Utilities
 std::string MQClientInstance::brokerAddrForMq(const MessageQueue& mq) { return brokerAddr(mq); }
 
 }  // namespace rocketmq

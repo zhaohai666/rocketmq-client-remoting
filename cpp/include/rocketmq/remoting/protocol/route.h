@@ -1,12 +1,12 @@
-// 用途：客户端向 NameServer 发 GET_ROUTEINFO_BY_TOPIC，响应 body 即 TopicRouteData
-// 的 JSON。据此得知集群里 broker 的地址（brokerDatas）与每个 topic 的读写队列数
-// （queueDatas），进而组装出可发送/可拉取的 MessageQueue 列表。
+// Purpose: the client sends GET_ROUTEINFO_BY_TOPIC to the name server and the response body is the JSON
+// of TopicRouteData. It gives the broker addresses in the cluster (brokerDatas) and the read/write queue
+// counts per topic (queueDatas), from which the sendable/pullable MessageQueue lists are assembled.
 //
-// JSON 字段（与 fastjson2 一致，键按字母序）：
+// JSON fields (as fastjson2 emits them, keys in alphabetical order):
 //   QueueData      : brokerName | perm | readQueueNums | topicSysFlag | writeQueueNums
 //   BrokerData     : brokerAddrs | brokerName | cluster | enableActingMaster | zoneName
 //   TopicRouteData : brokerDatas | filterServerTable | orderTopicConf | queueDatas
-//                    （+ topicQueueMappingByBroker，非空时才输出）
+//                    (+ topicQueueMappingByBroker, emitted only when non-empty)
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_ROUTE_H
 #define ROCKETMQ_REMOTING_PROTOCOL_ROUTE_H
 
@@ -56,7 +56,7 @@ public:
     }
     bool operator!=(const QueueData& o) const { return !(*this == o); }
 
-    // compareTo 协议语义：仅按 brokerName
+    // compareTo in protocol terms: by brokerName only
     int compareTo(const QueueData& o) const {
         if (brokerName == o.brokerName) return 0;
         return brokerName < o.brokerName ? -1 : 1;
@@ -72,7 +72,7 @@ class BrokerData {
 public:
     std::string cluster;
     std::string brokerName;
-    // brokerId -> 地址。brokerId=0 是 master（MixAll::MASTER_ID）
+    // brokerId -> address. brokerId=0 is the master (MixAll::MASTER_ID)
     std::map<int64_t, std::string> brokerAddrs;
     std::string zoneName;
     bool enableActingMaster = false;
@@ -95,20 +95,20 @@ public:
     bool isEnableActingMaster() const { return enableActingMaster; }
     void setEnableActingMaster(bool b) { enableActingMaster = b; }
 
-    // 优先返回 brokerId=0（master）；否则随机取一个从节点地址。
-    // 无可用地址时返回空串。
+    // Prefer brokerId=0 (master); otherwise pick a slave address at random.
+    // Returns an empty string when no address is available.
     std::string selectBrokerAddr() const;
 
     JsonValue toJson() const;
     static BrokerData fromJson(const JsonValue& v);
 
-    // equals 协议语义：cluster / brokerName / brokerAddrs
+    // equals in protocol terms: cluster / brokerName / brokerAddrs
     bool operator==(const BrokerData& o) const {
         return cluster == o.cluster && brokerName == o.brokerName && brokerAddrs == o.brokerAddrs;
     }
     bool operator!=(const BrokerData& o) const { return !(*this == o); }
 
-    // compareTo 协议语义：仅按 brokerName
+    // compareTo in protocol terms: by brokerName only
     int compareTo(const BrokerData& o) const {
         if (brokerName == o.brokerName) return 0;
         return brokerName < o.brokerName ? -1 : 1;
@@ -126,8 +126,8 @@ public:
     std::vector<QueueData> queueDatas;
     std::vector<BrokerData> brokerDatas;
     std::map<std::string, std::vector<std::string>> filterServerTable;
-    // 透传：不建模 TopicQueueMappingInfo，原样保留 JSON 以免丢字段。
-    // isNull() 表示该字段不存在。
+    // Pass-through: TopicQueueMappingInfo is not modelled, the JSON is kept verbatim so no field is lost.
+    // isNull() means the field is absent.
     JsonValue topicQueueMappingByBroker;
 
     TopicRouteData() = default;
@@ -147,21 +147,21 @@ public:
     const JsonValue& getTopicQueueMappingByBroker() const { return topicQueueMappingByBroker; }
     void setTopicQueueMappingByBroker(const JsonValue& v) { topicQueueMappingByBroker = v; }
 
-    // 按 queueDatas + brokerDatas 组装全部**可写** MessageQueue
-    // （对应 MQClientInstance.topicRouteData2TopicPublishInfo 的组装逻辑）。
-    // topic 会回填进每个 MessageQueue，否则后续按 mq.topic 回查路由会查不到。
+    // Assemble every **writable** MessageQueue from queueDatas + brokerDatas
+    // (the assembly used when deriving topic publish info in MQClientInstance).
+    // The topic is written back into each MessageQueue, otherwise a later route lookup by mq.topic finds nothing.
     std::vector<MessageQueue> getAllMessageQueue(const std::string& topic) const;
 
-    // 按 queueDatas 组装全部**可读** MessageQueue。
-    // 只看读位与 readQueueNums，**不查 brokerDatas、也不要求 broker 有 master** ——
-    // 消费侧（rebalance / fetchSubscribeMessageQueues）必须用这一份，不能拿发布信息代替：
-    // ①perm=4 的只读 topic 可消费，但发布信息里却是空表；
-    // ②master 掉线只剩从节点时可消费的队列集不变（拉取可以走从节点）。
+    // Assemble every **readable** MessageQueue from queueDatas.
+    // It looks only at the read permission and readQueueNums, **never at brokerDatas and it does not require a master**, because:
+    // the consume side (rebalance / fetchSubscribeMessageQueues) must use this list and must not substitute publish info.
+    // Case 1: a read-only topic with perm=4 is consumable, yet its publish info is an empty table;
+    // Case 2: when the master is gone and only slaves remain, the consumable queue set is unchanged (pulling may go to a slave).
     std::vector<MessageQueue> getAllSubscribeMessageQueue(const std::string& topic) const;
 
     TopicRouteData cloneTopicRouteData() const { return *this; }
 
-    // 路由是否变化：先按 compareTo 排序再比较
+    // Whether the route changed: sort by compareTo first, then compare
     bool topicRouteDataChanged(const TopicRouteData* oldData) const;
 
     JsonValue toJson() const;
@@ -170,7 +170,7 @@ public:
     bool operator==(const TopicRouteData& o) const;
     bool operator!=(const TopicRouteData& o) const { return !(*this == o); }
 
-    // RemotingSerializable.encode / decode 的等价物
+    // The equivalent of RemotingSerializable.encode / decode
     Bytes encode() const;
     static bool decode(const Bytes& data, TopicRouteData& out);
 

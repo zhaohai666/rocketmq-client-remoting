@@ -1,24 +1,24 @@
-// 用途：生产者/消费者按固定间隔向**所有** broker 发 HEART_BEAT，body 即
-// HeartbeatData 的 JSON。broker 据此注册/刷新 client channel、消费组订阅与
-// 生产者组，并创建重试 topic。
+// Purpose: producers/consumers send HEART_BEAT to **every** broker at a fixed interval, the body being the
+// JSON of HeartbeatData. The broker uses it to register/refresh the client channel, consumer group
+// subscriptions and producer groups, and to create retry topics.
 //
-// JSON 字段（与 fastjson2 序列化结果一致，键按字母序）：
+// JSON fields (identical to the fastjson2 serialization result, keys in alphabetical order):
 //   ProducerData  : groupName
 //   ConsumerData  : consumeFromWhere | consumeType | groupName | messageModel
 //                   | subscriptionDataSet | unitMode
 //   HeartbeatData : clientID | consumerDataSet | heartbeatFingerprint
 //                   | producerDataSet | withoutSub
 //
-// 注意两点与旧版 4.x 的差异（本仓库为 5.x 源码，已实测 fastjson2 输出确认）：
-//   1. ConsumerData **没有** consumeTimestamp / maxReconsumeTimes 字段；
-//   2. HeartbeatData 多了 heartbeatFingerprint / withoutSub 两个字段。
+// Two differences from the older 4.x protocol (this repository tracks 5.x sources; confirmed by measured fastjson2 output):
+//   1. ConsumerData has **no** consumeTimestamp / maxReconsumeTimes fields;
+//   2. HeartbeatData has two extra fields, heartbeatFingerprint / withoutSub.
 //
-// heartbeatFingerprint 的语义（见 broker ClientManageProcessor.heartBeat）：
-//   - fingerprint != 0 -> 走 heartBeatV2 路径（按指纹判断订阅是否变化，可配合
-//     withoutSub 跳过订阅上报）；
-//   - fingerprint == 0 -> 走 V1 路径，用完整的 subscriptionDataSet 注册消费者。
-// 因此**保持默认 0** 是最稳妥的选择：无需实现 computeHeartbeatFingerprint() 那套
-// 依赖 fastjson2 字段序的指纹算法，也能被 broker 正确注册。
+// Semantics of heartbeatFingerprint (see the broker's ClientManageProcessor.heartBeat):
+//   - fingerprint != 0 -> the heartBeatV2 path (the fingerprint decides whether the subscription
+//     changed, and withoutSub can skip reporting subscriptions);
+//   - fingerprint == 0 -> the V1 path, registering the consumer with the full subscriptionDataSet.
+// So **keeping the default 0** is the safest choice: it needs no computeHeartbeatFingerprint()
+// fingerprint algorithm depending on fastjson2 field order, and the broker still registers the client correctly.
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_HEARTBEAT_H
 #define ROCKETMQ_REMOTING_PROTOCOL_HEARTBEAT_H
 
@@ -46,11 +46,11 @@ struct MessageModel {
 
 struct ConsumeFromWhere {
     static const char* const CONSUME_FROM_LAST_OFFSET;  // "CONSUME_FROM_LAST_OFFSET"
-    // @Deprecated：与 CONSUME_FROM_LAST_OFFSET 同分支
+    // @Deprecated: same branch as CONSUME_FROM_LAST_OFFSET
     static const char* const CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST;  // "CONSUME_FROM_LAST_OFFSET_AND_FROM_MIN_WHEN_BOOT_FIRST"
-    // @Deprecated：与 CONSUME_FROM_LAST_OFFSET 同分支
+    // @Deprecated: same branch as CONSUME_FROM_LAST_OFFSET
     static const char* const CONSUME_FROM_MIN_OFFSET;  // "CONSUME_FROM_MIN_OFFSET"
-    // @Deprecated：与 CONSUME_FROM_LAST_OFFSET 同分支
+    // @Deprecated: same branch as CONSUME_FROM_LAST_OFFSET
     static const char* const CONSUME_FROM_MAX_OFFSET;  // "CONSUME_FROM_MAX_OFFSET"
     static const char* const CONSUME_FROM_FIRST_OFFSET;  // "CONSUME_FROM_FIRST_OFFSET"
     static const char* const CONSUME_FROM_TIMESTAMP;     // "CONSUME_FROM_TIMESTAMP"
@@ -106,7 +106,7 @@ public:
     void setSubscriptionDataSet(const std::vector<SubscriptionData>& s) {
         subscriptionDataSet = s;
     }
-    // 追加一个订阅数据
+    // Append one subscription data
     void addSubscriptionData(const SubscriptionData& sd) { subscriptionDataSet.push_back(sd); }
     bool isUnitMode() const { return unitMode; }
     void setUnitMode(bool m) { unitMode = m; }
@@ -126,9 +126,9 @@ public:
     std::string clientID;
     std::vector<ProducerData> producerDataSet;
     std::vector<ConsumerData> consumerDataSet;
-    // 0 = 走 broker 的 V1 注册路径（推荐）；非 0 才会触发 heartBeatV2 指纹优化
+    // 0 = the broker's V1 registration path (recommended); only a non-zero value triggers the heartBeatV2 fingerprint optimization
     int32_t heartbeatFingerprint = 0;
-    // 仅在 fingerprint != 0（V2 路径）时被 broker 读取
+    // Read by the broker only when fingerprint != 0 (the V2 path)
     bool withoutSub = false;
 
     HeartbeatData() = default;

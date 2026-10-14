@@ -1,4 +1,4 @@
-// 管理客户端实现。
+// Administration client implementation.
 #include "rocketmq/client/admin.h"
 
 #include <algorithm>
@@ -23,7 +23,7 @@ namespace {
 
 std::string i64str(int64_t v) { return std::to_string(v); }
 
-// 取响应 extFields 中的整数（缺失返回 fallback）
+// Read an integer from the response extFields (returns fallback when missing)
 int64_t extInt(const RemotingCommand& r, const std::string& key, int64_t fallback) {
     auto it = r.extFields.find(key);
     if (it == r.extFields.end() || it->second.empty()) return fallback;
@@ -34,12 +34,12 @@ int64_t extInt(const RemotingCommand& r, const std::string& key, int64_t fallbac
     }
 }
 
-// JsonValue 的等价文本（用于比较 DataVersion 是否变化）
+// Equivalent text of a JsonValue (used to compare whether DataVersion changed)
 std::string dvText(const JsonValue& v) { return v.isNull() ? std::string("null") : v.dump(); }
 
 }  // namespace
 
-// ---------------------------------------------------------------- 生命周期
+// ---------------------------------------------------------------- Lifecycle
 DefaultMQAdminExt::DefaultMQAdminExt(const std::string& instanceName)
     : instanceName_(instanceName) {}
 
@@ -52,7 +52,7 @@ void DefaultMQAdminExt::setNamesrvAddr(const std::string& addr) {
         size_t semi = addr.find(';', start);
         std::string piece = (semi == std::string::npos) ? addr.substr(start)
                                                         : addr.substr(start, semi - start);
-        // 去首尾空白
+        // Trim leading and trailing whitespace
         size_t b = 0, e = piece.size();
         while (b < e && (piece[b] == ' ' || piece[b] == '\t')) ++b;
         while (e > b && (piece[e - 1] == ' ' || piece[e - 1] == '\t')) --e;
@@ -116,7 +116,7 @@ MQClientInstance& DefaultMQAdminExt::requireClient() {
 
 MQClientInstance& DefaultMQAdminExt::getMQClientInstance() { return requireClient(); }
 
-// ---------------------------------------------------------------- 内部工具
+// ---------------------------------------------------------------- Internal utilities
 std::string DefaultMQAdminExt::firstBrokerAddr(MQClientInstance& client) {
     ClusterInfo ci = client.getBrokerClusterInfo();
     std::vector<std::string> addrs = ci.getBrokerAddrs();
@@ -141,7 +141,7 @@ std::vector<std::string> DefaultMQAdminExt::brokerAddrsOfCluster(MQClientInstanc
     return addrs;
 }
 
-// ---------------------------------------------------------------- Topic 管理
+// ---------------------------------------------------------------- Topic management
 void DefaultMQAdminExt::createTopic(const std::string& /*key*/, const std::string& newTopic,
                                     int32_t queueNum, int32_t /*topicSysFlag*/) {
     Validators::checkTopic(newTopic);
@@ -375,8 +375,8 @@ TopicStatsTable DefaultMQAdminExt::examineTopicStatsByBroker(const std::string& 
     return t;
 }
 
-// ---------------------------------------- 批量配置 / 单元化
-// GroupForbidden：UPDATE_AND_GET_GROUP_FORBIDDEN(353) 的响应体
+// ---------------------------------------- Batch configuration / unitization
+// GroupForbidden: response body of UPDATE_AND_GET_GROUP_FORBIDDEN(353)
 bool GroupForbidden::decode(const Bytes& data, GroupForbidden& out) {
     JsonValue v;
     if (!RemotingSerializable::decode(data, v) || !v.isObject()) return false;
@@ -388,8 +388,8 @@ bool GroupForbidden::decode(const Bytes& data, GroupForbidden& out) {
 
 void DefaultMQAdminExt::createAndUpdateTopicConfigList(const std::string& brokerAddr,
                                                       const std::vector<TopicConfig>& configs) {
-    // UPDATE_AND_CREATE_TOPIC_LIST(18)：custom header 为**空**（topic 名在 body 里做
-    // 授权资源），body 是 CreateTopicListRequestBody JSON，即 {"topicConfigList":[...]}。
+    // UPDATE_AND_CREATE_TOPIC_LIST(18): the custom header is **empty** (the topic name acts as the
+    // authorized resource in the body), and the body is CreateTopicListRequestBody JSON, i.e. {"topicConfigList":[...]}.
     if (configs.empty()) {
         throw MQClientException("createAndUpdateTopicConfigList: empty topicConfigList");
     }
@@ -406,8 +406,8 @@ void DefaultMQAdminExt::createAndUpdateTopicConfigList(const std::string& broker
 
 void DefaultMQAdminExt::createAndUpdateSubscriptionGroupConfigList(
     const std::string& brokerAddr, const std::vector<SubscriptionGroupConfig>& configs) {
-    // UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225)：与 topic-list 同形，但 body key 是
-    // `groupConfigList`（单组版 200 的 body 是裸 SubscriptionGroupConfig 对象）。
+    // UPDATE_AND_CREATE_SUBSCRIPTIONGROUP_LIST(225): same shape as the topic-list one, but the body key is
+    // `groupConfigList` (the single-group version 200 has a bare SubscriptionGroupConfig object as its body).
     if (configs.empty()) {
         throw MQClientException(
             "createAndUpdateSubscriptionGroupConfigList: empty groupConfigList");
@@ -428,9 +428,9 @@ void DefaultMQAdminExt::createStaticTopic(const std::string& brokerAddr,
                                          const std::string& defaultTopic,
                                          const TopicConfig& config,
                                          const JsonValue& mappingDetail, bool force) {
-    // UPDATE_AND_CREATE_STATIC_TOPIC(513)：header 复用 CreateTopicRequestHeader 字段
-    // （bool 转 "true"/"false" 小写字符串），body 是 TopicQueueMappingDetail 的 JSON 文档
-    // （单元化静态 topic 的映射信息）。
+    // UPDATE_AND_CREATE_STATIC_TOPIC(513): the header reuses CreateTopicRequestHeader fields
+    // (bool rendered as lowercase "true"/"false" strings), and the body is the TopicQueueMappingDetail JSON document
+    // (the mapping information of a unitized static topic).
     PropertyMap ext;
     ext["topic"] = config.topicName;
     ext["defaultTopic"] = defaultTopic;
@@ -489,9 +489,9 @@ bool DefaultMQAdminExt::resumeCheckHalfMessage(const std::string& brokerAddr,
 
 void DefaultMQAdminExt::createOrUpdateOrderConf(const std::string& key,
                                                const std::string& value, bool isCluster) {
-    // **不是独立请求**：NameServer KV namespace=ORDER_TOPIC_CONFIG 上的读改写。
-    // 集群模式把 value 原样写入；非集群模式把存储值当作 ";" 分隔的 "key:value" 列表，
-    // 替换 key 匹配的条目后整体写回（一次只动单个 topic，不动整个集群）。
+    // **Not a separate request**: a read-modify-write on the NameServer KV namespace=ORDER_TOPIC_CONFIG.
+    // Cluster mode writes the value verbatim; non-cluster mode treats the stored value as a ";" separated "key:value" list,
+    // replaces the entry whose key matches and writes the whole list back (one topic at a time, not the entire cluster).
     if (key.empty() || value.empty()) {
         throw MQClientException("createOrUpdateOrderConf: key/value required");
     }
@@ -511,7 +511,7 @@ void DefaultMQAdminExt::createOrUpdateOrderConf(const std::string& key,
         size_t semi = oldValue.find(';', start);
         std::string entry = (semi == std::string::npos) ? oldValue.substr(start)
                                                         : oldValue.substr(start, semi - start);
-        // 去首尾空白
+        // Trim leading and trailing whitespace
         size_t b = 0, e = entry.size();
         while (b < e && (entry[b] == ' ' || entry[b] == '\t')) ++b;
         while (e > b && (entry[e - 1] == ' ' || entry[e - 1] == '\t')) --e;
@@ -540,10 +540,10 @@ void DefaultMQAdminExt::createOrUpdateOrderConf(const std::string& key,
     putKvConfig(MixAll::NAMESPACE_ORDER_TOPIC_CONFIG, key, merged);
 }
 
-// ---------------------------------------- 运维清理
+// ---------------------------------------- Operational cleanup
 void DefaultMQAdminExt::cleanExpiredConsumerQueue(const std::string& brokerAddr,
                                                  int32_t timeHours) {
-    // CLEAN_EXPIRED_CONSUMEQUEUE(306)：broker 丢弃 `time` 小时前的 consume-queue 条目。
+    // CLEAN_EXPIRED_CONSUMEQUEUE(306): the broker drops consume-queue entries older than `time` hours.
     PropertyMap ext;
     ext["time"] = i64str(timeHours);
     requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::CLEAN_EXPIRED_CONSUMEQUEUE, ext,
@@ -564,7 +564,7 @@ std::vector<std::string> DefaultMQAdminExt::cleanExpiredConsumerQueueByAddr(
 }
 
 void DefaultMQAdminExt::deleteExpiredCommitLog(const std::string& brokerAddr, int32_t timeHours) {
-    // DELETE_EXPIRED_COMMITLOG(329)：broker 删除 `time` 小时前的 commit-log 文件。
+    // DELETE_EXPIRED_COMMITLOG(329): the broker deletes commit-log files older than `time` hours.
     PropertyMap ext;
     ext["time"] = i64str(timeHours);
     requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::DELETE_EXPIRED_COMMITLOG, ext,
@@ -585,17 +585,17 @@ std::vector<std::string> DefaultMQAdminExt::deleteExpiredCommitLogByAddr(
 }
 
 void DefaultMQAdminExt::cleanUnusedTopicByAddr(const std::string& brokerAddr) {
-    // CLEAN_UNUSED_TOPIC(316)：**单请求**，由 broker 自行清理未使用 topic。客户端绝不
-    // 遍历 topic 表逐个删——broker 自建的 BenchmarkTest、重试/死信 topic 会被 broker
-    // 以 SYSTEM_ERROR 拒绝。
+    // CLEAN_UNUSED_TOPIC(316): a **single request**; the broker cleans unused topics itself. The client must never
+    // iterate the topic table and delete one by one -- broker-created BenchmarkTest and retry/DLQ topics are rejected by the broker
+    // with SYSTEM_ERROR.
     requireClient().invokeSync(vipAddr(brokerAddr), RequestCode::CLEAN_UNUSED_TOPIC, PropertyMap(),
                                Bytes(), false, timeoutMillis_);
 }
 
 JsonValue DefaultMQAdminExt::queryConsumeTimeSpan(const std::string& topic,
                                                  const std::string& group) {
-    // QUERY_CONSUME_TIME_SPAN(303)：按 topic 路由扇出到每个 master，聚合响应 body 里
-    // consumeTimeSpanSet JSON 数组。
+    // QUERY_CONSUME_TIME_SPAN(303): fans out to every master along the topic route and aggregates the
+    // consumeTimeSpanSet JSON array from the response bodies.
     TopicRouteData route = examineTopicRoute(topic);
     JsonValue spans = JsonValue::makeArray();
     for (const BrokerData& bd : route.brokerDatas) {
@@ -626,7 +626,7 @@ void DefaultMQAdminExt::setMessageRequestMode(const std::string& brokerAddr,
                                              const std::string& topic,
                                              const std::string& consumerGroup,
                                              const std::string& mode, int32_t popShareQueueNum) {
-    // SET_MESSAGE_REQUEST_MODE(401)：在 POP 与 Pull 模式间切换消费组（单元化场景）。
+    // SET_MESSAGE_REQUEST_MODE(401): switches a consumer group between POP and Pull modes (unitized scenario).
     PropertyMap ext;
     ext["topic"] = topic;
     ext["consumerGroup"] = consumerGroup;
@@ -636,7 +636,7 @@ void DefaultMQAdminExt::setMessageRequestMode(const std::string& brokerAddr,
                                Bytes(), false, timeoutMillis_);
 }
 
-// ---------------------------------------- NameServer 配置（318/319）
+// ---------------------------------------- NameServer configuration (318/319)
 void DefaultMQAdminExt::updateNameServerConfig(const PropertyMap& properties,
                                               int32_t timeoutMillis) {
     std::string text = MixAll::properties2String(properties);
@@ -663,8 +663,8 @@ void DefaultMQAdminExt::updateNameServerConfig(const PropertyMap& properties,
 
 std::map<std::string, PropertyMap> DefaultMQAdminExt::getNameServerConfig(
     const std::vector<std::string>& namesrvAddrs, int32_t timeoutMillis) {
-    // GET_NAMESRV_CONFIG(319)：逐个 NameServer 查询，body 是 properties 文本；
-    // 返回 {地址: properties 字典}。
+    // GET_NAMESRV_CONFIG(319): queried against each NameServer, the body is properties text;
+    // returning {address: properties dictionary}.
     MQClientInstance& client = requireClient();
     std::vector<std::string> targets =
         namesrvAddrs.empty() ? client.nameServerAddrs() : namesrvAddrs;
@@ -679,7 +679,7 @@ std::map<std::string, PropertyMap> DefaultMQAdminExt::getNameServerConfig(
     return result;
 }
 
-// ---------------------------------------------------------------- 集群 / Broker
+// ---------------------------------------------------------------- Cluster / Broker
 ClusterInfo DefaultMQAdminExt::fetchBrokerClusterInfo() {
     return requireClient().getBrokerClusterInfo();
 }
@@ -696,8 +696,8 @@ KVTable DefaultMQAdminExt::fetchBrokerRuntimeStats(const std::string& brokerAddr
 
 PropertyMap DefaultMQAdminExt::getBrokerConfig(const std::string& brokerAddr,
                                                int32_t timeoutMillis) {
-    // ⚠ 响应体是 **properties 文本**（"k=v\n"），不是 JSON/KVTable。
-    // 早期实现把它当 KVTable JSON 解析，真实 broker 上必然失败。
+    // ⚠ The response body is **properties text** ("k=v\n"), not JSON/KVTable.
+    // The early implementation parsed it as KVTable JSON, which always fails against a real broker.
     RemotingCommand response = requireClient().invokeSync(
         vipAddr(brokerAddr), RequestCode::GET_BROKER_CONFIG, PropertyMap(), Bytes(), false,
         timeoutMillis < 0 ? timeoutMillis_ : timeoutMillis);
@@ -815,7 +815,7 @@ bool DefaultMQAdminExt::getKvConfig(const std::string& ns, const std::string& ke
                 outValue.clear();
                 return false;
             }
-            // 该 NS 明确返回"没有"，直接返回 false（不再试下一个）
+            // This NS explicitly answered "none": return false right away (do not try the next one)
             return false;
         } catch (const std::exception& e) {
             lastError = e.what();
@@ -861,7 +861,7 @@ KVTable DefaultMQAdminExt::getKvListByNamespace(const std::string& ns) {
     throw MQClientException("all name servers unreachable: " + lastError);
 }
 
-// ---------------------------------------------------------------- 订阅组管理
+// ---------------------------------------------------------------- Subscription group management
 void DefaultMQAdminExt::createAndUpdateSubscriptionGroupConfig(
     const std::string& addr, const SubscriptionGroupConfig& config) {
     Bytes body = config.encode();
@@ -936,7 +936,7 @@ SubscriptionGroupWrapper DefaultMQAdminExt::getAllSubscriptionGroup(const std::s
 
         auto totalIt = response.extFields.find("totalGroupNum");
         if (totalIt == response.extFields.end() || totalIt->second.empty()) {
-            // 老 broker：一次返回全部
+            // Old broker: everything in one response
             break;
         }
         int64_t total = 0;
@@ -986,7 +986,7 @@ void DefaultMQAdminExt::deleteSubscriptionGroup(const std::string& addr,
                                false, timeoutMillis_);
 }
 
-// ---------------------------------------------------------------- 连接信息
+// ---------------------------------------------------------------- Connection information
 ConsumerConnection DefaultMQAdminExt::examineConsumerConnectionInfo(
     const std::string& consumerGroup, const std::string& brokerAddr) {
     MQClientInstance& client = requireClient();
@@ -1042,7 +1042,7 @@ GetConsumerListByGroupResponseBody DefaultMQAdminExt::getConsumerListByGroup(
     return client.getConsumerListByGroup(consumerGroup, addr);
 }
 
-// ---------------------------------------------------------------- 消费统计
+// ---------------------------------------------------------------- Consumer statistics
 ConsumeStats DefaultMQAdminExt::examineConsumeStats(const std::string& brokerAddr,
                                                     const std::string& consumerGroup,
                                                     const std::string& topic,
@@ -1309,7 +1309,7 @@ void DefaultMQAdminExt::cloneGroupOffset(const std::string& brokerAddr,
                                false, timeoutMillis_);
 }
 
-// ---------------------------------------------------------------- Offset 管理
+// ---------------------------------------------------------------- Offset management
 int64_t DefaultMQAdminExt::maxOffset(const MessageQueue& mq) {
     return requireClient().getMaxOffset(mq);
 }
@@ -1397,8 +1397,8 @@ std::map<MessageQueue, int64_t> DefaultMQAdminExt::invokeBrokerToResetOffset(
 std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByTimestamp(
     const std::string& topic, const std::string& group, int64_t timestamp, bool isForce,
     const std::string& clusterName, bool isCpp) {
-    // 注意：这里**不再**走"逐队列 searchOffset + updateConsumerOffset"的旧本地实现——
-    // 那不会同步在线消费者，也不会做 broker 端一致性校验。
+    // This does **not** use the old local implementation of "per-queue searchOffset + updateConsumerOffset" --
+    // that would neither sync online consumers nor run broker-side consistency validation.
     std::string routeTopic = topic;
     std::string wheelTimer = std::string(MixAll::SYSTEM_TOPIC_PREFIX) + "wheel_timer";
     if (!topic.empty() && (MixAll::isLmq(topic) || topic == wheelTimer) && !clusterName.empty()) {
@@ -1477,7 +1477,7 @@ std::map<MessageQueue, int64_t> DefaultMQAdminExt::resetOffsetByTimestampOld(
     return result;
 }
 
-// ---------------------------------------------------------------- 消息查询
+// ---------------------------------------------------------------- Message query
 std::vector<MessageExt> DefaultMQAdminExt::queryMessage(const std::string& topic,
                                                         const std::string& key, int32_t maxNum,
                                                         int64_t begin, int64_t end) {
@@ -1556,7 +1556,7 @@ QueryConsumeQueueResponseBody DefaultMQAdminExt::queryConsumeQueue(
     return body;
 }
 
-// ---------------------------------------- 直接消费探针（309）
+// ---------------------------------------- Direct consume probe (309)
 PropertyMap DefaultMQAdminExt::buildConsumeMessageDirectlyExtFields(
     const std::string& topic, const std::string& consumerGroup, const std::string& clientId,
     const std::string& msgId) {

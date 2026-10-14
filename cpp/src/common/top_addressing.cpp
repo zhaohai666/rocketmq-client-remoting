@@ -19,7 +19,7 @@ std::string trimCopy(const std::string& s) {
     return s.substr(b, e - b);
 }
 
-// 从 "http://host:port/path" 拆出 host / port / path。port 缺省 80，path 缺省 "/"。
+// Split "http://host:port/path" into host / port / path. port defaults to 80, path to "/".
 bool splitHttpUrl(const std::string& url, std::string& host, std::string& port,
                   std::string& path) {
     static const std::string kScheme = "http://";
@@ -165,7 +165,7 @@ int DefaultTopAddressing::httpGet(const std::string& host, const std::string& po
         return -1;
     }
 
-    // 收发整体一个超时预算（简化：SO_RCVTIMEO/SO_SNDTIMEO 按 timeoutMillis）
+    // One timeout budget for the whole exchange (simplified: SO_RCVTIMEO/SO_SNDTIMEO from timeoutMillis)
     timeval tv{};
     tv.tv_sec = timeoutMillis / 1000;
     tv.tv_usec = (timeoutMillis % 1000) * 1000;
@@ -192,11 +192,11 @@ int DefaultTopAddressing::httpGet(const std::string& host, const std::string& po
         const int n = ::recv(sock, buf, sizeof(buf), 0);
         if (n <= 0) break;
         raw.append(buf, static_cast<size_t>(n));
-        if (raw.size() > 1024u * 1024u) break;   // 1MB 上限，防异常服务器拖死客户端
+        if (raw.size() > 1024u * 1024u) break;   // 1MB cap, so a broken server cannot drag the client down
     }
     netcompat::closeSocket(sock);
 
-    // 解析状态行 + 头，取 body
+    // Parse the status line and headers, then take the body
     const size_t headEnd = raw.find("\r\n\r\n");
     if (headEnd == std::string::npos) return -1;
     const std::string statusLine = raw.substr(0, raw.find("\r\n"));
@@ -209,7 +209,7 @@ int DefaultTopAddressing::httpGet(const std::string& host, const std::string& po
         }
     }
     body = raw.substr(headEnd + 4);
-    // HTTP/1.1 chunked：这里请求用 HTTP/1.0（服务器不会分块），防御性再剥一次
+    // HTTP/1.1 chunked: the request here uses HTTP/1.0 (so the server does not chunk), stripped once more defensively
     if (raw.find("Transfer-Encoding: chunked") != std::string::npos) {
         std::string out;
         size_t i = 0;

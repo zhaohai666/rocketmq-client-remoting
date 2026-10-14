@@ -27,7 +27,7 @@ int64_t nowMillis() {
 
 std::mt19937_64 makeRng() {
     std::random_device rd;
-    // 无硬件熵源时 random_device 可能退化为确定性序列，故再掺入高精度时钟。
+    // Without a hardware entropy source random_device can degrade to a deterministic sequence, so a high-resolution clock is mixed in.
     std::seed_seq seq{rd(), rd(),
                       static_cast<unsigned>(std::chrono::high_resolution_clock::now()
                                                 .time_since_epoch()
@@ -242,7 +242,7 @@ void RequestFutureHolder::shutdownScheduledTask() {
     if (worker.joinable()) worker.join();
 }
 
-// ---------------------------------------------------------------- 便利函数
+// ---------------------------------------------------------------- Convenience functions
 
 std::string createCorrelationId() {
     return randomUuid();
@@ -273,7 +273,7 @@ bool isReplyMessage(const Message& msg) {
     return msg.getProperty(MessageConst::PROPERTY_MESSAGE_TYPE) == MixAll::REPLY_MESSAGE_FLAG;
 }
 
-// ---------------------------------------------------------------- 326 处理器
+// ---------------------------------------------------------------- Code 326 processor
 
 std::optional<RemotingCommand> processReplyMessage(const RemotingCommand& cmd,
                                                    const std::string& addr) {

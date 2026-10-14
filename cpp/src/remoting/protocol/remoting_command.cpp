@@ -1,7 +1,7 @@
-// 线格式与编解码（已对真实 5.5.1 集群验证）：
-//   - 线格式：totalLength(4) | headerLength(高 8 位放序列化类型, 4) | header | body
-//   - header(JSON)：RemotingSerializable JSON 编码；解码兼容 5.x 把 language 写成枚举名字符串
-//   - header(ROCKETMQ)：RocketMQSerializable 私有二进制编码
+// Wire format and codec (verified against a real 5.5.1 cluster):
+//   - wire layout: totalLength(4) | headerLength(high 8 bits carry the serialize type, 4) | header | body
+//   - header(JSON): RemotingSerializable JSON encoding; decoding also accepts 5.x replies that write language as an enum name string
+//   - header(ROCKETMQ): RocketMQSerializable private binary encoding
 #include "rocketmq/remoting/protocol/remoting_command.h"
 
 #include <atomic>
@@ -19,12 +19,12 @@ constexpr const char* SERIALIZE_TYPE_PROPERTY = "rocketmq.serialize.type";
 constexpr const char* SERIALIZE_TYPE_ENV = "ROCKETMQ_SERIALIZE_TYPE";
 constexpr const char* REMOTING_VERSION_KEY = "rocketmq.remoting.version";
 
-// 协议 `MQVersion.CURRENT_VERSION`（= `Version.V5_5_1.ordinal()`，本机 5.5.1 集群）。
-// broker 按心跳/请求里记录的客户端版本决定能否把管理请求回调到客户端：
-// `AdminBrokerProcessor#callConsumer`（307）低于 `V3_1_8_SNAPSHOT`（ordinal 62）时
-// 直接回 "The Consumer <x> Version <0> too low to finish"；`Broker2Client#getConsumeStatus`
-// （223→221）低于 `V3_0_7_SNAPSHOT`（ordinal 28）时回 "the client does not support this
-// feature. version=V3_0_7_SNAPSHOT"，`resetOffset` 的在线分支同样按 28 跳过。
+// Protocol `MQVersion.CURRENT_VERSION` (= `Version.V5_5_1.ordinal()`, the local 5.5.1 cluster).
+// The broker uses the client version carried in heartbeats/requests to decide whether it may call the client back:
+// `AdminBrokerProcessor#callConsumer` (307) answers
+// "The Consumer <x> Version <0> too low to finish" straight away below `V3_1_8_SNAPSHOT` (ordinal 62); `Broker2Client#getConsumeStatus`
+// (223->221) answers "the client does not support this
+// feature. version=V3_0_7_SNAPSHOT" below `V3_0_7_SNAPSHOT` (ordinal 28), and the online branch of `resetOffset` skips on the same 28 threshold.
 constexpr int32_t CURRENT_VERSION = 515;
 
 std::atomic<int32_t>& opaqueCounter() {
@@ -32,8 +32,8 @@ std::atomic<int32_t>& opaqueCounter() {
     return counter;
 }
 
-// 全局序列化类型配置：环境变量 ROCKETMQ_SERIALIZE_TYPE / rocketmq.serialize.type，
-// 取 "ROCKETMQ" 走二进制，否则 JSON。
+// Global serialize-type config: env ROCKETMQ_SERIALIZE_TYPE / rocketmq.serialize.type,
+// "ROCKETMQ" selects the binary encoding, anything else JSON.
 uint8_t loadSerializeTypeConfig() {
     const char* v = std::getenv(SERIALIZE_TYPE_ENV);
     if (v == nullptr) v = std::getenv(SERIALIZE_TYPE_PROPERTY);
@@ -60,7 +60,7 @@ int32_t loadVersionConfig() {
 
 void setCmdVersion(RemotingCommand& cmd) { cmd.version = loadVersionConfig(); }
 
-// language 名称 -> 码（兼容 5.x 把 language 序列化为枚举名字符串）
+// language name -> code (accepts 5.x serializing language as an enum name string)
 uint8_t languageNameToCode(const std::string& name) {
     std::string up = name;
     for (auto& c : up) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -82,7 +82,7 @@ uint8_t languageNameToCode(const std::string& name) {
 
 }  // namespace
 
-// ---------------------------------------------------------------- 构造与工厂
+// ---------------------------------------------------------------- Construction and factories
 
 RemotingCommand::RemotingCommand(int32_t code_, std::shared_ptr<CommandCustomHeader> header,
                                  const std::string& remark_, int32_t opaque_, int32_t flag_,
@@ -142,7 +142,7 @@ uint8_t RemotingCommand::getSerializeTypeConfig() { return serializeTypeConfig()
 
 int32_t RemotingCommand::nextOpaque() { return opaqueCounter().fetch_add(1); }
 
-// ---------------------------------------------------------------- 头部展开
+// ---------------------------------------------------------------- Header expansion
 
 void RemotingCommand::makeCustomHeaderToNet() {
     if (customHeader) {
@@ -172,7 +172,7 @@ JsonValue RemotingCommand::toJsonObject() const {
     return obj;
 }
 
-// ---------------------------------------------------------------- 编解码
+// ---------------------------------------------------------------- Encoding and decoding
 
 Bytes RemotingCommand::headerEncode() {
     makeCustomHeaderToNet();
@@ -195,7 +195,7 @@ Bytes RemotingCommand::encode() {
     int32_t length = 4;
     Bytes headerData = headerEncode();
     length += static_cast<int32_t>(headerData.size());
-    // body 存在判定：显式置 hasBody，或 body 非空（与协议 body 为 null 时不带的语义一致）
+    // Body presence: hasBody set explicitly, or a non-empty body (matching the protocol, which omits body when it is null)
     bool withBody = hasBody || !body.empty();
     if (withBody) {
         length += static_cast<int32_t>(body.size());

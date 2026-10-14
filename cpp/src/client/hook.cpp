@@ -1,4 +1,4 @@
-// 客户端钩子基类实现（仅析构函数需要 TU 定义，避免跨 TU 的 ODR 问题）。
+// Client hook base implementations (only the destructors need a TU definition, avoiding cross-TU ODR problems).
 #include "rocketmq/client/hook.h"
 
 namespace rocketmq {

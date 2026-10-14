@@ -1,13 +1,13 @@
-// 提供：连接管理（惰性建连 + 复用 + TCP_NODELAY）、invokeSync / invokeAsync /
-// invokeOneway、opaque -> 响应回调分发、超时控制、连接状态探活。
+// Provides: connection management (lazy connect + reuse + TCP_NODELAY), invokeSync / invokeAsync /
+// invokeOneway, opaque -> response callback dispatch, timeout control, connection liveness probing.
 //
-// 线程模型（读线程每连接一个）：
-//   - 调用线程：encode -> 加写锁 -> sendall；随后在 invokeSync 里等条件变量
-//   - 读线程：select(300ms) -> recv -> 按 totalLength(4) 分帧 -> decode ->
-//             按 opaque 从响应表取出 future -> 唤醒调用线程 / 触发回调
+// Threading model (one read thread per connection):
+//   - calling thread: encode -> take the write lock -> sendall; then wait on a condition variable inside invokeSync
+//   - read thread: select(300ms) -> recv -> frame by totalLength(4) -> decode ->
+//             pull the future out of the response table by opaque -> wake the calling thread / fire the callback
 //
-// 线格式：totalLength(4) | headerLength(4) | header | body
-//   totalLength = 4 + headerLength + bodyLength（即首 4 字节之后的所有字节数）
+// Wire format: totalLength(4) | headerLength(4) | header | body
+//   totalLength = 4 + headerLength + bodyLength (i.e. every byte after the first 4)
 #ifndef ROCKETMQ_REMOTING_REMOTING_CLIENT_H
 #define ROCKETMQ_REMOTING_REMOTING_CLIENT_H
 
@@ -35,11 +35,11 @@ struct TlsOptions {
 
 struct InvokeError {
     enum class Kind {
-        NONE = 0,          // 没有错误（响应已送达，response 有效）
-        TIMEOUT,           // 对应 RemotingTimeoutException
-        SEND_REQUEST,      // 对应 RemotingSendRequestException
-        CONNECT,           // 对应 RemotingConnectException
-        TOO_MUCH_REQUEST,  // 对应 RemotingTooMuchRequestException（唯一不重试的传输错误）
+        NONE = 0,          // No error (the response arrived, response is valid)
+        TIMEOUT,           // Corresponds to RemotingTimeoutException
+        SEND_REQUEST,      // Corresponds to RemotingSendRequestException
+        CONNECT,           // Corresponds to RemotingConnectException
+        TOO_MUCH_REQUEST,  // Corresponds to RemotingTooMuchRequestException (the only transport error that is not retried)
         RESPONSE_FAILED,
         OTHER,
     };
@@ -66,7 +66,7 @@ public:
 
     static constexpr int32_t MAX_FRAME_LENGTH = 16 * 1024 * 1024;
 
-    // 默认 3s 建连、15s 调用超时
+    // Defaults: 3s connect timeout, 15s invoke timeout
     explicit RemotingClient(int32_t connectTimeoutMillis = 3000,
                             int32_t invokeTimeoutMillis = 15000);
     ~RemotingClient();
@@ -74,10 +74,10 @@ public:
     RemotingClient(const RemotingClient&) = delete;
     RemotingClient& operator=(const RemotingClient&) = delete;
 
-    // opaque 由调用方负责唯一性——用 RemotingCommand::createRequestCommand() 创建即可
-    // （其内部按全局计数器分配）。传输层**不会**把 opaque==0 当成"未设置"来改写，
-    // 因为计数器从 0 起算，第一个请求的 opaque 合法值就是 0。仅当 opaque 与**在途**
-    // 请求冲突时，传输层才会改分配一个新的并写回 request.opaque。
+    // opaque uniqueness is the caller's responsibility — creating the request with RemotingCommand::createRequestCommand()
+    // is enough (it allocates from a global counter). The transport does **not** rewrite an opaque==0 as "unset",
+    // because the counter starts at 0, so 0 is a legal opaque for the very first request. The transport only
+    // reallocates a fresh value and writes it back to request.opaque when opaque collides with an **in-flight** request.
     RemotingCommand invokeSync(const std::string& addr, RemotingCommand& request,
                                int32_t timeoutMillis = -1);
 
@@ -86,12 +86,12 @@ public:
 
     void invokeOneway(const std::string& addr, RemotingCommand& request);
 
-    // ---- broker 主动请求处理 ----
-    // 注册/注销按 requestCode 索引的请求处理器。
+    // ---- handling of broker-initiated requests ----
+    // Register/unregister request processors indexed by requestCode.
     //
-    // 只有**请求类型且不在本地在途响应表里**的命令才会派发到这里（典型场景：
-    // broker 发来的事务回查 CHECK_TRANSACTION_STATE=39），不会影响现有的
-    // invokeSync / invokeAsync 响应分发。handler 在读线程里被调用，需自保证线程安全。
+    // Only commands that are **of request type and not present in the local in-flight response table** are
+    // dispatched here (typical case: the transaction check-back CHECK_TRANSACTION_STATE=39 sent by the broker);
+    // existing invokeSync / invokeAsync response dispatch is unaffected. The handler runs on the read thread and must be thread safe.
     void registerProcessor(int32_t requestCode, RequestProcessor handler);
     void unregisterProcessor(int32_t requestCode);
 
@@ -100,37 +100,37 @@ public:
 
     void setTlsEnable(bool enable);
     bool tlsEnable() const;
-    // 设置 TLS 细化选项（caCert/clientCert/clientKey/serverName）。必须在首条连接建立前
-    // 调用；caCert 非空时 setTlsEnable(true) 会创建严格校验的 SSL_CTX（证书链 + 主机名）。
-    // 若 TLS 已开启则立即重建 ctx（options 变了 ctx 必须跟着变），失败抛 RemotingException。
+    // Set fine-grained TLS options (caCert/clientCert/clientKey/serverName). Must be called before the first
+    // connection is established; when caCert is non-empty, setTlsEnable(true) creates a strictly validating SSL_CTX (certificate chain + hostname).
+    // If TLS is already enabled, ctx is rebuilt immediately (a change of options must change ctx), and a failure throws RemotingException.
     void setTlsOptions(const TlsOptions& options);
 
     void setSocksProxy(const SocksProxyConfig& proxy);
-    // 是否已配置代理（测试/诊断用）
+    // Whether a proxy is configured (for tests/diagnostics)
     bool socksProxyEnabled() const;
 
     void setEnableReconnectForGoAway(bool enable);
     bool enableReconnectForGoAway() const;
 
-    // ---- 连接管理 ----
+    // ---- connection management ----
     bool isChannelWritable(const std::string& addr) const;
     void closeChannel(const std::string& addr);
 
-    // 预留：NameServer 地址列表由上层（MQClientInstance）维护
+    // Reserved: the name server address list is maintained by the upper layer (MQClientInstance)
     void updateNameServerAddressList(const std::vector<std::string>& addrs);
 
-    // 关闭全部连接并回收读线程；可重复调用
+    // Close all connections and reclaim the read threads; may be called repeatedly
     void shutdown();
 
     int32_t connectTimeoutMillis() const { return connectTimeoutMillis_; }
     int32_t invokeTimeoutMillis() const { return invokeTimeoutMillis_; }
 
-    // 当前活跃连接数（测试/诊断用）
+    // Number of currently active connections (for tests/diagnostics)
     size_t connectionCount() const;
 
     size_t pendingRequestCount() const;
 
-    // "host:port" 拆分，支持 IPv6 的 [::1]:10911 形式
+    // Split "host:port", supporting the IPv6 form [::1]:10911
     static void parseAddress(const std::string& addr, std::string& host, std::string& port);
 
 private:

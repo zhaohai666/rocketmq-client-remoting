@@ -1,4 +1,4 @@
-// 队列选择器实现：按哈希选择 / 随机选择。
+// Queue selector implementation: hash-based selection / random selection.
 #include "rocketmq/client/result.h"
 
 #include <cstdint>
@@ -15,12 +15,12 @@ MessageQueue SelectMessageQueueByHash::select(const std::vector<MessageQueue>& m
     if (mqs.empty()) {
         throw MQClientException("no message queue");
     }
-    // arg 的哈希取绝对值后对队列数取模。
-    // 哈希用 String.hashCode 多项式滚动语义（javaStringHash）：它是确定性的，
-    // 可跨进程复现，适合作分片键；不采用进程内随机化哈希。
+    // Take the absolute value of arg's hash, then modulo the queue count.
+    // The hash uses the String.hashCode polynomial rolling semantics (javaStringHash): it is deterministic
+    // and reproducible across processes, which suits a shard key; no per-process randomised hashing.
     int32_t hashCode = javaStringHash(arg);
     if (hashCode < 0) {
-        hashCode = hashCode == INT32_MIN ? 0 : -hashCode;  // 避免 INT32_MIN 取负溢出
+        hashCode = hashCode == INT32_MIN ? 0 : -hashCode;  // avoid negation overflow on INT32_MIN
     }
     size_t index = static_cast<size_t>(hashCode) % mqs.size();
     return mqs[index];
@@ -37,9 +37,9 @@ MessageQueue SelectMessageQueueByRandom::select(const std::vector<MessageQueue>&
     return mqs[dist(rng)];
 }
 
-// SelectMessageQueueByMachineRoom 在本 SDK 中是未实现的桩：MessageQueue 是值类型、
-// 无法表达"返回 null 让下游空指针"，这里直接抛 —— 用它发送必然失败，只是失败得更早、
-// 信息更明确。
+// SelectMessageQueueByMachineRoom is an unimplemented stub in this SDK: MessageQueue is a value type, so
+// "return null and let downstream hit a null pointer" cannot be expressed; this throws instead -- sending with it must fail,
+// just earlier and with a clearer message.
 MessageQueue SelectMessageQueueByMachineRoom::select(const std::vector<MessageQueue>& mqs,
                                                      const Message& /*msg*/,
                                                      const std::string& /*arg*/) const {

@@ -1,21 +1,21 @@
 #pragma once
 
-// Windows / POSIX socket 兼容层。
+// Windows / POSIX socket compatibility layer.
 //
-// 目的：让 util_all、remoting_client 等所有需要 socket 的代码共用同一套原语，
-// 并把两平台的差异集中在这里处理，避免每个文件各写一遍（写漏一处就是一个只能在
-// Windows 上暴露的编译错误）。
+// Purpose: let util_all, remoting_client and every other socket-using code share one set of primitives,
+// and handle the platform differences here in a single place instead of rewriting them per file (a missing
+// spot becomes a compile error that only shows up on Windows).
 //
-// 集中处理的差异：
-//   1. **NOMINMAX 必须在任何 windows.h 之前定义**。否则 windef.h 会定义 min/max
-//      宏，把代码里所有 std::min/std::max 展开成 `std::((a)<(b)?(a):(b))` 而编译失败。
-//   2. socket 句柄类型：Windows 是 `SOCKET`(UINT_PTR)，POSIX 是 `int`；
-//      对应"无效值"分别是 `INVALID_SOCKET` 与 `-1`。**不能互转 int**（64 位下截断）。
-//   3. 关闭：Windows 用 `closesocket`，POSIX 用 `close`。
-//   4. `socklen_t` 在 Windows 上不存在，统一用 `socklen_type`。
-//   5. SIGPIPE：POSIX 上向已关闭连接写入默认会**杀掉进程**，用 MSG_NOSIGNAL 或在
-//      建连后设置 SO_NOSIGPIPE。
-//   6. `WSAStartup` 必须在任何 winsock 调用之前执行且进程内只需一次。
+// Differences handled centrally:
+//   1. **NOMINMAX must be defined before any windows.h**. Otherwise windef.h defines min/max
+//      macros that expand every std::min/std::max into `std::((a)<(b)?(a):(b))` and compilation fails.
+//   2. Socket handle type: Windows uses `SOCKET`(UINT_PTR), POSIX uses `int`;
+//      the corresponding "invalid value" is `INVALID_SOCKET` and `-1`. **Never round-trip through int** (truncation on 64-bit).
+//   3. Closing: Windows uses `closesocket`, POSIX uses `close`.
+//   4. `socklen_t` does not exist on Windows; `socklen_type` is used uniformly.
+//   5. SIGPIPE: on POSIX, writing to a closed connection **kills the process** by default; use MSG_NOSIGNAL or set
+//      SO_NOSIGPIPE after connecting.
+//   6. `WSAStartup` must run before any winsock call, and only once per process.
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -53,7 +53,7 @@ const socket_t kInvalidSocket = INVALID_SOCKET;
 
 inline bool isValid(socket_t s) { return s != INVALID_SOCKET; }
 
-// 关 socket 前先 shutdown(SD_BOTH)：见 POSIX 分支里同一段注释。
+// shutdown(SD_BOTH) before closing the socket: see the same note in the POSIX branch.
 inline void closeSocket(socket_t s) {
     if (isValid(s)) {
         ::shutdown(s, SD_BOTH);
@@ -61,12 +61,12 @@ inline void closeSocket(socket_t s) {
     }
 }
 
-// Windows 无 SIGPIPE 语义：send 失败返回 SOCKET_ERROR 而非发信号
+// Windows has no SIGPIPE semantics: a failed send returns SOCKET_ERROR instead of raising a signal
 inline int sendFlags() { return 0; }
 
 inline int lastError() { return ::WSAGetLastError(); }
 
-// 进程级 WSA 初始化（线程安全，只在首次调用时执行）
+// Process-level WSA initialization (thread safe, runs only on the first call)
 inline void ensureInitialized() {
     static std::once_flag once;
     std::call_once(once, []() {
@@ -83,10 +83,10 @@ const socket_t kInvalidSocket = -1;
 
 inline bool isValid(socket_t s) { return s >= 0; }
 
-// 关 socket 前先 shutdown(SHUT_RDWR)：POSIX 上 close(fd) **不会**唤醒已经睡在
-// recv/select 里的线程（macOS 会，所以这类挂起只在 Linux 上暴露）。少了这一步，
-// 还在读这条连接的线程会一直挂着，而 join 它的退出路径（shutdown/析构）永远回不来。
-// shutdown 失败无所谓（未连接/已断开的 fd 返回 ENOTCONN），紧接着照常 close。
+// shutdown(SHUT_RDWR) before closing the socket: on POSIX close(fd) does **not** wake threads already asleep in
+// recv/select (macOS does, so this kind of hang only surfaces on Linux). Without this step,
+// threads still reading this connection stay blocked forever, and the exit path joining them (shutdown/destructor) never returns.
+// A failed shutdown does not matter (an unconnected/already-closed fd returns ENOTCONN); close follows right after.
 inline void closeSocket(socket_t s) {
     if (isValid(s)) {
         ::shutdown(s, SHUT_RDWR);
@@ -97,7 +97,7 @@ inline void closeSocket(socket_t s) {
 #if defined(MSG_NOSIGNAL)
 inline int sendFlags() { return MSG_NOSIGNAL; }
 #else
-// macOS/BSD 没有 MSG_NOSIGNAL：改由 tuneSocket 设置 SO_NOSIGPIPE
+// macOS/BSD have no MSG_NOSIGNAL: tuneSocket sets SO_NOSIGPIPE instead
 inline int sendFlags() { return 0; }
 #endif
 
@@ -107,7 +107,7 @@ inline void ensureInitialized() {}
 
 #endif
 
-// 建连成功后统一设置：禁用 Nagle 提升延迟敏感请求的表现；POSIX 上按平台关闭 SIGPIPE。
+// Set uniformly after a successful connection: disable Nagle to improve latency-sensitive requests; on POSIX disable SIGPIPE per platform.
 inline void tuneSocket(socket_t s) {
     int one = 1;
     ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
@@ -118,9 +118,9 @@ inline void tuneSocket(socket_t s) {
 #endif
 }
 
-// 给阻塞 recv 挂一个上界。select 报"可读"和真正 recv 之间还有一次 fd 被抽走/复用的
-// 窗口（见 remoting_client.cpp 的 readLoop），单靠 select 的超时盖不住睡在 recv 里的那
-// 一瞬间；SO_RCVTIMEO 到点会以 EAGAIN 失败返回，于是读线程任何一轮阻塞都有界。
+// Put an upper bound on a blocking recv. Between select reporting "readable" and the actual recv there is still a
+// window where the fd can be withdrawn/reused (see readLoop in remoting_client.cpp); the select timeout alone does not cover
+// that instant asleep inside recv; SO_RCVTIMEO expires with an EAGAIN failure, so every blocking round of the read thread is bounded.
 inline void setRecvTimeout(socket_t s, int millis) {
 #ifdef _WIN32
     DWORD timeout = static_cast<DWORD>(millis);
@@ -135,8 +135,8 @@ inline void setRecvTimeout(socket_t s, int millis) {
 #endif
 }
 
-// "这次没读到数据"而不是"连接断了"：SO_RCVTIMEO 到点、被信号打断，都必须接着等，
-// 否则一条空闲连接会被自己的读线程误当成断开。
+// "no data this round" rather than "the connection dropped": an SO_RCVTIMEO expiry or an interrupt by a signal must keep waiting,
+// otherwise an idle connection would be mistaken for a disconnect by its own read thread.
 inline bool isWouldBlock() {
 #ifdef _WIN32
     return lastError() == WSAEWOULDBLOCK;
@@ -153,8 +153,8 @@ inline bool isInterrupted() {
 #endif
 }
 
-// select() 的第一个参数：POSIX 要 "最大 fd + 1"，Windows **忽略**该参数。
-// 单独封装成函数，避免在 Windows 上把 64 位 SOCKET 硬转成 int（无意义且有告警）。
+// First argument of select(): POSIX wants "highest fd + 1", Windows **ignores** the argument.
+// Wrapped in its own function to avoid hard-casting a 64-bit SOCKET to int on Windows (pointless and warning-prone).
 inline int selectNfds(socket_t s) {
 #ifdef _WIN32
     (void)s;

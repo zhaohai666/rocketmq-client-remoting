@@ -1,4 +1,4 @@
-// 生产者实现（DefaultMQProducer，走经典 remoting 协议）。
+// Producer implementation (DefaultMQProducer, over the classic remoting protocol).
 #include "rocketmq/client/producer.h"
 
 #include <algorithm>
@@ -37,7 +37,7 @@ std::string trim(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
-// 把 broker 名列表拼成 "a, b, c"，用于发送失败信息里的 brokersSent
+// Join broker names into "a, b, c"; used for brokersSent in send-failure messages
 std::string joinStrings(const std::vector<std::string>& parts) {
     std::string out;
     for (size_t i = 0; i < parts.size(); ++i) {
@@ -47,8 +47,8 @@ std::string joinStrings(const std::vector<std::string>& parts) {
     return out;
 }
 
-// 用单调钟算耗时：一次本地 broker 往返可能不到 1ms，整数毫秒差会在容错表里记成
-// latency=0，那这条 broker 就永远不会被延迟阈值判到。
+// Duration uses the monotonic clock: a local broker round trip may be under 1ms, and an integer
+// millisecond delta records latency=0 in the fault table, so the broker is never caught by the latency threshold.
 double elapsedMillis(const std::chrono::steady_clock::time_point& from) {
     return std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - from)
@@ -70,10 +70,10 @@ std::vector<std::string> splitSemicolon(const std::string& addr) {
     return out;
 }
 
-// 发送前确保消息带有 UNIQ_KEY（32 位十六进制唯一 ID）：缺失才生成，已存在则保留（幂等）。
-// UNIQ_KEY 是经典 remoting 协议里的客户端消息 ID，broker 侧的事务回查与轨迹都按它关联。
-// 轨迹钩子用它在 SendResult.msgId 里回填 UNIQ_KEY，
-// 从而让发送侧轨迹的 msgId == UNIQ_KEY（非 offsetMsgId）。
+// Ensure the message carries UNIQ_KEY (a 32-hex-digit unique ID) before sending: generate only when
+// missing, keep an existing one (idempotent). UNIQ_KEY is the client message ID in the classic remoting
+// protocol; broker-side transaction check-back and tracing both correlate on it. The trace hook uses it
+// to backfill UNIQ_KEY into SendResult.msgId, so the send-side trace msgId == UNIQ_KEY (not offsetMsgId).
 void ensureUniqId(Message& msg) {
     std::string uniq = msg.getProperty(MessageConst::PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
     if (uniq.empty()) {
@@ -82,8 +82,8 @@ void ensureUniqId(Message& msg) {
     }
 }
 
-// 建背压信号量时的初始许可：配置**不高于**地板值时用地板值，并记一条 info ——
-// 分支是 `cfg > floor ? max(cfg, floor) : floor`，所以恰好等于地板值时也会打这条日志。
+// Initial permits for a backpressure semaphore: a config not above the floor uses the floor and logs
+// info -- the branch is `cfg > floor ? max(cfg, floor) : floor`, so exactly the floor value also logs.
 int64_t backPressurePermits(int32_t configured, int64_t floor, const char* name) {
     if (static_cast<int64_t>(configured) > floor) {
         return configured;
@@ -92,15 +92,15 @@ int64_t backPressurePermits(int32_t configured, int64_t floor, const char* name)
     return floor;
 }
 
-// 扣多少「字节」许可：取 body 长度，body 为空时按 1 计。不给空 body 算 1 就等于不限流。
+// Byte permits deducted: the body length, counted as 1 when empty; not charging empty bodies 1 means no throttling.
 int64_t backPressureMsgLen(const Message& msg) {
     const Bytes& body = msg.getBody();
     return body.empty() ? 1 : static_cast<int64_t>(body.size());
 }
 
-// 批量异步扣多少「字节」许可：逐条累加、空 body 也算 1，整批为空算 1。批量发送走
-// SEND_BATCH、整批编码成一个 body，没有现成的批长度可依——不给它按批累加，就等于一批
-// 整体只占 1 份容量，字节闸对批量形同虚设。
+// Byte permits deducted for a batched async send: summed per message, an empty body counts as 1, an
+// empty batch counts as 1. Batch sending uses SEND_BATCH and encodes the whole batch into one body, so
+// there is no ready-made batch length -- without summing per message, a batch occupies only 1 unit and the byte gate is a no-op for batches.
 int64_t batchBackPressureMsgLen(const std::vector<Message>& msgs) {
     int64_t total = 0;
     for (const Message& m : msgs) {
@@ -109,16 +109,16 @@ int64_t batchBackPressureMsgLen(const std::vector<Message>& msgs) {
     return total == 0 ? 1 : total;
 }
 
-// 攒批判定要看四个延时属性的最大值（缺省 0）：`DELAY`（getDelayTimeLevel）+
-// `TIMER_DELAY_MS` / `TIMER_DELAY_SEC` / `TIMER_DELIVER_MS`，这四个属性名都由经典
-// remoting 协议定义。
+// The batching decision looks at the maximum of four delay properties (default 0): `DELAY`
+// (getDelayTimeLevel) plus `TIMER_DELAY_MS` / `TIMER_DELAY_SEC` / `TIMER_DELIVER_MS`; all four
+// property names are defined by the classic remoting protocol.
 //
-// 一个 `MessageBatch` 只能有一个延时属性，所以任何一个 > 0 都不攒批。
+// A `MessageBatch` can carry only one delay property, so any value > 0 disables batching.
 //
-// ⚠ `MessageConst` 提供了这三个常量（PROPERTY_TIMER_DELAY_SEC/MS/DELIVER_MS），
-// 这里直接用常量，四个属性一份清单一起看。
+// ⚠ `MessageConst` provides those three constants (PROPERTY_TIMER_DELAY_SEC/MS/DELIVER_MS);
+// the constants are used directly here, all four properties checked in one list.
 //
-// 取值口径：属性缺失返回 0；**值非法时不吞**，数字解析的异常直接抛给调用方。
+// Value semantics: a missing property yields 0; invalid values are not swallowed -- number parse exceptions propagate to the caller.
 int64_t maxDelayValue(const Message& msg) {
     int64_t result = msg.getDelayTimeLevel();
     static const char* kTimerDelayProperties[] = {
@@ -140,8 +140,8 @@ int64_t maxDelayValue(const Message& msg) {
 }  // namespace
 
 DefaultMQProducer::DefaultMQProducer(const std::string& producerGroup)
-    // 两个公平信号量在构造时就建好，而不是等 start()：背压开关允许运行时才打开，
-    // 那时闸必须已经在了。
+    // The two fair semaphores are created in the constructor, not in start(): backpressure may be
+    // enabled only at runtime, and the gate must already exist by then.
     : semaphoreAsyncSendNum_(backPressurePermits(backPressureForAsyncSendNum_, kMinAsyncSendNum,
                                                  "semaphoreAsyncSendNum")),
       semaphoreAsyncSendSize_(backPressurePermits(backPressureForAsyncSendSize_,
@@ -156,11 +156,11 @@ DefaultMQProducer::~DefaultMQProducer() {
     try {
         shutdown();
     } catch (...) {
-        // 析构不抛
+        // Destructors do not throw
     }
 }
 
-// ---------------------------------------------------------------- 配置
+// ---------------------------------------------------------------- Configuration
 void DefaultMQProducer::setNamesrvAddr(const std::string& addr) {
     nameServerAddrs_ = splitSemicolon(addr);
 }
@@ -185,40 +185,40 @@ void DefaultMQProducer::setProducerGroup(const std::string& g) {
     producerGroup_ = g;
 }
 
-// ---------------------------------------------------------------- 生命周期
+// ---------------------------------------------------------------- Lifecycle
 void DefaultMQProducer::start() {
     std::lock_guard<std::mutex> lk(lock_);
     if (started_) {
         return;
     }
-    // 生产者组也拼命名空间（`setProducerGroup(withNamespace(producerGroup))`），
-    // broker 侧按带前缀的组名登记。
-    // wrapNamespace 自带"已带前缀则原样返回"的幂等守卫，重复 start 不会套两层。
+    // The producer group is namespace-prefixed too (`setProducerGroup(withNamespace(producerGroup))`);
+    // the broker registers the group under the prefixed name.
+    // wrapNamespace has its own idempotent guard ("already prefixed, return unchanged"), so a repeated start does not nest two prefixes.
     if (!namespace_.empty()) {
         producerGroup_ = NamespaceUtil::wrapNamespace(namespace_, producerGroup_);
     }
-    // 启动先做配置校验（checkConfig）：它排在 withNamespace 之后（组名要按带命名空间前缀的
-    // 结果校验），并且要挡住
-    // DEFAULT_PRODUCER —— 多进程共用默认组会互相踢下线。
-    // ⚠ checkConfig 是 start() 的第一步，所以这里领先于 name server 地址检查：
-    // 配置非法时不该先报"没配地址"，也不该建出客户端实例。
+    // start() validates configuration first (checkConfig): it runs after withNamespace (the group
+    // name must be validated against the namespace-prefixed result), and it must reject
+    // DEFAULT_PRODUCER -- processes sharing the default group kick each other offline.
+    // ⚠ checkConfig is the first step of start(), so it precedes the name server address check:
+    // with invalid configuration we must not report "no address set" first, nor create a client instance.
     Validators::checkGroup(producerGroup_);
     if (producerGroup_ == MixAll::DEFAULT_PRODUCER_GROUP) {
         throw MQClientException(
             "producerGroup can not equal DEFAULT_PRODUCER, please specify another one.");
     }
-    // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
+    // Either the static addresses or dynamic addressing (ROCKETMQ_NAMESRV_DOMAIN) must be available
     if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
-        // 码值用 10004（validateNameServerSetting 对同一个故障给的码）：
-        // 这道检查提前到 start()（更可预期），否则故障要等第一次发送才以 10004 冒出来，
-        // 但不能让调用方看到两种不同的码。
+        // Error code 10004 (the code validateNameServerSetting uses for this same fault):
+        // this check is hoisted into start() (more predictable), otherwise the fault would only surface
+        // as 10004 on the first send, but callers must not see two different codes.
         throw MQClientException("name server address is not set",
                                 ClientErrorCode::NO_NAME_SERVER_EXCEPTION);
     }
-    // 启动的两步：先 `changeInstanceNameToPID`（本实现没有内部生产者，所以无条件
-    // 执行），再拼 clientId：
-    // `<本机 IP>@<instanceName>[@unitName][@STREAM]` —— broker 侧按这个串识别客户端连接。
-    // instanceName 就地写回：第二次 start() 复用同一个 clientId。
+    // Two startup steps: first `changeInstanceNameToPID` (this implementation has no internal
+    // producer, so it runs unconditionally), then build the clientId:
+    // `<local IP>@<instanceName>[@unitName][@STREAM]` -- the broker identifies client connections by this string.
+    // instanceName is written back in place: a second start() reuses the same clientId.
     instanceName_ = changeInstanceNameToPID(instanceName_);
     if (clientId_.empty()) {
         clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);
@@ -228,7 +228,7 @@ void DefaultMQProducer::start() {
                                          /*invokeTimeoutMillis=*/15000,
                                          tlsEnable_, unitName_,
                                          pollNameServerIntervalMillis_));
-    // TLS 严格校验选项（caCert 非空 = 严格校验）：转发给实例与底层传输层
+    // TLS strict-verification option (non-empty caCert = strict verification): forwarded to the instance and the underlying transport
     if (tlsOptionsSet_) {
         mqClient_->setTlsOptions(tlsOptions_);
     }
@@ -244,12 +244,12 @@ void DefaultMQProducer::start() {
         }
     }
     mqClient_->start();
-    // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本生产者
+    // Dynamic name server: the instance may already have resolved addresses from the address server at start-up; backfill them into this producer
     if (nameServerAddrs_.empty() && !mqClient_->nameServerAddrs().empty()) {
         nameServerAddrs_ = mqClient_->nameServerAddrs();
     }
-    // 注册 broker 主动请求处理器：事务回查 CHECK_TRANSACTION_STATE(39)。
-    // 不注册的话 broker 回查会被传输层当成"未知请求"丢弃，事务消息永远停留在 UNKNOW。
+    // Register the broker-initiated request handler: transaction check-back CHECK_TRANSACTION_STATE(39).
+    // Without it, broker check-backs are dropped by the transport as "unknown request" and transactional messages stay UNKNOW forever.
     mqClient_->remotingClient().registerProcessor(
         RequestCode::CHECK_TRANSACTION_STATE,
         [this](const RemotingCommand& cmd, const std::string& addr)
@@ -257,8 +257,8 @@ void DefaultMQProducer::start() {
             this->checkTransactionState(cmd, addr);
             return std::nullopt;
         });
-    // 异步发送的两个线程池：必须在 started_ 置位前建好，否则 sendAsync 会看到
-    // "已启动但池子为空"。
+    // The two async-send thread pools must be created before started_ is set, otherwise sendAsync
+    // would see "started but the pools are null".
     createAsyncExecutors();
     started_ = true;
     logger_info("DefaultMQProducer[" + producerGroup_ + "] started, clientId=" + clientId_);
@@ -268,19 +268,19 @@ void DefaultMQProducer::start() {
         produceAccumulator_->start();
     }
 
-    // 消息轨迹：enableTrace=true 时建 AsyncTraceDispatcher 并注册 Send/EndTransaction 钩子。
-    // 必须在心跳线程之前完成 —— 分发器内部生产者要先把轨迹 topic 的路由拉起来。
+    // Message tracing: with enableTrace=true an AsyncTraceDispatcher is built and the Send/EndTransaction hooks registered.
+    // This must finish before the heartbeat thread -- the dispatcher's internal producer first needs the trace topic route.
     startTraceDispatcher();
 
     RequestFutureHolder::getInstance().startScheduledTask();
 
-    // 心跳线程：周期性向 broker 注册 ProducerData。没有它 broker 无法主动回查事务。
+    // Heartbeat thread: periodically registers ProducerData with every broker. Without it the broker cannot initiate transaction check-backs.
     heartbeatStop_.store(false);
     heartbeatThread_ = std::thread([this]() {
         setThreadName("ProducerHeartbeatThread");
-        // 启动后立刻发一次：让 broker 尽快登记 channel，避免首条事务消息错过回查窗口。
-        // 之后固定速率：每跳锚定在 heartbeatIntervalMillis_（见 schedule_util.h）——
-        // "干完再按 100ms 切片睡满 30s"每轮会多出十几毫秒，心跳周期被越拖越长。
+        // Send once immediately after start: the broker registers the channel early, so the first transactional message does not miss the check-back window.
+        // Then a fixed rate: each tick is anchored to heartbeatIntervalMillis_ (see schedule_util.h) --
+        // "work, then sleep 30s in 100ms slices" adds tens of milliseconds per round and stretches the heartbeat period.
         auto next = std::chrono::steady_clock::now();
         while (!heartbeatStop_.load()) {
             sleepUntilDeadline(heartbeatStop_, next);
@@ -317,9 +317,9 @@ void DefaultMQProducer::shutdown() {
         if (!started_) {
             return;
         }
-        // 先把两个池摘掉：之后的 sendAsync 会看到 "producer already shutdown"。
-        // ⚠ started_ 要等队列排空之后再翻 —— 排队里的异步发送还要用 client()，
-        //   提前置 false 会让它们以"producer not started"失败，等于静默丢消息。
+        // Detach the two pools first: subsequent sendAsync calls then see "producer already shutdown".
+        // ⚠ started_ must flip only after the queues drain -- queued async sends still need client();
+        //   setting it false early makes them fail with "producer not started", i.e. silently dropped messages.
         asyncSender.swap(asyncSenderExecutor_);
         callbackPool.swap(callbackExecutor_);
     }
@@ -333,8 +333,8 @@ void DefaultMQProducer::shutdown() {
         std::lock_guard<std::mutex> lk(lock_);
         started_ = false;
     }
-    // 先关轨迹分发器：它会把队列里剩余的轨迹强刷出去，再关内部生产者。
-    // 必须在 mqClient_->shutdown() 之前 —— 刷写要发消息，得有自己的传输层。
+    // Close the trace dispatcher first: it flushes the remaining queued trace records, then closes its internal producer.
+    // This must happen before mqClient_->shutdown() -- flushing sends messages and needs its own transport.
     if (traceDispatcher_) {
         try {
             traceDispatcher_->shutdown();
@@ -343,7 +343,7 @@ void DefaultMQProducer::shutdown() {
         }
         traceDispatcher_.reset();
     }
-    // 先停心跳线程（它内部持有 mqClient_ 引用），再回收其它线程
+    // Stop the heartbeat thread first (it holds mqClient_ references), then reclaim the other threads
     heartbeatStop_.store(true);
     if (heartbeatThread_.joinable()) {
         heartbeatThread_.join();
@@ -372,8 +372,8 @@ void DefaultMQProducer::shutdown() {
             logger_debug("unregister on shutdown failed: unknown exception");
         }
     }
-    // 这一步 join 掉连接的读线程与超时清理线程：返回后不可能再有异步回调打进本对象，
-    // 生产者的析构才是安全的（executeOnCallbackThread 在池子没了之后就地跑）。
+    // This step joins the connection reader threads and the timeout-cleanup thread: afterwards no async callback can
+    // reach this object, which makes the producer's destruction safe (executeOnCallbackThread runs inline once the pools are gone).
     if (mqClient_) {
         mqClient_->shutdown();
     }
@@ -437,7 +437,7 @@ int32_t DefaultMQProducer::prepareForSend(Message& msg) const {
     return sysFlag;
 }
 
-// ---------------------------------------------------------------- 消息轨迹 / 钩子
+// ---------------------------------------------------------------- Message tracing / hooks
 SendMessageContext DefaultMQProducer::buildSendMessageContext(
     const Message& msg, const MessageQueue& mq, const std::string& brokerAddr) const {
     SendMessageContext context;
@@ -506,13 +506,13 @@ SendResult DefaultMQProducer::sendWithHooks(MQClientInstance& client, const Mess
                                             const MessageQueue& mq, int32_t timeout,
                                             int32_t sysFlag, const std::string* arg,
                                             CommunicationMode mode) {
-    // W3C traceparent 透传（opt-in）：没有就注入根上下文，已有值不覆盖。
-    // ⚠ 必须放在 hasSendInterceptors() 早退之前，否则无钩子时注入被跳过。
+    // W3C traceparent propagation (opt-in): inject the root context when absent; never overwrite an existing value.
+    // ⚠ Must run before the hasSendInterceptors() early return, otherwise injection is skipped when there are no hooks.
     if (enableTraceContext_) {
         injectTraceContext(const_cast<Message*>(&msg));
     }
     if (!hasSendInterceptors()) {
-        // 无钩子时零开销透传；client.sendMessage 内部同样走发布地址，失败抛同一句。
+        // Zero-overhead passthrough when there are no hooks; client.sendMessage internally uses the publish address too and throws the same message on failure.
         return client.sendMessage(producerGroup_, msg, mq, timeout, sysFlag, unitMode_,
                                     createTopicKey_, defaultTopicQueueNums_);
     }
@@ -676,15 +676,15 @@ bool DefaultMQProducer::canBatch(const Message& msg) const {
     if (produceAccumulator_ == nullptr || !produceAccumulator_->tryAddMessage(msg)) {
         return false;
     }
-    // 延时/定时消息不攒批：一个 MessageBatch 只能有一个延时属性
+    // Delayed/timer messages are not batched: a MessageBatch can carry only one delay property
     if (maxDelayValue(msg) > 0) {
         return false;
     }
-    // 重试消息不攒批：%RETRY% topic 的位点语义特殊
+    // Retry messages are not batched: %RETRY% topics have special offset semantics
     if (msg.getTopic().rfind(MixAll::RETRY_GROUP_TOPIC_PREFIX, 0) == 0) {
         return false;
     }
-    // 已带 PGROUP 的消息（事务半消息那种）不攒批：broker 侧要按组找连接
+    // Messages already carrying PGROUP (transaction half messages) are not batched: the broker looks the connection up by group
     if (msg.properties.count(MessageConst::PROPERTY_PRODUCER_GROUP) > 0) {
         return false;
     }
@@ -724,7 +724,7 @@ std::optional<SendResult> DefaultMQProducer::sendByAccumulator(
     return std::nullopt;
 }
 
-// ---------------- AccumulatorSender 实现 ----------------
+// ---------------- AccumulatorSender implementation ----------------
 
 SendResult DefaultMQProducer::sendDirectBlocking(const MessageBatch& batch,
                                                  const MessageQueue* mq) {
@@ -746,8 +746,8 @@ SendResult DefaultMQProducer::sendPreparedBatch(const MessageBatch& batch, const
     const int32_t timeout = timeoutMillis >= 0 ? timeoutMillis : sendMsgTimeout_;
     checkMessage(batch);
     MessageBatch outbound = batch;
-    // 累加器的 AggregateKey.topic 已经是拼过命名空间的（生产者的公开入口先 withNamespace
-    // 再分流），`wrapNamespace` 幂等，所以这一步只是补齐「直接调 sender」这条路径。
+    // The accumulator's AggregateKey.topic is already namespace-prefixed (the producer's public
+    // entry points apply withNamespace before dispatching); `wrapNamespace` is idempotent, so this step only covers the "call the sender directly" path.
     if (!namespace_.empty()) {
         outbound.topic = NamespaceUtil::wrapNamespace(namespace_, outbound.topic);
     }
@@ -759,8 +759,8 @@ SendResult DefaultMQProducer::sendPreparedBatch(const MessageBatch& batch, const
         std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, outbound.topic);
         target = publish->selectOneMessageQueue();
     }
-    // isBatch ⇒ prepareForSend 直接返回 0（批量永不压缩），但 batch.body 已经是编码结果，
-    // 不需要（也不该）再 encode 一次。
+    // isBatch => prepareForSend returns 0 immediately (batches are never compressed), and batch.body is already the
+    // encoded result -- a second encode is neither needed nor desirable.
     const int32_t sysFlag = prepareForSend(outbound);
     return sendWithHooks(c, outbound, target, timeout, sysFlag);
 }
@@ -784,7 +784,7 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
     try {
         publish = topicPublishInfo(c, outbound.topic);
     } catch (const MQClientException& e) {
-        // 已经定过性的 10004（压根没配 name server）必须原样透传，否则两种故障又糊成一条
+        // A 10004 already classified (no name server configured at all) must pass through unchanged, otherwise the two faults blur into one
         throw MQClientException(e.what(), e.responseCode == ClientErrorCode::NO_NAME_SERVER_EXCEPTION
                                                ? e.responseCode
                                                : ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION);
@@ -798,7 +798,7 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
     bool gotResult = false;
     bool callTimeout = false;
     rememberDetectTopic(outbound.topic);
-    // 最后一次失败的原因，用于循环结束后的错误码映射
+    // The last failure's cause, used for error-code mapping after the loop ends
     enum class Cause { NONE, BROKER, CONNECT, TIMEOUT, CLIENT, OTHER };
     Cause cause = Cause::NONE;
     int32_t brokerCode = 0;
@@ -829,7 +829,7 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
             attemptBegan = std::chrono::steady_clock::now();
             result = sendWithHooks(c, outbound, selected, curTimeout, sysFlag);
             gotResult = true;
-            // 记录发送延迟；超出阈值会把该 broker 隔离一段时间
+            // Record send latency; exceeding the threshold isolates this broker for a while
             mqFaultStrategy_.updateFaultItem(selected.brokerName, elapsedMillis(attemptBegan),
                                              false, true);
             if (result.sendStatus != SendStatus::SEND_OK && retryAnotherBrokerWhenNotStoreOK_) {
@@ -837,7 +837,7 @@ SendResult DefaultMQProducer::sendDefaultImpl(const Message& msg, int32_t timeou
             }
             return result;
         } catch (const MQBrokerException& e) {
-            // broker 明确回了错误码：隔离该 broker（可达性不动），只有可重试码才换一台
+            // The broker replied with an explicit error code: isolate it (reachability unchanged); only retryable codes switch to another broker
             if (!selected.brokerName.empty()) {
                 mqFaultStrategy_.updateFaultItem(selected.brokerName,
                                                  elapsedMillis(attemptBegan), true, false);
@@ -925,7 +925,7 @@ SendResult DefaultMQProducer::sendBySelector(const Message& msg,
     if (timeoutMillis < 0 && getAutoBatch() && !outbound.isBatch) {
         return *sendByAccumulator(outbound, &selected, nullptr);
     }
-    // 选择器用的是原始消息（topic/业务字段），压缩只影响 body
+    // The selector sees the original message (topic/business fields); compression only affects the body
     const int32_t sysFlag = prepareForSend(outbound);
     return sendWithHooks(c, outbound, selected, timeout, sysFlag, &arg, CommunicationMode::SYNC);
 }
@@ -949,7 +949,7 @@ void classifyAsyncFailure(const InvokeError& error, int32_t cost, InvokeError* w
             *needRetry = true;
             return;
         case InvokeError::Kind::RESPONSE_FAILED:
-            *wrapped = error;  // 原样交给回调，不包装
+            *wrapped = error;  // Pass to the callback unchanged, no wrapping
             *needRetry = false;
             return;
         case InvokeError::Kind::TOO_MUCH_REQUEST:
@@ -1007,7 +1007,7 @@ int64_t DefaultMQProducer::getSemaphoreAsyncSendSizeAvailablePermits() const {
 void DefaultMQProducer::createAsyncExecutors() {
     int32_t cores = static_cast<int32_t>(std::thread::hardware_concurrency());
     if (cores <= 0) {
-        cores = 1;  // 取不到 CPU 数时按 1 核算，不能建出一个跑不动任务的池
+        cores = 1;  // Assume 1 core when the CPU count is unavailable; never build a pool that cannot run tasks
     }
     asyncSenderExecutor_ = std::make_shared<ConsumeExecutor>(
         cores, cores, 60.0, "AsyncSenderExecutor", asyncSenderQueueCapacity_, "_", 1);
@@ -1077,7 +1077,7 @@ void DefaultMQProducer::sendBatchAsync(const std::vector<Message>& msgs, const M
 
 void DefaultMQProducer::enqueueAsync(const std::shared_ptr<AsyncSendState>& state,
                                      const MessageQueue* pinned, int32_t timeoutMillis) {
-    // 先确认已启动（未启动立即抛，而不是在后台线程里静默失败）
+    // Verify started state first (throw immediately instead of failing silently on a background thread)
     (void)client();
     std::shared_ptr<ConsumeExecutor> pool;
     {
@@ -1173,9 +1173,9 @@ void DefaultMQProducer::releaseBackPressure(const std::shared_ptr<AsyncSendState
 
 void DefaultMQProducer::sendBatchAsyncInner(const std::shared_ptr<AsyncSendState>& state,
                                             const MessageQueue* pinned) {
-    // 批量分支：批量在本实现里只有同步内核，所以「异步」= 在
-    // AsyncSenderExecutor 线程里同步发一批，结果挪到回调线程交付。对调用方语义没差别。
-    // 校验、组批、拼 namespace、选队列、钩子全在内核里，这里不重复做。
+    // Batch branch: batching only has a synchronous kernel in this implementation, so "async" means
+    // sending one batch synchronously on the AsyncSenderExecutor thread and delivering the result on the callback thread. Caller-visible semantics are unchanged.
+    // Validation, batch assembly, namespace prefixing, queue selection and hooks all live in the kernel; nothing is repeated here.
     const int32_t timeout = state->timeout;
     try {
         const SendResult result = sendBatchKernel(state->batchMsgs, pinned, timeout,
@@ -1187,7 +1187,7 @@ void DefaultMQProducer::sendBatchAsyncInner(const std::shared_ptr<AsyncSendState
             completeAsync(state, nullptr, &err);
         });
     } catch (const std::exception& e) {
-        // 内核的失败（路由拿不到、校验不过、重试用尽）原样交付回调，与单条异步一致。
+        // Kernel failures (route unavailable, validation failed, retries exhausted) are delivered to the callback as they are, matching single-message async.
         executeOnCallbackThread([this, state, text = std::string(e.what())]() {
             const InvokeError err(InvokeError::Kind::OTHER, text);
             completeAsync(state, nullptr, &err);
@@ -1204,7 +1204,7 @@ void DefaultMQProducer::sendAsyncInner(const std::shared_ptr<AsyncSendState>& st
     }
     state->msg = withNamespace(state->msg);
     ensureUniqId(state->msg);
-    // 与同步发送同理：压缩在重试链之外做一次，避免重试时把已压缩的 body 再压一遍
+    // Same reasoning as synchronous send: compression happens once outside the retry chain so a retry never re-compresses an already compressed body
     state->sysFlag = prepareForSend(state->msg);
     if (pinned != nullptr) {
         sendKernelAsync(state);
@@ -1213,12 +1213,12 @@ void DefaultMQProducer::sendAsyncInner(const std::shared_ptr<AsyncSendState>& st
     try {
         state->publish = topicPublishInfo(c, state->msg.topic);
     } catch (const MQClientException& e) {
-        // 同 sendDefaultImpl：10004 不能被改写成 10005，异步链的定性和同步链不能分叉
+        // Same as sendDefaultImpl: 10004 must not be rewritten into 10005, the async chain's classification must not diverge from the sync chain
         throw MQClientException(e.what(), e.responseCode == ClientErrorCode::NO_NAME_SERVER_EXCEPTION
                                                ? e.responseCode
                                                : ClientErrorCode::NOT_FOUND_TOPIC_EXCEPTION);
     }
-    // ASYNC 的 timesTotal 固定为 1：外层只跑一次，换 broker 全在 onSendException 里
+    // ASYNC timesTotal is fixed at 1: the outer loop runs once, broker switching all happens inside onSendException
     MessageQueue selected =
         mqFaultStrategy_.selectOneMessageQueue(*state->publish, std::string(), false);
     if (selected.brokerName.empty()) {
@@ -1267,8 +1267,8 @@ void DefaultMQProducer::sendAttempt(const std::shared_ptr<AsyncSendState>& state
         mqClient_->sendMessageAsync(addr, state->request, state->msg, state->mq, state->timeout,
                                     [this, state](const SendResult& result,
                                                   const InvokeError& error) {
-                                        // 回调处理挪到 NettyClientPublicExecutor：
-                                        // 这里是连接读线程/超时清理线程，不能跑业务代码
+                                        // Callback handling moves to NettyClientPublicExecutor:
+                                        // this is the connection reader / timeout-cleanup thread, no business code may run here
                                         SendResult copy = result;
                                         InvokeError err = error;
                                         executeOnCallbackThread([this, state, copy, err]() {
@@ -1310,7 +1310,7 @@ void DefaultMQProducer::onAttemptComplete(const std::shared_ptr<AsyncSendState>&
     classifyAsyncFailure(error, cost, &wrapped, &needRetry);
     logger_warn("async send to broker " + state->brokerName + " failed: " + error.message
                 + " (reported as " + wrapped.message + ")");
-    // 超时预算是**所有尝试共享**的剩余时间，不是每次尝试各给一份
+    // The timeout budget is the remaining time **shared by all attempts**, not a fresh budget per attempt
     state->timeout -= cost;
     onSendException(state, wrapped, needRetry);
 }
@@ -1321,7 +1321,7 @@ void DefaultMQProducer::onSendException(const std::shared_ptr<AsyncSendState>& s
     if (needRetry && state->times <= retryTimesWhenSendAsyncFailed_ && state->timeout > 0) {
         std::string retryBroker = state->brokerName;
         if (state->publish != nullptr) {
-            // 第三个参数是 false：按 lastBrokerName 避开刚失败的那台
+            // The third argument is false: avoid the just-failed broker via lastBrokerName
             MessageQueue selected = mqFaultStrategy_.selectOneMessageQueue(
                 *state->publish, state->brokerName, false);
             if (!selected.brokerName.empty()) {
@@ -1331,7 +1331,7 @@ void DefaultMQProducer::onSendException(const std::shared_ptr<AsyncSendState>& s
         }
         const std::string addr = client().findBrokerAddressInPublish(retryBroker);
         if (addr.empty()) {
-            // 路由里连这台 broker 的主地址都没了，再试也没有意义
+            // The route no longer even has this broker's master address; retrying is pointless
             const InvokeError noBroker(InvokeError::Kind::OTHER,
                                        "The broker[" + retryBroker + "] not exist");
             completeAsync(state, nullptr, &noBroker);
@@ -1341,7 +1341,7 @@ void DefaultMQProducer::onSendException(const std::shared_ptr<AsyncSendState>& s
                     + state->msg.topic + ", brokerAddr=" + addr + ", brokerName=" + retryBroker
                     + ": " + error.message);
         state->brokerName = retryBroker;
-        // 换新 opaque：旧请求还挂在在途表里等超时，复用会把两次尝试的应答串台
+        // Use a fresh opaque: the old request is still in the in-flight table waiting to time out; reusing it would cross the two attempts' responses
         state->request.opaque = RemotingCommand::nextOpaque();
         sendAttempt(state, addr);
         return;
@@ -1368,7 +1368,7 @@ void DefaultMQProducer::executeOnCallbackThread(std::function<void()> fn) {
 
 void DefaultMQProducer::completeAsync(const std::shared_ptr<AsyncSendState>& state,
                                       const SendResult* result, const InvokeError* error) {
-    // 异步链的终点：先跑 SendMessageHook.after，再回调用户
+    // End of the async chain: run SendMessageHook.after first, then invoke the user callback
     if (state->context != nullptr) {
         if (result != nullptr) {
             state->context->sendResult = result;
@@ -1401,7 +1401,7 @@ void DefaultMQProducer::sendOneway(const Message& msg) {
     const int32_t sysFlag = prepareForSend(outbound);
     const std::string brokerAddr = c.publishAddrFor(selected.brokerName, selected.topic);
     runCheckForbidden(outbound, selected, brokerAddr, nullptr, CommunicationMode::ONEWAY);
-    // W3C traceparent 透传（opt-in）：单向发送同样注入
+    // W3C traceparent propagation (opt-in): oneway sends inject it too
     if (enableTraceContext_) {
         injectTraceContext(&outbound);
     }
@@ -1462,13 +1462,13 @@ Message DefaultMQProducer::requestWithQueue(Message& outbound, const MessageQueu
     outbound.putProperty(MessageConst::PROPERTY_MESSAGE_TTL, std::to_string(timeout));
 
     const int64_t begin = UtilAll::currentTimeMillis();
-    // 先确认路由已知，再补一次心跳：没在 broker 上登记为 producer，broker 就找不到
-    // channel 把应答推回来（REPLY_TO_CLIENT 反查 ProducerManager 的 clientChannelTable）。
+    // Confirm the route is known first, then send one more heartbeat: unless registered as a producer on
+    // the broker, the broker cannot find the channel to push the reply back (REPLY_TO_CLIENT is looked up in ProducerManager's clientChannelTable).
     try {
         (void)topicPublishInfo(c, outbound.topic);
         sendHeartbeatToAllBroker();
     } catch (const std::exception& e) {
-        // 拿不到路由就让下面的发送路径自己报错
+        // Without a route, let the send path below report its own error
         logger_debug(std::string("request: prepare route/heartbeat failed: ") + e.what());
     }
 
@@ -1513,11 +1513,11 @@ Message DefaultMQProducer::waitRequestResponse(const Message& outbound, int32_t 
         }
         throw MQClientException(detail);
     }
-    // 应答在 MessageExt 里带全属性（CORRELATION_ID / REPLY_MESSAGE_ARRIVE_TIME 等）
+    // The reply carries the full properties in MessageExt (CORRELATION_ID / REPLY_MESSAGE_ARRIVE_TIME etc.)
     return future->responseMessage();
 }
 
-// ---------------------------------------------------------------- 批量
+// ---------------------------------------------------------------- Batch
 SendResult DefaultMQProducer::sendBatch(const std::vector<Message>& msgs, int32_t timeoutMillis) {
     return sendBatchKernel(msgs, nullptr, timeoutMillis, kPinnedTopicMismatchSync);
 }
@@ -1564,12 +1564,12 @@ SendResult DefaultMQProducer::sendBatchKernel(const std::vector<Message>& msgs,
         std::shared_ptr<TopicPublishInfo> publish = topicPublishInfo(c, batch.topic);
         target = publish->selectOneMessageQueue();
     }
-    // MessageBatch 的 isBatch 为 true，prepareForSend 会直接返回 0（不压缩）
+    // MessageBatch has isBatch true, so prepareForSend returns 0 directly (no compression)
     const int32_t sysFlag = prepareForSend(batch);
     return sendWithHooks(c, batch, target, timeout, sysFlag);
 }
 
-// ---------------------------------------------------------------- 心跳
+// ---------------------------------------------------------------- Heartbeat
 int32_t DefaultMQProducer::sendHeartbeatToAllBroker() {
     if (mqClient_ == nullptr) {
         return 0;
@@ -1588,7 +1588,7 @@ int32_t DefaultMQProducer::sendHeartbeatToAllBroker() {
     HeartbeatData hb(clientId_);
     ProducerData pd;
     pd.groupName = producerGroup_;
-    hb.heartbeatFingerprint = 0;  // 走 V1 注册路径，最稳妥
+    hb.heartbeatFingerprint = 0;  // Take the V1 registration path, the safest
     hb.addProducerData(pd);
 
     int32_t okCount = 0;
@@ -1604,15 +1604,15 @@ int32_t DefaultMQProducer::sendHeartbeatToAllBroker() {
     return okCount;
 }
 
-// ---------------------------------------------------------------- 故障规避主动探测
+// ---------------------------------------------------------------- Fault-avoidance active detection
 void DefaultMQProducer::detectorLoop() {
     setThreadName("FaultDetectorThread");
     auto next = std::chrono::steady_clock::now();
-    // 注意：sleepUntilDeadline 的第一参是"停止标志"（false=继续睡，true=立刻返回），
-    // 与 consumer 的 stop_、mq_client 的 routeRefreshStop_ 同一约定。此前把运行中标志
-    // detectorRunning_ 直接传进来，极性反了：运行期 sleepUntilDeadline 立即返回，
-    // 循环变成零节流热轮询，next 每轮无条件 +3s 被推到实际时刻几十小时之外；
-    // shutdown 置停后线程反而进入"睡到 next"分支，join 被拖住数小时（ctest 挂死根因）。
+    // sleepUntilDeadline's first argument is the *stop* flag (false = keep sleeping, true = return
+    // at once), the same convention as consumer's stop_ and mq_client's routeRefreshStop_. Passing the
+    // running flag detectorRunning_ inverted the polarity: while running, sleepUntilDeadline returned
+    // at once, the loop became an unthrottled hot poll, and next grew +3s per round until it was tens of
+    // hours ahead of real time; after shutdown the thread took the "sleep until next" branch and blocked join for hours (the ctest hang).
     while (!detectorStop_.load()) {
         sleepUntilDeadline(detectorStop_, next);
         next += std::chrono::milliseconds(3000);
@@ -1660,7 +1660,7 @@ bool DefaultMQProducer::detectBrokerByMaxOffset(const std::string& addr, int32_t
     }
 }
 
-// ---------------------------------------------------------------- 事务消息
+// ---------------------------------------------------------------- Transactional messages
 static int32_t transactionFlagOf(LocalTransactionState state) {
     switch (state) {
         case LocalTransactionState::COMMIT_MESSAGE:
@@ -1686,7 +1686,7 @@ void DefaultMQProducer::endTransaction(const Message& msg, const SendResult& sen
 
     std::string addr;
     if (fromCheck) {
-        // 回查收尾：偏移 / 事务号来自 broker 的回查请求（sendResult 此时不可用）
+        // Check-back wrap-up: the offset / transaction id come from the broker's check-back request (sendResult is unusable here)
         header.topic = checkHeader->topic.value_or("");
         header.commitLogOffset = checkHeader->commitLogOffset;
         header.tranStateTableOffset = checkHeader->tranStateTableOffset;
@@ -1803,7 +1803,7 @@ TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message&
     MQClientInstance& c = client();
     checkMessage(msg);
 
-    // 半消息标记：broker 据此把消息写入 RMQ_SYS_TRANS_HALF_TOPIC，等待 END_TRANSACTION
+    // Half-message markers: the broker writes the message to RMQ_SYS_TRANS_HALF_TOPIC accordingly and waits for END_TRANSACTION
     Message outbound = withNamespace(msg);
     outbound.putProperty(MessageConst::PROPERTY_TRANSACTION_PREPARED, "true");
     outbound.putProperty(MessageConst::PROPERTY_PRODUCER_GROUP, producerGroup_);
@@ -1868,7 +1868,7 @@ TransactionSendResult DefaultMQProducer::sendMessageInTransaction(const Message&
     return tsr;
 }
 
-// ---------------------------------------------------------------- 查询 / 管理
+// ---------------------------------------------------------------- Query / administration
 std::vector<MessageExt> DefaultMQProducer::queryMessage(const std::string& topic,
                                                         const std::string& key, int32_t maxNum,
                                                         int64_t beginTimestamp,

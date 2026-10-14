@@ -17,7 +17,7 @@
 namespace rocketmq {
 
 inline constexpr double kSamplingIntervalSeconds = 10.0;
-inline constexpr size_t kMinuteListMax = 60;   // ≈ 10 分钟窗口
+inline constexpr size_t kMinuteListMax = 60;   // ≈ 10 minute window
 inline constexpr size_t kHourListMax = 60;
 
 struct StatsSnapshot {
@@ -34,8 +34,8 @@ public:
     StatsItem(std::string statsName, std::string statsKey);
 
     void addValue(int64_t incValue, int64_t incTimes);
-    void sample();        // 分钟级采样点（每 10s）
-    void sampleHour();    // 小时级采样点（每 10 分钟）
+    void sample();        // minute-level sample point (every 10s)
+    void sampleHour();    // hour-level sample point (every 10 minutes)
 
     StatsSnapshot getStatsDataInMinute();
     StatsSnapshot getStatsDataInHour();
@@ -43,7 +43,7 @@ public:
     int64_t value();
     int64_t times();
 
-    // 仅供测试：注入自定义时间戳的采样点（真实时钟两次 sample 间隔≈0，tps 无从测起）。
+    // Test only: inject sample points with custom timestamps (two samples from the real clock are ≈0 apart, so tps cannot be measured).
     void appendSampleForTest(int64_t tsMs, int64_t value, int64_t times) {
         std::lock_guard<std::mutex> lk(mutex_);
         minute_.emplace_back(tsMs, value, times);
@@ -65,7 +65,7 @@ public:
     explicit StatsItemSet(std::string statsName);
 
     std::shared_ptr<StatsItem> getAndCreate(const std::string& key);
-    std::shared_ptr<StatsItem> find(const std::string& key);   // 无则返回 nullptr
+    std::shared_ptr<StatsItem> find(const std::string& key);   // nullptr when absent
     void addValue(const std::string& key, int64_t incValue, int64_t incTimes);
     std::vector<std::string> keys();
     void sampleAll();
@@ -77,9 +77,9 @@ private:
     std::map<std::string, std::shared_ptr<StatsItem>> items_;
 };
 
-// 五个 StatsItemSet，key 一律 topic@group：
-// PULL_RT / PULL_TPS / CONSUME_RT / CONSUME_OK_TPS / CONSUME_FAILED_TPS。
-// start() 起统一采样线程（10s 分钟级 + 每 60 轮即 10 分钟小时级）。
+// Five StatsItemSet instances, all keyed by topic@group:
+// PULL_RT / PULL_TPS / CONSUME_RT / CONSUME_OK_TPS / CONSUME_FAILED_TPS.
+// start() launches one shared sampling thread (10s minute-level tick; hour-level every 60 ticks, i.e. 10 minutes).
 class ConsumerStatsManager {
 public:
     ConsumerStatsManager();
@@ -99,7 +99,7 @@ public:
 
     ConsumeStatus consumeStatus(const std::string& group, const std::string& topic);
 
-    // 供测试注入快照点：对指定 set 里 key 对应的 item 追加自定义采样。
+    // For tests: append a custom sample to the item of a key inside the chosen set.
     StatsItemSet& topicAndGroupPullRT() { return topicAndGroupPullRT_; }
     StatsItemSet& topicAndGroupPullTPS() { return topicAndGroupPullTPS_; }
     StatsItemSet& topicAndGroupConsumeRT() { return topicAndGroupConsumeRT_; }
@@ -115,7 +115,7 @@ private:
     StatsItemSet topicAndGroupConsumeOKTPS_;
     StatsItemSet topicAndGroupConsumeFailedTPS_;
 
-    // 采样线程（stop_ + condvar 定时等待，避免 sleep 轮询）
+    // Sampling thread (stop_ + condition-variable timed wait, so no sleep polling)
     std::mutex sampleMutex_;
     std::condition_variable sampleCond_;
     bool stop_ = false;

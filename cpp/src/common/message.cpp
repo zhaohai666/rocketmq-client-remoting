@@ -153,7 +153,7 @@ MessageBatch MessageBatch::generateFromList(const std::vector<Message>& msgs) {
     batch.setTopic(first->getTopic());
     batch.setWaitStoreMsgOk(first->isWaitStoreMsgOk());
     batch.setBody(batch.encode());
-    batch.isBatch = true;  // 让发送侧把 SendMessageRequestHeader.batch 置 true
+    batch.isBatch = true;  // makes the send path set SendMessageRequestHeader.batch to true
     return batch;
 }
 

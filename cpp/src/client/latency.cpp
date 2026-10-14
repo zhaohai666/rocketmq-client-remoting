@@ -19,7 +19,7 @@ int64_t nowMillis() { return UtilAll::currentTimeMillis(); }
 FaultItem::FaultItem(const std::string& name) : name_(name) {}
 
 void FaultItem::updateNotAvailableDuration(int64_t notAvailableDurationMillis) {
-    // 仅当 now + dur > startTimestamp 才更新（保持最长隔离期）
+    // Update only when now + dur > startTimestamp (keep the longest isolation window)
     if (notAvailableDurationMillis > 0
         && nowMillis() + notAvailableDurationMillis > startTimestamp_) {
         startTimestamp_ = nowMillis() + notAvailableDurationMillis;
@@ -50,7 +50,7 @@ void LatencyFaultToleranceImpl::updateFaultItem(const std::string& name, double 
 bool LatencyFaultToleranceImpl::isAvailable(const std::string& name) {
     std::lock_guard<std::mutex> lk(m_);
     auto it = table_.find(name);
-    // 没有记录 = 从未出过问题，默认可用
+    // No record = never any problem, available by default
     return it == table_.end() ? true : it->second.isAvailable();
 }
 
@@ -71,7 +71,7 @@ const FaultItem* LatencyFaultToleranceImpl::getFaultItem(const std::string& name
     return it == table_.end() ? nullptr : &it->second;
 }
 
-// ---------------------------------------------------------------- 主动探测
+// ---------------------------------------------------------------- Active detection
 
 void LatencyFaultToleranceImpl::detectByOneRound() {
     std::vector<std::string> due;
@@ -117,7 +117,7 @@ MQFaultStrategy::MQFaultStrategy(bool sendLatencyFaultEnable)
 MessageQueue MQFaultStrategy::selectOneMessageQueue(TopicPublishInfo& tpInfo,
                                                     const std::string& lastBrokerName,
                                                     bool resetIndex) {
-    // broker 避开过滤器：lastBrokerName 非空时一轮内跳过它
+    // Broker avoidance filter: skip lastBrokerName within one round when it is not empty
     std::function<bool(const MessageQueue&)> brokerFilter;
     if (lastBrokerName.empty()) {
         brokerFilter = [](const MessageQueue&) { return true; };
@@ -130,23 +130,23 @@ MessageQueue MQFaultStrategy::selectOneMessageQueue(TopicPublishInfo& tpInfo,
         if (resetIndex) {
             tpInfo.resetIndex();
         }
-        // 1) available：隔离期已过的 broker
+        // 1) available: brokers whose isolation window has passed
         std::function<bool(const MessageQueue&)> availableFilter =
             [this](const MessageQueue& mq) { return tolerance_.isAvailable(mq.brokerName); };
         if (auto mq = tpInfo.selectOneMessageQueue(availableFilter, brokerFilter)) {
             return *mq;
         }
-        // 2) reachable：隔离中但通道仍可达的 broker
+        // 2) reachable: brokers still isolating whose channel remains reachable
         std::function<bool(const MessageQueue&)> reachableFilter =
             [this](const MessageQueue& mq) { return tolerance_.isReachable(mq.brokerName); };
         if (auto mq = tpInfo.selectOneMessageQueue(reachableFilter, brokerFilter)) {
             return *mq;
         }
-        // 3) 全部被隔离且不可达：退化为普通轮询
+        // 3) all isolated and unreachable: fall back to plain round-robin
         return tpInfo.selectOneMessageQueue();
     }
 
-    // 关闭时退化为普通轮询（lastBrokerName 非空时避开它；全部同名时该重载内部已兜底）
+    // When disabled it degrades to plain round-robin (avoiding lastBrokerName when set; the overload already falls back when every queue shares it)
     return tpInfo.selectOneMessageQueue(lastBrokerName);
 }
 
@@ -161,7 +161,7 @@ void MQFaultStrategy::updateFaultItem(const std::string& brokerName, double curr
 }
 
 int64_t MQFaultStrategy::computeNotAvailableDuration(double currentLatency) const {
-    // 从表尾向首找第一个 latency >= LATENCY_MAX[i] 的档位
+    // Scan from the end of the table towards the front for the first level with latency >= LATENCY_MAX[i]
     for (int i = kLatencyMaxSize - 1; i >= 0; --i) {
         if (currentLatency >= static_cast<double>(kLatencyMax[i])) {
             return kNotAvailableDuration[i];

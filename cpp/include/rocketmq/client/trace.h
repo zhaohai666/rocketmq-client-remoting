@@ -12,7 +12,7 @@
 
 namespace rocketmq {
 
-// ---------------------------------------------------------------- 常量
+// ---------------------------------------------------------------- Constants
 struct TraceConstants {
     static constexpr const char* GROUP_NAME_PREFIX = "_INNER_TRACE_PRODUCER";
     static constexpr const char* CONTENT_SPLITOR = "\x01";  // SOH
@@ -45,7 +45,7 @@ struct TraceConstants {
 };
 
 // ---------------------------------------------------------------- TraceType
-// 枚举名即线上字段第 1 段（Pub / Recall / SubBefore / SubAfter / EndTransaction）。
+// The enum name is the first segment of the on-wire field (Pub / Recall / SubBefore / SubAfter / EndTransaction).
 enum class TraceType {
     PUB = 0,
     RECALL = 1,
@@ -71,11 +71,11 @@ inline TraceType traceTypeFromName(const std::string& name) {
     if (name == "SubBefore") return TraceType::SUB_BEFORE;
     if (name == "SubAfter") return TraceType::SUB_AFTER;
     if (name == "EndTransaction") return TraceType::END_TRANSACTION;
-    return TraceType::PUB;  // 未知类型交由调用方按"跳过该条"处理
+    return TraceType::PUB;  // unknown types are left for the caller to "skip this entry"
 }
 
 // ---------------------------------------------------------------- AccessChannel
-// 只在 SubAfter 编码时起作用：非 CLOUD 才追加 timestamp + groupName 两段。
+// Only takes effect in SubAfter encoding: only non-CLOUD appends the timestamp + groupName two segments.
 enum class AccessChannel {
     LOCAL = 0,
     CLOUD = 1,
@@ -93,7 +93,7 @@ enum class TraceMessageType {
     ORDER = 4,
 };
 
-// 本机出口地址（storeHost/clientHost 默认）。
+// Local egress address (default for storeHost/clientHost).
 std::string localAddressForTrace();
 
 // ---------------------------------------------------------------- TraceBean
@@ -109,7 +109,7 @@ struct TraceBean {
     int32_t retryTimes = 0;
     int32_t bodyLength = 0;
     int32_t msgType = static_cast<int32_t>(TraceMessageType::NORMAL);  // ordinal
-    std::string transactionState;   // LocalTransactionState 的名字（"COMMIT_MESSAGE" 等）
+    std::string transactionState;   // name of the LocalTransactionState ("COMMIT_MESSAGE" etc.)
     std::string transactionId;
     bool fromTransactionCheck = false;
 };
@@ -123,8 +123,8 @@ struct TraceContext {
     std::string groupName;
     int64_t costTime = 0;
     bool isSuccess = true;
-    // 默认请求 id（SubBefore/SubAfter 共用一个，是控制台把一次消费前后串起来的关键）；
-    // 非空业务场景会被显式覆盖。
+    // Default request id (SubBefore/SubAfter share one; it is the key that lets the console stitch one consumption's before/after
+    // together); non-empty business scenarios get explicitly overridden.
     std::string requestId = InnerIdGenerator::createUniqId();
     int32_t contextCode = 0;
     std::optional<AccessChannel> accessChannel;
@@ -139,7 +139,7 @@ struct TraceTransferBean {
     std::set<std::string> transKey;
 };
 
-// ---------------------------------------------------------------- 编解码
+// ---------------------------------------------------------------- Encode / decode
 class TraceDataEncoder {
 public:
     static std::vector<std::string> javaSplit(const std::string& value, const std::string& sep);

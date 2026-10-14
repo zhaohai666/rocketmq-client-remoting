@@ -1,4 +1,4 @@
-// 管理端响应体实现。
+// Admin response body implementations.
 #include "rocketmq/remoting/protocol/admin_body.h"
 
 #include <string>
@@ -37,7 +37,7 @@ JsonValue rawSub(const JsonValue& v, const char* key) {
     return p != nullptr ? *p : JsonValue::makeNull();
 }
 
-// 把 <MessageQueue, T> 编码成 fastjson2 风格的 offsetTable 对象
+// Encode a <MessageQueue, T> map as the fastjson2-style offsetTable object
 template <typename T>
 JsonValue encodeMqKeyedMap(const std::map<MessageQueue, T>& m) {
     JsonValue table = JsonValue::makeObject();
@@ -49,9 +49,9 @@ JsonValue encodeMqKeyedMap(const std::map<MessageQueue, T>& m) {
 
 }  // namespace
 
-// ---------------------------------------------------------------- MessageQueue 作为 map 键
+// ---------------------------------------------------------------- MessageQueue as a map key
 std::string messageQueueKey(const MessageQueue& mq) {
-    // 键按字母序（fastjson2 行为）：brokerName, queueId, topic
+    // Keys in alphabetical order (fastjson2 behaviour): brokerName, queueId, topic
     JsonValue v = JsonValue::makeObject();
     v.set("brokerName", JsonValue::makeString(mq.brokerName));
     v.set("queueId", JsonValue::makeInt(mq.queueId));
@@ -60,7 +60,7 @@ std::string messageQueueKey(const MessageQueue& mq) {
 }
 
 bool parseMessageQueueKey(const std::string& key, MessageQueue& out) {
-    // 先看是不是内联对象键（以 '{' 起头）；否则是普通字符串键，直接不接受
+    // Check for an inline object key (starting with '{') first; a plain string key is not accepted here
     size_t b = 0;
     while (b < key.size() && (key[b] == ' ' || key[b] == '\t')) ++b;
     if (b >= key.size() || key[b] != '{') return false;
@@ -229,7 +229,7 @@ JsonValue ConsumeQueueData::toJson() const {
     v.set("eval", JsonValue::makeBool(eval));
     if (hasBitMap) v.set("bitMap", JsonValue::makeString(bitMap));
     else v.set("bitMap", JsonValue::makeNull());
-    // broker 侧约定：null 字段不序列化（这里用 has* 显式表达 null）
+    // Broker convention: null fields are not serialized (the has* flags express null explicitly here)
     if (hasExtendDataJson) v.set("extendDataJson", JsonValue::makeString(extendDataJson));
     if (hasMsg) v.set("msg", JsonValue::makeString(msg));
     return v;

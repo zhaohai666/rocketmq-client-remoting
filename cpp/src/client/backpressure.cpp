@@ -18,21 +18,21 @@ bool FairSemaphore::tryAcquire(int64_t permits, int32_t timeoutMillis) {
         if (!queue_.empty() && queue_.front() == waiter && free_ >= permits) {
             queue_.pop_front();
             free_ -= permits;
-            // 队首换人 = 后面某个人的「轮不到我」变成了「该我了」：release 那次通知可能只
-            // 够队首用，之后才排上队的人不会再被谁喊一声。少这一嗓子他就睡到自己的超时
-            // （异步发送里是白等满 sendMsgTimeout 再回调 TooMuchRequest），实测真会撞上。
+            // A new queue head means someone behind went from "not my turn" to "my turn": the notify from release
+            // may only wake the head, and whoever queued up later is never called again. Without this nudge they sleep
+            // until their own timeout (in async send that burns the full sendMsgTimeout before a TooMuchRequest callback); observed in practice.
             cv_.notify_all();
             return true;
         }
         if (std::chrono::steady_clock::now() >= deadline) {
-            // 只有本线程会摘自己的等待者（拿到许可时自己摘，超时时自己摘），所以一定找得到。
+            // Only this thread removes its own waiter (on acquiring the permit, and on timeout), so the lookup always succeeds.
             for (auto it = queue_.begin(); it != queue_.end(); ++it) {
                 if (*it == waiter) {
                     queue_.erase(it);
                     break;
                 }
             }
-            cv_.notify_all();  // 挡路的人走了，理由同上
+            cv_.notify_all();  // the blocker is gone, same reasoning as above
             return false;
         }
         cv_.wait_until(lk, deadline);
@@ -47,8 +47,8 @@ void FairSemaphore::release(int64_t permits) {
         std::lock_guard<std::mutex> lk(m_);
         free_ += permits;
     }
-    // 逐个 notify 会让被叫醒的人因"不是队头"继续等而白等一轮；等待者本来就被
-    // 队头挡住，全部叫醒让它们各自复核更快。
+    // Notifying one by one would make a woken waiter keep waiting because it is "not the head", wasting a round;
+    // waiters are blocked by the head anyway, so waking them all to recheck is faster.
     cv_.notify_all();
 }
 
@@ -70,7 +70,7 @@ int32_t FairSemaphore::waitingCount() const {
 void FairSemaphore::setTotalPermits(int64_t total) {
     {
         std::lock_guard<std::mutex> lk(m_);
-        // 差额全记在空闲许可上 ⇒ 在途份数 (total - free) 保持不变
+        // The whole delta is charged to free permits => the in-flight count (total - free) stays unchanged
         free_ += total - total_;
         total_ = total;
     }

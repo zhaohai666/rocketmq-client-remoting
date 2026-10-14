@@ -1,7 +1,7 @@
-// 句柄不是客户端自己造的：发送带 TIMER_DELIVER_MS / TIMER_DELAY_MS / TIMER_DELAY_SEC
-// 的定时消息时，broker 在 SendMessageProcessor#attachRecallHandle 里把这个句柄挂到
-// SEND 响应头的 recallHandle 字段上返回，客户端只负责原样带回去调用 recallMessage。
-// 普通消息的响应里没有这个字段。
+// The handle is not produced by the client: when sending a timed message with TIMER_DELIVER_MS /
+// TIMER_DELAY_MS / TIMER_DELAY_SEC, the broker attaches this handle to the recallHandle field of the
+// SEND response header in SendMessageProcessor#attachRecallHandle; the client only carries it back
+// verbatim when calling recallMessage. Normal messages have no such field in the response.
 #ifndef ROCKETMQ_COMMON_RECALL_MESSAGE_HANDLE_H
 #define ROCKETMQ_COMMON_RECALL_MESSAGE_HANDLE_H
 

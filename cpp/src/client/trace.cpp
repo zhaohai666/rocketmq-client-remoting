@@ -68,7 +68,7 @@ bool parseSingleRecord(const std::vector<std::string>& line, TraceContext& ctx) 
     if (line.empty()) return false;
     const std::string& kind = line[0];
     if (kind == "Pub") {
-        // 最小 12 段（解析实际访问到 line[11]）；老版本无 offsetMsgId 时 13 段。
+        // At least 12 fields (parsing accesses line[11]); old versions without offsetMsgId have 13.
         if (line.size() < 12) return false;
         ctx.traceType = TraceType::PUB;
         ctx.timeStamp = toInt64(safeAt(line, 1), 0);
@@ -83,13 +83,13 @@ bool parseSingleRecord(const std::vector<std::string>& line, TraceContext& ctx) 
         bean.bodyLength = toInt32(safeAt(line, 9), 0);
         ctx.costTime = toInt32(safeAt(line, 10), 0);
         bean.msgType = toInt32(safeAt(line, 11), 0);
-        if (line.size() == 13) {                           // 老版本：无 offsetMsgId
+        if (line.size() == 13) {                           // old version: no offsetMsgId
             ctx.isSuccess = toBool(safeAt(line, 12));
         } else if (line.size() == 14) {
             bean.offsetMsgId = safeAt(line, 12);
             ctx.isSuccess = toBool(safeAt(line, 13));
         }
-        if (line.size() >= 15) {                           // 兼容更老版本（带 clientHost）
+        if (line.size() >= 15) {                           // even older versions (with clientHost)
             bean.offsetMsgId = safeAt(line, 12);
             ctx.isSuccess = toBool(safeAt(line, 13));
             bean.clientHost = safeAt(line, 14);
@@ -112,7 +112,7 @@ bool parseSingleRecord(const std::vector<std::string>& line, TraceContext& ctx) 
         return true;
     }
     if (kind == "SubAfter") {
-        // 最小 6 段（keys 在段 5，解析实际访问到 line[5]）。
+        // At least 6 fields (keys is field 5, parsing accesses line[5]).
         if (line.size() < 6) return false;
         ctx.traceType = TraceType::SUB_AFTER;
         ctx.requestId = safeAt(line, 1);
@@ -121,10 +121,10 @@ bool parseSingleRecord(const std::vector<std::string>& line, TraceContext& ctx) 
         bean.keys = safeAt(line, 5);
         ctx.costTime = toInt32(safeAt(line, 3), 0);
         ctx.isSuccess = toBool(safeAt(line, 4));
-        if (line.size() >= 7) {                            // 兼容老版本：contextCode 段
+        if (line.size() >= 7) {                            // old versions: the contextCode field
             ctx.contextCode = toInt32(safeAt(line, 6), 0);
         }
-        if (line.size() >= 9) {                            // 兼容更老版本：timeStamp + groupName
+        if (line.size() >= 9) {                            // even older versions: timeStamp + groupName
             ctx.timeStamp = toInt64(safeAt(line, 7), UtilAll::currentTimeMillis());
             ctx.groupName = safeAt(line, 8);
         }
@@ -163,12 +163,12 @@ bool parseSingleRecord(const std::vector<std::string>& line, TraceContext& ctx) 
         ctx.traceBeans = {bean};
         return true;
     }
-    return false;  // 未知类型
+    return false;  // unknown type
 }
 
 }  // namespace
 
-// ---------------------------------------------------------------- 本机地址
+// ---------------------------------------------------------------- Local host address
 std::string localAddressForTrace() {
     std::string ip = UtilAll::localIp();
     if (UtilAll::isIpv4(ip)) return ip;
@@ -303,7 +303,7 @@ std::vector<TraceContext> TraceDataEncoder::decoderFromTraceDataString(
     const std::string& traceData) {
     std::vector<TraceContext> res;
     if (traceData.empty()) return res;
-    // 先按记录分隔符切分（丢弃末尾空串），再按字段分隔符切分。
+    // Split on the record separator first (dropping the trailing empty part), then on the field separator.
     for (const std::string& context : javaSplit(traceData, TraceConstants::FIELD_SPLITOR)) {
         if (context.empty()) continue;
         std::vector<std::string> line = javaSplit(context, TraceConstants::CONTENT_SPLITOR);

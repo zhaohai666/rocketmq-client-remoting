@@ -21,7 +21,7 @@ struct SendMessageContext {
     int32_t msgType = 0;  // TraceMessageType ordinal
     const SendResult* sendResult = nullptr;
     std::string exception;
-    // 钩子私有状态：before 写入 TraceContext，after 取出
+    // Hook-private state: before writes the TraceContext, after reads it back
     std::shared_ptr<TraceContext> mqTraceContext;
     std::string props;
     std::string ns;
@@ -67,7 +67,7 @@ struct EndTransactionContext {
     std::string brokerAddr;
     std::string msgId;
     std::string transactionId;
-    std::string transactionState;  // LocalTransactionState 名字
+    std::string transactionState;  // LocalTransactionState name
     bool fromTransactionCheck = false;
     std::string ns;
 };
@@ -81,8 +81,8 @@ public:
 
 enum class CommunicationMode { SYNC, ASYNC, ONEWAY };
 
-// 与 SendMessageContext 的关键差别：**没有 sendResult**（此刻还没发），带上 `arg`
-// （send(msg, selector, arg) 里的业务参数）。
+// Key difference from SendMessageContext: **no sendResult** (nothing has been sent yet), plus an `arg`
+// (the business parameter from send(msg, selector, arg)).
 struct CheckForbiddenContext {
     std::string nameSrvAddr;
     std::string group;
@@ -103,8 +103,8 @@ public:
     virtual void checkForbidden(CheckForbiddenContext& context) = 0;
 };
 
-// `msgList` 是**可变的**：钩子把它替换/裁剪掉的消息会被客户端直接丢弃
-// （拉取路径 = 静默跳过、位点照常推进；POP 路径 = 立刻 ack）。
+// `msgList` is **mutable**: messages a hook replaces or trims away are dropped outright by the client
+// (pull path = silently skipped and the offset still advances; POP path = acked immediately).
 struct FilterMessageContext {
     std::string consumerGroup;
     std::vector<MessageExt> msgList;

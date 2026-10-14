@@ -1,11 +1,11 @@
-// 协议序列化实现：JSON（RemotingSerializable）与 RocketMQ 私有二进制（RocketMQSerializable）。
+// Protocol serialization: JSON (RemotingSerializable) and the RocketMQ private binary format (RocketMQSerializable).
 //
-// 线格式与编码口径（已对真实 5.5.1 集群验证）：
-//   - JSON：JsonValue -> UTF-8 字节串；
-//   - ROCKETMQ header 线格式：
+// Wire format and encoding rules (verified against a real 5.5.1 cluster):
+//   - JSON: JsonValue -> UTF-8 byte string;
+//   - ROCKETMQ header wire format:
 //       code(2) | language(1) | version(2) | opaque(4) | flag(4)
 //       | remark(int + utf8) | extFields(int + [key(short + utf8) value(int + utf8)]...)
-//   - writeDecimalLong：先占位 4B 长度，写完十进制 ASCII 后回补真实长度。
+//   - writeDecimalLong: reserve a 4-byte length slot first, then backfill the real length after the decimal ASCII has been written.
 #include "rocketmq/remoting/protocol/serialize.h"
 
 #include <limits>
@@ -26,7 +26,7 @@ bool RemotingSerializable::decode(const Bytes& data, JsonValue& out) {
 // ---------------------------------------------------------------- RocketMQSerializable
 
 void RocketMQSerializable::writeDecimalLong(Bytes& buf, int64_t value) {
-    // 先占位 4 字节长度
+    // Reserve the 4-byte length slot first
     size_t lenPos = buf.size();
     putInt32(buf, 0);
     size_t start = buf.size();
@@ -38,11 +38,11 @@ void RocketMQSerializable::writeDecimalLong(Bytes& buf, int64_t value) {
         if (neg) {
             buf.push_back('-');
             if (value == std::numeric_limits<int64_t>::min()) {
-                // -(INT64_MIN) 溢出，直接写字符串常量
+                // -(INT64_MIN) overflows, write the string constant directly
                 const char* kMin = "9223372036854775808";
                 buf += kMin;
                 int32_t n = static_cast<int32_t>(buf.size() - start);
-                // 回补长度
+                // Backfill the length
                 buf[lenPos + 0] = static_cast<char>((n >> 24) & 0xFF);
                 buf[lenPos + 1] = static_cast<char>((n >> 16) & 0xFF);
                 buf[lenPos + 2] = static_cast<char>((n >> 8) & 0xFF);

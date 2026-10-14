@@ -1,5 +1,5 @@
-// 编译期开关：CMake `RMQ_ENABLE_TLS`（找到 OpenSSL 时默认 ON）。找不到 OpenSSL 时
-// 本头文件提供**报错型占位**：setTlsEnable(true) 会抛出带说明的异常，其余路径零影响。
+// Compile-time switch: CMake `RMQ_ENABLE_TLS` (ON by default when OpenSSL is found). Without OpenSSL
+// this header provides an **error-raising stub**: setTlsEnable(true) throws an explanatory exception and all other paths are unaffected.
 #ifndef ROCKETMQ_REMOTING_TLS_SESSION_H
 #define ROCKETMQ_REMOTING_TLS_SESSION_H
 
@@ -26,41 +26,41 @@ std::shared_ptr<void> createStrictClientSslContext(const std::string& caPath,
                                                    const std::string& keyPath,
                                                    std::string& err);
 
-// 一条连接的 TLS 会话。生命周期：connect 后 handshake()，之后 read/writeAll
-// 替代裸 recv/send，close 时析构（内部 best-effort SSL_shutdown）。
+// TLS session for one connection. Lifetime: handshake() after connect, then read/writeAll
+// replace raw recv/send, and it is destroyed on close (best-effort SSL_shutdown internally).
 //
-// ⚠ OpenSSL 不支持两个线程同时用**同一个 SSL 对象**（维护者在 openssl/openssl#20622
-// 的原话："You cannot share (most) OpenSSL objects between threads"；openssl-threads(7)
-// 也只承诺"most objects are not safe for simultaneous use"）。而本传输层的形状是
-// "一连接一个读线程 + 调用方线程写"：读线程的 SSL_pending/SSL_read 与调用方的
-// SSL_write 必然在同一条会话上交叠，光靠连接层那把 writeMutex（只锁写侧）挡不住。
-// 所以锁放在**会话内部**，四个入口每次 SSL_* 调用取放一次：
-//   * 粒度是"一次 SSL_* 调用"而不是"一次业务读写"——writeAll 的多次 SSL_write 逐次取放，
-//     重试前的 10ms 睡眠在锁外，绝不抱着锁睡觉；
-//   * 读线程只在 select 报可读（或 SSL_pending>0）时才进 read，正常情况下锁内只有一次
-//     syscall 的量级；只有"记录只到了一半"这种对端停摆的极端情况会抱锁到 SO_RCVTIMEO
-//     （1s）到点，那是这条链路本就要付的代价。
+// ⚠ OpenSSL does not support two threads using the **same SSL object** concurrently (the maintainer's
+// words in openssl/openssl#20622: "You cannot share (most) OpenSSL objects between threads"; openssl-threads(7)
+// only promises that "most objects are not safe for simultaneous use"). This transport's shape is
+// "one reader thread per connection plus writes from caller threads", so the reader's SSL_pending/SSL_read and the
+// caller's SSL_write necessarily overlap on one session, and the connection-level writeMutex (write side only) cannot prevent that.
+// The lock therefore lives **inside the session**, taken and released around every SSL_* call in the four entry points:
+//   * the granularity is "one SSL_* call" rather than "one business read/write" -- writeAll's repeated SSL_write calls take and release each time,
+//     and the 10ms sleep before a retry is outside the lock, so the lock is never held while sleeping;
+//   * the reader only enters read when select reports readability (or SSL_pending>0), so under normal conditions the lock is held for about one
+//     syscall; only a peer stall with "a record only half received" holds the lock until SO_RCVTIMEO
+//     (1s) expires, which is the price this link has to pay anyway.
 class TlsSession {
 public:
-    // expectedName：严格模式下的主机名/SAN 校验目标（serverName 覆盖）；空 = 用连接 host。
-    // test-mode（ctx verify=NONE）下忽略。
+    // expectedName: the hostname/SAN to verify in strict mode (overridden by serverName); empty = use the connection host.
+    // Ignored in test mode (ctx verify=NONE).
     explicit TlsSession(std::shared_ptr<void> ctx, const std::string& expectedName = std::string());
     ~TlsSession();
     TlsSession(const TlsSession&) = delete;
     TlsSession& operator=(const TlsSession&) = delete;
 
-    // 阻塞握手；失败返回 false 并填 err（含超时）。host 用作 SNI。
+    // Blocking handshake; on failure returns false and fills err (including timeouts). host is used as SNI.
     bool handshake(netcompat::socket_t sock, const std::string& host, int timeoutMillis,
                    std::string& err);
 
-    // 读：>0 = 字节数；0 = 对端正常关闭；-2 = 暂无数据（重试）；<0 = 错误。
-    // SSL 内部缓冲未空时立即返回。
+    // Read: >0 = byte count; 0 = peer closed cleanly; -2 = no data yet (retry); <0 = error.
+    // Returns immediately when the SSL internal buffer is not empty.
     int read(netcompat::socket_t sock, char* buf, int len);
 
-    // 写全部字节；false = 对端关闭或错误。
+    // Write all bytes; false = peer closed or an error.
     bool writeAll(netcompat::socket_t sock, const char* data, size_t len);
 
-    // SSL 内部缓冲中尚未交付的字节数（>0 时 select 会漏报可读）。
+    // Bytes decrypted inside the SSL buffer but not yet delivered (when >0, select can miss readability).
     int pending();
 
     void shutdown();
@@ -69,13 +69,13 @@ private:
     std::shared_ptr<void> ctx_;
     std::string expectedName_;
     SSL* ssl_ = nullptr;
-    // 会话级 io 锁：见类注释。只包 SSL_* 调用，不包任何睡眠/等待。
+    // Session-level io lock: see the class comment. It wraps only SSL_* calls, never sleeps or waits.
     std::mutex ioMutex_;
 };
 
 #else  // !RMQ_HAS_TLS
 
-// 未编入 OpenSSL 的占位：握手永远失败并给出明确原因，其余 API 不可达。
+// Stub when OpenSSL is not compiled in: the handshake always fails with an explicit reason; the other APIs are unreachable.
 class TlsSession {
 public:
     explicit TlsSession(std::shared_ptr<void> ctx, const std::string& expectedName = std::string()) {

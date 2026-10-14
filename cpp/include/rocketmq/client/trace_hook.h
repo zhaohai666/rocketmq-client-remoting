@@ -1,6 +1,6 @@
-//   * SendMessageTraceHook    ← SendMessageTraceHookImpl
-//   * ConsumeMessageTraceHook ← ConsumeMessageTraceHookImpl
-//   * EndTransactionTraceHook ← EndTransactionTraceHookImpl
+//   * SendMessageTraceHook    — send-side trace records
+//   * ConsumeMessageTraceHook — consume-side trace records
+//   * EndTransactionTraceHook — end-transaction trace records
 #ifndef ROCKETMQ_CLIENT_TRACE_HOOK_H
 #define ROCKETMQ_CLIENT_TRACE_HOOK_H
 
@@ -12,7 +12,7 @@
 
 namespace rocketmq {
 
-// 发送侧轨迹钩子。
+// Send-side trace hook.
 class SendMessageTraceHook : public SendMessageHook {
 public:
     explicit SendMessageTraceHook(TraceDispatcher* dispatcher) : dispatcher_(dispatcher) {}
@@ -26,7 +26,7 @@ private:
     TraceDispatcher* dispatcher_;
 };
 
-// 消费侧轨迹钩子（SubBefore / SubAfter 两条记录共用同一个 request_id）。
+// Consume-side trace hook (the SubBefore / SubAfter records share one request_id).
 class ConsumeMessageTraceHook : public ConsumeMessageHook {
 public:
     explicit ConsumeMessageTraceHook(TraceDispatcher* dispatcher) : dispatcher_(dispatcher) {}
@@ -40,8 +40,8 @@ private:
     TraceDispatcher* dispatcher_;
 };
 
-// 事务收尾轨迹钩子（对应 EndTransactionTraceHookImpl）。
-// broker 的事务回查（fromTransactionCheck=true）也会走这里。
+// Trace hook for the end of a transaction (commit/rollback).
+// The broker's transaction check-back (fromTransactionCheck=true) also passes through here.
 class EndTransactionTraceHook : public EndTransactionHook {
 public:
     explicit EndTransactionTraceHook(TraceDispatcher* dispatcher) : dispatcher_(dispatcher) {}

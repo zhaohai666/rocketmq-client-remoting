@@ -1,6 +1,6 @@
-// 三条硬性约定见 trace_hook.h 头注释：轨迹消息不再被追踪、是否落轨迹由 broker / 消息属性
-// 决定、消费侧 msgId 用 offset 侧 ID（对齐 SendResult.offsetMsgId，而不是 SendResult.msgId /
-// UNIQ_KEY）。
+// The three hard rules are in the trace_hook.h header comment: trace messages are never traced, whether a record is written is decided by the broker / message
+// property, and the consume-side msgId uses the offset-side ID (matching SendResult.offsetMsgId rather than SendResult.msgId /
+// UNIQ_KEY).
 #include "rocketmq/client/trace_hook.h"
 
 #include "rocketmq/common/logging.h"
@@ -12,8 +12,8 @@ namespace rocketmq {
 
 namespace {
 
-// ConsumeReturnType 名字 -> ordinal（顺序即协议里 ConsumeReturnType 的枚举序号，
-// 轨迹 SubAfter 的 contextCode 用的正是它，不可重排）。未知名字退化为 SUCCESS(0)。
+// ConsumeReturnType name -> ordinal (this order is the protocol's ConsumeReturnType enum ordinal,
+// which is exactly what the trace SubAfter contextCode uses; it must not be reordered). Unknown names fall back to SUCCESS(0).
 int32_t consumeReturnTypeOrdinal(const std::string& name) {
     if (name == "SUCCESS") return 0;
     if (name == "TIME_OUT") return 1;
@@ -34,7 +34,7 @@ bool startsWith(const std::string& s, const std::string& prefix) {
 void SendMessageTraceHook::sendMessageBefore(SendMessageContext& context) {
     if (dispatcher_ == nullptr || context.message == nullptr) return;
     const std::string& topic = context.message->topic;
-    if (startsWith(topic, dispatcher_->getTraceTopicName())) return;  // 轨迹消息不再被追踪
+    if (startsWith(topic, dispatcher_->getTraceTopicName())) return;  // trace messages are never traced
 
     auto traceContext = std::make_shared<TraceContext>();
     context.mqTraceContext = traceContext;
@@ -58,7 +58,7 @@ void SendMessageTraceHook::sendMessageAfter(SendMessageContext& context) {
     if (context.mqTraceContext == nullptr) return;
     if (context.sendResult == nullptr) return;
     const SendResult& result = *context.sendResult;
-    // broker 侧 traceOn=false 或没带回 region 时不落库
+    // Nothing is written when the broker reports traceOn=false or returns no region
     if (result.regionId.empty() || !result.traceOn) return;
 
     TraceContext& traceContext = *context.mqTraceContext;
@@ -72,8 +72,8 @@ void SendMessageTraceHook::sendMessageAfter(SendMessageContext& context) {
     traceContext.regionId = result.regionId;
 
     TraceBean& bean = traceContext.traceBeans[0];
-    bean.msgId = result.msgId;               // 客户端 UNIQ_KEY
-    bean.offsetMsgId = result.offsetMsgId;   // broker 的 offset 消息 ID
+    bean.msgId = result.msgId;               // client-side UNIQ_KEY
+    bean.offsetMsgId = result.offsetMsgId;   // the broker's offset message ID
     bean.storeTime = traceContext.timeStamp + static_cast<int64_t>(costTime) / 2;
     dispatcher_->append(context.mqTraceContext);
 }
@@ -89,19 +89,19 @@ void ConsumeMessageTraceHook::consumeMessageBefore(ConsumeMessageContext& contex
 
     std::vector<TraceBean> beans;
     for (const MessageExt& msg : context.msgList) {
-        // 只按消息级开关过滤：不按空 topic 跳过（C++ 的 vector 里没有 null 元素）。
+        // Filter only on the per-message switch: no skip for empty topics (the C++ vector holds no null elements).
         std::string traceOn = msg.getProperty(TraceConstants::PROPERTY_TRACE_SWITCH);
-        if (traceOn == "false") continue;  // 消息级关闭轨迹
+        if (traceOn == "false") continue;  // tracing disabled per message
         TraceBean bean;
         bean.topic = NamespaceUtil::withoutNamespace(msg.topic);
-        bean.msgId = msg.msgId;            // 消费侧用 offset 侧 ID（对齐 SendResult.offsetMsgId）
+        bean.msgId = msg.msgId;            // consume side uses the offset-side ID (matching SendResult.offsetMsgId)
         bean.tags = msg.getTags();
         bean.keys = msg.getKeys();
         bean.storeTime = msg.storeTimestamp;
         bean.bodyLength = msg.storeSize;
         bean.retryTimes = msg.reconsumeTimes;
         std::string region = msg.getProperty(MessageConst::PROPERTY_MSG_REGION);
-        traceContext->regionId = region;   // 逐条覆盖，最后一条生效
+        traceContext->regionId = region;   // overwritten per message; the last one wins
         beans.push_back(bean);
     }
     if (!beans.empty()) {
@@ -122,16 +122,16 @@ void ConsumeMessageTraceHook::consumeMessageAfter(ConsumeMessageContext& context
     subAfter->traceType = TraceType::SUB_AFTER;
     subAfter->regionId = subBefore.regionId;
     subAfter->groupName = NamespaceUtil::withoutNamespace(subBefore.groupName);
-    subAfter->requestId = subBefore.requestId;        // 与 SubBefore 共用一个 request_id
+    subAfter->requestId = subBefore.requestId;        // shares one request_id with SubBefore
     subAfter->accessChannel = context.accessChannel;
     subAfter->isSuccess = context.success;
     int64_t now = UtilAll::currentTimeMillis();
     int32_t costTime = static_cast<int32_t>((now - subBefore.timeStamp)
                                             / static_cast<int64_t>(context.msgList.size()));
     subAfter->costTime = costTime;
-    subAfter->traceBeans = subBefore.traceBeans;      // 同一批消息，msgId 沿用 offset 侧 ID
+    subAfter->traceBeans = subBefore.traceBeans;      // the same batch of messages, msgIds stay the offset-side ones
 
-    // props 里放的是 ConsumeReturnType 的**名字**（消费端按名查 ordinal），未知退化为 SUCCESS。
+    // props carries the ConsumeReturnType **name** (the consumer looks the ordinal up by name); unknown values fall back to SUCCESS.
     subAfter->contextCode = consumeReturnTypeOrdinal(context.props);
 
     dispatcher_->append(subAfter);
@@ -141,7 +141,7 @@ void ConsumeMessageTraceHook::consumeMessageAfter(ConsumeMessageContext& context
 void EndTransactionTraceHook::endTransaction(EndTransactionContext& context) {
     if (dispatcher_ == nullptr || context.message == nullptr) return;
     const std::string& topic = context.message->topic;
-    if (startsWith(topic, dispatcher_->getTraceTopicName())) return;  // 轨迹消息不再被追踪
+    if (startsWith(topic, dispatcher_->getTraceTopicName())) return;  // trace messages are never traced
 
     auto traceContext = std::make_shared<TraceContext>();
     traceContext->traceType = TraceType::END_TRANSACTION;

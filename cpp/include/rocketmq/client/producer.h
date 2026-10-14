@@ -1,8 +1,8 @@
-// 能力覆盖：同步发送（轮询选队列 / 定点发送）、按选择器发送（顺序消息）、
-// 异步发送、单向发送、批量发送、事务消息（两阶段：半消息 → 本地事务 → END_TRANSACTION → broker 回查）、
-// **自动攒批（autoBatch + ProduceAccumulator，见 client/produce_accumulator.h）**、
-// 按 Key 查询、
-// offset 查询、建 topic。
+// Capability coverage: synchronous send (polling queue selection / pinned send to a specific queue), send by selector (ordered messages),
+// async send, oneway send, batch send, transactional messages (two-phase: half message → local transaction → END_TRANSACTION → broker check-back),
+// **auto batching (autoBatch + ProduceAccumulator, see client/produce_accumulator.h)**,
+// query by key,
+// offset queries, topic creation.
 #ifndef ROCKETMQ_CLIENT_PRODUCER_H
 #define ROCKETMQ_CLIENT_PRODUCER_H
 
@@ -43,15 +43,15 @@ public:
     DefaultMQProducer& operator=(const DefaultMQProducer&) = delete;
     virtual ~DefaultMQProducer();
 
-    // ---------------- 配置 ----------------
-    // 分号分隔的 nameServer 地址串，如 "127.0.0.1:9876"
+    // ---------------- Configuration ----------------
+    // Semicolon-separated name server address string, e.g. "127.0.0.1:9876"
     void setNamesrvAddr(const std::string& addr);
     void setNameServerAddresses(const std::vector<std::string>& addrs);
     std::string getNamesrvAddr() const;
     void setInstanceName(const std::string& name) { instanceName_ = name; }
     void setTlsEnable(bool b) { tlsEnable_ = b; }
-    // TLS 严格校验选项（caCert 非空 = 证书链 + 主机名严格校验；clientCert/Key = mTLS）。
-    // 调用后自动开启 TLS；须在 start() 之前设置。
+    // TLS strict-validation options (non-empty caCert = strict certificate-chain + hostname validation; clientCert/Key = mTLS).
+    // Setting this automatically enables TLS; must be configured before start().
     void setTlsOptions(const TlsOptions& opts) {
         tlsOptions_ = opts;
         tlsOptionsSet_ = true;
@@ -61,7 +61,7 @@ public:
         socksProxy_ = proxy;
         socksProxySet_ = true;
     }
-    // W3C traceparent 透传（opt-in；缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE）
+    // W3C tracepass-through (opt-in; default read from env ROCKETMQ_TRACE_CONTEXT_ENABLE)
     void setEnableTraceContext(bool b) { enableTraceContext_ = b; }
     void setSendMsgTimeout(int32_t millis) { sendMsgTimeout_ = millis; }
     void setRetryTimesWhenSendFailed(int32_t n) { retryTimesWhenSendFailed_ = n; }
@@ -77,13 +77,13 @@ public:
     void setMaxMessageSize(int32_t bytes) { maxMessageSize_ = bytes; }
     void setAutoBatch(bool autoBatch) { autoBatch_ = autoBatch; }
     bool getAutoBatch() const;
-    // 单个批次的最长攒批时间，合法区间 (0, 30s]（默认 10ms）
+    // Max hold time per batch, valid range (0, 30s] (default 10ms)
     void setBatchMaxDelayMs(int32_t holdMs);
     int32_t getBatchMaxDelayMs() const;
-    // 单个批次的 body 上限，合法区间 (0, 2MB]（默认 32KB）
+    // Max body size per batch, valid range (0, 2MB] (default 32KB)
     void setBatchMaxBytes(int64_t holdSize);
     int64_t getBatchMaxBytes() const;
-    // 累加器的在途总量上限，必须 > 0（默认 32MB）
+    // In-flight total cap of the accumulator, must be > 0 (default 32MB)
     void setTotalBatchMaxBytes(int64_t totalHoldBytes);
     int64_t getTotalBatchMaxBytes() const;
     void initProduceAccumulator();
@@ -140,7 +140,7 @@ public:
     }
 
     void setRPCHook(std::shared_ptr<RPCHook> hook) { rpcHook_ = std::move(hook); }
-    // 便捷入口：用 accessKey/secretKey（可选 securityToken）构造 AclClientRPCHook。
+    // Convenience entry: build an AclClientRPCHook from accessKey/secretKey (optional securityToken).
     void setCredentials(const std::string& accessKey, const std::string& secretKey,
                         const std::string& securityToken = std::string()) {
         rpcHook_ = std::make_shared<AclClientRPCHook>(
@@ -157,7 +157,7 @@ public:
 
     void setEnableTrace(bool enable) { enableTrace_ = enable; }
     bool isEnableTrace() const { return enableTrace_; }
-    // 自定义轨迹 topic（默认 RMQ_SYS_TRACE_TOPIC）
+    // Custom trace topic (default RMQ_SYS_TRACE_TOPIC)
     void setTraceTopic(const std::string& topic) { traceTopic_ = topic; }
     const std::string& getTraceTopic() const { return traceTopic_; }
     void setTraceMsgBatchNum(int32_t n) { traceMsgBatchNum_ = n; }
@@ -177,12 +177,12 @@ public:
     }
     bool hasCheckForbiddenHook() const { return !checkForbiddenHookList_.empty(); }
     size_t checkForbiddenHookCount() const { return checkForbiddenHookList_.size(); }
-    // 不需要走「带拦截/钩子」发送内核时返回 false（零开销快路径）
+    // Return false when the "interception/hook-bearing" send kernel is not needed (zero-overhead fast path)
     bool hasSendInterceptors() const {
         return !sendMessageHookList_.empty() || !checkForbiddenHookList_.empty();
     }
     void executeCheckForbiddenHook(CheckForbiddenContext& context);
-    // 轨迹分发器（未开轨迹时为空），供联调脚本读取丢弃计数等状态
+    // Trace dispatcher (null when tracing is off); integration scripts read state such as the discard counter from it
     std::shared_ptr<AsyncTraceDispatcher> traceDispatcher() const { return traceDispatcher_; }
 
     const std::string& producerGroup() const { return producerGroup_; }
@@ -203,19 +203,19 @@ public:
     void sendDirectAsync(const MessageBatch& batch, const MessageQueue* mq,
                          std::shared_ptr<SendCallback> callback) override;
 
-    // ---------------- 生命周期 ----------------
+    // ---------------- Lifecycle ----------------
     void start();
     void shutdown();
 
     MQClientInstance& client();
 
-    // ---------------- 同步发送 ----------------
-    // 不指定队列：轮询选择，失败按 retryTimesWhenSendFailed 重试
+    // ---------------- Synchronous send ----------------
+    // No queue specified: polling selection, retry on failure per retryTimesWhenSendFailed
     SendResult send(const Message& msg, int32_t timeoutMillis = -1);
-    // 定点发送到指定队列
+    // Pinned send to the specified queue
     SendResult send(const Message& msg, const MessageQueue& mq, int32_t timeoutMillis = -1);
 
-    // 按选择器发送（顺序消息：同一 arg 落到同一队列）
+    // Send via selector (ordered messages: the same arg lands on the same queue)
     SendResult sendBySelector(const Message& msg, const MessageQueueSelector& selector,
                               const std::string& arg, int32_t timeoutMillis = -1);
 
@@ -228,23 +228,23 @@ public:
 
     void setRequestTimeout(int32_t millis) { requestTimeoutMillis_ = millis; }
     int32_t requestTimeout() const { return requestTimeoutMillis_; }
-    // 不指定队列：轮询选择
+    // No queue specified: polling selection
     Message request(const Message& msg, int32_t timeoutMillis = -1);
-    // 定点发送请求到指定队列
+    // Pinned request send to the specified queue
     Message request(const Message& msg, const MessageQueue& mq, int32_t timeoutMillis = -1);
 
-    // ---------------- 批量 ----------------
+    // ---------------- Batch ----------------
     SendResult sendBatch(const std::vector<Message>& msgs, int32_t timeoutMillis = -1);
     SendResult sendBatch(const std::vector<Message>& msgs, const MessageQueue& mq,
                          int32_t timeoutMillis = -1);
 
-    // SendMessageHook（before/after）**照跑**：复用的同步批量内核内部就是 sendWithHooks，
-    // 每轮尝试一个 context。差别只在重试语义——这一条链走的
-    // 是同步内核的 retryTimesWhenSendFailed 循环，不是异步链 onSendException 的换 broker
-    // 重试；所以 completeAsync 不再重复跑 after（context 归内核自己收尾）。
+    // SendMessageHook (before/after) **still runs**: the reused synchronous batch kernel internally is sendWithHooks,
+    // one context per attempt. The difference lies only in retry semantics — this chain
+    // goes through the synchronous kernel's retryTimesWhenSendFailed loop, not the async chain's onSendException broker-switch
+    // retry; so completeAsync does not re-run after (the context is finalized by the kernel itself).
     //
-    // 背压闸与单条异步同口径，只是「字节」许可按整批每条 body 长度累加（空 body 也算 1，
-    // 整批为空算 1），见 batchBackPressureMsgLen。未 start() 时同样是同步抛。
+    // The backpressure gate matches the single-message async path, except the "byte" permit is charged as the sum of every body length
+    // in the batch (an empty body still counts as 1, an empty batch counts as 1), see batchBackPressureMsgLen. Not started() throws synchronously as well.
     void sendBatchAsync(const std::vector<Message>& msgs, std::shared_ptr<SendCallback> callback,
                         int32_t timeoutMillis = -1);
     void sendBatchAsync(const std::vector<Message>& msgs, const MessageQueue& mq,
@@ -253,7 +253,7 @@ public:
     TransactionSendResult sendMessageInTransaction(const Message& msg, TransactionListener& listener,
                                                    const std::string& arg = std::string());
 
-    // ---------------- 查询 / 管理 ----------------
+    // ---------------- Query / management ----------------
     std::vector<MessageExt> queryMessage(const std::string& topic, const std::string& key,
                                          int32_t maxNum, int64_t beginTimestamp,
                                          int64_t endTimestamp);
@@ -276,7 +276,7 @@ protected:
     Message withNamespace(const Message& msg) const;
     void checkPinnedTopic(const std::string& msgTopic, const MessageQueue& mq,
                           const std::string& message) const;
-    // request() 的公共收尾（两个公开重载都会走到这里；outbound 已过 withNamespace/checkMessage）
+    // Common tail of request() (both public overloads end up here; outbound already passed withNamespace/checkMessage)
     Message requestWithQueue(Message& outbound, const MessageQueue& mq, int32_t timeout);
     Message waitRequestResponse(const Message& outbound, int32_t timeout,
                                 const std::shared_ptr<RequestResponseFuture>& future,
@@ -297,44 +297,44 @@ protected:
                              CommunicationMode mode = CommunicationMode::SYNC);
     void executeSendMessageHookBefore(SendMessageContext& context);
     void executeSendMessageHookAfter(SendMessageContext& context);
-    // 构造 CheckForbiddenContext 并执行（每次发送尝试都会调一次，含重试）
+    // Build a CheckForbiddenContext and execute it (called once per send attempt, retries included)
     void runCheckForbidden(const Message& msg, const MessageQueue& mq,
                            const std::string& brokerAddr, const std::string* arg,
                            CommunicationMode mode);
     void executeEndTransactionHook(const Message& msg, const std::string& brokerAddr,
                                    const std::string& msgId, const std::string& transactionId,
                                    const std::string& transactionState, bool fromTransactionCheck);
-    // start() 里按 enableTrace 建分发器并注册钩子；任何异常只记日志，不影响正常发送。
+    // In start(), build the dispatcher per enableTrace and register hooks; any exception is only logged and never affects normal sending.
     void startTraceDispatcher();
-    // 发轨迹前的公共上下文（brokerAddr 用消息将要落到的 broker 地址）
+    // Common context before sending a trace (brokerAddr is the broker address the message is about to land on)
     SendMessageContext buildSendMessageContext(const Message& msg, const MessageQueue& mq,
                                                const std::string& brokerAddr) const;
 
     struct AsyncSendState {
-        Message msg;                                   // 已套 namespace、已压缩
-        std::shared_ptr<TopicPublishInfo> publish;     // nullptr = 定点发送，不换 broker
-        RemotingCommand request;                       // 跨重试复用的那一份请求
-        MessageQueue mq;                               // 当前尝试要打的队列
-        std::string brokerName;                        // 当前尝试的 broker（重选时避开）
+        Message msg;                                   // namespace applied, compressed
+        std::shared_ptr<TopicPublishInfo> publish;     // nullptr = pinned send, no broker switch
+        RemotingCommand request;                       // the one request object reused across retries
+        MessageQueue mq;                               // queue targeted by the current attempt
+        std::string brokerName;                        // broker of the current attempt (avoided on reselection)
         std::shared_ptr<SendCallback> callback;
-        std::shared_ptr<SendMessageContext> context;   // nullptr = 无发送钩子，不建上下文
-        int32_t sysFlag = 0;                           // 压缩位，整条链只算一次
-        int32_t timeout = 0;                           // **剩余**预算（每轮扣掉已花掉的）
+        std::shared_ptr<SendMessageContext> context;   // nullptr = no send hooks, no context built
+        int32_t sysFlag = 0;                           // compression bit, computed once for the whole chain
+        int32_t timeout = 0;                           // **remaining** timeout budget (each round deducts what was spent)
         int32_t times = 0;
-        bool pinned = false;                           // 定点发送：重试不换 broker
-        bool numAcquired = false;                      // 已拿到 1 份「条数」许可
-        bool sizeAcquired = false;                     // 已拿到 msgLen 份「字节」许可
-        bool permitsReleased = false;                  // 只归还一次（链上多条终点会重复收尾）
-        int64_t msgLen = 1;                            // 扣字节许可的份数，**压缩前**的 body 长度
-        // ---- 批量异步（sendBatchAsync）----
-        // batch=true 时这条链不建 request/publish/context，而是把 batchMsgs 交给同步批量内核
-        // （见 sendBatchAsyncInner）。msg 留空，重试链自然不参与。
+        bool pinned = false;                           // pinned send: retries do not switch broker
+        bool numAcquired = false;                      // 1 "count" permit already acquired
+        bool sizeAcquired = false;                     // msgLen "byte" permits already acquired
+        bool permitsReleased = false;                  // release exactly once (several chain end-points would finalize twice)
+        int64_t msgLen = 1;                            // units charged to the byte permit: **pre-compression** body length
+        // ---- batch async (sendBatchAsync) ----
+        // when batch=true this chain builds no request/publish/context; it hands batchMsgs to the synchronous batch
+        // kernel instead (see sendBatchAsyncInner). msg stays empty, so the retry chain naturally does not participate.
         bool batch = false;
         std::vector<Message> batchMsgs;
-        std::chrono::steady_clock::time_point attemptBegan;  // 本次尝试起点（单调钟）
+        std::chrono::steady_clock::time_point attemptBegan;  // start of this attempt (monotonic clock)
     };
 
-    // start() 里建 AsyncSenderExecutor + NettyClientPublicExecutor 两个池。
+    // In start(), create the AsyncSenderExecutor + NettyClientPublicExecutor pools.
     void createAsyncExecutors();
     void enqueueAsync(const std::shared_ptr<AsyncSendState>& state, const MessageQueue* pinned,
                       int32_t timeoutMillis);
@@ -344,21 +344,21 @@ protected:
                                  const std::shared_ptr<ConsumeExecutor>& pool);
     void releaseBackPressure(const std::shared_ptr<AsyncSendState>& state);
     void sendAsyncInner(const std::shared_ptr<AsyncSendState>& state, const MessageQueue* pinned);
-    // 批量分支：在
-    // AsyncSenderExecutor 线程里跑同步批量内核，结果挪到回调线程交付。
+    // Batch branch: run the synchronous batch kernel inside the
+    // AsyncSenderExecutor thread, then deliver the result on the callback thread.
     void sendBatchAsyncInner(const std::shared_ptr<AsyncSendState>& state,
                              const MessageQueue* pinned);
-    // 建请求 + before 钩子，然后发出第一笔尝试
+    // Build the request + run before hooks, then issue the first attempt
     void sendKernelAsync(const std::shared_ptr<AsyncSendState>& state);
     void sendAttempt(const std::shared_ptr<AsyncSendState>& state, const std::string& addr);
     void onTransportThrow(const std::shared_ptr<AsyncSendState>& state, const std::string& message,
                           InvokeError::Kind kind);
-    // 一笔尝试的结局（在 NettyClientPublicExecutor_N 上跑）：记容错表，然后要么收尾要么重试
+    // Outcome of one attempt (runs on NettyClientPublicExecutor_N): record into the fault-tolerance table, then either finalize or retry
     void onAttemptComplete(const std::shared_ptr<AsyncSendState>& state, const SendResult& result,
                            const InvokeError& error);
     void onSendException(const std::shared_ptr<AsyncSendState>& state, const InvokeError& error,
                          bool needRetry);
-    // 链的终点：先 after 钩子，再回调用户（用户回调抛的异常吞掉，不能带走回调线程）
+    // End of the chain: after hooks first, then the user callback (exceptions thrown by the user callback are swallowed; they must not take down the callback thread)
     void completeAsync(const std::shared_ptr<AsyncSendState>& state, const SendResult* result,
                        const InvokeError* error);
     void executeOnCallbackThread(std::function<void()> fn);
@@ -368,10 +368,10 @@ protected:
                         const std::string& localExceptionText, bool fromCheck,
                         const CheckTransactionStateRequestHeader* checkHeader,
                         const MessageExt* checkMsg, const std::string& brokerAddr);
-    // broker 主动发起的事务回查（CHECK_TRANSACTION_STATE=39）入口，由传输层回调。
+    // Transaction check-back initiated by the broker (CHECK_TRANSACTION_STATE=39) entry point, invoked by the transport layer.
     void checkTransactionState(const RemotingCommand& cmd, const std::string& addr);
 
-    // 向所有已知 broker 发一次心跳（含 ProducerData）。
+    // Send one heartbeat (including ProducerData) to every known broker.
     int32_t sendHeartbeatToAllBroker();
 
     void detectorLoop();
@@ -379,14 +379,14 @@ protected:
     void rememberDetectTopic(const std::string& topic);
     bool detectBrokerByMaxOffset(const std::string& addr, int32_t timeoutMillis);
 
-    TransactionListener* txListener_ = nullptr;    // 回查处理线程句柄，shutdown 时统一 join 回收
+    TransactionListener* txListener_ = nullptr;    // check-back handler thread handle, joined and reclaimed uniformly at shutdown
     std::vector<std::thread> txThreads_;
     std::mutex txThreadsMutex_;
 
     std::thread heartbeatThread_;
-    // 停止标志（false=运行中，true=已停），与 sleepUntilDeadline(stop, ...) 的契约一致：
-    // 传"运行中"语义的标志会把极性搞反——运行期零节流热循环、且 next 每轮 +interval
-    // 无限超前；stop 后线程反而要睡到一个被推到几十小时外的 deadline，join 永久挂死。
+    // Stop flag (false=running, true=stopped), consistent with the sleepUntilDeadline(stop, ...) contract:
+    // passing a "running"-semantics flag inverts the polarity — a zero-throttling hot loop while running with next advancing
+    // +interval every round without bound; after stop the thread would instead sleep to a deadline pushed tens of hours out, and join hangs forever.
     std::atomic<bool> heartbeatStop_{true};
     std::atomic<int64_t> lastHeartbeatMs_{0};
     int32_t heartbeatIntervalMillis_ = 30000;
@@ -409,11 +409,11 @@ protected:
     bool tlsEnable_ = MQClientInstance::tlsEnabledFromEnv();
     TlsOptions tlsOptions_;
     bool tlsOptionsSet_ = false;
-    // SOCKS 代理（start() 时透传给 MQClientInstance -> RemotingClient）
+    // SOCKS proxy (passed through at start() to MQClientInstance -> RemotingClient)
     SocksProxyConfig socksProxy_;
     bool socksProxySet_ = false;
-    // 缺省读 env ROCKETMQ_TRACE_CONTEXT_ENABLE，与 setEnableTraceContext 的注释一致；
-    // 写死 false 会让这条 env 开关形同虚设。
+    // Default read from env ROCKETMQ_TRACE_CONTEXT_ENABLE, consistent with the setEnableTraceContext comment;
+    // hardcoding false would make this env switch a no-op.
     bool enableTraceContext_ = traceContextEnabledFromEnv();
     int32_t sendMsgTimeout_ = 3000;
     int32_t requestTimeoutMillis_ = DEFAULT_REQUEST_TIMEOUT_MILLIS;
@@ -440,11 +440,11 @@ protected:
     MQFaultStrategy mqFaultStrategy_{false};
 
     std::unique_ptr<MQClientInstance> mqClient_;
-    // ACL 钩子，start() 时绑定到 MQClientInstance 的传输层
+    // ACL hook, bound at start() to the transport layer of MQClientInstance
     std::shared_ptr<RPCHook> rpcHook_;
-    // ---------------- 消息轨迹 / 钩子 ----------------
+    // ---------------- Message trace / hooks ----------------
     bool enableTrace_ = false;
-    std::string traceTopic_;                     // 空 => 用 MixAll::TRACE_TOPIC
+    std::string traceTopic_;                     // empty => use MixAll::TRACE_TOPIC
     int32_t traceMsgBatchNum_ = 10;
     std::vector<std::shared_ptr<SendMessageHook>> sendMessageHookList_;
     std::vector<std::shared_ptr<EndTransactionHook>> endTransactionHookList_;
@@ -455,8 +455,8 @@ protected:
     int32_t retryTimesWhenSendAsyncFailed_ = 2;
     int32_t asyncSenderQueueCapacity_ = 50000;
     int32_t clientCallbackExecutorThreads_ = 0;
-    // 用 shared_ptr 而不是 unique_ptr：submit 前会在锁内拷一份引用，这样即使
-    // shutdown() 同时把成员换走并排空队列，正在提交的那一次也不会摸到悬垂对象。
+    // shared_ptr rather than unique_ptr: a reference copy is taken under the lock before submit, so even if
+    // shutdown() concurrently swaps the member and drains the queue, the in-flight submission will not touch a dangling object.
     std::shared_ptr<ConsumeExecutor> asyncSenderExecutor_;
     std::shared_ptr<ConsumeExecutor> callbackExecutor_;
     bool enableBackpressureForAsyncMode_ = false;

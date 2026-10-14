@@ -1,6 +1,6 @@
-// 编译期开关 ROCKETMQ_HAS_ZLIB / ROCKETMQ_HAS_ZSTD / ROCKETMQ_HAS_LZ4 由 CMake 的
-// find_package(ZLIB) 与 find_path/find_library(zstd|lz4) 决定。若某个后端未编入，
-// 遇到该算法压缩的消息会**抛异常**而不是原样返回——静默透传等于数据损坏。
+// The compile-time switches ROCKETMQ_HAS_ZLIB / ROCKETMQ_HAS_ZSTD / ROCKETMQ_HAS_LZ4 come from CMake's
+// find_package(ZLIB) and find_path/find_library(zstd|lz4). If a backend was not compiled in, a message
+// compressed with that algorithm **throws** instead of passing through: silent passthrough is data corruption.
 #include "rocketmq/common/compression.h"
 
 #include <cstring>
@@ -29,7 +29,7 @@ int32_t CompressionType::findByValue(int32_t value) {
             return LZ4;
         case 2:
             return ZSTD;
-        case 0:  // 兼容老版本：没有类型位的压缩消息按 ZLIB 处理
+        case 0:  // Backwards compatible: a compressed message without a type byte is treated as ZLIB
         case 3:
             return ZLIB;
         default:
@@ -50,7 +50,7 @@ int32_t CompressionType::getCompressionFlag(int32_t value) {
     }
 }
 
-// ---------------------------------------------------------------- zlib 细节
+// ---------------------------------------------------------------- zlib details
 
 #if defined(ROCKETMQ_HAS_ZLIB)
 
@@ -77,7 +77,7 @@ Bytes zlibDeflate(const Bytes& src, int level) {
     while (ret != Z_STREAM_END) {
         zs.next_out = reinterpret_cast<Bytef*>(buf);
         zs.avail_out = static_cast<uInt>(sizeof(buf));
-        // 输入一次性给足，用 Z_FINISH 让 deflate 产出完整流
+        // Feed all input at once and use Z_FINISH so deflate emits a complete stream
         ret = ::deflate(&zs, Z_FINISH);
         if (ret != Z_OK && ret != Z_STREAM_END && ret != Z_BUF_ERROR) {
             ::deflateEnd(&zs);
@@ -85,7 +85,7 @@ Bytes zlibDeflate(const Bytes& src, int level) {
         }
         out.append(buf, sizeof(buf) - zs.avail_out);
         if (ret == Z_BUF_ERROR && zs.avail_out != 0) {
-            // 既没有进展也没有输出空间可用 —— 无法继续，避免死循环
+            // No progress and no output space left -- cannot continue; avoid an infinite loop
             break;
         }
     }
@@ -119,7 +119,7 @@ Bytes zlibInflate(const Bytes& src) {
         }
         out.append(buf, sizeof(buf) - zs.avail_out);
         if (ret != Z_STREAM_END && zs.avail_in == 0 && zs.avail_out != 0) {
-            // 输入已耗尽、输出缓冲未填满，却仍未到流结尾 → 数据被截断
+            // Input exhausted and the output buffer not full, yet the stream end was not reached -> the data is truncated
             ::inflateEnd(&zs);
             throw std::runtime_error("zlib inflate failed: truncated stream");
         }
@@ -132,13 +132,13 @@ Bytes zlibInflate(const Bytes& src) {
 
 #endif  // ROCKETMQ_HAS_ZLIB
 
-// ---------------------------------------------------------------- zstd 细节
+// ---------------------------------------------------------------- zstd details
 #if defined(ROCKETMQ_HAS_ZSTD)
 
 namespace {
 
-// ZSTD_compress 的 level 会被 libzstd 夹紧到 [1,19]，但显式夹一次可以避免不同版本
-// 对越界值的处理差异（0 在 zstd 语义里是"用默认级别"）。
+// libzstd clamps ZSTD_compress's level to [1,19] anyway, but clamping explicitly avoids version-dependent
+// handling of out-of-range values (0 means "use the default level" in zstd semantics).
 int clampZstdLevel(int level) {
     if (level <= 0) {
         return ZSTD_CLEVEL_DEFAULT;  // 3
@@ -148,11 +148,11 @@ int clampZstdLevel(int level) {
 }
 
 Bytes zstdCompressBytes(const Bytes& src, int level) {
-    // 用 compressBound 兜住最坏情况：不可压缩数据也保证一次分配到位，无需重试循环
+    // compressBound covers the worst case: even incompressible data is allocated in one shot, no retry loop
     const size_t bound = ::ZSTD_compressBound(src.size());
     Bytes out;
     out.resize(bound);
-    // src.data() 对空串也是有效指针（指向结尾 '\0'），不必特判 empty
+    // src.data() is a valid pointer even for an empty string (it points at the terminating '\0'), so no special case for empty
     const size_t produced =
         ::ZSTD_compress(&out[0], bound, src.data(), src.size(), clampZstdLevel(level));
     if (::ZSTD_isError(produced)) {
@@ -163,8 +163,8 @@ Bytes zstdCompressBytes(const Bytes& src, int level) {
     return out;
 }
 
-// 解压上限：防止坏帧头声明天文数字 content size 时按它去申请内存（DoS 面）。
-// 2GB 远超 RocketMQ 单条消息体上限（4MB），足够宽松。
+// Decompression ceiling: prevents allocating memory from an absurd content size claimed by a corrupt frame header (a DoS surface).
+// 2GB is far above the RocketMQ single message body limit (4MB), so it is generous enough.
 constexpr size_t kMaxZstdOutput = 2048ULL * 1024ULL * 1024ULL;
 
 Bytes zstdDecompressBytes(const Bytes& src) {
@@ -173,12 +173,12 @@ Bytes zstdDecompressBytes(const Bytes& src) {
     }
     unsigned long long declared = ::ZSTD_getFrameContentSize(src.data(), src.size());
     if (declared == ZSTD_CONTENTSIZE_ERROR) {
-        // 帧头都不合法（magic/window/contentSize 保留位错）——绝不能当正文交出
+        // Even the frame header is invalid (wrong magic/window/contentSize reserved bits) -- it must never be handed out as payload
         throw std::runtime_error("zstd decompress failed: not a valid zstd frame");
     }
     const bool sizeKnown = (declared != ZSTD_CONTENTSIZE_UNKNOWN);
-    // zstd-jni 的 ZstdOutputStream 是流式写，帧头里 content size 位置写的是 0（未知），
-    // 所以未知分支是**常态**而不是异常：用指数扩容 + dstSize_tooSmall 重试覆盖。
+    // zstd-jni's ZstdOutputStream writes incrementally and puts 0 (unknown) in the frame header's content size field,
+    // so the unknown branch is the **normal case**, not an error: it is covered by exponential growth plus dstSize_tooSmall retries.
     size_t capacity = sizeKnown ? static_cast<size_t>(declared)
                                 : (src.size() < (16ULL * 1024 * 1024)
                                        ? (src.size() < (64ULL * 1024) ? (64ULL * 1024) : src.size() * 4)
@@ -196,11 +196,11 @@ Bytes zstdDecompressBytes(const Bytes& src) {
             out.resize(produced);
             return out;
         }
-        // 只有"输出缓冲不够"这一种错误值得扩容重试；其余（坏帧/截断）一律抛错，
-        // 且缓冲大小已按帧头声明值给足时也不该再重试——那说明数据本身是坏的。
-        // 注：ZSTD_getErrorCode() / ZSTD_error_dstSize_tooSmall 并非所有 zstd 发行版都
-        // 暴露（CI 用的版本就缺这两个符号），改用稳定可读的错误名字符串来判定——目标
-        // 串是 "Dst buffer is too small"，用 "too small" 子串匹配以兼容措辞微调。
+        // Only "output buffer too small" is worth growing the buffer and retrying; every other error (bad frame/truncation) throws,
+        // and retrying when the buffer already matches the size declared in the frame header is pointless -- the data itself is corrupt.
+        // Note: ZSTD_getErrorCode() / ZSTD_error_dstSize_tooSmall are not exported by every
+        // zstd distribution (the CI version lacks both symbols), so the decision uses the stable, readable error-name string -- the target
+        // string is "Dst buffer is too small", matched on the substring "too small" to tolerate wording changes.
         const std::string zstd_err = ::ZSTD_getErrorName(produced);
         if (sizeKnown || std::string(zstd_err).find("too small") == std::string::npos ||
             attempt >= 32) {
@@ -214,14 +214,14 @@ Bytes zstdDecompressBytes(const Bytes& src) {
 
 #endif  // ROCKETMQ_HAS_ZSTD
 
-// ---------------------------------------------------------------- LZ4 Frame 细节
+// ---------------------------------------------------------------- LZ4 Frame details
 #if defined(ROCKETMQ_HAS_LZ4)
 
 namespace {
 
-// 解压时的输出块大小；LZ4F 是流式接口，不需要预知解压后总长。
+// Output block size during decompression; the LZ4F streaming API does not need the total decompressed length up front.
 constexpr size_t kLz4OutputChunk = 64ULL * 1024ULL;
-// 同 zstd：拒绝按坏帧头的指示无限申请内存。
+// Same as zstd: refuse to allocate memory without bound based on a corrupt frame header.
 constexpr size_t kMaxLz4Output = 2048ULL * 1024ULL * 1024ULL;
 
 Bytes lz4CompressFrame(const Bytes& src) {
@@ -231,7 +231,7 @@ Bytes lz4CompressFrame(const Bytes& src) {
     prefs.frameInfo.blockMode = LZ4F_blockIndependent;
     prefs.frameInfo.contentChecksumFlag = LZ4F_noContentChecksum;
     prefs.frameInfo.contentSize = static_cast<unsigned long long>(src.size());
-    prefs.compressionLevel = 0;  // 0 = liblz4 默认级别
+    prefs.compressionLevel = 0;  // 0 = liblz4 default level
 
     const size_t bound = ::LZ4F_compressFrameBound(src.size(), &prefs);
     Bytes out;
@@ -246,8 +246,8 @@ Bytes lz4CompressFrame(const Bytes& src) {
     return out;
 }
 
-// LZ4F_decompress 是流式接口：一次调用可能只吃掉部分输入或只填一部分输出，
-// 返回 0 表示帧结束，>0 是"到下一个块边界还需多少输入字节"的提示。
+// LZ4F_decompress is a streaming API: one call may consume only part of the input or fill only part of the output,
+// returning 0 at the end of the frame and >0 as a hint of "how many more input bytes until the next block boundary".
 Bytes lz4DecompressFrame(const Bytes& src) {
     if (src.empty()) {
         return Bytes();
@@ -256,8 +256,8 @@ Bytes lz4DecompressFrame(const Bytes& src) {
     if (::LZ4F_isError(::LZ4F_createDecompressionContext(&ctx, LZ4F_VERSION))) {
         throw std::runtime_error("lz4 decompress failed: cannot create decompression context");
     }
-    // RAII：下面每条抛错路径（以及 out.append 可能抛的 bad_alloc）都要还掉这个句柄，
-    // 手写成对 free 迟早漏一次。
+    // RAII: every throwing path below (and the bad_alloc out.append may raise) must release this handle;
+    // hand-written paired frees would leak eventually.
     struct CtxGuard {
         LZ4F_decompressionContext_t* p;
         ~CtxGuard() { if (*p != nullptr) ::LZ4F_freeDecompressionContext(*p); }
@@ -284,10 +284,10 @@ Bytes lz4DecompressFrame(const Bytes& src) {
                                      std::to_string(kMaxLz4Output) + " bytes)");
         }
         if (hint == 0) {
-            return out;  // 帧边界已到，剩余字节（若有）不属于本帧
+            return out;  // frame boundary reached; leftover bytes (if any) do not belong to this frame
         }
         if (srcAvail == 0 && dstWritten == 0) {
-            // 输入没吃掉、输出没写出——再循环就是死循环，说明帧不完整
+            // No input consumed and no output produced -- looping again would spin forever; the frame is incomplete
             throw std::runtime_error("lz4 decompress failed: truncated frame");
         }
     }
@@ -350,7 +350,7 @@ Bytes CompressorFactory::compress(const Bytes& src, int32_t compressionType, int
             "lz4 compression is not available in this build (rebuild with -DRMQ_WITH_LZ4=ON)");
 #endif
     }
-    // findByValue 只可能返回 LZ4/ZSTD/ZLIB 三者之一，走到这里说明上面有后端被编掉了。
+    // findByValue can only return one of LZ4/ZSTD/ZLIB; reaching here means a backend was compiled out above.
     throw std::runtime_error("unsupported compression type for compress: " + std::to_string(type));
 }
 
@@ -360,7 +360,7 @@ Bytes CompressorFactory::decompress(const Bytes& src, int32_t compressionType) {
 #if defined(ROCKETMQ_HAS_ZLIB)
         return zlibInflate(src);
 #else
-        // 关键：不能原样返回。返回压缩字节会被上层当作正文，属静默数据损坏。
+        // Key point: never return the bytes unchanged. Handing back compressed bytes would be treated as payload by the caller -- silent data corruption.
         throw std::runtime_error(
             "message is zlib-compressed but this build has no zlib support "
             "(rebuild with -DRMQ_WITH_ZLIB=ON)");
@@ -370,7 +370,7 @@ Bytes CompressorFactory::decompress(const Bytes& src, int32_t compressionType) {
 #if defined(ROCKETMQ_HAS_ZSTD)
         return zstdDecompressBytes(src);
 #else
-        // 同上：后端被编掉时抛错，绝不把 zstd 帧当正文交给调用方。
+        // As above: throw when the backend is compiled out and never hand a zstd frame to the caller as payload.
         throw std::runtime_error(
             "message is zstd-compressed but this build has no zstd support "
             "(rebuild with -DRMQ_WITH_ZSTD=ON)");
@@ -385,7 +385,7 @@ Bytes CompressorFactory::decompress(const Bytes& src, int32_t compressionType) {
             "(rebuild with -DRMQ_WITH_LZ4=ON)");
 #endif
     }
-    // 未知类型位已在 CompressionType::findByValue 抛出，这里不可达。
+    // Unknown type bytes already throw in CompressionType::findByValue, so this point is unreachable.
     throw std::runtime_error("unsupported compression type for decompress: " + std::to_string(type));
 }
 

@@ -1,4 +1,4 @@
-// QueueData / BrokerData / TopicRouteData 的实现。
+// QueueData / BrokerData / TopicRouteData implementations.
 #include "rocketmq/remoting/protocol/route.h"
 
 #include <algorithm>
@@ -16,8 +16,8 @@ namespace rocketmq {
 
 namespace {
 
-// fastjson2 的 brokerAddrs 是 HashMap<Long,String>，键为数字。
-// 我们输出为合法 JSON 的字符串键（"0"），语义等价且任何解析器都能读。
+// The broker's brokerAddrs map is keyed by numbers (a Long -> String map).
+// We emit string keys ("0"), which is valid JSON, semantically equivalent, and readable by any parser.
 JsonValue addrsToJson(const std::map<int64_t, std::string>& addrs) {
     JsonValue o = JsonValue::makeObject();
     for (const auto& kv : addrs) {
@@ -32,7 +32,7 @@ std::map<int64_t, std::string> addrsFromJson(const JsonValue& v) {
         return out;
     }
     for (const auto& kv : v.objectItems()) {
-        // 键可能是 "0"（标准 JSON）或 0（fastjson 裸数字键被解析成字符串）
+        // A key may be "0" (standard JSON) or a bare numeric 0 that the parser surfaces as a string
         int64_t id = 0;
         if (!kv.first.empty()) {
             bool numeric = true;
@@ -45,7 +45,7 @@ std::map<int64_t, std::string> addrsFromJson(const JsonValue& v) {
             if (numeric) {
                 id = std::strtoll(kv.first.c_str(), nullptr, 10);
             } else {
-                continue;  // 非数字键（异常数据）跳过
+                continue;  // skip non-numeric keys (malformed data)
             }
         }
         out[id] = kv.second.stringValue();
@@ -109,7 +109,7 @@ std::string BrokerData::selectBrokerAddr() const {
     if (it != brokerAddrs.end()) {
         return it->second;
     }
-    // 无 master：随机取一个从节点
+    // No master: pick a slave at random
     static thread_local std::mt19937_64 rng{std::random_device{}()};
     std::vector<std::string> addrs;
     addrs.reserve(brokerAddrs.size());
@@ -152,7 +152,7 @@ int BrokerData::hashCode() const {
     int64_t result = 1;
     result = 31 * result + javaStringHash(cluster);
     result = 31 * result + javaStringHash(brokerName);
-    // Map.hashCode = 各 entry 的 (keyHash ^ valueHash) 之和
+    // Map.hashCode = the sum of (keyHash ^ valueHash) over all entries
     int64_t mapHash = 0;
     for (const auto& kv : brokerAddrs) {
         int64_t k = kv.first;                       // Long.hashCode = (int)(v ^ (v>>>32))
@@ -181,7 +181,7 @@ std::string BrokerData::toString() const {
 std::vector<MessageQueue> TopicRouteData::getAllMessageQueue(const std::string& topic) const {
     std::vector<MessageQueue> mqs;
     for (const QueueData& qd : queueDatas) {
-        // 只挑有写权限的队列（协议 PermName.isWriteable）
+        // Only queues with write permission (protocol PermName.isWriteable)
         if (!PermName::checkPerm(qd.perm, PermName::PERM_WRITE)) {
             continue;
         }
@@ -195,10 +195,10 @@ std::vector<MessageQueue> TopicRouteData::getAllMessageQueue(const std::string& 
         if (found == nullptr) {
             continue;
         }
-        // 发布口径：brokerAddrs 里没有 MASTER_ID(0) 的 broker 整条跳过。
-        // 从节点自己也会注册进 namesrv，且默认配置下照样带写位 —— master 一旦掉线，
-        // 路由里同一个 brokerName 只剩 brokerId=1。漏判这条，生产者会把消息发到从节点上，
-        // 而从节点对发送请求一律 reject（broker 侧 SendMessageProcessor ⇒ SYSTEM_BUSY，可重试码）。
+        // Publish view: a broker whose brokerAddrs has no MASTER_ID(0) is skipped entirely.
+        // Slaves register in the name server on their own and still carry the write bit in the default config, so once the master is gone
+        // the route keeps only brokerId=1 under the same brokerName. Missing that check lets producers send to a slave,
+        // and a slave rejects every send request (the broker's SendMessageProcessor answers SYSTEM_BUSY, a retryable code).
         if (found->brokerAddrs.find(0) == found->brokerAddrs.end()) {
             continue;
         }
@@ -209,9 +209,9 @@ std::vector<MessageQueue> TopicRouteData::getAllMessageQueue(const std::string& 
     return mqs;
 }
 
-// 与 getAllMessageQueue 是两条口径，不能合成一条：这里只看**读**位与 readQueueNums，
-// 不查 brokerDatas、也不要求 broker 有 master（master 掉线时从节点照样服务拉取；
-// perm=4 的只读 topic 可消费，发布信息里却为空）。
+// A separate view from getAllMessageQueue, the two must not be merged: this one looks only at the **read** bit and readQueueNums,
+// without consulting brokerDatas or requiring a master (a slave keeps serving pulls while the master is down;
+// a read-only topic with perm=4 is consumable yet empty in the publish view).
 std::vector<MessageQueue> TopicRouteData::getAllSubscribeMessageQueue(
     const std::string& topic) const {
     std::vector<MessageQueue> mqs;

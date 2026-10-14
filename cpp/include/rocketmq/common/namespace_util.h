@@ -1,12 +1,12 @@
-// 命名空间用于多租户隔离：客户端把 ``namespace`` 以 ``namespace%`` 前缀拼到
-// topic / group 上再发给 broker，从 broker 拿到的资源名在交给上层（listener、
-// admin 结果）之前再剥掉前缀。
+// The namespace provides multi-tenant isolation: the client prepends ``namespace%`` to the
+// topic / group before sending to the broker, and strips the prefix again from resource names
+// returned by the broker before handing them to the upper layer (listener, admin results).
 //
-// 对齐要点（勿凭直觉改）：
-//   - 分隔符是 ``%``（不是 ``/`` 也不是 ``:``）。
-//   - ``%RETRY%`` / ``%DLQ%`` 前缀**在**命名空间之外：``%RETRY%NS%GID``。
-//     因此剥/拼都要先把 retry/DLQ 前缀摘下来处理，再拼回去。
-//   - 系统资源（``rmq_sys_`` 前缀 topic、``CID_RMQ_SYS_`` 前缀 group）**不**加命名空间。
+// Points that must stay exact (do not change them on intuition):
+//   - The separator is ``%`` (neither ``/`` nor ``:``).
+//   - The ``%RETRY%`` / ``%DLQ%`` prefixes sit **outside** the namespace: ``%RETRY%NS%GID``.
+//     So stripping and adding both remove the retry/DLQ prefix first, then reattach it.
+//   - System resources (``rmq_sys_`` prefixed topics, ``CID_RMQ_SYS_`` prefixed groups) get **no** namespace.
 #ifndef ROCKETMQ_COMMON_NAMESPACE_UTIL_H
 #define ROCKETMQ_COMMON_NAMESPACE_UTIL_H
 
@@ -31,13 +31,13 @@ struct NamespaceUtil {
         return MixAll::isDlqTopic(resource);
     }
 
-    // 系统资源（rmq_sys_* topic / CID_RMQ_SYS_* group）不加命名空间。
+    // System resources (rmq_sys_* topics / CID_RMQ_SYS_* groups) get no namespace.
     static bool isSystemResource(const std::string& resource) {
         if (resource.empty()) return false;
         return MixAll::isSysTopic(resource) || MixAll::isSysConsumerGroup(resource);
     }
 
-    // resource 是否已经带上了指定 namespace 前缀（NS%plain）。
+    // Whether resource already carries the given namespace prefix (NS%plain).
     static bool isAlreadyWithNamespace(const std::string& resource, const std::string& ns) {
         if (ns.empty() || resource.empty() || isSystemResource(resource)) return false;
         std::string plain = withOutRetryAndDlq(resource);

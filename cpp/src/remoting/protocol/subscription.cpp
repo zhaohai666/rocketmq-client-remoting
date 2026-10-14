@@ -1,4 +1,4 @@
-// 订阅组模型实现。
+// Subscription group model implementation.
 #include "rocketmq/remoting/protocol/subscription.h"
 
 #include <string>
@@ -7,10 +7,10 @@
 
 namespace rocketmq {
 
-// ---------------------------------------------------------------- 小工具
+// ---------------------------------------------------------------- Small helpers
 namespace {
 
-// 取 bool 字段，缺失时用默认值（fastjson2 会跳过 null/未设置字段）
+// Read a bool field, falling back to a default when absent (the broker omits null/unset fields)
 bool getBool(const JsonValue& v, const char* key, bool def) {
     const JsonValue* p = v.find(key);
     if (p == nullptr) return def;
@@ -48,7 +48,7 @@ JsonValue makeStringMap(const PropertyMap& m) {
     return o;
 }
 
-// 取原始子对象（isNull() 表示不存在）
+// Fetch the raw sub-object (isNull() means it is absent)
 JsonValue rawSub(const JsonValue& v, const char* key) {
     const JsonValue* p = v.find(key);
     return p != nullptr ? *p : JsonValue::makeNull();
@@ -110,7 +110,7 @@ JsonValue SubscriptionGroupConfig::toJson() const {
     v.set("groupSysFlag", JsonValue::makeInt(groupSysFlag));
     v.set("consumeTimeoutMinute", JsonValue::makeInt(consumeTimeoutMinute));
     v.set("attributes", makeStringMap(attributes));
-    // fastjson2 默认跳过 null：只有显式设置过才输出该键
+    // Null fields are omitted by default: the key is emitted only when it was set explicitly
     if (hasSubscriptionDataSet) {
         JsonValue arr = JsonValue::makeArray();
         for (const auto& s : subscriptionDataSet) arr.pushArray(s.toJson());

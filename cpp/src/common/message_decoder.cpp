@@ -1,7 +1,7 @@
-// 消息编解码实现（已对真实 5.5.1 集群验证），
-// 两条**互不可混用**的路径：
-//   1) 17 段存储格式：encodeMessageExt / decodeMessage / decodeMessages（broker 写入与 pull 返回）；
-//   2) 6 段轻量格式：encodeMessage / encodeMessages / decodeBatchMessage / decodeBatchMessages（批量 body）。
+// Message codec implementation (verified against a real 5.5.1 cluster),
+// with two paths that must **never be mixed**:
+//   1) the 17-field storage format: encodeMessageExt / decodeMessage / decodeMessages (broker storage and pull replies);
+//   2) the 6-field light format: encodeMessage / encodeMessages / decodeBatchMessage / decodeBatchMessages (batch body).
 #include "rocketmq/common/message_decoder.h"
 
 #include "rocketmq/common/compression.h"
@@ -28,13 +28,13 @@ Bytes maybeDecompress(const Bytes& body, bool decompressBody, int32_t sysFlag) {
 
 }  // namespace
 
-// ---------------------------------------------------------------- 基础工具
+// ---------------------------------------------------------------- Basic helpers
 
 Bytes ipAndPortToBytes(const std::string& ip, int32_t port, bool v6) {
     Bytes out;
     Bytes addr;
     if (!UtilAll::ipToBytes(ip, v6, addr)) {
-        // 非法 IP 回退 127.0.0.1（保持长度与调用方期望一致）
+        // An invalid IP falls back to 127.0.0.1 (keeps the length the caller expects)
         UtilAll::ipToBytes("127.0.0.1", false, addr);
         if (v6) addr.assign(16, '\0');
     }
@@ -61,7 +61,7 @@ uint32_t crc32(const Bytes& data) { return UtilAll::crc32(data); }
 
 std::string bytes2String(const Bytes& bs) { return UtilAll::bytes2String(bs); }
 
-// ------------------------------------------------------- 属性串 <-> Map
+// ------------------------------------------------------- Properties string <-> Map
 
 std::string messagePropertiesToString(const PropertyMap& properties) {
     std::string out;
@@ -112,7 +112,7 @@ bool decodeMessageId(const std::string& msgId, std::string& ip, int32_t& port, i
     return true;
 }
 
-// ------------------------------------------- 1) 17 段存储格式：MessageExt
+// ------------------------------------------- 1) 17-field storage format: MessageExt
 
 Bytes encodeMessageExt(const MessageExt& messageExt, bool needCompress) {
     Bytes body = maybeCompress(messageExt.body, needCompress, messageExt.sysFlag);
@@ -277,7 +277,7 @@ std::vector<MessageExt> decodeMessages(const Bytes& raw, bool readBody) {
     return result;
 }
 
-// --------------------------------------- 2) 6 段轻量格式：批量消息 body
+// --------------------------------------- 2) 6-field light format: batch message body
 
 Bytes encodeMessage(const Message& message) {
     const Bytes& body = message.body;
@@ -287,7 +287,7 @@ Bytes encodeMessage(const Message& message) {
 
     Bytes buf;
     putInt32(buf, storeSize);                                  // 1 TOTALSIZE
-    putInt32(buf, 0);                                          // 2 MAGICCODE（批量场景固定 0）
+    putInt32(buf, 0);                                          // 2 MAGICCODE (always 0 for batches)
     putInt32(buf, 0);                                          // 3 BODYCRC
     putInt32(buf, message.flag);                               // 4 FLAG
     putInt32(buf, static_cast<int32_t>(body.size()));          // 5 BODY

@@ -1,11 +1,11 @@
-// 打开 `autoBatch` 之后，`send(Message)` 不再一条一条直发，而是先按
-// `AggregateKey(topic, mq, waitStoreMsgOK, tag)` 归并进 `MessageAccumulation`，攒够
-// `holdMs` / `holdSize`（或被守卫线程唤醒）再合成**一个** `MessageBatch` 发出去，最后把
-// broker 回的**批量** `SendResult` 拆回每条消息各自的 `SendResult` —— 调用方看到的东西
-// 与直发一致。
+// With `autoBatch` turned on, `send(Message)` no longer dispatches one message at a time: it first
+// merges into `MessageAccumulation` per `AggregateKey(topic, mq, waitStoreMsgOK, tag)` and, once
+// `holdMs` / `holdSize` are reached (or the guard thread wakes it), composes **one** `MessageBatch` and
+// sends it out; the **batch** `SendResult` from the broker is then split back into a `SendResult` per
+// message, so what the caller sees is identical to a direct send.
 //
 //
-// ## 与其它三端的差异
+// ## Semantics of the batching path
 #ifndef ROCKETMQ_CLIENT_PRODUCE_ACCUMULATOR_H
 #define ROCKETMQ_CLIENT_PRODUCE_ACCUMULATOR_H
 
@@ -40,7 +40,7 @@ public:
                                  std::shared_ptr<SendCallback> callback) = 0;
 };
 
-// ---------------------------------------------------------------- 归并键
+// ---------------------------------------------------------------- Aggregate key
 
 struct AggregateKey {
     std::string topic;
@@ -60,14 +60,14 @@ struct AggregateKey {
     std::string toString() const;
 };
 
-// ---------------------------------------------------------------- 批次
+// ---------------------------------------------------------------- Batch
 
-class ProduceAccumulator;  // 前向声明：批次只持它的裸指针（生命周期由累加器的表保证）
+class ProduceAccumulator;  // Forward declaration: a batch only holds a raw pointer (its lifetime is guaranteed by the accumulator's table)
 
-// 两类调用方：同步 `add()` 会在批次达到阈值前**阻塞**自己（等到本批真的发出去，自己的那条
-// 消息才有 SendResult 可返回）；异步 `add(msg, callback)` 立刻返回，结果走回调。
+// Two kinds of callers: synchronous `add()` **blocks** itself until the batch reaches its threshold
+// (only a really sent batch yields the SendResult its message returns); asynchronous `add(msg, callback)` returns at once and reports through the callback.
 //
-// 非拷贝：`std::shared_ptr` 持有，`owner_` 是裸指针（累加器的表持着它，生命周期更长）。
+// Not copyable: held by a `std::shared_ptr`, `owner_` is a raw pointer (the accumulator's table holds it and outlives it).
 class MessageAccumulation {
 public:
     MessageAccumulation(AggregateKey key, ProduceAccumulator* owner);
@@ -121,7 +121,7 @@ private:
     friend class ProduceAccumulator;
 };
 
-// ---------------------------------------------------------------- 累加器
+// ---------------------------------------------------------------- Accumulator
 
 class ProduceAccumulator {
 public:
@@ -154,21 +154,21 @@ public:
     void sendAsyncWithMq(const Message& msg, const MessageQueue& mq,
                          std::shared_ptr<SendCallback> callback);
 
-    // ---------------- sender 生命周期 ----------------
-    // 生产者析构 / shutdown 时调用：之后守卫线程不再碰那个 sender。
+    // ---------------- sender lifecycle ----------------
+    // Called on producer destruction / shutdown: guard threads never touch that sender afterwards.
     void detachSender();
-    // 重新绑定（`getOrCreateProduceAccumulator` 在 sender 已 detach 时用）。
+    // Rebind (used by `getOrCreateProduceAccumulator` when the sender had been detached).
     void attachSender(AccumulatorSender* sender);
     bool hasSender() const;
 
-    // ---------------- 取证 / 测试接缝 ----------------
+    // ---------------- Forensics / test seams ----------------
     size_t syncBatchCount() const;
     size_t asyncBatchCount() const;
     std::vector<std::shared_ptr<MessageAccumulation>> syncBatchesSnapshot() const;
     std::vector<std::shared_ptr<MessageAccumulation>> asyncBatchesSnapshot() const;
-    // 往同步表里放一个（尚无人 add 的）批次 —— 验证守卫线程对 `messagesSize == 0` 的清理口径。
+    // Put a batch nobody has added to into the sync table; checks the guard thread's cleanup rule for `messagesSize == 0`.
     std::shared_ptr<MessageAccumulation> putEmptySyncBatch(const AggregateKey& key);
-    // 手工跑一轮守卫**主体**（守卫线程每个周期里 `sleep(max(1, holdMs/2))` 之前的那段）。
+    // Run one round of the guard **body** by hand (the part of each guard cycle before `sleep(max(1, holdMs/2))`).
     void runGuardOnce(bool sync);
 
 private:
@@ -184,7 +184,7 @@ private:
     int64_t holdSize() const { return holdSize_.load(); }
 
     std::string instanceName_;
-    // `mutable`：`hasSender()` 是 const，要拿它。
+    // `mutable`: `hasSender()` is const and has to read it.
     mutable std::mutex senderMutex_;
     AccumulatorSender* sender_ = nullptr;
     std::atomic<int32_t> holdMs_{PRODUCE_ACCUMULATOR_DEFAULT_HOLD_MS};

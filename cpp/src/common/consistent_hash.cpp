@@ -8,13 +8,13 @@ namespace rocketmq {
 
 namespace {
 
-// RFC 1321 §3.4 的 64 个位移量。
+// The 64 shift amounts from RFC 1321 §3.4.
 const uint32_t kMd5Shifts[64] = {
     7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9,  14, 20, 5, 9,  14, 20,
     5, 9,  14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
     6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
 
-// K[i] = floor(abs(sin(i + 1)) * 2^32)（RFC 1321 §3.4 的表）。
+// K[i] = floor(abs(sin(i + 1)) * 2^32), the table from RFC 1321 §3.4.
 const uint32_t kMd5K[64] = {
     0xd76aa478u, 0xe8c7b756u, 0x242070dbu, 0xc1bdceeeu, 0xf57c0fafu, 0x4787c62au, 0xa8304613u,
     0xfd469501u, 0x698098d8u, 0x8b44f7afu, 0xffff5bb1u, 0x895cd7beu, 0x6b901122u, 0xfd987193u,
@@ -48,7 +48,7 @@ inline void storeLe32(uint8_t* at, uint32_t value) {
 std::vector<uint8_t> md5Digest(const std::string& input) {
     uint32_t state[4] = {0x67452301u, 0xefcdab89u, 0x98badcfeu, 0x10325476u};
 
-    // 填充：0x80 + 若干 0x00 把长度顶到 ≡56 (mod 64)，再挂 8 字节小端 bit 长度。
+    // Padding: 0x80 plus enough 0x00 bytes to reach length ≡ 56 (mod 64), then the 8-byte little-endian bit length.
     std::vector<uint8_t> padded(input.begin(), input.end());
     const uint64_t bitLength = static_cast<uint64_t>(input.size()) * 8;
     padded.push_back(0x80);
@@ -62,7 +62,7 @@ std::vector<uint8_t> md5Digest(const std::string& input) {
 
         uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
         for (int i = 0; i < 64; ++i) {
-            // 四轮的非线性函数与消息字下标（RFC 1321 §3.4）。
+            // The nonlinear function and message-word index for each of the four rounds (RFC 1321 §3.4).
             uint32_t f;
             int g;
             if (i < 16) {

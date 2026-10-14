@@ -1,5 +1,5 @@
-// ⚠ 级别与文件路径在**首次写日志时**求值并缓存，因此必须在第一次日志输出前设置环境变量。
-//   程序内可用 setLogLevel() / setLogFile() 直接改（后者会重新打开文件）。
+// ⚠ Level and file path are resolved and cached **on the first log write**, so the environment variables must be set before the first log output.
+//   Inside the program, setLogLevel() / setLogFile() change them directly (the latter reopens the file).
 #ifndef ROCKETMQ_COMMON_LOGGING_H
 #define ROCKETMQ_COMMON_LOGGING_H
 
@@ -35,7 +35,7 @@ enum LogLevel {
     LOG_OFF = 4,
 };
 
-// ---------------------------------------------------------------- 级别
+// ---------------------------------------------------------------- levels
 inline int resolveDefaultLogLevel() {
     const char* env = std::getenv("ROCKETMQ_CLIENT_LOG_LEVEL");
     if (env == nullptr) return LOG_INFO;
@@ -57,9 +57,9 @@ inline std::atomic<int>& logLevelRef() {
 inline void setLogLevel(int level) { logLevelRef().store(level, std::memory_order_relaxed); }
 inline int logLevel() { return logLevelRef().load(std::memory_order_relaxed); }
 
-// 环境变量是否**显式**指定了级别。宿主程序若要"默认 INFO、但尊重外部显式配置"，
-// 写成 `if (!logLevelSetFromEnv()) setLogLevel(LOG_INFO);`，这样真机排查时
-// 直接 `ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG ./app` 就能提高日志级别而不必改代码。
+// Whether the environment **explicitly** specifies the level. A host program that wants "INFO by default but
+// honour external explicit configuration" writes `if (!logLevelSetFromEnv()) setLogLevel(LOG_INFO);`, so that on-site
+// debugging can raise the log level with just `ROCKETMQ_CLIENT_LOG_LEVEL=DEBUG ./app` and no code change.
 inline bool logLevelSetFromEnv() { return std::getenv("ROCKETMQ_CLIENT_LOG_LEVEL") != nullptr; }
 
 inline std::uintmax_t resolveLogFileMaxSize() {
@@ -95,12 +95,12 @@ inline int logFileMaxIndex() {
     return v;
 }
 
-// ---------------------------------------------------------------- 日志文件
+// ---------------------------------------------------------------- log file
 struct LogFileSink {
     std::FILE* fp = nullptr;
-    std::string path;          // 空 = 关闭文件输出
-    std::uintmax_t size = 0;   // 当前文件已写字节数（本进程视角）
-    bool explicitPath = false; // 是否由 setLogFile() 指定
+    std::string path;          // Empty = file output disabled
+    std::uintmax_t size = 0;   // Bytes written to the current file (as seen by this process)
+    bool explicitPath = false; // Whether set by setLogFile()
     bool openFailed = false;
 };
 
@@ -147,11 +147,11 @@ inline bool openLogSinkLocked(LogFileSink& sink) {
     if (!p.parent_path().empty()) {
         std::filesystem::create_directories(p.parent_path(), ec);
     }
-    // "ab" 而不是 "a"：Windows 的文本模式会把 '\n' 改写成 "\r\n"，既让落盘行格式与
-    // 其它平台不一致，又让轮转用的字节数（fprintf 返回值，翻译前）与真实文件大小脱钩。
+    // "ab" instead of "a": Windows text mode rewrites '\n' into "\r\n", which both makes the on-disk line format differ
+    // from other platforms and decouples the byte count used for rotation (the fprintf return value, before translation) from the real file size.
     sink.fp = std::fopen(sink.path.c_str(), "ab");
     if (sink.fp == nullptr) {
-        // 静默降级为仅 stderr（不阻断客户端），但只提示一次
+        // Silently degrade to stderr only (never block the client), but report it just once
         sink.openFailed = true;
         std::fprintf(stderr, "[rocketmq] client file log disabled: cannot open %s\n",
                      sink.path.c_str());
@@ -163,7 +163,7 @@ inline bool openLogSinkLocked(LogFileSink& sink) {
     return true;
 }
 
-// FixedWindow 滚动：<file>.N 最旧，先删；然后 .N-1 -> .N …… .1 -> .2；最后 base -> .1
+// FixedWindow rolling: <file>.N is the oldest and deleted first; then .N-1 -> .N ... .1 -> .2; finally base -> .1
 inline void rollLogFileLocked(LogFileSink& sink, int maxIndex) {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -177,7 +177,7 @@ inline void rollLogFileLocked(LogFileSink& sink, int maxIndex) {
     fs::rename(sink.path, sink.path + ".1", ec);
 }
 
-// 宿主程序可直接指定日志文件（空串 = 关闭文件输出）
+// The host program can point the log file directly (empty string = disable file output)
 inline void setLogFile(const std::string& path) {
     std::lock_guard<std::mutex> lk(logMutex());
     LogFileSink& sink = logFileSink();
@@ -193,9 +193,9 @@ inline void flushLogFile() {
     if (sink.fp != nullptr) std::fflush(sink.fp);
 }
 
-// ---------------------------------------------------------------- 线程名
-// 取值优先级：本线程设置的名称（同 OS 线程名）-> "main"（进程主线程）-> OS 线程名 -> tid 短串。
-// 结果按线程缓存（thread_local），线程改名请用 setThreadName()。
+// ---------------------------------------------------------------- thread name
+// Resolution priority: the name set on this thread (also the OS thread name) -> "main" (process main thread) -> OS thread name -> short tid string.
+// The result is cached per thread (thread_local); use setThreadName() to rename a thread.
 inline std::string& threadNameCache() {
     thread_local std::string name;
     return name;
@@ -234,15 +234,15 @@ inline std::string currentThreadName() {
 inline void setThreadName(const std::string& name) {
     threadNameCache() = name;
 #if defined(__APPLE__)
-    // macOS: int pthread_setname_np(const char*)，上限 64 字节
+    // macOS: int pthread_setname_np(const char*), limit 64 bytes
     if (!name.empty()) pthread_setname_np(name.substr(0, 63).c_str());
 #elif defined(__linux__)
-    // Linux: int pthread_setname_np(pthread_t, const char*)，上限 16 字节（含结尾 NUL）
+    // Linux: int pthread_setname_np(pthread_t, const char*), limit 16 bytes (including the trailing NUL)
     if (!name.empty()) pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
 #endif
 }
 
-// ---------------------------------------------------------------- 输出
+// ---------------------------------------------------------------- output
 inline const char* logLevelName(int level) {
     switch (level) {
         case LOG_DEBUG: return "DEBUG";
@@ -311,7 +311,7 @@ inline void writeLogLine(int level, const std::string& msg, const char* file = n
     }
 
     std::fwrite(out.data(), 1, out.size(), sink.fp);
-    std::fflush(sink.fp);  // 保证 tail -f 实时可见
+    std::fflush(sink.fp);  // Ensure tail -f sees it in real time
     sink.size += out.size();
 }
 

@@ -1,4 +1,4 @@
-// 推模式消费者实现。
+// Push-consumer implementation.
 #include "rocketmq/client/consumer.h"
 
 #include <algorithm>
@@ -61,7 +61,7 @@ DefaultMQPushConsumer::DefaultMQPushConsumer(const std::string& consumerGroup) {
         throw MQClientException("consumerGroup is empty");
     }
     consumerGroup_ = consumerGroup;
-    // 默认分配策略 AVG（构造参数可覆盖，这里等价于 setter）。
+    // Default allocation strategy AVG (the constructor argument may override it; equivalent to the setter here).
     allocateStrategy_ = std::make_shared<AllocateMessageQueueAveragely>();
 }
 
@@ -69,11 +69,11 @@ DefaultMQPushConsumer::~DefaultMQPushConsumer() {
     try {
         shutdown();
     } catch (...) {
-        // 析构不抛
+        // The destructor must not throw
     }
 }
 
-// ---------------------------------------------------------------- 配置
+// ---------------------------------------------------------------- Configuration
 void DefaultMQPushConsumer::setNamesrvAddr(const std::string& addr) {
     nameServerAddrs_ = splitSemicolon(addr);
 }
@@ -84,7 +84,7 @@ void DefaultMQPushConsumer::setNameServerAddresses(const std::vector<std::string
 
 void DefaultMQPushConsumer::setAllocateMessageQueueStrategy(
     std::shared_ptr<AllocateMessageQueueStrategy> strategy) {
-    // setter 不校验：null 策略由 start() 的 checkConfig 拒绝。
+    // The setter does not validate: a null strategy is rejected by checkConfig in start().
     allocateStrategy_ = std::move(strategy);
 }
 
@@ -93,8 +93,8 @@ std::shared_ptr<AllocateMessageQueueStrategy> DefaultMQPushConsumer::allocateMes
 }
 
 void DefaultMQPushConsumer::setConsumeThreadNums(int32_t n) {
-    // 便捷方法：min 与 max 一起设。线程数已拆成 setConsumeThreadMin/Max 两个开关，
-    // 本方法保留是为了兼容既有调用点。
+    // Convenience method: sets min and max together. The thread count is split into the
+    // setConsumeThreadMin/Max switches; this method stays for existing call sites.
     const int32_t v = std::max(1, n);
     consumeThreadMin_ = v;
     consumeThreadMax_ = v;
@@ -119,15 +119,15 @@ void DefaultMQPushConsumer::setConsumeThreadMax(int32_t n) {
     }
 }
 
-// ---------------------------------------------------------------- 消费线程弹性
+// ---------------------------------------------------------------- Consume-thread elasticity
 
 bool DefaultMQPushConsumer::updateCorePoolSize(int32_t corePoolSize) {
-    // 守卫逐条固定：
+    // Guards fixed one by one:
     //   ownsConsumeExecutor && corePoolSize > 0
     //       && corePoolSize <= Short.MAX_VALUE   (32767)
     //       && corePoolSize < consumeThreadMax
-    // 任一条不满足就静默忽略（不抛异常）。
-    // 本实现不支持外部注入执行器，ownsConsumeExecutor 恒为 true。
+    // Any failing guard is silently ignored (no exception thrown).
+    // This implementation takes no externally injected executor, so ownsConsumeExecutor is always true.
     if (corePoolSize <= 0 || corePoolSize > 32767 || corePoolSize >= consumeThreadMax_) {
         return false;
     }
@@ -175,9 +175,9 @@ void DefaultMQPushConsumer::updateMsgAccCnt(const std::string& key,
 
 void DefaultMQPushConsumer::updateMsgAccCntLocked(const std::string& key,
                                                  const std::vector<MessageExt>& msgs) {
-    // 口径：accTotal = MAX_OFFSET 属性 - 该条 queueOffset，accTotal > 0 才更新 msgAccCnt。
-    // 取**本批最后一条**；属性缺失/非数字/非正一律不更新（broker 恒会带上该属性，
-    // 这里做容错以免脏数据打断拉取线程）。
+    // Rule: accTotal = the MAX_OFFSET property minus this message's queueOffset, and msgAccCnt updates only when it is > 0.
+    // Uses the last message of this batch; a missing / non-numeric / non-positive property never updates (the broker
+    // always sends that property, so this tolerance only keeps dirty data from breaking the pull thread).
     if (msgs.empty()) return;
     const MessageExt& last = msgs.back();
     const std::string maxOffset = last.getProperty(MessageConst::PROPERTY_MAX_OFFSET);
@@ -197,8 +197,8 @@ void DefaultMQPushConsumer::updateMsgAccCntLocked(const std::string& key,
 }
 
 void DefaultMQPushConsumer::adjustThreadPool() {
-    // ⚠ 本方法是 no-op 设计：inc/decCorePoolSize 是**空实现**，积压达到阈值不会真的扩容。
-    // 这里保留阈值比较与日志，仅为让 msgAccCnt / 阈值配置可观测；**不要"修好"它**。
+    // No-op by design: inc/decCorePoolSize are empty implementations, so reaching the backlog threshold does not really grow the pool.
+    // The threshold comparison and log stay only to make msgAccCnt / the threshold config observable; do not "fix" this.
     const int64_t accTotal = computeAccumulationTotal();
     const int64_t threshold = adjustThreadPoolNumsThreshold_;
     const int64_t incThreshold = static_cast<int64_t>(static_cast<double>(threshold) * 1.0);
@@ -225,7 +225,7 @@ void DefaultMQPushConsumer::setMessageListener(std::shared_ptr<MessageListener> 
     messageListener_ = std::move(listener);
 }
 
-// ---------------------------------------------------------------- 订阅
+// ---------------------------------------------------------------- Subscription
 void DefaultMQPushConsumer::subscribe(const std::string& topic, const std::string& subExpression) {
     const std::string realTopic = NamespaceUtil::wrapNamespace(namespace_, topic);
     SubscriptionData sub = FilterAPI::buildSubscriptionData(realTopic, subExpression);
@@ -251,19 +251,19 @@ void DefaultMQPushConsumer::subscribe(const std::string& topic, const MessageSel
     notifySubscriptionChanged(realTopic);
 }
 
-// 订阅表新增/更新后的立即动作（subscribe 收尾同款）。
+// Immediate action after the subscription table gains or updates an entry (same tail as every subscribe).
 //
-// 三处 subscribe 都是 `subscriptionInner.put(...)` 之后立刻
-// `sendHeartbeatToAllBrokerWithLock()`—— **start() 之后仍可订阅**，且 put 完立即同步推一轮
-// 心跳。为什么必须立即：broker 的
-// ConsumerManager 只在收到心跳时才把 topic→group 记进它自己那张 topicGroupTable
-// （ClientManageProcessor → registerConsumer），而 QUERY_TOPIC_CONSUME_BY_WHO(300)
-// 读的正是这张表；晚一轮就是默认 30s 的空窗。
+// All three subscribe paths issue a heartbeat right after putting into the subscription
+// table - subscribing stays legal after start(), and the put is followed
+// immediately by one synchronous heartbeat round. Why it must be
+// immediate: the broker's consumer manager records topic -> group into its own topicGroupTable
+// only when a heartbeat arrives, and QUERY_TOPIC_CONSUME_BY_WHO(300)
+// reads exactly that table; one round late means a gap of the default 30s.
 //
-// 另外把新 topic 登记为「在用」，让后台路由刷新任务覆盖到它（刷新任务直接遍历
-// 消费者的**当前**订阅表收集要刷的 topic）。
-// 未启动时没有 client（mQClientFactory == null 口径），只落订阅表。
-// unsubscribe 不调本函数：只删表项、不发心跳。
+// Also registers the new topic as in use so the background route refresh task covers it (the task walks
+// the consumer's current subscription table to collect the topics to refresh).
+// Before start there is no client instance, so only the subscription table is written.
+// unsubscribe does not call this function: it just deletes the entry and sends no heartbeat.
 void DefaultMQPushConsumer::notifySubscriptionChanged(const std::string& topic) {
     if (!started_.load() || mqClient_ == nullptr) {
         return;
@@ -291,17 +291,17 @@ std::vector<std::string> DefaultMQPushConsumer::subscribedTopics() const {
     return out;
 }
 
-// ---------------------------------------------------------------- 配置数值闸门
-// checkConfig 的数值段。
+// ---------------------------------------------------------------- Config numeric gates
+// The numeric part of checkConfig.
 //
-// 为什么放在 start() 而不是各 setter 里：setter 是裸赋值，只有
-// checkConfig 统一在启动时把关。setter 里
-// clamp（setConsumeMessageBatchMaxSize 的 max(1,n)）对应的是运行期的
-// Math.max 守卫，两道各有分工：setter 保证"拿到 0 也不会除零/空转"，闸门保证
-// "写 0 的人当场收到错误"。
+// Why it runs in start() and not in each setter: setters are bare assignments, only checkConfig
+// gates the values at startup. Clamping inside a setter (max(1,n) in setConsumeMessageBatchMaxSize)
+// is the runtime counterpart of the max guard, and the two stages have separate jobs: the setter
+// ensures "even a 0 cannot divide by zero or spin idle", the gate ensures "whoever writes 0 gets
+// an error on the spot".
 //
-// 错误文案一律不带 FAQUrl.suggestTodo(CLIENT_PARAMETER_CHECK_URL) 后缀
-// （本仓库所有客户端错误的口径）。
+// Error texts carry no trailing FAQ-suggestion suffix
+// (the convention for every client error in this repository).
 void DefaultMQPushConsumer::checkConfigRanges() const {
     // consumeThreadMin
     if (consumeThreadMin_ < 1 || consumeThreadMin_ > 1000) {
@@ -325,7 +325,7 @@ void DefaultMQPushConsumer::checkConfigRanges() const {
     if (pullThresholdForQueue_ < 1 || pullThresholdForQueue_ > 65535) {
         throw MQClientException("pullThresholdForQueue Out of range [1, 65535]");
     }
-    // pullThresholdForTopic：-1 是"未设置，用队列级阈值"哨兵，不在区间内也不算错
+    // pullThresholdForTopic: -1 is the "unset, use the queue-level threshold" sentinel, so it is legal outside the range
     if (pullThresholdForTopic_ != -1
         && (pullThresholdForTopic_ < 1 || pullThresholdForTopic_ > 6553500)) {
         throw MQClientException("pullThresholdForTopic Out of range [1, 6553500]");
@@ -334,12 +334,12 @@ void DefaultMQPushConsumer::checkConfigRanges() const {
     if (pullThresholdSizeForQueue_ < 1 || pullThresholdSizeForQueue_ > 1024) {
         throw MQClientException("pullThresholdSizeForQueue Out of range [1, 1024]");
     }
-    // pullThresholdSizeForTopic：同样只有 -1 是哨兵
+    // pullThresholdSizeForTopic: here too only -1 is a sentinel
     if (pullThresholdSizeForTopic_ != -1
         && (pullThresholdSizeForTopic_ < 1 || pullThresholdSizeForTopic_ > 102400)) {
         throw MQClientException("pullThresholdSizeForTopic Out of range [1, 102400]");
     }
-    // pullInterval（下界是 0，与其它闸门不同）
+    // pullInterval (lower bound 0, unlike the other gates)
     if (pullIntervalMillis_ < 0 || pullIntervalMillis_ > 65535) {
         throw MQClientException("pullInterval Out of range [0, 65535]");
     }
@@ -357,40 +357,40 @@ void DefaultMQPushConsumer::checkConfigRanges() const {
                                 + std::to_string(kMinPopInvisibleTime) + ", "
                                 + std::to_string(kMaxPopInvisibleTime) + "]");
     }
-    // popBatchNums（判据就是 <= 0，不是 < 1）
+    // popBatchNums (the test is exactly <= 0, not < 1)
     if (popBatchNums_ <= 0 || popBatchNums_ > 32) {
         throw MQClientException("popBatchNums Out of range [1, 32]");
     }
 }
 
-// ---------------------------------------------------------------- 生命周期
+// ---------------------------------------------------------------- Lifecycle
 void DefaultMQPushConsumer::start() {
     {
         std::lock_guard<std::mutex> lk(lock_);
         if (started_.load()) {
             return;
         }
-        // 把消费组套上命名空间（ns%group），
-        // 之后所有面向 broker 的组名（心跳 / rebalance / 位点 / 锁 / 回投）都用包装后的值。
+        // Wrap the consumer group with the namespace (ns%group), so
+        // every group name facing the broker afterwards (heartbeat / rebalance / offset / lock / redelivery) uses the wrapped value.
         if (!namespace_.empty()) {
             consumerGroup_ = NamespaceUtil::wrapNamespace(namespace_, consumerGroup_);
         }
-        // checkConfig 第一步：先 Validators.checkGroup
-        // （blank / 120 长度 / 字符表），再挡 DEFAULT_CONSUMER —— 共用默认组会让
-        // broker 侧的订阅关系判定把两组混在一起，回投与重平衡都错乱。
-        // ⚠ checkConfig 领先于地址/订阅检查：
-        // 配置非法时既不碰网络，也不该被后面的"未订阅"错误盖掉真正原因。
+        // checkConfig step one: Validators::checkGroup
+        // (blank / 120 length / character set), then block DEFAULT_CONSUMER - a shared default group would make
+        // the broker mix the two groups' subscription relation, scrambling redelivery and rebalance.
+        // checkConfig runs ahead of the address/subscription checks:
+        // with illegal config nothing touches the network, and the real cause must not be masked by the later "not subscribed" error.
         Validators::checkGroup(consumerGroup_);
         if (consumerGroup_ == MixAll::DEFAULT_CONSUMER_GROUP) {
             throw MQClientException(
                 "consumerGroup can not equal DEFAULT_CONSUMER, please specify another one.");
         }
-        // 静态地址与动态取址（ROCKETMQ_NAMESRV_DOMAIN）二选一必须可用
+        // Either static addresses or dynamic resolution (ROCKETMQ_NAMESRV_DOMAIN) must be available
         if (nameServerAddrs_.empty() && !DefaultTopAddressing::isConfigured()) {
             throw MQClientException("name server address is not set");
         }
-        // 策略为 null 直接拒绝启动，
-        // 而不是等 rebalance 解引用空指针（UB）。
+        // A null strategy refuses start outright
+        // instead of letting rebalance dereference a null pointer (UB).
         if (allocateStrategy_ == nullptr) {
             throw MQClientException("allocateMessageQueueStrategy is null");
         }
@@ -400,21 +400,21 @@ void DefaultMQPushConsumer::start() {
         if (messageListener_ == nullptr) {
             throw MQClientException("message listener is not set");
         }
-        // checkConfig 的数值段：必须排在所有 null 检查之后、
-        // 建 MQClientInstance 之前 —— 起了后台线程再抛错就泄漏线程了。
+        // The numeric section of checkConfig: must sit after all null checks and
+        // before creating the MQClientInstance - throwing once background threads run would leak them.
         checkConfigRanges();
-        // 只有 CLUSTERING 才
-        // `changeInstanceToPID`（BROADCASTING 保持 "DEFAULT"，MQClientManager
-        // 因此让同进程的广播消费者复用同一份实例），再由 buildMQClientId
-        // 拼 `<本机 IP>@<instanceName>`。
+        // Only CLUSTERING
+        // changes the instance name to the PID (BROADCASTING keeps "DEFAULT", so the client manager
+        // lets broadcast consumers in the same process share one instance); buildMQClientId then
+        // assembles `<local IP>@<instanceName>`.
         if (messageModel_ == MessageModel::CLUSTERING) {
             instanceName_ = changeInstanceNameToPID(instanceName_);
         }
         if (clientId_.empty()) {
             clientId_ = buildClientId(instanceName_, unitName_, enableStreamRequestType_);
         }
-        // 集群模式自动订阅重试 topic（copySubscription → getRetryTopic）：
-        // broker 回投的消息写到 %RETRY%group，客户端不订阅就收不到
+        // Clustering auto-subscribes the retry topic (copySubscription -> getRetryTopic):
+        // the broker writes redelivered messages to %RETRY%group, and a client that does not subscribe never receives them
         if (messageModel_ != MessageModel::BROADCASTING) {
             const std::string retryTopic = MixAll::getRetryTopic(consumerGroup_);
             if (subscriptionData_.find(retryTopic) == subscriptionData_.end()) {
@@ -427,16 +427,16 @@ void DefaultMQPushConsumer::start() {
                                              /*invokeTimeoutMillis=*/pullTimeoutMillis_,
                                              tlsEnable_, unitName_,
                                              pollNameServerIntervalMillis_));
-        // TLS 严格校验选项（caCert 非空 = 严格校验）：转发给实例与底层传输层
+        // TLS strict verification option (non-empty caCert = strict verification): forwarded to the instance and the underlying transport
         if (tlsOptionsSet_) {
             mqClient_->setTlsOptions(tlsOptions_);
         }
         if (socksProxySet_) {
             mqClient_->setSocksProxy(socksProxy_);
         }
-        // 请求钩子（namespaceV2 的 `nsd`/`ns`、ACL 签名 / stream 的 `ReqT`）：绑定在
-        // **start() 之前**，保证实例第一笔报文就带着它。namespaceV2 传**取值函数**
-        // （每笔请求实时读配置，钩子装链后改值也立即生效）。
+        // Request hooks (namespaceV2's `nsd`/`ns`, ACL signing, the stream `ReqT`): attached
+        // before start(), so the instance's very first frame already carries them. namespaceV2 is passed as a getter
+        // (each request reads the config live, so changing the value after the hook is chained still takes effect).
         std::shared_ptr<RPCHook> requestHook =
             composeRequestHooks(enableStreamRequestType_, rpcHook_,
                                 [this] { return namespaceV2_; });
@@ -445,13 +445,13 @@ void DefaultMQPushConsumer::start() {
                         + clientId_ + ")");
         }
         mqClient_->start();
-        // 动态 name server：实例启动时可能已从地址服务器拿到地址，回填到本消费者
-        // （否则本实例后续看不到实际生效的地址列表）
+        // Dynamic name server: the instance may already have addresses from the address server at start, so backfill them here
+        // (otherwise this consumer never sees the address list actually in effect)
         if (nameServerAddrs_.empty() && !mqClient_->nameServerAddrs().empty()) {
             nameServerAddrs_ = mqClient_->nameServerAddrs();
         }
-        // POP 消费执行器必须在 rebalance（会立刻起每队列 POP 循环）之前建好，
-        // 否则循环弹出消息后无处投递（消费执行器必须在服务构造期就位）。
+        // The POP consume executor must exist before rebalance (which immediately starts the per-queue POP loop),
+        // otherwise the loop pops messages with nowhere to deliver them (the executor must be ready while the service is being built).
         if (popMode_) {
             popConsumeExecutor_ = std::make_shared<ConsumeExecutor>(
                 std::max(1, corePoolSize_), std::max(1, consumeThreadMax_),
@@ -462,21 +462,21 @@ void DefaultMQPushConsumer::start() {
         started_.store(true);
     }
 
-    // broker 主动通知 40（成员变化 → 立即重算）**不**在这里注册处理器：
-    // remoting 表里一个 code 只有一个处理器，各消费者各自注册会互相覆盖。改成向实例登记
-    // 「叫醒」回调，由实例收到后扇出。
-    // 回调跑在 remoting 读线程上，只做置位 + notify，不发 RPC。
+    // Broker push notification 40 (membership changed -> recompute immediately) does NOT register a handler here:
+    // the remoting table holds one handler per code, so consumers registering their own would overwrite each other.
+    // Instead each consumer registers a "wake up" callback with the instance, which fans it out on receipt.
+    // The callback runs on the remoting read thread and only sets a flag + notifies; it issues no RPC.
     mqClient_->registerRebalanceWakeup(consumerGroup_, [this] { this->wakeRebalanceLoop(); });
 
-    // GET_CONSUMER_RUNNING_INFO(307)：
-    // admin / broker 查询本消费者运行信息，回 ConsumerRunningInfo JSON body。
+    // GET_CONSUMER_RUNNING_INFO(307):
+    // admin / broker queries this consumer's running info; replies with a ConsumerRunningInfo JSON body.
     mqClient_->remotingClient().registerProcessor(
         RequestCode::GET_CONSUMER_RUNNING_INFO,
         [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
             auto it = cmd.extFields.find("consumerGroup");
             const std::string group = it == cmd.extFields.end() ? std::string() : it->second;
             if (group != consumerGroup_) {
-                // 组不匹配回 SYSTEM_ERROR（broker 端会打 warn，错误文案是匹配合同）
+                // Group mismatch answers SYSTEM_ERROR (the broker logs a warn; the error text is part of the matching contract)
                 return RemotingCommand::createResponseCommand(
                     ResponseCode::SYSTEM_ERROR,
                     "consumerGroup not matched, expect " + consumerGroup_ + ", got " + group);
@@ -487,15 +487,15 @@ void DefaultMQPushConsumer::start() {
             return resp;
         });
 
-    // RESET_CONSUMER_CLIENT_OFFSET(220)：broker 用 invokeOneway 发，无需应答。
-    // 重置逻辑里会触发 rebalance（lock/unlock/batch 等 invokeSync），不能在读线程上
-    // 同步跑（自死锁，见本文件顶部工程点）——丢到后台线程，立即返回 nullopt。
+    // RESET_CONSUMER_CLIENT_OFFSET(220): the broker sends it with invokeOneway, so no reply is needed.
+    // The reset logic triggers rebalance (invokeSync calls such as lock/unlock/batch), which must not run
+    // synchronously on the read thread (self-deadlock, see the engineering notes at the top of this file) - handed to a background thread, returns nullopt at once.
     mqClient_->remotingClient().registerProcessor(
         RequestCode::RESET_CONSUMER_CLIENT_OFFSET,
         [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
             auto git = cmd.extFields.find("group");
             const std::string group = git == cmd.extFields.end() ? std::string() : git->second;
-            if (group != consumerGroup_) return std::nullopt;  // oneway，不回响应
+            if (group != consumerGroup_) return std::nullopt;  // oneway, no response
             std::string topic;
             auto tit = cmd.extFields.find("topic");
             if (tit != cmd.extFields.end()) topic = tit->second;
@@ -515,15 +515,15 @@ void DefaultMQPushConsumer::start() {
             return std::nullopt;
         });
 
-    // GET_CONSUMER_STATUS_FROM_CLIENT(221)：admin 查询本消费者已消费位点表，
-    // 回 GetConsumerStatusBody JSON body（messageQueueTable 内联对象键）。
+    // GET_CONSUMER_STATUS_FROM_CLIENT(221): admin queries this consumer's consumed-offset table,
+    // replies with a GetConsumerStatusBody JSON body (messageQueueTable with inline object keys).
     mqClient_->remotingClient().registerProcessor(
         RequestCode::GET_CONSUMER_STATUS_FROM_CLIENT,
         [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
             auto git = cmd.extFields.find("group");
             const std::string group = git == cmd.extFields.end() ? std::string() : git->second;
             if (group != consumerGroup_) {
-                // 组不匹配回 SYSTEM_ERROR（broker 端会打 warn，错误文案是匹配合同）
+                // Group mismatch answers SYSTEM_ERROR (the broker logs a warn; the error text is part of the matching contract)
                 return RemotingCommand::createResponseCommand(
                     ResponseCode::SYSTEM_ERROR,
                     "consumerGroup not matched, expect " + consumerGroup_ + ", got " + group);
@@ -539,9 +539,9 @@ void DefaultMQPushConsumer::start() {
             return resp;
         });
 
-    // CONSUME_MESSAGE_DIRECTLY(309)：broker 把一条消息推下来，要求本地真实消费一次。
-    // 监听器在读线程上同步跑（admin 一次性探针；监听器里如果再发
-    // 同步请求会自死锁，但那是用户代码的职责）。
+    // CONSUME_MESSAGE_DIRECTLY(309): the broker pushes one message down and asks the client to really consume it once.
+    // The listener runs synchronously on the read thread (a one-shot admin probe; a synchronous request issued from
+    // inside the listener would self-deadlock, but that is the user code's responsibility).
     mqClient_->remotingClient().registerProcessor(
         RequestCode::CONSUME_MESSAGE_DIRECTLY,
         [this](const RemotingCommand& cmd, const std::string&) -> std::optional<RemotingCommand> {
@@ -572,10 +572,10 @@ void DefaultMQPushConsumer::start() {
             return resp;
         });
 
-    // start 的固定顺序：
-    // 拉路由（登记 topic 在用 + 填 broker 地址表）→ 发心跳（broker 先认识本消费者）
-    // → 立即 rebalance → 起消费线程。心跳必须在 rebalance 之前：rebalance 要向 broker
-    // 查消费者列表（GET_CONSUMER_LIST_BY_GROUP），broker 只有收到心跳才登记本 clientId。
+    // The fixed order of start:
+    // fetch routes (register topics in use + fill the broker address table) -> heartbeat (the broker learns this consumer first)
+    // -> rebalance immediately -> start the consume threads. The heartbeat must come before rebalance: rebalance asks the broker
+    // for the consumer id list (GET_CONSUMER_LIST_BY_GROUP), and the broker only records this clientId after receiving a heartbeat.
     for (const std::string& t : subscribedTopics()) {
         mqClient_->registerTopicInUse(t);
         try {
@@ -584,9 +584,9 @@ void DefaultMQPushConsumer::start() {
             logger_debug("refresh route for " + t + " failed: " + e.what());
         }
     }
-    // 路由到手之后、心跳之前，把
-    // 非 TAG 订阅发给 broker 校验（CHECK_CLIENT_CONFIG 46）。SQL92 写错时 broker 的过滤层
-    // 会**静默放行全部消息**，只有这一笔请求能把它变成启动错误；失败就地回滚后再上抛。
+    // Between the routes arriving and the heartbeat,
+    // non-TAG subscriptions are validated by the broker (CHECK_CLIENT_CONFIG 46). A malformed SQL92 expression makes the broker's
+    // filter layer pass every message silently; only this request turns that into a startup error, so roll back locally and rethrow on failure.
     try {
         std::vector<SubscriptionData> subs;
         subs.reserve(subscriptionData_.size());
@@ -601,24 +601,24 @@ void DefaultMQPushConsumer::start() {
     } catch (const std::exception& e) {
         logger_debug("initial heartbeat failed: " + std::string(e.what()));
     }
-    // 首轮分配必须同步完成：否则拉取线程会在空分配集上白转，直到第一轮 rebalance 才生效。
+    // The first allocation must complete synchronously: otherwise pull threads spin on an empty assignment set until the first rebalance round takes effect.
     try {
         doRebalance();
     } catch (const std::exception& e) {
         logger_debug("initial rebalance failed: " + std::string(e.what()));
     }
 
-    // 拉取：每队列一个线程（并发长轮询，避免空队列 suspend 阻塞其他队列投递）
-    // 这四个常驻循环与拉取线程同一口径：**异常必须在边界上接住**。线程里逃出一个异常
-    // 就是 std::terminate（整个进程陪葬，而不是这一个消费者少干活）；shutdown 先把
-    // started_ 置 false 再依次 join 线程，中间任何一句 client() 都会抛 "consumer not started"。
+    // Pulling: one thread per queue (concurrent long polling, so a suspended empty queue does not block delivery on other queues)
+    // These four resident loops follow the same rule as the pull threads: exceptions must be caught at the boundary. One
+    // escaping from a thread means std::terminate (the whole process dies, not merely this consumer doing less work); shutdown
+    // sets started_ to false first and joins the threads afterwards, so any client() call in that gap throws "consumer not started".
     dispatchThread_ = std::thread([this]() {
         setThreadName("ConsumeMessageThread");
         runLoop("dispatch", [this] { dispatchLoop(); });
     });
-    // 挂起 listener 的清扫调度只在**经典并发**路径存在：它随并发消费服务
-    // 构造/start 建起来；顺序消费的 cleanExpiredMsg 本来就直接返回，POP 的
-    // 并发消费服务也没有对应的调度。
+    // The suspended-listener cleanup scheduler exists only on the classic concurrent path: it is built together
+    // with the concurrent consume service at construction/start; orderly consumption's cleanExpiredMsg already
+    // returns directly, and the POP concurrent consume service has no matching scheduler either.
     if (!isOrderly() && !popMode_) {
         cleanExpireThread_ = std::thread([this]() {
             setThreadName("CleanExpireMsgScheduledThread_" + consumerGroup_);
@@ -638,8 +638,8 @@ void DefaultMQPushConsumer::start() {
         runLoop("rebalance", [this] { rebalanceLoop(); });
     });
 
-    // 消息轨迹：enableMsgTrace=true 时建 AsyncTraceDispatcher 并注册 ConsumeMessageTraceHook。
-    // 放在消费线程起来之后：分发器的内部生产者要先把轨迹 topic 的路由拉起来。
+    // Message trace: with enableMsgTrace=true an AsyncTraceDispatcher is created and ConsumeMessageTraceHook registered.
+    // Placed after the consume threads start: the dispatcher's internal producer must first bring up the trace topic's route.
     startTraceDispatcher();
 
     std::string topics;
@@ -658,7 +658,7 @@ void DefaultMQPushConsumer::shutdown() {
     }
     stop_.store(true);
     cv_.notify_all();
-    // POP：把所有队列标成 dropped，在途批次不再 ack（交给 broker 复活重投）
+    // POP: mark every queue dropped so in-flight batches are no longer acked (the broker revives and redelivers them)
     if (popMode_) {
         std::lock_guard<std::mutex> lk(lock_);
         for (auto& kv : popQueues_) {
@@ -666,21 +666,21 @@ void DefaultMQPushConsumer::shutdown() {
         }
         popQueues_.clear();
     }
-    // POP 消费执行器收工（shutdownGracefully：不再收新任务，把手上的批次跑完）。
-    // ⚠ 必须显式 join：工作线程捕获了 this，留着跑就是 use-after-free。
+    // Retire the POP consume executor (graceful shutdown: accept no new tasks, finish the batches in hand).
+    // An explicit join is mandatory: worker threads captured this, so letting them keep running is a use-after-free.
     if (popConsumeExecutor_) {
         popConsumeExecutor_->shutdown(true);
         popConsumeExecutor_.reset();
     }
-    // 退出前把已消费位点持久化一次（shutdown 收尾的 persistAllConsumerOffset）
+    // Persist consumed offsets once before exiting (the persistAllConsumerOffset tail of shutdown)
     try {
         persistOffsetsOnce();
     } catch (const std::exception& e) {
         logger_debug(std::string("persist offsets on shutdown failed: ") + e.what());
     }
-    // 顺序消费清退时解锁队列（shutdown → unlockAll）。
-    // POP 顺序服务走同一个 unlockAll，而它只读 processQueueTable —— POP 模式下是空表，
-    // 不发报文。
+    // Unlock the queues when orderly consumption retires (shutdown -> unlockAll).
+    // The POP orderly service uses the same unlockAll, but it only reads processQueueTable - an empty table in POP mode,
+    // so it sends no frames.
     if (isOrderly() && !popMode_ && messageModel_ != MessageModel::BROADCASTING) {
         try {
             std::vector<MessageQueue> mqs = assignedQueues();
@@ -709,8 +709,8 @@ void DefaultMQPushConsumer::shutdown() {
     if (lockThread_.joinable()) lockThread_.join();
     if (rebalanceThread_.joinable()) rebalanceThread_.join();
     if (cleanExpireThread_.joinable()) cleanExpireThread_.join();
-    // 消费线程都停了之后再关轨迹分发器：先把队列里剩余的轨迹强刷出去（SubBefore/SubAfter
-    // 落盘就靠这一步），再关内部生产者。必须在 mqClient_->shutdown() 之前。
+    // Close the trace dispatcher only after all consume threads stopped: first flush the traces still queued (this step is what
+    // persists SubBefore/SubAfter), then close the internal producer. Must happen before mqClient_->shutdown().
     if (traceDispatcher_) {
         try {
             traceDispatcher_->shutdown();
@@ -719,12 +719,12 @@ void DefaultMQPushConsumer::shutdown() {
         }
         traceDispatcher_.reset();
     }
-    // 优雅注销（unregisterClient）：关闭连接**之前**对
-    // brokerAddrTable 里所有 broker 发 UNREGISTER_CLIENT(35)，broker 端立刻摘除本 clientId，
-    // 不必等心跳超时（默认 ~120s）——否则这段时间内消费者变更通知仍可能发往已退出的实例。
+    // Graceful unregister (unregisterClient): before closing any connection, send
+    // UNREGISTER_CLIENT(35) to every broker in the broker address table so the broker drops this clientId at once
+    // instead of waiting for the heartbeat timeout (~120s by default); otherwise consumer-change notifications could still be sent to the exited instance meanwhile.
     if (mqClient_) {
-        // 叫醒回调捕获了 this：消费线程都已 join，先把回调摘掉，剩下
-        // （注销客户端、关连接）这段时间里 broker 再推 40 也不会回调到半个线程上。
+        // The wake-up callback captured this: consume threads are all joined, so remove the callback first; during what
+        // remains (unregister client, close connections) a broker push of code 40 can no longer call into a half-dead thread.
         mqClient_->unregisterRebalanceWakeup(consumerGroup_);
         try {
             mqClient_->unregisterClientAllBrokers(clientId_, "", consumerGroup_);
@@ -742,17 +742,17 @@ MQClientInstance& DefaultMQPushConsumer::client() {
     return *mqClient_;
 }
 
-// 常驻循环线程的边界。两件事缺一不可：
-//   1. **接住异常**：线程里逃出异常 = std::terminate，整个进程陪葬，而不是这一个消费者
-//      少干活。shutdown 第一步就把 started_ 置 false，之后任何一句 client() 都会抛
-//      "consumer not started"，而它 join 各线程是在更后面 —— 中间的空档必然有人踩到。
-//   2. **还在运行就重进循环**：只接不重跑，等于把一次偶发异常变成"心跳照发、位点照刷、
-//      就是不再消费"的静默停摆，比崩溃更难查。重进前睡 1s，持续失败会在日志里留痕。
+// Boundary of the resident loop threads; both duties are indispensable:
+//   1. Catch exceptions: one escaping a thread is std::terminate and the whole process dies, not just this
+//      consumer doing less work. shutdown sets started_ to false as its first step, after which any client() call
+//      throws "consumer not started", and it joins the threads only later - the gap in between is bound to be hit.
+//   2. Re-enter the loop while still running: catching without re-running turns an occasional exception into a silent
+//      stall ("heartbeats sent, offsets flushed, consumption just stops"), harder to diagnose than a crash; sleep 1s before re-entering and persistent failure leaves traces in the log.
 void DefaultMQPushConsumer::runLoop(const std::string& what, const std::function<void()>& body) {
     while (started_.load() && !stop_.load()) {
         try {
             body();
-            return;  // 循环自己退出了（看到停机），正常收工
+            return;  // the loop exited on its own (it saw the stop flag), a normal finish
         } catch (const std::exception& e) {
             logger_warn(what + " loop threw: " + e.what());
         } catch (...) {
@@ -762,16 +762,16 @@ void DefaultMQPushConsumer::runLoop(const std::string& what, const std::function
     }
 }
 
-// ---------------------------------------------------------------- 消费循环
+// ---------------------------------------------------------------- Consume loop
 bool DefaultMQPushConsumer::isOrderly() const {
     return messageListener_ != nullptr && messageListener_->orderly();
 }
 
 void DefaultMQPushConsumer::rebalancePullThreads() {
-    // updateProcessQueueTableInRebalance 口径：
-    // 按当前分配集同步拉取线程，并为被撤销的队列做收尾（持久化已消费位点、
-    // 丢弃在途缓冲、顺序消费集群模式解锁）。少任何一步，被撤销队列里的在途消息
-    // 会被旧实例继续消费，与新属主重复（同组多实例重复消费的根因）。
+    // Same contract as updateProcessQueueTableInRebalance:
+    // sync the pull threads with the current assignment set and finish up the revoked queues (persist consumed offsets,
+    // drop in-flight buffers, unlock queues in orderly clustering mode). Skipping any step lets the old instance keep
+    // consuming the revoked queue's in-flight messages, duplicating the new owner (root cause of duplicate consumption across instances in one group).
     std::vector<MessageQueue> queues = assignedQueues();
     std::map<std::string, MessageQueue> current;
     for (const MessageQueue& mq : queues) {
@@ -780,23 +780,23 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
     std::vector<std::pair<MessageQueue, int64_t>> retired;
     {
         std::lock_guard<std::mutex> lk(lock_);
-        // 1. 撤：被分走的（!mqSet.contains(mq)）+ **拉取停摆**的
-        //    （pq.isPullExpired()）。停摆这一支防的是
-        //    "循环线程死了/卡住了但队列还归本实例"——不撤就永久静默，且没有任何异常。
-        //    先收 key 再逐个撤：retireQueueLocked 会擦 pullThreads_ 的条目，
-        //    在迭代器上直接擦会跟 std::map 的 erase 语义纠缠。
+        // 1. Retire: queues allocated elsewhere (!mqSet.contains(mq)) plus pull-stalled ones
+        //    (pq.isPullExpired()). The stalled branch guards against
+        //    "the loop thread died or is stuck while the queue still belongs to this instance" - not retiring it means permanent silence with no exception at all.
+        //    Collect the keys first, then retire them one by one: retireQueueLocked erases pullThreads_ entries, and
+        //    erasing straight from the iterator would tangle with std::map erase semantics.
         std::vector<std::string> toRetire;
         for (auto it = pullThreads_.begin(); it != pullThreads_.end(); ++it) {
             const std::string& key = it->first;
             const bool revoked = current.find(key) == current.end();
-            // 停机期间线程本来就陆续退出，这时不判停摆（否则会刷一堆假 [BUG] 日志）
+            // During shutdown threads are exiting anyway, so do not test for stalls then (it would spam a pile of fake [BUG] logs)
             const bool stalled = !revoked && started_.load() && !stop_.load()
                 && pullStalledLocked(key);
             if (!revoked && !stalled) {
                 continue;
             }
             if (stalled) {
-                // 该告警文案保持既有句式，用于排查"消费停摆被自愈"的现场
+                // This warning keeps its established wording, used to diagnose "consumption stalled and self-healed" incidents
                 logger_error("[BUG]doRebalance, " + consumerGroup_
                              + ", try remove unnecessary mq, " + key
                              + ", because pull is pause, so try to fixed it");
@@ -806,57 +806,57 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
         for (const std::string& key : toRetire) {
             MessageQueue fallback;
             auto cit = current.find(key);
-            if (cit != current.end()) fallback = cit->second;   // 停摆队列可能一条都没拉过
+            if (cit != current.end()) fallback = cit->second;   // a stalled queue may never have pulled anything
             retireQueueLocked(key, fallback, retired);
         }
     }
-    // 撤的收尾（持久化位点 / UNLOCK）必须在起新线程**之前**做完：反过来会让新循环
-    // 拿旧位点起拉、又把更小的位点写回去，白增重复投递。网络/落盘在锁外做。
+    // The retire tail (offset persistence / UNLOCK) must finish before starting new threads: otherwise the new loop starts
+    // pulling from the old offset and writes a smaller one back, adding needless redelivery. Network and disk work happen outside the lock.
     if (!retired.empty()) {
         onQueuesRevoked(retired);
     }
     {
         std::lock_guard<std::mutex> lk(lock_);
-        // 2. 建：为缺失的队列起拉取线程。
-        //    std::thread 一构造就跑，做不到「先入表再启动」，所以
-        //    「写 pullOwners_」必须在构造之前，而「写 pullThreads_」必须与它同批完成。
-        //    错开一步就有两种坏结果：
-        //      * 新线程先跑到 ownsQueue()，看到表里还没有自己 ⇒ 当场退出；而 key
-        //        随后被登记成「已有拉取线程」，之后每轮 rebalance 都不会再起 ——
-        //        这条队列**永久静默**，落在它上面的消息一条都不会投（真机少一整批
-        //        消息、且重复数=0 的根因）。
-        //      * 两轮 rebalance 交错给同一 key 起两条线程 ⇒ 同一队列重复消费。
-        //    新线程第一轮要拿的正是这把锁，它会等到我们 release，看到的一定是登记完
-        //    成之后的状态，所以「先跑起来看不到归属」的窗口被彻底关死。
+        // 2. Build: start pull threads for the missing queues.
+        //    std::thread runs on construction, so "register first, then start" is impossible:
+        //    writing pullOwners_ must precede the construction, and writing pullThreads_ must complete in the same batch.
+        //    Offsetting them by one step yields two bad outcomes:
+        //      * the new thread reaches ownsQueue() first, sees itself absent from the table and exits on the spot; the key is
+        //        then registered as "already has a pull thread", so no later rebalance round ever starts one again -
+        //        this queue goes permanently silent and not one of its messages is delivered (root cause of a real run
+        //        missing a whole batch with duplicate count = 0).
+        //      * two interleaved rebalance rounds start two threads for the same key => duplicate consumption on one queue.
+        //    The new thread's first round takes exactly this lock, so it waits until we release and can only observe the state
+        //    after registration finished, which closes the "started but sees no ownership" window completely.
         for (const auto& kv : current) {
             if (pullThreads_.find(kv.first) != pullThreads_.end()) continue;
-            // shutdown 已经开始就只撤不建：`started_` 在 shutdown 第一步就被置成 false，
-            // 而 `client()` 此后必抛（"consumer not started"）——此刻起的线程一进门就死在
-            // 第一句上；更糟的是 shutdown 的 join 循环可能已经过去，没人 join 这条新线程，
-            // 它能活到本对象析构之后。所以建线程前先查 `isStopped`（stop_/started_），同一口径。
+            // Once shutdown has begun only retire, never build: started_ is set false in shutdown's first step and
+            // client() then always throws ("consumer not started"), so a thread started now dies on its very first line; worse,
+            // shutdown's join loop may already have passed, nobody joins this new thread, and it can outlive this object's
+            // destructor. Hence the isStopped check (stop_/started_) before creating threads, same rule.
             if (stop_.load() || !started_.load()) return;
             if (popMode_ && popQueues_.find(kv.first) == popQueues_.end()) {
                 popQueues_[kv.first] = std::make_shared<PopProcessQueue>();
             }
-            // 新 ProcessQueue 就位 ⇒ 解冻（removeProcessQueue 里的 removeOffset
-            // 取消冻结状态）：重建后的队列按修正位点重新开始推进。留在冻结集里会让
-            // 队列从此只拉不 ack —— 位点永久停在纠错值，重投也不会前移。
+            // A new ProcessQueue means unfreeze (removeOffset inside removeProcessQueue clears the frozen state): the
+            // rebuilt queue resumes advancing from the corrected offset. Staying in the frozen set would leave the queue
+            // pulling forever without acking - the offset sticks at the correction value and redelivery never moves it forward.
             frozenOffsets_.erase(kv.first);
             const uint64_t token = ++nextPullToken_;
             pullOwners_[kv.first] = token;
-            // 队列一旦分配就进 mqMap_（ProcessQueueTable 的键集即"已分配"），不等
-            // 第一条消息：位点持久化、307 运行信息、停摆自愈都要靠这份映射找得到队列。
+            // A queue enters mqMap_ as soon as it is allocated (the ProcessQueueTable key set is "allocated"), without waiting for
+            // the first message: offset persistence, 307 running info and stall self-healing all rely on this mapping to find the queue.
             mqMap_[kv.first] = kv.second;
-            // 线程刚建、还没跑到盖章处，先用当前时刻占位，避免下一趟误判停摆
+            // The thread was just created and has not reached the stamping point yet: placeholder with the current time so the next round does not misjudge a stall
             lastPullAt_[kv.first] = UtilAll::currentTimeMillis();
             const std::string key = kv.first;
             const MessageQueue mq = kv.second;
             try {
                 std::thread t([this, mq, key, token]() {
-                    // 线程体的**边界**必须自己接住异常：这里逃出去就是 std::terminate，
-                    // 整个进程陪葬（真机实测：shutdown 与一轮 rebalance 抢在一起时，
-                    // 新起的线程第一句 client() 抛 "consumer not started"，把跑了一般的
-                    // 用例全带走）。消费循环内部的异常一律就地转成停摆上报。
+                    // The thread body's boundary must catch its own exceptions: escaping here means std::terminate and the
+                    // whole process dies (measured on a real cluster: when shutdown raced a rebalance round, the freshly started
+                    // thread threw "consumer not started" from its first client() call and took down every test case halfway).
+                    // Exceptions inside the consume loop are always converted into a stall report in place.
                     try {
                         if (popMode_) {
                             setThreadName("PopMessageService");
@@ -870,16 +870,16 @@ void DefaultMQPushConsumer::rebalancePullThreads() {
                     } catch (...) {
                         logger_warn("pull loop died, queue=" + key + ": unknown exception");
                     }
-                    // 走到这里说明循环自己返回了。若它返回时**仍然持有**该队列，就不是
-                    // 被 rebalance 撤走的正常退出，而是"订阅没了/异常打穿"这类死法：
-                    // 报到停摆，下一趟撤掉重建（std::thread 死了问不出 is_alive）。
-                    // 停机路上这一步无害：此刻已经没有下一趟 rebalance 了。
+                    // Reaching here means the loop returned by itself. If it still holds the queue when returning, that is not a normal
+                    // exit revoked by rebalance but a death like "subscription gone / exception punched through": report it as
+                    // stalled so the next round retires and rebuilds it (a dead std::thread cannot be asked is_alive).
+                    // Harmless on the shutdown path: by then there is no next rebalance round.
                     markPullLoopExited(key, token);
                 });
                 pullThreads_[key] = std::move(t);
             } catch (const std::system_error& e) {
-                // 起线程失败（资源耗尽）必须把归属收回，留着一个没人认领的 token
-                // 等于给这条队列判了永久静默；收回去下一轮 rebalance 会重试。
+                // Failing to start a thread (resource exhaustion) must reclaim the ownership: leaving a token nobody claimed is a
+                // permanent silence sentence for this queue; reclaiming lets the next rebalance round retry it.
                 pullOwners_.erase(key);
                 lastPullAt_.erase(key);
                 logger_warn("rebalance: cannot start pull thread for " + key + ": " + e.what());
@@ -901,26 +901,26 @@ void DefaultMQPushConsumer::stampPullAt(const std::string& key) {
             auto it = popQueues_.find(key);
             if (it != popQueues_.end()) pq = it->second;
         }
-        // POP 队列的 lastPopTimestamp 在同一个时刻盖章
+        // The POP queue's lastPopTimestamp is stamped at the same instant
         if (pq) pq->setLastPopTimestamp(now);
     }
 }
 
 bool DefaultMQPushConsumer::pullStalledLocked(const std::string& key) const {
-    // isPullExpired（ProcessQueue / PopProcessQueue 同一判据）：只看"多久没发起过
-    // 一次拉取/弹出"。没盖过章（新线程还没跑到入口）不算停摆，否则刚分配就被撤。
+    // isPullExpired (same test for ProcessQueue / PopProcessQueue): only "how long since the last
+    // pull/pop was issued". Never stamped (a new thread that has not reached the entry) is not a stall, otherwise a queue would be revoked right after allocation.
     auto it = lastPullAt_.find(key);
     if (it == lastPullAt_.end()) return false;
-    if (it->second == 0) return true;      // 循环自行退出的标记
+    if (it->second == 0) return true;      // marker that the loop exited on its own
     return UtilAll::currentTimeMillis() - it->second > kPullMaxIdleTime;
 }
 
 void DefaultMQPushConsumer::markPullLoopExited(const std::string& key, uint64_t token) {
     if (stop_.load() || !started_.load()) return;
     std::lock_guard<std::mutex> lk(lock_);
-    // 直接查归属表：ownsQueue() 也要拿同一把非递归锁，这里已经持着它了。
+    // Query the ownership table directly: ownsQueue() takes the same non-recursive lock, which is already held here.
     auto it = pullOwners_.find(key);
-    if (it == pullOwners_.end() || it->second != token) return;   // 被撤走的正常退出
+    if (it == pullOwners_.end() || it->second != token) return;   // normal exit after being revoked
     lastPullAt_[key] = 0;
 }
 
@@ -930,10 +930,10 @@ bool DefaultMQPushConsumer::pullStalled(const std::string& key) const {
 }
 
 bool DefaultMQPushConsumer::flowControlHit(const MessageQueue& mq, const std::string& key) {
-    // ProcessQueue 的五个流控阈值：先队列级三条（条数、字节、
-    // 位点跨度），再 topic 级累计两条。字节阈值单位是 **MiB**，跨度是 pending 里
-    // queueOffset 的 max-min 且**严格大于**才算。
-    // 只有开着 topic 级阈值时才去遍历别的队列，否则一次判定多走一遍全表。
+    // The five flow-control thresholds of a ProcessQueue: first the three queue-level ones (message count, bytes,
+    // offset span), then the two topic-level cumulative ones. The byte threshold is in MiB; the span is max-min of the
+    // pending queueOffsets and counts only when strictly greater.
+    // Other queues are walked only when topic-level thresholds are enabled, otherwise one check would scan the whole table needlessly.
     size_t count = 0;
     double sizeMb = 0.0;
     int64_t span = 0;
@@ -1011,11 +1011,11 @@ void DefaultMQPushConsumer::setLastPullAt(const std::string& key, int64_t millis
 void DefaultMQPushConsumer::syncPullThreads() { rebalancePullThreads(); }
 
 void DefaultMQPushConsumer::rebalanceLoop() {
-    // 周期重算分配（默认 20s），或被 NOTIFY_CONSUMER_IDS_CHANGED
-    // 通知时立即重算（rebalanceNow_ 置位）。启动后 60s 内且当前无任何分配时缩短为 2s 重试：
-    // 消费者可能先于 topic 被创建启动，此时真实路由还拉不到——消费端不做默认 topic 兜底，
-    // 死等 20s 会长时间不消费；快速重试只在启动后 60s 内生效，避免长期订阅不存在 topic 时
-    // 高频打 NameServer。
+    // Recompute the allocation periodically (20s by default), or immediately on a
+    // NOTIFY_CONSUMER_IDS_CHANGED notification (rebalanceNow_ set). Within 60s after start and while nothing is assigned, retry every 2s:
+    // the consumer may have been created before the topic, so the real route is not fetchable yet - the consumer does no default-topic fallback, and
+    // waiting the full 20s would mean not consuming for a long time; the fast retry only applies during the first 60s after start, avoiding
+    // hammering the name server when a non-existent topic is subscribed long-term.
     while (!stop_.load()) {
         bool fast = false;
         {
@@ -1042,27 +1042,27 @@ void DefaultMQPushConsumer::rebalanceLoop() {
 }
 
 void DefaultMQPushConsumer::resume() {
-    // resume：清 pause 后立即 doRebalance，
-    // 让 suspend 期间错过的分配马上补上。
+    // resume: run doRebalance right after clearing the pause,
+    // so allocations missed while suspended are picked up immediately.
     paused_.store(false);
     doRebalance();
 }
 
 void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token) {
-    // 停机路上被起来过一趟（见 rebalancePullThreads 的"只撤不建"守卫）：直接收工，
-    // 别去碰 client()——shutdown 第一步就把 started_ 置了 false，那时它必抛。
+    // A loop started on the shutdown path (see the "retire only, never build" guard in rebalancePullThreads): finish at once and
+    // do not touch client() - shutdown sets started_ false in its first step, so client() would certainly throw.
     if (!started_.load() || stop_.load()) return;
     MQClientInstance& c = client();
     const bool orderly = isOrderly();
     const std::string key = offsetKey(mq);
     while (!stop_.load() && started_.load()) {
-        // 长轮询期间被 rebalance 撤走（队列或换了拉取线程）即失效：直接退出本线程，
-        // 由新属主从我们最后持久化的位点接手，避免两实例重复消费同一条消息。
+        // Revoked by rebalance during long polling (the queue may have a new pull thread) means stale: exit this thread
+        // outright and let the new owner take over from our last persisted offset, so two instances never consume the same message twice.
         if (!ownsQueue(key, token)) {
             return;
         }
-        // 每次**发起**拉取就盖时刻，
-        // 在流控/锁判定之前：判据是"这条循环还在跑"，不是"这轮真的打了网络"。
+        // Stamp the time at every pull issue, before the flow-control/lock checks:
+        // the test is "this loop is still running", not "this round really hit the network".
         stampPullAt(key);
         SubscriptionData sub;
         {
@@ -1071,16 +1071,16 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
             if (it == subscriptionData_.end()) return;
             sub = it->second;
         }
-        // paused 时本队列拉取
-        // 延后 PULL_TIME_DELAY_MILLS_WHEN_SUSPEND（1000ms）再试；已拉到的消息继续
-        // 消费，位点不回退。判点在流控/顺序锁之前（pause 先判）。
+        // While paused this queue's pull is delayed by
+        // PULL_TIME_DELAY_MILLS_WHEN_SUSPEND (1000ms) before retrying; already fetched messages keep
+        // being consumed and the offset never rewinds. Checked before flow control / the orderly lock (pause wins).
         if (paused_.load()) {
             logger_debug("consumer was paused, execute pull request later. group=" +
                          consumerGroup_);
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             continue;
         }
-        // 顺序消费：broker 未确认锁定（LOCK_BATCH_MQ）的队列不拉取
+        // Orderly consumption: queues the broker has not confirmed as locked (LOCK_BATCH_MQ) are not pulled
         if (orderly) {
             bool locked = false;
             {
@@ -1092,7 +1092,7 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
                 continue;
             }
         }
-        // 流控（ProcessQueue 的五个阈值，见 flowControlHit）：命中任一条就暂停本队列拉取
+        // Flow control (the five ProcessQueue thresholds, see flowControlHit): any hit pauses pulling this queue
         if (flowControlHit(mq, key)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
@@ -1122,9 +1122,9 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
 
         PullResult result;
         try {
-            // subscription 位置位
-            // 与否完全由 subExpression 是否为空决定；默认关闭时表达式**根本不进报文的
-            // subscription 字段**（见 MQClientInstance::pullMessage）。
+            // Whether the subscription bit is set
+            // depends solely on subExpression being non-empty; when disabled by default the expression does not even enter the frame's
+            // subscription field (see MQClientInstance::pullMessage).
             const bool postSub = shouldPostSubscriptionWhenPull(postSubscriptionWhenPull_,
                                                                sub.classFilterMode);
             const int32_t sysFlag =
@@ -1136,7 +1136,7 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
             int64_t brokerId;
             {
                 std::lock_guard<std::mutex> lk(lock_);
-                // recalculatePullFromWhichNode：无记录按 master=0
+                // recalculatePullFromWhichNode: no record means master=0
                 auto it = pullFromWhichNode_.find(key);
                 brokerId = (it != pullFromWhichNode_.end()) ? it->second : MixAll::MASTER_ID;
             }
@@ -1147,13 +1147,13 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
                                    pullSuspendTimeoutMillis_, /*addr=*/std::string(),
                                    /*requestSource=*/0, /*brokerId=*/brokerId);
             {
-                // processPullResult：每轮应答都回写
-                // pullFromWhichNodeTable（缺省按 master=0 记账）
+                // processPullResult: every response writes back
+                // pullFromWhichNodeTable (defaulting to master=0)
                 std::lock_guard<std::mutex> lk(lock_);
                 pullFromWhichNode_[key] =
                     result.suggestWhichBrokerId.value_or(MixAll::MASTER_ID);
             }
-            // 消费统计（PullCallback.onSuccess：RT 每次都记，TPS 只在有消息时记）
+            // Consume statistics (PullCallback.onSuccess: RT always recorded, TPS only when messages came back)
             mqClient_->consumerStats().incPullRT(consumerGroup_, mq.topic,
                                                  UtilAll::currentTimeMillis() - pullBegan);
             if (result.isFound() && !result.msgFoundList.empty()) {
@@ -1161,14 +1161,14 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
                                                       static_cast<int64_t>(result.msgFoundList.size()));
             }
         } catch (const MQBrokerException& e) {
-            // TOPIC_NOT_EXIST / PULL_NOT_FOUND 等多为预期路径（topic 未创建等），debug + 退避
+            // TOPIC_NOT_EXIST / PULL_NOT_FOUND and friends are mostly expected paths (topic not created yet), so debug + backoff
             logger_debug("pull broker error for " + mq.toString() + ": " + e.what());
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         } catch (const RemotingTimeoutException& e) {
-            // 长轮询在 suspend 期间无新消息触发客户端超时属正常行为：broker 会把
-            // suspend 时间钳制到自身 brokerSuspendMaxTimeMillis，忽略客户端下发值，
-            // 故空闲队列会周期性超时。非错误，仅 debug，避免污染运行日志。
+            // Long polling timing out on the client when nothing arrives during suspend is normal: the broker clamps the
+            // suspend time to its own brokerSuspendMaxTimeMillis and ignores the client value,
+            // so idle queues time out periodically. Not an error: debug only, to keep the run log clean.
             logger_debug("pull long-poll timeout for " + mq.toString()
                          + " (benign, will retry): " + e.what());
             continue;
@@ -1185,19 +1185,19 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
                 mqMap_[key] = mq;
             }
         }
-        // 入队与「是否仍持有该队列」必须一致：长轮询期间被 rebalance 撤走的队列，这批消息按
-        // ProcessQueue.isDropped() 语义：直接丢弃——不消费、不推进位点，由新属主从我们
-        // 最后持久化的位点重投，否则两实例会重复消费同一条消息。
+        // Enqueuing and "still owning this queue" must stay consistent: for a queue revoked during long polling the fetched batch
+        // follows the ProcessQueue.isDropped() semantics - drop it, consume nothing, advance no offset; the new owner
+        // redelivers from our last persisted offset, otherwise two instances consume the same message twice.
         if (!ownsQueue(key, token)) {
             logger_debug("queue " + mq.toString()
                          + " revoked during pull, discard fetched messages");
             return;
         }
         if (result.status == PullStatus::FOUND && !result.msgFoundList.empty()) {
-            // 投递前的客户端侧过滤（processPullResult 的过滤段）：
-            // 先二次 tag 过滤，再跑 FilterMessageHook。**必须在拿 lock_ 之前做** ——
-            // 钩子是用户代码，可能阻塞，不能压在入队的临界区里。
-            // 拉取路径被摘掉的消息**不 ack**：位点照常推进 = 静默跳过。
+            // Client-side filtering before delivery (the filter stage of processPullResult):
+            // a second tag filter first, then the FilterMessageHook. This must run before taking lock_ -
+            // hooks are user code and may block, so they cannot sit inside the enqueue critical section.
+            // Messages removed on the pull path are not acked: the offset advances anyway, i.e. they are silently skipped.
             std::vector<MessageExt> deliverable = filterMessagesForDelivery(mq, &sub, result.msgFoundList);
             if (deliverable.size() != result.msgFoundList.size()) {
                 filteredMessageCount_ +=
@@ -1208,23 +1208,23 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
             for (const MessageExt& m : deliverable) {
                 dq.push_back(m);
             }
-            // ProcessQueue.msgAccCnt：用**过滤后入队**的那批算（先过滤再 putMessage）
+            // ProcessQueue.msgAccCnt: computed from the filtered batch that got enqueued (filter first, then putMessage)
             updateMsgAccCntLocked(key, deliverable);
         }
-        // 拉取游标推进到 nextBeginOffset；"已消费位点"由 consumeOffsetTable_ 跟踪并持久化
+        // The pull cursor advances to nextBeginOffset; the "consumed offset" is tracked and persisted by consumeOffsetTable_
         if (result.nextBeginOffset >= 0) {
             bool illegal = false;
             {
                 std::lock_guard<std::mutex> lk(lock_);
                 offsetTable_[key] = result.nextBeginOffset;
                 if (result.status == PullStatus::OFFSET_ILLEGAL) {
-                    // 位点被 broker 纠正，
-                    // 纠错 + 撤队列 + 落盘的整条链路见 handleOffsetIllegal。
-                    // 冻结位点要在锁内先落地，纠错的其余步骤（网络 RPC）放锁外。
+                    // The broker corrected the offset;
+                    // the whole chain of correction + queue revoke + persistence is described in handleOffsetIllegal.
+                    // Freezing the offset must land inside the lock; the remaining correction steps (network RPCs) run outside it.
                     illegal = true;
                 } else {
-                    // 空应答（NO_NEW_MSG / NO_MATCHED_MSG）时修正
-                    // "已消费位点"，见 correctTagsOffsetLocked
+                    // On an empty response (NO_NEW_MSG / NO_MATCHED_MSG) correct the
+                    // "consumed offset", see correctTagsOffsetLocked
                     correctTagsOffsetLocked(key, result.status, result.nextBeginOffset);
                 }
             }
@@ -1235,20 +1235,20 @@ void DefaultMQPushConsumer::queuePullLoop(const MessageQueue& mq, uint64_t token
     }
 }
 
-// ---------------------------------------------------------------- POP 消费循环
+// ---------------------------------------------------------------- POP consume loop
 void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token) {
-    // 与 pull 循环的关键差别：
-    //   - **不查、不提交消费位点**：进度由 broker 侧的 checkpoint 跟踪，确认只靠 ack；
-    //   - 弹出即投递给消费线程，本轮循环立刻继续（不等消费结果）；
-    //   - POLLING_NOT_FOUND（队列暂时没消息）是**正常态**，直接下一轮，不算错误。
+    // Key differences from the pull loop:
+    //   - it neither queries nor commits a consume offset: progress is tracked by the broker-side checkpoint and confirmed only by ack;
+    //   - popped messages go straight to the consume threads and the loop continues at once (no waiting for consume results);
+    //   - POLLING_NOT_FOUND (queue momentarily empty) is a normal state: just take the next round, it is not an error.
     const std::string key = offsetKey(mq);
     int64_t invisible = popInvisibleTime_;
     if (invisible < kMinPopInvisibleTime || invisible > kMaxPopInvisibleTime) {
-        // 钳制规则：超出 [5s, 300s] 一律回落到 60s
+        // Clamp rule: anything outside [5s, 300s] falls back to 60s
         invisible = 60000;
     }
-    // PopRequest 缺省是 ConsumeInitMode.MAX；这里按 consumeFromWhere 映射，
-    // 让"从头消费"的语义在 POP 模式下也成立。
+    // PopRequest defaults to ConsumeInitMode.MAX; map it through consumeFromWhere here, so
+    // "consume from the beginning" keeps working in POP mode as well.
     const int32_t initMode =
         consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET
             ? static_cast<int32_t>(ConsumeInitMode::MIN)
@@ -1264,8 +1264,8 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             pq = it->second;
         }
         if (pq->isDropped()) return;
-        // 发起即盖章（POP 模式的
-        // isPullExpired 读的就是 PopProcessQueue.lastPopTimestamp）。
+        // Stamp as soon as the request is issued (in POP mode
+        // isPullExpired reads exactly PopProcessQueue.lastPopTimestamp).
         stampPullAt(key);
         SubscriptionData sub;
         {
@@ -1274,15 +1274,15 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             if (it == subscriptionData_.end()) return;
             sub = it->second;
         }
-        // paused 时本队列弹出
-        // 延后 PULL_TIME_DELAY_MILLS_WHEN_SUSPEND（1000ms）再试（与 pull 循环同款）。
+        // While paused this queue's pop is delayed by
+        // PULL_TIME_DELAY_MILLS_WHEN_SUSPEND (1000ms) before retrying (same as the pull loop).
         if (paused_.load()) {
             logger_debug("consumer was paused, execute pop request later. group=" +
                          consumerGroup_);
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             continue;
         }
-        // 流控：已弹未 ack 太多就先缓一缓（popThresholdForQueue）
+        // Flow control: too many popped-but-unacked messages, so hold back first (popThresholdForQueue)
         if (pq->waitAckCount() > popThresholdForQueue_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
@@ -1295,7 +1295,7 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
                                          sub.subString.empty() ? "*" : sub.subString,
                                          sub.expressionType, false, popTimeoutMillis_, mq.brokerName);
         } catch (const RemotingTimeoutException& e) {
-            // 长轮询挂起期间没有消息 → 客户端先超时，属正常行为，直接下一轮
+            // No message arrived while long polling was suspended -> the client times out first: normal behaviour, go to the next round
             logger_debug("pop long-poll timeout for " + key + " (benign): " + e.what());
             continue;
         } catch (const std::exception& e) {
@@ -1303,20 +1303,20 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         }
-        // 弹出后队列被 rebalance 撤走：这一批**既不消费也不 ack**
-        // （PopProcessQueue.isDropped() 分支），交给 invisibleTime 到期后
-        // broker 自动复活重投给新属主。
+        // The queue was revoked by rebalance after popping: this batch is neither consumed nor acked
+        // (the PopProcessQueue.isDropped() branch); when invisibleTime expires the
+        // broker revives the messages and redelivers them to the new owner.
         if (!ownsQueue(key, token) || pq->isDropped()) {
             logger_debug("queue " + key + " revoked during pop, discard "
                          + std::to_string(result.msgFoundList.size()) + " messages un-acked");
             return;
         }
-        // 拉取统计（PopCallback.onSuccess，判定见 recordPopPullStats）
+        // Pull statistics after popping (PopCallback.onSuccess; the test is in recordPopPullStats)
         recordPopPullStats(client().consumerStats(), mq.topic, result, began);
         if (result.status == PopStatus::FOUND && !result.msgFoundList.empty()) {
             pq->incFoundMsg(static_cast<int32_t>(result.msgFoundList.size()));
-            // 投递前过滤（processPopResult）：POP 路径**必须 ack 被摘掉的**，
-            // 否则 invisibleTime 到期后 broker 会复活重投 —— 表现为"过滤没生效"。
+            // Filtering before delivery (processPopResult): the POP path must ack the dropped entries,
+            // otherwise the broker revives and redelivers them when invisibleTime expires - which looks like "the filter did not take effect".
             std::vector<MessageExt> kept = filterMessagesForDelivery(mq, &sub, result.msgFoundList);
             if (kept.size() != result.msgFoundList.size()) {
                 std::vector<MessageExt> dropped = droppedMessages(result.msgFoundList, kept);
@@ -1330,20 +1330,20 @@ void DefaultMQPushConsumer::queuePopLoop(const MessageQueue& mq, uint64_t token)
             }
             if (!kept.empty()) submitPopConsumeRequest(kept, pq, mq);
         } else if (UtilAll::currentTimeMillis() - began < 200) {
-            // 空结果：若 broker 没按 pollTime 挂起（立即返回）就会变成热循环，
-            // 这里按"本轮耗时过短"兜底退避，避免打爆 broker。
+            // Empty result: if the broker did not suspend for pollTime (returned at once) this would spin hot,
+            // so fall back to a backoff when the round was too short, keeping the broker from being flooded.
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        // NO_NEW_MSG / POLLING_NOT_FOUND / POLLING_FULL 都直接进下一轮
+        // NO_NEW_MSG / POLLING_NOT_FOUND / POLLING_FULL all go straight into the next round
     }
 }
 
 void DefaultMQPushConsumer::recordPopPullStats(ConsumerStatsManager& stats,
                                                const std::string& topic,
                                                const PopResult& result, int64_t beganMs) {
-    // pull 回调每次都记 RT，POP 回调只在 FOUND 记，而且
-    // 是在判空**之前**记；TPS 只按真正弹到的条数记。保持这个不对称口径：POP 的空手而归是
-    // 长轮询常态（POLLING_NOT_FOUND），把它算进 RT 等于用挂起时长稀释平均拉取耗时。
+    // The pull callback records RT every time, the POP callback only on FOUND, and it does so
+    // before the emptiness check; TPS counts only the messages actually popped. This asymmetry is kept on purpose: an empty-handed POP is
+    // the long-polling norm (POLLING_NOT_FOUND), and folding it into RT would dilute the average pull time with suspend durations.
     if (result.status != PopStatus::FOUND) return;
     stats.incPullRT(consumerGroup_, topic, UtilAll::currentTimeMillis() - beganMs);
     if (!result.msgFoundList.empty()) {
@@ -1355,21 +1355,21 @@ void DefaultMQPushConsumer::recordPopPullStats(ConsumerStatsManager& stats,
 void DefaultMQPushConsumer::submitPopConsumeRequest(std::vector<MessageExt> msgs,
                                                     std::shared_ptr<PopProcessQueue> pq,
                                                     const MessageQueue& mq) {
-    // 按 listener 类型选消费服务：顺序监听器 +
-    // POP 走顺序 POP 服务，而该链路是未完成骨架（POPTODO）：请求去重入队后 run()
-    // 拿到队列锁就返回 —— 消息**不消费、不 ack**，
-    // invisibleTime 到期由 broker 复活重投，宏观表现是「顺序 + POP 收不到消息且积压
-    // 不消」。照此保留骨架行为，别"修好"：POP 路径的顺序语义（队列锁、COMMIT/ROLLBACK）
-    // 尚未定论。msgs 在这条路径被忽略（ConsumeRequest 只带 pq + mq）；
-    // 弹出批次的预过滤与被摘条目的 ack 在分派之前，两种服务共享，不受影响。
+    // The consume service is chosen by listener type: an orderly listener plus
+    // POP goes to the orderly POP service, and that chain is an unfinished skeleton (POPTODO): after the deduplicated
+    // request is queued, run() returns as soon as it holds the queue lock - messages are not consumed and not acked,
+    // the broker revives and redelivers them when invisibleTime expires, so the macro behaviour is
+    // "orderly + POP receives no messages and the backlog never drains". Keep the skeleton behaviour, do not "fix" it: the orderly
+    // semantics of the POP path (queue locks, COMMIT/ROLLBACK) are undecided. msgs is ignored on this path (ConsumeRequest carries only pq + mq);
+    // the pre-filter of the popped batch and the acking of dropped entries happen before dispatch, shared by both services and unaffected.
     if (isOrderly()) {
         submitPopOrderlyRequest(pq, mq, /*force=*/false);
         return;
     }
-    // 投给**core/max 两档线程池**（core=consumeThreadMin / max=consumeThreadMax，队列无界）：
-    // 此前这里每批起一个 detached 线程（无上限），慢监听器一上来就线程爆炸，
-    // 而 setConsumeThreadNums() 设的值完全没作用。线程池 + 无界队列
-    // 意味着真实并发度 == corePoolSize，updateCorePoolSize() 在运行时能改它。
+    // Submitted to the core/max two-tier pool (core=consumeThreadMin / max=consumeThreadMax, unbounded queue):
+    // previously each batch spawned a detached thread with no cap, so one slow listener blew up the thread count and
+    // the value set by setConsumeThreadNums() had no effect at all. A pool plus an unbounded queue
+    // means real concurrency == corePoolSize, which updateCorePoolSize() can change at runtime.
     const size_t size = static_cast<size_t>(std::max(1, consumeMessageBatchMaxSize_));
     std::shared_ptr<ConsumeExecutor> exec = popConsumeExecutor_;
     for (size_t i = 0; i < msgs.size(); i += size) {
@@ -1382,7 +1382,7 @@ void DefaultMQPushConsumer::submitPopConsumeRequest(std::vector<MessageExt> msgs
                 consumePopBatch(std::move(*batch), pq, mq);
             });
         } else {
-            // 未 start（单测）时没有执行器：同步执行，保持与改动前一致的可测行为。
+            // Not started (unit tests) means no executor: run synchronously to keep the testable behaviour from before the change.
             consumePopBatch(std::move(*batch), pq, mq);
         }
     }
@@ -1390,11 +1390,11 @@ void DefaultMQPushConsumer::submitPopConsumeRequest(std::vector<MessageExt> msgs
 
 void DefaultMQPushConsumer::submitPopOrderlyRequest(const std::shared_ptr<PopProcessQueue>& pq,
                                                     const MessageQueue& mq, bool force) {
-    // submitConsumeRequest 口径：
-    // 在 (mq, shardingKeyIndex=0) 的锁下去重（MessageQueueLock + ConcurrentSet，
-    // 相等性 = (shardingKeyIndex, pq 引用, mq)），新请求才投执行器。rebalance 撤走队列
-    // 会换**新** PopProcessQueue（指针身份不同），新请求照常入队。
-    // 每 key 锁在这里折进 lock_：临界区只有一次 set 插入，等价且少一张锁表。
+    // Same contract as submitConsumeRequest:
+    // dedupe under the (mq, shardingKeyIndex=0) lock (MessageQueueLock + ConcurrentSet,
+    // equality = (shardingKeyIndex, pq reference, mq)) and only new requests go to the executor. When rebalance revokes a queue
+    // it swaps in a new PopProcessQueue (different pointer identity), so the new request queues normally.
+    // The per-key lock is folded into lock_ here: the critical section is a single set insert, equivalent and one less lock table.
     {
         std::lock_guard<std::mutex> lk(lock_);
         const bool isNew = popOrderlyRequests_.insert({pq.get(), mq}).second;
@@ -1405,11 +1405,11 @@ void DefaultMQPushConsumer::submitPopOrderlyRequest(const std::shared_ptr<PopPro
         if (exec) {
             exec->submit([this, pq, mq]() { runPopOrderlyRequest(pq, mq); });
         } else {
-            // 未 start（单测）时没有执行器：同步执行，与并发路径的可测行为一致。
+            // Not started (unit tests) means no executor: run synchronously, matching the concurrent path's testable behaviour.
             runPopOrderlyRequest(pq, mq);
         }
     } catch (const std::exception& e) {
-        // 提交失败只打日志，请求留在集合里（不会自动重投）。
+        // A failed submit only logs; the request stays in the set (it is not re-offered automatically).
         logger_error("error submit pop orderly request: " + std::string(e.what())
                      + ", mq: " + mq.toString());
     }
@@ -1417,9 +1417,9 @@ void DefaultMQPushConsumer::submitPopOrderlyRequest(const std::shared_ptr<PopPro
 
 void DefaultMQPushConsumer::runPopOrderlyRequest(const std::shared_ptr<PopProcessQueue>& pq,
                                                  const MessageQueue& mq) {
-    // ConsumeRequest.run 的骨架到此为止：pq 被撤销才摘请求（removeConsumeRequest 同款日志）；
-    // 否则拿到队列锁就**什么都不做**。fetchLockObject 的对应物是调用方的去重集
-    // （同队列同时至多一个请求在跑），无需再取锁。
+    // The skeleton of ConsumeRequest.run ends here: the request is removed only when pq was revoked (same log as removeConsumeRequest);
+    // otherwise it takes the queue lock and does nothing. The counterpart of fetchLockObject is the caller's dedupe set
+    // (at most one request running per queue), so no extra lock is needed.
     if (pq->isDropped()) {
         logger_warn("run, message queue not be able to consume, because it's dropped. "
                     + mq.toString());
@@ -1437,7 +1437,7 @@ size_t DefaultMQPushConsumer::popOrderlyRequestCount() const {
 void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
                                             std::shared_ptr<PopProcessQueue> pq,
                                             const MessageQueue& mq) {
-    // POP 并发消费的 ConsumeRequest.run。
+    // ConsumeRequest.run for POP concurrent consumption.
     if (pq->isDropped() || msgs.empty()) return;
 
     int64_t popTime = 0;
@@ -1453,21 +1453,21 @@ void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
         logger_debug(std::string("parse pop ck failed: ") + e.what());
     }
     if (isPopTimeout(popTime, invisible)) {
-        // 已经超过 invisibleTime：ack 也不会被承认，直接放弃本批（等 broker 复活重投）
+        // Already past invisibleTime: an ack would not be accepted either, so abandon this batch (wait for the broker to revive and redeliver)
         pq->decFoundMsg(-static_cast<int32_t>(msgs.size()));
         return;
     }
 
     resetRetryTopicAndNamespace(msgs);
     ConsumeConcurrentlyContext ctx(mq);
-    // POP 路径把 ackIndex 当
-    // 「已 ack 到第几条」用，语义与 classic 回投路径一致，默认值 Integer.MAX_VALUE
-    // 已经表示「整批 ack」；这里钳到 size-1 只是让 ctx 上的值与本批条数对齐，
-    // 不影响 CONSUME_SUCCESS 的行为（不 ack 会让消息在 invisibleTime 后被复活重投）。
+    // The POP path uses ackIndex as
+    // "up to which message has been acked", the same semantics as the classic redelivery path; the default Integer.MAX_VALUE
+    // already means "ack the whole batch", and clamping to size-1 here only aligns the ctx value with this batch size
+    // without changing CONSUME_SUCCESS behaviour (not acking would let the messages be revived and redelivered after invisibleTime).
     ctx.ackIndex = static_cast<int32_t>(msgs.size()) - 1;
-    // 消费钩子：before 在 listener 之前，after 紧跟在 listener 之后
-    // （固定顺序：
-    //  after 钩子在「队列被撤走 / pop 超时」判定**之前**跑）
+    // Consume hooks: before runs ahead of the listener, after runs right behind it
+    // (fixed order:
+    //  the after hook runs before the "queue revoked / pop timed out" checks)
     const bool useHook = hasConsumeMessageHook();
     ConsumeMessageContext hookCtx;
     if (useHook) {
@@ -1478,9 +1478,9 @@ void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
     bool hookHasException = false;
     int64_t hookBeginMs = UtilAll::currentTimeMillis();
     try {
-        // POP 并发路径同样在交给
-        // listener 前逐条盖 CONSUME_START_TIME（POP 没有 cleanExpiredMsg 清扫，但这条
-        // 属性对 listener/轨迹可见，口径与经典并发一致）。
+        // The POP concurrent path also stamps CONSUME_START_TIME on every message before handing them
+        // to the listener (POP has no cleanExpiredMsg sweep, but this property is visible to the
+        // listener and to tracing, matching the classic concurrent contract).
         const int64_t popStampNow = UtilAll::currentTimeMillis();
         for (MessageExt& m : msgs) {
             m.putProperty(MessageConst::PROPERTY_CONSUME_START_TIMESTAMP,
@@ -1489,7 +1489,7 @@ void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
         auto* conc = static_cast<MessageListenerConcurrently*>(messageListener_.get());
         status = conc->consumeMessage(msgs, ctx);
     } catch (const std::exception& e) {
-        // 消费抛异常按 RECONSUME_LATER 处理
+        // A consume exception is treated as RECONSUME_LATER
         logger_debug(std::string("pop listener error, treat as RECONSUME_LATER: ") + e.what());
         hookHasException = true;
     }
@@ -1501,7 +1501,7 @@ void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
                           ok ? "CONSUME_SUCCESS" : "RECONSUME_LATER");
     }
     if (pq->isDropped() || isPopTimeout(popTime, invisible)) {
-        // 消费期间队列被撤走或已超时：结果不再处理
+        // The queue was revoked or the pop timed out while consuming: the result is no longer processed
         pq->decFoundMsg(-static_cast<int32_t>(msgs.size()));
         return;
     }
@@ -1509,7 +1509,7 @@ void DefaultMQPushConsumer::consumePopBatch(std::vector<MessageExt> msgs,
 }
 
 bool DefaultMQPushConsumer::isPopTimeout(int64_t popTime, int64_t invisible) {
-    // isPopTimeout 口径：不能解析出 popTime/invisibleTime 时按超时处理
+    // isPopTimeout contract: when popTime/invisibleTime cannot be parsed, treat it as timed out
     if (popTime <= 0 || invisible <= 0) return true;
     return UtilAll::currentTimeMillis() - popTime >= invisible;
 }
@@ -1517,14 +1517,14 @@ bool DefaultMQPushConsumer::isPopTimeout(int64_t popTime, int64_t invisible) {
 void DefaultMQPushConsumer::processPopConsumeResult(
     ConsumeConcurrentlyStatus status, const ConsumeConcurrentlyContext& ctx,
     std::vector<MessageExt>& msgs, const std::shared_ptr<PopProcessQueue>& pq) {
-    // processConsumeResult（POP 并发）。
+    // processConsumeResult (POP concurrent).
     int32_t ackIndex = ctx.ackIndex;
     if (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS) {
         if (ackIndex >= static_cast<int32_t>(msgs.size())) {
             ackIndex = static_cast<int32_t>(msgs.size()) - 1;
         }
     } else {
-        ackIndex = -1;  // RECONSUME_LATER：一条都不 ack
+        ackIndex = -1;  // RECONSUME_LATER: ack not one message
     }
     for (int32_t i = 0; i <= ackIndex; i++) {
         ackPopMsg(msgs[static_cast<size_t>(i)]);
@@ -1533,8 +1533,8 @@ void DefaultMQPushConsumer::processPopConsumeResult(
     for (int32_t i = ackIndex + 1; i < static_cast<int32_t>(msgs.size()); i++) {
         pq->ack();
         const MessageExt& msg = msgs[static_cast<size_t>(i)];
-        // 超过最大重试次数：走 checkNeedAckOrDelay（太老就直接 ack 丢弃，
-        // 否则按消息已存活时间选一个延迟档位）
+        // Past the max reconsume count: hand it to checkNeedAckOrDelay (too old means ack and drop,
+        // otherwise pick a delay level from how long the message has already lived)
         if (maxReconsumeTimes_ >= 0 && msg.reconsumeTimes >= maxReconsumeTimes_) {
             checkNeedAckOrDelay(msg);
             continue;
@@ -1544,9 +1544,9 @@ void DefaultMQPushConsumer::processPopConsumeResult(
 }
 
 void DefaultMQPushConsumer::checkNeedAckOrDelay(const MessageExt& msg) {
-    // checkNeedAckOrDelay：重试次数用尽后的兜底。
-    // 消息存活时间已经超过最大延迟档位的 2 倍 → 直接 ack 丢弃（不再无限重试）；
-    // 否则按存活时间选一个档位继续延长不可见时间。
+    // checkNeedAckOrDelay: the fallback once the retry count is exhausted.
+    // If the message lived longer than twice the largest delay level -> ack and drop (no endless retries);
+    // otherwise pick a level by its age and keep extending the invisible time.
     const std::vector<int32_t>& table = popDelayLevel_;
     const int64_t msgDelayTime = UtilAll::currentTimeMillis() - msg.bornTimestamp;
     if (msgDelayTime > static_cast<int64_t>(table.back()) * 1000 * 2) {
@@ -1561,17 +1561,17 @@ void DefaultMQPushConsumer::checkNeedAckOrDelay(const MessageExt& msg) {
             break;
         }
     }
-    // ⚠ 有意容错：存活时间小于首档时按原算式会算出 level=-1 并索引
-    // delayLevelTable[-1] 抛 ArrayIndexOutOfBounds。这里钳到首档。
+    // Deliberate tolerance: when the age is below the first level the original formula yields level=-1 and indexing
+    // delayLevelTable[-1] would throw ArrayIndexOutOfBounds, so the value is clamped to the first level.
     changePopInvisibleTime(msg, level);
 }
 
 std::optional<PopCkTarget> DefaultMQPushConsumer::popCkTarget(const MessageExt& msg) {
-    // ⚠ 两处都不能想当然：
-    //   1. topic 要用 ExtraInfoUtil.getRealTopic 按 CK 的 retryFlag 还原 —— 复活消息
-    //      （retryFlag=1）的真实 topic 是 %RETRY%<group>_<topic>，**不是**消息上的 topic；
-    //   2. 地址要按 CK 里的 brokerName 反查，不能按 topic 查路由 —— retry topic 通常没有
-    //      独立路由表项，按 topic 查会失败（要走 findBrokerAddressInSubscribe）。
+    // Two things must not be assumed:
+    //   1. the topic has to be restored with ExtraInfoUtil.getRealTopic from the CK retryFlag - a revived message
+    //      (retryFlag=1) really belongs to %RETRY%<group>_<topic>, NOT the topic on the message;
+    //   2. the address must be looked up from the CK brokerName, not from the topic's route - a retry topic usually has
+    //      no route entry of its own, so looking it up by topic fails (findBrokerAddressInSubscribe is the way).
     auto pit = msg.properties.find(MessageConst::PROPERTY_POP_CK);
     if (pit == msg.properties.end() || pit->second.empty()) {
         logger_debug("pop message without POP_CK, cannot ack: " + msg.msgId);
@@ -1594,25 +1594,25 @@ std::optional<PopCkTarget> DefaultMQPushConsumer::popCkTarget(const MessageExt& 
 }
 
 void DefaultMQPushConsumer::ackPopMsg(const MessageExt& msg) {
-    // ackAsync 口径。
+    // Same contract as ackAsync.
     auto target = popCkTarget(msg);
     if (!target) return;
     try {
-        // 走 findBrokerAddressInSubscribe(brokerName, MASTER_ID, true)：
-        // **只要主**，刷一次路由仍拿不到就抛「The broker[X] not exist」。
+        // Uses findBrokerAddressInSubscribe(brokerName, MASTER_ID, true):
+        // master only; if one route refresh still yields nothing it throws "The broker[X] not exist".
         MQClientInstance& c = client();
         c.ackMessage(consumerGroup_, target->topic, target->queueId, target->extraInfo,
                      target->offset, 3000, target->brokerName,
                      c.publishAddrFor(target->brokerName, target->topic));
     } catch (const std::exception& e) {
-        // ack 失败不致命：消息会在 invisibleTime 到期后被 broker 复活重投
+        // An ack failure is not fatal: the broker revives and redelivers the message once invisibleTime expires
         logger_debug(std::string("ack failed for ") + msg.msgId + ": " + e.what());
     }
 }
 
 void DefaultMQPushConsumer::changePopInvisibleTime(const MessageExt& msg, int32_t delayLevel) {
-    // changePopInvisibleTime 口径。
-    // delayLevel == 0 时用消息已重试次数当档位；档位表是**秒**，接口要毫秒。
+    // Same contract as changePopInvisibleTime.
+    // With delayLevel == 0 the message's reconsume count is used as the level; the level table is in seconds, the API takes milliseconds.
     auto target = popCkTarget(msg);
     if (!target) return;
     if (delayLevel == 0) {
@@ -1626,7 +1626,7 @@ void DefaultMQPushConsumer::changePopInvisibleTime(const MessageExt& msg, int32_
         delaySecond = table[static_cast<size_t>(std::max(0, delayLevel))];
     }
     try {
-        // changePopInvisibleTimeAsync 同样是「只要主」+ 刷一次路由
+        // changePopInvisibleTimeAsync likewise is "master only" plus one route refresh
         MQClientInstance& c = client();
         c.changeInvisibleTime(consumerGroup_, target->topic, target->queueId,
                               target->extraInfo, target->offset,
@@ -1658,8 +1658,8 @@ void DefaultMQPushConsumer::dispatchLoop() {
                 if (it == mqMap_.end()) continue;
                 mq = it->second;
             }
-            // 连同这批消息所属的 ProcessQueue 代号一起取走：消费/ack 前比对，
-            // 不一致整批作废（isDropped 判据，ConsumeMessageConcurrentlyService 口径）。
+            // Take the batch together with the ProcessQueue epoch it belongs to, and compare before consuming/acking:
+            // a mismatch invalidates the whole batch (the isDropped test, same contract as ConsumeMessageConcurrentlyService).
             uint64_t epoch = 0;
             std::vector<MessageExt> batch = takeBatchForConsume(key, &epoch);
             if (batch.empty()) continue;
@@ -1667,7 +1667,7 @@ void DefaultMQPushConsumer::dispatchLoop() {
                 bool done = consumeBatch(key, mq, batch, epoch);
                 progressed = progressed || done;
             } catch (const std::exception& e) {
-                // 分发路径意外异常：批次塞回队首，稍后重试（不要让它杀死分发线程）
+                // Unexpected exception on the dispatch path: push the batch back to the head and retry later (do not let it kill the dispatch thread)
                 logger_warn("dispatch batch error (will retry): " + std::string(e.what()));
                 std::lock_guard<std::mutex> lk(lock_);
                 auto it = pending_.find(key);
@@ -1686,18 +1686,18 @@ void DefaultMQPushConsumer::dispatchLoop() {
     }
 }
 
-// ---------------------------------------------------------------- 消费钩子 / 轨迹
+// ---------------------------------------------------------------- Consume hooks / trace
 //
-// ConsumeMessageHook 的调用点（并发 / 顺序 / POP 并发三条消费路径）：
-//   1) 调 listener **之前** 建 context 并跑 before 钩子（生成 SubBefore 轨迹）；
-//   2) listener 返回后算出 ConsumeReturnType 名字写进 props（决定 SubAfter 的 contextCode），
-//      再跑 after 钩子（生成 SubAfter 轨迹）。
-// 钩子异常一律吞掉并记 warn —— 轨迹挂了绝不能影响消费。
+// Call sites of ConsumeMessageHook (the concurrent / orderly / POP concurrent consume paths):
+//   1) build the context and run the before hook before calling the listener (produces the SubBefore trace);
+//   2) after the listener returns, compute the ConsumeReturnType name and write it into props (it decides the SubAfter
+//      contextCode), then run the after hook (produces the SubAfter trace).
+// Hook exceptions are always swallowed and logged as warn - broken tracing must never affect consumption.
 ConsumeMessageContext DefaultMQPushConsumer::buildConsumeHookContext(
     const std::vector<MessageExt>& msgs, const MessageQueue& mq) const {
     ConsumeMessageContext context(consumerGroup_, msgs, mq);
-    context.success = false;            // 初始值就是 false
-    context.props.clear();              // props 用来放 ConsumeReturnType 名字
+    context.success = false;            // the initial value is already false
+    context.props.clear();              // props carries the ConsumeReturnType name
     context.accessChannel = accessChannel_;
     return context;
 }
@@ -1727,8 +1727,8 @@ void DefaultMQPushConsumer::executeConsumeHookAfter(ConsumeMessageContext& conte
 }
 
 void DefaultMQPushConsumer::executeFilterMessageHook(FilterMessageContext& context) {
-    // 钩子异常一律吞掉并记 error（executeHook / processPopResult 同口径）。
-    // 与 CheckForbiddenHook 相反：过滤钩子挂了不能影响消费。
+    // Hook exceptions are always swallowed and logged as error (same contract as executeHook / processPopResult).
+    // Unlike CheckForbiddenHook: a failing filter hook must not affect consumption.
     for (auto& hook : filterMessageHookList_) {
         try {
             hook->filterMessage(context);
@@ -1742,15 +1742,15 @@ void DefaultMQPushConsumer::executeFilterMessageHook(FilterMessageContext& conte
 
 std::vector<MessageExt> DefaultMQPushConsumer::filterMessagesForDelivery(
     const MessageQueue& mq, const SubscriptionData* sub, const std::vector<MessageExt>& msgs) {
-    // 投递前过滤：① 客户端二次 tag 过滤 ② FilterMessageHook（拉取 / POP 两条路径共用）。
+    // Pre-delivery filtering: (1) the client-side second tag filter, (2) FilterMessageHook (shared by the pull and POP paths).
     //
-    // ① 口径：processPullResult / processPopResult 的二次 tag 过滤——
-    //    broker 侧是按 tag 的**哈希（codeSet）**过滤的，存在哈希碰撞误放，客户端要再按
-    //    字符串核一遍。守卫 `!tagsSet.isEmpty()` 意味着订阅 "*"（SUB_ALL）时不过滤 ——
-    //    所以 FilterAPI.buildSubscriptionData 对 SUB_ALL 必须留空。
+    // (1) Contract: the second tag filter of processPullResult / processPopResult -
+    //    the broker filters by the tag hash (codeSet), so hash collisions can let wrong messages through and the client has to
+    //    verify against the tag string again. The `!tagsSet.isEmpty()` guard means no filtering when subscribed to "*"
+    //    (SUB_ALL), which is why FilterAPI::buildSubscriptionData must leave the tag set empty for SUB_ALL.
     //
-    // ② 钩子拿到的是**可变的** msgList，被摘掉的消息由调用方决定怎么处置：
-    //    拉取路径 = 静默跳过（位点照常推进，不 ack）；POP 路径 = 立刻 ack。
+    // (2) The hook receives a mutable msgList, and the caller decides what to do with the removed messages:
+    //    the pull path skips them silently (the offset advances as usual, no ack); the POP path acks them immediately.
     std::vector<MessageExt> out = msgs;
     if (out.empty()) return out;
     if (sub != nullptr && !sub->tagsSet.empty() && !sub->classFilterMode) {
@@ -1767,7 +1767,7 @@ std::vector<MessageExt> DefaultMQPushConsumer::filterMessagesForDelivery(
         context.consumerGroup = consumerGroup_;
         context.msgList = out;
         context.mq = mq;
-        // filterMessageContext.setUnitMode(consumer.isUnitMode()) —— 钩子据此判断是否单元化流量
+        // filterMessageContext.setUnitMode(consumer.isUnitMode()) - the hook uses this to tell whether the traffic is unitised
         context.unitMode = unitMode_;
         executeFilterMessageHook(context);
         out = context.msgList;
@@ -1777,10 +1777,10 @@ std::vector<MessageExt> DefaultMQPushConsumer::filterMessagesForDelivery(
 
 std::vector<MessageExt> DefaultMQPushConsumer::droppedMessages(
     const std::vector<MessageExt>& original, const std::vector<MessageExt>& kept) {
-    // 原口径用 List.contains(Object)（Object.equals = 引用同一性），msgListFilterAgain
-    // 与原 msgFoundList 共享元素引用，所以差集是精确的。C++ 里 vector 拷贝后没有同一性可用，
-    // 改用 **msgId** 求差 —— 同一批 POP 结果的 msgId 必不相同（msgId 由 storeHost+commitLogOffset
-    // 生成），语义等价且不会被"值相等"误判。
+    // The original contract used List.contains(Object) (Object.equals = reference identity), and msgListFilterAgain
+    // shared element references with the original msgFoundList, so the difference was exact. After a vector copy there is no
+    // identity left, so the difference is taken by msgId instead - msgIds within one POP result are guaranteed distinct
+    // (they derive from storeHost + commitLogOffset), which is equivalent and immune to false matches on value equality.
     if (kept.size() >= original.size()) return {};
     std::vector<std::string> keptIds;
     keptIds.reserve(kept.size());
@@ -1799,7 +1799,7 @@ std::vector<MessageExt> DefaultMQPushConsumer::droppedMessages(
 
 const char* DefaultMQPushConsumer::consumeReturnTypeOf(bool hasException, int64_t consumeRtMs,
                                                        bool failed, bool succeeded) {
-    // 判定顺序是既定合同（异常 → 超时 → 失败 → 成功），不可重排
+    // The decision order is a fixed contract (exception -> timeout -> failed -> succeeded) and must not be reordered
     if (hasException) return "EXCEPTION";
     if (consumeRtMs >= 15LL * 60 * 1000) return "TIME_OUT";
     if (failed) return "FAILED";
@@ -1827,8 +1827,8 @@ void DefaultMQPushConsumer::recordConsumeStats(const std::string& topic, int64_t
     if (failed) {
         stats.incConsumeFailedTPS(consumerGroup_, topic, msgCount);
     } else {
-        // processConsumeResult 口径：ok = ackIndex + 1，部分 ack 时
-        // 前缀记 OK、尾巴记 FAILED（否则整批算成功会低估失败量、看不出有多少条要重投）
+        // Same contract as processConsumeResult: ok = ackIndex + 1, and on a partial ack the
+        // prefix counts as OK while the tail counts as FAILED (treating the whole batch as successful understates failures and hides how many messages need redelivery)
         const int64_t ok = ackCount.has_value() ? *ackCount : msgCount;
         stats.incConsumeOKTPS(consumerGroup_, topic, ok);
         if (msgCount > ok) stats.incConsumeFailedTPS(consumerGroup_, topic, msgCount - ok);
@@ -1837,7 +1837,7 @@ void DefaultMQPushConsumer::recordConsumeStats(const std::string& topic, int64_t
 }
 
 ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
-    // consumerRunningInfo：307 的应答体。
+    // consumerRunningInfo: the response body of request code 307.
     ConsumerRunningInfo info;
     std::string namesrv;
     for (const std::string& a : nameServerAddrs_) {
@@ -1862,7 +1862,7 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
         }
         auto makePqi = [&](int64_t commitOffset, int64_t cachedMsgCount, bool droped,
                            int64_t lastPullTimestamp) {
-            // ProcessQueueInfo 全字段（协议 JSON；键名 "droped" 拼写是 broker 侧解析匹配的）
+            // Every ProcessQueueInfo field (protocol JSON; the key spelling "droped" is what the broker-side parser matches)
             JsonValue pqi = JsonValue::makeObject();
             pqi.set("commitOffset", JsonValue::makeInt(commitOffset));
             pqi.set("cachedMsgMinOffset", JsonValue::makeInt(0));
@@ -1881,13 +1881,13 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
             return pqi;
         };
         for (const auto& kv : mqMap_) {
-            // POP 模式下弹出去 popQueues_（popProcessQueueTable），classic 的
-            // processQueueTable 是空的 —— 两把表互斥，307 里也必须互斥：同一把队列
-            // 既进 mqTable 又进 mqPopTable 会让控制台把一路消费数成两路。mqMap_ 是"已分配"
-            // 注册表（自愈、位点持久化都靠它），两种模式都写，所以这里按模式过滤而不是不写。
+            // In POP mode messages land in popQueues_ (popProcessQueueTable) and the classic
+            // processQueueTable stays empty - the two tables are mutually exclusive, so they must be in 307 as well: reporting the same
+            // queue in both mqTable and mqPopTable makes the console count one consume stream as two. mqMap_ is the "allocated"
+            // registry (self-healing and offset persistence rely on it) and is written in both modes, so filter by mode here rather than skipping the write.
             if (popMode_ && popQueues_.find(kv.first) != popQueues_.end()) continue;
             const MessageQueue& mq = kv.second;
-            // fastjson2 内联对象键（键按字母序）
+            // The map key is an inline JSON object whose fields stay in alphabetical order, as the peer's parser expects
             const std::string mqKey = "{\"brokerName\":\"" + mq.brokerName + "\",\"queueId\":"
                 + std::to_string(mq.queueId) + ",\"topic\":\"" + mq.topic + "\"}";
             int64_t commit = 0;
@@ -1896,8 +1896,8 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
             int64_t cached = 0;
             auto pt = pending_.find(kv.first);
             if (pt != pending_.end()) cached = static_cast<int64_t>(pt->second.size());
-            // fillOutRunningInfo 报 lastPullTimestamp。
-            // 写死 0 等于把"这一路多久没拉了"这份停摆判据的现场证据全丢了。
+            // fillOutRunningInfo reports lastPullTimestamp.
+            // Hard-coding 0 throws away the scene evidence behind the stall test "how long has this stream not pulled anything".
             int64_t lastPull = 0;
             auto lt = lastPullAt_.find(kv.first);
             if (lt != lastPullAt_.end()) lastPull = lt->second;
@@ -1910,15 +1910,15 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
                 const MessageQueue& mq = mt->second;
                 const std::string mqKey = "{\"brokerName\":\"" + mq.brokerName + "\",\"queueId\":"
                     + std::to_string(mq.queueId) + ",\"topic\":\"" + mq.topic + "\"}";
-                // PopProcessQueue 用 lastPopTimestamp 顶替 lastPullTimestamp 判停摆
-                // （isPullExpired），这里填同一个时刻保持可比。
+                // PopProcessQueue uses lastPopTimestamp in place of lastPullTimestamp for the stall test
+                // (isPullExpired), so report the same value here to keep the two comparable.
                 info.mqPopTable.set(mqKey, makePqi(0, kv.second->waitAckCount(),
                                                    kv.second->isDropped(),
                                                    kv.second->lastPopTimestamp()));
             }
         }
     }
-    // statusTable（consumeStatus(group, topic)，minute 快照）
+    // statusTable (consumeStatus(group, topic), a minute-level snapshot)
     for (const auto& kv : subscriptionData_) {
         ConsumeStatus cs;
         if (mqClient_) cs = mqClient_->consumerStats().consumeStatus(consumerGroup_, kv.first);
@@ -1931,27 +1931,27 @@ ConsumerRunningInfo DefaultMQPushConsumer::consumerRunningInfo() {
 
 void DefaultMQPushConsumer::resetOffset(const std::string& topic,
                                         const std::map<MessageQueue, int64_t>& offsetTable) {
-    // resetOffset 口径：命中的队列 `pq.setDropped(true);
-    // pq.clear()`（在途批次作废）→ 等并发消费结束 → `updateConsumeOffset(mq, offset)` ＋
-    // `removeUnnecessaryMessageQueue`（先 persist 再 removeOffset）→ 从 processQueueTable
-    // 摘掉，rebalance 按新位点重建。
+    // Same contract as resetOffset: for every hit queue do `pq.setDropped(true);
+    // pq.clear()` (in-flight batches voided) -> wait for concurrent consumption to end -> `updateConsumeOffset(mq, offset)` plus
+    // `removeUnnecessaryMessageQueue` (persist first, then removeOffset) -> take it out of the
+    // processQueueTable, and rebalance rebuilds it at the new offset.
     //
-    // 只把新位点写进内存表的做法是**静默**失效的：重置前取回、重置后才返回的批次一 ack
-    // 就把位点推回原处，broker 上刚写下的新位点被盖掉，消费从重置前的位置继续 —— 而 222
-    // 的响应里那一组 offsetTable 看着完全正常。故这里必须走 retireQueueLocked（代号 +1
-    // 即 setDropped，顺带摘掉拉取线程/归属）。
+    // Only writing the new offset into the in-memory table fails silently: a batch fetched before the reset and acked after
+    // it pushes the offset right back, the fresh offset just written on the broker is overwritten, and consumption continues from
+    // the pre-reset position - while the offsetTable in the 222 reply still looks completely normal. So retireQueueLocked is required here
+    // (bumping the epoch is setDropped, and it also removes the pull thread and the ownership record).
     if (topic.empty() || offsetTable.empty()) return;
     std::vector<std::pair<MessageQueue, int64_t>> retired;
     {
         std::lock_guard<std::mutex> lk(lock_);
-        // 先收 key 再逐个撤：retireQueueLocked 会擦 mqMap_ 的条目
+        // Collect the keys first, then retire one by one: retireQueueLocked erases mqMap_ entries
         std::vector<std::pair<std::string, MessageQueue>> hits;
         for (const auto& kv : mqMap_) {
             if (kv.second.topic != topic) continue;
             auto it = offsetTable.find(kv.second);
             if (it == offsetTable.end()) continue;
-            // 新位点先落表：撤销会把**它**交给 onQueuesRevoked 落盘
-            //（updateConsumeOffset 之后紧接着的那次 persist）
+            // Store the new offset in the table first: the revoke hands this value to onQueuesRevoked to persist it
+            // (the persist that immediately follows updateConsumeOffset)
             consumeOffsetTable_[kv.first] = it->second;
             hits.emplace_back(kv.first, kv.second);
         }
@@ -1960,8 +1960,8 @@ void DefaultMQPushConsumer::resetOffset(const std::string& topic,
         }
     }
     if (retired.empty()) return;
-    // 原口径用 RESET_OFFSET_MAX_WAIT（10 秒）等并发消费跑完再写位点；这里缩短以免阻塞太久
-    // （220 是 oneway，broker 不等响应）。代号已让在途 ack 全部失效，不靠"等"避竞争。
+    // The original contract waited RESET_OFFSET_MAX_WAIT (10s) for concurrent consumption to drain before writing offsets; shortened here to avoid blocking long
+    // (220 is oneway, the broker awaits no response). The epoch bump already invalidates every in-flight ack, so waiting is not needed to avoid races.
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     onQueuesRevoked(retired);
     try {
@@ -1979,8 +1979,8 @@ std::map<MessageQueue, int64_t> DefaultMQPushConsumer::parseResetOffsetBody(cons
     ResetOffsetBody mapForm;
     if (ResetOffsetBody::decode(body, mapForm)) table = std::move(mapForm.offsetTable);
     if (!table.empty()) return table;
-    // 数组形状（ResetOffsetBodyForC）：map 形状解析器对数组只会得到空表，不兜底就等于
-    // 整笔重置静默丢弃。
+    // Array shape (ResetOffsetBodyForC): the map-shaped parser only yields an empty table for an array, and without this
+    // fallback the whole reset request would be discarded silently.
     ResetOffsetBodyForC forC;
     if (ResetOffsetBodyForC::decode(body, forC)) {
         for (const MessageQueueForC& e : forC.offsetTable) {
@@ -1991,8 +1991,8 @@ std::map<MessageQueue, int64_t> DefaultMQPushConsumer::parseResetOffsetBody(cons
 }
 
 std::map<MessageQueue, int64_t> DefaultMQPushConsumer::getConsumerStatus(const std::string& topic) {
-    // 221 的应答数据源 getConsumerStatus：
-    // 返回**已消费位点**表（不是拉取游标）。
+    // Data source of the 221 reply, getConsumerStatus:
+    // returns the consumed-offset table (not the pull cursor).
     std::map<MessageQueue, int64_t> out;
     std::lock_guard<std::mutex> lk(lock_);
     for (const auto& kv : mqMap_) {
@@ -2005,7 +2005,7 @@ std::map<MessageQueue, int64_t> DefaultMQPushConsumer::getConsumerStatus(const s
 
 ConsumeMessageDirectlyResult DefaultMQPushConsumer::consumeMessageDirectly(
     const MessageExt& msg, const std::string& brokerName) {
-    // consumeMessageDirectly（309 的本地真实消费）。
+    // consumeMessageDirectly (the real local consumption behind 309).
     ConsumeMessageDirectlyResult result;
     result.autoCommit = true;
     std::vector<MessageExt> msgs{msg};
@@ -2019,9 +2019,9 @@ ConsumeMessageDirectlyResult DefaultMQPushConsumer::consumeMessageDirectly(
         auto* orderly = static_cast<MessageListenerOrderly*>(messageListener_.get());
         ConsumeOrderlyContext ctx(mq);
         try {
-            // 顺序侧 consumeMessageDirectly 的映射比并发侧多两个成员
-            //（COMMIT → CR_COMMIT、ROLLBACK → CR_ROLLBACK，broker 按它们区分 binlog 口径），
-            // 且 autoCommit 取 listener 跑完**之后**的上下文值。
+            // The orderly side of consumeMessageDirectly maps two more members than the concurrent side
+            // (COMMIT -> CR_COMMIT, ROLLBACK -> CR_ROLLBACK, which the broker uses to tell the binlog contract apart),
+            // and autoCommit reads the context value after the listener has finished.
             const ConsumeOrderlyStatus status = orderly->consumeMessage(msgs, ctx);
             switch (status) {
                 case ConsumeOrderlyStatus::COMMIT:
@@ -2044,9 +2044,9 @@ ConsumeMessageDirectlyResult DefaultMQPushConsumer::consumeMessageDirectly(
             result.consumeResult = "CR_THROW_EXCEPTION";
             result.remark = "unknown exception";
         }
-        // autoCommit 读的是 listener 跑完之后的上下文值（异常路径同样读）。listener 里置
-        // false 的 binlog 用法靠这条回传让 broker 知道「这条直接消费没提交」；提前读初值
-        // 等于把它吞掉，真机上只表现为 mqadmin 返回的 autoCommit 恒为 true。
+        // autoCommit reads the context value after the listener returns (the exception path reads it too). The binlog usage that
+        // sets it false inside the listener relies on this reply to tell the broker "this direct consume did not commit"; reading the
+        // initial value early swallows it, and on a real cluster it only shows up as mqadmin always returning autoCommit=true.
         result.autoCommit = ctx.autoCommit;
     } else {
         auto* conc = static_cast<MessageListenerConcurrently*>(messageListener_.get());
@@ -2072,8 +2072,8 @@ void DefaultMQPushConsumer::startTraceDispatcher() {
     try {
         auto dispatcher = std::make_shared<AsyncTraceDispatcher>(
             consumerGroup_, TraceDispatcherType::CONSUME, traceMsgBatchNum_, traceTopic_, rpcHook_);
-        // 对齐 `traceProducer.setNamespaceV2(namespaceV2)` 口径：
-        // 轨迹的内部生产者也要带上实例命名空间，否则 broker 侧把轨迹写到别的实例下。
+        // Match the traceProducer.setNamespaceV2(namespaceV2) contract:
+        // the trace dispatcher's internal producer must carry the instance namespace too, otherwise the broker writes the trace under a different instance.
         dispatcher->setNamespaceV2(namespaceV2_);
         dispatcher->setHostConsumer(this);
         dispatcher->setHostClientId(clientId_);
@@ -2094,22 +2094,22 @@ void DefaultMQPushConsumer::startTraceDispatcher() {
 bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQueue& mq,
                                          const std::vector<MessageExt>& batch,
                                          const std::optional<uint64_t>& epoch) {
-    // 队列在本批次排队期间被丢弃（rebalance 撤走 / OFFSET_ILLEGAL 纠错 / 停摆自愈）：
-    // 这批消息不能再消费也不能 ack —— 它们属于已被丢弃的旧 ProcessQueue，直接作废。
-    // 与并发/顺序两条消费链路的 isDropped() 短路同构：**不塞回缓冲**（塞回去只会被新属主重复消费）。
+    // The queue was dropped while this batch was queued (rebalance revoke / OFFSET_ILLEGAL correction / stall self-healing):
+    // these messages can neither be consumed nor acked - they belong to the already-dropped old ProcessQueue, so void them outright.
+    // Same short-circuit as isDropped() in the concurrent and orderly consume chains: do not push them back (the new owner would consume them twice).
     if (epoch.has_value() && *epoch != queueEpoch(key)) {
         logger_warn("the message queue not be able to consume, because it's dropped. group="
                     + consumerGroup_ + " mq=" + key
                     + " msgs=" + std::to_string(batch.size()));
         return false;
     }
-    // 分发前把重投消息的 topic 还原成业务原始 topic（resetRetryAndNamespace）：
-    // broker 回投的消息实际写在 %RETRY%group，原始 topic 在 RETRY_TOPIC 属性里，不还原
-    // 用户按 topic 分支的代码会走错。
+    // Restore the original business topic of redelivered messages before dispatching (resetRetryAndNamespace):
+    // the broker writes redelivered messages into %RETRY%group and keeps the original topic in the RETRY_TOPIC property; without
+    // restoring it, user code that branches on the topic takes the wrong path.
     std::vector<MessageExt> restored = batch;
     resetRetryTopicAndNamespace(restored);
     const bool broadcast = (messageModel_ == MessageModel::BROADCASTING);
-    // ---- 顺序消费（ConsumeMessageOrderlyService 口径）----
+    // ---- Orderly consumption (same contract as ConsumeMessageOrderlyService) ----
     if (isOrderly()) {
         const bool useHook = hasConsumeMessageHook();
         ConsumeMessageContext hookCtx;
@@ -2125,21 +2125,21 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
         try {
             status = orderly->consumeMessage(restored, ctx);
         } catch (const std::exception& e) {
-            // 顺序消费异常 → 不提交 offset，原地重试
+            // An orderly consume error -> commit no offset and retry in place
             logger_debug(std::string("orderly listener error (retry in place): ") + e.what());
             status = ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT;
             hookHasException = true;
         }
         if (status == ConsumeOrderlyStatus::ROLLBACK ||
             status == ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT) {
-            // 返回「不是 OK」时打一条 warn（含抛异常归一化来的挂起）。
-            // 这条日志是顺序消费 head-of-line blocking 的唯一线索，缺了就只能看见"这个组不动了"。
+            // Log one warn whenever the result is not OK (including the suspend normalised from a thrown exception).
+            // This log is the only clue to orderly head-of-line blocking; without it one can only see "this group stopped moving".
             logger_warn("consumeMessage Orderly return not OK, Group: " + consumerGroup_
                         + " Msgs: " + std::to_string(restored.size()) + " MQ: " + key);
         }
-        // 顺序消费的钩子同样在拿到 status 后触发（orderly 服务同口径）：
-        // status 是归一化后的枚举名，success 判据是 SUCCESS||COMMIT，而 returnType
-        //（props 里的 CONSUME_CONTEXT_TYPE）按归一化前的 status 算。
+        // The orderly consume hooks fire once status is known too (same contract as the orderly service):
+        // status is the normalised enum name, success is SUCCESS||COMMIT, while returnType
+        // (CONSUME_CONTEXT_TYPE in props) is computed from the pre-normalisation status.
         if (useHook) {
             const bool ok = (status == ConsumeOrderlyStatus::SUCCESS ||
                              status == ConsumeOrderlyStatus::COMMIT);
@@ -2148,22 +2148,22 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
                               ok, consumeOrderlyStatusName(status));
         }
         if (ctx.autoCommit) {
-            // ---- processConsumeResult（autoCommit=true）----
+            // ---- processConsumeResult (autoCommit=true) ----
             if (status == ConsumeOrderlyStatus::COMMIT ||
                 status == ConsumeOrderlyStatus::ROLLBACK) {
-                // autoCommit=true 时 COMMIT/ROLLBACK 是**非法**用法（只给
-                // binlog 消费用）：这里只 warn、**不写 break**，顺势落进 SUCCESS 分支，
-                // 消息照 ack、不当回滚。
+                // With autoCommit=true, COMMIT/ROLLBACK is illegal usage (binlog consumption only):
+                // only a warn is emitted and no break is written, so control falls through to the SUCCESS
+                // branch - the messages are acked and the rollback request is ignored.
                 logger_warn("the message queue consume result is illegal, we think you want to "
                             "ack these message " + key);
                 status = ConsumeOrderlyStatus::SUCCESS;
             }
             if (status == ConsumeOrderlyStatus::SUSPEND_CURRENT_QUEUE_A_MOMENT) {
                 recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs, true);
-                // 挂起之前要先过 checkReconsumeTimes：只有「还在重试次数内 /
-                // 回投失败」才把这一批塞回队首原地重试；已经交给 broker 的（回投成功）要前进
-                // 位点，否则一条毒消息永久占住这条队列（head-of-line blocking 在真机上就是
-                // "这个组停在第 N 条不动"）。
+                // Before suspending, run checkReconsumeTimes: only while inside the retry budget /
+                // when the redelivery failed does this batch go back to the head and retry in place; a batch already
+                // handed to the broker (redelivery succeeded) must advance the offset, otherwise one poison message blocks
+                // this queue forever (head-of-line blocking on a real cluster looks like "this group stops at message N").
                 if (checkOrderlyReconsumeTimes(restored)) {
                     requeuePending(key, restored);
                     std::this_thread::sleep_for(
@@ -2177,16 +2177,16 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
             consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
             return true;
         }
-        // ---- autoCommit=false（binlog 消费场景：提交权在 listener 手里）----
+        // ---- autoCommit=false (binlog consumption: the commit decision belongs to the listener) ----
         if (status == ConsumeOrderlyStatus::COMMIT) {
-            // 显式提交：位点前进，**不记 TPS**（RT 在分支外照记）
+            // Explicit commit: the offset advances but no TPS is recorded (RT is still recorded outside the branch)
             recordConsumeRt(mq.topic, hookBeginMs);
             advanceConsumeOffset(key, restored, std::nullopt, epoch);
             consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
             return true;
         }
         if (status == ConsumeOrderlyStatus::ROLLBACK) {
-            // rollback() 把消息退回 ProcessQueue 并延后重试
+            // rollback() returns the messages to the ProcessQueue and delays the retry
             recordConsumeRt(mq.topic, hookBeginMs);
             requeuePending(key, restored);
             std::this_thread::sleep_for(std::chrono::milliseconds(orderlySuspendMillis(ctx)));
@@ -2198,24 +2198,24 @@ bool DefaultMQPushConsumer::consumeBatch(const std::string& key, const MessageQu
                 requeuePending(key, restored);
                 std::this_thread::sleep_for(std::chrono::milliseconds(orderlySuspendMillis(ctx)));
             }
-            // 与自动提交分支的差别：毒消息交给 broker 之后**不 commit**，
-            // 位点前不前进由 binlog 消费方自己拿主意。
+            // Difference from the auto-commit branch: once the poison message is handed to the broker nothing is committed,
+            // and whether the offset advances is left to the binlog consumer to decide.
             return false;
         }
-        // SUCCESS + autoCommit=false：原口径只记 OK TPS、不提交，把消息
-        // 留在 ProcessQueue.consumingMsgOrderlyTreeMap 里等显式 commit()；本端口没有把
-        // ProcessQueue 暴露给 listener（没有 commit 的口子），照做「什么都不做」会让这批消息
-        // 被分发线程吞掉而位点又没动。这里等价地塞回队首并等一个挂起周期：位点同样不前进、
-        // 消息不丢，也不会把消费线程变成忙等（不 sleep 的话下一轮立刻又拿到同一批）。
+        // SUCCESS + autoCommit=false: the original contract only records OK TPS and commits nothing, leaving the
+        // messages in ProcessQueue.consumingMsgOrderlyTreeMap awaiting an explicit commit(); here the ProcessQueue is not
+        // exposed to the listener (there is no commit entry point), so copying "do nothing" would let the dispatch thread
+        // swallow this batch while the offset never moves. Equivalent behaviour here: push back to the head and wait one suspend
+        // period - the offset still does not advance, no message is lost, and the thread is not turned into a busy loop.
         recordConsumeStats(mq.topic, static_cast<int64_t>(restored.size()), hookBeginMs, false);
         requeuePending(key, restored);
         std::this_thread::sleep_for(std::chrono::milliseconds(orderlySuspendMillis(ctx)));
         return false;
     }
-    // ---- 并发消费（ConsumeMessageConcurrentlyService 的 ConsumeRequest.run）----
-    // 「登记在途 → 消费 → 注销在途」用 RAII 围起来：并发分支一堆 return（整批认可、
-    // 广播丢弃、回投失败……），手工注销漏一条，登记表就永远摘不干净，位点还会被
-    // correctTagsOffset 的在途闸门永久挡停。
+    // ---- Concurrent consumption (ConsumeRequest.run of ConsumeMessageConcurrentlyService) ----
+    // "register in-flight -> consume -> deregister in-flight" is wrapped in RAII: the concurrent branch has many returns
+    // (whole batch accepted, broadcast discard, redelivery failed ...). Missing one manual deregistration leaves the registry
+    // dirty forever, and correctTagsOffset's in-flight gate would then block the offset permanently.
     struct InflightGuard {
         DefaultMQPushConsumer* self;
         const std::string* guardKey;
@@ -2231,15 +2231,15 @@ bool DefaultMQPushConsumer::consumeConcurrentBatch(const std::string& key, const
     const bool useHook = hasConsumeMessageHook();
     ConsumeMessageContext hookCtx;
     if (useHook) {
-        // 钩子顺序固定：before 在 listener **之前**（生成 SubBefore），
-        // after 在拿到 status 之后（生成 SubAfter，带 contextCode）
+        // Fixed hook order: before runs ahead of the listener (produces SubBefore),
+        // after runs once status is known (produces SubAfter, carrying the contextCode)
         hookCtx = buildConsumeHookContext(restored, mq);
         executeConsumeHookBefore(hookCtx);
     }
-    // 交给 listener **之前**逐条盖 CONSUME_START_TIME，每次投递（含重试）
-    // 重新盖；cleanExpiredMsg 的挂起逃生口靠它判「这条在手里挂了多久」。登记紧随盖章：
-    // 本端口的批次是 MessageExt **值拷贝**（不是共享引用），登记早了表里躺的
-    // 就是未盖章的副本，清扫永远看不见它们。
+    // Stamp CONSUME_START_TIME on each message before handing them to the listener, re-stamped on every
+    // delivery (retries included); cleanExpiredMsg's suspend escape uses it to judge how long a message has been held. Registration
+    // follows the stamping: batches here are MessageExt value
+    // copies (not shared references), so registering early would leave un-stamped copies in the table that the sweep never sees.
     const int64_t stampNow = UtilAll::currentTimeMillis();
     for (MessageExt& m : restored) {
         m.putProperty(MessageConst::PROPERTY_CONSUME_START_TIMESTAMP, std::to_string(stampNow));
@@ -2253,14 +2253,14 @@ bool DefaultMQPushConsumer::consumeConcurrentBatch(const std::string& key, const
     try {
         status = conc->consumeMessage(restored, ctx);
     } catch (const std::exception& e) {
-        // 消费抛异常按 RECONSUME_LATER 处理
+        // A consume exception is treated as RECONSUME_LATER
         logger_debug(std::string("listener error, treat as RECONSUME_LATER: ") + e.what());
         status = ConsumeConcurrentlyStatus::RECONSUME_LATER;
         hookHasException = true;
     }
-    // processConsumeResult：CONSUME_SUCCESS 用 listener 设的 ackIndex
-    // 划分「已认可前缀 / 待回投后缀」（默认 Integer.MAX_VALUE，钳到 size-1 即整批认可）；
-    // RECONSUME_LATER 强制 ackIndex=-1，整批回投。
+    // processConsumeResult: CONSUME_SUCCESS uses the ackIndex set by the listener
+    // to split "accepted prefix / tail to send back" (default Integer.MAX_VALUE; clamping to size-1 means the whole batch is accepted);
+    // RECONSUME_LATER forces ackIndex=-1 and sends the whole batch back.
     const auto size32 = static_cast<int32_t>(restored.size());
     int32_t ackIndex = ctx.ackIndex;
     if (status == ConsumeConcurrentlyStatus::CONSUME_SUCCESS) {
@@ -2280,8 +2280,8 @@ bool DefaultMQPushConsumer::consumeConcurrentBatch(const std::string& key, const
                           ok ? "CONSUME_SUCCESS" : "RECONSUME_LATER");
     }
     if (broadcast) {
-        // 广播模式不回投：未认可的尾巴只打一条 warn 就丢掉，
-        // 整批位点照样前进（重启后不重投）
+        // Broadcasting mode sends nothing back: the unaccepted tail only gets one warn and is dropped,
+        // and the offset still advances for the whole batch (no redelivery after a restart)
         const size_t dropped = restored.size() - acked;
         if (dropped > 0) {
             logger_warn("BROADCASTING, the message consume failed, drop it: "
@@ -2292,13 +2292,13 @@ bool DefaultMQPushConsumer::consumeConcurrentBatch(const std::string& key, const
         return true;
     }
     if (acked >= restored.size()) {
-        // 整批认可（默认路径）：一条都不用回投，位点直接前进
+        // Whole batch accepted (the default path): nothing needs to be sent back, so the offset advances directly
         advanceConsumeOffset(key, restored, std::nullopt, epoch);
         consumedCount_.fetch_add(static_cast<int64_t>(restored.size()));
         return true;
     }
-    // 集群模式：未认可的 [acked, size) 逐条回投 %RETRY%topic
-    //（延迟梯度 3+reconsumeTimes，超限由 broker 转 %DLQ%）
+    // Clustering: every unaccepted message in [acked, size) is sent back one by one to %RETRY%topic
+    // (delay ladder 3+reconsumeTimes; past the limit the broker moves it to %DLQ%)
     const std::vector<std::pair<size_t, MessageExt>> msgBackFailed =
         sendBackBatch(key, restored, ctx, acked);
     std::set<size_t> failedIdx;
@@ -2312,7 +2312,7 @@ bool DefaultMQPushConsumer::consumeConcurrentBatch(const std::string& key, const
             hasFloor = true;
         }
     }
-    // 回投失败的那几条塞回队首稍后重试（ProcessQueue 里不摘掉它们）
+    // The messages whose send-back failed go back to the head and retry later (they are not removed from the ProcessQueue)
     if (!msgBackFailed.empty()) {
         std::lock_guard<std::mutex> lk(lock_);
         auto it = pending_.find(key);
@@ -2323,8 +2323,8 @@ bool DefaultMQPushConsumer::consumeConcurrentBatch(const std::string& key, const
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    // 提交的是「本批已处理条目里最大的 queueOffset + 1」，且不能越过
-    // 回投失败、仍留在缓冲里的那几条，否则那几条会被位点静默跳过（丢消息）
+    // What gets committed is "the largest queueOffset among this batch's handled entries + 1", and it must not step over
+    // the send-back failures still left in the buffer, otherwise those would be silently skipped by the offset (message loss)
     std::vector<MessageExt> handled;
     handled.reserve(restored.size() - failedIdx.size());
     for (size_t i = 0; i < restored.size(); i++) {
@@ -2344,9 +2344,9 @@ std::vector<std::pair<size_t, MessageExt>> DefaultMQPushConsumer::sendBackBatch(
     std::vector<std::pair<size_t, MessageExt>> failed;
     for (size_t i = base; i < batch.size(); i++) {
         const MessageExt& msg = batch[i];
-        // 回投前先 containsMessage：listener 挂着
-        // 期间被 cleanExpiredMsg 清扫回投（并摘除）的消息，listener 事后返回
-        // RECONSUME_LATER 时**不能再回投一次**，否则同一个位点会被投两次。
+        // containsMessage first: a message swept and sent back (and removed) by cleanExpiredMsg while the listener was
+        // still running must not be sent back a second time when that listener later returns
+        // RECONSUME_LATER, otherwise the same offset would be delivered twice.
         if (!processQueueContains(key, msg)) {
             logger_info("Message is not found in its process queue; skip send-back-procedure"
                         ", topic=" + msg.topic + ", brokerName=" + msg.brokerName
@@ -2354,18 +2354,18 @@ std::vector<std::pair<size_t, MessageExt>> DefaultMQPushConsumer::sendBackBatch(
                         + ", queueOffset=" + std::to_string(msg.queueOffset));
             continue;
         }
-        // delayLevelWhenNextConsume == 0 → 3 + reconsumeTimes
-        //（reconsumeTimes 在 MessageExt 线上格式第 13 字段，broker 重投时 +1）
+        // delayLevelWhenNextConsume == 0 -> 3 + reconsumeTimes
+        // (reconsumeTimes is field 13 of the MessageExt wire format; the broker increments it on redelivery)
         int32_t delayLevel = ctx.delayLevelWhenNextConsume;
         if (delayLevel == 0) {
             delayLevel = 3 + msg.getReconsumeTimes();
         }
-        // ⚠ sendMessageBack 自己吞掉所有异常、用返回值表成败；只看异常等于把
-        // 「回投失败」当成「回投成功」，位点会越过这条静默丢消息。
+        // sendMessageBack swallows every exception itself and reports success through its return value; watching only for
+        // exceptions would read "send-back failed" as "send-back succeeded", and the offset would pass this message over silently.
         if (!sendMessageBack(msg, delayLevel)) {
             logger_debug("send message back failed for msg " + msg.msgId);
             MessageExt retried = msg;
-            // 次数加在**要被重新消费的副本**上，broker 没记成功
+            // The count is bumped on the copy that will be consumed again; the broker recorded no success
             retried.setReconsumeTimes(retried.getReconsumeTimes() + 1);
             failed.emplace_back(i, retried);
         }
@@ -2378,7 +2378,7 @@ void DefaultMQPushConsumer::advanceConsumeOffset(const std::string& key,
                                                  const std::optional<int64_t>& floor,
                                                  const std::optional<uint64_t>& epoch) {
     if (batch.empty()) {
-        // 整批回投都失败时没有任何条目被认可，位点原地不动
+        // When every message of the batch failed to be sent back, nothing was accepted and the offset stays put
         return;
     }
     int64_t nextOffset = 0;
@@ -2391,16 +2391,16 @@ void DefaultMQPushConsumer::advanceConsumeOffset(const std::string& key,
         nextOffset = *floor;
     }
     std::lock_guard<std::mutex> lk(lock_);
-    // 代号不一致 ⇒ 这批消息属于已被撤销/重建的旧 ProcessQueue，ack 整批作废
-    //（!processQueue.isDropped() 闸门）。
-    // 少了它，旧批次的 ack 会把 broker 刚纠正过的位点又推回非法值，客户端与 broker
-    // 之间来回弹跳。
+    // An epoch mismatch means this batch belongs to a revoked/rebuilt old ProcessQueue, so the whole ack is voided
+    // (the !processQueue.isDropped() gate).
+    // Without it the stale batch's ack would push the offset the broker just corrected back to an illegal value,
+    // bouncing back and forth between client and broker.
     if (epoch.has_value() && *epoch != queueEpochLocked(key)) {
         logger_debug("drop ack for " + key + ": process queue was dropped");
         return;
     }
-    // 被 OFFSET_ILLEGAL 纠错冻结（ControllableOffset allowToUpdate=false）：
-    // 直到队列按修正位点重建前，ack 一律不许再改它。
+    // Frozen by the OFFSET_ILLEGAL correction (ControllableOffset with allowToUpdate=false):
+    // no ack may change it until the queue is rebuilt at the corrected offset.
     if (frozenOffsets_.count(key) > 0) {
         return;
     }
@@ -2410,31 +2410,31 @@ void DefaultMQPushConsumer::advanceConsumeOffset(const std::string& key,
     }
 }
 
-// correctTagsOffset（拉取回调里的空应答修正）。须持 lock_。
+// correctTagsOffset (the empty-response correction in the pull callback). lock_ must be held.
 //
-// 拉取应答是 NO_NEW_MSG（队列里真没消息）或 NO_MATCHED_MSG（broker 侧按订阅表达式过完
-// 一轮、一条都没匹配上，见 MQClientAPIImpl:1095-1097 把 PULL_RETRY_IMMEDIATELY 映射成
-// 它）时，这条队列的"已消费位点"必须跟着拉取游标走，否则会**永久卡死**：没人 ack 的消息
-// 不属于任何人（broker 侧被过滤掉的不在应答里，客户端二次 tag 过滤摘掉的又明确不 ack），
-// 位点不动就永远停在原地，重投/重启后再把这批没人要的消息从头扫一遍。
+// When the pull response is NO_NEW_MSG (the queue really holds nothing) or NO_MATCHED_MSG (the broker applied the
+// subscription expression over the window and matched not a single message; PULL_RETRY_IMMEDIATELY maps to
+// it), this queue's "consumed offset" must follow the pull cursor or it sticks forever: messages nobody acked
+// belong to nobody (broker-side filtered ones are absent from the response, and entries removed by the client's second tag
+// filter are explicitly not acked), so a frozen offset never moves and redelivery/restart rescans that unwanted batch from the start.
 //
-// 更新走 offsetStore.updateOffset(mq, nextOffset, increaseOnly=true)（只前进不回退），
-// 且有一道闸：0L == processQueue.getMsgCount()。msgCount 数的是**仍在 ProcessQueue 里**的
-// 消息 —— 并发消费的 removeMessage 要等 listener 返回之后才调
-//（ConsumeMessageConcurrentlyService:266），所以在途批次也算数；不等它落定就抬位点，
-// 进程崩溃时这批消息会被静默跳过。本端口把 pending_ 为空与 inflightCount_ 为 0 合成同一
-// 判据，后者的登记与"取走批次"在 dispatchLoop 的同一把锁里完成（见 takeBatchLocked）。
+// The update goes through offsetStore.updateOffset(mq, nextOffset, increaseOnly=true) (forward only, never backwards),
+// behind one gate: 0L == processQueue.getMsgCount(). msgCount counts the messages still inside the ProcessQueue -
+// concurrent consumption calls removeMessage only after the listener returns,
+// so in-flight batches count as well; raising the offset before they settle means a process crash silently skips those messages.
+// The emptiness of pending_ and inflightCount_ == 0 are combined here into one
+// test, and the in-flight registration happens in the same dispatchLoop lock as "take the batch" (see takeBatchLocked).
 //
-// 有意把状态判据也收进本函数（原本散在回调的 switch 里），这样离线
-// 单测一次就能锁死「哪些状态要修正 + 何时允许修正」两件事。
+// The status test is deliberately folded into this function too (it used to be spread over the callback's switch), so an
+// offline unit test can pin down both "which statuses need correcting" and "when a correction is allowed".
 void DefaultMQPushConsumer::correctTagsOffsetLocked(const std::string& key, PullStatus status,
                                                     int64_t nextOffset) {
     if (status != PullStatus::NO_NEW_MSG && status != PullStatus::NO_MATCHED_MSG) {
         return;
     }
     if (frozenOffsets_.count(key) > 0) {
-        // 位点已被 OFFSET_ILLEGAL 纠错冻结（ControllableOffset.update 在
-        // allowToUpdate=false 时直接丢弃更新），这条路径同样不许改
+        // The offset is frozen by the OFFSET_ILLEGAL correction (ControllableOffset.update drops the update
+        // outright when allowToUpdate=false), so this path must not change it either
         return;
     }
     auto pendingIt = pending_.find(key);
@@ -2471,8 +2471,8 @@ std::vector<MessageExt> DefaultMQPushConsumer::takeBatchLocked(const std::string
         batch.push_back(it->second.front());
         it->second.pop_front();
     }
-    // 与"取走批次"同一临界区登记在途：correctTagsOffsetLocked 的闸门靠它区分
-    // "消息还在缓冲里"和"消息在 listener 手里"——两个都不算空。
+    // Register in-flight in the same critical section as taking the batch: correctTagsOffsetLocked's gate uses it to tell
+    // "messages still in the buffer" from "messages in the listener's hands" - neither one counts as empty.
     ++inflightCount_[key];
     return batch;
 }
@@ -2490,8 +2490,8 @@ void DefaultMQPushConsumer::finishBatchLocked(const std::string& key) {
 std::vector<MessageExt> DefaultMQPushConsumer::takeBatchForConsume(const std::string& key,
                                                                   uint64_t* epochOut) {
     std::lock_guard<std::mutex> lk(lock_);
-    // 代号与批次必须同一临界区读走：分开读会出现「先取批次、后读代号」的窗口，
-    // 期间队列被撤走重建的话，旧批次会被贴上**新**代号，ack 反而被放行。
+    // The epoch and the batch must be read in the same critical section: reading them separately opens a "take the batch, then read the epoch" window,
+    // and if the queue is revoked and rebuilt in between, the old batch gets stamped with the new epoch and its ack is wrongly allowed through.
     if (epochOut != nullptr) {
         *epochOut = queueEpochLocked(key);
     }
@@ -2503,15 +2503,15 @@ void DefaultMQPushConsumer::finishBatchConsume(const std::string& key) {
     finishBatchLocked(key);
 }
 
-// ---------------------------------------------------------------- 位点持久化
+// ---------------------------------------------------------------- Offset persistence
 void DefaultMQPushConsumer::offsetPersistLoop() {
-    // 调度口径：
+    // Scheduling contract:
     //   scheduleAtFixedRate(persistAllConsumerOffset, 1000 * 10, persistConsumerOffsetInterval)
-    // ——首个任务延迟 10s，之后周期取 clientConfig.persistConsumerOffsetInterval（默认 5s）；
-    // 首笔落盘发生在 initialDelay **这一刻**，不是 initialDelay + 一个周期后（旧写法要 15s）。
-    // 周期是**固定速率**：每跳锚定在 10s + n×周期（见 schedule_util.h），不会像"干完再按
-    // 100ms 切片睡一个周期"那样被每段多出来的几毫秒越拖越长。
-    // 周期只在启动时读一次，运行期改字段不改变已排定的节奏。
+    // - the first task is delayed 10s, then the period comes from clientConfig.persistConsumerOffsetInterval (5s by default);
+    // the first flush happens exactly at initialDelay, not at initialDelay + one period (the old form took 15s).
+    // The rate is fixed: every tick is anchored at 10s + n x period (see schedule_util.h), so it does not drift
+    // longer and longer the way "finish the work, then sleep one period sliced into 100ms chunks" would.
+    // The period is read once at startup; changing the field at runtime does not alter the already scheduled cadence.
     auto next = std::chrono::steady_clock::now() + std::chrono::seconds(10);
     while (!stop_.load()) {
         if (!started_.load()) return;
@@ -2551,7 +2551,7 @@ void DefaultMQPushConsumer::persistOffsetsOnce() {
 }
 
 std::string DefaultMQPushConsumer::localOffsetPath() const {
-    // 本地位点文件路径（LocalFileOffsetStore 约定）：$HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
+    // Local offset file path (the LocalFileOffsetStore convention): $HOME/.rocketmq_offsets/<clientId>/<group>/offsets.json
     std::string base = UtilAll::userHome();
     if (base.empty()) base = ".";
     return base + "/.rocketmq_offsets/" + (clientId_.empty() ? "DEFAULT" : clientId_)
@@ -2559,8 +2559,8 @@ std::string DefaultMQPushConsumer::localOffsetPath() const {
 }
 
 namespace {
-// 「对象作 JSON key」扫描器的底层件（无 regex 依赖，手写扫描，容忍 fastjson2
-// pretty 版的换行缩进）。文件内容是外部输入，任何结构不对都判整体失败。
+// Low-level pieces of the "object as JSON key" scanner (no regex dependency, hand-written scan, tolerant of the
+// pretty-printed variant's newlines and indentation). File content is external input: any structural error fails the whole parse.
 
 void offsetScanSkipWs(const std::string& s, size_t& pos) {
     while (pos < s.size()
@@ -2619,7 +2619,7 @@ bool offsetScanString(const std::string& s, size_t& pos, std::string& out) {
                     cp = cp * 16 + d;
                 }
                 pos += 4;
-                // 位点文件里是 topic/broker 名，BMP 内按 UTF-8 编出即可
+                // The offset file only holds topic/broker names, so encoding BMP code points as UTF-8 is enough
                 if (cp < 0x80) {
                     out += static_cast<char>(cp);
                 } else if (cp < 0x800) {
@@ -2654,9 +2654,9 @@ bool offsetScanInt(const std::string& s, size_t& pos, int64_t& out) {
 std::string DefaultMQPushConsumer::buildLocalOffsetsJson(
     const std::map<std::string, int64_t>& items,
     const std::map<std::string, MessageQueue>& mqMap) {
-    // 落盘格式（与其他客户端写的文件互认，实测兼容）：
+    // On-disk format (mutually readable with files written by other clients, verified compatible in practice):
     // {"offsetTable":{{"brokerName":"broker-a","queueId":1,"topic":"Tt"}:9,...}}
-    // —— MessageQueue 对象直接当 JSON key。没有队列信息的条目跳过（persistAll 同款）。
+    // - the MessageQueue object is used directly as the JSON key; entries without queue info are skipped (same as persistAll).
     std::string s = "{\"offsetTable\":{";
     bool first = true;
     for (const auto& kv : items) {
@@ -2675,8 +2675,8 @@ std::string DefaultMQPushConsumer::buildLocalOffsetsJson(
 
 std::optional<std::map<std::string, int64_t>> DefaultMQPushConsumer::parseLocalOffsetsText(
     const std::string& text) {
-    // 先按严格 JSON 解析（旧版本写过的扁平 map）；「对象作 key」
-    // 格式对严格解析必然失败（含 pretty 版），落进下面的扫描器。
+    // Try strict JSON first (the flat map older versions used to write); the "object as key"
+    // format always fails strict parsing (the pretty variant included), so it falls through to the scanner below.
     size_t b = text.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) return std::nullopt;
     size_t e = text.find_last_not_of(" \t\r\n");
@@ -2751,7 +2751,7 @@ std::optional<std::map<std::string, int64_t>> DefaultMQPushConsumer::parseLocalO
         if (offsetScanEat(trimmed, pos, '}')) break;
         return std::nullopt;
     }
-    // 表收尾后还有 wrapper 本身的 }（{"offsetTable":{...}} 两层括号）
+    // After the table closes there is still the wrapper's own } ({"offsetTable":{...}} has two brace levels)
     if (!offsetScanEat(trimmed, pos, '}')) return std::nullopt;
     offsetScanSkipWs(trimmed, pos);
     if (pos != trimmed.size()) return std::nullopt;
@@ -2764,7 +2764,7 @@ void DefaultMQPushConsumer::saveLocalOffsetsAt(const std::string& path,
     std::string dir = path.substr(0, path.find_last_of('/'));
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    // string2File 口径：旧内容先滚到 .bak 再写新文件
+    // Offset-file writer contract: the previous content rolls into .bak before the new file is written
     std::ifstream prevIn(path);
     if (prevIn.is_open()) {
         std::string prev((std::istreambuf_iterator<char>(prevIn)),
@@ -2775,7 +2775,7 @@ void DefaultMQPushConsumer::saveLocalOffsetsAt(const std::string& path,
             if (bak.is_open()) bak << prev;
         }
     }
-    // 先写 .tmp 再原子改名，避免半截文件（string2File 同款）
+    // Write .tmp first, then rename atomically, so a half-written file never appears (same writer contract)
     std::string tmp = path + ".tmp";
     {
         std::ofstream f(tmp, std::ios::trunc);
@@ -2785,7 +2785,7 @@ void DefaultMQPushConsumer::saveLocalOffsetsAt(const std::string& path,
 }
 
 std::map<std::string, int64_t> DefaultMQPushConsumer::loadLocalOffsetsAt(const std::string& path) {
-    // 主文件缺失/损坏时回退 .bak（readLocalOffset → readLocalOffsetBak）
+    // Fall back to .bak when the main file is missing or unparseable
     for (const std::string& candidate : {path, path + ".bak"}) {
         std::ifstream f(candidate);
         if (!f.is_open()) continue;
@@ -2817,12 +2817,12 @@ void DefaultMQPushConsumer::saveLocalOffsets(
         mqMap = mqMap_;
     }
     for (const auto& kv : extra) {
-        // 没有位点（撤销时表里就没有，本端口用 -1 表达 null）：不凭空造条目
+        // No offset at all (absent from the table at revoke time, expressed here as -1): do not invent an entry
         if (kv.second < 0) continue;
         const std::string key = offsetKey(kv.first);
         items[key] = kv.second;
-        // 队列信息也要补上：buildLocalOffsetsJson 在 mqMap 里查不到队列就**跳过**该条目，
-        // 只并位点等于没并。
+        // The queue descriptor must be merged too: buildLocalOffsetsJson silently skips an entry whose queue key
+        // is missing from mqMap_, so merging only the offsets would drop exactly the ones being rescued.
         mqMap.emplace(key, kv.first);
     }
     saveLocalOffsetsAt(localOffsetPath(), items, mqMap);
@@ -2832,18 +2832,18 @@ std::map<std::string, int64_t> DefaultMQPushConsumer::loadLocalOffsets() const {
     return loadLocalOffsetsAt(localOffsetPath());
 }
 
-// ---------------------------------------------------------------- 顺序消费队列锁
+// ---------------------------------------------------------------- Orderly consume queue locks
 void DefaultMQPushConsumer::lockLoop() {
     if (!isOrderly() || messageModel_ == MessageModel::BROADCASTING) {
         return;
     }
-    // lockMQ：每 20s 批量锁分到的队列；
-    // 启动时立刻尝试一次，避免首个 20s 空转
+    // lockMQ: batch-lock the assigned queues every 20s;
+    // the first attempt runs immediately at start so the first 20s is not spent idle
     while (!stop_.load()) {
-        // POP 顺序服务同样跑这个 20s
-        // 定时器，但 lockAll() 只遍历 processQueueTable（classic 拉取表）—— POP 模式下
-        // 队列登记在 popProcessQueueTable，这张表是空的 ⇒ 定时器在转、一次网络都不发。
-        // 按同一口径：POP 模式只保留定时器，不发 LOCK_BATCH_MQ。
+        // The POP orderly service runs this same 20s
+        // timer too, but the batch lock only walks the classic pull queue table - in POP mode the queues
+        // are registered in the POP table and that one stays empty, so the timer turns without ever sending.
+        // Same contract here: POP mode keeps the timer and sends no LOCK_BATCH_MQ.
         if (!popMode_) {
             try {
                 std::vector<MessageQueue> mqs = assignedQueues();
@@ -2863,8 +2863,8 @@ void DefaultMQPushConsumer::lockLoop() {
                 logger_debug(std::string("lock mq error: ") + e.what());
             }
         }
-        // 等待 20s（期间响应 stop）。按绝对 deadline 分段睡：100ms 的系统 sleep 实测多几毫秒，
-        // 200 段会把 20s 轮次拖长；对着 deadline 算就不累积。
+        // Wait 20s (responsive to stop meanwhile). Sleep in chunks measured against an absolute deadline:
+        // a 100ms system sleep runs a few ms long, so 200 chunks stretch the round; per-chunk deltas do not add up.
         sleepUntilDeadline(stop_, std::chrono::steady_clock::now() + std::chrono::seconds(20));
     }
 }
@@ -2886,35 +2886,35 @@ std::vector<MessageExt> DefaultMQPushConsumer::pendingMessages(const std::string
     return std::vector<MessageExt>(it->second.begin(), it->second.end());
 }
 
-// ---------------------------------------------------------------- cleanExpiredMsg
+// ---------------------------------------------------------------- Expired message cleanup
 //
-// cleanExpiredMsg 的完整口径：CleanExpireMsgScheduledThread_<group> 单线程调度
- //（scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)，
- // initialDelay 与 period 同值）＋遍历 processQueueTable 逐队列清扫
- //＋ProcessQueue.cleanExpiredMsg 的逐句实现。
+// Full contract of the expired-message sweep: one dedicated scheduler thread per group,
+ // fixed-rate with initial delay == period == consumeTimeout minutes, walking the process queues
+ // one at a time; the per-queue body below mirrors that loop statement for statement
+ // (see cleanExpiredQueue).
 //
-// 这是"listener 卡死不返回"时唯一的回收路径：把在手里超过 consumeTimeout 分钟的消息发回
-// broker（delayLevel 固定 3），由 %RETRY% 重新投递。少了它，一条卡住的消息让该队列位点
-// 永久停在原地，且没有任何异常、日志或超时可见。语义三件套（错一个方向都是静默故障）：
-// 只看队首（最小位点）、单条判据**严格大于** consumeTimeout、每轮最多 16 条。
+// The only reclamation path when a listener hangs and never returns: messages held longer
+// than consumeTimeout minutes are sent back to the broker (delayLevel 3) for %RETRY% redelivery;
+// without it one stuck message pins the queue offset forever, invisible to logs and timeouts.
+// Three rules, each wrong direction a silent failure: head only, strictly greater, max 16 a round.
 bool DefaultMQPushConsumer::isConsumeExpired(const MessageExt& msg, int32_t consumeTimeoutMinutes,
                                              int64_t nowMs) {
     const std::string stamp = msg.getProperty(MessageConst::PROPERTY_CONSUME_START_TIMESTAMP);
     if (stamp.empty()) {
-        // 没盖过章（还没进过 listener 的缓冲消息）不算过期。
-        // 这一条同时把"还没被消费过的积压"整个挡在清扫之外。
+        // Never stamped (a buffered message that has not entered a listener yet) does not count as expired.
+        // This clause also keeps the whole "backlog nobody has consumed yet" outside the sweep.
         return false;
     }
-    // 过期判据是**严格大于**（等于阈值不动手）。std::stoll 对非数字抛 invalid_argument，
-    // 与 NumberFormatException 同路：由 cleanExpiredMsgLoop 的调度壳子接住并
-    // log.error，不在这里吞掉（吞掉就变成"整个队列静默不再清扫"）。
+    // The expiry test is STRICTLY greater than the threshold (no action when exactly equal). std::stoll
+    // throws invalid_argument on a non-numeric stamp, taking the same road as a parse failure:
+    // cleanExpiredMsgLoop's scheduling shell catches it and logs - swallowing it here would silence the sweep.
     return nowMs - std::stoll(stamp) > static_cast<int64_t>(consumeTimeoutMinutes) * 60 * 1000;
 }
 
 int64_t DefaultMQPushConsumer::cleanExpirePeriodMillis(int32_t consumeTimeoutMinutes) {
-    // initialDelay 与 period 同源，都是 consumeTimeout 分钟（默认 15 → 900000ms）。
-    // max(1,·) 兜底：setConsumeTimeout 不做校验，配成 0 会让调度变成每 0 分钟
-    // 空转（真跟着跑就是忙等），这里按 1 分钟下限处理。
+    // initialDelay and period share one source: consumeTimeout minutes (default 15 -> 900000ms).
+    // The max(1, .) fallback is defensive: setConsumeTimeout does not validate, and 0 would turn the
+    // schedule into a fire every 0 minutes (a busy wait if it really ran), so 1 minute is the floor.
     return static_cast<int64_t>(std::max(1, consumeTimeoutMinutes)) * 60 * 1000;
 }
 
@@ -2933,9 +2933,9 @@ void DefaultMQPushConsumer::registerInflight(const std::string& key,
 
 void DefaultMQPushConsumer::deregisterInflight(const std::string& key,
                                                const std::vector<MessageExt>& msgs) {
-    // 只摘「在途」这一边（缓冲里可能有一份"回投失败塞回队首"的同位点副本，它得留着）。
-    // 按 queueOffset 摘除：本端口的批次是拷贝，没有对象身份可用；而 msgTreeMap
-    // 本来就是 offset → msg 的映射，同一条消息在表里只可能有一份。
+    // Remove only on the in-flight side (the buffer may hold a same-offset copy pushed back after a failed send-back, and that one must stay).
+    // Removal keys on queueOffset: batches here are copies with no object identity to use, and the
+    // process queue is an offset -> msg mapping anyway, so one message can only appear once on the table.
     std::lock_guard<std::mutex> lk(lock_);
     auto it = inflightMsgs_.find(key);
     if (it == inflightMsgs_.end()) return;
@@ -2952,9 +2952,9 @@ void DefaultMQPushConsumer::deregisterInflight(const std::string& key,
 
 std::vector<MessageExt> DefaultMQPushConsumer::processQueueEntriesLocked(
     const std::string& key) const {
-    // pending_（已拉未分发）∪ inflightMsgs_（已分发未落定）= msgTreeMap 的完整视图。
-    // 两边都在同一把 lock_ 内成对维护，同一条消息在同一瞬间只可能在一边；按 queueOffset
-    // 再去一次重只为防御未来新调用点写出重叠。
+    // pending_ (pulled but not dispatched) union inflightMsgs_ (dispatched but not settled) = the complete process-queue view.
+    // Both sides are maintained in pairs inside the same lock_, so a message can only live on one side at any
+    // instant; de-duplicating by queueOffset again is only defence against future call sites producing overlaps.
     std::vector<MessageExt> out;
     std::set<int64_t> seen;
     auto iit = inflightMsgs_.find(key);
@@ -2974,7 +2974,7 @@ std::vector<MessageExt> DefaultMQPushConsumer::processQueueEntriesLocked(
 
 std::optional<MessageExt> DefaultMQPushConsumer::processQueueHeadLocked(
     const std::string& key) const {
-    // 队首 = 最小 queueOffset 的那条（msgTreeMap.firstEntry()）。
+    // The head is the entry with the smallest queueOffset (the first entry of the offset-ordered view).
     const std::vector<MessageExt> entries = processQueueEntriesLocked(key);
     if (entries.empty()) return std::nullopt;
     const MessageExt* best = &entries[0];
@@ -2986,8 +2986,8 @@ std::optional<MessageExt> DefaultMQPushConsumer::processQueueHeadLocked(
 
 bool DefaultMQPushConsumer::processQueueContainsLocked(const std::string& key,
                                                        const MessageExt& msg) const {
-    // containsMessage 口径：msgTreeMap.containsKey(queueOffset)。
-    // 不是"对象身份"：本端口的批次本来就是拷贝，而且要的语义正是"这个位点还挂在表上吗"。
+    // containsMessage semantics: "is this queueOffset still keyed on the table".
+    // Not object identity: batches here are copies, and the offset membership is exactly the question asked.
     auto iit = inflightMsgs_.find(key);
     if (iit != inflightMsgs_.end()) {
         for (const MessageExt& m : iit->second) {
@@ -3015,9 +3015,9 @@ void DefaultMQPushConsumer::removeProcessQueueEntryLocked(const std::string& key
         }
         if (iit->second.empty()) inflightMsgs_.erase(iit);
     }
-    // 缓冲这一边同样摘：并发路径"回投失败塞回队首"与"方法收尾注销登记"之间有一瞬两边
-    // 都在，只摘一边会让下一轮清扫再看见它（同一条消息被投第二次）。按位点扫而不是只看
-    // 队首：缓冲在乱序场景（回投失败条目 push_front）里不一定严格按位点排。
+    // Remove from the buffer side too: after a failed send-back both sides can briefly hold the same
+    // offset, so removing only one side lets the next sweep see it again and deliver it a second time.
+    // Scan by offset rather than head only: push_front entries leave the buffer not strictly offset-ordered.
     auto pit = pending_.find(key);
     if (pit != pending_.end()) {
         for (auto vit = pit->second.begin(); vit != pit->second.end(); ++vit) {
@@ -3048,8 +3048,8 @@ bool DefaultMQPushConsumer::processQueueContains(const std::string& key,
 void DefaultMQPushConsumer::removeExpiredEntryIfStillHead(const std::string& key,
                                                           const MessageExt& msg) {
     std::lock_guard<std::mutex> lk(lock_);
-    // 回投成功之后才走到这里；只有它**仍是**队首时才摘除：
-    // listener 恰好在此期间正常收尾（或前面冒出了更小的位点）就让位给正常路径，别抢。
+    // Reached only after the send-back succeeded; remove it only while it IS still the head:
+    // if the listener wrapped up normally in the meantime (or a smaller offset surfaced ahead of it), yield to the normal path instead of grabbing it.
     const std::optional<MessageExt> head = processQueueHeadLocked(key);
     if (!head.has_value() || head->queueOffset != msg.queueOffset) {
         return;
@@ -3058,14 +3058,14 @@ void DefaultMQPushConsumer::removeExpiredEntryIfStillHead(const std::string& key
 }
 
 int32_t DefaultMQPushConsumer::cleanExpiredQueue(const std::string& key, int64_t nowMs) {
-    // ProcessQueue.cleanExpiredMsg 的循环体。
+    // The loop body of the per-queue expired-message sweep.
     if (isOrderly()) {
-        // 顺序消费没有这条路径（消息本来就要原地重试，回投会乱序）
+        // Orderly consumption has no such path (messages are retried in place; sending them back would reorder the queue)
         return 0;
     }
     size_t loop = 0;
     {
-        // loop 在**进入循环前**算一次（本轮最多 16 条），不随摘除动态缩小
+        // loop is computed once BEFORE entering (at most 16 per round); it does not shrink dynamically as entries are removed
         std::lock_guard<std::mutex> lk(lock_);
         loop = std::min<size_t>(processQueueEntriesLocked(key).size(), 16);
     }
@@ -3078,12 +3078,12 @@ int32_t DefaultMQPushConsumer::cleanExpiredQueue(const std::string& key, int64_t
         }
         if (!head.has_value()) break;
         if (!isConsumeExpired(*head, consumeTimeoutMinutes_, nowMs)) {
-            break;  // 队首没过期，后面的更不可能过期
+            break;  // the head is not expired, so later ones cannot be
         }
         const MessageExt msg = *head;
         attempts++;
-        if (!sendMessageBack(msg, 3)) {  // delayLevel 固定 3
-            // 回投失败只记日志：消息留在原地，下一轮再试；绝不摘除
+        if (!sendMessageBack(msg, 3)) {  // delayLevel fixed at 3
+            // A failed send-back only logs: the message stays where it is and the next round retries it; never remove it here.
             logger_error("send expired msg exception: send message back failed, msgId="
                          + msg.msgId + ", topic=" + msg.topic
                          + ", queueOffset=" + std::to_string(msg.queueOffset));
@@ -3099,8 +3099,8 @@ int32_t DefaultMQPushConsumer::cleanExpiredQueue(const std::string& key, int64_t
 }
 
 int32_t DefaultMQPushConsumer::cleanExpiredMsgOnce(int64_t nowMs) {
-    // cleanExpireMsg：遍历 rebalance 的 processQueueTable，逐个
-    // pq.cleanExpiredMsg(pushConsumer)。清扫范围 = **当前持有**的队列（撤走的不再被扫）。
+    // Sweep entry: walk the queues of the current rebalance assignment and clean them one by
+    // one. Sweep scope = the queues HELD right now (a revoked one is never scanned again).
     std::vector<std::string> keys;
     {
         std::lock_guard<std::mutex> lk(lock_);
@@ -3116,11 +3116,11 @@ int32_t DefaultMQPushConsumer::cleanExpiredMsgOnce(int64_t nowMs) {
 }
 
 void DefaultMQPushConsumer::cleanExpiredMsgLoop() {
-    // 调度口径（ConsumeMessageConcurrentlyService）：
-    //   scheduleAtFixedRate(cleanExpireMsg, consumeTimeout, consumeTimeout, MINUTES)
-    // —— initialDelay 与 period 同值（都是 consumeTimeout 分钟），首轮也要等满一个周期；
-    // 立刻扫会把刚开始消费、还没超时的消息整批看一遍（不会误伤，但完全没必要）。
-    // 与其它定时任务同一口径（schedule_util.h 的固定速率推进 + 100ms 分段响 stop_）。
+    // Scheduling contract of the expired-message task:
+    //   fixed-rate schedule(sweep, initialDelay = consumeTimeout, period = consumeTimeout, unit MINUTES)
+    // so initialDelay and period are the same value (consumeTimeout minutes) and even the first round waits a full period;
+    // sweeping immediately would walk every message that just started consuming and cannot be expired yet (harmless, but pointless).
+    // Same contract as the other periodic tasks (fixed-rate advance from schedule_util.h + 100ms chunks responsive to stop_).
     const auto period = std::chrono::milliseconds(cleanExpirePeriodMillis(consumeTimeoutMinutes_));
     auto next = std::chrono::steady_clock::now() + period;
     while (!stop_.load()) {
@@ -3130,8 +3130,8 @@ void DefaultMQPushConsumer::cleanExpiredMsgLoop() {
         try {
             cleanExpiredMsgOnce(UtilAll::currentTimeMillis());
         } catch (const std::exception& e) {
-            // 调度壳子 catch (Throwable)：单轮清扫出错不能打死调度，
-            // 否则一条坏时间戳就变成"这个消费者从此不再有清扫"。
+            // The scheduling shell swallows every throwable: one failing sweep round must not kill the schedule,
+            // otherwise a single bad timestamp would leave this consumer without any sweeping for the rest of its life.
             logger_error(std::string("scheduleAtFixedRate cleanExpireMsg exception: ") + e.what());
         }
     }
@@ -3150,22 +3150,22 @@ void DefaultMQPushConsumer::setAssignedQueue(const std::string& key, const Messa
 }
 
 std::vector<MessageQueue> DefaultMQPushConsumer::assignedQueues() {
-    // 返回真实 rebalance 计算出的分配集（doRebalance 写入 assignedQueues_）。
-    // 不再返回「订阅 topic 的全部队列」——那正是同组多实例重复消费的根源。
+    // Return the assignment set computed by the real rebalance (what doRebalance writes into assignedQueues_).
+    // Not "all queues of the subscribed topic" anymore - that was the root of duplicate consumption across group instances.
     std::lock_guard<std::mutex> lk(lock_);
     return assignedQueues_;
 }
 
-// ---------------------------------------------------------------- 真实 rebalance
+// ---------------------------------------------------------------- Real rebalance
 void DefaultMQPushConsumer::doRebalance() {
-    // rebalanceByTopic：BROADCASTING 全给自己；CLUSTERING 查 broker
-    // 消费者列表 → 排序 → 分配策略 → 取本实例那一份。查不到消费者列表时
-    // 保留现有分配（仅告警），绝不回退成"独占全部队列"（否则同组多实例互相重复消费）。
+    // rebalanceByTopic: BROADCASTING keeps every queue; CLUSTERING asks the broker for the
+    // consumer id list -> sorts it -> runs the allocation strategy -> takes this instance's share.
+    // No consumer list => keep the current assignment (debug log only), never fall back to "own every queue": that means duplicate consumption across group instances.
     //
-    // ⚠ POP 的队列同样来自这条**客户端 rebalance**（每队列一个 POP 循环 + ack）。
-    // broker 侧分配是另一条路径：getRebalanceResultFromBroker → queryAssignment
-    //（QUERY_ASSIGNMENT=400，回 MessageQueueAssignment mode=POP）。本端口只实现客户端分配：
-    // 语义等价，差别只在"谁决定队列集合"。动这里之前请先读这段。
+    // NOTE: POP queues also come from this SAME client-side rebalance (one POP loop + acks per queue).
+    // Broker-side allocation is another path (QUERY_ASSIGNMENT = 400, answering MessageQueueAssignment
+    // with mode=POP) and is not implemented here: the semantics are equivalent, only "who decides the queue set" differs.
+    // Read this paragraph before changing anything here.
     if (mqClient_ == nullptr) return;
     MQClientInstance& c = *mqClient_;
     std::vector<std::string> topics;
@@ -3192,7 +3192,7 @@ void DefaultMQPushConsumer::doRebalance() {
     } else {
         for (const std::string& topic : topics) {
             std::vector<MessageQueue> mqAll = allQueuesOfTopic(topic);
-            // mqAll 与 cidAll 都排序：排序后才分配，否则不同实例算出不同结果
+            // Both mqAll and cidAll are sorted: allocation happens only after sorting, otherwise different instances compute different results
             std::sort(mqAll.begin(), mqAll.end(),
                       [](const MessageQueue& a, const MessageQueue& b) {
                           return a.compareTo(b) < 0;
@@ -3211,8 +3211,8 @@ void DefaultMQPushConsumer::doRebalance() {
                 continue;
             }
             std::sort(cidAll.begin(), cidAll.end());
-            // 自定义策略抛异常时：**保持现有分配**并结束本轮 rebalance
-            //（catch Throwable → log error → return false 的口径）。绝不能把该 topic 的队列撤走。
+            // When a custom strategy throws: KEEP THE CURRENT ASSIGNMENT and end this rebalance round
+            // (catch the error, log it, give up). Never revoke the topic's queues because of a failing strategy.
             std::vector<MessageQueue> got;
             try {
                 got = allocateStrategy_->allocate(consumerGroup_, clientId_, mqAll, cidAll);
@@ -3236,10 +3236,10 @@ void DefaultMQPushConsumer::doRebalance() {
         logger_info("rebalance result changed, group=" + consumerGroup_
                     + " clientId=" + clientId_ + " assigned=" + std::to_string(assigned.size()));
     }
-    // 新分配的队列**立刻**解析初始位点写入 offsetTable_（口径：
-    // updateProcessQueueTableInRebalance → computePullFromWhereWithException →
-    // offsetStore.updateOffset）。不能留到第一次拉取时才惰性解析：CONSUME_FROM_LAST_OFFSET 语义
-    // 是"分配时刻的最新位点"，惰性解析会跳过「分配之后、首次拉取之前」新产生的消息。
+    // Newly assigned queues resolve their initial offset IMMEDIATELY into offsetTable_ (same contract as
+    // updateProcessQueueTableInRebalance -> computePullFromWhere -> persisting it through the offset store).
+    // It must not be resolved lazily at the first pull: CONSUME_FROM_LAST_OFFSET means "the max offset at
+    // assignment time", and lazy resolution would skip messages produced between assignment and the first pull.
     for (const MessageQueue& mq : assigned) {
         std::string key = offsetKey(mq);
         if (was.count(key)) {
@@ -3267,10 +3267,10 @@ void DefaultMQPushConsumer::doRebalance() {
 }
 
 std::vector<MessageQueue> DefaultMQPushConsumer::allQueuesOfTopic(const std::string& topic) {
-    // 取自**订阅信息**（topicRouteData2TopicSubscribeInfo：读位 + readQueueNums、不筛
-    // master），不是发布信息 —— 两者在「perm=4 的只读 topic」与「master 掉线只剩从节点」
-    // 两种路由上答案不同，消费侧必须用宽的这一份（rebalance 队列集从来就是订阅
-    // 信息，发布信息只服务生产者选队）。
+    // Taken from the SUBSCRIBE side of the route (read queues + readQueueNums, no master filtering),
+    // not the publish side - the two differ on a perm=4 read-only topic and on "master down, only slaves
+    // left", and the consumer must use the wider one (the rebalance queue set has always been subscribe
+    // info; publish info only serves a producer picking a queue).
     if (mqClient_ == nullptr) return {};
     std::vector<MessageQueue> queues = mqClient_->getTopicSubscribeInfo(topic);
     if (queues.empty()) {
@@ -3280,9 +3280,9 @@ std::vector<MessageQueue> DefaultMQPushConsumer::allQueuesOfTopic(const std::str
 }
 
 bool DefaultMQPushConsumer::ownsQueue(const std::string& key, uint64_t token) const {
-    // 本拉取线程是否仍持有该队列（rebalance 撤走或换了拉取线程后即失效）。
-    // 比 token 而不是比 std::thread 的 id：归属是在**起线程之前**登记的，线程自己
-    // 拿不到自己的 std::thread 句柄，也就没有「先跑起来、后登记」的窗口。
+    // Whether this pull thread still owns the queue (invalid once rebalance revokes it or swaps the thread).
+    // Comparing tokens instead of std::thread ids: ownership is registered BEFORE the thread starts, and a
+    // thread cannot obtain its own std::thread handle, so there is no "run first, register later" window.
     std::lock_guard<std::mutex> lk(lock_);
     auto it = pullOwners_.find(key);
     return it != pullOwners_.end() && it->second == token;
@@ -3290,10 +3290,10 @@ bool DefaultMQPushConsumer::ownsQueue(const std::string& key, uint64_t token) co
 
 void DefaultMQPushConsumer::onQueuesRevoked(
     const std::vector<std::pair<MessageQueue, int64_t>>& revoked) {
-    // removeUnnecessaryMessageQueue 口径
+    // Same contract as removeUnnecessaryMessageQueue
     if (messageModel_ == MessageModel::BROADCASTING) {
-        // 广播模式位点只存本地。撤下来的位点必须连同队列信息写回文件（persist 在前、
-        // removeOffset 在后），否则重建时读不到旧位点、按 consumeFromWhere 重扫。
+        // Broadcasting stores offsets only locally. A revoked offset must be written back to the file together
+        // with its queue info (persist first, then drop it), or a rebuild cannot see the old offset and rescans from consumeFromWhere.
         saveLocalOffsets(revoked);
         return;
     }
@@ -3302,7 +3302,7 @@ void DefaultMQPushConsumer::onQueuesRevoked(
     for (const auto& kv : revoked) {
         const MessageQueue& mq = kv.first;
         int64_t off = kv.second;
-        // 仅该队列的已消费位点：一条 UPDATE_CONSUMER_OFFSET(15)，info 级别只记一次摘要
+        // Only this queue's consumed offset: one UPDATE_CONSUMER_OFFSET(15); the info log keeps a single summary
         if (off >= 0) {
             try {
                 mqClient_->updateConsumerOffset(consumerGroup_, mq, off);
@@ -3311,9 +3311,9 @@ void DefaultMQPushConsumer::onQueuesRevoked(
                              + e.what());
             }
         }
-        // 撤队列时的单队列解锁只属于 classic 顺序（removeUnnecessaryMessageQueue
-        // 拿的是 processQueueTable
-        // 里的 ProcessQueue —— POP 模式下那张表是空的，这条路径根本不会跑）。
+        // The per-queue unlock during revoke belongs to classic orderly consumption only (the queue
+        // comes from the classic pull-side process queue table
+        // - in POP mode that table is empty, so this path never runs there).
         if (isOrderly() && !popMode_) {
             toUnlock.push_back(mq);
         }
@@ -3329,13 +3329,13 @@ void DefaultMQPushConsumer::onQueuesRevoked(
                 + " count=" + std::to_string(revoked.size()));
 }
 
-// 丢弃一个队列的全部本地状态（调用方须持 lock_），已消费位点经 retired 交给调用方在锁外
-// 持久化。两处调用：rebalance 撤队列（含停摆自愈，RebalanceImpl:438-461）与 OFFSET_ILLEGAL
-// 纠错（DefaultMQPushConsumerImpl:407-420 的 setDropped + removeProcessQueue）。
+// Drop every piece of local state for a queue (the caller must hold lock_); the consumed offset is handed
+// to the caller through retired for persistence outside the lock. Two call sites: rebalance revoking a
+// queue (including self-healing of a stalled one) and the OFFSET_ILLEGAL correction (drop + remove).
 //
-// 「撤走归属」这一步是后者的关键：pullOwners_ 里没有该 key 后，旧拉取线程下一轮 ownsQueue
-// 即失效并退出，即便同一队列马上被重新分配给本实例，也会拿到一份**新**凭据、起一条新线程
-// ——旧循环不可能再往这条队列里塞它用旧位点拉回来的消息。
+// Withdrawing ownership is the key step for the latter: once the key is gone from pullOwners_, the old
+// pull thread fails ownsQueue on its next round and exits; even if the same queue is reassigned to this
+// instance immediately, it gets a NEW token and a NEW thread, so the old loop can never re-inject messages pulled at its old offset.
 void DefaultMQPushConsumer::retireQueueLocked(
     const std::string& key, const MessageQueue& fallbackMq,
     std::vector<std::pair<MessageQueue, int64_t>>& retired) {
@@ -3344,8 +3344,8 @@ void DefaultMQPushConsumer::retireQueueLocked(
     if (mit != mqMap_.end()) {
         mq = mit->second;
     } else if (!fallbackMq.topic.empty()) {
-        // 停摆队列可能一条都没拉过（mqMap_ 里还没有条目），但它的已消费位点是真实的，
-        // 漏 persist 就会让新属主从头重投。
+        // A stalled queue may never have pulled anything (no mqMap_ entry yet), but its consumed offset is real,
+        // and skipping the persist would make the new owner redeliver everything from the start.
         mq = fallbackMq;
     }
     int64_t off = -1;
@@ -3361,17 +3361,17 @@ void DefaultMQPushConsumer::retireQueueLocked(
     lastPullAt_.erase(key);
     mqMap_.erase(key);
     pending_.erase(key);
-    // 队列已从 processQueueTable 摘除，清扫不会再碰它 —— 在途登记一并清掉，
-    // 免得旧副本继续被 cleanExpiredMsgOnce 的并集视图看见。
+    // The queue is off the process-queue tables, so the sweep will not touch it again - the in-flight
+    // registry goes too, otherwise stale copies would stay visible in the sweep's union view.
     inflightMsgs_.erase(key);
     lockOk_.erase(key);
     offsetTable_.erase(key);
     consumeOffsetTable_.erase(key);
-    // 代号 +1 ⇒ 在途批次的 ack 全部失效（ProcessQueue.setDropped(true)，
-    // ack 路径靠 isDropped 挡掉）。冻结标记**保留**
-    // 到队列重建为止（见 rebalancePullThreads 的解冻分支），否则纠错后的位点会被旧 ack 覆盖。
+    // Epoch +1 makes every in-flight batch's acks invalid (equivalent to marking the ProcessQueue
+    // dropped; the ack path rejects on isDropped). The freeze flag STAYS
+    // until the queue is rebuilt (see the unfreeze branch in rebalancePullThreads), otherwise a corrected offset gets overwritten by a stale ack.
     ++queueEpoch_[key];
-    // POP：标记 dropped，在途批次不再消费也不 ack（交给 broker 复活）
+    // POP: mark dropped so in-flight batches neither consume nor ack (the broker revives them)
     auto pqit = popQueues_.find(key);
     if (pqit != popQueues_.end()) {
         pqit->second->setDropped(true);
@@ -3394,52 +3394,52 @@ bool DefaultMQPushConsumer::offsetFrozen(const std::string& key) const {
     return frozenOffsets_.count(key) > 0;
 }
 
-// OFFSET_ILLEGAL 纠错分支。须在**不持 lock_** 的
-// 路径上调用（内部要做网络 RPC）。
+// The OFFSET_ILLEGAL correction branch. Must be called on a path that does NOT hold lock_
+// (it performs network RPCs internally).
 //
-// broker 说"你请求的位点非法"（队列被截断 / commitlog 过期 / 服务端一次性重置，见
-// PullMessageProcessor 对 OFFSET_OVERFLOW_BADLY / OFFSET_TOO_SMALL / OFFSET_RESET 一律回
-// PULL_OFFSET_MOVED，客户端 remoting 层映射成本状态），并把修正值放在
-// nextBeginOffset 里。纠错不只是把游标拨过去：这条队列上**已经取回、还没消费/没 ack** 的
-// 消息全部作废 —— 它们落在被跳过的区间里，ack 它们会把位点推回非法值，不 ack 又会让位点
-// 卡死；两者都错，只能整批丢掉，由新循环按修正位点重来。
+// The broker says "the requested offset is illegal" (queue truncated / commitlog expired / a
+// one-shot server-side reset - all three answer PULL_OFFSET_MOVED, which the remoting layer
+// maps to this status) and returns the corrected value in nextBeginOffset. The fix is more than
+// moving the cursor: every message already taken from this queue but not consumed or acked is
+// voided - they sit inside the skipped range, acking them would push the offset back to an illegal
+// value and not acking them would strand it, so the batch is dropped and the new loop restarts at the corrected offset.
 //
-// 四步合同：setNextOffset → ProcessQueue.setDropped(true) →
-// { updateAndFreezeOffset; persist; removeProcessQueue } → rebalanceImmediately。
-// 本端口：改位点 + 冻结（等价 updateAndFreezeOffset：覆盖写，且此后 ack 与空应答修正
-// 一律作废）→ retireQueueLocked（等价 setDropped，代号 +1）→ onQueuesRevoked 锁外落盘
-// （等价 persist；removeProcessQueue → removeUnnecessaryMessageQueue 也会 persist 一次）
-// → 叫醒 rebalance 按修正位点重建（removeProcessQueue 之后同样由分配结果重建）。
+// Four-step contract: set the next offset -> mark the ProcessQueue dropped ->
+// { updateAndFreezeOffset; persist; remove the queue } -> immediate rebalance.
+// Here: rewrite + freeze the offset (updateAndFreezeOffset is an overwrite, and from then on acks and
+// empty-response corrections are all void) -> retireQueueLocked (the drop, epoch +1) -> onQueuesRevoked
+// persists outside the lock (removing the queue would persist once anyway)
+// -> wake rebalance so the queue is rebuilt at the corrected offset.
 void DefaultMQPushConsumer::handleOffsetIllegal(const std::string& key, int64_t nextOffset) {
     std::vector<std::pair<MessageQueue, int64_t>> retired;
     {
         std::lock_guard<std::mutex> lk(lock_);
-        // updateAndFreezeOffset：位点**覆盖写**成 broker 给的修正值（不是 increaseOnly），
-        // 并冻结（ControllableOffset.allowToUpdate=false）。冻结要赶在撤队列之前，
-        // 否则旧 ack 可能在两者之间把位点改回去。
+        // updateAndFreezeOffset: the offset OVERWRITES to the broker's corrected value (not increaseOnly)
+        // and freezes it (allowToUpdate=false). The freeze must precede the queue revoke,
+        // otherwise a stale ack could write the offset back in between the two steps.
         if (nextOffset >= 0) {
             consumeOffsetTable_[key] = nextOffset;
         }
         frozenOffsets_.insert(key);
         retireQueueLocked(key, MessageQueue(), retired);
     }
-    // persist：把修正位点立刻推给 broker（显式的一次 persist，不等周期落盘）。
-    // 这也是本分支唯一能观测到的「立即落盘」证据：来不及落盘的实现会让 broker 上的
-    // 位点停在被纠正的非法值上，直到队列重建后的首次周期持久化。
+    // persist: push the corrected offset to the broker immediately (an explicit persist that does not
+    // wait for the periodic flush). This is the branch's only observable proof of an immediate flush: without
+    // it the broker keeps the illegal value until the first periodic persist after the queue is rebuilt.
     onQueuesRevoked(retired);
     wakeRebalanceLoop();
     logger_warn("the pull request offset illegal, fix it, queue=" + key);
 }
 
 void DefaultMQPushConsumer::wakeRebalanceLoop() {
-    // broker 通知消费组实例变化 → 立即重算（rebalanceImmediately）。
+    // The broker signalled that the consumer group's membership changed -> recompute immediately.
     rebalanceNow_.store(true);
     rebalanceCv_.notify_all();
 }
 
 void DefaultMQPushConsumer::resetRetryTopicAndNamespace(std::vector<MessageExt>& msgs) {
-    // resetRetryAndNamespace（分发前调用）。
-    // 重投消息 topic 还原成业务原始 topic，并剥掉命名空间前缀。
+    // resetRetryAndNamespace (called before dispatch).
+    // A redelivered message's topic becomes the original business topic again and the namespace prefix is stripped.
     const std::string groupTopic = MixAll::getRetryTopic(consumerGroup_);
     for (MessageExt& msg : msgs) {
         std::string retryTopic = msg.getProperty(MessageConst::PROPERTY_RETRY_TOPIC);
@@ -3455,25 +3455,25 @@ int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq,
                                                     const SubscriptionData& sub) {
     MQClientInstance& c = client();
     if (sub.expressionType == ExpressionType::SQL92) {
-        // SQL 过滤无 offset 语义，默认最新
+        // SQL filtering has no offset semantics, so start from the latest
         return c.getMaxOffset(mq);
     }
     if (messageModel_ == MessageModel::BROADCASTING) {
-        // 广播模式：offset 只存本地（本地文件位点存储）
+        // Broadcasting: the offset lives only in the local offset file
         std::map<std::string, int64_t> stored = loadLocalOffsets();
         auto it = stored.find(offsetKey(mq));
         if (it != stored.end()) {
             return it->second;
         }
         if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-            // FIRST_OFFSET 且本地没有位点时直接给 0（本地文件与 broker 两条路径
-            // 同一个分支），真正的起点由 OFFSET_ILLEGAL 纠错按 broker 回的
-            // nextBeginOffset 落定。
+            // FIRST_OFFSET with no local offset returns 0 directly (the local-file and broker paths share
+            // this branch); the real start point is settled by the OFFSET_ILLEGAL correction using the
+            // nextBeginOffset the broker returns.
             return 0;
         }
         return c.getMaxOffset(mq);
     }
-    // 集群模式：先查 broker 上已提交的位点（远端 broker 位点存储）
+    // Clustering: first query the committed offset on the broker (remote offset store)
     try {
         int64_t stored = 0;
         if (c.queryConsumerOffset(consumerGroup_, mq, stored, 5000, std::string(),
@@ -3485,42 +3485,42 @@ int64_t DefaultMQPushConsumer::resolveInitialOffset(const MessageQueue& mq,
     }
     try {
         if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_FIRST_OFFSET) {
-            // FIRST_OFFSET 直接返回 0，「位点由 OFFSET_ILLEGAL 过程纠正」：
-            // **不**发 minOffset 查询。多打这一枪的代价不只是慢：
-            // minOffset 是 MQAdminImpl 口径（只认 master），主掉线期间恰好是「新起的消费者
-            // 一条都拉不到」——而从节点本来就能按 0 起拉、越界时由 broker 用
-            // PULL_OFFSET_MOVED 把位点纠回来（见 handleOffsetIllegal）。
+            // FIRST_OFFSET returns 0 directly, with the offset "corrected by the OFFSET_ILLEGAL process":
+            // NO minOffset query is sent. The cost of that extra call is more than latency:
+            // minOffset only accepts a master (the admin path), so while the master is down a fresh
+            // consumer would pull nothing at all - whereas a slave can start from 0 and, on overrun, the
+            // broker corrects the offset back with PULL_OFFSET_MOVED (see handleOffsetIllegal).
             return 0;
         }
         if (consumeFromWhere_ == ConsumeFromWhere::CONSUME_FROM_TIMESTAMP) {
             int64_t ts = UtilAll::currentTimeMillis() - 30 * 60 * 1000LL;
             return c.searchOffsetByTimestamp(mq, ts);
         }
-        // 首次消费且无已提交位点时，%RETRY% 主题从 0 开始
-        // （重试消息要全量重试），而不是从最大位点跳过。
+        // On first consumption with no committed offset, the %RETRY% topic starts at 0
+        // (redelivery must replay everything) instead of jumping to the max offset.
         if (MixAll::isRetryTopic(mq.topic)) {
             return 0;
         }
-        return c.getMaxOffset(mq);  // 默认 CONSUME_FROM_LAST_OFFSET
+        return c.getMaxOffset(mq);  // default CONSUME_FROM_LAST_OFFSET
     } catch (const std::exception&) {
         return 0;
     }
 }
 
-// ---------------------------------------------------------------- 心跳
+// ---------------------------------------------------------------- Heartbeat
 int32_t DefaultMQPushConsumer::sendHeartbeatToAllBroker() {
     if (mqClient_ == nullptr) {
         return 0;
     }
     std::vector<std::string> addrs;
     try {
-        // 每台都发（主 + 从）：遍历 brokerAddrTable 的每个 brokerId，仅当
-        // consumerEmpty 且 id != MASTER_ID 才跳过；消费者心跳必带 ConsumerData，故从节点
-        // 不跳。broker 的 ConsumerManager 每台各自一份，从节点收不到心跳就会对指向自己的
-        // 拉取回 `SUBSCRIPTION_NOT_EXIST`（broker 的 PullMessageProcessor；默认
-        // postSubscriptionWhenPull=false 的拉取不带订阅标志，走的正是那条）。生产者心跳
-        // 相反：只带 ProducerData（consumerEmpty），见本仓库
-        // DefaultMQProducer::sendHeartbeatToAllBroker 用的 knownBrokerAddrs。
+        // Send to every broker (master AND slave): iterate all brokerIds of the address table and skip one
+        // only when the heartbeat carries no ConsumerData and the id is not MASTER_ID; a consumer heartbeat
+        // always carries ConsumerData, so slaves are not skipped. Each broker keeps its own consumer
+        // manager, and a slave that never heard the heartbeat answers a pull pointed at it with
+        // SUBSCRIPTION_NOT_EXIST (pulls sent with the default postSubscriptionWhenPull=false carry no
+        // subscription flag, so that is exactly the path taken). Producer heartbeats are the opposite: they
+        // carry only ProducerData (consumerEmpty); see knownBrokerAddrs in DefaultMQProducer::sendHeartbeatToAllBroker.
         addrs = mqClient_->getAllBrokerAddrs();
     } catch (const std::exception& e) {
         logger_warn("heartbeat: gather brokers failed: " + std::string(e.what()));
@@ -3536,8 +3536,8 @@ int32_t DefaultMQPushConsumer::sendHeartbeatToAllBroker() {
     cd.consumeType = ConsumeType::CONSUME_PASSIVELY;
     cd.messageModel = messageModel_;
     cd.consumeFromWhere = consumeFromWhere_;
-    // 心跳的 ConsumerData 带 unitMode（setUnitMode 语义）：
-    // broker 据此决定 %RETRY% topic 建出来带不带 UNIT_SUB 位
+    // The heartbeat's ConsumerData carries unitMode (the setUnitMode semantics):
+    // the broker uses it to decide whether the %RETRY% topic it creates gets the UNIT_SUB flag
     cd.unitMode = unitMode_;
     {
         std::lock_guard<std::mutex> lk(lock_);
@@ -3545,8 +3545,8 @@ int32_t DefaultMQPushConsumer::sendHeartbeatToAllBroker() {
             cd.addSubscriptionData(kv.second);
         }
     }
-    // 保持 fingerprint = 0，让 broker 走 V1 注册路径（用完整 subscriptionDataSet 注册）
-    // withoutSub 仅在 fingerprint != 0 的 V2 路径下被读取，这里保持默认 false 即可。
+    // Keep fingerprint = 0 so the broker takes the V1 registration path (registers the full subscriptionDataSet);
+    // withoutSub is only read on the V2 path (fingerprint != 0), so its default false is fine here.
     hb.heartbeatFingerprint = 0;
     hb.addConsumerData(cd);
 
@@ -3576,37 +3576,37 @@ void DefaultMQPushConsumer::maybeSendHeartbeat() {
     sendHeartbeatToAllBroker();
 }
 
-// ---------------------------------------------------------------- 管理
+// ---------------------------------------------------------------- Administration
 std::vector<MessageQueue> DefaultMQPushConsumer::fetchSubscribeMessageQueues(
     const std::string& topic) {
-    // 读的是订阅侧信息链（全量队列、不筛 master），与 rebalance 共用同一份口径，
-    // 不是发布信息。
+    // Reads the subscribe side of the route (every queue, no master filtering), the same source
+    // rebalance uses, not the publish side.
     MQClientInstance& c = client();
     return c.getTopicSubscribeInfo(topic);
 }
 
 int32_t DefaultMQPushConsumer::maxReconsumeTimesOrDefault() const {
-    // -1 表示用 broker 默认的 retryMaxTimes=16
+    // -1 means the broker default retryMaxTimes = 16
     return maxReconsumeTimes_ == -1 ? 16 : maxReconsumeTimes_;
 }
 
-// 回投请求失败时，把这条消息当成普通消息重新发到 %RETRY%group，
-// 由 broker 按 DELAY 档位重投。属性置法见 buildRetryMessage。
+// When the send-back request fails, resend the message to %RETRY%group as an ordinary message
+// and let the broker redeliver it by delay level; see buildRetryMessage for the property setup.
 void DefaultMQPushConsumer::sendMessageBackAsNormalMessage(const MessageExt& msg) {
     MQClientInstance& c = client();
     Message newMsg = buildRetryMessage(msg, maxReconsumeTimesOrDefault());
     std::shared_ptr<TopicPublishInfo> publish =
         c.getTopicPublishInfo(newMsg.topic, /*isDefault=*/true);
     MessageQueue selected = publish->selectOneMessageQueue();
-    // 走的是 MQClientInstance 的**内部生产者**，构造它时调过
-    // `resetClientConfig(clientConfig)`，所以 unitMode 与本消费者一致 ——
-    // 这里必须带上，否则重投消息会丢单元标记。
+    // This goes through the INTERNAL producer of MQClientInstance, which had
+    // resetClientConfig(clientConfig) applied when it was built, so its unitMode matches this consumer's -
+    // it must be passed here, otherwise the redelivered message loses its unit marker.
     c.sendMessage(MixAll::CLIENT_INNER_PRODUCER_GROUP, newMsg, selected, 3000, /*sysFlag=*/0,
                   unitMode_);
 }
 
-// 普通回投与顺序回投两条路径的 newMsg 构造体**逐行相同**
-// （只有 maxReconsumeTimes 各调各的 getter），所以抽成一个函数，避免两处属性置法漂移。
+// The newMsg construction of the plain and the orderly send-back paths is identical line by line
+// (only maxReconsumeTimes uses each path's own getter), so it is one function to stop the two property setups drifting apart.
 Message DefaultMQPushConsumer::buildRetryMessage(const MessageExt& msg,
                                                  int32_t maxReconsumeTimes) const {
     Message newMsg(MixAll::getRetryTopic(consumerGroup_), msg.body);
@@ -3622,7 +3622,7 @@ Message DefaultMQPushConsumer::buildRetryMessage(const MessageExt& msg,
                        std::to_string(msg.reconsumeTimes + 1));
     newMsg.putProperty(MessageConst::PROPERTY_MAX_RECONSUME_TIMES,
                        std::to_string(maxReconsumeTimes));
-    // 半消息重投时不能带上 TRAN_MSG，否则 broker 会把它再当回查消息处理
+    // A half-message redelivery must not carry TRAN_MSG, otherwise the broker handles it as a check-back message again
     newMsg.properties.erase(MessageConst::PROPERTY_TRANSACTION_PREPARED);
     newMsg.putProperty(MessageConst::PROPERTY_DELAY_TIME_LEVEL,
                        std::to_string(3 + msg.reconsumeTimes));
@@ -3634,16 +3634,16 @@ Message DefaultMQPushConsumer::buildRetryMessage(const MessageExt& msg,
 }
 
 int32_t DefaultMQPushConsumer::orderlyMaxReconsumeTimes() const {
-    // 顺序消费的消息一直停在本地队列里原地重试，broker 侧压根没有重投计数，所以默认
-    // 就该重试到成功为止 —— -1 在这里读成 int32 最大值。**不是**并发侧的 16
-    //（那边每轮回投都过一遍 broker，16 是 broker 的默认 retryMaxTimes）；把两套并成
-    // 一个常量，等于要么给顺序消费凭空造出死信，要么让并发消息无限重投。
+    // Orderly messages stay in the local queue and retry in place, so the broker counts no redelivery at all
+    // and the default should be retry-until-success - here -1 reads as the int32 max value. NOT the
+    // concurrent side's 16 (that path sends every round back through the broker, and 16 is the broker's
+    // retryMaxTimes); one shared constant would fabricate dead letters for orderly consume or make concurrent messages redeliver forever.
     return maxReconsumeTimes_ == -1 ? std::numeric_limits<int32_t>::max() : maxReconsumeTimes_;
 }
 
 bool DefaultMQPushConsumer::orderlySendMessageBack(const MessageExt& msg) {
-    // 整个函数包在 try/catch 里，只按返回值表成败。抛给消费线程等于这条既没 ack 也没
-    // 回投，只能等 broker 锁超时 —— 而顺序消费的锁超时是分钟级，看起来就像卡死。
+    // The whole function is try/catch wrapped and reports the outcome only through its return value: an
+    // exception reaching the consume thread leaves the message neither acked nor sent back, waiting for a broker lock timeout - minutes for orderly consume, and it looks like a hang.
     try {
         MQClientInstance& c = client();
         Message newMsg = buildRetryMessage(msg, orderlyMaxReconsumeTimes());
@@ -3688,11 +3688,11 @@ int32_t DefaultMQPushConsumer::orderlySuspendMillis(const ConsumeOrderlyContext&
 }
 
 bool DefaultMQPushConsumer::checkOrderlyReconsumeTimes(std::vector<MessageExt>& msgs) {
-    // 逐条两种走法：
-    //   - 次数没用尽：本地 reconsumeTimes + 1（broker 那边没记这次失败，客户端不补就
-    //     永远到不了阈值），继续挂起；
-    //   - 次数已用尽：交给 broker 回投。**回投成功就不挂起**（成功即 commit 位点，
-    //     毒消息让路、队列继续往前），回投失败才 +1 并挂起。
+    // Per message there are two paths:
+    //   - retries left: bump reconsumeTimes locally (the broker did not record this failure, so without
+    //     the client's increment the threshold would never be reached) and keep the queue suspended;
+    //   - retries used up: hand the message to the broker send-back. A SUCCESSFUL send-back does not
+    //     suspend (success commits the offset, the poison message steps aside, the queue moves on); only a failure bumps +1 and suspends.
     bool suspend = false;
     const int32_t maxTimes = orderlyMaxReconsumeTimes();
     for (MessageExt& msg : msgs) {
@@ -3712,15 +3712,15 @@ bool DefaultMQPushConsumer::checkOrderlyReconsumeTimes(std::vector<MessageExt>& 
 bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delayLevel,
                                            const std::string& brokerNameIn) {
     std::string brokerName = brokerNameIn.empty() ? msg.brokerName : brokerNameIn;
-    // 整个回投过程包在 try/catch 里，失败退化到"普通消息重投"，
-    // 绝不把异常抛给消费线程（否则这条消息既没 ack 也没回投，只能等超时重复消费）。
-    // ⚠ client() 在未 start 时会抛，所以必须留在 try 内：本函数的契约是「只按返回值
-    // 表成败」，调用方（sendBackBatch）已经不再看异常了。
+    // The whole send-back is wrapped in try/catch and degrades to "resend as a normal message" on failure,
+    // never letting an exception reach the consume thread (that would leave the message neither acked nor
+    // sent back, waiting for a timeout redelivery). NOTE: client() throws before start(), so it must stay
+    // inside the try - this function only reports the outcome through its return value, and the caller (sendBackBatch) no longer looks at exceptions.
     try {
         MQClientInstance& c = client();
-        // 用 findBrokerAddressInPublish（只认 master），拿不到就报
-        // 「Broker[X] master node does not exist」（与调用方匹配的合同文案）；
-        // 从节点不接 CONSUMER_SEND_MSG_BACK。
+        // Uses findBrokerAddressInPublish (master only); when it returns nothing the error is
+        // "Broker[X] master node does not exist" (the contract wording callers match on);
+        // slaves do not accept CONSUMER_SEND_MSG_BACK.
         std::string addr = c.findBrokerAddressInPublish(brokerName);
         if (addr.empty()) {
             throw MQClientException("Broker[" + brokerName + "] master node does not exist");
@@ -3731,11 +3731,11 @@ bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
         header->delayLevel = delayLevel;
         header->originMsgId = msg.msgId;
         header->originTopic = msg.topic;
-        // ⚠ 本端特意如实上报 unitMode：常见实现只填
-        // group/offset/delayLevel/originMsgId/originTopic/maxReconsumeTimes/brokerName，
-        // 从不写 unitMode，字段恒为 false。broker 侧确实读它
-        // （AbstractSendMessageProcessor 用它 buildSysFlag(false, true)），所以这里
-        // 按消费者配置上报，单元化重试 topic 才会带上 UNIT_SUB 标记。
+        // NOTE: unitMode is reported faithfully here. A common shortcut fills only
+        // group/offset/delayLevel/originMsgId/originTopic/maxReconsumeTimes/brokerName and
+        // never writes unitMode, leaving the field permanently false. The broker does read it
+        // (it builds the system flag from it, buildSysFlag(false, true)), so reporting the consumer's
+        // configuration is what makes a unit-scoped retry topic carry the UNIT_SUB marker.
         header->unitMode = unitMode_;
         header->maxReconsumeTimes = maxReconsumeTimesOrDefault();
         RemotingCommand request =
@@ -3768,8 +3768,8 @@ bool DefaultMQPushConsumer::sendMessageBack(const MessageExt& msg, int32_t delay
 }
 
 std::vector<std::string> DefaultMQPushConsumer::assignedQueueKeys() const {
-    // 当前分给本实例的队列 key 列表（真机验证"同组两实例不重不漏"用）。
-    // key 格式与 offsetKey 一致：topic + brokerName + queueId。
+    // The keys of the queues currently assigned to this instance (used by live-cluster checks that two
+    // instances of one group neither overlap nor miss queues). Key format matches offsetKey: topic + brokerName + queueId.
     std::lock_guard<std::mutex> lk(lock_);
     std::vector<std::string> out;
     out.reserve(assignedQueues_.size());
@@ -3781,7 +3781,7 @@ std::vector<std::string> DefaultMQPushConsumer::assignedQueueKeys() const {
 
 std::vector<std::string> DefaultMQPushConsumer::consumerIdListOfGroup(
     const std::string& topic) const {
-    // 查消费组在某 topic 上的全部 clientId，用于验证多实例注册。
+    // Query every clientId of the consumer group on a topic, used to verify multi-instance registration.
     if (mqClient_ == nullptr) return {};
     try {
         return mqClient_->getConsumerIdListByGroup(topic, consumerGroup_);

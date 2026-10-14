@@ -1,5 +1,5 @@
-// 实现 MQFaultStrategy + LatencyFaultToleranceImpl（带 FaultItem）：追踪每个 broker 的
-// 发送延迟，延迟过高或发生异常时**隔离**一段时间（不分配给新消息），默认关闭。
+// Implements MQFaultStrategy and LatencyFaultToleranceImpl (with FaultItem): tracks the send latency of
+// each broker and **isolates** it for a while (no new messages assigned) when the latency is too high or an exception happened; disabled by default.
 #ifndef ROCKETMQ_CLIENT_LATENCY_H
 #define ROCKETMQ_CLIENT_LATENCY_H
 
@@ -56,7 +56,7 @@ public:
     bool isReachable(const std::string& name);
     void remove(const std::string& name);
 
-    // 供测试/诊断读取（不存在返回 nullptr）
+    // For tests/diagnostics (nullptr when the entry does not exist)
     const FaultItem* getFaultItem(const std::string& name);
 
     void setResolver(Resolver resolver) { resolver_ = std::move(resolver); }
@@ -82,11 +82,11 @@ private:
     ServiceDetector serviceDetector_;
 };
 
-// 仅当 sendLatencyFaultEnable 为 true 时，发送选队列阶段会：
-//   1) 优先选 available（隔离期已过）的 broker；
-//   2) 否则选 reachable 的 broker；
-//   3) 否则退化为普通轮询。
-// 发送结果/异常会回调 updateFaultItem 写延迟与隔离信息。
+// Only when sendLatencyFaultEnable is true does the send-time queue selection stage:
+//   1) prefer brokers that are available (their isolation period has elapsed);
+//   2) otherwise pick a broker that is reachable;
+//   3) otherwise fall back to plain round-robin.
+// Send results/exceptions call back into updateFaultItem to record the latency and isolation info.
 class MQFaultStrategy {
 public:
     static constexpr int32_t kLatencyMaxSize = 7;

@@ -63,7 +63,7 @@ bool base64UrlDecode(const std::string& text, std::string& out) {
     uint32_t acc = 0;
     int bits = 0;
     for (char c : text) {
-        if (c == '=') break;  // 填充之后不该再有数据，尾部一律忽略
+        if (c == '=') break;  // no data should follow the padding, so the tail is ignored
         const int8_t v = base64Value(c);
         if (v < 0) return false;
         acc = (acc << 6) | static_cast<uint32_t>(v);

@@ -1,9 +1,9 @@
-// ⚠ 关键坑：这几个类的 Map 键是 **MessageQueue**，broker 侧 fastjson 会把键直接内联成 JSON 对象，
-// 产出**非法 JSON**，例如：
+// ⚠ Key pitfall: the Map keys of these classes are **MessageQueue**, and broker-side fastjson inlines the key as a JSON
+// object, producing **invalid JSON**, for example:
 //   {"offsetTable":{{"brokerName":"broker-a","queueId":3,"topic":"MyTopic"}:{...}}}
-// 因此 json.cpp 的解析器必须容忍"对象作为键"（保留原始 JSON 文本作键名），
-// 再由 parseMessageQueueKey() 还原成 MessageQueue。
-// 字段名与结构均由 broker 侧序列化探针实测确认。
+// So the parser in json.cpp must tolerate "an object as key" (keeping the raw JSON text as the key name),
+// and parseMessageQueueKey() then restores it into a MessageQueue.
+// Field names and structures were all confirmed by measurements with the broker-side serialization probe.
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_ADMIN_BODY_H
 #define ROCKETMQ_REMOTING_PROTOCOL_ADMIN_BODY_H
 
@@ -19,16 +19,16 @@
 
 namespace rocketmq {
 
-// ---------------------------------------------------------------- MessageQueue 作为 map 键
+// ---------------------------------------------------------------- MessageQueue as map key
 
-// 把 MessageQueue 序列化成 fastjson2 风格的内联对象键（键按字母序，与 fastjson2 一致）
+// Serialize a MessageQueue into a fastjson2-style inlined object key (keys in alphabetical order, as fastjson2 does)
 std::string messageQueueKey(const MessageQueue& mq);
 
-// 把 fastjson2 写出的 MessageQueue 内联对象键还原成 MessageQueue。
-// 返回 false 表示这个键不是内联对象（例如 "0"、"G1" 这类普通字符串键）。
+// Restore a fastjson2-written inlined MessageQueue object key back into a MessageQueue.
+// Returning false means this key is not an inlined object (an ordinary string key such as "0" or "G1").
 bool parseMessageQueueKey(const std::string& key, MessageQueue& out);
 
-// 通用：解析以 MessageQueue 为键的 map，值为原始 JsonValue
+// Generic: parse a map keyed by MessageQueue, with raw JsonValue values
 std::map<MessageQueue, JsonValue> decodeMessageQueueMap(const JsonValue& raw);
 
 struct TopicOffset {
@@ -44,7 +44,7 @@ struct TopicStatsTable {
     std::map<MessageQueue, TopicOffset> offsetTable;
     double topicPutTps = 0.0;
 
-    // 各队列 maxOffset 之和（管理端最常用的收敛判断）
+    // Sum of maxOffset over all queues (the convergence check used most often on the admin side)
     int64_t totalMaxOffset() const;
 
     JsonValue toJson() const;
@@ -60,7 +60,7 @@ struct OffsetWrapper {
     int64_t lastTimestamp = 0;
     int64_t pullOffset = 0;
 
-    // lag 协议语义：brokerOffset - consumerOffset
+    // Lag in protocol terms: brokerOffset - consumerOffset
     int64_t lag() const { return brokerOffset - consumerOffset; }
 
     JsonValue toJson() const;
@@ -82,7 +82,7 @@ struct ConsumeStats {
 
 struct TopicConfigSerializeWrapper {
     std::map<std::string, TopicConfig> topicConfigTable;
-    JsonValue dataVersion;  // 透传
+    JsonValue dataVersion;  // Pass-through
 
     JsonValue toJson() const;
     static TopicConfigSerializeWrapper fromJson(const JsonValue& v);
@@ -103,12 +103,12 @@ struct ConsumeQueueData {
     std::string msg;
     bool hasMsg = false;
 
-    JsonValue toJson() const;  // null 字段不序列化（broker 侧约定）
+    JsonValue toJson() const;  // null fields are not serialized (broker-side convention)
     static ConsumeQueueData fromJson(const JsonValue& v);
 };
 
 struct QueryConsumeQueueResponseBody {
-    JsonValue subscriptionData;  // 透传（null 表示不出现）
+    JsonValue subscriptionData;  // Pass-through (null means absent)
     std::string filterData;
     bool hasFilterData = false;
     std::vector<ConsumeQueueData> queueData;

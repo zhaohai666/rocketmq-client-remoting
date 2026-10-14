@@ -1,7 +1,7 @@
-// 协议序列化：JSON（RemotingSerializable）与 RocketMQ 私有二进制（RocketMQSerializable）。
+// Protocol serialization: JSON (RemotingSerializable) and the RocketMQ private binary format (RocketMQSerializable).
 //
 //
-// RocketMQ 二进制 header 线格式：
+// RocketMQ binary header wire format:
 //   code(2) | language(1) | version(2) | opaque(4) | flag(4)
 //   | remark(int + utf8) | extFields(int + [key(short + utf8) value(int + utf8)]...)
 #ifndef ROCKETMQ_REMOTING_PROTOCOL_SERIALIZE_H
@@ -17,7 +17,7 @@
 
 namespace rocketmq {
 
-// RocketMQ 二进制 header 的字段集合。刻意不依赖 RemotingCommand，避免与调用层循环包含。
+// The field set of a RocketMQ binary header. Deliberately independent of RemotingCommand to avoid a circular include with the calling layer.
 struct ProtocolHeaderFields {
     int32_t code = 0;
     uint8_t language = 0;
@@ -30,22 +30,22 @@ struct ProtocolHeaderFields {
 };
 
 struct RemotingSerializable {
-    // JsonValue -> UTF-8 字节串
+    // JsonValue -> UTF-8 byte string
     static Bytes encode(const JsonValue& v);
     static std::string dump(const JsonValue& v);
-    // 字节串 -> JsonValue；空串或解析失败返回 false
+    // Byte string -> JsonValue; an empty string or a parse failure returns false
     static bool decode(const Bytes& data, JsonValue& out);
 };
 
 struct RocketMQSerializable {
-    // 十进制 ASCII 写入：先占位 int 长度，写完回补
+    // Written as decimal ASCII: reserve an int length slot first, patch it after writing
     static void writeDecimalLong(Bytes& buf, int64_t value);
     static void writeDecimalInt(Bytes& buf, int32_t value);
 
-    // useShortLength=true 用 2 字节长度（extFields 的 key），false 用 4 字节（value / remark）
+    // useShortLength=true uses a 2-byte length (extFields keys), false uses 4 bytes (value / remark)
     static void writeStr(Bytes& buf, bool useShortLength, const std::string& s);
 
-    // 读取返回 false 表示越界
+    // A read returning false means out of range
     static bool readStr(const Bytes& buf, size_t offset, bool useShortLength,
                         std::string& out, size_t& newOffset);
 

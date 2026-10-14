@@ -11,9 +11,9 @@ struct MessageConst {
     static constexpr const char* PROPERTY_TAGS = "TAGS";
     static constexpr const char* PROPERTY_WAIT_STORE_MSG_OK = "WAIT";
     static constexpr const char* PROPERTY_DELAY_TIME_LEVEL = "DELAY";
-    // 5.x 定时消息三属性：setDelayTimeSec 写
-    // TIMER_DELAY_SEC、setDelayTimeMs 写 TIMER_DELAY_MS、setDeliverTimeMs 写
-    // TIMER_DELIVER_MS。canBatch 攒批判定用这四个（含 DELAY）的最大值。
+    // The three 5.x timed-message properties: setDelayTimeSec writes TIMER_DELAY_SEC,
+    // setDelayTimeMs writes TIMER_DELAY_MS, setDeliverTimeMs writes TIMER_DELIVER_MS.
+    // The canBatch accumulation check uses the maximum of these four (DELAY included).
     static constexpr const char* PROPERTY_TIMER_DELAY_SEC = "TIMER_DELAY_SEC";
     static constexpr const char* PROPERTY_TIMER_DELAY_MS = "TIMER_DELAY_MS";
     static constexpr const char* PROPERTY_TIMER_DELIVER_MS = "TIMER_DELIVER_MS";
@@ -46,9 +46,9 @@ struct MessageConst {
     static constexpr const char* PROPERTY_INSTANCE_ID = "INSTANCE_ID";
     static constexpr const char* PROPERTY_CLUSTER = "CLUSTER";
     static constexpr const char* PROPERTY_MESSAGE_TYPE = "MSG_TYPE";
-    // Request-Reply（5.x）：请求消息带 CORRELATION_ID / REPLY_TO_CLIENT / TTL，
-    // 应答消息的 MSG_TYPE == "reply"（据此把请求码换成 SEND_REPLY_MESSAGE_V2），
-    // broker 按 REPLY_TO_CLIENT 反查请求方 channel 后推 PUSH_REPLY_MESSAGE_TO_CLIENT。
+    // Request-Reply (5.x): a request message carries CORRELATION_ID / REPLY_TO_CLIENT / TTL,
+    // the reply message has MSG_TYPE == "reply" (which is what maps the request code to SEND_REPLY_MESSAGE_V2),
+    // and the broker looks up the requester channel by REPLY_TO_CLIENT and pushes PUSH_REPLY_MESSAGE_TO_CLIENT.
     static constexpr const char* PROPERTY_CORRELATION_ID = "CORRELATION_ID";
     static constexpr const char* PROPERTY_MESSAGE_REPLY_TO_CLIENT = "REPLY_TO_CLIENT";
     static constexpr const char* PROPERTY_MESSAGE_TTL = "TTL";
@@ -79,8 +79,8 @@ struct MessageConst {
     static constexpr int32_t CHARACTER_MAX_LENGTH = 255;
     static constexpr const char* MESSAGE_ID_PREFIX = "MSGID-";
 
-    // 索引查询类型（对应 MessageConst.INDEX_KEY_TYPE / INDEX_UNIQUE_TYPE / INDEX_TAG_TYPE）。
-    // broker 的 QueryMessageRequestHeader.indexType 取这些值；为空时 broker 按 "K" 处理。
+    // Index query types: MessageConst.INDEX_KEY_TYPE / INDEX_UNIQUE_TYPE / INDEX_TAG_TYPE.
+    // The broker's QueryMessageRequestHeader.indexType takes these values; when empty the broker treats it as "K".
     static constexpr const char* INDEX_KEY_TYPE = "K";
     static constexpr const char* INDEX_UNIQUE_TYPE = "U";
     static constexpr const char* INDEX_TAG_TYPE = "T";

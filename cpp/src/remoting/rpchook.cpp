@@ -1,4 +1,4 @@
-// AclClientRPCHook 实现 + 自带的 SHA1 / HMAC-SHA1 / Base64。
+// AclClientRPCHook implementation plus the bundled SHA1 / HMAC-SHA1 / Base64 helpers.
 #include "rocketmq/remoting/rpchook.h"
 
 #include <algorithm>
@@ -124,7 +124,7 @@ Bytes sha1(const Bytes& data) {
 }
 
 Bytes hmacSha1(const std::string& key, const Bytes& data) {
-    // RFC 2104：>64 字节的 key 先做一次 SHA1
+    // RFC 2104: a key longer than 64 bytes is SHA1-hashed first
     uint8_t k[64];
     std::memset(k, 0, sizeof(k));
     if (key.size() > sizeof(k)) {
@@ -196,7 +196,7 @@ Bytes AclClientRPCHook::buildRequestContent(RemotingCommand& request) {
     Bytes buf;
     for (const auto& kv : request.extFields) {
         if (kv.first == SessionCredentials::SIGNATURE) {
-            continue;  // Signature 自身不参与签名（与 broker 侧一致）
+            continue;  // the Signature field itself is excluded from the signing input (as on the broker side)
         }
         buf += kv.second;
     }
@@ -238,7 +238,7 @@ void NamespaceRpcHook::doBeforeRequest(const std::string& remoteAddr,
 }
 
 void ChainedRPCHook::doBeforeRequest(const std::string& remoteAddr, RemotingCommand& request) {
-    // 严格按注册顺序执行 —— 顺序决定 ACL 签名覆盖的字段集（见头文件注释）。
+    // Run strictly in registration order -- that order decides which fields the ACL signature covers (see the header comment).
     for (const std::shared_ptr<RPCHook>& hook : hooks_) {
         if (hook) hook->doBeforeRequest(remoteAddr, request);
     }
@@ -257,11 +257,11 @@ std::shared_ptr<RPCHook> composeRequestHooks(bool enableStreamRequestType,
     const bool hasNamespace = namespaceV2Getter != nullptr;
     if (!hasNamespace && !enableStreamRequestType) return userHook;
     std::vector<std::shared_ptr<RPCHook>> hooks;
-    // 取值函数直接透传：钩子每笔请求实时读配置，start() 之后再 setNamespaceV2 也生效
+    // The value getters are passed straight through: the hook reads the config live on every request, so setNamespaceV2() after start() still takes effect
     if (hasNamespace) hooks.push_back(std::make_shared<NamespaceRpcHook>(namespaceV2Getter));
     if (enableStreamRequestType) hooks.push_back(std::make_shared<StreamTypeRPCHook>());
     if (userHook) hooks.push_back(userHook);
-    // 只剩一个钩子时原样返回（不套链壳）：门面「只配了 namespaceV2」的形态
+    // With only one hook left it is returned as is (no chain wrapper): the shape taken when "only namespaceV2 is configured"
     if (hooks.size() == 1) return hooks.front();
     return std::make_shared<ChainedRPCHook>(std::move(hooks));
 }

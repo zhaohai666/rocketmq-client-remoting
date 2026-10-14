@@ -1,4 +1,4 @@
-// 公共 body 实现。
+// Shared body implementations.
 #include "rocketmq/remoting/protocol/body.h"
 
 #include <algorithm>
@@ -144,7 +144,7 @@ JsonValue CheckClientRequestBody::toJson() const {
     v.set("clientId", JsonValue::makeString(clientId));
     v.set("group", JsonValue::makeString(group));
     v.set("subscriptionData", subscriptionData.toJson());
-    // namespace 未置位时不写这个键（broker 侧 fastjson 不序列化 null 字段），用 hasNamespace 表达该语义
+    // The key is omitted when no namespace is set (the broker does not serialize null fields), hasNamespace carries that meaning
     if (hasNamespace) v.set("namespace", JsonValue::makeString(clientNamespace));
     return v;
 }
@@ -174,7 +174,7 @@ bool CheckClientRequestBody::decode(const Bytes& data, CheckClientRequestBody& o
 
 // ---------------------------------------------------------------- ClusterInfo
 std::vector<std::string> ClusterInfo::getBrokerAddrs() const {
-    // brokerAddrTable 是 std::map（已按 brokerName 排序），内层 brokerAddrs 也按 brokerId 排序
+    // brokerAddrTable is a std::map (already sorted by brokerName) and the inner brokerAddrs is sorted by brokerId too
     std::vector<std::string> addrs;
     for (const auto& kv : brokerAddrTable) {
         for (const auto& addrKv : kv.second.brokerAddrs) {
@@ -224,8 +224,8 @@ JsonValue ClusterInfo::toJson() const {
 
 ClusterInfo ClusterInfo::fromJson(const JsonValue& v) {
     ClusterInfo ci;
-    // 真实 RocketMQ 的 brokerAddrTable[name] 是 BrokerData 对象，
-    // 真正的 {brokerId: addr} 映射在其中的 brokerAddrs 字段下。
+    // In real RocketMQ brokerAddrTable[name] is a BrokerData object,
+    // and the actual {brokerId: addr} map lives in its brokerAddrs field.
     const JsonValue* brokers = v.find("brokerAddrTable");
     if (brokers != nullptr && brokers->isObject()) {
         for (const auto& kv : brokers->objectItems()) {
@@ -235,7 +235,7 @@ ClusterInfo ClusterInfo::fromJson(const JsonValue& v) {
     const JsonValue* clusters = v.find("clusterAddrTable");
     if (clusters != nullptr && clusters->isObject()) {
         for (const auto& kv : clusters->objectItems()) {
-            // 兼容两种写法：数组形式（标准）与字符串形式（个别老版本）
+            // Accept both shapes: the array form (standard) and the string form (a few older releases)
             if (kv.second.isArray()) {
                 std::vector<std::string> names;
                 for (size_t i = 0; i < kv.second.size(); ++i) {
@@ -373,8 +373,8 @@ JsonValue ConsumerRunningInfo::toJson() const {
     v.set("properties", makeStringMap(properties));
     v.set("subscriptionSet", subscriptionSet.isNull() ? JsonValue::makeArray() : subscriptionSet);
     v.set("mqTable", mqTable.isNull() ? JsonValue::makeObject() : mqTable);
-    // 307 应答报文总是带 mqPopTable/statusTable/userConsumerInfo，缺省时输出空对象 {}：
-    // broker 侧 fastjson 字段非 null 就序列化，空 map 输出 {}，故保持这一报文形状。
+    // A 307 reply always carries mqPopTable/statusTable/userConsumerInfo, as an empty object {} when unset:
+    // the broker serializes every non-null field and an empty map becomes {}, so this reply shape is kept.
     v.set("mqPopTable", mqPopTable.isNull() ? JsonValue::makeObject() : mqPopTable);
     v.set("statusTable", statusTable.isNull() ? JsonValue::makeObject() : statusTable);
     v.set("userConsumerInfo", userConsumerInfo.isNull() ? JsonValue::makeObject() : userConsumerInfo);
@@ -522,8 +522,8 @@ JsonValue GetConsumerStatusBody::toJson() const {
         table.set(messageQueueKey(kv.first), JsonValue::makeInt(kv.second));
     }
     v.set("messageQueueTable", table);
-    // 协议保留的废弃字段 consumerTable（clientId -> 位点表）：始终带空对象 {}，
-    // 与 broker 侧约定的序列化形状一致。
+    // Deprecated consumerTable retained by the protocol (clientId -> offset table): always present as an empty object {},
+    // matching the serialization shape agreed with the broker.
     v.set("consumerTable", JsonValue::makeObject());
     return v;
 }

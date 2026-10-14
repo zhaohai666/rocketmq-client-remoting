@@ -63,11 +63,11 @@ struct Message {
     Bytes body;
     bool hasBody = true;
     std::string transactionId;
-    // 是否为批量消息体（由 MessageBatch::generateFromList 置位）。
-    // 发送时映射到 SendMessageRequestHeader.batch —— broker 端
-    // SendMessageProcessor 用 requestHeader.isBatch() 决定走 sendBatchMessage
-    // 还是 sendMessage，所以这个标志是必须的。
-    // 说明：不用 dynamic_cast 是因为 Message 非多态类型（无虚函数），RTTI 不可用。
+    // Whether this is a batch message body (set by MessageBatch::generateFromList).
+    // On sending it maps to SendMessageRequestHeader.batch — the broker's
+    // SendMessageProcessor uses requestHeader.isBatch() to choose between sendBatchMessage
+    // and sendMessage, so this flag is required.
+    // Remark: dynamic_cast is not used because Message is not a polymorphic type (no virtual functions), so RTTI is unavailable.
     bool isBatch = false;
 
     Message() = default;
@@ -79,7 +79,7 @@ struct Message {
         if (!keys.empty()) setKeys(keys);
     }
 
-    // ---- 属性快捷方式 ----
+    // ---- property shortcuts ----
     void setTags(const std::string& tags) { properties[MessageConst::PROPERTY_TAGS] = tags; }
     std::string getTags() const;
     void setKeys(const std::string& keys) { properties[MessageConst::PROPERTY_KEYS] = keys; }

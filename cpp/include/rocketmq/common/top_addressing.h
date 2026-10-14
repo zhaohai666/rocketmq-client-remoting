@@ -13,14 +13,14 @@ std::string clearNewLine(const std::string& content);
 
 class DefaultTopAddressing {
  public:
-    // 默认构造 = 动态取址关闭（wsAddr 为空，fetch 直接返回空串）。
+    // Default construction = dynamic addressing disabled (wsAddr empty, fetch returns an empty string directly).
     DefaultTopAddressing() = default;
     explicit DefaultTopAddressing(std::string wsAddr, std::string unitName = std::string(),
                                   std::map<std::string, std::string> para = std::map<std::string, std::string>(),
                                   int32_t timeoutMillis = 3000);
 
     static std::string getWsAddr(const std::string& domain, const std::string& subgroup = "nsaddr");
-    // 动态取址是否已配置（ROCKETMQ_NAMESRV_DOMAIN 环境变量）
+    // Whether dynamic addressing is configured (ROCKETMQ_NAMESRV_DOMAIN environment variable)
     static bool isConfigured();
 
     void setWsAddr(std::string wsAddr) { wsAddr_ = std::move(wsAddr); }
@@ -31,7 +31,7 @@ class DefaultTopAddressing {
 
     void configureFromEnv(const std::string& unitName = std::string());
 
-    // 对应 fetchNSAddr 里的 URL 拼装（unitName / para 规则逐条照抄）
+    // URL assembly used when fetching the name server address (unitName / para rules followed item by item)
     std::string buildUrl() const;
 
     std::string fetchNsAddr(bool verbose = true);
@@ -39,7 +39,7 @@ class DefaultTopAddressing {
     std::string fetchAndApply();
 
  private:
-    // 极简 HTTP GET：返回 HTTP 状态码，body 带出响应体。零第三方依赖。
+    // Minimal HTTP GET: returns the HTTP status code and writes the response body out. No third-party dependencies.
     static int httpGet(const std::string& host, const std::string& port,
                        const std::string& path, int32_t timeoutMillis, std::string& body);
 
